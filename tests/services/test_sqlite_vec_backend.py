@@ -78,6 +78,37 @@ def _settings() -> Settings:
 pytestmark = pytest.mark.skipif(not HAS_SQLITE_VEC, reason="sqlite-vec is not installed")
 
 
+_TS = "2026-04-04T00:00:00+00:00"
+
+
+async def _insert_stub_memory(connection, memory_id: str, user_id: str) -> None:
+    """Insert minimal parent rows so FK constraints are satisfied."""
+    await connection.execute(
+        "INSERT OR IGNORE INTO users(id, created_at, updated_at) VALUES (?, ?, ?)",
+        (user_id, _TS, _TS),
+    )
+    await connection.execute(
+        """INSERT OR IGNORE INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+           VALUES ('general_qa', 'General QA', 'stub', '{}', ?, ?)""",
+        (_TS, _TS),
+    )
+    await connection.execute(
+        """INSERT OR IGNORE INTO conversations(id, user_id, assistant_mode_id, created_at, updated_at)
+           VALUES ('conv_stub', ?, 'general_qa', ?, ?)""",
+        (user_id, _TS, _TS),
+    )
+    await connection.execute(
+        """INSERT OR IGNORE INTO memory_objects(
+               id, user_id, conversation_id, assistant_mode_id, object_type, scope,
+               canonical_text, payload_json, source_kind, confidence, stability, vitality,
+               maya_score, privacy_level, status, created_at, updated_at
+           ) VALUES (?, ?, 'conv_stub', 'general_qa', 'evidence', 'conversation',
+               'stub', '{}', 'extracted', 0.5, 0.5, 1.0, 0.0, 0, 'active', ?, ?)""",
+        (memory_id, user_id, _TS, _TS),
+    )
+    await connection.commit()
+
+
 async def _build_backend(database_path: str = ":memory:"):
     connection = await initialize_database(database_path, MIGRATIONS_DIR)
     provider = EmbeddingProvider(
@@ -102,6 +133,7 @@ async def _build_backend(database_path: str = ":memory:"):
 async def test_upsert_stores_embedding_and_metadata() -> None:
     connection, backend = await _build_backend()
     try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
         await backend.upsert(
             "mem_1",
             "memory one",
@@ -121,6 +153,8 @@ async def test_upsert_stores_embedding_and_metadata() -> None:
 async def test_search_returns_nearest_neighbors_filtered_by_user_id() -> None:
     connection, backend = await _build_backend()
     try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
+        await _insert_stub_memory(connection, "mem_2", "usr_2")
         await backend.upsert(
             "mem_1",
             "memory one",
@@ -155,6 +189,7 @@ async def test_search_returns_empty_when_no_matches_exist() -> None:
 async def test_delete_removes_embedding_and_metadata() -> None:
     connection, backend = await _build_backend()
     try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
         await backend.upsert(
             "mem_1",
             "memory one",
@@ -176,6 +211,7 @@ async def test_delete_removes_embedding_and_metadata() -> None:
 async def test_upsert_twice_updates_existing_embedding_idempotently() -> None:
     connection, backend = await _build_backend()
     try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
         await backend.upsert(
             "mem_1",
             "memory one",
@@ -201,6 +237,7 @@ async def test_upsert_commits_metadata_durably(tmp_path: Path) -> None:
     database_path = str(tmp_path / "atagia-sqlite-vec.db")
     connection, backend = await _build_backend(database_path)
     try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
         await backend.upsert(
             "mem_1",
             "memory one",
@@ -224,6 +261,7 @@ async def test_delete_commits_metadata_removal_durably(tmp_path: Path) -> None:
     database_path = str(tmp_path / "atagia-sqlite-vec-delete.db")
     connection, backend = await _build_backend(database_path)
     try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
         await backend.upsert(
             "mem_1",
             "memory one",

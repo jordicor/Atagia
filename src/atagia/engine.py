@@ -16,11 +16,13 @@ from atagia.models.schemas_replay import AblationConfig
 from atagia.services.chat_service import ChatService
 from atagia.services.chat_support import (
     DEFAULT_ASSISTANT_MODE_ID,
+    RECENT_FETCH_LIMIT,
     build_message_jobs,
     build_system_prompt,
     enqueue_message_jobs,
     resolve_policy,
 )
+from atagia.memory.lifecycle_runner import piggyback_lifecycle
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.errors import (
     AssistantModeMismatchError,
@@ -117,11 +119,10 @@ class Atagia:
                     assistant_mode_id=mode,
                 )
                 messages = MessageRepository(connection, runtime.clock)
-                prior_messages = await messages.get_messages(
+                prior_messages = await messages.get_recent_messages(
                     conversation["id"],
                     user_id,
-                    limit=500,
-                    offset=0,
+                    limit=RECENT_FETCH_LIMIT,
                 )
                 resolution = await cache_service.resolve_with_connection(
                     connection,
@@ -165,6 +166,11 @@ class Atagia:
                 message_text=message,
                 role="user",
             )
+            if runtime.settings.lifecycle_lazy_enabled:
+                runtime.spawn_background_task(
+                    piggyback_lifecycle(runtime),
+                    name="atagia-lifecycle-piggyback",
+                )
         return ContextResult(
             system_prompt=build_system_prompt(
                 str(conversation["assistant_mode_id"]),
@@ -226,11 +232,10 @@ class Atagia:
                     assistant_mode_id=mode,
                 )
                 messages = MessageRepository(connection, runtime.clock)
-                prior_messages = await messages.get_messages(
+                prior_messages = await messages.get_recent_messages(
                     str(conversation["id"]),
                     user_id,
-                    limit=500,
-                    offset=0,
+                    limit=RECENT_FETCH_LIMIT,
                 )
                 await connection.execute("BEGIN")
                 try:
@@ -286,11 +291,10 @@ class Atagia:
                 if conversation is None:
                     raise ConversationNotFoundError("Conversation not found for user")
                 messages = MessageRepository(connection, runtime.clock)
-                prior_messages = await messages.get_messages(
+                prior_messages = await messages.get_recent_messages(
                     conversation_id,
                     user_id,
-                    limit=500,
-                    offset=0,
+                    limit=RECENT_FETCH_LIMIT,
                 )
                 await connection.execute("BEGIN")
                 try:
@@ -450,6 +454,10 @@ class Atagia:
             lifecycle_archive_confidence=env_settings.lifecycle_archive_confidence,
             lifecycle_ephemeral_ttl_hours=env_settings.lifecycle_ephemeral_ttl_hours,
             lifecycle_review_ttl_days=env_settings.lifecycle_review_ttl_days,
+            lifecycle_lazy_enabled=env_settings.lifecycle_lazy_enabled,
+            lifecycle_min_interval_seconds=env_settings.lifecycle_min_interval_seconds,
+            lifecycle_worker_enabled=env_settings.lifecycle_worker_enabled,
+            lifecycle_worker_interval_seconds=env_settings.lifecycle_worker_interval_seconds,
             promotion_conv_to_ws_min_conversations=env_settings.promotion_conv_to_ws_min_conversations,
             promotion_ws_to_global_min_sessions=env_settings.promotion_ws_to_global_min_sessions,
             promotion_require_mode_consistency=env_settings.promotion_require_mode_consistency,

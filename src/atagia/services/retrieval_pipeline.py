@@ -227,6 +227,8 @@ class RetrievalPipeline:
             plan.max_candidates = max(0, int(override_params["max_candidates"]))
         if "max_context_items" in override_params:
             plan.max_context_items = max(1, int(override_params["max_context_items"]))
+        if "vector_limit" in override_params:
+            plan.vector_limit = max(0, int(override_params["vector_limit"]))
         if "privacy_ceiling" in override_params:
             plan.privacy_ceiling = max(0, min(3, int(override_params["privacy_ceiling"])))
         return plan

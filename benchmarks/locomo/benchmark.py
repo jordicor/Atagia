@@ -43,6 +43,8 @@ class LoCoMoBenchmark(BenchmarkRunner):
         llm_model: str | None,
         judge_model: str | None = None,
         manifests_dir: str | Path | None = None,
+        embedding_backend: str = "none",
+        embedding_model: str | None = None,
     ) -> None:
         self._data_path = Path(data_path).expanduser()
         self._llm_provider = llm_provider
@@ -54,6 +56,8 @@ class LoCoMoBenchmark(BenchmarkRunner):
             if manifests_dir is not None
             else _DEFAULT_MANIFESTS_DIR
         )
+        self._embedding_backend = embedding_backend
+        self._embedding_model = embedding_model
         self._adapter = LoCoMoAdapter(self._data_path)
 
     async def run(
@@ -134,6 +138,8 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 llm_provider=self._llm_provider,
                 llm_api_key=self._llm_api_key,
                 llm_model=self._llm_model,
+                embedding_backend=self._embedding_backend,
+                embedding_model=self._embedding_model,
                 skip_belief_revision=ablation.skip_belief_revision if ablation else False,
                 skip_compaction=ablation.skip_compaction if ablation else False,
             ) as engine:

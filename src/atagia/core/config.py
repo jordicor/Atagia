@@ -59,6 +59,10 @@ class Settings:
     context_cache_max_ttl_seconds: int = 3600
     chunking_enabled: bool = False
     chunking_threshold_tokens: int = 2000
+    lifecycle_lazy_enabled: bool = True
+    lifecycle_min_interval_seconds: int = 3600
+    lifecycle_worker_enabled: bool = False
+    lifecycle_worker_interval_seconds: int = 3600
 
     def __post_init__(self) -> None:
         if self.context_cache_min_ttl_seconds <= 0:
@@ -69,6 +73,10 @@ class Settings:
             raise ValueError("context_cache_max_ttl_seconds must be >= context_cache_min_ttl_seconds")
         if self.chunking_threshold_tokens <= 0:
             raise ValueError("chunking_threshold_tokens must be positive")
+        if self.lifecycle_min_interval_seconds <= 0:
+            raise ValueError("lifecycle_min_interval_seconds must be positive")
+        if self.lifecycle_worker_enabled and self.lifecycle_worker_interval_seconds <= 0:
+            raise ValueError("lifecycle_worker_interval_seconds must be positive")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -130,6 +138,14 @@ class Settings:
             chunking_enabled=_env_bool("ATAGIA_CHUNKING_ENABLED", False),
             chunking_threshold_tokens=int(
                 os.getenv("ATAGIA_CHUNKING_THRESHOLD_TOKENS", "2000")
+            ),
+            lifecycle_lazy_enabled=_env_bool("ATAGIA_LIFECYCLE_LAZY_ENABLED", True),
+            lifecycle_min_interval_seconds=int(
+                os.getenv("ATAGIA_LIFECYCLE_MIN_INTERVAL_SECONDS", "3600")
+            ),
+            lifecycle_worker_enabled=_env_bool("ATAGIA_LIFECYCLE_WORKER_ENABLED", False),
+            lifecycle_worker_interval_seconds=int(
+                os.getenv("ATAGIA_LIFECYCLE_WORKER_INTERVAL_SECONDS", "3600")
             ),
         )
 

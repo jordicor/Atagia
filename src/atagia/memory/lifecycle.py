@@ -72,7 +72,8 @@ class MemoryLifecycleManager:
 
         await self._connection.execute("BEGIN")
         try:
-            result.decayed_count = await self._decay_vitality(decay_cutoff, timestamp)
+            decayed_refs = await self._decay_vitality(decay_cutoff, timestamp)
+            result.decayed_count = len(decayed_refs)
             archived_refs = await self._archive_low_value_memories(timestamp)
             archived_ids = [ref.memory_id for ref in archived_refs]
             result.archived_count = len(archived_ids)
@@ -83,7 +84,7 @@ class MemoryLifecycleManager:
             review_required_ids = [ref.memory_id for ref in review_required_refs]
             affected_user_ids = {
                 ref.user_id
-                for ref in archived_refs + ephemeral_refs + review_required_refs
+                for ref in decayed_refs + archived_refs + ephemeral_refs + review_required_refs
             }
             projection_keys = await self._contract_repository.list_projection_keys_for_sources(
                 archived_ids + ephemeral_ids + review_required_ids
@@ -102,15 +103,15 @@ class MemoryLifecycleManager:
                 await self._delete_embeddings(deleted_memory_ids)
                 self._affected_user_ids = affected_user_ids
             return result
-        except Exception:
+        except BaseException:
             self._affected_user_ids = set()
             await self._connection.rollback()
             raise
 
-    async def _decay_vitality(self, decay_cutoff: str, timestamp: str) -> int:
+    async def _decay_vitality(self, decay_cutoff: str, timestamp: str) -> list[_LifecycleMemoryRef]:
         cursor = await self._connection.execute(
             """
-            SELECT id, vitality
+            SELECT id, user_id, vitality
             FROM memory_objects
             WHERE status = ?
               AND updated_at < ?
@@ -135,7 +136,10 @@ class MemoryLifecycleManager:
                 """,
                 updates,
             )
-        return len(updates)
+        return [
+            _LifecycleMemoryRef(memory_id=str(row["id"]), user_id=str(row["user_id"]))
+            for row in rows
+        ]
 
     async def _archive_low_value_memories(self, timestamp: str) -> list[_LifecycleMemoryRef]:
         cursor = await self._connection.execute(

@@ -107,6 +107,10 @@ class StorageBackend:
     async def remember_dedupe(self, key: str, ttl_seconds: int) -> bool:
         raise NotImplementedError
 
+    async def force_dedupe(self, key: str, ttl_seconds: int) -> None:
+        """Set or overwrite a dedupe marker unconditionally."""
+        raise NotImplementedError
+
     async def has_dedupe(self, key: str) -> bool:
         raise NotImplementedError
 
@@ -114,6 +118,12 @@ class StorageBackend:
         raise NotImplementedError
 
     async def release_lock(self, key: str, token: str) -> None:
+        raise NotImplementedError
+
+    async def get_cache_generation(self, key: str) -> int:
+        raise NotImplementedError
+
+    async def increment_cache_generation(self, key: str) -> int:
         raise NotImplementedError
 
     async def close(self) -> None:
@@ -129,6 +139,7 @@ class InProcessBackend(StorageBackend):
     _context_view_keys_by_user: dict[str, set[str]] = field(default_factory=dict)
     _dedupe_keys: dict[str, float] = field(default_factory=dict)
     _locks: dict[str, tuple[float, str]] = field(default_factory=dict)
+    _cache_generations: dict[str, int] = field(default_factory=dict)
     _queues: dict[str, asyncio.Queue[dict[str, Any]]] = field(default_factory=dict)
     _stream_pending: dict[tuple[str, str], dict[str, dict[str, Any]]] = field(default_factory=dict)
     _stream_groups: set[tuple[str, str]] = field(default_factory=set)
@@ -398,6 +409,10 @@ class InProcessBackend(StorageBackend):
             self._dedupe_keys[key] = monotonic() + ttl_seconds
             return True
 
+    async def force_dedupe(self, key: str, ttl_seconds: int) -> None:
+        with self._guard:
+            self._dedupe_keys[key] = monotonic() + ttl_seconds
+
     async def has_dedupe(self, key: str) -> bool:
         with self._guard:
             self._purge_expired()
@@ -421,6 +436,16 @@ class InProcessBackend(StorageBackend):
                 return
             self._locks.pop(key, None)
 
+    async def get_cache_generation(self, key: str) -> int:
+        with self._guard:
+            return self._cache_generations.get(key, 0)
+
+    async def increment_cache_generation(self, key: str) -> int:
+        with self._guard:
+            gen = self._cache_generations.get(key, 0) + 1
+            self._cache_generations[key] = gen
+            return gen
+
     async def close(self) -> None:
         with self._guard:
             self._recent_windows.clear()
@@ -428,6 +453,7 @@ class InProcessBackend(StorageBackend):
             self._context_view_keys_by_user.clear()
             self._dedupe_keys.clear()
             self._locks.clear()
+            self._cache_generations.clear()
             self._queues.clear()
             self._stream_pending.clear()
             self._stream_groups.clear()

@@ -27,6 +27,7 @@
   ],
   "privacy_ceiling": 2,
   "context_budget_tokens": 4200,
+  "transcript_budget_tokens": 6000,
   "retrieval_params": {
     "fts_limit": 25,
     "vector_limit": 10,

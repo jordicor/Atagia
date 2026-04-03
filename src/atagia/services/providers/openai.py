@@ -101,15 +101,69 @@ def _openai_tools(request: LLMCompletionRequest) -> list[dict[str, Any]]:
     ]
 
 
+def _has_free_form_objects(schema: dict[str, Any]) -> bool:
+    """Return True if the schema contains bare object nodes without properties.
+
+    These nodes come from ``dict[str, Any]`` fields in Pydantic and are
+    incompatible with OpenAI strict mode, which requires
+    ``additionalProperties: false`` on every object -- effectively forcing
+    property-less objects to always be ``{}``.
+    """
+    if not isinstance(schema, dict):
+        return False
+    if schema.get("type") == "object" and "properties" not in schema:
+        return True
+    return any(
+        _has_free_form_objects(v)
+        for v in schema.values()
+        if isinstance(v, (dict, list))
+    ) or any(
+        _has_free_form_objects(item)
+        for v in schema.values()
+        if isinstance(v, list)
+        for item in v
+        if isinstance(item, dict)
+    )
+
+
+def _add_additional_properties_false(schema: dict[str, Any]) -> dict[str, Any]:
+    """Add ``additionalProperties: false`` to objects that have ``properties``.
+
+    Only touches structured objects (those with explicit property definitions).
+    Bare ``{"type": "object"}`` nodes (from ``dict[str, Any]``) are left
+    untouched so they remain valid free-form maps.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    result = dict(schema)
+    if (
+        result.get("type") == "object"
+        and "properties" in result
+        and "additionalProperties" not in result
+    ):
+        result["additionalProperties"] = False
+    for key, value in result.items():
+        if isinstance(value, dict):
+            result[key] = _add_additional_properties_false(value)
+        elif isinstance(value, list):
+            result[key] = [
+                _add_additional_properties_false(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+    return result
+
+
 def _response_format(schema: dict[str, Any] | None) -> dict[str, Any] | None:
     if schema is None:
         return None
+    strict = not _has_free_form_objects(schema)
+    sanitized = _add_additional_properties_false(schema) if strict else schema
     return {
         "type": "json_schema",
         "json_schema": {
             "name": "structured_output",
-            "strict": True,
-            "schema": schema,
+            "strict": strict,
+            "schema": sanitized,
         },
     }
 

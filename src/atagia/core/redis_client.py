@@ -314,6 +314,9 @@ class RedisBackend(StorageBackend):
         )
         return bool(result)
 
+    async def force_dedupe(self, key: str, ttl_seconds: int) -> None:
+        await self._client.set(f"dedupe:{key}", "1", ex=ttl_seconds)
+
     async def has_dedupe(self, key: str) -> bool:
         return bool(await self._client.exists(f"dedupe:{key}"))
 
@@ -329,6 +332,13 @@ class RedisBackend(StorageBackend):
 
     async def release_lock(self, key: str, token: str) -> None:
         await self._client.eval(RELEASE_LOCK_SCRIPT, 1, f"lock:{key}", token)
+
+    async def get_cache_generation(self, key: str) -> int:
+        val = await self._client.get(f"cachegen:{key}")
+        return int(val) if val else 0
+
+    async def increment_cache_generation(self, key: str) -> int:
+        return await self._client.incr(f"cachegen:{key}")
 
     async def close(self) -> None:
         await self._client.aclose()

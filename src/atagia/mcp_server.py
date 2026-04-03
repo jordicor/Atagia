@@ -22,7 +22,7 @@ from atagia.models.schemas_jobs import (
 )
 from atagia.models.schemas_memory import ExtractionConversationContext, MemoryStatus
 from atagia.models.schemas_replay import AblationConfig
-from atagia.services.chat_support import build_job_payload, recent_context
+from atagia.services.chat_support import RECENT_FETCH_LIMIT, build_job_payload, recent_context
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.errors import (
     AssistantModeMismatchError,
@@ -156,11 +156,10 @@ async def _add_memory_impl(
             conversation = await conversations.get_conversation(resolved_conversation_id, user_id)
             if conversation is None:
                 raise ValueError("Conversation not found for user")
-            prior_messages = await messages.get_messages(
+            prior_messages = await messages.get_recent_messages(
                 resolved_conversation_id,
                 user_id,
-                limit=500,
-                offset=0,
+                limit=RECENT_FETCH_LIMIT,
             )
             await connection.execute("BEGIN")
             try:

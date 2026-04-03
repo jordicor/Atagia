@@ -124,6 +124,73 @@ async def test_message_round_trip_ordering_and_user_isolation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_recent_messages_returns_newest_rows_sorted_ascending() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+
+        for seq in range(1, 13):
+            await messages.create_message(
+                f"msg_{seq}",
+                "cnv_a",
+                "user" if seq % 2 else "assistant",
+                seq,
+                f"Message {seq}",
+                2,
+                {},
+            )
+
+        recent = await messages.get_recent_messages("cnv_a", "usr_a", limit=5)
+
+        assert [item["seq"] for item in recent] == [8, 9, 10, 11, 12]
+        assert [item["id"] for item in recent] == ["msg_8", "msg_9", "msg_10", "msg_11", "msg_12"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_get_messages_from_seq_returns_tail_in_order() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+
+        for seq in range(1, 8):
+            await messages.create_message(
+                f"msg_tail_{seq}",
+                "cnv_a",
+                "user" if seq % 2 else "assistant",
+                seq,
+                f"Message {seq}",
+                2,
+                {},
+            )
+
+        tail = await messages.get_messages_from_seq("cnv_a", "usr_a", start_seq=4)
+
+        assert [item["seq"] for item in tail] == [4, 5, 6, 7]
+        assert [item["id"] for item in tail] == [
+            "msg_tail_4",
+            "msg_tail_5",
+            "msg_tail_6",
+            "msg_tail_7",
+        ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_create_message_persists_occurred_at_and_defaults_to_created_at() -> None:
     connection, clock = await _connection_and_clock()
     try:

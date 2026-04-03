@@ -79,8 +79,12 @@ class SQLiteVecBackend(EmbeddingIndex):
             return
         try:
             await self._connection.execute(
+                "DELETE FROM vec_memory_embeddings WHERE memory_id = ?",
+                (memory_id,),
+            )
+            await self._connection.execute(
                 """
-                INSERT OR REPLACE INTO vec_memory_embeddings(memory_id, embedding)
+                INSERT INTO vec_memory_embeddings(memory_id, embedding)
                 VALUES (?, ?)
                 """,
                 (

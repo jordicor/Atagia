@@ -46,6 +46,7 @@ def test_load_all_manifests_successfully() -> None:
         "research_deep_dive",
     }
     assert manifests["coding_debug"].privacy_ceiling == 1
+    assert manifests["coding_debug"].transcript_budget_tokens == 8000
     assert manifests["coding_debug"].context_cache_policy.max_messages_without_refresh == 5
     assert manifests["general_qa"].cross_chat_allowed is False
     assert manifests["general_qa"].context_cache_policy.base_ttl_seconds == 900
@@ -88,6 +89,7 @@ def test_policy_resolution_without_overrides_returns_manifest_values() -> None:
     assert resolved.allowed_scopes == manifest.allowed_scopes
     assert resolved.privacy_ceiling == manifest.privacy_ceiling
     assert resolved.context_budget_tokens == manifest.context_budget_tokens
+    assert resolved.transcript_budget_tokens == manifest.transcript_budget_tokens
     assert resolved.retrieval_params == manifest.retrieval_params
     assert resolved.context_cache_policy == manifest.context_cache_policy
 
@@ -112,16 +114,19 @@ def test_policy_resolution_conversation_override_takes_preference_values() -> No
         manifest,
         {
             "context_budget_tokens": 5000,
+            "transcript_budget_tokens": 7000,
             "retrieval_params": {"fts_limit": 18, "rerank_top_k": 12},
         },
         {
             "context_budget_tokens": 3200,
+            "transcript_budget_tokens": 2800,
             "retrieval_params": {"fts_limit": 9},
             "preferred_memory_types": ["evidence", "summary_view"],
         },
     )
 
     assert resolved.context_budget_tokens == 3200
+    assert resolved.transcript_budget_tokens == 2800
     assert resolved.retrieval_params.fts_limit == 9
     assert resolved.retrieval_params.rerank_top_k == 12
     assert [item.value for item in resolved.preferred_memory_types] == ["evidence", "summary_view"]

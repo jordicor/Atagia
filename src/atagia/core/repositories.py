@@ -394,6 +394,48 @@ class MessageRepository(BaseRepository):
             (conversation_id, user_id, limit, offset),
         )
 
+    async def get_recent_messages(
+        self,
+        conversation_id: str,
+        user_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            """
+            SELECT *
+            FROM (
+                SELECT m.*
+                FROM messages AS m
+                JOIN conversations AS c ON c.id = m.conversation_id
+                WHERE m.conversation_id = ?
+                  AND c.user_id = ?
+                ORDER BY m.seq DESC
+                LIMIT ?
+            ) AS recent_messages
+            ORDER BY seq ASC
+            """,
+            (conversation_id, user_id, limit),
+        )
+
+    async def get_messages_from_seq(
+        self,
+        conversation_id: str,
+        user_id: str,
+        start_seq: int,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            """
+            SELECT m.*
+            FROM messages AS m
+            JOIN conversations AS c ON c.id = m.conversation_id
+            WHERE m.conversation_id = ?
+              AND c.user_id = ?
+              AND m.seq >= ?
+            ORDER BY m.seq ASC
+            """,
+            (conversation_id, user_id, start_seq),
+        )
+
     async def get_message(self, message_id: str, user_id: str) -> dict[str, Any] | None:
         return await self._fetch_one(
             """

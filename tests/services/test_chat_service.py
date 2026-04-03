@@ -14,6 +14,7 @@ from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository
+from atagia.core.summary_repository import SummaryRepository
 from atagia.models.schemas_jobs import CONTRACT_STREAM_NAME, EXTRACT_STREAM_NAME, WORKER_GROUP_NAME
 from atagia.services.chat_service import ChatService
 from atagia.services.errors import ConversationNotFoundError, LLMUnavailableError
@@ -348,5 +349,136 @@ async def test_chat_reply_cache_hit_creates_retrieval_event_and_debug_metadata(
             assert latest["outcome_json"]["detected_needs"] == []
         finally:
             await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_uses_windowed_transcript_and_records_trace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        connection = await runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, runtime.clock)
+            summaries = SummaryRepository(connection, runtime.clock)
+            for seq in range(1, 11):
+                await messages.create_message(
+                    f"msg_{seq}",
+                    "cnv_1",
+                    "user" if seq % 2 else "assistant",
+                    seq,
+                    (f"old-{seq}-" + ("x" * 6000)) if seq <= 6 else f"recent-{seq}",
+                    None,
+                    {},
+                )
+            await summaries.create_summary(
+                "usr_1",
+                {
+                    "id": "sum_old",
+                    "conversation_id": "cnv_1",
+                    "workspace_id": None,
+                    "source_message_start_seq": 1,
+                    "source_message_end_seq": 6,
+                    "summary_kind": "conversation_chunk",
+                    "summary_text": "Earlier retry-loop investigation and rollback plan.",
+                    "source_object_ids_json": [],
+                    "maya_score": 1.5,
+                    "model": "classify-test-model",
+                    "created_at": "2026-04-03T10:00:00+00:00",
+                }
+            )
+        finally:
+            await connection.close()
+
+        result = await ChatService(runtime).chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="What should I check next?",
+            assistant_mode_id="coding_debug",
+        )
+
+        chat_request = next(
+            request
+            for request in reversed(provider.requests)
+            if request.metadata.get("purpose") == "chat_reply"
+        )
+        transcript_messages = chat_request.messages[1:]
+
+        assert result.response_text == "Check the retry guard first."
+        assert "[Conversation summary | historical context only | ...]" in chat_request.messages[0].content
+        assert transcript_messages[0].role == "assistant"
+        assert transcript_messages[0].content.startswith(
+            "[Conversation summary | historical context only | turns 1-6]"
+        )
+        assert [message.content for message in transcript_messages[1:5]] == [
+            "recent-7",
+            "recent-8",
+            "recent-9",
+            "recent-10",
+        ]
+        assert transcript_messages[-1].role == "user"
+        assert transcript_messages[-1].content == "What should I check next?"
+
+        connection = await runtime.open_connection()
+        try:
+            event = await RetrievalEventRepository(connection, runtime.clock).get_event(
+                result.retrieval_event_id,
+                "usr_1",
+            )
+            assert event is not None
+            assert event["outcome_json"]["transcript_window"]["raw_message_seqs"] == [7, 8, 9, 10]
+            assert event["outcome_json"]["transcript_window"]["chunk_ids"] == ["sum_old"]
+            assert event["outcome_json"]["transcript_window"]["budget_tokens"] == 8000
+            assert event["outcome_json"]["transcript_window"]["budget_used_tokens"] > 0
+        finally:
+            await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_fetches_full_uncovered_tail_when_chunks_lag_behind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        connection = await runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, runtime.clock)
+            for seq in range(1, 521):
+                await messages.create_message(
+                    f"msg_tail_{seq}",
+                    "cnv_1",
+                    "user" if seq % 2 else "assistant",
+                    seq,
+                    f"tail-{seq}",
+                    None,
+                    {},
+                )
+        finally:
+            await connection.close()
+
+        await ChatService(runtime).chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="Continue from the start.",
+            assistant_mode_id="coding_debug",
+        )
+
+        chat_request = next(
+            request
+            for request in reversed(provider.requests)
+            if request.metadata.get("purpose") == "chat_reply"
+        )
+        transcript_messages = chat_request.messages[1:]
+
+        assert transcript_messages[0].content == "tail-1"
+        assert transcript_messages[-1].content == "Continue from the start."
     finally:
         await runtime.close()

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -24,17 +25,21 @@ from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.models.schemas_api import MemorySummary
 from atagia.models.schemas_cache import ContextCacheEntry
 from atagia.models.schemas_memory import ComposedContext
+from atagia.memory.lifecycle_runner import cache_generation_key
 from atagia.models.schemas_replay import AblationConfig
 
 if TYPE_CHECKING:
     from atagia.app import AppRuntime
 from atagia.services.chat_support import (
+    RECENT_FETCH_LIMIT,
     build_memory_summaries,
     resolve_assistant_mode_id,
     resolve_policy,
 )
 from atagia.services.errors import ConversationNotFoundError
 from atagia.services.retrieval_service import RetrievalService
+
+logger = logging.getLogger(__name__)
 
 CACHE_GUARD_TTL_SECONDS = 5 * 60
 CACHE_GUARD_ACQUIRE_TIMEOUT_SECONDS = 30.0
@@ -76,6 +81,7 @@ class AdaptiveContextResolution:
     scored_candidates: list[dict[str, Any]]
     pending_cache_entry: ContextCacheEntry | None
     cache_ttl_seconds: int | None
+    cache_generation: int = 0
 
 
 @dataclass(slots=True)
@@ -113,6 +119,9 @@ class ContextCacheService:
         conversation: dict[str, Any] | None = None,
         ablation: AblationConfig | None = None,
     ) -> AdaptiveContextResolution:
+        cache_generation = await self.runtime.storage_backend.get_cache_generation(
+            cache_generation_key(self.runtime.database_path, user_id)
+        )
         conversations = ConversationRepository(connection, self.runtime.clock)
         messages = MessageRepository(connection, self.runtime.clock)
         active_conversation = conversation or await conversations.get_conversation(conversation_id, user_id)
@@ -130,11 +139,10 @@ class ContextCacheService:
         )
         current_messages = stored_messages
         if current_messages is None:
-            current_messages = await messages.get_messages(
+            current_messages = await messages.get_recent_messages(
                 conversation_id,
                 user_id,
-                limit=500,
-                offset=0,
+                limit=RECENT_FETCH_LIMIT,
             )
 
         cache_key = self.build_cache_key(
@@ -198,6 +206,7 @@ class ContextCacheService:
                     scored_candidates=[],
                     pending_cache_entry=None,
                     cache_ttl_seconds=None,
+                    cache_generation=cache_generation,
                 )
         else:
             staleness_elapsed = 0.0
@@ -265,6 +274,7 @@ class ContextCacheService:
             ],
             pending_cache_entry=pending_entry,
             cache_ttl_seconds=cache_ttl_seconds,
+            cache_generation=cache_generation,
         )
 
     async def publish_pending_cache_entry(
@@ -274,6 +284,20 @@ class ContextCacheService:
         last_retrieval_message_seq: int,
     ) -> bool:
         if resolution.pending_cache_entry is None or resolution.cache_ttl_seconds is None:
+            return False
+        current_gen = await self.runtime.storage_backend.get_cache_generation(
+            cache_generation_key(
+                self.runtime.database_path,
+                resolution.pending_cache_entry.user_id,
+            )
+        )
+        if current_gen != resolution.cache_generation:
+            logger.debug(
+                "Skipping stale cache publish for user %s (gen %d != %d)",
+                resolution.pending_cache_entry.user_id,
+                resolution.cache_generation,
+                current_gen,
+            )
             return False
         entry = resolution.pending_cache_entry.model_copy(
             update={

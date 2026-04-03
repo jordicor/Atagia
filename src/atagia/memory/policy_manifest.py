@@ -76,6 +76,7 @@ class PolicyOverride(BaseModel):
     contract_dimensions_priority: list[str] | None = None
     privacy_ceiling: int | None = Field(default=None, ge=0, le=3)
     context_budget_tokens: int | None = Field(default=None, gt=0)
+    transcript_budget_tokens: int | None = Field(default=None, gt=0)
     retrieval_params: RetrievalParamsOverride | None = None
 
     @field_validator("allowed_scopes")
@@ -127,6 +128,7 @@ class ResolvedPolicy(BaseModel):
     contract_dimensions_priority: list[str]
     privacy_ceiling: int
     context_budget_tokens: int
+    transcript_budget_tokens: int
     retrieval_params: RetrievalParams
     context_cache_policy: ContextCachePolicy
 
@@ -216,6 +218,11 @@ class PolicyResolver:
                 manifest.context_budget_tokens,
                 workspace.context_budget_tokens,
                 conversation.context_budget_tokens,
+            ),
+            transcript_budget_tokens=self._pick_most_specific_scalar(
+                manifest.transcript_budget_tokens,
+                workspace.transcript_budget_tokens,
+                conversation.transcript_budget_tokens,
             ),
             retrieval_params=self._resolve_retrieval_params(
                 manifest.retrieval_params,

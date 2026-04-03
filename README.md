@@ -6,9 +6,20 @@ Named after *autophagy*, the cellular process of recycling what no longer serves
 
 ## Why
 
-Current AI memory systems retrieve information based on how similar it sounds to the current query. This leads to real problems: coding preferences bleed into emotional support conversations, outdated beliefs override current context, and compressed summaries get treated as established facts.
+AI assistants forget everything between sessions. The standard fix -- retrieve memories by embedding similarity -- creates its own problems: coding preferences bleed into emotional support conversations, outdated beliefs override current context, and compressed summaries get treated as established facts. Similarity tells you what *sounds related*, not what *actually helps*.
 
-Atagia takes a different approach. Instead of ranking memories by embedding distance, it scores each candidate across multiple dimensions (task fit, mode fit, temporal validity, epistemic quality, risk relevance) and selects based on **applicability** to the current situation.
+Atagia scores each candidate memory across multiple dimensions (task fit, mode fit, temporal validity, epistemic quality, risk relevance) and selects based on **applicability** to the current situation. The result is memory that adapts to what the assistant is doing right now, not just what the user said before.
+
+## Key capabilities
+
+- **Applicability-based memory selection** -- memories are scored on whether they help the current task, not just whether they sound similar
+- **Belief revision with version history** -- 8 conflict resolution strategies; beliefs are never silently overwritten
+- **Scoped personalization per assistant mode** -- a coding assistant and a companion retrieve different memories from the same user, governed by policy manifests
+- **Consequence chain learning** -- records action-outcome-tendency chains so the assistant can learn from prior advice results
+- **Interaction contract learning** -- observes how the user prefers to collaborate (depth, directness, pushback tolerance) and adapts per mode
+- **Adaptive context caching** -- deterministic staleness scoring serves cached results on follow-up turns when context has not significantly changed
+- **Intelligent text chunking** -- two-level splitting (rule-based + AI-assisted) handles voice transcriptions and long pastes before extraction
+- **All storage in SQLite** -- no external vector DB required; sqlite-vec available for optional embedding recall
 
 ## Current status
 
@@ -107,12 +118,13 @@ Messages accept an optional `occurred_at` ISO timestamp for historical data wher
 | `llm_api_key` | From env | API key for the LLM provider |
 | `llm_model` | From env | Model name for extraction, scoring, and chat |
 | `embedding_backend` | `"none"` | `"none"` or `"sqlite_vec"` |
+| `embedding_model` | `None` | Embedding model name (required when backend is `sqlite_vec`) |
 | `context_cache_enabled` | `True` | Enable adaptive context caching |
 | `chunking_enabled` | `True` | Enable intelligent chunking for long messages |
 | `skip_belief_revision` | `False` | Disable belief revision (for benchmarks/ablation) |
 | `skip_compaction` | `False` | Disable compaction (for benchmarks/ablation) |
 
-SQLite is the only required dependency. Redis accelerates queues and caching but never replaces SQLite as the canonical store. The engine works without Redis using in-process queues.
+SQLite is the only required storage dependency. An LLM API (Anthropic, OpenAI, or OpenRouter) is required for memory extraction, scoring, and chat. Redis accelerates queues and caching but is optional -- the engine works without it using in-process queues.
 
 ### As an MCP server (Claude Desktop, Cursor, Windsurf)
 
@@ -295,21 +307,7 @@ Each chunk is extracted independently with a cross-chunk context accumulator tha
                          +---------------+
 ```
 
-SQLite is the canonical data store. Redis accelerates queues and caching but never replaces it. The engine works without Redis using in-process queues.
-
-## Comparison
-
-| | Atagia | Mem0 | Letta |
-|---|---|---|---|
-| **Memory selection** | Applicability scoring (multi-dimensional) | Similarity (vector distance) | Agent self-edits |
-| **Conflict resolution** | 8 revision actions with full version history | ADD/UPDATE/DELETE (flat) | Agent decides |
-| **Scoping** | 5 levels + policy manifests per mode | Flat user_id | 3 tiers (core/recall/archival) |
-| **Interaction memory** | Learned collaboration style (contracts) | No | No |
-| **Epistemic tracking** | Maya score (evidence-to-inference distance) | No | No |
-| **Consequence learning** | Action-outcome-tendency chains | No | No |
-| **Long message handling** | Two-level intelligent chunking | No | No |
-| **Context caching** | Adaptive staleness-scored cache | No | No |
-| **External dependencies** | None (SQLite only) | Vector DB required | Letta runtime required |
+SQLite is the canonical data store. An LLM API is required for memory extraction, applicability scoring, belief revision, and chat. Redis accelerates queues and caching but is optional.
 
 ## Stack
 
@@ -318,9 +316,9 @@ SQLite is the canonical data store. Redis accelerates queues and caching but nev
 | Language | Python 3.12+ |
 | API | FastAPI |
 | Primary storage | SQLite + FTS5 |
+| LLM providers | Anthropic, OpenAI, OpenRouter |
 | Optional cache/queues | Redis |
 | Optional semantic recall | sqlite-vec |
-| LLM providers | Anthropic, OpenAI, OpenRouter |
 
 ## Running tests
 

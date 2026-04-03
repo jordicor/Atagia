@@ -161,6 +161,37 @@ async def test_list_conversation_chunks_returns_ordered_rows() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_all_conversation_chunks_returns_all_rows_in_order() -> None:
+    connection, summaries = await _build_runtime()
+    try:
+        for index in range(25):
+            await summaries.create_summary(
+                "usr_1",
+                {
+                    "id": f"sum_{index:02d}",
+                    "conversation_id": "cnv_1",
+                    "workspace_id": "wrk_1",
+                    "source_message_start_seq": index * 2 + 1,
+                    "source_message_end_seq": index * 2 + 2,
+                    "summary_kind": "conversation_chunk",
+                    "summary_text": f"Chunk {index}",
+                    "source_object_ids_json": [],
+                    "maya_score": 1.5,
+                    "model": "classify-test-model",
+                    "created_at": "2026-04-03T10:00:00+00:00",
+                }
+            )
+
+        rows = await summaries.list_all_conversation_chunks("usr_1", "cnv_1")
+
+        assert len(rows) == 25
+        assert rows[0]["id"] == "sum_00"
+        assert rows[-1]["id"] == "sum_24"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_workspace_rollups_are_ordered_desc_and_latest_is_returned() -> None:
     connection, summaries = await _build_runtime()
     try:

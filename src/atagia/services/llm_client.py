@@ -82,7 +82,7 @@ class LLMCompletionResponse(BaseModel):
     output_text: str = ""
     thinking: str | None = None
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
-    usage: dict[str, int | float] = Field(default_factory=dict)
+    usage: dict[str, Any] = Field(default_factory=dict)
     raw_response: dict[str, Any] = Field(default_factory=dict)
 
 

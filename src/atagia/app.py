@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiosqlite
@@ -34,6 +35,7 @@ from atagia.workers.compaction_worker import CompactionWorker
 from atagia.workers.contract_worker import ContractWorker
 from atagia.workers.evaluation_worker import EvaluationWorker
 from atagia.workers.ingest_worker import IngestWorker
+from atagia.workers.lifecycle_worker import LifecycleWorker
 from atagia.workers.revision_worker import RevisionWorker
 
 
@@ -55,15 +57,23 @@ class AppRuntime:
     revision_worker: RevisionWorker | None
     compaction_worker: CompactionWorker | None
     evaluation_worker: EvaluationWorker | None
+    lifecycle_worker: LifecycleWorker | None
     worker_tasks: list[asyncio.Task[None]]
     bootstrap_connection: aiosqlite.Connection
     embedding_connection: aiosqlite.Connection | None
     worker_connections: list[aiosqlite.Connection]
+    _background_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     closed: bool = False
 
     async def open_connection(self) -> aiosqlite.Connection:
         """Open a short-lived SQLite connection for one unit of work."""
         return await open_connection(self.database_path)
+
+    def spawn_background_task(self, coro: Coroutine[Any, Any, None], *, name: str) -> None:
+        """Create a tracked background task that is cancelled on shutdown."""
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def close(self) -> None:
         """Close worker tasks, transient backends, and SQLite resources."""
@@ -74,6 +84,11 @@ class AppRuntime:
             task.cancel()
         if self.worker_tasks:
             await asyncio.gather(*self.worker_tasks, return_exceptions=True)
+        bg_tasks = list(self._background_tasks)
+        for task in bg_tasks:
+            task.cancel()
+        if bg_tasks:
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
         await self.storage_backend.close()
         for worker_connection in self.worker_connections:
             await worker_connection.close()
@@ -152,6 +167,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             EVALUATION_STREAM_NAME,
         ):
             await storage_backend.stream_ensure_group(stream_name, WORKER_GROUP_NAME)
+        lifecycle_worker: LifecycleWorker | None = None
         if settings.workers_enabled:
             ingest_connection = await open_connection(database_path)
             contract_connection = await open_connection(database_path)
@@ -214,6 +230,17 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
                 asyncio.create_task(compaction_worker.run(), name="atagia-compaction-worker"),
                 asyncio.create_task(evaluation_worker.run(), name="atagia-evaluation-worker"),
             ]
+        if settings.lifecycle_worker_enabled:
+            lifecycle_worker = LifecycleWorker(
+                database_path=database_path,
+                clock=clock,
+                settings=settings,
+                embedding_index=embedding_index,
+                storage_backend=storage_backend,
+            )
+            worker_tasks.append(
+                asyncio.create_task(lifecycle_worker.run(), name="atagia-lifecycle-worker")
+            )
         return AppRuntime(
             settings=settings,
             clock=clock,
@@ -229,6 +256,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             revision_worker=revision_worker,
             compaction_worker=compaction_worker,
             evaluation_worker=evaluation_worker,
+            lifecycle_worker=lifecycle_worker,
             worker_tasks=worker_tasks,
             bootstrap_connection=bootstrap_connection,
             embedding_connection=embedding_connection,

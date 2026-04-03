@@ -108,6 +108,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=str(_DEFAULT_MANIFESTS_DIR),
         help="Path to the Atagia manifests directory",
     )
+    parser.add_argument(
+        "--embedding-backend",
+        default="none",
+        help='Embedding backend: "none" or "sqlite_vec"',
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        help="Embedding model name (required when backend is sqlite_vec)",
+    )
     return parser
 
 
@@ -119,6 +129,8 @@ async def _run_async(args: argparse.Namespace) -> tuple[BenchmarkReport, Path]:
         llm_model=args.model,
         judge_model=args.judge_model,
         manifests_dir=args.manifests_dir,
+        embedding_backend=args.embedding_backend,
+        embedding_model=args.embedding_model,
     )
     report = await benchmark.run(
         ablation=_parse_ablation(args.ablation),
@@ -209,6 +221,8 @@ def main() -> None:
     """Parse CLI args, run the benchmark, and print the report path."""
     parser = _build_parser()
     args = parser.parse_args()
+    if args.embedding_backend == "sqlite_vec" and not args.embedding_model:
+        parser.error("--embedding-model is required when --embedding-backend is sqlite_vec")
     report, output_path = asyncio.run(_run_async(args))
     print(_format_report_summary(report, output_path))
 

@@ -29,8 +29,6 @@ class ContextComposer:
         conversation_messages: list[dict[str, Any]],
         workspace_rollup: dict[str, Any] | None = None,
     ) -> ComposedContext:
-        del conversation_messages  # Phase 1 keeps the raw transcript outside these composed blocks.
-
         candidates = sorted(
             (
                 candidate

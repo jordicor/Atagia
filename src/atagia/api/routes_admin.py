@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 import aiosqlite
+
+if TYPE_CHECKING:
+    from atagia.app import AppRuntime
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from atagia.api.dependencies import (
@@ -13,6 +18,7 @@ from atagia.api.dependencies import (
     get_embedding_index,
     get_llm_client,
     get_manifest_loader,
+    get_runtime,
     get_settings,
     get_storage_backend,
 )
@@ -25,7 +31,8 @@ from atagia.core.retrieval_event_repository import AdminAuditRepository, Retriev
 from atagia.memory.compactor import Compactor
 from atagia.memory.grounding_analyzer import GroundingAnalyzer
 from atagia.memory.inspector import MemoryInspector
-from atagia.memory.lifecycle import LifecycleCycleResult, MemoryLifecycleManager
+from atagia.memory.lifecycle import LifecycleCycleResult
+from atagia.memory.lifecycle_runner import LifecycleLockError, run_lifecycle_direct
 from atagia.memory.metrics_computer import MetricsComputer, normalize_time_bucket
 from atagia.memory.policy_manifest import ManifestLoader
 from atagia.models.schemas_api import AdminMetricsComputeRequest
@@ -298,29 +305,38 @@ async def list_consequence_chains(
 async def run_lifecycle(
     dry_run: bool = Query(default=False),
     auth_context: AuthContext = Depends(get_admin_auth_context),
-    connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
     embedding_index: EmbeddingIndex = Depends(get_embedding_index),
     settings: Settings = Depends(get_settings),
     storage_backend: StorageBackend = Depends(get_storage_backend),
+    runtime: AppRuntime = Depends(get_runtime),
 ) -> LifecycleCycleResult:
-    lifecycle_manager = MemoryLifecycleManager(
-        connection,
-        clock,
-        embedding_index=embedding_index,
-        settings=settings,
-    )
-    result = await lifecycle_manager.run_cycle(dry_run=dry_run)
-    if not dry_run:
-        for user_id in lifecycle_manager.affected_user_ids:
-            await storage_backend.delete_context_views_for_user(user_id)
-    await AdminAuditRepository(connection, clock).create_audit_entry(
-        admin_user_id=auth_context.actor_id,
-        action="run_lifecycle_cycle",
-        target_type="lifecycle",
-        target_id="all",
-        metadata={"dry_run": dry_run, **result.model_dump()},
-    )
+    try:
+        result = await run_lifecycle_direct(
+            database_path=runtime.database_path,
+            clock=clock,
+            settings=settings,
+            embedding_index=embedding_index,
+            storage_backend=storage_backend,
+            dry_run=dry_run,
+        )
+    except LifecycleLockError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    connection = await runtime.open_connection()
+    try:
+        await AdminAuditRepository(connection, clock).create_audit_entry(
+            admin_user_id=auth_context.actor_id,
+            action="run_lifecycle_cycle",
+            target_type="lifecycle",
+            target_id="all",
+            metadata={"dry_run": dry_run, **result.model_dump()},
+        )
+        await connection.commit()
+    finally:
+        await connection.close()
     return result
 
 

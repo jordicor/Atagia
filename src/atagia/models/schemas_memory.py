@@ -119,6 +119,7 @@ class AssistantModeManifest(BaseModel):
     contract_dimensions_priority: list[str] = Field(min_length=1)
     privacy_ceiling: int = Field(ge=0, le=3)
     context_budget_tokens: int = Field(gt=0)
+    transcript_budget_tokens: int = Field(gt=0)
     retrieval_params: RetrievalParams
     context_cache_policy: ContextCachePolicy
     prompt_hash: str | None = Field(default=None, exclude=True)

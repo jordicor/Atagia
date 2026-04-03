@@ -149,6 +149,24 @@ class SummaryRepository(BaseRepository):
             (user_id, conversation_id, SummaryViewKind.CONVERSATION_CHUNK.value, limit),
         )
 
+    async def list_all_conversation_chunks(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            """
+            SELECT sv.*
+            FROM summary_views AS sv
+            JOIN conversations AS c ON c.id = sv.conversation_id
+            WHERE c.user_id = ?
+              AND sv.conversation_id = ?
+              AND sv.summary_kind = ?
+            ORDER BY sv.source_message_start_seq ASC, sv.id ASC
+            """,
+            (user_id, conversation_id, SummaryViewKind.CONVERSATION_CHUNK.value),
+        )
+
     async def get_latest_conversation_chunk(
         self,
         user_id: str,

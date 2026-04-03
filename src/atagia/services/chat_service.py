@@ -8,15 +8,22 @@ from typing import Any
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
+from atagia.memory.lifecycle_runner import piggyback_lifecycle
+from atagia.core.summary_repository import SummaryRepository
 from atagia.core.timestamps import resolve_message_occurred_at
 from atagia.models.schemas_api import ChatResult
 from atagia.services.chat_support import (
     CONTEXT_VIEW_TTL_SECONDS,
+    RECENT_FETCH_LIMIT,
     RECENT_WINDOW_MESSAGES,
     build_message_jobs,
     build_system_prompt,
+    build_transcript_window,
+    build_transcript_window_trace,
     chat_model,
     enqueue_message_jobs,
+    missing_uncovered_tail_start_seq,
+    render_transcript_window,
     resolve_assistant_mode_id,
     resolve_policy,
     summarize_memory_summaries,
@@ -54,6 +61,7 @@ class ChatService:
                 messages = MessageRepository(connection, self.runtime.clock)
                 memories = MemoryObjectRepository(connection, self.runtime.clock)
                 events = RetrievalEventRepository(connection, self.runtime.clock)
+                summaries = SummaryRepository(connection, self.runtime.clock)
 
                 conversation = await conversations.get_conversation(conversation_id, user_id)
                 if conversation is None:
@@ -68,12 +76,22 @@ class ChatService:
                     resolved_mode_id,
                     self.runtime.policy_resolver,
                 )
-                prior_messages = await messages.get_messages(
+                prior_messages = await messages.get_recent_messages(
                     conversation_id,
                     user_id,
-                    limit=500,
-                    offset=0,
+                    limit=RECENT_FETCH_LIMIT,
                 )
+                conversation_chunks = await summaries.list_all_conversation_chunks(user_id, conversation_id)
+                missing_tail_start_seq = missing_uncovered_tail_start_seq(
+                    prior_messages,
+                    conversation_chunks,
+                )
+                if missing_tail_start_seq is not None and prior_messages:
+                    prior_messages = await messages.get_messages_from_seq(
+                        conversation_id,
+                        user_id,
+                        start_seq=missing_tail_start_seq,
+                    )
                 cold_start = (
                     await memories.count_for_context(
                         user_id,
@@ -93,8 +111,17 @@ class ChatService:
                     stored_messages=prior_messages,
                     conversation=conversation,
                 )
+                transcript_entries = build_transcript_window(
+                    prior_messages,
+                    conversation_chunks,
+                    resolution.resolved_policy.transcript_budget_tokens,
+                )
+                transcript_trace = build_transcript_window_trace(
+                    transcript_entries,
+                    resolution.resolved_policy.transcript_budget_tokens,
+                )
                 transcript = [
-                    *prior_messages,
+                    *render_transcript_window(transcript_entries),
                     {"role": "user", "text": message_text},
                 ]
                 try:
@@ -179,6 +206,7 @@ class ChatService:
                                 "background_tasks_enqueued": True,
                                 "scored_candidates": resolution.scored_candidates,
                                 "stage_timings_ms": resolution.stage_timings,
+                                "transcript_window": transcript_trace,
                             },
                         },
                         commit=False,
@@ -193,6 +221,11 @@ class ChatService:
                 resolution,
                 last_retrieval_message_seq=int(user_message["seq"]),
             )
+            if self.runtime.settings.lifecycle_lazy_enabled:
+                self.runtime.spawn_background_task(
+                    piggyback_lifecycle(self.runtime),
+                    name="atagia-lifecycle-piggyback",
+                )
             final_window = [
                 {"role": str(message["role"]), "content": str(message["text"])}
                 for message in [*prior_messages, user_message, assistant_message][-RECENT_WINDOW_MESSAGES:]

@@ -10,7 +10,12 @@ import aiosqlite
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
 from atagia.models.schemas_memory import ExtractionConversationContext
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
-from atagia.services.chat_support import recent_context, resolve_assistant_mode_id, resolve_policy
+from atagia.services.chat_support import (
+    RECENT_FETCH_LIMIT,
+    recent_context,
+    resolve_assistant_mode_id,
+    resolve_policy,
+)
 from atagia.services.errors import ConversationNotFoundError
 from atagia.services.retrieval_pipeline import RetrievalPipeline
 
@@ -95,11 +100,10 @@ class RetrievalService:
             assistant_mode_id,
             self.runtime.policy_resolver,
         )
-        active_messages = stored_messages or await messages.get_messages(
+        active_messages = stored_messages or await messages.get_recent_messages(
             conversation_id,
             user_id,
-            limit=500,
-            offset=0,
+            limit=RECENT_FETCH_LIMIT,
         )
         transcript, prior_messages, source_message_id = self._pipeline_inputs(
             active_messages,

@@ -201,6 +201,7 @@ class RetrievalPlanner:
             scope_filter=base_scope_filter,
             status_filter=[MemoryStatus.ACTIVE],
             max_candidates=resolved_policy.retrieval_params.fts_limit,
+            vector_limit=resolved_policy.retrieval_params.vector_limit,
             max_context_items=resolved_policy.retrieval_params.final_context_items,
             privacy_ceiling=resolved_policy.privacy_ceiling,
             require_evidence_regrounding=False,
@@ -218,6 +219,7 @@ class RetrievalPlanner:
             if need.need_type is NeedTrigger.AMBIGUITY:
                 plan.scope_filter = self._ordered_scopes(resolved_policy.allowed_scopes, _BROAD_SCOPE_ORDER)
                 plan.max_candidates = self._increase_limit(plan.max_candidates)
+                plan.vector_limit = self._increase_limit(plan.vector_limit)
             elif need.need_type is NeedTrigger.CONTRADICTION:
                 if MemoryStatus.SUPERSEDED not in plan.status_filter:
                     plan.status_filter.append(MemoryStatus.SUPERSEDED)
@@ -226,13 +228,16 @@ class RetrievalPlanner:
             elif need.need_type is NeedTrigger.LOOP:
                 plan.scope_filter = self._ordered_scopes(resolved_policy.allowed_scopes, _BROAD_SCOPE_ORDER)
                 plan.max_candidates = self._increase_limit(plan.max_candidates)
+                plan.vector_limit = self._increase_limit(plan.vector_limit)
             elif need.need_type is NeedTrigger.HIGH_STAKES:
                 plan.max_candidates = self._increase_limit(plan.max_candidates)
+                plan.vector_limit = self._increase_limit(plan.vector_limit)
                 plan.require_evidence_regrounding = True
             elif need.need_type is NeedTrigger.MODE_SHIFT:
                 plan.scope_filter = list(base_scope_filter)
                 plan.status_filter = [MemoryStatus.ACTIVE]
                 plan.max_candidates = resolved_policy.retrieval_params.fts_limit
+                plan.vector_limit = resolved_policy.retrieval_params.vector_limit
                 plan.max_context_items = resolved_policy.retrieval_params.final_context_items
                 plan.privacy_ceiling = resolved_policy.privacy_ceiling
                 plan.require_evidence_regrounding = False
@@ -243,6 +248,7 @@ class RetrievalPlanner:
             elif need.need_type is NeedTrigger.UNDER_SPECIFIED_REQUEST:
                 plan.scope_filter = self._ordered_scopes(resolved_policy.allowed_scopes, _BROAD_SCOPE_ORDER)
                 plan.max_candidates = self._increase_limit(plan.max_candidates)
+                plan.vector_limit = self._increase_limit(plan.vector_limit)
 
         return plan
 
