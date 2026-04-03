@@ -1,0 +1,44 @@
+{
+  "assistant_mode_id": "research_deep_dive",
+  "display_name": "Research Deep Dive",
+  "cross_chat_allowed": true,
+  "allowed_scopes": [
+    "assistant_mode",
+    "workspace",
+    "conversation",
+    "global_user"
+  ],
+  "preferred_memory_types": [
+    "interaction_contract",
+    "belief",
+    "evidence",
+    "summary_view"
+  ],
+  "need_triggers": [
+    "ambiguity",
+    "contradiction",
+    "high_stakes",
+    "mode_shift"
+  ],
+  "contract_dimensions_priority": [
+    "citation_need",
+    "depth",
+    "pushback_preference",
+    "pace"
+  ],
+  "privacy_ceiling": 1,
+  "context_budget_tokens": 6100,
+  "retrieval_params": {
+    "fts_limit": 25,
+    "vector_limit": 15,
+    "graph_hops": 0,
+    "rerank_top_k": 15,
+    "final_context_items": 8
+  },
+  "context_cache_policy": {
+    "base_ttl_seconds": 600,
+    "sync_threshold": 0.7,
+    "max_messages_without_refresh": 4,
+    "max_minutes_without_refresh": 10
+  }
+}

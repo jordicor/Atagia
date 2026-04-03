@@ -1,0 +1,43 @@
+{
+  "assistant_mode_id": "biographical_interview",
+  "display_name": "Biographical Interview",
+  "cross_chat_allowed": true,
+  "allowed_scopes": [
+    "conversation",
+    "assistant_mode",
+    "global_user"
+  ],
+  "preferred_memory_types": [
+    "evidence",
+    "belief",
+    "summary_view",
+    "interaction_contract"
+  ],
+  "need_triggers": [
+    "ambiguity",
+    "contradiction",
+    "sensitive_context",
+    "follow_up_failure"
+  ],
+  "contract_dimensions_priority": [
+    "chronology",
+    "callback_density",
+    "sensitivity",
+    "depth"
+  ],
+  "privacy_ceiling": 2,
+  "context_budget_tokens": 5000,
+  "retrieval_params": {
+    "fts_limit": 25,
+    "vector_limit": 15,
+    "graph_hops": 0,
+    "rerank_top_k": 15,
+    "final_context_items": 8
+  },
+  "context_cache_policy": {
+    "base_ttl_seconds": 600,
+    "sync_threshold": 0.7,
+    "max_messages_without_refresh": 4,
+    "max_minutes_without_refresh": 10
+  }
+}

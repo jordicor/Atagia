@@ -1,0 +1,44 @@
+{
+  "assistant_mode_id": "coding_debug",
+  "display_name": "Coding Debug",
+  "cross_chat_allowed": true,
+  "allowed_scopes": [
+    "workspace",
+    "assistant_mode",
+    "conversation",
+    "global_user"
+  ],
+  "preferred_memory_types": [
+    "interaction_contract",
+    "belief",
+    "consequence_chain",
+    "evidence"
+  ],
+  "need_triggers": [
+    "follow_up_failure",
+    "ambiguity",
+    "loop",
+    "high_stakes"
+  ],
+  "contract_dimensions_priority": [
+    "implementation_first",
+    "depth",
+    "directness",
+    "clarification_tolerance"
+  ],
+  "privacy_ceiling": 1,
+  "context_budget_tokens": 5300,
+  "retrieval_params": {
+    "fts_limit": 25,
+    "vector_limit": 15,
+    "graph_hops": 0,
+    "rerank_top_k": 15,
+    "final_context_items": 8
+  },
+  "context_cache_policy": {
+    "base_ttl_seconds": 600,
+    "sync_threshold": 0.8,
+    "max_messages_without_refresh": 5,
+    "max_minutes_without_refresh": 10
+  }
+}

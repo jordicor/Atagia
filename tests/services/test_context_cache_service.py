@@ -1,0 +1,447 @@
+"""Tests for adaptive context-cache orchestration."""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+from atagia.app import AppRuntime, initialize_runtime
+from atagia.core.config import Settings
+from atagia.core.repositories import ConversationRepository, UserRepository
+from atagia.models.schemas_replay import AblationConfig
+from atagia.services.context_cache_service import ContextCacheService
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMCompletionResponse,
+    LLMEmbeddingRequest,
+    LLMEmbeddingResponse,
+    LLMProvider,
+)
+
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+_MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
+
+
+class ContextCacheProvider(LLMProvider):
+    name = "context-cache-tests"
+
+    def __init__(self) -> None:
+        self.requests: list[LLMCompletionRequest] = []
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.requests.append(request)
+        purpose = str(request.metadata.get("purpose"))
+        if purpose == "need_detection":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps([]),
+            )
+        if purpose == "applicability_scoring":
+            memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    [
+                        {"memory_id": memory_id, "llm_applicability": 0.5}
+                        for memory_id in memory_ids
+                    ]
+                ),
+            )
+        raise AssertionError(f"Unexpected purpose: {purpose}")
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        raise AssertionError(f"Embeddings are not used in context cache tests: {request.model}")
+
+
+def _settings(tmp_path: Path) -> Settings:
+    return Settings(
+        sqlite_path=str(tmp_path / "atagia-context-cache.db"),
+        migrations_path=str(MIGRATIONS_DIR),
+        manifests_path=str(MANIFESTS_DIR),
+        storage_backend="inprocess",
+        redis_url="redis://localhost:6379/0",
+        llm_provider="openai",
+        llm_api_key=None,
+        openai_api_key="test-openai-key",
+        openrouter_api_key=None,
+        llm_base_url=None,
+        openrouter_site_url="http://localhost",
+        openrouter_app_name="Atagia",
+        llm_extraction_model="extract-test-model",
+        llm_scoring_model="score-test-model",
+        llm_classifier_model="classify-test-model",
+        llm_chat_model="reply-test-model",
+        service_mode=False,
+        service_api_key=None,
+        admin_api_key=None,
+        workers_enabled=False,
+        debug=False,
+        allow_insecure_http=True,
+    )
+
+
+async def _build_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[AppRuntime, ContextCacheProvider]:
+    provider = ContextCacheProvider()
+    monkeypatch.setattr(
+        "atagia.app.build_llm_client",
+        lambda _settings: LLMClient(provider_name=provider.name, providers=[provider]),
+    )
+    runtime = await initialize_runtime(_settings(tmp_path))
+    return runtime, provider
+
+
+async def _seed_conversation(
+    runtime: AppRuntime,
+    *,
+    user_id: str,
+    conversation_id: str,
+    assistant_mode_id: str = "coding_debug",
+) -> dict[str, object]:
+    connection = await runtime.open_connection()
+    try:
+        users = UserRepository(connection, runtime.clock)
+        conversations = ConversationRepository(connection, runtime.clock)
+        await users.create_user(user_id)
+        return await conversations.create_conversation(
+            conversation_id,
+            user_id,
+            None,
+            assistant_mode_id,
+            "Chat",
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_cache_miss_builds_pending_entry_and_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+        connection = await runtime.open_connection()
+        try:
+            resolution = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="Please help me debug this retry loop.",
+            )
+        finally:
+            await connection.close()
+
+        assert resolution.from_cache is False
+        assert resolution.cache_source == "sync"
+        assert resolution.pending_cache_entry is not None
+
+        published = await service.publish_pending_cache_entry(
+            resolution,
+            last_retrieval_message_seq=1,
+        )
+        stored = await runtime.storage_backend.get_context_view(str(resolution.cache_key))
+
+        assert published is True
+        assert stored is not None
+        assert stored["last_retrieval_message_seq"] == 1
+        assert stored["assistant_mode_id"] == "coding_debug"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_cache_hit_skips_need_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+
+        connection = await runtime.open_connection()
+        try:
+            first = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="Please help me debug this retry loop.",
+            )
+        finally:
+            await connection.close()
+        await service.publish_pending_cache_entry(first, last_retrieval_message_seq=1)
+        need_count_before = sum(
+            1 for request in provider.requests if request.metadata.get("purpose") == "need_detection"
+        )
+
+        connection = await runtime.open_connection()
+        try:
+            second = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="continue",
+            )
+        finally:
+            await connection.close()
+
+        need_count_after = sum(
+            1 for request in provider.requests if request.metadata.get("purpose") == "need_detection"
+        )
+        assert second.from_cache is True
+        assert second.detected_needs == []
+        assert second.need_detection_skipped is True
+        assert second.pending_cache_entry is None
+        assert need_count_after == need_count_before
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_policy_hash_mismatch_forces_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+        cache_key = service.build_cache_key(
+            user_id="usr_1",
+            assistant_mode_id=str(conversation["assistant_mode_id"]),
+            conversation_id="cnv_1",
+            workspace_id=conversation.get("workspace_id"),
+        )
+        await runtime.storage_backend.set_context_view(
+            cache_key,
+            {
+                "cache_key": cache_key,
+                "user_id": "usr_1",
+                "conversation_id": "cnv_1",
+                "assistant_mode_id": "coding_debug",
+                "policy_prompt_hash": "mismatch",
+                "workspace_id": None,
+                "composed_context": {
+                    "contract_block": "",
+                    "workspace_block": "",
+                    "memory_block": "",
+                    "state_block": "",
+                    "selected_memory_ids": [],
+                    "total_tokens_estimate": 0,
+                    "budget_tokens": 500,
+                    "items_included": 0,
+                    "items_dropped": 0,
+                },
+                "contract": {},
+                "memory_summaries": [],
+                "detected_needs": [],
+                "source_retrieval_plan": {},
+                "selected_memory_ids": [],
+                "cached_at": runtime.clock.now().isoformat(),
+                "last_retrieval_message_seq": 1,
+                "last_user_message_text": "retry loop",
+                "source": "sync",
+            },
+            ttl_seconds=30,
+        )
+
+        connection = await runtime.open_connection()
+        try:
+            resolution = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="continue",
+            )
+        finally:
+            await connection.close()
+
+        assert resolution.from_cache is False
+        assert resolution.pending_cache_entry is not None
+        assert await runtime.storage_backend.get_context_view(cache_key) is None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_workspace_mismatch_forces_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+        cache_key = service.build_cache_key(
+            user_id="usr_1",
+            assistant_mode_id=str(conversation["assistant_mode_id"]),
+            conversation_id="cnv_1",
+            workspace_id=conversation.get("workspace_id"),
+        )
+        await runtime.storage_backend.set_context_view(
+            cache_key,
+            {
+                "cache_key": cache_key,
+                "user_id": "usr_1",
+                "conversation_id": "cnv_1",
+                "assistant_mode_id": "coding_debug",
+                "policy_prompt_hash": runtime.manifests["coding_debug"].prompt_hash,
+                "workspace_id": "wrk_1",
+                "composed_context": {
+                    "contract_block": "",
+                    "workspace_block": "",
+                    "memory_block": "",
+                    "state_block": "",
+                    "selected_memory_ids": [],
+                    "total_tokens_estimate": 0,
+                    "budget_tokens": 500,
+                    "items_included": 0,
+                    "items_dropped": 0,
+                },
+                "contract": {},
+                "memory_summaries": [],
+                "detected_needs": [],
+                "source_retrieval_plan": {},
+                "selected_memory_ids": [],
+                "cached_at": runtime.clock.now().isoformat(),
+                "last_retrieval_message_seq": 1,
+                "last_user_message_text": "retry loop",
+                "source": "sync",
+            },
+            ttl_seconds=30,
+        )
+
+        connection = await runtime.open_connection()
+        try:
+            resolution = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="continue",
+            )
+        finally:
+            await connection.close()
+
+        assert resolution.from_cache is False
+        assert resolution.pending_cache_entry is not None
+        assert await runtime.storage_backend.get_context_view(cache_key) is None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_invalid_cache_entry_is_deleted_before_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+        cache_key = service.build_cache_key(
+            user_id="usr_1",
+            assistant_mode_id=str(conversation["assistant_mode_id"]),
+            conversation_id="cnv_1",
+            workspace_id=conversation.get("workspace_id"),
+        )
+        await runtime.storage_backend.set_context_view(
+            cache_key,
+            {"cache_key": cache_key},
+            ttl_seconds=30,
+        )
+
+        connection = await runtime.open_connection()
+        try:
+            resolution = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="continue",
+            )
+        finally:
+            await connection.close()
+
+        assert resolution.from_cache is False
+        assert resolution.pending_cache_entry is not None
+        assert await runtime.storage_backend.get_context_view(cache_key) is None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_monotonic_publish_rejects_older_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+
+        connection = await runtime.open_connection()
+        try:
+            older = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="First request",
+            )
+            newer = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="Second request",
+            )
+        finally:
+            await connection.close()
+
+        assert await service.publish_pending_cache_entry(newer, last_retrieval_message_seq=6) is True
+        assert await service.publish_pending_cache_entry(older, last_retrieval_message_seq=5) is False
+
+        stored = await runtime.storage_backend.get_context_view(str(newer.cache_key))
+        assert stored is not None
+        assert stored["last_user_message_text"] == "Second request"
+        assert stored["last_retrieval_message_seq"] == 6
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_ablation_disables_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+
+        connection = await runtime.open_connection()
+        try:
+            resolution = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="Please help me debug this retry loop.",
+                ablation=AblationConfig(disable_context_cache=True),
+            )
+        finally:
+            await connection.close()
+
+        assert resolution.from_cache is False
+        assert resolution.pending_cache_entry is None
+        assert resolution.cache_key is not None
+    finally:
+        await runtime.close()

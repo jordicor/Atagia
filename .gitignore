@@ -1,0 +1,27 @@
+.DS_Store
+.env
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+.coverage
+build/
+dist/
+*.egg-info/
+.venv/
+data/
+benchmarks/data/
+benchmarks/results/
+
+# Internal work process docs (not public)
+CLAUDE.md
+AGENTS.md
+atagia.command
+docs/
+!docs/BEYOND_HUMAN_MEMORY.md
+!docs/Beyond_Similarity_Applicability_Governed_Memory.md
