@@ -11,7 +11,16 @@ from atagia.core.clock import Clock
 from atagia.core.ids import generate_prefixed_id, new_memory_id
 from atagia.core.storage_backend import StorageBackend
 from atagia.core.timestamps import normalize_optional_timestamp
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
+from atagia.models.schemas_memory import (
+    MemoryCategory,
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    MemoryStatus,
+    SummaryViewKind,
+)
+
+RETRIEVAL_ELIGIBLE_MEMORY_STATUSES: tuple[MemoryStatus, ...] = (MemoryStatus.ACTIVE,)
 
 
 def _decode_json_columns(row: aiosqlite.Row | None) -> dict[str, Any] | None:
@@ -40,6 +49,21 @@ def _stable_string_union(existing: list[str], new_values: list[str]) -> list[str
         seen.add(normalized)
         merged.append(normalized)
     return merged
+
+
+def summary_mirror_id(summary_view_id: str) -> str:
+    """Return the deterministic mirror memory ID for a summary view."""
+    return f"sum_mem_{summary_view_id}"
+
+
+def _status_filter_clause(
+    column_name: str,
+    statuses: tuple[MemoryStatus, ...] | None,
+) -> tuple[str, list[Any]]:
+    if statuses is None:
+        return "", []
+    placeholders = ", ".join("?" for _ in statuses)
+    return f"{column_name} IN ({placeholders})", [status.value for status in statuses]
 
 
 class BaseRepository:
@@ -417,6 +441,26 @@ class MessageRepository(BaseRepository):
             (conversation_id, user_id, limit),
         )
 
+    async def get_messages_in_seq_range(
+        self,
+        conversation_id: str,
+        user_id: str,
+        start_seq: int,
+        end_seq: int,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            """
+            SELECT m.*
+            FROM messages AS m
+            JOIN conversations AS c ON c.id = m.conversation_id
+            WHERE m.conversation_id = ?
+              AND c.user_id = ?
+              AND m.seq BETWEEN ? AND ?
+            ORDER BY m.seq ASC
+            """,
+            (conversation_id, user_id, start_seq, end_seq),
+        )
+
     async def get_messages_from_seq(
         self,
         conversation_id: str,
@@ -508,6 +552,122 @@ class MemoryObjectRepository(BaseRepository):
             await self._connection.commit()
         return cursor.rowcount > 0
 
+    async def upsert_summary_mirror(
+        self,
+        *,
+        user_id: str,
+        summary_view_id: str,
+        summary_kind: SummaryViewKind,
+        hierarchy_level: int,
+        summary_text: str,
+        source_object_ids: list[str],
+        created_at: str,
+        updated_at: str | None = None,
+        index_text: str | None = None,
+        scope: MemoryScope = MemoryScope.GLOBAL_USER,
+        workspace_id: str | None = None,
+        conversation_id: str | None = None,
+        assistant_mode_id: str | None = None,
+        confidence: float = 0.72,
+        stability: float = 0.82,
+        vitality: float = 0.15,
+        maya_score: float = 1.5,
+        privacy_level: int = 0,
+        status: MemoryStatus = MemoryStatus.ACTIVE,
+        payload: dict[str, Any] | None = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        mirror_id = summary_mirror_id(summary_view_id)
+        existing = await self.get_memory_object(mirror_id, user_id)
+        normalized_source_ids = [
+            str(item).strip()
+            for item in source_object_ids
+            if str(item).strip()
+        ]
+        normalized_payload = {
+            **(payload or {}),
+            "summary_view_id": summary_view_id,
+            "summary_kind": summary_kind.value,
+            "hierarchy_level": hierarchy_level,
+            "source_object_ids": normalized_source_ids,
+        }
+
+        if existing is None:
+            return await self.create_memory_object(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                assistant_mode_id=assistant_mode_id,
+                object_type=MemoryObjectType.SUMMARY_VIEW,
+                scope=scope,
+                canonical_text=summary_text,
+                index_text=index_text,
+                payload=normalized_payload,
+                source_kind=MemorySourceKind.SUMMARIZED,
+                confidence=confidence,
+                stability=stability,
+                vitality=vitality,
+                maya_score=maya_score,
+                privacy_level=privacy_level,
+                memory_category=MemoryCategory.UNKNOWN,
+                preserve_verbatim=False,
+                status=status,
+                memory_id=mirror_id,
+                commit=commit,
+            )
+
+        await self._connection.execute(
+            """
+            UPDATE memory_objects
+            SET workspace_id = ?,
+                conversation_id = ?,
+                assistant_mode_id = ?,
+                scope = ?,
+                canonical_text = ?,
+                index_text = ?,
+                payload_json = ?,
+                source_kind = ?,
+                confidence = ?,
+                stability = ?,
+                vitality = ?,
+                maya_score = ?,
+                privacy_level = ?,
+                memory_category = ?,
+                preserve_verbatim = ?,
+                status = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (
+                workspace_id,
+                conversation_id,
+                assistant_mode_id,
+                scope.value,
+                summary_text,
+                index_text,
+                _encode_json(normalized_payload),
+                MemorySourceKind.SUMMARIZED.value,
+                confidence,
+                stability,
+                vitality,
+                maya_score,
+                privacy_level,
+                MemoryCategory.UNKNOWN.value,
+                0,
+                status.value,
+                self._timestamp(),
+                mirror_id,
+                user_id,
+            ),
+        )
+        if commit:
+            await self._connection.commit()
+        refreshed = await self.get_memory_object(mirror_id, user_id)
+        if refreshed is None:
+            raise ValueError(f"Unknown summary mirror memory_id: {mirror_id}")
+        return refreshed
+
     async def create_memory_object(
         self,
         *,
@@ -515,6 +675,7 @@ class MemoryObjectRepository(BaseRepository):
         object_type: MemoryObjectType,
         scope: MemoryScope,
         canonical_text: str,
+        index_text: str | None = None,
         source_kind: MemorySourceKind,
         confidence: float,
         privacy_level: int,
@@ -527,8 +688,11 @@ class MemoryObjectRepository(BaseRepository):
         vitality: float = 0.0,
         maya_score: float = 0.0,
         status: MemoryStatus = MemoryStatus.ACTIVE,
+        memory_category: MemoryCategory = MemoryCategory.UNKNOWN,
+        preserve_verbatim: bool = False,
         valid_from: str | None = None,
         valid_to: str | None = None,
+        temporal_type: str = "unknown",
         memory_id: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
@@ -543,6 +707,7 @@ class MemoryObjectRepository(BaseRepository):
             object_type.value,
             scope.value,
             canonical_text,
+            index_text,
             extraction_hash,
             _encode_json(payload),
             source_kind.value,
@@ -551,8 +716,11 @@ class MemoryObjectRepository(BaseRepository):
             vitality,
             maya_score,
             privacy_level,
+            memory_category.value,
+            int(preserve_verbatim),
             valid_from,
             valid_to,
+            temporal_type,
             status.value,
             timestamp,
             timestamp,
@@ -569,6 +737,7 @@ class MemoryObjectRepository(BaseRepository):
                     object_type,
                     scope,
                     canonical_text,
+                    index_text,
                     extraction_hash,
                     payload_json,
                     source_kind,
@@ -577,13 +746,16 @@ class MemoryObjectRepository(BaseRepository):
                     vitality,
                     maya_score,
                     privacy_level,
+                    memory_category,
+                    preserve_verbatim,
                     valid_from,
                     valid_to,
+                    temporal_type,
                     status,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 parameters,
             )
@@ -734,12 +906,20 @@ class MemoryObjectRepository(BaseRepository):
             SELECT COUNT(*) AS count
             FROM memory_objects
             WHERE user_id = ?
-              AND status != 'deleted'
               AND (
                   {clauses}
               )
-            """.format(clauses=" OR ".join(clauses)),
-            tuple(parameters),
+              AND status IN ({status_placeholders})
+            """.format(
+                clauses=" OR ".join(clauses),
+                status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+            ),
+            tuple(
+                [
+                    *parameters,
+                    *(status.value for status in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                ]
+            ),
         )
         row = await cursor.fetchone()
         return int(row["count"])
@@ -800,19 +980,22 @@ class MemoryObjectRepository(BaseRepository):
         assistant_mode_id: str | None,
         workspace_id: str | None,
         conversation_id: str | None,
+        statuses: tuple[MemoryStatus, ...] | None = RETRIEVAL_ELIGIBLE_MEMORY_STATUSES,
     ) -> bool:
         clauses = [
             "mo.user_id = ?",
             "mo.object_type = ?",
-            "mo.status != ?",
             "source_ids.value = ?",
         ]
         parameters: list[Any] = [
             user_id,
             object_type.value,
-            MemoryStatus.DELETED.value,
             source_message_id,
         ]
+        status_clause, status_parameters = _status_filter_clause("mo.status", statuses)
+        if status_clause:
+            clauses.append(status_clause)
+            parameters.extend(status_parameters)
         if assistant_mode_id is not None:
             clauses.append("mo.assistant_mode_id = ?")
             parameters.append(assistant_mode_id)
@@ -836,15 +1019,26 @@ class MemoryObjectRepository(BaseRepository):
         row = await cursor.fetchone()
         return row is not None
 
-    async def list_for_user(self, user_id: str) -> list[dict[str, Any]]:
+    async def list_for_user(
+        self,
+        user_id: str,
+        *,
+        statuses: tuple[MemoryStatus, ...] | None = RETRIEVAL_ELIGIBLE_MEMORY_STATUSES,
+    ) -> list[dict[str, Any]]:
+        clauses = ["user_id = ?"]
+        parameters: list[Any] = [user_id]
+        status_clause, status_parameters = _status_filter_clause("status", statuses)
+        if status_clause:
+            clauses.append(status_clause)
+            parameters.extend(status_parameters)
         return await self._fetch_all(
             """
             SELECT *
             FROM memory_objects
-            WHERE user_id = ?
+            WHERE {clauses}
             ORDER BY created_at ASC, id ASC
-            """,
-            (user_id,),
+            """.format(clauses=" AND ".join(clauses)),
+            tuple(parameters),
         )
 
     async def list_for_source_message(
@@ -855,13 +1049,17 @@ class MemoryObjectRepository(BaseRepository):
         assistant_mode_id: str | None = None,
         workspace_id: str | None = None,
         conversation_id: str | None = None,
+        statuses: tuple[MemoryStatus, ...] | None = RETRIEVAL_ELIGIBLE_MEMORY_STATUSES,
     ) -> list[dict[str, Any]]:
         clauses = [
             "mo.user_id = ?",
             "source_ids.value = ?",
-            "mo.status != ?",
         ]
-        parameters: list[Any] = [user_id, source_message_id, MemoryStatus.DELETED.value]
+        parameters: list[Any] = [user_id, source_message_id]
+        status_clause, status_parameters = _status_filter_clause("mo.status", statuses)
+        if status_clause:
+            clauses.append(status_clause)
+            parameters.extend(status_parameters)
         if assistant_mode_id is not None:
             clauses.append("mo.assistant_mode_id = ?")
             parameters.append(assistant_mode_id)
@@ -883,7 +1081,21 @@ class MemoryObjectRepository(BaseRepository):
             tuple(parameters),
         )
 
-    async def search_memory_objects(self, user_id: str, query: str, limit: int) -> list[dict[str, Any]]:
+    async def search_memory_objects(
+        self,
+        user_id: str,
+        query: str,
+        limit: int,
+        *,
+        statuses: tuple[MemoryStatus, ...] | None = RETRIEVAL_ELIGIBLE_MEMORY_STATUSES,
+    ) -> list[dict[str, Any]]:
+        clauses = ["mo.user_id = ?", "memory_objects_fts MATCH ?"]
+        parameters: list[Any] = [user_id, query]
+        status_clause, status_parameters = _status_filter_clause("mo.status", statuses)
+        if status_clause:
+            clauses.append(status_clause)
+            parameters.extend(status_parameters)
+        parameters.append(limit)
         return await self._fetch_all(
             """
             SELECT
@@ -891,12 +1103,11 @@ class MemoryObjectRepository(BaseRepository):
                 bm25(memory_objects_fts) AS rank
             FROM memory_objects_fts
             JOIN memory_objects AS mo ON mo._rowid = memory_objects_fts.rowid
-            WHERE mo.user_id = ?
-              AND memory_objects_fts MATCH ?
+            WHERE {clauses}
             ORDER BY rank ASC, mo.created_at DESC
             LIMIT ?
-            """,
-            (user_id, query, limit),
+            """.format(clauses=" AND ".join(clauses)),
+            tuple(parameters),
         )
 
     @staticmethod

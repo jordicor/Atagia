@@ -1,0 +1,45 @@
+{
+  "assistant_mode_id": "personal_assistant",
+  "display_name": "Personal Assistant",
+  "prompt_hash": "07ec7f4d9f3429160ef0925ba667dcfa98de25a2bd5c4d1e46554fe092f5ce45",
+  "cross_chat_allowed": true,
+  "allowed_scopes": [
+    "assistant_mode",
+    "conversation",
+    "global_user"
+  ],
+  "preferred_memory_types": [
+    "interaction_contract",
+    "state_snapshot",
+    "belief",
+    "evidence"
+  ],
+  "need_triggers": [
+    "ambiguity",
+    "sensitive_context",
+    "follow_up_failure",
+    "high_stakes"
+  ],
+  "contract_dimensions_priority": [
+    "continuity",
+    "preference_recall",
+    "sensitivity",
+    "pace"
+  ],
+  "privacy_ceiling": 3,
+  "context_budget_tokens": 4600,
+  "transcript_budget_tokens": 6000,
+  "retrieval_params": {
+    "fts_limit": 25,
+    "vector_limit": 10,
+    "graph_hops": 0,
+    "rerank_top_k": 15,
+    "final_context_items": 8
+  },
+  "context_cache_policy": {
+    "base_ttl_seconds": 1800,
+    "sync_threshold": 0.95,
+    "max_messages_without_refresh": 12,
+    "max_minutes_without_refresh": 30
+  }
+}

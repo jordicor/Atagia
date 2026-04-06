@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -34,18 +35,34 @@ class MemorySourceKind(str, Enum):
     COMPOSED = "composed"
 
 
+class MemoryCategory(str, Enum):
+    PHONE = "phone"
+    ADDRESS = "address"
+    PIN_OR_PASSWORD = "pin_or_password"
+    MEDICATION = "medication"
+    FINANCIAL = "financial"
+    DATE_OF_BIRTH = "date_of_birth"
+    CONTACT_IDENTITY = "contact_identity"
+    OTHER_SENSITIVE = "other_sensitive"
+    UNKNOWN = "unknown"
+
+
 class MemoryStatus(str, Enum):
     ACTIVE = "active"
     SUPERSEDED = "superseded"
     ARCHIVED = "archived"
     DELETED = "deleted"
     REVIEW_REQUIRED = "review_required"
+    PENDING_USER_CONFIRMATION = "pending_user_confirmation"
+    DECLINED = "declined"
 
 
 class SummaryViewKind(str, Enum):
     CONVERSATION_CHUNK = "conversation_chunk"
     WORKSPACE_ROLLUP = "workspace_rollup"
     CONTEXT_VIEW = "context_view"
+    EPISODE = "episode"
+    THEMATIC_PROFILE = "thematic_profile"
 
 
 class NeedTrigger(str, Enum):
@@ -73,6 +90,10 @@ class AssistantModeId(str, Enum):
     BRAINSTORM = "brainstorm"
     BIOGRAPHICAL_INTERVIEW = "biographical_interview"
     GENERAL_QA = "general_qa"
+    PERSONAL_ASSISTANT = "personal_assistant"
+
+
+_VALID_TEMPORAL_TYPES = frozenset({"permanent", "bounded", "event_triggered", "unknown"})
 
 
 def _ensure_unique_values(values: list[Any]) -> list[Any]:
@@ -175,14 +196,79 @@ class ExtractionConversationContext(BaseModel):
 class ExtractedMemoryBase(BaseModel):
     """Shared fields returned by the extraction model."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     canonical_text: str = Field(min_length=1)
+    index_text: str | None = None
     scope: MemoryScope
     confidence: float = Field(ge=0.0, le=1.0)
     source_kind: MemorySourceKind
     privacy_level: int = Field(ge=0, le=3)
+    memory_category: MemoryCategory = MemoryCategory.UNKNOWN
+    preserve_verbatim: bool = False
+    informational_mention: bool | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+    temporal_type: str = "unknown"
+    valid_from_iso: str | None = None
+    valid_to_iso: str | None = None
+    temporal_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        if "canonical_text" not in normalized:
+            for field_name in ("text", "memory_text", "summary_text", "description", "content"):
+                value = normalized.get(field_name)
+                if isinstance(value, str) and value.strip():
+                    normalized["canonical_text"] = value
+                    break
+        if "confidence" not in normalized and "score" in normalized:
+            normalized["confidence"] = normalized.get("score")
+        normalized.setdefault("confidence", 0.5)
+        normalized.setdefault("scope", MemoryScope.CONVERSATION.value)
+        normalized.setdefault("source_kind", MemorySourceKind.EXTRACTED.value)
+        normalized.setdefault("privacy_level", 0)
+        normalized.setdefault("payload", {})
+        normalized.setdefault("temporal_type", "unknown")
+        normalized.setdefault("temporal_confidence", 0.0)
+        return normalized
+
+    @field_validator("temporal_type")
+    @classmethod
+    def validate_temporal_type(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in _VALID_TEMPORAL_TYPES:
+            raise ValueError(f"temporal_type must be one of: {', '.join(sorted(_VALID_TEMPORAL_TYPES))}")
+        return normalized
+
+    @field_validator("index_text")
+    @classmethod
+    def validate_index_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("valid_from_iso", "valid_to_iso")
+    @classmethod
+    def validate_temporal_iso(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        datetime.fromisoformat(normalized)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_temporal_bounds(self) -> "ExtractedMemoryBase":
+        if self.valid_from_iso and self.valid_to_iso:
+            if datetime.fromisoformat(self.valid_from_iso) > datetime.fromisoformat(self.valid_to_iso):
+                raise ValueError("valid_from_iso must be <= valid_to_iso")
+        return self
 
 
 class ExtractedEvidence(ExtractedMemoryBase):
@@ -207,7 +293,7 @@ class ExtractedStateUpdate(ExtractedMemoryBase):
 class ExtractionResult(BaseModel):
     """Structured output returned by the memory extractor."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     evidences: list[ExtractedEvidence] = Field(default_factory=list)
     beliefs: list[ExtractedBelief] = Field(default_factory=list)
@@ -216,6 +302,101 @@ class ExtractionResult(BaseModel):
     # Hook for mode-shift detection in Step 7.
     mode_guess: str | None = None
     nothing_durable: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_payload(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        metadata = normalized.pop("extraction_metadata", None)
+        normalized.pop("extraction_rationale", None)
+        normalized.pop("rationale", None)
+        normalized.pop("extraction_id", None)
+        normalized.pop("source_message_timestamp", None)
+        evidences = list(normalized.get("evidences", []))
+        beliefs: list[Any] = []
+        for item in normalized.get("beliefs", []):
+            if isinstance(item, dict) and (
+                item.get("claim_key") is None or item.get("claim_value") is None
+            ):
+                evidences.append(dict(item))
+                continue
+            beliefs.append(item)
+        contract_signals = list(normalized.get("contract_signals", []))
+        state_updates = list(normalized.get("state_updates", []))
+
+        legacy_items = None
+        for field_name in (
+            "durable_memory_items",
+            "durable_memories",
+            "extracted_items",
+            "items",
+        ):
+            if field_name in normalized:
+                legacy_items = normalized.pop(field_name)
+                break
+
+        if legacy_items is not None:
+            for item in legacy_items if isinstance(legacy_items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                normalized_item = dict(item)
+                item_type = str(
+                    normalized_item.get("memory_type")
+                    or normalized_item.get("item_type")
+                    or normalized_item.get("object_type")
+                    or normalized_item.get("type")
+                    or normalized_item.get("kind")
+                    or ""
+                ).strip().lower()
+                if (
+                    ("claim_key" in normalized_item and "claim_value" in normalized_item)
+                    or (
+                        item_type == MemoryObjectType.BELIEF.value
+                        and normalized_item.get("claim_key") is not None
+                        and normalized_item.get("claim_value") is not None
+                    )
+                ):
+                    claim_key = str(normalized_item.get("claim_key") or "").strip()
+                    claim_value_raw = normalized_item.get("claim_value")
+                    if isinstance(claim_value_raw, str):
+                        claim_value = claim_value_raw.strip()
+                    elif claim_value_raw is None:
+                        claim_value = ""
+                    else:
+                        claim_value = json.dumps(claim_value_raw, ensure_ascii=False, sort_keys=True)
+                    if claim_key and claim_value:
+                        normalized_item["claim_key"] = claim_key
+                        normalized_item["claim_value"] = claim_value
+                        beliefs.append(normalized_item)
+                    else:
+                        evidences.append(normalized_item)
+                elif item_type in {
+                    MemoryObjectType.INTERACTION_CONTRACT.value,
+                    "contract",
+                    "contract_signal",
+                }:
+                    contract_signals.append(normalized_item)
+                elif item_type in {
+                    MemoryObjectType.STATE_SNAPSHOT.value,
+                    "state",
+                    "state_update",
+                }:
+                    state_updates.append(normalized_item)
+                else:
+                    evidences.append(normalized_item)
+        normalized["evidences"] = evidences
+        normalized["beliefs"] = beliefs
+        normalized["contract_signals"] = contract_signals
+        normalized["state_updates"] = state_updates
+
+        if isinstance(metadata, dict):
+            if "nothing_durable" not in normalized and "nothing_durable" in metadata:
+                normalized["nothing_durable"] = bool(metadata["nothing_durable"])
+            if normalized.get("mode_guess") is None and isinstance(metadata.get("mode_guess"), str):
+                normalized["mode_guess"] = metadata["mode_guess"]
+        return normalized
 
     @model_validator(mode="after")
     def validate_nothing_durable_consistency(self) -> "ExtractionResult":
@@ -317,6 +498,21 @@ class ConsequenceChainResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
 
 
+class TemporalQueryRange(BaseModel):
+    """Normalized temporal range derived from a user query."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start: datetime
+    end: datetime
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "TemporalQueryRange":
+        if self.end < self.start:
+            raise ValueError("TemporalQueryRange.end must be >= start")
+        return self
+
+
 class RetrievalPlan(BaseModel):
     """Deterministic retrieval plan built before candidate search."""
 
@@ -332,6 +528,9 @@ class RetrievalPlan(BaseModel):
     max_candidates: int = Field(ge=0)
     max_context_items: int = Field(gt=0)
     privacy_ceiling: int = Field(ge=0, le=3)
+    retrieval_levels: list[int] = Field(default_factory=lambda: [0])
+    temporal_query_range: TemporalQueryRange | None = None
+    consequence_search_enabled: bool = False
     require_evidence_regrounding: bool = False
     need_driven_boosts: dict[NeedTrigger, float] = Field(default_factory=dict)
     skip_retrieval: bool = False
@@ -351,6 +550,16 @@ class RetrievalPlan(BaseModel):
     @classmethod
     def validate_status_filter(cls, values: list[MemoryStatus]) -> list[MemoryStatus]:
         return _ensure_unique_values(values)
+
+    @field_validator("retrieval_levels")
+    @classmethod
+    def validate_retrieval_levels(cls, values: list[int]) -> list[int]:
+        normalized = _ensure_unique_values(values)
+        if not normalized:
+            raise ValueError("retrieval_levels must not be empty")
+        if any(value not in {0, 1, 2} for value in normalized):
+            raise ValueError("retrieval_levels must contain only 0, 1, or 2")
+        return normalized
 
 
 class ScoredCandidate(BaseModel):
@@ -398,6 +607,7 @@ class MemoryObject(BaseModel):
     object_type: MemoryObjectType
     scope: MemoryScope
     canonical_text: str
+    index_text: str | None = None
     payload_json: dict[str, Any] = Field(default_factory=dict)
     source_kind: MemorySourceKind
     confidence: float = 0.5
@@ -405,6 +615,11 @@ class MemoryObject(BaseModel):
     vitality: float = 0.0
     maya_score: float = 0.0
     privacy_level: int = 0
+    memory_category: MemoryCategory = MemoryCategory.UNKNOWN
+    preserve_verbatim: bool = False
+    temporal_type: str = "unknown"
+    tension_score: float = 0.0
+    tension_updated_at: datetime | None = None
     valid_from: datetime | None = None
     valid_to: datetime | None = None
     status: MemoryStatus = MemoryStatus.ACTIVE
@@ -427,6 +642,20 @@ class ContractDimensionCurrent(BaseModel):
     value_json: dict[str, Any] = Field(default_factory=dict)
     confidence: float
     source_memory_id: str
+    updated_at: datetime
+
+
+class MemoryConsentProfile(BaseModel):
+    """Per-user consent counts for sensitive memory categories."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    category: MemoryCategory
+    confirmed_count: int = Field(ge=0)
+    declined_count: int = Field(ge=0)
+    last_confirmed_at: datetime | None = None
+    last_declined_at: datetime | None = None
     updated_at: datetime
 
 

@@ -74,6 +74,8 @@ async def _create_memory_at(
     assistant_mode_id: str | None = "coding_debug",
     conversation_id: str | None = "cnv_1",
     payload: dict[str, object] | None = None,
+    valid_to: str | None = None,
+    temporal_type: str = "unknown",
 ) -> dict[str, object]:
     original = clock.current
     clock.current = created_at
@@ -92,6 +94,8 @@ async def _create_memory_at(
             status=status,
             memory_id=memory_id,
             payload=payload,
+            valid_to=valid_to,
+            temporal_type=temporal_type,
         )
     finally:
         clock.current = original
@@ -250,6 +254,118 @@ async def test_expired_review_required_objects_are_deleted() -> None:
 
         assert result.deleted_count == 1
         assert await memories.get_memory_object("mem_review", "usr_1") is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_state_snapshot_is_archived() -> None:
+    connection, clock, memories, _contracts = await _build_runtime()
+    try:
+        memory = await _create_memory_at(
+            memories,
+            clock,
+            created_at=clock.now() - timedelta(days=1),
+            memory_id="mem_state_expired",
+            object_type=MemoryObjectType.STATE_SNAPSHOT,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="User is currently traveling.",
+            confidence=0.9,
+            vitality=0.9,
+            valid_to=(clock.now() - timedelta(hours=1)).isoformat(),
+            temporal_type="bounded",
+        )
+
+        result = await MemoryLifecycleManager(connection, clock, _settings()).run_cycle()
+        updated = await memories.get_memory_object(str(memory["id"]), "usr_1")
+
+        assert result.archived_count == 1
+        assert updated is not None
+        assert updated["status"] == MemoryStatus.ARCHIVED.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_non_expired_state_snapshot_is_not_archived_by_low_value_sweep() -> None:
+    connection, clock, memories, _contracts = await _build_runtime()
+    try:
+        memory = await _create_memory_at(
+            memories,
+            clock,
+            created_at=clock.now() - timedelta(days=10),
+            memory_id="mem_state_current",
+            object_type=MemoryObjectType.STATE_SNAPSHOT,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="User is currently traveling.",
+            confidence=0.2,
+            vitality=0.04,
+            valid_to=(clock.now() + timedelta(days=1)).isoformat(),
+            temporal_type="bounded",
+        )
+
+        result = await MemoryLifecycleManager(connection, clock, _settings()).run_cycle()
+        updated = await memories.get_memory_object(str(memory["id"]), "usr_1")
+
+        assert result.archived_count == 0
+        assert updated is not None
+        assert updated["status"] == MemoryStatus.ACTIVE.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_evidence_remains_active_for_historical_retrieval() -> None:
+    connection, clock, memories, _contracts = await _build_runtime()
+    try:
+        memory = await _create_memory_at(
+            memories,
+            clock,
+            created_at=clock.now() - timedelta(days=10),
+            memory_id="mem_history",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="User was traveling in March.",
+            confidence=0.95,
+            vitality=0.8,
+            valid_to=(clock.now() - timedelta(days=5)).isoformat(),
+            temporal_type="bounded",
+        )
+
+        result = await MemoryLifecycleManager(connection, clock, _settings()).run_cycle()
+        updated = await memories.get_memory_object(str(memory["id"]), "usr_1")
+
+        assert result.archived_count == 0
+        assert updated is not None
+        assert updated["status"] == MemoryStatus.ACTIVE.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_belief_remains_active_for_historical_retrieval() -> None:
+    connection, clock, memories, _contracts = await _build_runtime()
+    try:
+        memory = await _create_memory_at(
+            memories,
+            clock,
+            created_at=clock.now() - timedelta(days=10),
+            memory_id="mem_belief_history",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.ASSISTANT_MODE,
+            canonical_text="User used to prefer coffee.",
+            confidence=0.2,
+            vitality=0.04,
+            valid_to=(clock.now() - timedelta(days=5)).isoformat(),
+            temporal_type="bounded",
+        )
+
+        result = await MemoryLifecycleManager(connection, clock, _settings()).run_cycle()
+        updated = await memories.get_memory_object(str(memory["id"]), "usr_1")
+
+        assert result.archived_count == 0
+        assert updated is not None
+        assert updated["status"] == MemoryStatus.ACTIVE.value
     finally:
         await connection.close()
 
@@ -485,5 +601,43 @@ async def test_full_lifecycle_cycle_runs_all_steps_in_order() -> None:
             await memories.get_memory_object("mem_archive_then_cleanup", "usr_1")
         )["status"] == MemoryStatus.ARCHIVED.value
         assert await contracts.count_for_context("usr_1", "coding_debug", None, None) == 0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_does_not_delete_pending_or_declined_ephemeral_memories() -> None:
+    connection, clock, memories, _contracts = await _build_runtime()
+    try:
+        await _create_memory_at(
+            memories,
+            clock,
+            created_at=clock.now() - timedelta(days=8),
+            memory_id="mem_pending_ephemeral",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.EPHEMERAL_SESSION,
+            canonical_text="Pending confirmation memory",
+            confidence=0.9,
+            vitality=0.4,
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+        )
+        await _create_memory_at(
+            memories,
+            clock,
+            created_at=clock.now() - timedelta(days=8),
+            memory_id="mem_declined_ephemeral",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.EPHEMERAL_SESSION,
+            canonical_text="Declined confirmation memory",
+            confidence=0.9,
+            vitality=0.4,
+            status=MemoryStatus.DECLINED,
+        )
+
+        result = await MemoryLifecycleManager(connection, clock, _settings()).run_cycle()
+
+        assert result.deleted_count == 0
+        assert await memories.get_memory_object("mem_pending_ephemeral", "usr_1") is not None
+        assert await memories.get_memory_object("mem_declined_ephemeral", "usr_1") is not None
     finally:
         await connection.close()

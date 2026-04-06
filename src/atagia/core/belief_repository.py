@@ -36,6 +36,152 @@ def _claim_key_tokens(claim_key: str) -> set[str]:
 class BeliefRepository(BaseRepository):
     """Focused persistence helpers for belief revision flows."""
 
+    async def increment_tension(
+        self,
+        belief_id: str,
+        delta: float,
+        *,
+        user_id: str,
+        commit: bool = True,
+    ) -> float:
+        return await self._update_tension(
+            belief_id,
+            user_id=user_id,
+            delta=abs(float(delta)),
+            commit=commit,
+        )
+
+    async def decrement_tension(
+        self,
+        belief_id: str,
+        delta: float,
+        *,
+        user_id: str,
+        commit: bool = True,
+    ) -> float:
+        return await self._update_tension(
+            belief_id,
+            user_id=user_id,
+            delta=-abs(float(delta)),
+            commit=commit,
+        )
+
+    async def get_tension(self, belief_id: str, *, user_id: str) -> float:
+        row = await self._fetch_one(
+            """
+            SELECT tension_score
+            FROM memory_objects
+            WHERE id = ?
+              AND user_id = ?
+              AND object_type = ?
+            LIMIT 1
+            """,
+            (
+                belief_id,
+                user_id,
+                MemoryObjectType.BELIEF.value,
+            ),
+        )
+        if row is None:
+            return 0.0
+        return max(0.0, float(row.get("tension_score") or 0.0))
+
+    async def reset_tension(
+        self,
+        belief_id: str,
+        *,
+        user_id: str,
+        commit: bool = True,
+    ) -> float:
+        await self._connection.execute(
+            """
+            UPDATE memory_objects
+            SET tension_score = 0.0,
+                tension_updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+              AND object_type = ?
+            """,
+            (
+                self._timestamp(),
+                belief_id,
+                user_id,
+                MemoryObjectType.BELIEF.value,
+            ),
+        )
+        if commit:
+            await self._connection.commit()
+        return await self.get_tension(belief_id, user_id=user_id)
+
+    async def get_beliefs_above_tension_threshold(
+        self,
+        user_id: str,
+        threshold: float,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            """
+            SELECT *
+            FROM memory_objects
+            WHERE user_id = ?
+              AND object_type = ?
+              AND status = ?
+              AND tension_score >= ?
+            ORDER BY tension_score DESC, updated_at DESC, id ASC
+            LIMIT ?
+            """,
+            (
+                user_id,
+                MemoryObjectType.BELIEF.value,
+                MemoryStatus.ACTIVE.value,
+                float(threshold),
+                limit,
+            ),
+        )
+
+    async def add_tension_evidence_ids(
+        self,
+        belief_id: str,
+        evidence_memory_ids: list[str],
+        *,
+        user_id: str,
+        commit: bool = True,
+    ) -> list[str]:
+        payload = await self._belief_payload(belief_id, user_id=user_id)
+        existing_ids = self._payload_tension_evidence_ids(payload)
+        merged_ids = list(existing_ids)
+        for memory_id in evidence_memory_ids:
+            normalized = str(memory_id)
+            if normalized not in merged_ids:
+                merged_ids.append(normalized)
+        payload["tension_evidence_memory_ids"] = merged_ids
+        await self._write_belief_payload(
+            belief_id,
+            user_id=user_id,
+            payload=payload,
+            commit=commit,
+        )
+        return merged_ids
+
+    async def pop_tension_evidence_ids(
+        self,
+        belief_id: str,
+        *,
+        user_id: str,
+        commit: bool = True,
+    ) -> list[str]:
+        payload = await self._belief_payload(belief_id, user_id=user_id)
+        evidence_ids = self._payload_tension_evidence_ids(payload)
+        payload.pop("tension_evidence_memory_ids", None)
+        await self._write_belief_payload(
+            belief_id,
+            user_id=user_id,
+            payload=payload,
+            commit=commit,
+        )
+        return evidence_ids
+
     async def create_first_version(
         self,
         belief_id: str,
@@ -345,6 +491,94 @@ class BeliefRepository(BaseRepository):
         if stats["distinct_conversations"] < min_conversations:
             return stats
         return stats
+
+    async def _update_tension(
+        self,
+        belief_id: str,
+        *,
+        user_id: str,
+        delta: float,
+        commit: bool,
+    ) -> float:
+        await self._connection.execute(
+            """
+            UPDATE memory_objects
+            SET tension_score = MAX(0.0, COALESCE(tension_score, 0.0) + ?),
+                tension_updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+              AND object_type = ?
+            """,
+            (
+                float(delta),
+                self._timestamp(),
+                belief_id,
+                user_id,
+                MemoryObjectType.BELIEF.value,
+            ),
+        )
+        if commit:
+            await self._connection.commit()
+        return await self.get_tension(belief_id, user_id=user_id)
+
+    async def _belief_payload(
+        self,
+        belief_id: str,
+        *,
+        user_id: str,
+    ) -> dict[str, Any]:
+        row = await self._fetch_one(
+            """
+            SELECT payload_json
+            FROM memory_objects
+            WHERE id = ?
+              AND user_id = ?
+              AND object_type = ?
+            LIMIT 1
+            """,
+            (
+                belief_id,
+                user_id,
+                MemoryObjectType.BELIEF.value,
+            ),
+        )
+        payload = {} if row is None else row.get("payload_json")
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    async def _write_belief_payload(
+        self,
+        belief_id: str,
+        *,
+        user_id: str,
+        payload: dict[str, Any],
+        commit: bool,
+    ) -> None:
+        await self._connection.execute(
+            """
+            UPDATE memory_objects
+            SET payload_json = ?,
+                tension_updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+              AND object_type = ?
+            """,
+            (
+                _encode_json(payload),
+                self._timestamp(),
+                belief_id,
+                user_id,
+                MemoryObjectType.BELIEF.value,
+            ),
+        )
+        if commit:
+            await self._connection.commit()
+
+    @staticmethod
+    def _payload_tension_evidence_ids(payload: dict[str, Any]) -> list[str]:
+        raw_ids = payload.get("tension_evidence_memory_ids", [])
+        if not isinstance(raw_ids, list):
+            return []
+        return [str(memory_id) for memory_id in raw_ids]
 
     async def create_memory_link(
         self,

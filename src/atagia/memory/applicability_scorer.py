@@ -17,6 +17,7 @@ from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryStatus,
     NeedTrigger,
+    RetrievalPlan,
     ScoredCandidate,
 )
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
@@ -89,9 +90,15 @@ class ApplicabilityScorer:
         conversation_context: ExtractionConversationContext | dict[str, Any],
         resolved_policy: ResolvedPolicy,
         detected_needs: list[DetectedNeed],
+        retrieval_plan: RetrievalPlan | None = None,
     ) -> list[ScoredCandidate]:
         context = ExtractionConversationContext.model_validate(conversation_context)
-        filtered = self.filter_candidates(candidates, resolved_policy, detected_needs)
+        filtered = self.filter_candidates(
+            candidates,
+            resolved_policy,
+            detected_needs,
+            retrieval_plan=retrieval_plan,
+        )
         if not filtered:
             return []
 
@@ -108,11 +115,11 @@ class ApplicabilityScorer:
         for candidate in shortlist:
             memory_id = str(candidate["id"])
             llm_applicability = llm_scores[memory_id]
-            retrieval_score = self._retrieval_score(candidate.get("rank"))
+            retrieval_score = self._retrieval_score(candidate.get("rrf_score"))
             vitality_boost = self._vitality_boost(candidate)
             confirmation_boost = self._confirmation_boost(candidate)
             need_boost = self._need_boost(candidate, detected_needs, resolved_policy.privacy_ceiling)
-            penalty = self._penalty(candidate)
+            penalty = self._penalty(candidate, retrieval_plan)
             final_score = (
                 (llm_applicability * 0.65)
                 + (retrieval_score * 0.15)
@@ -143,6 +150,7 @@ class ApplicabilityScorer:
         candidates: list[dict[str, Any]],
         resolved_policy: ResolvedPolicy,
         detected_needs: list[DetectedNeed],
+        retrieval_plan: RetrievalPlan | None = None,
     ) -> list[dict[str, Any]]:
         allowed_scopes = {scope.value for scope in resolved_policy.allowed_scopes}
         allowed_statuses = self._allowed_statuses(detected_needs)
@@ -155,8 +163,10 @@ class ApplicabilityScorer:
                 continue
             if int(candidate.get("privacy_level", 0)) > resolved_policy.privacy_ceiling:
                 continue
-            valid_to = candidate.get("valid_to")
-            if valid_to is not None and datetime.fromisoformat(str(valid_to)) <= now:
+            if (
+                (retrieval_plan is None or retrieval_plan.temporal_query_range is None)
+                and self._is_future_valid(candidate, now)
+            ):
                 continue
             filtered.append(candidate)
         return self._prioritize_preferred_types(filtered, resolved_policy)
@@ -253,7 +263,12 @@ class ApplicabilityScorer:
             f'scope="{html.escape(str(candidate.get("scope", "")))}" '
             f'status="{html.escape(str(candidate.get("status", "")))}" '
             f'privacy_level="{html.escape(str(candidate.get("privacy_level", 0)))}" '
+            f'temporal_type="{html.escape(str(candidate.get("temporal_type", "unknown")))}" '
+            f'valid_from="{html.escape(str(candidate.get("valid_from", "")))}" '
+            f'valid_to="{html.escape(str(candidate.get("valid_to", "")))}" '
             f'rank="{html.escape(str(candidate.get("rank", "")))}" '
+            f'rrf_score="{html.escape(str(candidate.get("rrf_score", 0.0)))}" '
+            f'retrieval_sources="{html.escape(",".join(candidate.get("retrieval_sources", [])))}" '
             f'vitality="{html.escape(str(candidate.get("vitality", 0.0)))}" '
             f'maya_score="{html.escape(str(candidate.get("maya_score", 0.0)))}">'
             "<candidate_memory>"
@@ -263,10 +278,10 @@ class ApplicabilityScorer:
         )
 
     @staticmethod
-    def _retrieval_score(rank: Any) -> float:
-        if rank is None:
+    def _retrieval_score(rrf_score: Any) -> float:
+        if rrf_score is None:
             return 0.0
-        return 1.0 / (1.0 + abs(float(rank)))
+        return max(0.0, min(1.0, float(rrf_score)))
 
     @staticmethod
     def _vitality_boost(candidate: dict[str, Any]) -> float:
@@ -291,7 +306,12 @@ class ApplicabilityScorer:
         status = str(candidate.get("status", ""))
         total = 0.0
         for need in detected_needs:
-            if need.need_type is NeedTrigger.AMBIGUITY and object_type in _AMBIGUITY_TYPES:
+            if (
+                need.need_type is NeedTrigger.AMBIGUITY
+                and object_type == MemoryObjectType.CONSEQUENCE_CHAIN.value
+            ):
+                total += 0.04
+            elif need.need_type is NeedTrigger.AMBIGUITY and object_type in _AMBIGUITY_TYPES:
                 total += 0.04
             elif need.need_type is NeedTrigger.CONTRADICTION and (
                 object_type in _HIGH_STAKES_TYPES or status == MemoryStatus.SUPERSEDED.value
@@ -300,6 +320,11 @@ class ApplicabilityScorer:
             elif need.need_type is NeedTrigger.FOLLOW_UP_FAILURE and object_type in _FOLLOW_UP_FAILURE_TYPES:
                 total += 0.06
             elif need.need_type is NeedTrigger.LOOP and object_type in _LOOP_TYPES:
+                total += 0.05
+            elif (
+                need.need_type is NeedTrigger.HIGH_STAKES
+                and object_type == MemoryObjectType.CONSEQUENCE_CHAIN.value
+            ):
                 total += 0.05
             elif need.need_type is NeedTrigger.HIGH_STAKES and object_type in _HIGH_STAKES_TYPES:
                 total += 0.08
@@ -311,18 +336,73 @@ class ApplicabilityScorer:
                 and privacy_level <= min(privacy_ceiling, 1)
             ):
                 total += 0.03
+            elif (
+                need.need_type is NeedTrigger.UNDER_SPECIFIED_REQUEST
+                and object_type == MemoryObjectType.CONSEQUENCE_CHAIN.value
+            ):
+                total += 0.04
             elif need.need_type is NeedTrigger.UNDER_SPECIFIED_REQUEST and object_type in _UNDER_SPECIFIED_TYPES:
                 total += 0.04
         return min(total, 0.2)
 
-    def _penalty(self, candidate: dict[str, Any]) -> float:
+    def _penalty(self, candidate: dict[str, Any], retrieval_plan: RetrievalPlan | None = None) -> float:
         penalty = min(max(float(candidate.get("maya_score", 0.0)), 0.0), 3.0) * 0.05
-        updated_at = candidate.get("updated_at")
-        if updated_at is not None:
-            age_days = (self._clock.now() - datetime.fromisoformat(str(updated_at))).days
-            if age_days > 90:
+        if str(candidate.get("temporal_type", "unknown")) == "unknown":
+            updated_at = candidate.get("updated_at")
+            if updated_at is not None:
+                age_days = (self._clock.now() - self._parse_candidate_datetime(updated_at, self._clock.now())).days
+                if age_days > 90:
+                    penalty += 0.05
+        if retrieval_plan is not None and retrieval_plan.temporal_query_range is not None:
+            overlap_status = self._temporal_overlap_status(candidate, retrieval_plan)
+            if overlap_status == "overlap":
+                penalty = max(0.0, penalty - 0.04)
+            elif overlap_status == "non_overlap":
                 penalty += 0.05
         return penalty
+
+    @staticmethod
+    def _is_future_valid(candidate: dict[str, Any], now: datetime) -> bool:
+        valid_from = candidate.get("valid_from")
+        if valid_from is None:
+            return False
+        return ApplicabilityScorer._parse_candidate_datetime(valid_from, now) > now
+
+    @staticmethod
+    def _parse_candidate_datetime(value: Any, reference: datetime) -> datetime:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None and reference.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=reference.tzinfo)
+        return parsed
+
+    def _temporal_overlap_status(
+        self,
+        candidate: dict[str, Any],
+        retrieval_plan: RetrievalPlan,
+    ) -> str:
+        if retrieval_plan.temporal_query_range is None:
+            return "none"
+        temporal_type = str(candidate.get("temporal_type", "unknown"))
+        if temporal_type == "unknown":
+            return "unknown"
+        valid_from = candidate.get("valid_from")
+        valid_to = candidate.get("valid_to")
+        parsed_valid_from = (
+            None
+            if valid_from is None
+            else self._parse_candidate_datetime(valid_from, retrieval_plan.temporal_query_range.start)
+        )
+        parsed_valid_to = (
+            None
+            if valid_to is None
+            else self._parse_candidate_datetime(valid_to, retrieval_plan.temporal_query_range.start)
+        )
+        if (
+            (parsed_valid_from is None or parsed_valid_from <= retrieval_plan.temporal_query_range.end)
+            and (parsed_valid_to is None or parsed_valid_to >= retrieval_plan.temporal_query_range.start)
+        ):
+            return "overlap"
+        return "non_overlap"
 
     @staticmethod
     def _prioritize_preferred_types(

@@ -302,6 +302,19 @@ def build_system_prompt(
             f"You are the Atagia assistant for mode {assistant_mode_id}. "
             "Use retrieved context only when it is helpful and stay grounded in the active conversation."
         ),
+        (
+            "When a retrieved memory contains relative time expressions "
+            "(e.g., 'next month', 'yesterday', 'last week', 'last Saturday', "
+            "'last weekend', 'a few weeks ago', 'the Friday before [date]', "
+            "'the week before [date]'), resolve them against that memory's "
+            "source_window date, not against the current date. Calculate the "
+            "actual calendar date when possible."
+        ),
+        (
+            "When listing items from memory (hobbies, activities, preferences, "
+            "possessions, events), include all distinct items found across the "
+            "retrieved memories, not just the most prominent ones."
+        ),
         f"Resolved policy hash: {resolved_policy.prompt_hash}",
         (
             "Messages enclosed between "

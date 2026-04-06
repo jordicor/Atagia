@@ -10,6 +10,7 @@ import aiosqlite
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
+from atagia.core.ids import new_job_id
 from atagia.core.storage_backend import StorageBackend
 from atagia.memory.compactor import Compactor
 from atagia.models.schemas_jobs import (
@@ -22,6 +23,7 @@ from atagia.models.schemas_jobs import (
     WORKER_GROUP_NAME,
     WorkerIterationResult,
 )
+from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,7 @@ class CompactionWorker:
         connection: aiosqlite.Connection,
         llm_client: LLMClient[Any],
         clock: Clock,
+        embedding_index: EmbeddingIndex | None = None,
         settings: Settings | None = None,
     ) -> None:
         self._storage_backend = storage_backend
@@ -46,6 +49,7 @@ class CompactionWorker:
             connection=connection,
             llm_client=llm_client,
             clock=clock,
+            embedding_index=embedding_index,
             settings=settings,
         )
 
@@ -106,7 +110,11 @@ class CompactionWorker:
                 user_id=job_payload.user_id,
                 conversation_id=job_payload.conversation_id,
             )
-            return {"summary_ids": summary_ids}
+            await self._enqueue_hierarchy_job(
+                user_id=job_payload.user_id,
+                job_kind=CompactionJobKind.EPISODE,
+            )
+            return {"job_kind": job_payload.job_kind.value, "summary_ids": summary_ids}
         if job_payload.job_kind is CompactionJobKind.WORKSPACE_ROLLUP:
             if job_payload.workspace_id is None:
                 raise ValueError("workspace_rollup jobs require workspace_id")
@@ -114,8 +122,38 @@ class CompactionWorker:
                 user_id=job_payload.user_id,
                 workspace_id=job_payload.workspace_id,
             )
-            return {"summary_id": summary_id}
+            return {"job_kind": job_payload.job_kind.value, "summary_id": summary_id}
+        if job_payload.job_kind is CompactionJobKind.EPISODE:
+            summary_ids = await self._compactor.generate_episodes(job_payload.user_id)
+            await self._enqueue_hierarchy_job(
+                user_id=job_payload.user_id,
+                job_kind=CompactionJobKind.THEMATIC_PROFILE,
+            )
+            return {"job_kind": job_payload.job_kind.value, "summary_ids": summary_ids}
+        if job_payload.job_kind is CompactionJobKind.THEMATIC_PROFILE:
+            summary_ids = await self._compactor.generate_thematic_profiles(job_payload.user_id)
+            return {"job_kind": job_payload.job_kind.value, "summary_ids": summary_ids}
         raise ValueError(f"Unsupported compaction job_kind: {job_payload.job_kind}")
+
+    async def _enqueue_hierarchy_job(
+        self,
+        *,
+        user_id: str,
+        job_kind: CompactionJobKind,
+    ) -> None:
+        await self._storage_backend.stream_add(
+            COMPACT_STREAM_NAME,
+            JobEnvelope(
+                job_id=new_job_id(),
+                job_type=JobType.COMPACT_SUMMARIES,
+                user_id=user_id,
+                payload=CompactionJobPayload(
+                    user_id=user_id,
+                    job_kind=job_kind,
+                ).model_dump(mode="json"),
+                created_at=None,
+            ).model_dump(mode="json"),
+        )
 
     async def _next_messages(
         self,

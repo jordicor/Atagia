@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import json
-import re
+import logging
 
 from benchmarks.base import ScoreResult
+from ai_json_cleanroom import validate_ai_json
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
 
-_JSON_OBJECT_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
 _DEFAULT_REASONING = "Judge response could not be parsed as valid verdict JSON."
+logger = logging.getLogger(__name__)
 
 
 class LLMJudgeScorer:
@@ -62,6 +62,10 @@ class LLMJudgeScorer:
     def _parse_result(self, raw_output: str, response_model: str) -> ScoreResult:
         payload = self._extract_json_payload(raw_output)
         if payload is None:
+            logger.warning(
+                "Judge response could not be parsed: %s",
+                raw_output[:500],
+            )
             return ScoreResult(
                 score=0,
                 reasoning=_DEFAULT_REASONING,
@@ -79,14 +83,7 @@ class LLMJudgeScorer:
 
     @staticmethod
     def _extract_json_payload(raw_output: str) -> dict[str, object] | None:
-        try:
-            payload = json.loads(raw_output)
-        except json.JSONDecodeError:
-            match = _JSON_OBJECT_PATTERN.search(raw_output)
-            if match is None:
-                return None
-            try:
-                payload = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                return None
-        return payload if isinstance(payload, dict) else None
+        result = validate_ai_json(raw_output)
+        if result.json_valid and isinstance(result.data, dict):
+            return result.data
+        return None

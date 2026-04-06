@@ -12,7 +12,7 @@ mcp_available = pytest.importorskip("mcp", reason="mcp package not installed")
 
 from atagia import Atagia
 from atagia.core.repositories import MemoryObjectRepository, MessageRepository
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
+from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
 from atagia.mcp_server import (
     _add_memory_impl,
     _delete_memory_impl,
@@ -119,6 +119,7 @@ async def _seed_memory(
     memory_id: str,
     text: str,
     object_type: MemoryObjectType = MemoryObjectType.EVIDENCE,
+    status: MemoryStatus = MemoryStatus.ACTIVE,
 ) -> None:
     runtime = engine.runtime
     if runtime is None:
@@ -136,6 +137,7 @@ async def _seed_memory(
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.9,
             privacy_level=0,
+            status=status,
             memory_id=memory_id,
         )
     finally:
@@ -218,6 +220,18 @@ async def test_mcp_search_memories(
             memory_id="mem_archived",
             text="archived retry memory",
         )
+        await _seed_memory(
+            engine,
+            memory_id="mem_pending",
+            text="pending retry credential",
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+        )
+        await _seed_memory(
+            engine,
+            memory_id="mem_declined",
+            text="declined retry credential",
+            status=MemoryStatus.DECLINED,
+        )
         await _delete_memory_impl(engine, "usr_1", "mem_archived")
 
         results = json.loads(await _search_memories_impl(engine, "usr_1", "retry", limit=10))
@@ -226,6 +240,8 @@ async def test_mcp_search_memories(
         assert results[0]["id"] == "mem_1"
         assert "retry loop websocket backoff" in results[0]["text"]
         assert all(result["id"] != "mem_archived" for result in results)
+        assert all(result["id"] != "mem_pending" for result in results)
+        assert all(result["id"] != "mem_declined" for result in results)
     finally:
         await engine.close()
 
@@ -389,6 +405,20 @@ async def test_mcp_list_memories(
             text="Old archived memory",
             object_type=MemoryObjectType.EVIDENCE,
         )
+        await _seed_memory(
+            engine,
+            memory_id="mem_pending",
+            text="Pending memory",
+            object_type=MemoryObjectType.EVIDENCE,
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+        )
+        await _seed_memory(
+            engine,
+            memory_id="mem_declined",
+            text="Declined memory",
+            object_type=MemoryObjectType.EVIDENCE,
+            status=MemoryStatus.DECLINED,
+        )
         await _delete_memory_impl(engine, "usr_1", "mem_archived")
 
         all_memories = json.loads(await _list_memories_impl(engine, "usr_1"))
@@ -400,9 +430,17 @@ async def test_mcp_list_memories(
             )
         )
 
-        assert len(all_memories) == 2
-        assert {memory["id"] for memory in all_memories} == {"mem_evidence", "mem_belief"}
-        assert all(memory["id"] != "mem_archived" for memory in all_memories)
+        assert len(all_memories) == 3
+        assert {memory["id"] for memory in all_memories} == {
+            "mem_evidence",
+            "mem_belief",
+            "mem_archived",
+        }
+        assert next(memory for memory in all_memories if memory["id"] == "mem_archived")["status"] == (
+            MemoryStatus.ARCHIVED.value
+        )
+        assert all(memory["id"] != "mem_pending" for memory in all_memories)
+        assert all(memory["id"] != "mem_declined" for memory in all_memories)
         assert len(belief_memories) == 1
         assert belief_memories[0]["id"] == "mem_belief"
         assert belief_memories[0]["type"] == MemoryObjectType.BELIEF.value

@@ -18,6 +18,7 @@ from atagia.models.schemas_replay import AblationConfig
 
 _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+_DEFAULT_ANTHROPIC_JUDGE_MODEL = "claude-opus-4-6"
 _CATEGORY_NAMES = {
     1: "single-hop",
     2: "multi-hop",
@@ -71,7 +72,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--judge-model",
         default=None,
-        help="Optional LLM model for scoring; defaults to the answer model",
+        help=(
+            "Optional LLM model for scoring; defaults to claude-opus-4-6 for "
+            "Anthropic, otherwise the answer model"
+        ),
     )
     parser.add_argument(
         "--conversations",
@@ -121,13 +125,21 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_judge_model(args: argparse.Namespace) -> str | None:
+    if args.judge_model is not None:
+        return args.judge_model
+    if args.provider == "anthropic":
+        return _DEFAULT_ANTHROPIC_JUDGE_MODEL
+    return None
+
+
 async def _run_async(args: argparse.Namespace) -> tuple[BenchmarkReport, Path]:
     benchmark = LoCoMoBenchmark(
         data_path=args.data_path,
         llm_provider=args.provider,
         llm_api_key=args.api_key,
         llm_model=args.model,
-        judge_model=args.judge_model,
+        judge_model=_resolve_judge_model(args),
         manifests_dir=args.manifests_dir,
         embedding_backend=args.embedding_backend,
         embedding_model=args.embedding_model,

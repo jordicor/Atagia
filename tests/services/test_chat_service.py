@@ -175,6 +175,88 @@ async def test_chat_reply_basic(
 
 
 @pytest.mark.asyncio
+async def test_chat_reply_does_not_raise_when_post_commit_recent_window_update_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    original_set_recent_window = runtime.storage_backend.set_recent_window
+
+    async def failing_set_recent_window(key: str, messages: list[dict[str, object]]) -> None:
+        raise RuntimeError("Injected recent window failure")
+
+    monkeypatch.setattr(runtime.storage_backend, "set_recent_window", failing_set_recent_window)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+
+        result = await ChatService(runtime).chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="Please help me debug this retry loop.",
+            assistant_mode_id="coding_debug",
+            debug=True,
+        )
+
+        assert result.response_text == "Check the retry guard first."
+        assert result.debug is not None
+        assert "recent_window_failed" in result.debug["post_commit_errors"]
+
+        connection = await runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, runtime.clock)
+            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            assert [message["role"] for message in stored_messages[-2:]] == ["user", "assistant"]
+        finally:
+            await connection.close()
+    finally:
+        monkeypatch.setattr(runtime.storage_backend, "set_recent_window", original_set_recent_window)
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_marks_background_tasks_false_when_enqueue_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+
+    async def failing_enqueue_message_jobs(*, storage_backend: object, jobs: list[object]) -> list[str]:
+        del storage_backend
+        del jobs
+        raise RuntimeError("Injected enqueue failure")
+
+    monkeypatch.setattr("atagia.services.chat_service.enqueue_message_jobs", failing_enqueue_message_jobs)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+
+        result = await ChatService(runtime).chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="Please help me debug this retry loop.",
+            assistant_mode_id="coding_debug",
+            debug=True,
+        )
+
+        assert result.debug is not None
+        assert result.debug["enqueued_job_ids"] == []
+        assert "job_enqueue_failed" in result.debug["post_commit_errors"]
+
+        connection = await runtime.open_connection()
+        try:
+            event = await RetrievalEventRepository(connection, runtime.clock).get_event(
+                result.retrieval_event_id,
+                "usr_1",
+            )
+            assert event is not None
+            assert event["outcome_json"]["background_tasks_enqueued"] is False
+            assert "job_enqueue_failed" in event["outcome_json"]["post_commit_errors"]
+        finally:
+            await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_reply_user_isolation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

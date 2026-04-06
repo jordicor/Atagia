@@ -55,7 +55,12 @@ class RetrievalPipeline:
         self._summary_repository = SummaryRepository(connection, clock)
         self._need_detector = NeedDetector(llm_client=llm_client, settings=self._settings)
         self._planner = RetrievalPlanner(clock)
-        self._candidate_search = CandidateSearch(connection, clock, embedding_index=embedding_index)
+        self._candidate_search = CandidateSearch(
+            connection,
+            clock,
+            embedding_index=embedding_index,
+            settings=self._settings,
+        )
         self._scorer = ApplicabilityScorer(llm_client=llm_client, clock=clock, settings=self._settings)
         self._context_composer = ContextComposer(clock)
         self._contract_projector = ContractProjector(
@@ -125,7 +130,12 @@ class RetrievalPipeline:
             scored_candidates = await self._measure_stage(
                 stage_timings,
                 "applicability_scoring",
-                self._score_without_llm(raw_candidates, effective_policy, detected_needs),
+                self._score_without_llm(
+                    raw_candidates,
+                    effective_policy,
+                    detected_needs,
+                    retrieval_plan,
+                ),
             )
         else:
             scored_candidates = await self._measure_stage(
@@ -137,6 +147,7 @@ class RetrievalPipeline:
                     conversation_context=conversation_context,
                     resolved_policy=effective_policy,
                     detected_needs=detected_needs,
+                    retrieval_plan=retrieval_plan,
                 ),
             )
 
@@ -181,6 +192,7 @@ class RetrievalPipeline:
             stage_timings,
             "context_composition",
             self._compose_context(
+                message_text=message_text,
                 scored_candidates=scored_candidates,
                 current_contract=current_contract,
                 workspace_rollup=effective_workspace_rollup,
@@ -238,12 +250,18 @@ class RetrievalPipeline:
         candidates: list[dict[str, Any]],
         resolved_policy: ResolvedPolicy,
         detected_needs: list[Any],
+        retrieval_plan: RetrievalPlan,
     ) -> list[ScoredCandidate]:
-        filtered = self._scorer.filter_candidates(candidates, resolved_policy, detected_needs)
+        filtered = self._scorer.filter_candidates(
+            candidates,
+            resolved_policy,
+            detected_needs,
+            retrieval_plan=retrieval_plan,
+        )
         shortlist = filtered[: resolved_policy.retrieval_params.rerank_top_k]
         scored: list[ScoredCandidate] = []
         for candidate in shortlist:
-            retrieval_score = self._normalized_retrieval_score(candidate.get("rank"))
+            retrieval_score = self._normalized_retrieval_score(candidate.get("rrf_score"))
             scored.append(
                 ScoredCandidate(
                     memory_id=str(candidate["id"]),
@@ -303,6 +321,7 @@ class RetrievalPipeline:
     async def _compose_context(
         self,
         *,
+        message_text: str,
         scored_candidates: list[ScoredCandidate],
         current_contract: dict[str, dict[str, Any]],
         workspace_rollup: dict[str, Any] | None,
@@ -317,6 +336,7 @@ class RetrievalPipeline:
             user_state=user_state,
             resolved_policy=resolved_policy,
             conversation_messages=conversation_messages,
+            query_text=message_text,
         )
 
     def _override_policy(
@@ -349,10 +369,10 @@ class RetrievalPipeline:
         return result
 
     @staticmethod
-    def _normalized_retrieval_score(rank: Any) -> float:
-        if rank is None:
+    def _normalized_retrieval_score(rrf_score: Any) -> float:
+        if rrf_score is None:
             return 0.0
-        return 1.0 / (1.0 + abs(float(rank)))
+        return max(0.0, min(1.0, float(rrf_score)))
 
     def _without_contract_block(self, composed_context: ComposedContext) -> ComposedContext:
         contract_tokens = self._context_composer.estimate_tokens(composed_context.contract_block)

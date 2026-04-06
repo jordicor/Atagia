@@ -43,6 +43,7 @@ class Settings:
     embedding_backend: str = "none"
     embedding_model: str | None = None
     embedding_dimension: int = 1536
+    rrf_k: int = 60
     lifecycle_decay_days: int = 7
     lifecycle_decay_rate: float = 0.9
     lifecycle_archive_vitality: float = 0.05
@@ -52,6 +53,9 @@ class Settings:
     promotion_conv_to_ws_min_conversations: int = 2
     promotion_ws_to_global_min_sessions: int = 3
     promotion_require_mode_consistency: bool = True
+    belief_tension_increment: float = 0.15
+    belief_tension_decrement: float = 0.05
+    belief_tension_threshold: float = 0.5
     skip_belief_revision: bool = False
     skip_compaction: bool = False
     context_cache_enabled: bool = True
@@ -73,10 +77,18 @@ class Settings:
             raise ValueError("context_cache_max_ttl_seconds must be >= context_cache_min_ttl_seconds")
         if self.chunking_threshold_tokens <= 0:
             raise ValueError("chunking_threshold_tokens must be positive")
+        if self.rrf_k <= 0:
+            raise ValueError("rrf_k must be positive")
         if self.lifecycle_min_interval_seconds <= 0:
             raise ValueError("lifecycle_min_interval_seconds must be positive")
         if self.lifecycle_worker_enabled and self.lifecycle_worker_interval_seconds <= 0:
             raise ValueError("lifecycle_worker_interval_seconds must be positive")
+        if self.belief_tension_increment <= 0:
+            raise ValueError("belief_tension_increment must be positive")
+        if self.belief_tension_decrement <= 0:
+            raise ValueError("belief_tension_decrement must be positive")
+        if self.belief_tension_threshold < 0:
+            raise ValueError("belief_tension_threshold must be non-negative")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -110,6 +122,7 @@ class Settings:
             embedding_backend=os.getenv("ATAGIA_EMBEDDING_BACKEND", "none").strip().lower(),
             embedding_model=os.getenv("ATAGIA_EMBEDDING_MODEL") or None,
             embedding_dimension=int(os.getenv("ATAGIA_EMBEDDING_DIMENSION", "1536")),
+            rrf_k=int(os.getenv("ATAGIA_RRF_K", "60")),
             lifecycle_decay_days=int(os.getenv("ATAGIA_LIFECYCLE_DECAY_DAYS", "7")),
             lifecycle_decay_rate=float(os.getenv("ATAGIA_LIFECYCLE_DECAY_RATE", "0.9")),
             lifecycle_archive_vitality=float(os.getenv("ATAGIA_LIFECYCLE_ARCHIVE_VITALITY", "0.05")),
@@ -126,6 +139,9 @@ class Settings:
                 "ATAGIA_PROMOTION_REQUIRE_MODE_CONSISTENCY",
                 True,
             ),
+            belief_tension_increment=float(os.getenv("ATAGIA_BELIEF_TENSION_INCREMENT", "0.15")),
+            belief_tension_decrement=float(os.getenv("ATAGIA_BELIEF_TENSION_DECREMENT", "0.05")),
+            belief_tension_threshold=float(os.getenv("ATAGIA_BELIEF_TENSION_THRESHOLD", "0.5")),
             skip_belief_revision=_env_bool("ATAGIA_SKIP_BELIEF_REVISION", False),
             skip_compaction=_env_bool("ATAGIA_SKIP_COMPACTION", False),
             context_cache_enabled=_env_bool("ATAGIA_CONTEXT_CACHE_ENABLED", True),

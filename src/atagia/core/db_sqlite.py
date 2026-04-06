@@ -11,6 +11,7 @@ from uuid import uuid4
 import aiosqlite
 
 _MIGRATION_PATTERN = re.compile(r"^(?P<version>\d+)_(?P<name>[a-z0-9_]+)\.sql$")
+_FOREIGN_KEYS_OFF_MARKER = "-- atagia:foreign_keys_off"
 
 
 def is_in_memory_database(database_path: str) -> bool:
@@ -116,21 +117,58 @@ class MigrationManager:
         for migration in pending:
             timestamp = datetime.now(tz=timezone.utc).isoformat()
             try:
-                # Migration files are trusted local SQL, but the metadata insert should
-                # still use a parameterized statement to follow the repository rule.
-                await connection.executescript(f"BEGIN;\n{migration.sql.rstrip()}\n")
-                await connection.execute(
-                    """
-                    INSERT INTO schema_migrations(version, name, applied_at)
-                    VALUES (?, ?, ?)
-                    """,
-                    (migration.version, migration.name, timestamp),
-                )
-                await connection.commit()
+                if self._requires_foreign_keys_off(migration):
+                    await self._apply_with_foreign_keys_disabled(connection, migration, timestamp)
+                else:
+                    # Migration files are trusted local SQL, but the metadata insert should
+                    # still use a parameterized statement to follow the repository rule.
+                    await connection.executescript(f"BEGIN;\n{migration.sql.rstrip()}\n")
+                    await connection.execute(
+                        """
+                        INSERT INTO schema_migrations(version, name, applied_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (migration.version, migration.name, timestamp),
+                    )
+                    await connection.commit()
             except Exception:
                 await connection.rollback()
                 raise
         return pending
+
+    @staticmethod
+    def _requires_foreign_keys_off(migration: Migration) -> bool:
+        return _FOREIGN_KEYS_OFF_MARKER in migration.sql
+
+    async def _apply_with_foreign_keys_disabled(
+        self,
+        connection: aiosqlite.Connection,
+        migration: Migration,
+        timestamp: str,
+    ) -> None:
+        await connection.commit()
+        await connection.execute("PRAGMA foreign_keys = OFF;")
+        try:
+            await connection.executescript(migration.sql.rstrip() + "\n")
+            cursor = await connection.execute("PRAGMA foreign_key_check;")
+            violations = await cursor.fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"Foreign key violations after migration {migration.version}_{migration.name}"
+                )
+            await connection.execute("PRAGMA foreign_keys = ON;")
+            await connection.execute(
+                """
+                INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (?, ?, ?)
+                """,
+                (migration.version, migration.name, timestamp),
+            )
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            await connection.execute("PRAGMA foreign_keys = ON;")
+            raise
 
 
 async def initialize_database(

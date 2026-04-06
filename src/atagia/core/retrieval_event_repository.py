@@ -106,6 +106,37 @@ class RetrievalEventRepository(BaseRepository):
             (user_id, conversation_id, limit, offset),
         )
 
+    async def update_outcome_fields(
+        self,
+        event_id: str,
+        user_id: str,
+        updates: dict[str, Any],
+        *,
+        commit: bool = True,
+    ) -> dict[str, Any] | None:
+        event = await self.get_event(event_id, user_id)
+        if event is None:
+            return None
+        outcome = event.get("outcome_json")
+        current_outcome = dict(outcome) if isinstance(outcome, dict) else {}
+        current_outcome.update(updates)
+        await self._connection.execute(
+            """
+            UPDATE retrieval_events
+            SET outcome_json = ?
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (
+                _encode_json(current_outcome),
+                event_id,
+                user_id,
+            ),
+        )
+        if commit:
+            await self._connection.commit()
+        return await self.get_event(event_id, user_id)
+
 
 class MemoryFeedbackRepository(BaseRepository):
     """Persistence operations for memory usefulness feedback."""

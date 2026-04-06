@@ -22,6 +22,8 @@ class JobType(str, Enum):
 class CompactionJobKind(str, Enum):
     CONVERSATION_CHUNK = "conversation_chunk"
     WORKSPACE_ROLLUP = "workspace_rollup"
+    EPISODE = "episode"
+    THEMATIC_PROFILE = "thematic_profile"
 
 
 class JobEnvelope(BaseModel):

@@ -310,3 +310,104 @@ async def test_create_memory_link_persists_valid_relation() -> None:
         assert row["dst_memory_id"] == "mem_target"
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_tension_methods_update_and_reset_belief_tension() -> None:
+    connection, memories, beliefs = await _build_runtime()
+    try:
+        await _seed_belief(
+            memories,
+            beliefs,
+            memory_id="mem_tension",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            claim_key="response_style.debugging",
+            claim_value="terse",
+        )
+
+        increased = await beliefs.increment_tension("mem_tension", 0.15, user_id="usr_1")
+        decreased = await beliefs.decrement_tension("mem_tension", 0.05, user_id="usr_1")
+        reset = await beliefs.reset_tension("mem_tension", user_id="usr_1")
+
+        assert increased == pytest.approx(0.15)
+        assert decreased == pytest.approx(0.10)
+        assert reset == pytest.approx(0.0)
+        assert await beliefs.get_tension("mem_tension", user_id="usr_1") == pytest.approx(0.0)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_get_beliefs_above_tension_threshold_filters_by_user_and_type() -> None:
+    connection, memories, beliefs = await _build_runtime()
+    try:
+        await _seed_belief(
+            memories,
+            beliefs,
+            memory_id="mem_hot",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            claim_key="response_style.debugging",
+            claim_value="terse",
+        )
+        await _seed_belief(
+            memories,
+            beliefs,
+            memory_id="mem_other_user",
+            user_id="usr_2",
+            conversation_id="cnv_3",
+            claim_key="response_style.debugging",
+            claim_value="terse",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Evidence should never appear in belief tension reads.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            memory_id="mem_evidence",
+        )
+
+        await beliefs.increment_tension("mem_hot", 0.55, user_id="usr_1")
+        await beliefs.increment_tension("mem_other_user", 0.90, user_id="usr_2")
+
+        rows = await beliefs.get_beliefs_above_tension_threshold("usr_1", 0.5)
+
+        assert [row["id"] for row in rows] == ["mem_hot"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_tension_evidence_buffer_round_trips_unique_ids() -> None:
+    connection, memories, beliefs = await _build_runtime()
+    try:
+        await _seed_belief(
+            memories,
+            beliefs,
+            memory_id="mem_buffer",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            claim_key="response_style.debugging",
+            claim_value="terse",
+        )
+
+        merged = await beliefs.add_tension_evidence_ids(
+            "mem_buffer",
+            ["mem_e1", "mem_e2", "mem_e1"],
+            user_id="usr_1",
+        )
+        popped = await beliefs.pop_tension_evidence_ids("mem_buffer", user_id="usr_1")
+        row = await memories.get_memory_object("mem_buffer", "usr_1")
+
+        assert merged == ["mem_e1", "mem_e2"]
+        assert popped == ["mem_e1", "mem_e2"]
+        assert row is not None
+        assert row["payload_json"].get("tension_evidence_memory_ids") is None
+    finally:
+        await connection.close()

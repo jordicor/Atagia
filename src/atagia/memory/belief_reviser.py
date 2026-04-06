@@ -153,6 +153,67 @@ class BeliefReviser:
         new_evidence: list[dict[str, Any]],
         context: RevisionContext | dict[str, Any],
     ) -> RevisionResult:
+        revision_context, belief_row, current_version = await self._load_revision_state(
+            belief_id,
+            context,
+        )
+        decision = await self._decide_action(
+            belief_id=belief_id,
+            belief_row=belief_row,
+            current_version=current_version,
+            new_evidence=new_evidence,
+            context=revision_context,
+        )
+        return await self._apply_decision(
+            decision=decision,
+            belief_row=belief_row,
+            current_version=current_version,
+            new_evidence=new_evidence,
+            revision_context=revision_context,
+        )
+
+    async def preview_revision(
+        self,
+        belief_id: str,
+        new_evidence: list[dict[str, Any]],
+        context: RevisionContext | dict[str, Any],
+    ) -> RevisionDecision:
+        revision_context, belief_row, current_version = await self._load_revision_state(
+            belief_id,
+            context,
+        )
+        return await self._decide_action(
+            belief_id=belief_id,
+            belief_row=belief_row,
+            current_version=current_version,
+            new_evidence=new_evidence,
+            context=revision_context,
+        )
+
+    async def apply_previewed_revision(
+        self,
+        belief_id: str,
+        new_evidence: list[dict[str, Any]],
+        context: RevisionContext | dict[str, Any],
+        decision: RevisionDecision,
+    ) -> RevisionResult:
+        revision_context, belief_row, current_version = await self._load_revision_state(
+            belief_id,
+            context,
+        )
+        return await self._apply_decision(
+            decision=decision,
+            belief_row=belief_row,
+            current_version=current_version,
+            new_evidence=new_evidence,
+            revision_context=revision_context,
+        )
+
+    async def _load_revision_state(
+        self,
+        belief_id: str,
+        context: RevisionContext | dict[str, Any],
+    ) -> tuple[RevisionContext, dict[str, Any], dict[str, Any]]:
         revision_context = RevisionContext.model_validate(context)
         belief_row = await self._memory_repository.get_memory_object(belief_id, revision_context.user_id)
         if belief_row is None:
@@ -172,14 +233,17 @@ class BeliefReviser:
             raise ValueError(
                 "Revision claim_key is not semantically equivalent to the current belief claim_key"
             )
+        return revision_context, belief_row, current_version
 
-        decision = await self._decide_action(
-            belief_id=belief_id,
-            belief_row=belief_row,
-            current_version=current_version,
-            new_evidence=new_evidence,
-            context=revision_context,
-        )
+    async def _apply_decision(
+        self,
+        *,
+        decision: RevisionDecision,
+        belief_row: dict[str, Any],
+        current_version: dict[str, Any],
+        new_evidence: list[dict[str, Any]],
+        revision_context: RevisionContext,
+    ) -> RevisionResult:
         try:
             if decision.action is RevisionAction.REINFORCE:
                 result = await self._apply_reinforce(

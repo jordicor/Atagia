@@ -151,9 +151,166 @@ class RevisionWorker:
                 lock_token,
             )
 
-    async def _revise_existing_belief(self, payload: RevisionJobPayload) -> dict[str, Any]:
+    async def _revise_existing_belief(
+        self,
+        payload: RevisionJobPayload,
+    ) -> dict[str, Any]:
+        signal_type = await self._classify_revision_signal(payload)
+        if signal_type == "contradictory":
+            await self._belief_repository.add_tension_evidence_ids(
+                payload.belief_id,
+                payload.evidence_memory_ids,
+                user_id=payload.user_id,
+                commit=False,
+            )
+            tension_score = await self._belief_repository.increment_tension(
+                payload.belief_id,
+                self._settings.belief_tension_increment,
+                user_id=payload.user_id,
+                commit=False,
+            )
+            await self._belief_repository.commit()
+            if tension_score < self._settings.belief_tension_threshold:
+                logger.info(
+                    "Deferring belief revision for belief_id=%s at tension=%s threshold=%s",
+                    payload.belief_id,
+                    tension_score,
+                    self._settings.belief_tension_threshold,
+                )
+                return {
+                    "status": "deferred_tension",
+                    "belief_id": payload.belief_id,
+                    "signal_type": signal_type,
+                    "tension_score": tension_score,
+                    "threshold": self._settings.belief_tension_threshold,
+                }
+            accumulated_evidence_ids = await self._belief_repository.pop_tension_evidence_ids(
+                payload.belief_id,
+                user_id=payload.user_id,
+                commit=False,
+            )
+            try:
+                await self._belief_repository.reset_tension(
+                    payload.belief_id,
+                    user_id=payload.user_id,
+                    commit=False,
+                )
+                result = await self._execute_belief_revision(
+                    payload.model_copy(update={"evidence_memory_ids": accumulated_evidence_ids}),
+                )
+            except Exception:
+                await self._belief_repository.rollback()
+                raise
+            result["signal_type"] = signal_type
+            result["trigger_tension_score"] = tension_score
+            result["tension_score"] = 0.0
+            return result
+
+        preview_decision = await self._preview_belief_revision(payload)
+        if preview_decision.action.value != "REINFORCE":
+            await self._belief_repository.add_tension_evidence_ids(
+                payload.belief_id,
+                payload.evidence_memory_ids,
+                user_id=payload.user_id,
+                commit=False,
+            )
+            tension_score = await self._belief_repository.increment_tension(
+                payload.belief_id,
+                self._settings.belief_tension_increment,
+                user_id=payload.user_id,
+                commit=False,
+            )
+            await self._belief_repository.commit()
+            if tension_score < self._settings.belief_tension_threshold:
+                return {
+                    "status": "deferred_tension",
+                    "belief_id": payload.belief_id,
+                    "signal_type": "ambiguous",
+                    "preview_action": preview_decision.action.value,
+                    "tension_score": tension_score,
+                    "threshold": self._settings.belief_tension_threshold,
+                }
+            accumulated_evidence_ids = await self._belief_repository.pop_tension_evidence_ids(
+                payload.belief_id,
+                user_id=payload.user_id,
+                commit=False,
+            )
+            threshold_payload = payload.model_copy(update={"evidence_memory_ids": accumulated_evidence_ids})
+            try:
+                threshold_preview = await self._preview_belief_revision(threshold_payload)
+                await self._belief_repository.reset_tension(
+                    payload.belief_id,
+                    user_id=payload.user_id,
+                    commit=False,
+                )
+                result = await self._execute_belief_revision(
+                    threshold_payload,
+                    preview_action=threshold_preview,
+                )
+            except Exception:
+                await self._belief_repository.rollback()
+                raise
+            result["signal_type"] = "ambiguous"
+            result["trigger_tension_score"] = tension_score
+            result["tension_score"] = 0.0
+            return result
+
+        result = await self._execute_belief_revision(payload, preview_action=preview_decision)
+        tension_score = await self._post_revision_tension_update(payload, result)
+        result["signal_type"] = signal_type
+        result["tension_score"] = tension_score
+        return result
+
+    async def _execute_belief_revision(
+        self,
+        payload: RevisionJobPayload,
+        preview_action: Any | None = None,
+    ) -> dict[str, Any]:
         evidence_rows = await self._load_evidence_rows(payload.user_id, payload.evidence_memory_ids)
-        result = await self._reviser.revise(
+        revision_context = RevisionContext(
+            user_id=payload.user_id,
+            claim_key=payload.claim_key,
+            claim_value=payload.claim_value,
+            source_message_id=payload.source_message_id,
+            assistant_mode_id=payload.assistant_mode_id,
+            workspace_id=payload.workspace_id,
+            conversation_id=payload.conversation_id,
+            scope=MemoryScope(payload.scope),
+        )
+        if preview_action is None:
+            result = await self._reviser.revise(
+                belief_id=payload.belief_id,
+                new_evidence=evidence_rows,
+                context=revision_context,
+            )
+        else:
+            result = await self._reviser.apply_previewed_revision(
+                belief_id=payload.belief_id,
+                new_evidence=evidence_rows,
+                context=revision_context,
+                decision=preview_action,
+            )
+        return result.model_dump(mode="json")
+
+    async def _classify_revision_signal(
+        self,
+        payload: RevisionJobPayload,
+    ) -> str:
+        current_version = await self._belief_repository.get_current_version(
+            payload.belief_id,
+            payload.user_id,
+        )
+        if current_version is None:
+            return "unknown"
+        current_value = self._normalize_claim_value(current_version.get("claim_value_json"))
+        next_value = self._normalize_claim_value(self._parse_claim_value(payload.claim_value))
+        if current_value != next_value:
+            return "contradictory"
+        return "ambiguous"
+
+    async def _preview_belief_revision(self, payload: RevisionJobPayload) -> Any:
+        evidence_rows = await self._load_evidence_rows(payload.user_id, payload.evidence_memory_ids)
+        return await self._reviser.preview_revision(
             belief_id=payload.belief_id,
             new_evidence=evidence_rows,
             context=RevisionContext(
@@ -167,7 +324,28 @@ class RevisionWorker:
                 scope=MemoryScope(payload.scope),
             ),
         )
-        return result.model_dump(mode="json")
+
+    async def _post_revision_tension_update(
+        self,
+        payload: RevisionJobPayload,
+        result: dict[str, Any],
+    ) -> float:
+        if result.get("action") != "REINFORCE":
+            return await self._belief_repository.get_tension(
+                payload.belief_id,
+                user_id=payload.user_id,
+            )
+        tension_score = await self._belief_repository.decrement_tension(
+            payload.belief_id,
+            self._settings.belief_tension_decrement,
+            user_id=payload.user_id,
+        )
+        if tension_score <= 0.0:
+            await self._belief_repository.pop_tension_evidence_ids(
+                payload.belief_id,
+                user_id=payload.user_id,
+            )
+        return tension_score
 
     async def _process_promotion(self, payload: RevisionJobPayload) -> dict[str, Any] | None:
         active_beliefs = await self._matching_beliefs_for_claim_key(
@@ -183,7 +361,7 @@ class RevisionWorker:
         existing_belief_id = self._select_external_belief_id(active_beliefs, payload)
         if existing_belief_id is not None:
             return await self._revise_existing_belief(
-                payload.model_copy(update={"belief_id": existing_belief_id})
+                payload.model_copy(update={"belief_id": existing_belief_id}),
             )
 
         if same_message_beliefs and explicit_user_statement:
@@ -450,6 +628,10 @@ class RevisionWorker:
             return json.loads(claim_value)
         except json.JSONDecodeError:
             return claim_value
+
+    @staticmethod
+    def _normalize_claim_value(claim_value: Any) -> str:
+        return json.dumps(claim_value, ensure_ascii=False, sort_keys=True)
 
     def _canonical_text(
         self,

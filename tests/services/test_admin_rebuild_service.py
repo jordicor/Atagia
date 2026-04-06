@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -18,6 +19,7 @@ from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
 )
+from atagia.core.summary_repository import SummaryRepository
 from atagia.core.storage_backend import InProcessBackend
 from atagia.memory.extractor import MemoryExtractor
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
@@ -27,6 +29,7 @@ from atagia.models.schemas_memory import (
     MemoryScope,
     MemorySourceKind,
     MemoryStatus,
+    SummaryViewKind,
 )
 from atagia.services.admin_rebuild_service import AdminRebuildService
 from atagia.services.llm_client import (
@@ -105,6 +108,7 @@ class RebuildReplayProvider(LLMProvider):
                         "evidences": [
                             {
                                 "canonical_text": canonical_text,
+                                "index_text": f"Context for {canonical_text.lower()} from replayed conversation history.",
                                 "scope": "conversation",
                                 "confidence": 0.92,
                                 "source_kind": "extracted",
@@ -158,6 +162,68 @@ class RebuildReplayProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text='{"summary_text": "Workspace summary", "cited_memory_ids": []}',
+            )
+        if purpose == "summary_chunk_segmentation":
+            prompt = request.messages[1].content
+            message_sequences = [int(item) for item in re.findall(r'<message seq="(\d+)"', prompt)]
+            if not message_sequences:
+                raise AssertionError("Expected message sequences in chunk segmentation prompt")
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "episodes": [
+                            {
+                                "start_seq": min(message_sequences),
+                                "end_seq": max(message_sequences),
+                                "summary_text": "Replay chunk summary.",
+                            }
+                        ]
+                    }
+                ),
+            )
+        if purpose == "episode_synthesis":
+            prompt = request.messages[1].content
+            chunk_ids = re.findall(r'<conversation_chunk id="([^"]+)"', prompt)
+            if not chunk_ids:
+                raise AssertionError("Expected conversation chunk IDs in episode synthesis prompt")
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "episodes": [
+                            {
+                                "source_summary_ids": chunk_ids,
+                                "summary_text": "Replay episode summary.",
+                            }
+                        ]
+                    }
+                ),
+            )
+        if purpose == "thematic_profile_synthesis":
+            prompt = request.messages[1].content
+            episode_ids = re.findall(r'<episode id="([^"]+)"', prompt)
+            if not episode_ids:
+                return LLMCompletionResponse(
+                    provider=self.name,
+                    model=request.model,
+                    output_text='{"profiles": []}',
+                )
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "profiles": [
+                            {
+                                "source_memory_ids": [episode_ids[0]],
+                                "summary_text": "Replay thematic profile.",
+                            }
+                        ]
+                    }
+                ),
             )
         raise AssertionError(f"Unexpected completion purpose in rebuild replay test: {purpose}")
 
@@ -379,6 +445,85 @@ async def test_extractor_shared_workspace_memory_survives_conversation_purge() -
 
 
 @pytest.mark.asyncio
+async def test_conversation_rebuild_purge_removes_hierarchy_summaries_and_mirrors() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    memories = MemoryObjectRepository(connection, clock)
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await memories.create_memory_object(
+            user_id="usr_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="User prefers patch-first debugging.",
+            payload={"claim_key": "workflow.debugging.style", "claim_value": "patch_first"},
+            source_kind=MemorySourceKind.INFERRED,
+            confidence=0.9,
+            privacy_level=0,
+            memory_id="mem_belief",
+        )
+        await connection.execute(
+            """
+            INSERT INTO summary_views(
+                id, user_id, conversation_id, workspace_id, source_message_start_seq, source_message_end_seq,
+                summary_kind, summary_text, source_object_ids_json, maya_score, model, hierarchy_level, created_at
+            )
+            VALUES
+                ('sum_episode', 'usr_1', NULL, NULL, NULL, NULL, 'episode', 'Episode summary', '["mem_belief"]', 1.5, 'score', 1, '2026-04-10T12:00:00+00:00'),
+                ('sum_theme', 'usr_1', NULL, NULL, NULL, NULL, 'thematic_profile', 'Thematic profile', '["mem_belief"]', 1.5, 'score', 2, '2026-04-10T12:00:01+00:00')
+            """
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            object_type=MemoryObjectType.SUMMARY_VIEW,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="Episode summary",
+            payload={"summary_view_id": "sum_episode", "summary_kind": "episode", "hierarchy_level": 1, "source_object_ids": ["mem_belief"]},
+            source_kind=MemorySourceKind.SUMMARIZED,
+            confidence=0.7,
+            privacy_level=0,
+            memory_id="sum_mem_sum_episode",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            object_type=MemoryObjectType.SUMMARY_VIEW,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="Thematic profile",
+            payload={"summary_view_id": "sum_theme", "summary_kind": "thematic_profile", "hierarchy_level": 2, "source_object_ids": ["mem_belief"]},
+            source_kind=MemorySourceKind.SUMMARIZED,
+            confidence=0.7,
+            privacy_level=0,
+            memory_id="sum_mem_sum_theme",
+        )
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(provider_name=NoOpProvider.name, providers=[NoOpProvider()]),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        await service._purge_conversation_state("usr_1", "cnv_1")
+
+        cursor = await connection.execute("SELECT id FROM summary_views ORDER BY id ASC")
+        summary_rows = await cursor.fetchall()
+        assert [row["id"] for row in summary_rows] == []
+        assert await memories.get_memory_object("sum_mem_sum_episode", "usr_1") is None
+        assert await memories.get_memory_object("sum_mem_sum_theme", "usr_1") is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_rebuild_conversation_wipes_context_cache_for_user() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
@@ -515,11 +660,14 @@ async def test_rebuild_conversation_replays_assistant_messages_for_extraction() 
             for row in stored
             for source_id in row["payload_json"].get("source_message_ids", [])
         }
+        extracted_rows = [row for row in stored if row["object_type"] == MemoryObjectType.EVIDENCE.value]
 
         assert result.processed_messages == 2
         assert result.extract_jobs_processed == 2
         assert result.contract_jobs_processed == 1
         assert {"msg_1", "msg_2"} <= source_ids
+        assert extracted_rows
+        assert all(row["index_text"] for row in extracted_rows)
         extraction_prompts = [
             request.messages[1].content
             for request in provider.requests
@@ -533,5 +681,119 @@ async def test_rebuild_conversation_replays_assistant_messages_for_extraction() 
         assert "<message_timestamp>2023-05-08T13:56:00</message_timestamp>" in contract_prompts[0]
         assert any("<message_timestamp>2023-05-08T13:56:00</message_timestamp>" in prompt for prompt in extraction_prompts)
         assert any("<message_timestamp>2023-05-08T14:10:00</message_timestamp>" in prompt for prompt in extraction_prompts)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_conversation_recreates_hierarchy_for_short_conversation() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+    memories = MemoryObjectRepository(connection, clock)
+    summaries = SummaryRepository(connection, clock)
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00")
+        await summaries.create_summary(
+            "usr_1",
+            {
+                "id": "sum_old_episode",
+                "conversation_id": None,
+                "workspace_id": None,
+                "source_message_start_seq": None,
+                "source_message_end_seq": None,
+                "summary_kind": "episode",
+                "hierarchy_level": 1,
+                "summary_text": "Old episode.",
+                "source_object_ids_json": [],
+                "maya_score": 1.5,
+                "model": "score-test-model",
+                "created_at": "2026-04-10T11:00:00+00:00",
+            }
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            object_type=MemoryObjectType.SUMMARY_VIEW,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="Old episode.",
+            payload={"summary_view_id": "sum_old_episode", "summary_kind": "episode", "hierarchy_level": 1, "source_object_ids": []},
+            source_kind=MemorySourceKind.SUMMARIZED,
+            confidence=0.7,
+            privacy_level=0,
+            memory_id="sum_mem_sum_old_episode",
+        )
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=RebuildReplayProvider.name,
+                providers=[RebuildReplayProvider()],
+            ),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        result = await service.rebuild_conversation("usr_1", "cnv_1")
+
+        chunk_rows = await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10)
+        episode_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE)
+        thematic_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.THEMATIC_PROFILE)
+
+        assert result.conversation_compaction_jobs_processed == 1
+        assert result.episode_compaction_jobs_processed == 1
+        assert result.thematic_profile_jobs_processed == 1
+        assert len(chunk_rows) == 1
+        assert len(episode_rows) == 1
+        assert len(thematic_rows) == 1
+        assert await memories.get_memory_object("sum_mem_sum_old_episode", "usr_1") is None
+        assert await memories.get_memory_object(f"sum_mem_{episode_rows[0]['id']}", "usr_1") is not None
+        assert await memories.get_memory_object(f"sum_mem_{thematic_rows[0]['id']}", "usr_1") is not None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_user_processes_workspace_rollups_synchronously() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+    summaries = SummaryRepository(connection, clock)
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00")
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=RebuildReplayProvider.name,
+                providers=[RebuildReplayProvider()],
+            ),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        result = await service.rebuild_user("usr_1")
+        workspace_rollups = await summaries.list_workspace_rollups("usr_1", "wsp_1", limit=10)
+
+        assert result.workspace_rollup_jobs_processed == 1
+        assert len(workspace_rollups) == 1
+        assert workspace_rollups[0]["summary_text"] == "Workspace summary"
     finally:
         await connection.close()

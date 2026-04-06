@@ -20,6 +20,7 @@ from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
     MemorySourceKind,
+    MemoryStatus,
 )
 from atagia.models.schemas_replay import AblationConfig
 from atagia.services.embeddings import NoneBackend
@@ -145,6 +146,7 @@ async def _seed_memory(
     scope: MemoryScope,
     object_type: MemoryObjectType = MemoryObjectType.EVIDENCE,
     assistant_mode_id: str = "coding_debug",
+    status: MemoryStatus = MemoryStatus.ACTIVE,
 ) -> dict[str, object]:
     return await memories.create_memory_object(
         user_id="usr_1",
@@ -157,6 +159,7 @@ async def _seed_memory(
         source_kind=MemorySourceKind.EXTRACTED if object_type is not MemoryObjectType.INTERACTION_CONTRACT else MemorySourceKind.INFERRED,
         confidence=0.8,
         privacy_level=0,
+        status=status,
         memory_id=memory_id,
     )
 
@@ -207,6 +210,48 @@ async def test_pipeline_executes_full_flow() -> None:
             "context_composition",
         }.issubset(result.stage_timings)
         assert all(value >= 0.0 for value in result.stage_timings.values())
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_excludes_pending_and_declined_candidates_before_scoring() -> None:
+    message_text = "retry loop websocket backoff"
+    provider = PipelineProvider(score_map={"mem_active": 0.9, "mem_pending": 0.99, "mem_declined": 0.99})
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_active",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+            status=MemoryStatus.ACTIVE,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_pending",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_declined",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+            status=MemoryStatus.DECLINED,
+        )
+
+        result = await pipeline.execute(
+            message_text=message_text,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": message_text}],
+        )
+
+        assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_active"]
+        assert [candidate.memory_id for candidate in result.scored_candidates] == ["mem_active"]
     finally:
         await connection.close()
 

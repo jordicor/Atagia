@@ -79,6 +79,7 @@ class AdaptiveContextResolution:
     cache_key: str | None
     source_retrieval_plan: dict[str, Any]
     scored_candidates: list[dict[str, Any]]
+    candidate_search_summary: dict[str, Any]
     pending_cache_entry: ContextCacheEntry | None
     cache_ttl_seconds: int | None
     cache_generation: int = 0
@@ -204,6 +205,7 @@ class ContextCacheService:
                     cache_key=cache_key,
                     source_retrieval_plan=dict(entry.source_retrieval_plan),
                     scored_candidates=[],
+                    candidate_search_summary={},
                     pending_cache_entry=None,
                     cache_ttl_seconds=None,
                     cache_generation=cache_generation,
@@ -272,6 +274,10 @@ class ContextCacheService:
                 candidate.model_dump(mode="json")
                 for candidate in pipeline_result.scored_candidates
             ],
+            candidate_search_summary=self._summarize_candidate_channels(
+                pipeline_result.raw_candidates,
+                top_k=pipeline_result.retrieval_plan.max_candidates,
+            ),
             pending_cache_entry=pending_entry,
             cache_ttl_seconds=cache_ttl_seconds,
             cache_generation=cache_generation,
@@ -415,6 +421,57 @@ class ContextCacheService:
             0.0,
             (self.runtime.clock.now() - cached_at.astimezone(timezone.utc)).total_seconds(),
         )
+
+    @staticmethod
+    def _summarize_candidate_channels(
+        raw_candidates: list[dict[str, Any]],
+        *,
+        top_k: int,
+    ) -> dict[str, Any]:
+        fts_candidates_count = 0
+        vec_candidates_count = 0
+        consequence_candidates_count = 0
+        multi_channel_candidates_count = 0
+        top_candidates = raw_candidates[:top_k]
+        combination_counts: dict[str, int] = {}
+
+        for candidate in raw_candidates:
+            sources = ContextCacheService._candidate_sources(candidate)
+            if "fts" in sources:
+                fts_candidates_count += 1
+            if "embedding" in sources:
+                vec_candidates_count += 1
+            if "consequence" in sources:
+                consequence_candidates_count += 1
+            if len(sources) >= 2:
+                multi_channel_candidates_count += 1
+
+        for candidate in top_candidates:
+            label = "+".join(ContextCacheService._candidate_sources(candidate)) or "unknown"
+            combination_counts[label] = combination_counts.get(label, 0) + 1
+
+        top_k_channel_distribution = {
+            label: count / len(top_candidates)
+            for label, count in combination_counts.items()
+        } if top_candidates else {}
+
+        return {
+            "fts_candidates_count": fts_candidates_count,
+            "vec_candidates_count": vec_candidates_count,
+            "consequence_candidates_count": consequence_candidates_count,
+            "multi_channel_candidates_count": multi_channel_candidates_count,
+            "top_k_channel_distribution": top_k_channel_distribution,
+        }
+
+    @staticmethod
+    def _candidate_sources(candidate: dict[str, Any]) -> list[str]:
+        raw_sources = candidate.get("retrieval_sources")
+        if isinstance(raw_sources, list):
+            return [str(source) for source in raw_sources]
+        raw_source = candidate.get("retrieval_source")
+        if isinstance(raw_source, str) and raw_source:
+            return [source for source in raw_source.split("+") if source]
+        return []
 
     async def _acquire_guard(self, guard_key: str) -> str:
         deadline = perf_counter() + CACHE_GUARD_ACQUIRE_TIMEOUT_SECONDS

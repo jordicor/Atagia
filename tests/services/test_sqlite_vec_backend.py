@@ -30,11 +30,13 @@ class EmbeddingProvider(LLMProvider):
 
     def __init__(self, vectors_by_text: dict[str, list[float]]) -> None:
         self.vectors_by_text = dict(vectors_by_text)
+        self.requests: list[LLMEmbeddingRequest] = []
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         raise AssertionError("Completions are not used in sqlite-vec backend tests")
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        self.requests.append(request)
         return LLMEmbeddingResponse(
             provider=self.name,
             model=request.model,
@@ -114,6 +116,7 @@ async def _build_backend(database_path: str = ":memory:"):
     provider = EmbeddingProvider(
         {
             "memory one": [1.0, 0.0],
+            "memory one\nretry policies for websocket incidents": [1.0, 0.0],
             "memory two": [0.0, 1.0],
             "query one": [1.0, 0.0],
             "query none": [-1.0, 0.0],
@@ -126,12 +129,12 @@ async def _build_backend(database_path: str = ":memory:"):
         _settings(),
     )
     await backend.initialize()
-    return connection, backend
+    return connection, backend, provider
 
 
 @pytest.mark.asyncio
 async def test_upsert_stores_embedding_and_metadata() -> None:
-    connection, backend = await _build_backend()
+    connection, backend, _provider = await _build_backend()
     try:
         await _insert_stub_memory(connection, "mem_1", "usr_1")
         await backend.upsert(
@@ -151,7 +154,7 @@ async def test_upsert_stores_embedding_and_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_search_returns_nearest_neighbors_filtered_by_user_id() -> None:
-    connection, backend = await _build_backend()
+    connection, backend, _provider = await _build_backend()
     try:
         await _insert_stub_memory(connection, "mem_1", "usr_1")
         await _insert_stub_memory(connection, "mem_2", "usr_2")
@@ -176,7 +179,7 @@ async def test_search_returns_nearest_neighbors_filtered_by_user_id() -> None:
 
 @pytest.mark.asyncio
 async def test_search_returns_empty_when_no_matches_exist() -> None:
-    connection, backend = await _build_backend()
+    connection, backend, _provider = await _build_backend()
     try:
         matches = await backend.search("query none", "usr_1", top_k=5)
 
@@ -187,7 +190,7 @@ async def test_search_returns_empty_when_no_matches_exist() -> None:
 
 @pytest.mark.asyncio
 async def test_delete_removes_embedding_and_metadata() -> None:
-    connection, backend = await _build_backend()
+    connection, backend, _provider = await _build_backend()
     try:
         await _insert_stub_memory(connection, "mem_1", "usr_1")
         await backend.upsert(
@@ -209,7 +212,7 @@ async def test_delete_removes_embedding_and_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_upsert_twice_updates_existing_embedding_idempotently() -> None:
-    connection, backend = await _build_backend()
+    connection, backend, _provider = await _build_backend()
     try:
         await _insert_stub_memory(connection, "mem_1", "usr_1")
         await backend.upsert(
@@ -235,7 +238,7 @@ async def test_upsert_twice_updates_existing_embedding_idempotently() -> None:
 @pytest.mark.asyncio
 async def test_upsert_commits_metadata_durably(tmp_path: Path) -> None:
     database_path = str(tmp_path / "atagia-sqlite-vec.db")
-    connection, backend = await _build_backend(database_path)
+    connection, backend, _provider = await _build_backend(database_path)
     try:
         await _insert_stub_memory(connection, "mem_1", "usr_1")
         await backend.upsert(
@@ -259,7 +262,7 @@ async def test_upsert_commits_metadata_durably(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_delete_commits_metadata_removal_durably(tmp_path: Path) -> None:
     database_path = str(tmp_path / "atagia-sqlite-vec-delete.db")
-    connection, backend = await _build_backend(database_path)
+    connection, backend, _provider = await _build_backend(database_path)
     try:
         await _insert_stub_memory(connection, "mem_1", "usr_1")
         await backend.upsert(
@@ -279,3 +282,27 @@ async def test_delete_commits_metadata_removal_durably(tmp_path: Path) -> None:
         assert (await cursor.fetchone())["count"] == 0
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_upsert_embeds_canonical_and_index_text_together() -> None:
+    connection, backend, provider = await _build_backend()
+    try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
+        await backend.upsert(
+            "mem_1",
+            "memory one",
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:00:00+00:00",
+                "index_text": "retry policies for websocket incidents",
+            },
+        )
+
+        assert provider.requests[0].input_texts == [
+            "memory one\nretry policies for websocket incidents"
+        ]
+    finally:
+        await connection.close()

@@ -75,6 +75,7 @@ async def test_default_plan_matches_policy_retrieval_params() -> None:
         MemoryScope.ASSISTANT_MODE,
         MemoryScope.GLOBAL_USER,
     ]
+    assert plan.consequence_search_enabled is False
     assert plan.fts_queries == [
         "need help debugging websocket",
         "need help debugging",
@@ -102,6 +103,7 @@ async def test_ambiguity_need_broadens_scope_and_increases_limit() -> None:
         MemoryScope.WORKSPACE,
         MemoryScope.CONVERSATION,
     ]
+    assert plan.consequence_search_enabled is True
     assert plan.need_driven_boosts[NeedTrigger.AMBIGUITY] == 1.2
 
 
@@ -120,6 +122,238 @@ async def test_high_stakes_need_requires_regrounding() -> None:
 
     assert plan.require_evidence_regrounding is True
     assert plan.max_candidates == 37
+    assert plan.consequence_search_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_under_specified_request_broadens_scope_increases_limit_and_enables_consequence_search() -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 3, 30, 20, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="What should we do next?",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[_need(NeedTrigger.UNDER_SPECIFIED_REQUEST)],
+        cold_start=False,
+    )
+
+    assert plan.max_candidates == 37
+    assert plan.scope_filter == [
+        MemoryScope.GLOBAL_USER,
+        MemoryScope.ASSISTANT_MODE,
+        MemoryScope.WORKSPACE,
+        MemoryScope.CONVERSATION,
+    ]
+    assert plan.consequence_search_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_pattern_query_targets_episode_then_atomic_levels() -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 3, 30, 20, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="What patterns or preferences do I usually show when debugging?",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[],
+        cold_start=False,
+    )
+
+    assert plan.retrieval_levels == [1, 0]
+
+
+@pytest.mark.asyncio
+async def test_abstract_multi_session_query_targets_thematic_then_episode_then_atomic_levels() -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 3, 30, 20, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="What themes recur across conversations overall?",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[],
+        cold_start=False,
+    )
+
+    assert plan.retrieval_levels == [2, 1, 0]
+
+
+@pytest.mark.asyncio
+async def test_temporal_query_detects_named_month_and_removes_date_tokens_from_fts() -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="What was true in January 2024 about my travel plans?",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[],
+        cold_start=False,
+    )
+
+    assert plan.temporal_query_range is not None
+    assert plan.temporal_query_range.start == datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    assert plan.temporal_query_range.end == datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    joined_queries = " ".join(plan.fts_queries)
+    assert "january" not in joined_queries
+    assert "2024" not in joined_queries
+    assert plan.retrieval_levels == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_temporal_query_detects_prefixed_month_without_explicit_year() -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="What changed in March for the project?",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[],
+        cold_start=False,
+    )
+
+    assert plan.temporal_query_range is not None
+    assert plan.temporal_query_range.start == datetime(2026, 3, 1, 0, 0, tzinfo=timezone.utc)
+    assert plan.temporal_query_range.end == datetime(2026, 3, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    assert "march" not in " ".join(plan.fts_queries)
+
+
+@pytest.mark.asyncio
+async def test_temporal_query_detects_iso_date_and_removes_date_tokens_from_fts() -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="What happened on 2026-01-15 with the deploy?",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[],
+        cold_start=False,
+    )
+
+    assert plan.temporal_query_range is not None
+    assert plan.temporal_query_range.start == datetime(2026, 1, 15, 0, 0, tzinfo=timezone.utc)
+    assert plan.temporal_query_range.end == datetime(2026, 1, 15, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    joined_queries = " ".join(plan.fts_queries)
+    assert "2026" not in joined_queries
+    assert "01" not in joined_queries
+    assert "15" not in joined_queries
+
+
+@pytest.mark.asyncio
+async def test_temporal_query_detects_relative_day_from_clock() -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="What happened yesterday with the deploy?",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[],
+        cold_start=False,
+    )
+
+    assert plan.temporal_query_range is not None
+    assert plan.temporal_query_range.start == datetime(2026, 4, 4, 0, 0, tzinfo=timezone.utc)
+    assert plan.temporal_query_range.end == datetime(2026, 4, 4, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    assert "yesterday" not in " ".join(plan.fts_queries)
+
+
+@pytest.mark.asyncio
+async def test_temporal_query_detects_last_month_window() -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="What changed last month in the project?",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[],
+        cold_start=False,
+    )
+
+    assert plan.temporal_query_range is not None
+    assert plan.temporal_query_range.start == datetime(2026, 3, 1, 0, 0, tzinfo=timezone.utc)
+    assert plan.temporal_query_range.end == datetime(2026, 3, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message_text", "expected_start", "expected_end"),
+    [
+        (
+            "What do I have next week?",
+            datetime(2026, 4, 6, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 4, 12, 23, 59, 59, 999999, tzinfo=timezone.utc),
+        ),
+        (
+            "What changes next month?",
+            datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 5, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
+        ),
+        (
+            "What is planned next year?",
+            datetime(2027, 1, 1, 0, 0, tzinfo=timezone.utc),
+            datetime(2027, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
+        ),
+    ],
+)
+async def test_temporal_query_detects_next_relative_spans(
+    message_text: str,
+    expected_start: datetime,
+    expected_end: datetime,
+) -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text=message_text,
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[],
+        cold_start=False,
+    )
+
+    assert plan.temporal_query_range is not None
+    assert plan.temporal_query_range.start == expected_start
+    assert plan.temporal_query_range.end == expected_end
+
+
+@pytest.mark.asyncio
+async def test_temporal_query_does_not_treat_modal_may_as_month() -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="May I get a status update on the deploy?",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[],
+        cold_start=False,
+    )
+
+    assert plan.temporal_query_range is None
+    assert "deploy" in " ".join(plan.fts_queries)
+
+
+@pytest.mark.asyncio
+async def test_temporal_query_does_not_treat_non_temporal_march_as_month() -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="Should we march on the deploy plan now?",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[],
+        cold_start=False,
+    )
+
+    assert plan.temporal_query_range is None
+    assert "march" in " ".join(plan.fts_queries)
 
 
 @pytest.mark.asyncio
@@ -180,6 +414,7 @@ async def test_multiple_needs_compose_without_losing_high_stakes_flags() -> None
     ]
     assert plan.need_driven_boosts[NeedTrigger.HIGH_STAKES] == 1.25
     assert plan.need_driven_boosts[NeedTrigger.LOOP] == 1.25
+    assert plan.consequence_search_enabled is True
 
 
 @pytest.mark.asyncio
@@ -208,6 +443,33 @@ async def test_mode_shift_resets_first_then_other_needs_reapply_adjustments() ->
     ]
     assert plan.need_driven_boosts[NeedTrigger.MODE_SHIFT] == 1.0
     assert plan.need_driven_boosts[NeedTrigger.HIGH_STAKES] == 1.25
+    assert plan.consequence_search_enabled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "need_type",
+    [
+        NeedTrigger.FOLLOW_UP_FAILURE,
+        NeedTrigger.LOOP,
+        NeedTrigger.HIGH_STAKES,
+        NeedTrigger.UNDER_SPECIFIED_REQUEST,
+        NeedTrigger.AMBIGUITY,
+    ],
+)
+async def test_consequence_search_needs_set_explicit_plan_flag(need_type: NeedTrigger) -> None:
+    planner = RetrievalPlanner(FrozenClock(datetime(2026, 3, 30, 20, 0, tzinfo=timezone.utc)))
+    policy = _resolved_policy()
+
+    plan = planner.build_plan(
+        message_text="We are stuck and need the next safest step.",
+        conversation_context=_context(),
+        resolved_policy=policy,
+        detected_needs=[_need(need_type)],
+        cold_start=False,
+    )
+
+    assert plan.consequence_search_enabled is True
 
 
 async def _build_candidate_runtime():
@@ -229,6 +491,7 @@ def _plan(
     *,
     scope_filter: list[MemoryScope],
     status_filter: list[MemoryStatus],
+    retrieval_levels: list[int] | None = None,
     skip_retrieval: bool = False,
 ) -> RetrievalPlan:
     return RetrievalPlan(
@@ -241,6 +504,7 @@ def _plan(
         max_candidates=10,
         max_context_items=8,
         privacy_ceiling=1,
+        retrieval_levels=retrieval_levels or [0],
         require_evidence_regrounding=False,
         need_driven_boosts={},
         skip_retrieval=skip_retrieval,
@@ -314,6 +578,83 @@ async def test_candidate_search_respects_scope_filter() -> None:
         )
 
         assert [candidate["scope"] for candidate in candidates] == ["conversation"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_candidate_search_filters_summary_mirrors_by_retrieval_levels() -> None:
+    connection, memories, search = await _build_candidate_runtime()
+    try:
+        await memories.create_memory_object(
+            user_id="usr_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.ASSISTANT_MODE,
+            canonical_text="debugging preference memory",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            memory_id="mem_atomic",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            object_type=MemoryObjectType.SUMMARY_VIEW,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="episode debugging preference summary",
+            payload={
+                "summary_kind": "episode",
+                "hierarchy_level": 1,
+                "source_object_ids": ["mem_atomic"],
+            },
+            source_kind=MemorySourceKind.SUMMARIZED,
+            confidence=0.7,
+            privacy_level=0,
+            memory_id="sum_mem_episode",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            object_type=MemoryObjectType.SUMMARY_VIEW,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="thematic debugging preference summary",
+            payload={
+                "summary_kind": "thematic_profile",
+                "hierarchy_level": 2,
+                "source_object_ids": ["mem_atomic"],
+            },
+            source_kind=MemorySourceKind.SUMMARIZED,
+            confidence=0.7,
+            privacy_level=0,
+            memory_id="sum_mem_thematic",
+        )
+
+        plan_episode = _plan(
+            scope_filter=[MemoryScope.ASSISTANT_MODE, MemoryScope.GLOBAL_USER],
+            status_filter=[MemoryStatus.ACTIVE],
+            retrieval_levels=[1, 0],
+        ).model_copy(update={"fts_queries": ["debugging preference"]})
+        plan_atomic = _plan(
+            scope_filter=[MemoryScope.ASSISTANT_MODE, MemoryScope.GLOBAL_USER],
+            status_filter=[MemoryStatus.ACTIVE],
+            retrieval_levels=[0],
+        ).model_copy(update={"fts_queries": ["debugging preference"]})
+        plan_all = _plan(
+            scope_filter=[MemoryScope.ASSISTANT_MODE, MemoryScope.GLOBAL_USER],
+            status_filter=[MemoryStatus.ACTIVE],
+            retrieval_levels=[2, 1, 0],
+        ).model_copy(update={"fts_queries": ["debugging preference"]})
+
+        episode_results = await search.search(plan_episode, user_id="usr_1")
+        atomic_results = await search.search(plan_atomic, user_id="usr_1")
+        all_results = await search.search(plan_all, user_id="usr_1")
+
+        assert {candidate["id"] for candidate in episode_results} == {"mem_atomic", "sum_mem_episode"}
+        assert [candidate["id"] for candidate in atomic_results] == ["mem_atomic"]
+        assert {candidate["id"] for candidate in all_results} == {
+            "mem_atomic",
+            "sum_mem_episode",
+            "sum_mem_thematic",
+        }
     finally:
         await connection.close()
 

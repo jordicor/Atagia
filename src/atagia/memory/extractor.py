@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import html
 import hashlib
 import json
@@ -14,6 +15,7 @@ from typing import Any
 from atagia.core.belief_repository import BeliefRepository
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
+from atagia.core.consent_repository import MemoryConsentProfileRepository
 from atagia.core.repositories import MemoryObjectRepository, MessageRepository
 from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
 from atagia.memory.chunking_config import PRIOR_CHUNK_CONTEXT_MAX_TOKENS
@@ -29,6 +31,7 @@ from atagia.models.schemas_memory import (
     ExtractedStateUpdate,
     ExtractionConversationContext,
     ExtractionResult,
+    MemoryCategory,
     MemoryObjectType,
     MemoryScope,
     MemoryStatus,
@@ -44,6 +47,8 @@ NORMAL_BELIEF_ACTIVE_THRESHOLD = 0.7
 COLD_START_BELIEF_ACTIVE_THRESHOLD = 0.85
 DEFAULT_ACTIVE_THRESHOLD = 0.5
 DEDUPE_TTL_SECONDS = 24 * 60 * 60
+CONSENT_CONFIRM_THRESHOLD = 2
+CONSENT_DECLINE_SUPPRESSION_THRESHOLD = 2
 logger = logging.getLogger(__name__)
 
 EXTRACTION_PROMPT_TEMPLATE = """You are extracting durable memory candidates for an assistant memory engine.
@@ -95,12 +100,22 @@ Rules:
 - Do not invent facts, preferences, or stable traits.
 - Set nothing_durable=true when the message is purely transactional or has no durable memory value.
 - Keep canonical_text concise and grounded in the source message.
+- When useful, add index_text: 1-2 short sentences of retrieval-oriented context that preserves the original fact and adds discoverability context.
 - For beliefs, use claim_key and claim_value only when the message supports a stable interpretation.
 - Normalize every claim_key to the schema `domain.subdomain.aspect`.
 - claim_key must be lowercase, in English, dot-separated, and stable across paraphrases.
 - Reuse normalized vocabulary patterns instead of inventing synonyms.
 - Examples of good claim_keys: `response_style.verbosity`, `coding.language.primary`, `communication.formality`, `collaboration.autonomy`.
 - Contract signals represent collaboration preferences. State updates represent temporary current state.
+- For every extracted item, set:
+  - temporal_type: `permanent`, `bounded`, `event_triggered`, or `unknown`
+  - valid_from_iso / valid_to_iso as ISO-8601 timestamps when the message implies a durable time window
+  - temporal_confidence from 0.0 to 1.0
+- Use <message_timestamp> as the anchor for resolving relative dates like "yesterday", "today", "tomorrow", "next week", and "last month".
+- For timeless facts or stable traits, prefer temporal_type=`permanent` with null bounds.
+
+Natural memory annotations:
+{natural_capture_block}
 """
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
@@ -110,6 +125,12 @@ _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 class _ChunkExtraction:
     chunk: TextChunk
     result: ExtractionResult
+
+
+@dataclass(frozen=True, slots=True)
+class _PersistenceDecision:
+    status: MemoryStatus | None
+    skip_item: bool = False
 
 
 class MemoryExtractor:
@@ -144,6 +165,7 @@ class MemoryExtractor:
             model=self._extraction_model,
         )
         self._belief_repository = BeliefRepository(memory_repository._connection, clock)
+        self._consent_repository = MemoryConsentProfileRepository(memory_repository._connection, clock)
 
     async def extract(
         self,
@@ -212,9 +234,10 @@ class MemoryExtractor:
                 resolved_policy=resolved_policy,
                 cold_start=cold_start,
                 explicit_user_statement=explicit_user_statement,
+                occurred_at=resolved_occurred_at,
             )
 
-        pending_embedding_upserts: list[dict[str, str]] = []
+        pending_embedding_upserts: list[dict[str, Any]] = []
         persisted: list[dict[str, Any]] = []
         await self._memory_repository.begin()
         try:
@@ -230,6 +253,7 @@ class MemoryExtractor:
                         resolved_policy=resolved_policy,
                         cold_start=cold_start,
                         explicit_user_statement=explicit_user_statement,
+                        occurred_at=resolved_occurred_at,
                         chunk=chunk_extraction.chunk,
                         chunked=True,
                         commit=False,
@@ -244,6 +268,9 @@ class MemoryExtractor:
             await self._upsert_embedding(
                 memory_id=pending["memory_id"],
                 canonical_text=pending["canonical_text"],
+                index_text=pending.get("index_text"),
+                privacy_level=pending["privacy_level"],
+                preserve_verbatim=pending["preserve_verbatim"],
                 user_id=pending["user_id"],
                 object_type=pending["object_type"],
                 scope=pending["scope"],
@@ -354,6 +381,7 @@ class MemoryExtractor:
             indent=2,
             sort_keys=True,
         )
+        natural_capture_block = self._natural_capture_prompt_block(role)
         return EXTRACTION_PROMPT_TEMPLATE.format(
             role=escaped_role,
             message_timestamp_block=escaped_message_timestamp_block,
@@ -366,6 +394,25 @@ class MemoryExtractor:
             belief_threshold=belief_threshold,
             review_required_threshold=REVIEW_REQUIRED_CONFIDENCE,
             privacy_ceiling=resolved_policy.privacy_ceiling,
+            natural_capture_block=natural_capture_block,
+        )
+
+    @staticmethod
+    def _natural_capture_prompt_block(role: str) -> str:
+        category_values = ", ".join(category.value for category in MemoryCategory)
+        if role == "user":
+            return (
+                "The source role is `user`, so for every extracted item also set:\n"
+                f"- `memory_category`: one of [{category_values}]. Use `unknown` when the item is not a sensitive structured fact.\n"
+                "- `preserve_verbatim`: true only when the exact structured value must be retained verbatim in canonical_text; otherwise false.\n"
+                "- `informational_mention`: optional bool. Use it only as a prompt/debugging hint when the user casually shares a structured fact worth remembering.\n"
+                "- When `preserve_verbatim=true`, keep `canonical_text` exact and put any retrieval-safe gloss in `index_text` without repeating the secret value."
+            )
+        return (
+            "The source role is `assistant`. Keep the existing extraction behavior for assistant messages:\n"
+            "- leave `memory_category` as `unknown`\n"
+            "- leave `preserve_verbatim` as false\n"
+            "- do not use `informational_mention` unless it is needed for debugging a clearly structured extraction output"
         )
 
     async def _plan_extraction_chunks(self, message_text: str) -> ChunkingPlan:
@@ -506,13 +553,15 @@ class MemoryExtractor:
         resolved_policy: ResolvedPolicy,
         cold_start: bool,
         explicit_user_statement: bool,
+        occurred_at: str | None = None,
         chunk: TextChunk | None = None,
         chunked: bool = False,
         commit: bool = True,
-        pending_embedding_upserts: list[dict[str, str]] | None = None,
+        pending_embedding_upserts: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         persisted: list[dict[str, Any]] = []
         embedding_upserts = pending_embedding_upserts if pending_embedding_upserts is not None else []
+        consent_profiles: dict[MemoryCategory, dict[str, Any] | None] = {}
         try:
             for object_type, item in self._iter_items(result):
                 if item.scope not in resolved_policy.allowed_scopes:
@@ -530,6 +579,26 @@ class MemoryExtractor:
                     conversation_id=context.conversation_id,
                 )
                 if scope_identifiers is None:
+                    continue
+                consent_profile = None
+                if role == "user":
+                    if item.memory_category not in consent_profiles:
+                        consent_profiles[item.memory_category] = await self._consent_repository.get_profile(
+                            context.user_id,
+                            item.memory_category,
+                        )
+                    consent_profile = consent_profiles[item.memory_category]
+                decision = self._resolve_persistence_decision(
+                    item=item,
+                    object_type=object_type,
+                    privacy_ceiling=resolved_policy.privacy_ceiling,
+                    message_text=message_text,
+                    role=role,
+                    cold_start=cold_start,
+                    explicit_user_statement=explicit_user_statement,
+                    consent_profile=consent_profile,
+                )
+                if decision.skip_item or decision.status is None:
                     continue
                 extraction_hash = self._compute_extraction_hash(
                     item.canonical_text,
@@ -559,6 +628,8 @@ class MemoryExtractor:
                     continue
 
                 payload = dict(item.payload)
+                if item.informational_mention is not None:
+                    payload["informational_mention"] = item.informational_mention
                 if chunked:
                     payload["chunk_index"] = chunk.chunk_index if chunk is not None else 1
                     payload["chunk_count"] = chunk.chunk_count if chunk is not None else 1
@@ -573,6 +644,11 @@ class MemoryExtractor:
                 if isinstance(item, ExtractedBelief):
                     payload["claim_key"] = item.claim_key
                     payload["claim_value"] = item.claim_value
+                payload["temporal_confidence"] = item.temporal_confidence
+                valid_from, valid_to, temporal_type = self._resolved_temporal_fields(
+                    item,
+                    occurred_at=occurred_at,
+                )
 
                 created = await self._memory_repository.create_memory_object(
                     user_id=context.user_id,
@@ -582,6 +658,7 @@ class MemoryExtractor:
                     object_type=object_type,
                     scope=item.scope,
                     canonical_text=item.canonical_text,
+                    index_text=item.index_text,
                     payload=payload,
                     extraction_hash=extraction_hash,
                     source_kind=item.source_kind,
@@ -590,16 +667,12 @@ class MemoryExtractor:
                     vitality=self._default_vitality(object_type),
                     maya_score=self._default_maya_score(object_type),
                     privacy_level=item.privacy_level,
-                    status=self._resolve_status(
-                        item=item,
-                        object_type=object_type,
-                        privacy_level=item.privacy_level,
-                        privacy_ceiling=resolved_policy.privacy_ceiling,
-                        message_text=message_text,
-                        role=role,
-                        cold_start=cold_start,
-                        explicit_user_statement=explicit_user_statement,
-                    ),
+                    memory_category=item.memory_category,
+                    preserve_verbatim=item.preserve_verbatim,
+                    valid_from=valid_from,
+                    valid_to=valid_to,
+                    temporal_type=temporal_type,
+                    status=decision.status,
                     commit=False,
                 )
                 if isinstance(item, ExtractedBelief):
@@ -624,6 +697,9 @@ class MemoryExtractor:
                     {
                         "memory_id": str(created["id"]),
                         "canonical_text": item.canonical_text,
+                        "index_text": item.index_text,
+                        "privacy_level": item.privacy_level,
+                        "preserve_verbatim": item.preserve_verbatim,
                         "user_id": context.user_id,
                         "object_type": object_type.value,
                         "scope": item.scope.value,
@@ -645,6 +721,9 @@ class MemoryExtractor:
                 await self._upsert_embedding(
                     memory_id=pending["memory_id"],
                     canonical_text=pending["canonical_text"],
+                    index_text=pending.get("index_text"),
+                    privacy_level=pending["privacy_level"],
+                    preserve_verbatim=pending["preserve_verbatim"],
                     user_id=pending["user_id"],
                     object_type=pending["object_type"],
                     scope=pending["scope"],
@@ -652,11 +731,48 @@ class MemoryExtractor:
                 )
         return persisted
 
+    def _resolved_temporal_fields(
+        self,
+        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        *,
+        occurred_at: str | None,
+    ) -> tuple[str | None, str | None, str]:
+        if item.temporal_confidence < 0.6:
+            return None, None, "unknown"
+        anchor = self._parse_temporal_datetime(occurred_at)
+        valid_from = self._normalize_temporal_iso(item.valid_from_iso, anchor=anchor)
+        valid_to = self._normalize_temporal_iso(item.valid_to_iso, anchor=anchor)
+        return valid_from, valid_to, item.temporal_type
+
+    @staticmethod
+    def _parse_temporal_datetime(value: str | None) -> datetime | None:
+        normalized = normalize_optional_timestamp(value)
+        if normalized is None:
+            return None
+        return datetime.fromisoformat(normalized)
+
+    @classmethod
+    def _normalize_temporal_iso(
+        cls,
+        value: str | None,
+        *,
+        anchor: datetime | None,
+    ) -> str | None:
+        parsed = cls._parse_temporal_datetime(value)
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None and anchor is not None and anchor.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=anchor.tzinfo)
+        return parsed.isoformat()
+
     async def _upsert_embedding(
         self,
         *,
         memory_id: str,
         canonical_text: str,
+        index_text: str | None,
+        privacy_level: int,
+        preserve_verbatim: bool,
         user_id: str,
         object_type: str,
         scope: str,
@@ -664,15 +780,26 @@ class MemoryExtractor:
     ) -> None:
         if self._embedding_index.vector_limit == 0:
             return
+        embedding_text = canonical_text
+        embedding_index_text = index_text
         try:
+            if preserve_verbatim and privacy_level >= 2:
+                protected_index_text = str(index_text or "").strip()
+                if not protected_index_text:
+                    raise ValueError(
+                        "Protected verbatim memories require index_text for safe embedding generation"
+                    )
+                embedding_text = protected_index_text
+                embedding_index_text = None
             await self._embedding_index.upsert(
                 memory_id=memory_id,
-                text=canonical_text,
+                text=embedding_text,
                 metadata={
                     "user_id": user_id,
                     "object_type": object_type,
                     "scope": scope,
                     "created_at": created_at,
+                    "index_text": embedding_index_text,
                 },
             )
         except Exception:
@@ -720,6 +847,55 @@ class MemoryExtractor:
         ):
             return MemoryStatus.ACTIVE
         return MemoryStatus.REVIEW_REQUIRED
+
+    def _resolve_persistence_decision(
+        self,
+        *,
+        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        object_type: MemoryObjectType,
+        privacy_ceiling: int,
+        message_text: str,
+        role: str,
+        cold_start: bool,
+        explicit_user_statement: bool,
+        consent_profile: dict[str, Any] | None,
+    ) -> _PersistenceDecision:
+        if role != "user":
+            return _PersistenceDecision(
+                status=self._resolve_status(
+                    item=item,
+                    object_type=object_type,
+                    privacy_level=item.privacy_level,
+                    privacy_ceiling=privacy_ceiling,
+                    message_text=message_text,
+                    role=role,
+                    cold_start=cold_start,
+                    explicit_user_statement=explicit_user_statement,
+                )
+            )
+
+        confirmed_count = int(consent_profile.get("confirmed_count", 0)) if consent_profile is not None else 0
+        declined_count = int(consent_profile.get("declined_count", 0)) if consent_profile is not None else 0
+        if declined_count >= CONSENT_DECLINE_SUPPRESSION_THRESHOLD:
+            return _PersistenceDecision(status=None, skip_item=True)
+        # For user-role items with privacy_level >= 3, consent gating takes precedence
+        # over the ceiling-based REVIEW_REQUIRED path. Retrieval-time
+        # privacy_level <= ceiling filtering remains the actual enforcement layer,
+        # so pending confirmation is the correct initial status here.
+        if item.privacy_level >= 3 and confirmed_count < CONSENT_CONFIRM_THRESHOLD:
+            return _PersistenceDecision(status=MemoryStatus.PENDING_USER_CONFIRMATION)
+        return _PersistenceDecision(
+            status=self._resolve_status(
+                item=item,
+                object_type=object_type,
+                privacy_level=item.privacy_level,
+                privacy_ceiling=privacy_ceiling,
+                message_text=message_text,
+                role=role,
+                cold_start=cold_start,
+                explicit_user_statement=explicit_user_statement,
+            )
+        )
 
     def _active_threshold(
         self,

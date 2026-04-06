@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+import re
 from typing import Any, AsyncIterator, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 T = TypeVar("T")
+_JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 
 
 class LLMError(RuntimeError):
@@ -224,10 +226,37 @@ class LLMClient(Generic[T]):
         request: LLMCompletionRequest,
         schema: type[T],
     ) -> T:
-        response = await self.complete(request)
+        used_schema_fallback = False
         try:
-            payload = json.loads(response.output_text)
+            response = await self.complete(request)
+        except LLMError as exc:
+            if not self._should_retry_without_schema(exc, request):
+                raise
+            used_schema_fallback = True
+            response = await self.complete(
+                request.model_copy(
+                    update={
+                        "response_schema": None,
+                        "messages": [
+                            *request.messages,
+                            LLMMessage(
+                                role="user",
+                                content=(
+                                    "Return raw JSON only. Do not include markdown fences, "
+                                    "explanations, or any text outside the JSON object."
+                                ),
+                            ),
+                        ],
+                    }
+                )
+            )
+        try:
+            payload = self._decode_json_payload(response.output_text)
         except json.JSONDecodeError as exc:
+            if used_schema_fallback:
+                raise StructuredOutputError(
+                    "Provider returned non-JSON structured output after schema fallback"
+                ) from exc
             raise StructuredOutputError("Provider returned non-JSON structured output") from exc
 
         adapter = TypeAdapter(schema)
@@ -251,3 +280,37 @@ class LLMClient(Generic[T]):
         if last_error is None:
             raise LLMError("LLM operation failed without a captured error")
         raise last_error
+
+    @staticmethod
+    def _should_retry_without_schema(exc: LLMError, request: LLMCompletionRequest) -> bool:
+        if request.response_schema is None:
+            return False
+        message = str(exc).lower()
+        return (
+            "compiled grammar is too large" in message
+            or "additionalproperties" in message and "must be explicitly set to false" in message
+        )
+
+    @staticmethod
+    def _decode_json_payload(output_text: str) -> Any:
+        try:
+            return json.loads(output_text)
+        except json.JSONDecodeError:
+            pass
+
+        stripped = output_text.strip()
+        fence_match = _JSON_FENCE_PATTERN.search(stripped)
+        if fence_match is not None:
+            fenced_payload = fence_match.group(1).strip()
+            return json.loads(fenced_payload)
+
+        decoder = json.JSONDecoder()
+        for index, character in enumerate(stripped):
+            if character not in "[{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(stripped[index:])
+                return payload
+            except json.JSONDecodeError:
+                continue
+        raise json.JSONDecodeError("Expecting value", output_text, 0)

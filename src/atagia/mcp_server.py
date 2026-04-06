@@ -246,8 +246,6 @@ async def _search_memories_impl(
             "status": str(row.get("status", "")),
         }
         for row in rows
-        if str(row.get("status"))
-        not in (MemoryStatus.DELETED.value, MemoryStatus.ARCHIVED.value)
     ]
     return json.dumps(filtered, ensure_ascii=False, sort_keys=True)
 
@@ -262,16 +260,17 @@ async def _list_memories_impl(
     runtime = await _runtime(engine)
     connection = await runtime.open_connection()
     try:
-        rows = await MemoryObjectRepository(connection, runtime.clock).list_for_user(user_id)
+        rows = await MemoryObjectRepository(connection, runtime.clock).list_for_user(
+            user_id,
+            statuses=(MemoryStatus.ACTIVE, MemoryStatus.ARCHIVED),
+        )
     finally:
         await connection.close()
     normalized_type = memory_type.strip() if memory_type is not None else None
     filtered_rows = [
         row
         for row in rows
-        if str(row.get("status"))
-        not in (MemoryStatus.DELETED.value, MemoryStatus.ARCHIVED.value)
-        and (normalized_type is None or str(row.get("object_type")) == normalized_type)
+        if normalized_type is None or str(row.get("object_type")) == normalized_type
     ]
     filtered_rows.sort(key=lambda row: (str(row.get("created_at", "")), str(row.get("id", ""))), reverse=True)
     payload = [

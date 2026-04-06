@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
@@ -31,6 +32,8 @@ from atagia.services.chat_support import (
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.errors import ConversationNotFoundError, LLMUnavailableError
 from atagia.services.llm_client import LLMCompletionRequest, LLMError, LLMMessage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -203,10 +206,11 @@ class ChatService:
                                 "zero_candidates": not bool(
                                     resolution.composed_context.selected_memory_ids
                                 ),
-                                "background_tasks_enqueued": True,
+                                "background_tasks_enqueued": False,
                                 "scored_candidates": resolution.scored_candidates,
                                 "stage_timings_ms": resolution.stage_timings,
                                 "transcript_window": transcript_trace,
+                                **resolution.candidate_search_summary,
                             },
                         },
                         commit=False,
@@ -215,83 +219,141 @@ class ChatService:
                 except Exception:
                     await connection.rollback()
                     raise
+
+                post_commit_errors: list[str] = []
+                enqueued_job_ids: list[str] = []
+                background_tasks_enqueued = False
+
+                try:
+                    await cache_service.publish_pending_cache_entry(
+                        resolution,
+                        last_retrieval_message_seq=int(user_message["seq"]),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to publish pending cache entry for retrieval_event_id=%s",
+                        retrieval_event["id"],
+                    )
+                    post_commit_errors.append("cache_publish_failed")
+
+                if self.runtime.settings.lifecycle_lazy_enabled:
+                    try:
+                        self.runtime.spawn_background_task(
+                            piggyback_lifecycle(self.runtime),
+                            name="atagia-lifecycle-piggyback",
+                        )
+                    except Exception:
+                        logger.exception("Failed to spawn lifecycle piggyback task")
+                        post_commit_errors.append("lifecycle_spawn_failed")
+
+                final_window = [
+                    {"role": str(message["role"]), "content": str(message["text"])}
+                    for message in [*prior_messages, user_message, assistant_message][-RECENT_WINDOW_MESSAGES:]
+                ]
+                try:
+                    await self.runtime.storage_backend.set_recent_window(
+                        f"{user_id}:{conversation_id}",
+                        final_window,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to update recent window for conversation_id=%s",
+                        conversation_id,
+                    )
+                    post_commit_errors.append("recent_window_failed")
+
+                try:
+                    await self.runtime.storage_backend.set_context_view(
+                        retrieval_event["id"],
+                        resolution.composed_context.model_dump(mode="json"),
+                        ttl_seconds=CONTEXT_VIEW_TTL_SECONDS,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to store context view for retrieval_event_id=%s",
+                        retrieval_event["id"],
+                    )
+                    post_commit_errors.append("context_view_failed")
+
+                user_jobs = build_message_jobs(
+                    clock=self.runtime.clock,
+                    conversation=conversation,
+                    message_id=str(user_message["id"]),
+                    prior_messages=prior_messages,
+                    message_text=message_text,
+                    occurred_at=resolve_message_occurred_at(user_message),
+                    role="user",
+                )
+                assistant_jobs = build_message_jobs(
+                    clock=self.runtime.clock,
+                    conversation=conversation,
+                    message_id=str(assistant_message["id"]),
+                    prior_messages=[*prior_messages, user_message],
+                    message_text=llm_response.output_text,
+                    occurred_at=resolve_message_occurred_at(assistant_message),
+                    role="assistant",
+                )
+                try:
+                    enqueued_job_ids = await enqueue_message_jobs(
+                        storage_backend=self.runtime.storage_backend,
+                        jobs=[*user_jobs, *assistant_jobs],
+                    )
+                    background_tasks_enqueued = True
+                except Exception:
+                    logger.exception(
+                        "Failed to enqueue post-response jobs for retrieval_event_id=%s",
+                        retrieval_event["id"],
+                    )
+                    post_commit_errors.append("job_enqueue_failed")
+
+                try:
+                    await events.update_outcome_fields(
+                        str(retrieval_event["id"]),
+                        user_id,
+                        {
+                            "background_tasks_enqueued": background_tasks_enqueued,
+                            "post_commit_errors": post_commit_errors,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to update retrieval outcome metadata for retrieval_event_id=%s",
+                        retrieval_event["id"],
+                    )
+
+                debug_payload: dict[str, Any] | None = None
+                if debug:
+                    debug_payload = {
+                        "cold_start": cold_start,
+                        "detected_needs": list(resolution.detected_needs),
+                        "retrieval_plan": dict(resolution.source_retrieval_plan),
+                        "selected_memory_ids": resolution.composed_context.selected_memory_ids,
+                        "context_view": resolution.composed_context.model_dump(mode="json"),
+                        "cache": {
+                            "from_cache": resolution.from_cache,
+                            "staleness": resolution.staleness,
+                            "next_refresh_strategy": resolution.next_refresh_strategy,
+                            "cache_age_seconds": resolution.cache_age_seconds,
+                            "cache_source": resolution.cache_source,
+                            "need_detection_skipped": resolution.need_detection_skipped,
+                            "cache_key": resolution.cache_key,
+                        },
+                        "enqueued_job_ids": enqueued_job_ids,
+                        "post_commit_errors": post_commit_errors,
+                    }
+                    if llm_response.thinking:
+                        debug_payload["thinking"] = llm_response.thinking
+
+                return ChatResult(
+                    conversation_id=conversation_id,
+                    request_message_id=str(user_message["id"]),
+                    response_message_id=str(assistant_message["id"]),
+                    response_text=llm_response.output_text,
+                    retrieval_event_id=str(retrieval_event["id"]),
+                    composed_context=resolution.composed_context,
+                    detected_needs=resolution.detected_needs,
+                    memories_used=summarize_memory_summaries(resolution.memory_summaries),
+                    debug=debug_payload,
+                )
             finally:
                 await connection.close()
-            await cache_service.publish_pending_cache_entry(
-                resolution,
-                last_retrieval_message_seq=int(user_message["seq"]),
-            )
-            if self.runtime.settings.lifecycle_lazy_enabled:
-                self.runtime.spawn_background_task(
-                    piggyback_lifecycle(self.runtime),
-                    name="atagia-lifecycle-piggyback",
-                )
-            final_window = [
-                {"role": str(message["role"]), "content": str(message["text"])}
-                for message in [*prior_messages, user_message, assistant_message][-RECENT_WINDOW_MESSAGES:]
-            ]
-            await self.runtime.storage_backend.set_recent_window(
-                f"{user_id}:{conversation_id}",
-                final_window,
-            )
-            await self.runtime.storage_backend.set_context_view(
-                retrieval_event["id"],
-                resolution.composed_context.model_dump(mode="json"),
-                ttl_seconds=CONTEXT_VIEW_TTL_SECONDS,
-            )
-            user_jobs = build_message_jobs(
-                clock=self.runtime.clock,
-                conversation=conversation,
-                message_id=str(user_message["id"]),
-                prior_messages=prior_messages,
-                message_text=message_text,
-                occurred_at=resolve_message_occurred_at(user_message),
-                role="user",
-            )
-            assistant_jobs = build_message_jobs(
-                clock=self.runtime.clock,
-                conversation=conversation,
-                message_id=str(assistant_message["id"]),
-                prior_messages=[*prior_messages, user_message],
-                message_text=llm_response.output_text,
-                occurred_at=resolve_message_occurred_at(assistant_message),
-                role="assistant",
-            )
-            enqueued_job_ids = await enqueue_message_jobs(
-                storage_backend=self.runtime.storage_backend,
-                jobs=[*user_jobs, *assistant_jobs],
-            )
-
-            debug_payload: dict[str, Any] | None = None
-            if debug:
-                debug_payload = {
-                    "cold_start": cold_start,
-                    "detected_needs": list(resolution.detected_needs),
-                    "retrieval_plan": dict(resolution.source_retrieval_plan),
-                    "selected_memory_ids": resolution.composed_context.selected_memory_ids,
-                    "context_view": resolution.composed_context.model_dump(mode="json"),
-                    "cache": {
-                        "from_cache": resolution.from_cache,
-                        "staleness": resolution.staleness,
-                        "next_refresh_strategy": resolution.next_refresh_strategy,
-                        "cache_age_seconds": resolution.cache_age_seconds,
-                        "cache_source": resolution.cache_source,
-                        "need_detection_skipped": resolution.need_detection_skipped,
-                        "cache_key": resolution.cache_key,
-                    },
-                    "enqueued_job_ids": enqueued_job_ids,
-                }
-                if llm_response.thinking:
-                    debug_payload["thinking"] = llm_response.thinking
-
-            return ChatResult(
-                conversation_id=conversation_id,
-                request_message_id=str(user_message["id"]),
-                response_message_id=str(assistant_message["id"]),
-                response_text=llm_response.output_text,
-                retrieval_event_id=str(retrieval_event["id"]),
-                composed_context=resolution.composed_context,
-                detected_needs=resolution.detected_needs,
-                memories_used=summarize_memory_summaries(resolution.memory_summaries),
-                debug=debug_payload,
-            )

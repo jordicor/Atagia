@@ -28,6 +28,10 @@ def _candidate(
     object_type: str = "evidence",
     confidence: float = 0.8,
     scope: str = "conversation",
+    payload_json: dict | None = None,
+    updated_at: str | None = None,
+    valid_from: str | None = None,
+    valid_to: str | None = None,
 ) -> ScoredCandidate:
     return ScoredCandidate(
         memory_id=memory_id,
@@ -37,6 +41,10 @@ def _candidate(
             "confidence": confidence,
             "scope": scope,
             "canonical_text": canonical_text,
+            "payload_json": payload_json or {},
+            "updated_at": updated_at,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
         },
         llm_applicability=0.7,
         retrieval_score=0.6,
@@ -239,6 +247,82 @@ def test_priority_ordering_prefers_higher_scored_candidates_first() -> None:
     assert "Lower-priority memory" not in context.memory_block
 
 
+def test_temporal_memory_includes_validity_window_in_rendered_block() -> None:
+    composer = _composer()
+    context = composer.compose(
+        scored_candidates=[
+            _candidate(
+                "mem_bounded",
+                final_score=0.9,
+                canonical_text="User painted a lake sunrise.",
+                valid_from="2022-05-15T00:00:00+00:00",
+                valid_to="2022-05-31T23:59:59+00:00",
+            ),
+            _candidate(
+                "mem_open",
+                final_score=0.8,
+                canonical_text="User signed up for pottery class.",
+                valid_from="2023-07-02T00:00:00+00:00",
+            ),
+            _candidate(
+                "mem_no_time",
+                final_score=0.7,
+                canonical_text="User prefers direct answers.",
+            ),
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=_resolved_policy(600),
+        conversation_messages=[],
+    )
+
+    # Bounded memory shows both dates
+    assert "valid: 2022-05-15T00:00:00+00:00 to 2022-05-31T23:59:59+00:00" in context.memory_block
+    # Open-ended (only valid_from) shows from-date and ?
+    assert "valid: 2023-07-02T00:00:00+00:00 to ?" in context.memory_block
+    # Non-temporal memory has no valid: segment
+    # (verified by making sure the line for mem_no_time does not include the marker)
+    lines = context.memory_block.splitlines()
+    no_time_line = next(line for line in lines if "User prefers direct answers." in line)
+    no_time_header = lines[lines.index(no_time_line) - 1]
+    assert "valid:" not in no_time_header
+
+
+def test_conversation_chunk_summary_includes_source_window_and_excerpt() -> None:
+    composer = _composer()
+    context = composer.compose(
+        scored_candidates=[
+            _candidate(
+                "sum_mem_chunk",
+                final_score=0.9,
+                canonical_text="Melanie signed up for a pottery class.",
+                object_type="summary_view",
+                scope="conversation",
+                payload_json={
+                    "summary_kind": "conversation_chunk",
+                    "hierarchy_level": 0,
+                    "source_excerpt_messages": [
+                        {
+                            "role": "assistant",
+                            "occurred_at": "2023-07-03T13:36:00",
+                            "text": "Melanie: I just signed up for a pottery class yesterday.",
+                        }
+                    ],
+                    "source_message_window_start_occurred_at": "2023-07-03T13:36:00",
+                    "source_message_window_end_occurred_at": "2023-07-03T13:36:00",
+                },
+            )
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=_resolved_policy(500),
+        conversation_messages=[],
+    )
+
+    assert "source_window: 2023-07-03T13:36:00 to 2023-07-03T13:36:00" in context.memory_block
+    assert "source_excerpt: assistant @ 2023-07-03T13:36:00: Melanie: I just signed up for a pottery class yesterday." in context.memory_block
+
+
 def test_empty_canonical_text_candidates_are_filtered_out() -> None:
     composer = _composer()
     context = composer.compose(
@@ -375,3 +459,262 @@ def test_workspace_rollup_none_keeps_workspace_block_empty() -> None:
     )
 
     assert context.workspace_block == ""
+
+
+def test_hierarchical_summary_reserves_budget_for_supporting_l0_memory() -> None:
+    composer = _composer()
+    context = composer.compose(
+        scored_candidates=[
+            _candidate(
+                "sum_mem_theme",
+                final_score=0.95,
+                canonical_text="Thematic profile summary.",
+                object_type="summary_view",
+                scope="global_user",
+                payload_json={
+                    "summary_kind": "thematic_profile",
+                    "hierarchy_level": 2,
+                    "source_object_ids": ["mem_support"],
+                    "source_claim_signatures": [],
+                },
+                updated_at="2026-03-30T12:00:00+00:00",
+            ),
+            _candidate(
+                "mem_support",
+                final_score=0.4,
+                canonical_text="Supporting atomic belief.",
+                object_type="belief",
+                scope="global_user",
+                payload_json={"claim_key": "workflow.debugging.style", "claim_value": "patch_first"},
+                updated_at="2026-03-30T11:00:00+00:00",
+            ),
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=_resolved_policy(400),
+        conversation_messages=[],
+    )
+
+    assert context.selected_memory_ids == ["mem_support", "sum_mem_theme"]
+    assert "Supporting atomic belief." in context.memory_block
+    assert "Thematic profile summary." in context.memory_block
+
+
+def test_conflicting_fresher_l0_demotes_hierarchical_summary() -> None:
+    composer = _composer()
+    context = composer.compose(
+        scored_candidates=[
+            _candidate(
+                "sum_mem_theme",
+                final_score=0.95,
+                canonical_text="Outdated thematic profile summary.",
+                object_type="summary_view",
+                scope="global_user",
+                payload_json={
+                    "summary_kind": "thematic_profile",
+                    "hierarchy_level": 2,
+                    "source_object_ids": ["mem_old"],
+                    "source_claim_signatures": [
+                        {"claim_key": "workflow.debugging.style", "claim_value": "patch_first"}
+                    ],
+                },
+                updated_at="2026-03-30T10:00:00+00:00",
+            ),
+            _candidate(
+                "mem_old",
+                final_score=0.5,
+                canonical_text="Older supporting belief.",
+                object_type="belief",
+                scope="global_user",
+                payload_json={"claim_key": "workflow.debugging.style", "claim_value": "patch_first"},
+                updated_at="2026-03-30T09:00:00+00:00",
+            ),
+            _candidate(
+                "mem_fresh",
+                final_score=0.45,
+                canonical_text="Fresher contradictory belief.",
+                object_type="belief",
+                scope="global_user",
+                payload_json={"claim_key": "workflow.debugging.style", "claim_value": "investigate_breadth_first"},
+                updated_at="2026-03-30T12:00:00+00:00",
+            ),
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=_resolved_policy(400),
+        conversation_messages=[],
+    )
+
+    assert "Outdated thematic profile summary." not in context.memory_block
+    assert "Fresher contradictory belief." in context.memory_block
+
+
+def test_thematic_profile_can_ground_through_episode_to_nested_l0_support() -> None:
+    composer = _composer()
+    policy = _resolved_policy(400).model_copy(
+        update={
+            "retrieval_params": _resolved_policy(400).retrieval_params.model_copy(
+                update={"final_context_items": 2}
+            )
+        }
+    )
+
+    context = composer.compose(
+        scored_candidates=[
+            _candidate(
+                "sum_mem_theme",
+                final_score=0.95,
+                canonical_text="Theme derived from an episode only.",
+                object_type="summary_view",
+                scope="global_user",
+                payload_json={
+                    "summary_kind": "thematic_profile",
+                    "hierarchy_level": 2,
+                    "source_object_ids": ["sum_mem_episode"],
+                    "source_claim_signatures": [],
+                },
+                updated_at="2026-03-30T12:00:00+00:00",
+            ),
+            _candidate(
+                "sum_mem_episode",
+                final_score=0.7,
+                canonical_text="Episode carrying the real support.",
+                object_type="summary_view",
+                scope="global_user",
+                payload_json={
+                    "summary_kind": "episode",
+                    "hierarchy_level": 1,
+                    "source_object_ids": ["mem_support"],
+                    "source_claim_signatures": [],
+                },
+                updated_at="2026-03-30T11:00:00+00:00",
+            ),
+            _candidate(
+                "mem_support",
+                final_score=0.4,
+                canonical_text="Nested atomic support.",
+                object_type="belief",
+                scope="global_user",
+                payload_json={"claim_key": "workflow.debugging.style", "claim_value": "patch_first"},
+                updated_at="2026-03-30T10:00:00+00:00",
+            ),
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=policy,
+        conversation_messages=[],
+    )
+
+    assert context.selected_memory_ids == ["mem_support", "sum_mem_theme"]
+    assert "Nested atomic support." in context.memory_block
+    assert "Theme derived from an episode only." in context.memory_block
+
+
+def test_broad_query_selection_prefers_diverse_specific_facets() -> None:
+    composer = _composer()
+    policy = _resolved_policy(500).model_copy(
+        update={
+            "retrieval_params": _resolved_policy(500).retrieval_params.model_copy(
+                update={"final_context_items": 4}
+            )
+        }
+    )
+
+    context = composer.compose(
+        scored_candidates=[
+            _candidate(
+                "mem_dinosaurs",
+                final_score=0.91,
+                canonical_text="Melanie's kids were excited about the dinosaur exhibit at the museum.",
+                object_type="summary_view",
+            ),
+            _candidate(
+                "mem_busy",
+                final_score=0.90,
+                canonical_text="Melanie mentions being busy with the kids and work.",
+                object_type="summary_view",
+            ),
+            _candidate(
+                "mem_pottery",
+                final_score=0.87,
+                canonical_text="Melanie took her kids to a pottery workshop where they loved getting creative with clay.",
+                object_type="summary_view",
+            ),
+            _candidate(
+                "mem_nature",
+                final_score=0.86,
+                canonical_text="Melanie's family enjoys camping, hiking, and spending time in nature together.",
+                object_type="summary_view",
+            ),
+            _candidate(
+                "mem_swimming",
+                final_score=0.88,
+                canonical_text="Melanie went swimming with her kids after the conversation.",
+                object_type="summary_view",
+            ),
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=policy,
+        conversation_messages=[],
+        query_text="What do Melanie's kids like?",
+    )
+
+    assert set(context.selected_memory_ids) == {
+        "mem_dinosaurs",
+        "mem_pottery",
+        "mem_nature",
+        "mem_swimming",
+    }
+    assert "busy with the kids and work" not in context.memory_block
+
+
+def test_slot_fill_query_selection_keeps_complementary_origin_fact() -> None:
+    composer = _composer()
+    policy = _resolved_policy(500).model_copy(
+        update={
+            "retrieval_params": _resolved_policy(500).retrieval_params.model_copy(
+                update={"final_context_items": 3}
+            )
+        }
+    )
+
+    context = composer.compose(
+        scored_candidates=[
+            _candidate(
+                "mem_move",
+                final_score=0.91,
+                canonical_text=(
+                    "Caroline says her friends supported her for four years since moving "
+                    "from her home country."
+                ),
+                object_type="summary_view",
+            ),
+            _candidate(
+                "mem_generic",
+                final_score=0.90,
+                canonical_text=(
+                    "Caroline says her friends, family, and mentors were a strong support "
+                    "system for her through a tough breakup."
+                ),
+                object_type="summary_view",
+            ),
+            _candidate(
+                "mem_sweden",
+                final_score=0.84,
+                canonical_text=(
+                    "Caroline describes a necklace from her Swedish grandmother and talks "
+                    "about her roots."
+                ),
+                object_type="summary_view",
+            ),
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=policy,
+        conversation_messages=[],
+        query_text="Where did Caroline move from 4 years ago?",
+    )
+
+    assert context.selected_memory_ids[:2] == ["mem_move", "mem_sweden"]
+    assert "strong support system" in context.memory_block

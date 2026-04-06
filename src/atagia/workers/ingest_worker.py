@@ -37,9 +37,10 @@ from atagia.models.schemas_jobs import (
 from atagia.models.schemas_memory import (
     ExtractionContextMessage,
     ExtractionConversationContext,
+    ExtractionResult,
     MemoryObjectType,
 )
-from atagia.services.llm_client import LLMClient
+from atagia.services.llm_client import LLMClient, StructuredOutputError
 from atagia.services.embeddings import EmbeddingIndex
 
 logger = logging.getLogger(__name__)
@@ -169,13 +170,24 @@ class IngestWorker:
                 for item in job_payload.recent_messages
             ],
         )
-        result, persisted = await self._extractor.extract_with_persistence_details(
-            message_text=job_payload.message_text,
-            role=job_payload.role,
-            conversation_context=context,
-            resolved_policy=resolved_policy,
-            occurred_at=job_payload.message_occurred_at,
-        )
+        try:
+            result, persisted = await self._extractor.extract_with_persistence_details(
+                message_text=job_payload.message_text,
+                role=job_payload.role,
+                conversation_context=context,
+                resolved_policy=resolved_policy,
+                occurred_at=job_payload.message_occurred_at,
+            )
+        except StructuredOutputError as exc:
+            if "after schema fallback" not in str(exc):
+                raise
+            logger.warning(
+                "Skipping extraction job %s after schema fallback returned non-JSON output",
+                job_payload.message_id,
+                exc_info=True,
+            )
+            result = ExtractionResult(nothing_durable=True)
+            persisted = []
         if not result.nothing_durable and not self._settings.skip_belief_revision:
             await self._emit_revision_jobs(
                 envelope=envelope,

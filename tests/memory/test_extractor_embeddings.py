@@ -15,7 +15,7 @@ from atagia.core.repositories import ConversationRepository, MemoryObjectReposit
 from atagia.core.storage_backend import InProcessBackend
 from atagia.memory.extractor import MemoryExtractor
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
-from atagia.models.schemas_memory import ExtractionConversationContext
+from atagia.models.schemas_memory import ExtractionConversationContext, MemoryStatus
 from atagia.services.embeddings import NoneBackend
 from atagia.services.llm_client import (
     LLMClient,
@@ -125,6 +125,7 @@ async def _build_runtime(embedding_index: object, *, database_path: str = ":memo
             "evidences": [
                 {
                     "canonical_text": "I prefer concise debugging answers",
+                    "index_text": "This preference was stated during incident debugging about websocket retries.",
                     "scope": "assistant_mode",
                     "confidence": 0.9,
                     "source_kind": "extracted",
@@ -189,6 +190,9 @@ async def test_extraction_with_embedding_index_upserts_after_persist() -> None:
         assert len(stored) == 1
         assert len(embedding_index.calls) == 1
         assert embedding_index.calls[0]["memory_id"] == stored[0]["id"]
+        assert embedding_index.calls[0]["metadata"]["index_text"] == (
+            "This preference was stated during incident debugging about websocket retries."
+        )
     finally:
         await connection.close()
 
@@ -279,5 +283,85 @@ async def test_embedding_upsert_failure_still_persists_memory(caplog: pytest.Log
 
         assert len(await memories.list_for_user("usr_1")) == 1
         assert "Embedding upsert failed" in caplog.text
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_protected_verbatim_memories_embed_only_index_text() -> None:
+    embedding_index = TrackingEmbeddingIndex()
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 4, 10, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+    memories = MemoryObjectRepository(connection, clock)
+    await users.create_user("usr_1")
+    await conversations.create_conversation("cnv_1", "usr_1", None, "personal_assistant", "Chat")
+    provider = ExtractionProvider(
+        {
+            "evidences": [
+                {
+                    "canonical_text": "Banking card PIN: 4512",
+                    "index_text": "User's banking card credential",
+                    "scope": "global_user",
+                    "confidence": 0.95,
+                    "source_kind": "extracted",
+                    "privacy_level": 3,
+                    "memory_category": "pin_or_password",
+                    "preserve_verbatim": True,
+                    "payload": {},
+                }
+            ],
+            "beliefs": [],
+            "contract_signals": [],
+            "state_updates": [],
+            "mode_guess": None,
+            "nothing_durable": False,
+        }
+    )
+    extractor = MemoryExtractor(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=clock,
+        message_repository=messages,
+        memory_repository=memories,
+        storage_backend=InProcessBackend(),
+        embedding_index=embedding_index,
+    )
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["personal_assistant"]
+    resolved_policy = PolicyResolver().resolve(manifest, None, None)
+    try:
+        message = await messages.create_message(
+            "msg_1",
+            "cnv_1",
+            "user",
+            1,
+            "My banking card PIN is 4512.",
+            6,
+            {},
+        )
+
+        await extractor.extract(
+            message_text=str(message["text"]),
+            role="user",
+            conversation_context=ExtractionConversationContext(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                source_message_id="msg_1",
+                workspace_id=None,
+                assistant_mode_id="personal_assistant",
+                recent_messages=[],
+            ),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        assert len(persisted) == 1
+        assert persisted[0]["status"] == MemoryStatus.PENDING_USER_CONFIRMATION.value
+        assert len(embedding_index.calls) == 1
+        assert embedding_index.calls[0]["text"] == "User's banking card credential"
+        assert embedding_index.calls[0]["metadata"]["index_text"] is None
+        assert "4512" not in str(embedding_index.calls[0])
     finally:
         await connection.close()

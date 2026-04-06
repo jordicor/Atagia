@@ -9,9 +9,10 @@ import pytest
 
 from atagia.core.clock import FrozenClock
 from atagia.core.db_sqlite import initialize_database
-from atagia.core.repositories import ConversationRepository, UserRepository, WorkspaceRepository
+from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository, WorkspaceRepository
 from atagia.core.summary_repository import SummaryRepository
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
+from atagia.models.schemas_memory import MemoryScope, SummaryViewKind
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -75,8 +76,8 @@ async def test_create_summary_rejects_missing_parent_references() -> None:
                     "id": "sum_bad",
                     "conversation_id": None,
                     "workspace_id": None,
-                    "source_message_start_seq": 0,
-                    "source_message_end_seq": 0,
+                    "source_message_start_seq": None,
+                    "source_message_end_seq": None,
                     "summary_kind": "workspace_rollup",
                     "summary_text": "Invalid",
                     "source_object_ids_json": [],
@@ -201,8 +202,8 @@ async def test_workspace_rollups_are_ordered_desc_and_latest_is_returned() -> No
                 "id": "sum_old",
                 "conversation_id": None,
                 "workspace_id": "wrk_1",
-                "source_message_start_seq": 0,
-                "source_message_end_seq": 0,
+                "source_message_start_seq": None,
+                "source_message_end_seq": None,
                 "summary_kind": "workspace_rollup",
                 "summary_text": "Old rollup",
                 "source_object_ids_json": ["mem_1"],
@@ -217,8 +218,8 @@ async def test_workspace_rollups_are_ordered_desc_and_latest_is_returned() -> No
                 "id": "sum_new",
                 "conversation_id": None,
                 "workspace_id": "wrk_1",
-                "source_message_start_seq": 0,
-                "source_message_end_seq": 0,
+                "source_message_start_seq": None,
+                "source_message_end_seq": None,
                 "summary_kind": "workspace_rollup",
                 "summary_text": "New rollup",
                 "source_object_ids_json": ["mem_2"],
@@ -249,8 +250,8 @@ async def test_delete_old_rollups_keeps_n_most_recent() -> None:
                     "id": f"sum_{index}",
                     "conversation_id": None,
                     "workspace_id": "wrk_1",
-                    "source_message_start_seq": 0,
-                    "source_message_end_seq": 0,
+                    "source_message_start_seq": None,
+                    "source_message_end_seq": None,
                     "summary_kind": "workspace_rollup",
                     "summary_text": f"Rollup {index}",
                     "source_object_ids_json": [],
@@ -291,4 +292,131 @@ async def test_create_summary_rejects_wrong_user_ownership() -> None:
                 }
             )
     finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_create_summary_allows_user_level_thematic_profile_rows() -> None:
+    connection, summaries = await _build_runtime()
+    try:
+        summary_id = await summaries.create_summary(
+            "usr_1",
+            {
+                "id": "sum_profile",
+                "conversation_id": None,
+                "workspace_id": None,
+                "source_message_start_seq": None,
+                "source_message_end_seq": None,
+                "summary_kind": "thematic_profile",
+                "hierarchy_level": 2,
+                "summary_text": "User consistently prefers incremental debugging and concise checkpoints.",
+                "source_object_ids_json": ["mem_1"],
+                "maya_score": 1.5,
+                "model": "score-test-model",
+                "created_at": "2026-04-03T10:00:00+00:00",
+            }
+        )
+
+        row = await summaries.get_summary(summary_id, "usr_1")
+
+        assert row is not None
+        assert row["user_id"] == "usr_1"
+        assert row["hierarchy_level"] == 2
+        assert row["summary_kind"] == SummaryViewKind.THEMATIC_PROFILE.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_summaries_removes_linked_summary_mirrors() -> None:
+    connection, summaries = await _build_runtime()
+    clock = FrozenClock(datetime(2026, 4, 3, 10, 0, tzinfo=timezone.utc))
+    memories = MemoryObjectRepository(connection, clock)
+    try:
+        await summaries.create_summary(
+            "usr_1",
+            {
+                "id": "sum_episode",
+                "conversation_id": None,
+                "workspace_id": None,
+                "source_message_start_seq": None,
+                "source_message_end_seq": None,
+                "summary_kind": "episode",
+                "hierarchy_level": 1,
+                "summary_text": "Episode summary",
+                "source_object_ids_json": ["mem_1"],
+                "maya_score": 1.5,
+                "model": "score-test-model",
+                "created_at": "2026-04-03T10:00:00+00:00",
+            }
+        )
+        await memories.upsert_summary_mirror(
+            user_id="usr_1",
+            summary_view_id="sum_episode",
+            summary_kind=SummaryViewKind.EPISODE,
+            hierarchy_level=1,
+            summary_text="Episode summary",
+            source_object_ids=["mem_1"],
+            created_at="2026-04-03T10:00:00+00:00",
+            scope=MemoryScope.GLOBAL_USER,
+        )
+
+        deleted = await summaries.delete_summaries("usr_1", ["sum_episode"])
+
+        assert deleted == 1
+        assert await summaries.get_summary("sum_episode", "usr_1") is None
+        assert await memories.get_memory_object("sum_mem_sum_episode", "usr_1") is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_summaries_rolls_back_both_deletes_on_failure() -> None:
+    connection, summaries = await _build_runtime()
+    clock = FrozenClock(datetime(2026, 4, 3, 10, 0, tzinfo=timezone.utc))
+    memories = MemoryObjectRepository(connection, clock)
+    original_execute = connection.execute
+    try:
+        await summaries.create_summary(
+            "usr_1",
+            {
+                "id": "sum_episode",
+                "conversation_id": None,
+                "workspace_id": None,
+                "source_message_start_seq": None,
+                "source_message_end_seq": None,
+                "summary_kind": "episode",
+                "hierarchy_level": 1,
+                "summary_text": "Episode summary",
+                "source_object_ids_json": ["mem_1"],
+                "maya_score": 1.5,
+                "model": "score-test-model",
+                "created_at": "2026-04-03T10:00:00+00:00",
+            }
+        )
+        await memories.upsert_summary_mirror(
+            user_id="usr_1",
+            summary_view_id="sum_episode",
+            summary_kind=SummaryViewKind.EPISODE,
+            hierarchy_level=1,
+            summary_text="Episode summary",
+            source_object_ids=["mem_1"],
+            created_at="2026-04-03T10:00:00+00:00",
+            scope=MemoryScope.GLOBAL_USER,
+        )
+
+        async def failing_execute(query: str, parameters: object = ()) -> object:
+            if "DELETE FROM summary_views" in query:
+                raise RuntimeError("simulated summary delete failure")
+            return await original_execute(query, parameters)
+
+        connection.execute = failing_execute  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="simulated summary delete failure"):
+            await summaries.delete_summaries("usr_1", ["sum_episode"])
+
+        assert await summaries.get_summary("sum_episode", "usr_1") is not None
+        assert await memories.get_memory_object("sum_mem_sum_episode", "usr_1") is not None
+    finally:
+        connection.execute = original_execute  # type: ignore[method-assign]
         await connection.close()

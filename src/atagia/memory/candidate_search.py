@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any
 
 import aiosqlite
 
 from atagia.core.clock import Clock
+from atagia.core.config import Settings
 from atagia.core.repositories import _decode_json_columns
+from atagia.models.schemas_memory import MemoryScope, RetrievalPlan, SummaryViewKind
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
-from atagia.models.schemas_memory import MemoryScope, NeedTrigger, RetrievalPlan
 
 _ALLOWED_CONSEQUENCE_MATCH_COLUMNS = frozenset(
     {
@@ -19,6 +21,13 @@ _ALLOWED_CONSEQUENCE_MATCH_COLUMNS = frozenset(
         "tendency_belief_id",
     }
 )
+_CHANNEL_ORDER = ("fts", "embedding", "consequence")
+_SAFE_ALIAS_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _assert_safe_alias(alias: str) -> None:
+    if not _SAFE_ALIAS_PATTERN.match(alias):
+        raise ValueError(f"Unsafe SQL alias: {alias!r}")
 
 
 class CandidateSearch:
@@ -29,10 +38,13 @@ class CandidateSearch:
         connection: aiosqlite.Connection,
         clock: Clock,
         embedding_index: EmbeddingIndex | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._connection = connection
         self._clock = clock
+        self._settings = settings or Settings.from_env()
         self._embedding_index = embedding_index or NoneBackend()
+        self._rrf_k = self._settings.rrf_k
 
     async def search(
         self,
@@ -50,6 +62,8 @@ class CandidateSearch:
 
         status_placeholders = ", ".join("?" for _ in plan.status_filter)
         scope_order_case = self._scope_order_case(plan.scope_filter)
+        temporal_order_case = self._temporal_order_case(plan, alias="mo")
+        retrieval_level_clauses, retrieval_level_parameters = self._retrieval_level_clauses(plan)
         query = """
             SELECT
                 mo.*,
@@ -60,12 +74,15 @@ class CandidateSearch:
               AND ({scope_clauses})
               AND mo.status IN ({status_placeholders})
               AND mo.privacy_level <= ?
+              AND ({retrieval_level_clauses})
               AND memory_objects_fts MATCH ?
-            ORDER BY {scope_order_case}, rank ASC, mo.updated_at DESC
+            ORDER BY {temporal_order_case}{scope_order_case}, rank ASC, mo.updated_at DESC
             LIMIT ?
         """.format(
             scope_clauses=" OR ".join(scope_clauses),
             status_placeholders=status_placeholders,
+            retrieval_level_clauses=" OR ".join(retrieval_level_clauses),
+            temporal_order_case=temporal_order_case,
             scope_order_case=scope_order_case,
         )
 
@@ -77,28 +94,32 @@ class CandidateSearch:
                     *scope_parameters,
                     *(status.value for status in plan.status_filter),
                     plan.privacy_ceiling,
+                    *retrieval_level_parameters,
                     fts_query,
+                    *self._temporal_order_parameters(plan),
                     plan.max_candidates,
                 )
                 cursor = await self._connection.execute(query, parameters)
                 rows = await cursor.fetchall()
-                for row in rows:
-                    decoded = _decode_json_columns(row)
-                    if decoded is None:
-                        continue
-                    current = aggregated.get(decoded["id"])
-                    if current is None or self._is_better_candidate(decoded, current, plan.scope_filter):
-                        aggregated[decoded["id"]] = decoded
-                if self._needs_consequence_chain_search(plan):
-                    consequence_candidates = await self._search_consequence_chains(
-                        plan=plan,
-                        user_id=user_id,
-                        fts_query=fts_query,
-                    )
-                    for candidate in consequence_candidates:
-                        current = aggregated.get(candidate["id"])
-                        if current is None or self._is_better_candidate(candidate, current, plan.scope_filter):
-                            aggregated[candidate["id"]] = candidate
+                fts_candidates = self._assign_position_ranks(
+                    [
+                        decoded
+                        for decoded in (_decode_json_columns(row) for row in rows)
+                        if decoded is not None
+                    ]
+                )
+                self._merge_channel_candidates(aggregated, fts_candidates, channel="fts")
+        if plan.fts_queries and self._needs_consequence_chain_search(plan):
+            consequence_candidates = await self._search_consequence_chains(
+                plan=plan,
+                user_id=user_id,
+                fts_query=plan.fts_queries[0],
+            )
+            self._merge_channel_candidates(
+                aggregated,
+                consequence_candidates,
+                channel="consequence",
+            )
         if query_text:
             embedding_candidates = await self.search_by_embedding(
                 query_text=query_text,
@@ -106,17 +127,21 @@ class CandidateSearch:
                 plan=plan,
                 embedding_index=self._embedding_index,
             )
-            for candidate in embedding_candidates:
-                current = aggregated.get(candidate["id"])
-                if current is None or self._is_better_candidate(candidate, current, plan.scope_filter):
-                    aggregated[candidate["id"]] = candidate
+            self._merge_channel_candidates(
+                aggregated,
+                embedding_candidates,
+                channel="embedding",
+            )
 
         candidates = sorted(
             aggregated.values(),
             key=lambda candidate: (
+                self._temporal_priority(candidate, plan),
+                self._retrieval_level_priority(candidate, plan),
                 self._scope_priority(candidate["scope"], plan.scope_filter),
-                -self._candidate_strength(candidate),
+                -float(candidate.get("rrf_score", 0.0)),
                 -self._updated_at_sort_key(candidate["updated_at"]),
+                str(candidate["id"]),
             ),
         )
         return candidates[: plan.max_candidates]
@@ -142,9 +167,14 @@ class CandidateSearch:
                 continue
             row["similarity_score"] = match.score
             row["rank"] = max(0.0, 1.0 - float(match.score))
-            row["retrieval_source"] = "embedding"
+            if match.position_rank is not None:
+                row["embedding_position_rank"] = int(match.position_rank)
+                row["position_rank"] = int(match.position_rank)
             candidates.append(row)
-        return candidates
+        candidates = self._sort_embedding_candidates(candidates, plan)
+        if candidates and all(candidate.get("position_rank") is not None for candidate in candidates):
+            return candidates[: plan.vector_limit]
+        return self._sort_embedding_candidates(self._assign_position_ranks(candidates), plan)[: plan.vector_limit]
 
     async def _search_consequence_chains(
         self,
@@ -161,16 +191,21 @@ class CandidateSearch:
                 fts_query=fts_query,
                 match_column=match_column,
             )
-            for row in rows:
-                current = aggregated.get(row["id"])
-                if current is None or self._is_better_candidate(row, current, plan.scope_filter):
-                    aggregated[row["id"]] = row
+            ranked_rows = self._assign_position_ranks(rows)
+            for row in ranked_rows:
+                memory_id = str(row["id"])
+                current = aggregated.get(memory_id)
+                if current is None or self._is_lower_position_rank(row, current):
+                    aggregated[memory_id] = row
         return sorted(
             aggregated.values(),
             key=lambda candidate: (
+                self._temporal_priority(candidate, plan),
+                self._retrieval_level_priority(candidate, plan),
                 self._scope_priority(candidate["scope"], plan.scope_filter),
-                float(candidate["rank"]),
+                int(candidate["position_rank"]),
                 -self._updated_at_sort_key(candidate["updated_at"]),
+                str(candidate["id"]),
             ),
         )[: plan.max_candidates]
 
@@ -202,6 +237,11 @@ class CandidateSearch:
             primary_alias="tendency",
             fallback_alias="outcome",
         )
+        temporal_order_case = self._coalesced_temporal_order_case(
+            plan,
+            primary_alias="tendency",
+            fallback_alias="outcome",
+        )
         query = """
             SELECT
                 COALESCE(tendency._rowid, outcome._rowid) AS _rowid,
@@ -221,6 +261,7 @@ class CandidateSearch:
                 COALESCE(tendency.vitality, outcome.vitality) AS vitality,
                 COALESCE(tendency.maya_score, outcome.maya_score) AS maya_score,
                 COALESCE(tendency.privacy_level, outcome.privacy_level) AS privacy_level,
+                COALESCE(tendency.temporal_type, outcome.temporal_type) AS temporal_type,
                 COALESCE(tendency.valid_from, outcome.valid_from) AS valid_from,
                 COALESCE(tendency.valid_to, outcome.valid_to) AS valid_to,
                 COALESCE(tendency.status, outcome.status) AS status,
@@ -247,7 +288,7 @@ class CandidateSearch:
               AND ({chain_relevance_clauses})
               AND memory_objects_fts MATCH ?
             ORDER BY
-                {scope_order_case},
+                {temporal_order_case}{scope_order_case},
                 rank ASC,
                 cc.confidence DESC,
                 COALESCE(tendency.updated_at, outcome.updated_at) DESC
@@ -257,6 +298,7 @@ class CandidateSearch:
             status_placeholders=status_placeholders,
             candidate_scope_clauses=" OR ".join(candidate_scope_clauses),
             chain_relevance_clauses=" OR ".join(chain_relevance_clauses),
+            temporal_order_case=temporal_order_case,
             scope_order_case=scope_order_case,
         )
         parameters = (
@@ -268,6 +310,7 @@ class CandidateSearch:
             *candidate_scope_parameters,
             *chain_relevance_parameters,
             fts_query,
+            *self._temporal_order_parameters(plan),
             plan.max_candidates,
         )
         cursor = await self._connection.execute(query, parameters)
@@ -312,6 +355,27 @@ class CandidateSearch:
             for index, scope in enumerate(scope_filter)
         ]
         return "CASE " + " ".join(clauses) + f" ELSE {len(scope_filter)} END"
+
+    @staticmethod
+    def _temporal_order_parameters(plan: RetrievalPlan) -> tuple[str, ...]:
+        if plan.temporal_query_range is None:
+            return ()
+        return (
+            plan.temporal_query_range.end.isoformat(),
+            plan.temporal_query_range.start.isoformat(),
+        )
+
+    @staticmethod
+    def _temporal_order_case(plan: RetrievalPlan, *, alias: str) -> str:
+        if plan.temporal_query_range is None:
+            return ""
+        return (
+            "CASE "
+            f"WHEN {alias}.temporal_type = 'unknown' THEN 1 "
+            f"WHEN (({alias}.valid_from IS NULL OR {alias}.valid_from <= ?) "
+            f"AND ({alias}.valid_to IS NULL OR {alias}.valid_to >= ?)) THEN 0 "
+            "ELSE 2 END, "
+        )
 
     @staticmethod
     def _coalesced_scope_clauses(
@@ -365,28 +429,28 @@ class CandidateSearch:
         return "CASE " + " ".join(clauses) + f" ELSE {len(scope_filter)} END"
 
     @staticmethod
-    def _needs_consequence_chain_search(plan: RetrievalPlan) -> bool:
+    def _coalesced_temporal_order_case(
+        plan: RetrievalPlan,
+        *,
+        primary_alias: str,
+        fallback_alias: str,
+    ) -> str:
+        if plan.temporal_query_range is None:
+            return ""
+        temporal_type_expr = f"COALESCE({primary_alias}.temporal_type, {fallback_alias}.temporal_type)"
+        valid_from_expr = f"COALESCE({primary_alias}.valid_from, {fallback_alias}.valid_from)"
+        valid_to_expr = f"COALESCE({primary_alias}.valid_to, {fallback_alias}.valid_to)"
         return (
-            NeedTrigger.FOLLOW_UP_FAILURE in plan.need_driven_boosts
-            or NeedTrigger.LOOP in plan.need_driven_boosts
+            "CASE "
+            f"WHEN {temporal_type_expr} = 'unknown' THEN 1 "
+            f"WHEN (({valid_from_expr} IS NULL OR {valid_from_expr} <= ?) "
+            f"AND ({valid_to_expr} IS NULL OR {valid_to_expr} >= ?)) THEN 0 "
+            "ELSE 2 END, "
         )
 
-    @classmethod
-    def _is_better_candidate(
-        cls,
-        candidate: dict[str, Any],
-        current: dict[str, Any],
-        scope_filter: list[MemoryScope],
-    ) -> bool:
-        return (
-            cls._scope_priority(candidate["scope"], scope_filter),
-            -cls._candidate_strength(candidate),
-            -cls._updated_at_sort_key(candidate["updated_at"]),
-        ) < (
-            cls._scope_priority(current["scope"], scope_filter),
-            -cls._candidate_strength(current),
-            -cls._updated_at_sort_key(current["updated_at"]),
-        )
+    @staticmethod
+    def _needs_consequence_chain_search(plan: RetrievalPlan) -> bool:
+        return plan.consequence_search_enabled
 
     async def _load_memory_object(self, memory_id: str, user_id: str) -> dict[str, Any] | None:
         cursor = await self._connection.execute(
@@ -407,7 +471,26 @@ class CandidateSearch:
             return False
         if candidate.get("status") not in {status.value for status in plan.status_filter}:
             return False
+        if not cls._candidate_matches_retrieval_levels(candidate, plan):
+            return False
         return cls._candidate_matches_scope(candidate, plan)
+
+    @staticmethod
+    def _candidate_matches_retrieval_levels(candidate: dict[str, Any], plan: RetrievalPlan) -> bool:
+        if candidate.get("object_type") != "summary_view":
+            return 0 in plan.retrieval_levels
+        payload_json = candidate.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            return False
+        hierarchy_level = int(payload_json.get("hierarchy_level", -1))
+        summary_kind = str(payload_json.get("summary_kind", "")).strip()
+        if hierarchy_level == 0:
+            return 0 in plan.retrieval_levels and summary_kind == SummaryViewKind.CONVERSATION_CHUNK.value
+        if hierarchy_level == 1:
+            return 1 in plan.retrieval_levels and summary_kind == SummaryViewKind.EPISODE.value
+        if hierarchy_level == 2:
+            return 2 in plan.retrieval_levels and summary_kind == SummaryViewKind.THEMATIC_PROFILE.value
+        return False
 
     @staticmethod
     def _candidate_matches_scope(candidate: dict[str, Any], plan: RetrievalPlan) -> bool:
@@ -440,16 +523,6 @@ class CandidateSearch:
         return False
 
     @staticmethod
-    def _candidate_strength(candidate: dict[str, Any]) -> float:
-        similarity_score = candidate.get("similarity_score")
-        if similarity_score is not None:
-            return float(similarity_score)
-        rank = candidate.get("rank")
-        if rank is None:
-            return 0.0
-        return 1.0 / (1.0 + abs(float(rank)))
-
-    @staticmethod
     def _scope_priority(scope_value: str, scope_filter: list[MemoryScope]) -> int:
         for index, scope in enumerate(scope_filter):
             if scope.value == scope_value:
@@ -457,5 +530,198 @@ class CandidateSearch:
         return len(scope_filter)
 
     @staticmethod
+    def _retrieval_level_clauses(plan: RetrievalPlan, alias: str = "mo") -> tuple[list[str], list[Any]]:
+        _assert_safe_alias(alias)
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if 0 in plan.retrieval_levels:
+            clauses.append(
+                "("
+                f"{alias}.object_type != 'summary_view' "
+                "OR ("
+                f"{alias}.object_type = 'summary_view' "
+                f"AND CAST(json_extract({alias}.payload_json, '$.hierarchy_level') AS INTEGER) = 0 "
+                f"AND json_extract({alias}.payload_json, '$.summary_kind') = ?"
+                ")"
+                ")"
+            )
+            parameters.append(SummaryViewKind.CONVERSATION_CHUNK.value)
+        if 1 in plan.retrieval_levels:
+            clauses.append(
+                "("
+                f"{alias}.object_type = 'summary_view' "
+                f"AND CAST(json_extract({alias}.payload_json, '$.hierarchy_level') AS INTEGER) = 1 "
+                f"AND json_extract({alias}.payload_json, '$.summary_kind') = ?"
+                ")"
+            )
+            parameters.append(SummaryViewKind.EPISODE.value)
+        if 2 in plan.retrieval_levels:
+            clauses.append(
+                "("
+                f"{alias}.object_type = 'summary_view' "
+                f"AND CAST(json_extract({alias}.payload_json, '$.hierarchy_level') AS INTEGER) = 2 "
+                f"AND json_extract({alias}.payload_json, '$.summary_kind') = ?"
+                ")"
+            )
+            parameters.append(SummaryViewKind.THEMATIC_PROFILE.value)
+        return clauses, parameters
+
+    @staticmethod
+    def _retrieval_level_priority(candidate: dict[str, Any], plan: RetrievalPlan) -> int:
+        if candidate.get("object_type") != "summary_view":
+            level = 0
+        else:
+            payload_json = candidate.get("payload_json") or {}
+            level = int(payload_json.get("hierarchy_level", 99)) if isinstance(payload_json, dict) else 99
+        try:
+            return plan.retrieval_levels.index(level)
+        except ValueError:
+            return len(plan.retrieval_levels)
+
+    @staticmethod
     def _updated_at_sort_key(updated_at: str) -> float:
         return datetime.fromisoformat(updated_at).timestamp()
+
+    @classmethod
+    def _sort_embedding_candidates(
+        cls,
+        candidates: list[dict[str, Any]],
+        plan: RetrievalPlan,
+    ) -> list[dict[str, Any]]:
+        return sorted(
+            candidates,
+            key=lambda candidate: (
+                cls._temporal_priority(candidate, plan),
+                cls._retrieval_level_priority(candidate, plan),
+                int(candidate.get("position_rank", 10**9)),
+                -cls._updated_at_sort_key(str(candidate["updated_at"])),
+                str(candidate["id"]),
+            ),
+        )
+
+    @staticmethod
+    def _assign_position_ranks(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ranked: list[dict[str, Any]] = []
+        for rank_index, candidate in enumerate(candidates, start=1):
+            updated = dict(candidate)
+            updated["position_rank"] = rank_index
+            ranked.append(updated)
+        return ranked
+
+    def _merge_channel_candidates(
+        self,
+        aggregated: dict[str, dict[str, Any]],
+        candidates: list[dict[str, Any]],
+        *,
+        channel: str,
+    ) -> None:
+        for candidate in candidates:
+            position_rank = candidate.get("position_rank")
+            if position_rank is None:
+                raise ValueError(f"Candidate {candidate.get('id')} missing position_rank for channel {channel}")
+
+            memory_id = str(candidate["id"])
+            current = aggregated.get(memory_id)
+            if current is None:
+                current = self._initialize_channel_candidate(candidate)
+                aggregated[memory_id] = current
+
+            existing_rank = current["channel_ranks"].get(channel)
+            if existing_rank is None or int(position_rank) < int(existing_rank):
+                for key, value in candidate.items():
+                    if key in {"channel_ranks", "retrieval_sources", "rrf_score"}:
+                        continue
+                    current[key] = value
+                current["channel_ranks"][channel] = int(position_rank)
+
+            if channel not in current["retrieval_sources"]:
+                current["retrieval_sources"].append(channel)
+                current["retrieval_sources"].sort(key=_CHANNEL_ORDER.index)
+
+            current["position_rank"] = min(
+                rank
+                for rank in current["channel_ranks"].values()
+                if rank is not None
+            )
+            current["retrieval_source"] = "+".join(current["retrieval_sources"])
+            raw_rrf_score, normalized_rrf_score = self._compute_rrf_scores(current["channel_ranks"])
+            current["rrf_score_raw"] = raw_rrf_score
+            current["rrf_score"] = normalized_rrf_score
+
+    def _initialize_channel_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        channel_candidate = dict(candidate)
+        channel_candidate["channel_ranks"] = {
+            channel: None for channel in _CHANNEL_ORDER
+        }
+        channel_candidate["retrieval_sources"] = []
+        channel_candidate["rrf_score"] = 0.0
+        channel_candidate["rrf_score_raw"] = 0.0
+        channel_candidate["retrieval_source"] = ""
+        return channel_candidate
+
+    def _compute_rrf_scores(self, channel_ranks: dict[str, int | None]) -> tuple[float, float]:
+        raw_score = sum(
+            1.0 / (self._rrf_k + int(rank))
+            for rank in channel_ranks.values()
+            if rank is not None
+        )
+        normalized_score = raw_score / self._max_rrf_score()
+        return raw_score, max(0.0, min(1.0, normalized_score))
+
+    def _max_rrf_score(self) -> float:
+        return sum(1.0 / (self._rrf_k + 1) for _ in _CHANNEL_ORDER)
+
+    @classmethod
+    def _is_lower_position_rank(
+        cls,
+        candidate: dict[str, Any],
+        current: dict[str, Any],
+    ) -> bool:
+        return (
+            int(candidate["position_rank"]),
+            -cls._updated_at_sort_key(str(candidate["updated_at"])),
+            str(candidate["id"]),
+        ) < (
+            int(current["position_rank"]),
+            -cls._updated_at_sort_key(str(current["updated_at"])),
+            str(current["id"]),
+        )
+
+    @classmethod
+    def _temporal_priority(cls, candidate: dict[str, Any], plan: RetrievalPlan) -> int:
+        if plan.temporal_query_range is None:
+            return 0
+        temporal_type = str(candidate.get("temporal_type", "unknown"))
+        if temporal_type == "unknown":
+            return 1
+        valid_from = cls._parse_temporal_datetime(candidate.get("valid_from"), plan)
+        valid_to = cls._parse_temporal_datetime(candidate.get("valid_to"), plan)
+        if cls._overlaps_temporal_range(valid_from, valid_to, plan):
+            return 0
+        return 2
+
+    @staticmethod
+    def _parse_temporal_datetime(value: Any, plan: RetrievalPlan) -> datetime | None:
+        if value is None:
+            return None
+        parsed = datetime.fromisoformat(str(value))
+        if (
+            parsed.tzinfo is None
+            and plan.temporal_query_range is not None
+            and plan.temporal_query_range.start.tzinfo is not None
+        ):
+            parsed = parsed.replace(tzinfo=plan.temporal_query_range.start.tzinfo)
+        return parsed
+
+    @staticmethod
+    def _overlaps_temporal_range(
+        valid_from: datetime | None,
+        valid_to: datetime | None,
+        plan: RetrievalPlan,
+    ) -> bool:
+        if plan.temporal_query_range is None:
+            return True
+        return (
+            (valid_from is None or valid_from <= plan.temporal_query_range.end)
+            and (valid_to is None or valid_to >= plan.temporal_query_range.start)
+        )

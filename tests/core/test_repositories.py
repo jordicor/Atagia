@@ -13,11 +13,19 @@ from atagia.core.clock import FrozenClock
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.storage_backend import InProcessBackend
 from atagia.core.repositories import (
+    RETRIEVAL_ELIGIBLE_MEMORY_STATUSES,
     ConversationRepository,
     MemoryObjectRepository,
     MessageRepository,
     UserRepository,
     WorkspaceRepository,
+)
+from atagia.models.schemas_memory import (
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    MemoryStatus,
+    SummaryViewKind,
 )
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
@@ -304,6 +312,263 @@ async def test_memory_object_search_filters_by_user_before_ranking() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_memory_object_persists_temporal_fields() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+
+        created = await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.ASSISTANT_MODE,
+            canonical_text="User is traveling next week.",
+            payload={"temporal_confidence": 0.82},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            valid_from="2026-04-06T00:00:00+00:00",
+            valid_to="2026-04-12T23:59:59.999999+00:00",
+            temporal_type="bounded",
+            memory_id="mem_temporal",
+        )
+
+        assert created["temporal_type"] == "bounded"
+        assert created["valid_from"] == "2026-04-06T00:00:00+00:00"
+        assert created["valid_to"] == "2026-04-12T23:59:59.999999+00:00"
+        assert created["payload_json"]["temporal_confidence"] == pytest.approx(0.82)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_create_memory_object_persists_index_text() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+
+        created = await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.ASSISTANT_MODE,
+            canonical_text="User prefers terse debugging help.",
+            index_text="Context: this preference was stated during a production incident debugging discussion.",
+            payload={},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            memory_id="mem_index_text",
+        )
+
+        assert created["index_text"] == (
+            "Context: this preference was stated during a production incident debugging discussion."
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_object_search_matches_index_text() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+
+        await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.ASSISTANT_MODE,
+            canonical_text="User preference memory",
+            index_text="This memory came from a discussion about websocket backoff troubleshooting.",
+            payload={},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            memory_id="mem_index_search",
+        )
+
+        hits = await memories.search_memory_objects("usr_a", "websocket", limit=10)
+
+        assert [item["id"] for item in hits] == ["mem_index_search"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_count_for_context_counts_only_active_memories() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+
+        for memory_id, status in (
+            ("mem_active", MemoryStatus.ACTIVE),
+            ("mem_review", MemoryStatus.REVIEW_REQUIRED),
+            ("mem_pending", MemoryStatus.PENDING_USER_CONFIRMATION),
+            ("mem_declined", MemoryStatus.DECLINED),
+        ):
+            await memories.create_memory_object(
+                user_id="usr_a",
+                assistant_mode_id="coding_debug",
+                conversation_id="cnv_a",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.CONVERSATION,
+                canonical_text=f"{memory_id} memory",
+                payload={"source_message_ids": ["msg_1"]},
+                source_kind=MemorySourceKind.EXTRACTED,
+                confidence=0.9,
+                privacy_level=0,
+                status=status,
+                memory_id=memory_id,
+            )
+
+        count = await memories.count_for_context(
+            "usr_a",
+            [MemoryScope.CONVERSATION],
+            workspace_id=None,
+            conversation_id="cnv_a",
+            assistant_mode_id="coding_debug",
+        )
+
+        assert count == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_repository_helpers_default_to_retrieval_eligible_statuses() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+        await messages.create_message("msg_1", "cnv_a", "user", 1, "first", 1, {})
+        await messages.create_message("msg_2", "cnv_a", "user", 2, "second", 1, {})
+
+        await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_a",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Active credential memory",
+            payload={"source_message_ids": ["msg_1"]},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            status=MemoryStatus.ACTIVE,
+            memory_id="mem_active",
+        )
+        await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_a",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Pending credential memory",
+            payload={"source_message_ids": ["msg_2"]},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=3,
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+            memory_id="mem_pending",
+        )
+        await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_a",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Declined credential memory",
+            payload={"source_message_ids": ["msg_2"]},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=3,
+            status=MemoryStatus.DECLINED,
+            memory_id="mem_declined",
+        )
+
+        default_rows = await memories.list_for_user("usr_a")
+        all_rows = await memories.list_for_user("usr_a", statuses=None)
+        default_hits = await memories.search_memory_objects("usr_a", "credential", limit=10)
+        all_hits = await memories.search_memory_objects("usr_a", "credential", limit=10, statuses=None)
+        default_has_msg_1 = await memories.has_memory_for_source_message(
+            user_id="usr_a",
+            object_type=MemoryObjectType.EVIDENCE,
+            source_message_id="msg_1",
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_a",
+        )
+        default_has_msg_2 = await memories.has_memory_for_source_message(
+            user_id="usr_a",
+            object_type=MemoryObjectType.EVIDENCE,
+            source_message_id="msg_2",
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_a",
+        )
+        all_has_msg_2 = await memories.has_memory_for_source_message(
+            user_id="usr_a",
+            object_type=MemoryObjectType.EVIDENCE,
+            source_message_id="msg_2",
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_a",
+            statuses=None,
+        )
+        default_msg_2_rows = await memories.list_for_source_message(
+            user_id="usr_a",
+            source_message_id="msg_2",
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_a",
+        )
+        all_msg_2_rows = await memories.list_for_source_message(
+            user_id="usr_a",
+            source_message_id="msg_2",
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_a",
+            statuses=None,
+        )
+
+        assert RETRIEVAL_ELIGIBLE_MEMORY_STATUSES == (MemoryStatus.ACTIVE,)
+        assert [row["id"] for row in default_rows] == ["mem_active"]
+        assert {row["id"] for row in all_rows} == {"mem_active", "mem_pending", "mem_declined"}
+        assert [row["id"] for row in default_hits] == ["mem_active"]
+        assert {row["id"] for row in all_hits} == {"mem_active", "mem_pending", "mem_declined"}
+        assert default_has_msg_1 is True
+        assert default_has_msg_2 is False
+        assert all_has_msg_2 is True
+        assert default_msg_2_rows == []
+        assert {row["id"] for row in all_msg_2_rows} == {"mem_pending", "mem_declined"}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_workspace_delete_triggers_schema_cascade_and_orphaning() -> None:
     connection, clock = await _connection_and_clock()
     cache_backend = InProcessBackend()
@@ -329,12 +594,12 @@ async def test_workspace_delete_triggers_schema_cascade_and_orphaning() -> None:
         await connection.execute(
             """
             INSERT INTO summary_views(
-                id, conversation_id, workspace_id, source_message_start_seq, source_message_end_seq,
+                id, user_id, conversation_id, workspace_id, source_message_start_seq, source_message_end_seq,
                 summary_kind, summary_text, source_object_ids_json, maya_score, created_at
             )
-            VALUES (?, NULL, ?, 0, 0, 'workspace_rollup', 'summary', '[]', 1.5, ?)
+            VALUES (?, ?, NULL, ?, NULL, NULL, 'workspace_rollup', 'summary', '[]', 1.5, ?)
             """,
-            ("sum_a", "wrk_a", "2026-03-30T12:00:00+00:00"),
+            ("sum_a", "usr_a", "wrk_a", "2026-03-30T12:00:00+00:00"),
         )
         await connection.commit()
 
@@ -386,3 +651,49 @@ async def test_create_message_assigns_sequences_atomically_across_connections(tm
     finally:
         await connection_a.close()
         await connection_b.close()
+
+
+@pytest.mark.asyncio
+async def test_upsert_summary_mirror_is_deterministic_and_updates_in_place() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+
+        first = await memories.upsert_summary_mirror(
+            user_id="usr_a",
+            summary_view_id="sum_episode_1",
+            summary_kind=SummaryViewKind.EPISODE,
+            hierarchy_level=1,
+            summary_text="First episode summary",
+            source_object_ids=["mem_1"],
+            created_at="2026-03-30T12:00:00+00:00",
+            scope=MemoryScope.GLOBAL_USER,
+            privacy_level=1,
+        )
+        second = await memories.upsert_summary_mirror(
+            user_id="usr_a",
+            summary_view_id="sum_episode_1",
+            summary_kind=SummaryViewKind.EPISODE,
+            hierarchy_level=1,
+            summary_text="Updated episode summary",
+            source_object_ids=["mem_1", "mem_2"],
+            created_at="2026-03-30T12:00:00+00:00",
+            updated_at="2026-03-30T12:05:00+00:00",
+            scope=MemoryScope.GLOBAL_USER,
+            privacy_level=2,
+        )
+
+        rows = await memories.list_for_user("usr_a")
+
+        assert first["id"] == second["id"] == "sum_mem_sum_episode_1"
+        assert len(rows) == 1
+        assert rows[0]["canonical_text"] == "Updated episode summary"
+        assert rows[0]["payload_json"]["summary_view_id"] == "sum_episode_1"
+        assert rows[0]["payload_json"]["source_object_ids"] == ["mem_1", "mem_2"]
+        assert rows[0]["privacy_level"] == 2
+    finally:
+        await connection.close()

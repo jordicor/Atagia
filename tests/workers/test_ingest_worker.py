@@ -44,6 +44,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingRequest,
     LLMEmbeddingResponse,
     LLMProvider,
+    StructuredOutputError,
 )
 from atagia.workers.contract_worker import ContractWorker
 from atagia.workers.ingest_worker import IngestWorker
@@ -509,6 +510,37 @@ async def test_ingest_skips_revision_when_disabled() -> None:
 
         assert result.acked == 1
         assert revision_job is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_treats_non_json_after_schema_fallback_as_noop() -> None:
+    async def fake_extract(*args, **kwargs):
+        del args, kwargs
+        raise StructuredOutputError("Provider returned non-JSON structured output after schema fallback")
+
+    async def skip_side_effects(*args, **kwargs) -> None:
+        del args, kwargs
+
+    connection, _clock, backend, _provider, memories, ingest_worker, _contract_worker, message = await _build_runtime(
+        [],
+    )
+    try:
+        ingest_worker._extractor.extract_with_persistence_details = fake_extract
+        ingest_worker._process_consequence_detection = skip_side_effects
+        ingest_worker._maybe_enqueue_conversation_compaction = skip_side_effects
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"])).model_dump(mode="json"),
+        )
+
+        result = await ingest_worker.run_once()
+        stored = await memories.list_for_user("usr_1")
+
+        assert result.acked == 1
+        assert result.failed == 0
+        assert stored == []
     finally:
         await connection.close()
 

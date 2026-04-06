@@ -36,6 +36,7 @@ def test_load_all_manifests_successfully() -> None:
     loader = ManifestLoader(MANIFESTS_DIR)
 
     manifests = loader.load_all()
+    personal_assistant_payload = _load_manifest_json(MANIFESTS_DIR, "personal_assistant.json")
 
     assert set(manifests) == {
         "biographical_interview",
@@ -43,6 +44,7 @@ def test_load_all_manifests_successfully() -> None:
         "coding_debug",
         "companion",
         "general_qa",
+        "personal_assistant",
         "research_deep_dive",
     }
     assert manifests["coding_debug"].privacy_ceiling == 1
@@ -50,6 +52,8 @@ def test_load_all_manifests_successfully() -> None:
     assert manifests["coding_debug"].context_cache_policy.max_messages_without_refresh == 5
     assert manifests["general_qa"].cross_chat_allowed is False
     assert manifests["general_qa"].context_cache_policy.base_ttl_seconds == 900
+    assert manifests["personal_assistant"].privacy_ceiling == 3
+    assert personal_assistant_payload["prompt_hash"] == manifests["personal_assistant"].prompt_hash
     assert manifests["research_deep_dive"].prompt_hash is not None
 
 
@@ -177,7 +181,7 @@ async def test_sync_assistant_modes_upserts_manifest_rows() -> None:
         )
         rows = await cursor.fetchall()
 
-        assert len(rows) == 6
+        assert len(rows) == 7
         coding_debug_row = next(row for row in rows if row["id"] == "coding_debug")
         assert coding_debug_row["prompt_hash"] == manifests["coding_debug"].prompt_hash
         assert json.loads(coding_debug_row["memory_policy_json"]) == manifests["coding_debug"].model_dump(mode="json")

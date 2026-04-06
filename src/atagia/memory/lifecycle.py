@@ -74,7 +74,8 @@ class MemoryLifecycleManager:
         try:
             decayed_refs = await self._decay_vitality(decay_cutoff, timestamp)
             result.decayed_count = len(decayed_refs)
-            archived_refs = await self._archive_low_value_memories(timestamp)
+            expired_state_refs = await self._archive_expired_state_snapshots(timestamp)
+            archived_refs = expired_state_refs + await self._archive_low_value_memories(timestamp)
             archived_ids = [ref.memory_id for ref in archived_refs]
             result.archived_count = len(archived_ids)
             result.skipped_evidence_count = await self._count_preserved_evidence()
@@ -147,15 +148,64 @@ class MemoryLifecycleManager:
             SELECT id, user_id, canonical_text, payload_json
             FROM memory_objects
             WHERE status = ?
-              AND object_type != ?
+              AND object_type NOT IN (?, ?, ?)
               AND vitality < ?
               AND confidence < ?
             """,
             (
                 MemoryStatus.ACTIVE.value,
                 MemoryObjectType.EVIDENCE.value,
+                MemoryObjectType.BELIEF.value,
+                MemoryObjectType.STATE_SNAPSHOT.value,
                 self._settings.lifecycle_archive_vitality,
                 self._settings.lifecycle_archive_confidence,
+            ),
+        )
+        rows = await cursor.fetchall()
+        updates = [
+            (
+                MemoryStatus.ARCHIVED.value,
+                json.dumps(
+                    self._archived_payload(row["payload_json"], row["canonical_text"]),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                timestamp,
+                row["id"],
+            )
+            for row in rows
+        ]
+        if updates:
+            await self._connection.executemany(
+                """
+                UPDATE memory_objects
+                SET status = ?, payload_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                updates,
+            )
+        return [
+            _LifecycleMemoryRef(
+                memory_id=str(row["id"]),
+                user_id=str(row["user_id"]),
+            )
+            for row in rows
+        ]
+
+    async def _archive_expired_state_snapshots(self, timestamp: str) -> list[_LifecycleMemoryRef]:
+        cursor = await self._connection.execute(
+            """
+            SELECT id, user_id, canonical_text, payload_json
+            FROM memory_objects
+            WHERE status = ?
+              AND object_type = ?
+              AND valid_to IS NOT NULL
+              AND valid_to < ?
+            """,
+            (
+                MemoryStatus.ACTIVE.value,
+                MemoryObjectType.STATE_SNAPSHOT.value,
+                timestamp,
             ),
         )
         rows = await cursor.fetchall()
@@ -216,11 +266,16 @@ class MemoryLifecycleManager:
             FROM memory_objects
             WHERE scope = ?
               AND object_type != ?
+              AND status IN (?, ?, ?, ?)
               AND created_at < ?
             """,
             (
                 MemoryScope.EPHEMERAL_SESSION.value,
                 MemoryObjectType.EVIDENCE.value,
+                MemoryStatus.ACTIVE.value,
+                MemoryStatus.SUPERSEDED.value,
+                MemoryStatus.ARCHIVED.value,
+                MemoryStatus.REVIEW_REQUIRED.value,
                 cutoff,
             ),
         )

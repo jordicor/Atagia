@@ -11,6 +11,7 @@ import pytest
 
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
+from atagia.core.consent_repository import MemoryConsentProfileRepository
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import (
     ConversationRepository,
@@ -24,9 +25,11 @@ from atagia.memory.extractor import MemoryExtractor
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
 from atagia.models.schemas_memory import (
     ExtractionConversationContext,
+    MemoryCategory,
     MemoryObjectType,
     MemoryScope,
     MemorySourceKind,
+    MemoryStatus,
 )
 from atagia.services.llm_client import (
     LLMClient,
@@ -378,9 +381,147 @@ async def test_low_confidence_items_are_marked_review_required() -> None:
             resolved_policy=resolved_policy,
         )
 
-        persisted = await memories.list_for_user("usr_1")
+        persisted = await memories.list_for_user("usr_1", statuses=None)
         assert len(persisted) == 1
-        assert persisted[0]["status"] == "review_required"
+        assert persisted[0]["status"] == MemoryStatus.REVIEW_REQUIRED.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_temporal_fields_are_persisted_when_temporal_confidence_is_high() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "User is traveling to Tokyo next week.",
+                "scope": "conversation",
+                "confidence": 0.9,
+                "source_kind": "extracted",
+                "privacy_level": 0,
+                "payload": {},
+                "temporal_type": "bounded",
+                "valid_from_iso": "2023-05-15T00:00:00",
+                "valid_to_iso": "2023-05-21T23:59:59.999999",
+                "temporal_confidence": 0.82,
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="I'm traveling to Tokyo next week.",
+            occurred_at="2023-05-08T13:56:00+00:00",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1")
+        evidence = persisted[0]
+        assert evidence["temporal_type"] == "bounded"
+        assert evidence["valid_from"] == "2023-05-15T00:00:00+00:00"
+        assert evidence["valid_to"] == "2023-05-21T23:59:59.999999+00:00"
+        assert evidence["payload_json"]["temporal_confidence"] == pytest.approx(0.82)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_temporal_bounds_are_not_persisted_below_confidence_threshold() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "I might be traveling soon.",
+                "scope": "conversation",
+                "confidence": 0.9,
+                "source_kind": "extracted",
+                "privacy_level": 0,
+                "payload": {},
+                "temporal_type": "bounded",
+                "valid_from_iso": "2023-05-15T00:00:00",
+                "valid_to_iso": "2023-05-21T23:59:59.999999",
+                "temporal_confidence": 0.4,
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="I might be traveling soon.",
+            occurred_at="2023-05-08T13:56:00+00:00",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1")
+        evidence = persisted[0]
+        assert evidence["temporal_type"] == "unknown"
+        assert evidence["valid_from"] is None
+        assert evidence["valid_to"] is None
+        assert evidence["payload_json"]["temporal_confidence"] == pytest.approx(0.4)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_index_text_is_persisted_when_present() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "I prefer concise debugging advice for websocket retry failures.",
+                "index_text": "This preference was stated while discussing websocket retry failures in production.",
+                "scope": "assistant_mode",
+                "confidence": 0.9,
+                "source_kind": "extracted",
+                "privacy_level": 0,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="I prefer concise debugging advice for websocket retry failures.",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1")
+        assert persisted[0]["index_text"] == (
+            "This preference was stated while discussing websocket retry failures in production."
+        )
     finally:
         await connection.close()
 
@@ -797,7 +938,7 @@ async def test_cold_start_raises_belief_threshold_until_memory_exists() -> None:
             conversation_context=_context(cold_source["id"]),
             resolved_policy=resolved_policy,
         )
-        cold_rows = await cold_memories.list_for_user("usr_1")
+        cold_rows = await cold_memories.list_for_user("usr_1", statuses=None)
         assert len(cold_rows) == 1
         assert cold_rows[0]["status"] == "review_required"
     finally:
@@ -874,7 +1015,7 @@ async def test_disallowed_scope_is_not_persisted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_over_ceiling_privacy_is_persisted_as_review_required() -> None:
+async def test_over_ceiling_privacy_user_item_starts_pending() -> None:
     payload = {
         "evidences": [
             {
@@ -882,7 +1023,7 @@ async def test_over_ceiling_privacy_is_persisted_as_review_required() -> None:
                 "scope": "conversation",
                 "confidence": 0.94,
                 "source_kind": "extracted",
-                "privacy_level": 2,
+                "privacy_level": 3,
                 "payload": {},
             }
         ],
@@ -909,10 +1050,380 @@ async def test_over_ceiling_privacy_is_persisted_as_review_required() -> None:
             resolved_policy=resolved_policy,
         )
 
-        persisted = await memories.list_for_user("usr_1")
+        persisted = await memories.list_for_user("usr_1", statuses=None)
         assert len(persisted) == 1
-        assert persisted[0]["privacy_level"] == 2
-        assert persisted[0]["status"] == "review_required"
+        assert persisted[0]["privacy_level"] == 3
+        assert persisted[0]["status"] == MemoryStatus.PENDING_USER_CONFIRMATION.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_natural_memory_fields_persist_to_columns_and_payload_debug_fields() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "Phone number: +1 415 555 0101",
+                "index_text": "User's primary phone number",
+                "scope": "global_user",
+                "confidence": 0.94,
+                "source_kind": "extracted",
+                "privacy_level": 2,
+                "memory_category": "phone",
+                "preserve_verbatim": True,
+                "informational_mention": True,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+        payload,
+        mode_id="personal_assistant",
+    )
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="By the way, my phone number is +1 415 555 0101.",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        assert len(persisted) == 1
+        assert persisted[0]["memory_category"] == MemoryCategory.PHONE.value
+        assert persisted[0]["preserve_verbatim"] == 1
+        assert persisted[0]["payload_json"]["informational_mention"] is True
+        assert persisted[0]["status"] == MemoryStatus.ACTIVE.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_high_privacy_user_items_start_pending_without_prior_confirmation() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "Banking card PIN: 4512",
+                "index_text": "User's banking card credential",
+                "scope": "global_user",
+                "confidence": 0.97,
+                "source_kind": "extracted",
+                "privacy_level": 3,
+                "memory_category": "pin_or_password",
+                "preserve_verbatim": True,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+        payload,
+        mode_id="personal_assistant",
+    )
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="My banking card PIN is 4512.",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        assert len(persisted) == 1
+        assert persisted[0]["status"] == MemoryStatus.PENDING_USER_CONFIRMATION.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_category_skips_pending_for_later_high_privacy_items() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "My locker PIN is 9988",
+                "index_text": "User's locker credential",
+                "scope": "global_user",
+                "confidence": 0.95,
+                "source_kind": "extracted",
+                "privacy_level": 3,
+                "memory_category": "pin_or_password",
+                "preserve_verbatim": True,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+        payload,
+        mode_id="personal_assistant",
+    )
+    try:
+        consent_profiles = MemoryConsentProfileRepository(connection, clock)
+        await consent_profiles.upsert_profile(
+            user_id="usr_1",
+            category=MemoryCategory.PIN_OR_PASSWORD,
+            confirmed_count=2,
+            declined_count=0,
+            last_confirmed_at="2026-03-30T17:59:00+00:00",
+        )
+        source_message = await _create_source_message(
+            messages,
+            text="My locker PIN is 9988.",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        assert len(persisted) == 1
+        assert persisted[0]["status"] == MemoryStatus.ACTIVE.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_high_privacy_user_items_stay_pending_below_confirmation_threshold() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "My desk drawer PIN is 6731",
+                "index_text": "User's desk drawer credential",
+                "scope": "global_user",
+                "confidence": 0.95,
+                "source_kind": "extracted",
+                "privacy_level": 3,
+                "memory_category": "pin_or_password",
+                "preserve_verbatim": True,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+        payload,
+        mode_id="personal_assistant",
+    )
+    try:
+        consent_profiles = MemoryConsentProfileRepository(connection, clock)
+        await consent_profiles.upsert_profile(
+            user_id="usr_1",
+            category=MemoryCategory.PIN_OR_PASSWORD,
+            confirmed_count=1,
+            declined_count=0,
+            last_confirmed_at="2026-03-30T17:59:00+00:00",
+        )
+        source_message = await _create_source_message(
+            messages,
+            text="My desk drawer PIN is 6731.",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        assert len(persisted) == 1
+        assert persisted[0]["status"] == MemoryStatus.PENDING_USER_CONFIRMATION.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_single_decline_does_not_suppress_high_privacy_item() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "My account PIN is 9031",
+                "index_text": "User's account credential",
+                "scope": "global_user",
+                "confidence": 0.95,
+                "source_kind": "extracted",
+                "privacy_level": 3,
+                "memory_category": "pin_or_password",
+                "preserve_verbatim": True,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+        payload,
+        mode_id="personal_assistant",
+    )
+    try:
+        consent_profiles = MemoryConsentProfileRepository(connection, clock)
+        await consent_profiles.upsert_profile(
+            user_id="usr_1",
+            category=MemoryCategory.PIN_OR_PASSWORD,
+            confirmed_count=0,
+            declined_count=1,
+            last_declined_at="2026-03-30T17:59:00+00:00",
+        )
+        source_message = await _create_source_message(
+            messages,
+            text="My account PIN is 9031.",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        assert len(persisted) == 1
+        assert persisted[0]["status"] == MemoryStatus.PENDING_USER_CONFIRMATION.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_declined_category_suppresses_only_matching_items() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "Work card PIN: 7000",
+                "index_text": "User's work card credential",
+                "scope": "global_user",
+                "confidence": 0.95,
+                "source_kind": "extracted",
+                "privacy_level": 3,
+                "memory_category": "pin_or_password",
+                "preserve_verbatim": True,
+                "payload": {},
+            },
+            {
+                "canonical_text": "I prefer patch-first debugging",
+                "scope": "assistant_mode",
+                "confidence": 0.9,
+                "source_kind": "extracted",
+                "privacy_level": 0,
+                "memory_category": "unknown",
+                "preserve_verbatim": False,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+        payload,
+        mode_id="personal_assistant",
+    )
+    try:
+        consent_profiles = MemoryConsentProfileRepository(connection, clock)
+        await consent_profiles.upsert_profile(
+            user_id="usr_1",
+            category=MemoryCategory.PIN_OR_PASSWORD,
+            confirmed_count=0,
+            declined_count=2,
+            last_declined_at="2026-03-30T17:59:00+00:00",
+        )
+        source_message = await _create_source_message(
+            messages,
+            text="My work card PIN is 7000 and I prefer patch-first debugging.",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        assert len(persisted) == 1
+        assert persisted[0]["canonical_text"] == "I prefer patch-first debugging"
+        assert persisted[0]["status"] == MemoryStatus.ACTIVE.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_assistant_messages_do_not_enter_pending_confirmation_branch() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "Customer support PIN: 1234",
+                "index_text": "Support credential mentioned by the assistant",
+                "scope": "conversation",
+                "confidence": 0.96,
+                "source_kind": "extracted",
+                "privacy_level": 3,
+                "memory_category": "pin_or_password",
+                "preserve_verbatim": True,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+        payload,
+        mode_id="personal_assistant",
+    )
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="The customer support PIN is 1234.",
+            role="assistant",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="assistant",
+            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        assert len(persisted) == 1
+        assert persisted[0]["status"] == MemoryStatus.ACTIVE.value
     finally:
         await connection.close()
 

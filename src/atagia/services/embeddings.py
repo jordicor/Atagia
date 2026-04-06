@@ -18,6 +18,7 @@ class EmbeddingMatch(BaseModel):
 
     memory_id: str
     score: float
+    position_rank: int | None = Field(default=None, ge=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -11,11 +11,12 @@ import pytest
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database
-from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository, WorkspaceRepository
+from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository, WorkspaceRepository
 from atagia.core.storage_backend import InProcessBackend
 from atagia.core.summary_repository import SummaryRepository
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
-from atagia.models.schemas_jobs import COMPACT_STREAM_NAME, JobEnvelope, JobType
+from atagia.models.schemas_jobs import COMPACT_STREAM_NAME, CompactionJobKind, JobEnvelope, JobType
+from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, SummaryViewKind
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -104,6 +105,7 @@ async def _build_runtime(
     conversations = ConversationRepository(connection, clock)
     messages = MessageRepository(connection, clock)
     summaries = SummaryRepository(connection, clock)
+    memories = MemoryObjectRepository(connection, clock)
     await users.create_user("usr_1")
     await workspaces.create_workspace("wrk_1", "usr_1", "Workspace")
     await conversations.create_conversation("cnv_1", "usr_1", "wrk_1", "coding_debug", "Chat")
@@ -114,7 +116,7 @@ async def _build_runtime(
         clock=clock,
         settings=_settings(),
     )
-    return connection, backend, messages, summaries, worker
+    return connection, backend, messages, summaries, memories, worker
 
 
 async def _seed_messages(messages: MessageRepository) -> None:
@@ -141,7 +143,7 @@ def _compaction_job(*, job_kind: str) -> JobEnvelope:
 
 @pytest.mark.asyncio
 async def test_compaction_worker_processes_conversation_chunk_job() -> None:
-    connection, backend, messages, summaries, worker = await _build_runtime(
+    connection, backend, messages, summaries, _memories, worker = await _build_runtime(
         {
             "summary_chunk_segmentation": [
                 json.dumps(
@@ -170,7 +172,7 @@ async def test_compaction_worker_processes_conversation_chunk_job() -> None:
 
 @pytest.mark.asyncio
 async def test_compaction_worker_processes_workspace_rollup_job() -> None:
-    connection, backend, _messages, summaries, worker = await _build_runtime(
+    connection, backend, _messages, summaries, _memories, worker = await _build_runtime(
         {
             "workspace_rollup_synthesis": [
                 json.dumps(
@@ -206,6 +208,8 @@ async def test_compaction_worker_processes_workspace_rollup_job() -> None:
 
         assert result.acked == 1
         assert len(rows) == 1
+        assert rows[0]["source_message_start_seq"] is None
+        assert rows[0]["source_message_end_seq"] is None
         assert rows[0]["summary_text"] == "Workspace prefers narrow debugging patches."
     finally:
         await connection.close()
@@ -213,7 +217,7 @@ async def test_compaction_worker_processes_workspace_rollup_job() -> None:
 
 @pytest.mark.asyncio
 async def test_compaction_worker_dead_letters_after_max_failed_deliveries() -> None:
-    connection, backend, messages, _summaries, worker = await _build_runtime(
+    connection, backend, messages, _summaries, _memories, worker = await _build_runtime(
         {"summary_chunk_segmentation": ["not-json", "not-json", "not-json"]}
     )
     try:
@@ -237,7 +241,7 @@ async def test_compaction_worker_dead_letters_after_max_failed_deliveries() -> N
 
 @pytest.mark.asyncio
 async def test_compaction_worker_handles_llm_failure_gracefully() -> None:
-    connection, backend, messages, summaries, worker = await _build_runtime(
+    connection, backend, messages, summaries, _memories, worker = await _build_runtime(
         {},
         failing_purposes={"summary_chunk_segmentation"},
     )
@@ -251,5 +255,96 @@ async def test_compaction_worker_handles_llm_failure_gracefully() -> None:
         assert result.acked == 0
         assert result.failed == 1
         assert rows == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_worker_orders_chunk_episode_and_thematic_jobs() -> None:
+    connection, backend, messages, summaries, memories, worker = await _build_runtime(
+        {
+            "summary_chunk_segmentation": [
+                json.dumps(
+                    {
+                        "episodes": [
+                            {"start_seq": 1, "end_seq": 2, "summary_text": "Patch-first debugging summary."}
+                        ]
+                    }
+                )
+            ],
+            "episode_synthesis": [
+                json.dumps(
+                    {
+                        "episodes": [
+                            {
+                                "source_summary_ids": ["sum_chunk_seed"],
+                                "summary_text": "Cross-session debugging episode.",
+                            }
+                        ]
+                    }
+                )
+            ],
+            "thematic_profile_synthesis": [
+                json.dumps(
+                    {
+                        "profiles": [
+                            {
+                                "source_memory_ids": ["mem_belief"],
+                                "summary_text": "User consistently prefers patch-first debugging.",
+                            }
+                        ]
+                    }
+                )
+            ],
+        }
+    )
+    try:
+        await _seed_messages(messages)
+        await memories.create_memory_object(
+            user_id="usr_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="User prefers patch-first debugging.",
+            payload={"claim_key": "workflow.debugging.style", "claim_value": "patch_first"},
+            source_kind=MemorySourceKind.INFERRED,
+            confidence=0.9,
+            privacy_level=1,
+            memory_id="mem_belief",
+        )
+        await summaries.create_summary(
+            "usr_1",
+            {
+                "id": "sum_chunk_seed",
+                "conversation_id": "cnv_1",
+                "workspace_id": "wrk_1",
+                "source_message_start_seq": 1,
+                "source_message_end_seq": 2,
+                "summary_kind": "conversation_chunk",
+                "summary_text": "Chunk seed.",
+                "source_object_ids_json": ["mem_belief"],
+                "maya_score": 1.5,
+                "model": "classify-test-model",
+                "created_at": "2026-04-03T14:00:00+00:00",
+            }
+        )
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(job_kind=CompactionJobKind.CONVERSATION_CHUNK.value).model_dump(mode="json"),
+        )
+
+        first = await worker.run_once()
+        second = await worker.run_once()
+        third = await worker.run_once()
+
+        episode_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE)
+        thematic_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.THEMATIC_PROFILE)
+
+        assert first.acked == 1
+        assert second.acked == 1
+        assert third.acked == 1
+        assert episode_rows
+        assert thematic_rows
+        assert thematic_rows[0]["summary_kind"] == SummaryViewKind.THEMATIC_PROFILE.value
     finally:
         await connection.close()

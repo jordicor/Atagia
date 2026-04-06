@@ -183,6 +183,10 @@ def test_build_transcript_window_trace_and_system_prompt_include_summary_boundar
     assert trace["raw_message_seqs"] == [7, 8, 9, 10]
     assert trace["budget_tokens"] == 400
     assert trace["budget_used_tokens"] > 0
+    assert "resolve them against that memory's source_window date" in prompt
+    assert "last Saturday" in prompt
+    assert "Calculate the actual calendar date when possible." in prompt
+    assert "include all distinct items found across the retrieved memories" in prompt
     assert "[Conversation summary | historical context only | ...]" in prompt
     assert "[End of summary]" in prompt
 

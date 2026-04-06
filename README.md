@@ -17,29 +17,36 @@ Atagia scores each candidate memory across multiple dimensions (task fit, mode f
 - **Scoped personalization per assistant mode** -- a coding assistant and a companion retrieve different memories from the same user, governed by policy manifests
 - **Consequence chain learning** -- records action-outcome-tendency chains so the assistant can learn from prior advice results
 - **Interaction contract learning** -- observes how the user prefers to collaborate (depth, directness, pushback tolerance) and adapts per mode
+- **Natural memory capture** -- picks up facts from normal conversation without requiring "remember this" commands
+- **Consent-gated memory** -- sensitive information is stored only after user confirmation, with per-user category tracking
+- **Temporal grounding** -- resolves relative dates ("last Saturday", "three weeks ago") against source timestamps into actual calendar dates
 - **Adaptive context caching** -- deterministic staleness scoring serves cached results on follow-up turns when context has not significantly changed
-- **Intelligent text chunking** -- two-level splitting (rule-based + AI-assisted) handles voice transcriptions and long pastes before extraction
+- **Two-level text chunking** -- rule-based + AI-assisted splitting handles voice transcriptions and long pastes before extraction
 - **All storage in SQLite** -- no external vector DB required; sqlite-vec available for optional embedding recall
 
 ## Current status
 
-Atagia is functional and under active development. The core pipeline (extraction, retrieval, scoring, belief revision, consequence chains) is implemented and tested with 400+ unit and integration tests.
+Atagia is functional and under active development. The core pipeline is implemented and tested with 539 unit and integration tests.
 
 What works today:
-- Full memory extraction from conversations with LLM-based applicability scoring
-- Belief revision with 8 conflict resolution strategies and full version history
-- Consequence chain learning (action to outcome to tendency)
-- Interaction contract learning (how the user prefers to collaborate)
+- Memory extraction from conversations with LLM-based applicability scoring
+- Natural memory capture from casual conversation (no protocol phrases required)
+- Consent-gated memory storage with per-user category thresholds
+- Hybrid retrieval: FTS5 with reciprocal rank fusion and progressive multi-query expansion
+- Three-level memory hierarchy (L0 verbatim, L1 belief, L2 summary) with mirror retrieval
+- Temporal grounding for relative dates against source message timestamps
+- Belief revision with 8 strategies and full version history
+- Consequence chain learning and interaction contract observation
 - Adaptive context cache with deterministic staleness scoring
-- Intelligent two-level text chunking for long messages (voice transcriptions, etc.)
-- Message timestamps for temporal reference resolution
+- Two-level text chunking for long messages (voice transcriptions, pastes)
+- Query-aware context selection with diversity reranking
 - Library mode, REST API, and MCP server
-- LoCoMo benchmark harness with ablation support
+- LoCoMo benchmark harness with ablation support and replay probes
 
 What is in progress or planned:
-- **Retrieval recall improvements**: candidate search currently uses FTS5 (full-text search). Single-hop and temporal questions work well, but multi-hop questions that require finding specific facts across hundreds of memories need better candidate generation. Vector embeddings (sqlite-vec) are the planned next step.
-- **Full benchmark validation**: the LoCoMo harness runs end-to-end but published accuracy numbers are pending the embedding work above.
-- **Neo4j graph layer**: planned for cases where relationship traversal adds value over flat retrieval. Will only ship if benchmark evidence justifies the added complexity.
+- **Vector embeddings**: candidate search uses FTS5. This handles single-hop and temporal questions well, but multi-hop questions across hundreds of memories need semantic candidate generation. sqlite-vec integration is next.
+- **Benchmark coverage**: the LoCoMo harness runs end-to-end. A ground truth audit of the LoCoMo conv-26 subset found factual errors and ambiguous items in the dataset ([details](https://github.com/snap-research/locomo/issues/35)). A separate benchmark (Atagia-bench) is in design to cover behaviors LoCoMo does not test: verbatim recall, consent boundaries, privacy scoping, and abstention.
+- **Neo4j graph layer**: planned for relationship traversal where flat retrieval is insufficient. Will ship only if benchmark evidence justifies the complexity.
 
 ## Quick start
 
@@ -353,14 +360,12 @@ Available ablation presets: `similarity_only`, `no_contract`, `no_scope`, `no_ne
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| 1 | Extraction, retrieval, scoring, contracts, lifecycle, API, workers | Done |
+| 1 | Core memory system: extraction, retrieval, scoring, contracts, lifecycle, API | Done |
 | 2 | Belief revision, consequence chains, compaction, evaluation, replay | Done |
-| 2.5 | Library mode, MCP server, documentation | Done |
-| 3 | LoCoMo benchmark harness, FTS multi-query retrieval, ablation support | Done |
-| 3.5 | Adaptive context cache, staleness scoring, invalidation hardening | Done |
-| 3.6 | Intelligent text chunking for long messages | Done |
-| 3.7 | Message timestamps and temporal reference resolution | Done |
-| 4 | Vector embeddings (sqlite-vec) for improved candidate recall | Next |
+| 2.5 | Library mode, MCP server | Done |
+| 3 | Benchmark harness, adaptive context cache, text chunking, temporal timestamps | Done |
+| 3.5 | Retrieval quality: RRF hybrid scoring, temporal grounding, contextual indexing, memory hierarchy, natural memory capture, consent gating | Done |
+| 4 | Vector embeddings (sqlite-vec) for semantic candidate recall | Next |
 | 5 | Neo4j graph layer for relationship-aware retrieval | Planned |
 
 ## Research

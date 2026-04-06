@@ -15,6 +15,16 @@ from atagia.services.llm_client import ConfigurationError, LLMClient, LLMEmbeddi
 logger = logging.getLogger(__name__)
 
 
+def compose_embedding_text(canonical_text: str, index_text: Any | None) -> str:
+    """Combine canonical and retrieval-oriented context for embedding."""
+    normalized_index_text = ""
+    if index_text is not None:
+        normalized_index_text = str(index_text).strip()
+    if not normalized_index_text:
+        return canonical_text
+    return f"{canonical_text}\n{normalized_index_text}"
+
+
 class SQLiteVecBackend(EmbeddingIndex):
     """Embedding index backed by sqlite-vec virtual tables."""
 
@@ -71,8 +81,9 @@ class SQLiteVecBackend(EmbeddingIndex):
         await self._connection.commit()
 
     async def upsert(self, memory_id: str, text: str, metadata: dict[str, Any]) -> None:
+        embedding_text = compose_embedding_text(text, metadata.get("index_text"))
         embedding = await self._embed_texts(
-            [text],
+            [embedding_text],
             metadata={"purpose": "embedding_upsert", "memory_id": memory_id, **metadata},
         )
         if not embedding:
@@ -137,6 +148,7 @@ class SQLiteVecBackend(EmbeddingIndex):
         if not query_embedding:
             return []
 
+        # TODO: add per-user partitioning when sqlite-vec multi-tenant scale matters.
         fetch_k = max(50, top_k * 5)
         cursor = await self._connection.execute(
             """
@@ -166,6 +178,7 @@ class SQLiteVecBackend(EmbeddingIndex):
             EmbeddingMatch(
                 memory_id=str(row["memory_id"]),
                 score=1.0 / (1.0 + max(0.0, float(row["distance"]))),
+                position_rank=index,
                 metadata={
                     "distance": float(row["distance"]),
                     "object_type": str(row["object_type"]),
@@ -173,7 +186,7 @@ class SQLiteVecBackend(EmbeddingIndex):
                     "created_at": str(row["created_at"]),
                 },
             )
-            for row in rows
+            for index, row in enumerate(rows, start=1)
         ]
 
     async def delete(self, memory_id: str) -> None:

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 
 from fastapi.testclient import TestClient
 
@@ -42,6 +43,66 @@ class QueueProvider(LLMProvider):
         purpose = str(request.metadata.get("purpose"))
         queue = self.outputs.get(purpose, [])
         if not queue:
+            if purpose == "summary_chunk_segmentation":
+                prompt = request.messages[1].content
+                message_sequences = [int(item) for item in re.findall(r'<message seq="(\d+)"', prompt)]
+                if not message_sequences:
+                    raise AssertionError("Expected message sequences in chunk segmentation prompt")
+                return LLMCompletionResponse(
+                    provider=self.name,
+                    model=request.model,
+                    output_text=json.dumps(
+                        {
+                            "episodes": [
+                                {
+                                    "start_seq": min(message_sequences),
+                                    "end_seq": max(message_sequences),
+                                    "summary_text": "Admin rebuild chunk summary.",
+                                }
+                            ]
+                        }
+                    ),
+                )
+            if purpose == "episode_synthesis":
+                prompt = request.messages[1].content
+                chunk_ids = re.findall(r'<conversation_chunk id="([^"]+)"', prompt)
+                if not chunk_ids:
+                    raise AssertionError("Expected conversation chunk IDs in episode synthesis prompt")
+                return LLMCompletionResponse(
+                    provider=self.name,
+                    model=request.model,
+                    output_text=json.dumps(
+                        {
+                            "episodes": [
+                                {
+                                    "source_summary_ids": chunk_ids,
+                                    "summary_text": "Admin rebuild episode summary.",
+                                }
+                            ]
+                        }
+                    ),
+                )
+            if purpose == "thematic_profile_synthesis":
+                prompt = request.messages[1].content
+                episode_ids = re.findall(r'<episode id="([^"]+)"', prompt)
+                return LLMCompletionResponse(
+                    provider=self.name,
+                    model=request.model,
+                    output_text=json.dumps(
+                        {
+                            "profiles": (
+                                [
+                                    {
+                                        "source_memory_ids": [episode_ids[0]],
+                                        "summary_text": "Admin rebuild thematic profile.",
+                                    }
+                                ]
+                                if episode_ids
+                                else []
+                            )
+                        }
+                    ),
+                )
             raise AssertionError(f"No queued output left for purpose {purpose}")
         return LLMCompletionResponse(
             provider=self.name,

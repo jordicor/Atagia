@@ -22,7 +22,7 @@
     "clarification_tolerance",
     "pace"
   ],
-  "privacy_ceiling": 0,
+  "privacy_ceiling": 2,
   "context_budget_tokens": 2800,
   "transcript_budget_tokens": 4000,
   "retrieval_params": {

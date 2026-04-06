@@ -25,6 +25,7 @@ from atagia.models.schemas_jobs import (
     JobEnvelope,
     JobType,
     REVISE_STREAM_NAME,
+    RevisionJobPayload,
     WORKER_GROUP_NAME,
 )
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
@@ -167,10 +168,10 @@ async def _seed_belief(
     beliefs: BeliefRepository,
     *,
     memory_id: str = "mem_belief",
-    scope: MemoryScope = MemoryScope.ASSISTANT_MODE,
+    scope: MemoryScope = MemoryScope.CONVERSATION,
     assistant_mode_id: str | None = "coding_debug",
     workspace_id: str | None = "wrk_1",
-    conversation_id: str | None = None,
+    conversation_id: str | None = "cnv_1",
     source_message_ids: list[str] | None = None,
     status: MemoryStatus = MemoryStatus.ACTIVE,
 ) -> dict[str, object]:
@@ -240,6 +241,7 @@ def _revision_job(
     source_message_id: str,
     scope: str,
     claim_key: str = "response_style.debugging",
+    claim_value: str = "terse",
 ) -> JobEnvelope:
     return JobEnvelope(
         job_id="job_revision_1",
@@ -250,7 +252,7 @@ def _revision_job(
         payload={
             "belief_id": belief_id,
             "claim_key": claim_key,
-            "claim_value": json.dumps("terse"),
+            "claim_value": json.dumps(claim_value),
             "evidence_memory_ids": evidence_memory_ids,
             "source_message_id": source_message_id,
             "user_id": "usr_1",
@@ -298,6 +300,521 @@ async def test_revision_worker_processes_revision_job_end_to_end_and_releases_lo
         assert result.failed == 0
         assert version["support_count"] == 2
         assert backend._locks == {}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_defers_contradictory_revision_below_tension_threshold() -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime([])
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_defer",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+
+        result = await worker.process_job(
+            _revision_job(
+                belief_id=str(belief["id"]),
+                evidence_memory_ids=[str(evidence["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+                claim_value="verbose",
+            ).model_dump(mode="json")
+        )
+
+        assert result is not None
+        assert result["status"] == "deferred_tension"
+        assert result["signal_type"] == "contradictory"
+        assert result["tension_score"] == pytest.approx(0.15)
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.15)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_defers_same_value_scope_exception_after_preview() -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "This belief only holds in a narrower scope."})]
+    )
+    try:
+        belief = await _seed_belief(
+            memories,
+            beliefs,
+            scope=MemoryScope.ASSISTANT_MODE,
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id=None,
+        )
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_scope_split",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+
+        result = await worker.process_job(
+            _revision_job(
+                belief_id=str(belief["id"]),
+                evidence_memory_ids=[str(evidence["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+                claim_value="terse",
+            ).model_dump(mode="json")
+        )
+
+        assert result is not None
+        assert result["status"] == "deferred_tension"
+        assert result["signal_type"] == "ambiguous"
+        assert result["preview_action"] == "SPLIT_BY_SCOPE"
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.15)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_allows_same_value_narrower_scope_reinforcement_after_preview() -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [json.dumps({"action": "REINFORCE", "explanation": "The narrower evidence still reinforces the broader belief."})]
+    )
+    try:
+        belief = await _seed_belief(
+            memories,
+            beliefs,
+            scope=MemoryScope.ASSISTANT_MODE,
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id=None,
+        )
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_scope_reinforce",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+
+        result = await worker.process_job(
+            _revision_job(
+                belief_id=str(belief["id"]),
+                evidence_memory_ids=[str(evidence["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+                claim_value="terse",
+            ).model_dump(mode="json")
+        )
+        cursor = await connection.execute(
+            "SELECT support_count FROM belief_versions WHERE belief_id = ? AND is_current = 1",
+            (belief["id"],),
+        )
+        version = await cursor.fetchone()
+
+        assert result is not None
+        assert result["action"] == "REINFORCE"
+        assert result["signal_type"] == "ambiguous"
+        assert version["support_count"] == 2
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_resets_tension_and_revises_once_threshold_is_reached() -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [json.dumps({"action": "WEAKEN", "explanation": "Contradiction reached the threshold."})]
+    )
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        await beliefs.increment_tension(str(belief["id"]), 0.45, user_id="usr_1")
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_threshold",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+
+        result = await worker.process_job(
+            _revision_job(
+                belief_id=str(belief["id"]),
+                evidence_memory_ids=[str(evidence["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+                claim_value="verbose",
+            ).model_dump(mode="json")
+        )
+
+        assert result is not None
+        assert result["action"] == "WEAKEN"
+        assert result["signal_type"] == "contradictory"
+        assert result["trigger_tension_score"] == pytest.approx(0.60)
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_reinforcing_evidence_reduces_tension_before_reinforce() -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [json.dumps({"action": "REINFORCE", "explanation": "This evidence reinforces the belief."})]
+    )
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        await beliefs.increment_tension(str(belief["id"]), 0.20, user_id="usr_1")
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_reinforce",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+
+        result = await worker.process_job(
+            _revision_job(
+                belief_id=str(belief["id"]),
+                evidence_memory_ids=[str(evidence["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+            ).model_dump(mode="json")
+        )
+
+        assert result is not None
+        assert result["action"] == "REINFORCE"
+        assert result["signal_type"] == "ambiguous"
+        assert result["tension_score"] == pytest.approx(0.15)
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.15)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_propagates_tension_decrement_failures_after_reinforce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime([])
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        payload = RevisionJobPayload.model_validate(
+            _revision_job(
+                belief_id=str(belief["id"]),
+                evidence_memory_ids=["mem_evidence_reinforce_fail"],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+            ).payload
+        )
+
+        async def fail_decrement(*args: object, **kwargs: object) -> float:
+            del args, kwargs
+            raise RuntimeError("decrement failed")
+
+        monkeypatch.setattr(worker._belief_repository, "decrement_tension", fail_decrement)
+
+        with pytest.raises(RuntimeError, match="decrement failed"):
+            await worker._post_revision_tension_update(  # noqa: SLF001
+                payload,
+                {"action": "REINFORCE"},
+            )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_replays_accumulated_contradictory_evidence_at_threshold() -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [json.dumps({"action": "WEAKEN", "explanation": "Accumulated contradictions reached the threshold."})]
+    )
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        evidence_ids: list[str] = []
+        for index in range(1, 5):
+            evidence = await _seed_evidence(
+                memories,
+                memory_id=f"mem_evidence_acc_{index}",
+                conversation_id="cnv_1",
+                assistant_mode_id="coding_debug",
+                source_message_id="msg_1",
+            )
+            evidence_ids.append(str(evidence["id"]))
+            result = await worker.process_job(
+                _revision_job(
+                    belief_id=str(belief["id"]),
+                    evidence_memory_ids=[str(evidence["id"])],
+                    source_message_id="msg_1",
+                    scope=MemoryScope.CONVERSATION.value,
+                    claim_value="verbose",
+                ).model_dump(mode="json")
+            )
+            assert result is not None
+
+        cursor = await connection.execute(
+            "SELECT contradict_count FROM belief_versions WHERE belief_id = ? AND is_current = 1",
+            (belief["id"],),
+        )
+        version = await cursor.fetchone()
+        belief_row = await memories.get_memory_object(str(belief["id"]), "usr_1")
+
+        assert result["action"] == "WEAKEN"
+        assert result["trigger_tension_score"] == pytest.approx(0.60)
+        assert version["contradict_count"] == 4
+        assert belief_row is not None
+        assert belief_row["payload_json"].get("tension_evidence_memory_ids") is None
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+        assert len(evidence_ids) == 4
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_clears_stale_contradiction_buffer_when_tension_returns_to_zero() -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [
+            json.dumps({"action": "REINFORCE", "explanation": "Reinforcing evidence."}),
+            json.dumps({"action": "REINFORCE", "explanation": "Reinforcing evidence."}),
+            json.dumps({"action": "REINFORCE", "explanation": "Reinforcing evidence."}),
+            json.dumps({"action": "WEAKEN", "explanation": "Fresh contradictions reached the threshold."}),
+        ]
+    )
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        contradiction = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_old_contradiction",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+        deferred = await worker.process_job(
+            _revision_job(
+                belief_id=str(belief["id"]),
+                evidence_memory_ids=[str(contradiction["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+                claim_value="verbose",
+            ).model_dump(mode="json")
+        )
+        assert deferred is not None
+        assert deferred["status"] == "deferred_tension"
+
+        for index in range(1, 4):
+            reinforce_evidence = await _seed_evidence(
+                memories,
+                memory_id=f"mem_evidence_reinforce_zero_{index}",
+                conversation_id="cnv_1",
+                assistant_mode_id="coding_debug",
+                source_message_id="msg_1",
+            )
+            reinforce = await worker.process_job(
+                _revision_job(
+                    belief_id=str(belief["id"]),
+                    evidence_memory_ids=[str(reinforce_evidence["id"])],
+                    source_message_id="msg_1",
+                    scope=MemoryScope.CONVERSATION.value,
+                ).model_dump(mode="json")
+            )
+            assert reinforce is not None
+            assert reinforce["action"] == "REINFORCE"
+
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+
+        for index in range(1, 5):
+            contradiction_evidence = await _seed_evidence(
+                memories,
+                memory_id=f"mem_evidence_new_contradiction_{index}",
+                conversation_id="cnv_1",
+                assistant_mode_id="coding_debug",
+                source_message_id="msg_1",
+            )
+            result = await worker.process_job(
+                _revision_job(
+                    belief_id=str(belief["id"]),
+                    evidence_memory_ids=[str(contradiction_evidence["id"])],
+                    source_message_id="msg_1",
+                    scope=MemoryScope.CONVERSATION.value,
+                    claim_value="verbose",
+                ).model_dump(mode="json")
+            )
+            assert result is not None
+
+        cursor = await connection.execute(
+            "SELECT contradict_count FROM belief_versions WHERE belief_id = ? AND is_current = 1",
+            (belief["id"],),
+        )
+        version = await cursor.fetchone()
+
+        assert result["action"] == "WEAKEN"
+        assert version["contradict_count"] == 4
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_reuses_threshold_preview_for_ambiguous_same_value_cases() -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [
+            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 1."}),
+            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 2."}),
+            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 3."}),
+            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Threshold trigger preview."}),
+            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Threshold apply preview."}),
+            json.dumps({"action": "REINFORCE", "explanation": "Should remain unused."}),
+        ]
+    )
+    try:
+        belief = await _seed_belief(
+            memories,
+            beliefs,
+            scope=MemoryScope.ASSISTANT_MODE,
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id=None,
+        )
+        for index in range(1, 5):
+            evidence = await _seed_evidence(
+                memories,
+                memory_id=f"mem_evidence_scope_threshold_{index}",
+                conversation_id="cnv_1",
+                assistant_mode_id="coding_debug",
+                source_message_id="msg_1",
+            )
+            result = await worker.process_job(
+                _revision_job(
+                    belief_id=str(belief["id"]),
+                    evidence_memory_ids=[str(evidence["id"])],
+                    source_message_id="msg_1",
+                    scope=MemoryScope.CONVERSATION.value,
+                    claim_value="terse",
+                ).model_dump(mode="json")
+            )
+            assert result is not None
+
+        assert result["action"] == "SPLIT_BY_SCOPE"
+        assert result["signal_type"] == "ambiguous"
+        assert result["trigger_tension_score"] == pytest.approx(0.60)
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_preserves_contradiction_buffer_when_threshold_revision_fails() -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime(["not-json"])
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        for index in range(1, 5):
+            evidence = await _seed_evidence(
+                memories,
+                memory_id=f"mem_evidence_fail_contradiction_{index}",
+                conversation_id="cnv_1",
+                assistant_mode_id="coding_debug",
+                source_message_id="msg_1",
+            )
+            if index < 4:
+                result = await worker.process_job(
+                    _revision_job(
+                        belief_id=str(belief["id"]),
+                        evidence_memory_ids=[str(evidence["id"])],
+                        source_message_id="msg_1",
+                        scope=MemoryScope.CONVERSATION.value,
+                        claim_value="verbose",
+                    ).model_dump(mode="json")
+                )
+                assert result is not None
+                assert result["status"] == "deferred_tension"
+                continue
+
+            with pytest.raises(Exception):
+                await worker.process_job(
+                    _revision_job(
+                        belief_id=str(belief["id"]),
+                        evidence_memory_ids=[str(evidence["id"])],
+                        source_message_id="msg_1",
+                        scope=MemoryScope.CONVERSATION.value,
+                        claim_value="verbose",
+                    ).model_dump(mode="json")
+                )
+
+        belief_row = await memories.get_memory_object(str(belief["id"]), "usr_1")
+
+        assert belief_row is not None
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.60)
+        assert belief_row["payload_json"]["tension_evidence_memory_ids"] == [
+            "mem_evidence_fail_contradiction_1",
+            "mem_evidence_fail_contradiction_2",
+            "mem_evidence_fail_contradiction_3",
+            "mem_evidence_fail_contradiction_4",
+        ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_preserves_ambiguous_buffer_when_threshold_preview_fails() -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [
+            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 1."}),
+            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 2."}),
+            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 3."}),
+            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Threshold trigger preview."}),
+            "not-json",
+        ]
+    )
+    try:
+        belief = await _seed_belief(
+            memories,
+            beliefs,
+            scope=MemoryScope.ASSISTANT_MODE,
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id=None,
+        )
+        for index in range(1, 5):
+            evidence = await _seed_evidence(
+                memories,
+                memory_id=f"mem_evidence_fail_ambiguous_{index}",
+                conversation_id="cnv_1",
+                assistant_mode_id="coding_debug",
+                source_message_id="msg_1",
+            )
+            if index < 4:
+                result = await worker.process_job(
+                    _revision_job(
+                        belief_id=str(belief["id"]),
+                        evidence_memory_ids=[str(evidence["id"])],
+                        source_message_id="msg_1",
+                        scope=MemoryScope.CONVERSATION.value,
+                        claim_value="terse",
+                    ).model_dump(mode="json")
+                )
+                assert result is not None
+                assert result["status"] == "deferred_tension"
+                continue
+
+            with pytest.raises(Exception):
+                await worker.process_job(
+                    _revision_job(
+                        belief_id=str(belief["id"]),
+                        evidence_memory_ids=[str(evidence["id"])],
+                        source_message_id="msg_1",
+                        scope=MemoryScope.CONVERSATION.value,
+                        claim_value="terse",
+                    ).model_dump(mode="json")
+                )
+
+        belief_row = await memories.get_memory_object(str(belief["id"]), "usr_1")
+
+        assert belief_row is not None
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.60)
+        assert belief_row["payload_json"]["tension_evidence_memory_ids"] == [
+            "mem_evidence_fail_ambiguous_1",
+            "mem_evidence_fail_ambiguous_2",
+            "mem_evidence_fail_ambiguous_3",
+            "mem_evidence_fail_ambiguous_4",
+        ]
     finally:
         await connection.close()
 

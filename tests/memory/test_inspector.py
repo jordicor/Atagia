@@ -99,6 +99,32 @@ async def _build_runtime():
         status=MemoryStatus.ACTIVE,
         memory_id="mem_other",
     )
+    await memories.create_memory_object(
+        user_id="usr_1",
+        conversation_id="cnv_1",
+        assistant_mode_id="coding_debug",
+        object_type=MemoryObjectType.EVIDENCE,
+        scope=MemoryScope.CONVERSATION,
+        canonical_text="Pending sensitive memory.",
+        source_kind=MemorySourceKind.EXTRACTED,
+        confidence=0.8,
+        privacy_level=3,
+        status=MemoryStatus.PENDING_USER_CONFIRMATION,
+        memory_id="mem_pending",
+    )
+    await memories.create_memory_object(
+        user_id="usr_1",
+        conversation_id="cnv_1",
+        assistant_mode_id="coding_debug",
+        object_type=MemoryObjectType.EVIDENCE,
+        scope=MemoryScope.CONVERSATION,
+        canonical_text="Declined sensitive memory.",
+        source_kind=MemorySourceKind.EXTRACTED,
+        confidence=0.8,
+        privacy_level=3,
+        status=MemoryStatus.DECLINED,
+        memory_id="mem_declined",
+    )
     await connection.execute(
         """
         INSERT INTO belief_versions(
@@ -194,6 +220,25 @@ async def test_inspect_user_memories_filters_by_type_scope_and_status() -> None:
         audit_rows = await audits.list_entries("adm_1")
         assert audit_rows[-1]["target_type"] == "user_memory_collection"
         assert audit_rows[-1]["metadata_json"]["result_count"] == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_inspect_user_memories_shows_pending_and_declined_rows() -> None:
+    connection, inspector, audits, _event = await _build_runtime()
+    try:
+        memories = await inspector.inspect_user_memories(
+            "usr_1",
+            admin_user_id="adm_1",
+            limit=10,
+        )
+
+        statuses = {item["id"]: item["status"] for item in memories}
+        assert statuses["mem_pending"] == MemoryStatus.PENDING_USER_CONFIRMATION.value
+        assert statuses["mem_declined"] == MemoryStatus.DECLINED.value
+        audit_rows = await audits.list_entries("adm_1")
+        assert audit_rows[-1]["metadata_json"]["result_count"] == len(memories)
     finally:
         await connection.close()
 

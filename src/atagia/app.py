@@ -212,6 +212,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
                 connection=compaction_connection,
                 llm_client=llm_client,
                 clock=clock,
+                embedding_index=embedding_index,
                 settings=settings,
             )
             evaluation_worker = EvaluationWorker(

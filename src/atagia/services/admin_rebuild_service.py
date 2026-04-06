@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -10,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
-from atagia.core.repositories import ConversationRepository, MessageRepository
+from atagia.core.repositories import ConversationRepository, MessageRepository, summary_mirror_id
 from atagia.core.storage_backend import InProcessBackend, StorageBackend
 from atagia.core.timestamps import resolve_message_occurred_at
 from atagia.memory.policy_manifest import ManifestLoader
@@ -49,6 +50,8 @@ class RebuildResult(BaseModel):
     contract_jobs_processed: int = 0
     revision_jobs_processed: int = 0
     conversation_compaction_jobs_processed: int = 0
+    episode_compaction_jobs_processed: int = 0
+    thematic_profile_jobs_processed: int = 0
     workspace_rollup_jobs_processed: int = 0
 
 
@@ -120,6 +123,7 @@ class AdminRebuildService:
     ) -> None:
         rebuild_backend = InProcessBackend()
         try:
+            rebuild_settings = replace(self._settings, skip_compaction=True)
             ingest_worker = IngestWorker(
                 storage_backend=rebuild_backend,
                 connection=self._connection,
@@ -127,7 +131,7 @@ class AdminRebuildService:
                 clock=self._clock,
                 manifest_loader=self._manifest_loader,
                 embedding_index=self._embedding_index,
-                settings=self._settings,
+                settings=rebuild_settings,
             )
             contract_worker = ContractWorker(
                 storage_backend=rebuild_backend,
@@ -149,8 +153,10 @@ class AdminRebuildService:
                 connection=self._connection,
                 llm_client=self._llm_client,
                 clock=self._clock,
+                embedding_index=self._embedding_index,
                 settings=self._settings,
             )
+            conversations_with_messages: list[dict[str, Any]] = []
 
             for conversation in conversations:
                 messages = await self._message_repository.get_messages(
@@ -159,6 +165,8 @@ class AdminRebuildService:
                     limit=5000,
                     offset=0,
                 )
+                if messages:
+                    conversations_with_messages.append(conversation)
                 for index, message in enumerate(messages):
                     message_role = str(message["role"])
                     recent_messages = [
@@ -209,12 +217,29 @@ class AdminRebuildService:
             )
             result.revision_jobs_processed += len(revision_results)
 
+            for conversation in conversations_with_messages:
+                self._record_compaction_result(
+                    result,
+                    await compaction_worker.process_job(
+                        self._conversation_chunk_job(
+                            user_id=str(conversation["user_id"]),
+                            conversation_id=str(conversation["id"]),
+                            workspace_id=(
+                                str(conversation["workspace_id"])
+                                if conversation.get("workspace_id") is not None
+                                else None
+                            ),
+                        )
+                    ),
+                )
+
             compaction_results = await self._drain_stream(
                 rebuild_backend,
                 COMPACT_STREAM_NAME,
                 compaction_worker.process_job,
             )
-            result.conversation_compaction_jobs_processed += len(compaction_results)
+            for item in compaction_results:
+                self._record_compaction_result(result, item)
 
             for workspace_id in result.workspace_ids:
                 await compaction_worker.process_job(
@@ -265,6 +290,42 @@ class AdminRebuildService:
             created_at=None,
         ).model_dump(mode="json")
 
+    @staticmethod
+    def _conversation_chunk_job(
+        *,
+        user_id: str,
+        conversation_id: str,
+        workspace_id: str | None,
+    ) -> dict[str, Any]:
+        return JobEnvelope(
+            job_id=f"job_rebuild_chunk_{conversation_id}",
+            job_type=JobType.COMPACT_SUMMARIES,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            payload=CompactionJobPayload(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                job_kind=CompactionJobKind.CONVERSATION_CHUNK,
+            ).model_dump(mode="json"),
+            created_at=None,
+        ).model_dump(mode="json")
+
+    @staticmethod
+    def _record_compaction_result(
+        result: RebuildResult,
+        compaction_result: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(compaction_result, dict):
+            return
+        job_kind = compaction_result.get("job_kind")
+        if job_kind == CompactionJobKind.CONVERSATION_CHUNK.value:
+            result.conversation_compaction_jobs_processed += 1
+        elif job_kind == CompactionJobKind.EPISODE.value:
+            result.episode_compaction_jobs_processed += 1
+        elif job_kind == CompactionJobKind.THEMATIC_PROFILE.value:
+            result.thematic_profile_jobs_processed += 1
+
     async def _drain_stream(
         self,
         storage_backend: InProcessBackend,
@@ -294,6 +355,8 @@ class AdminRebuildService:
 
     async def _purge_conversation_state(self, user_id: str, conversation_id: str) -> None:
         memory_ids = await self._memory_ids_for_conversation(user_id, conversation_id)
+        summary_ids = await self._summary_ids_for_conversation_purge(user_id, conversation_id)
+        mirror_ids = [summary_mirror_id(summary_id) for summary_id in summary_ids]
         try:
             await self._connection.execute("BEGIN")
             await self._connection.execute(
@@ -304,19 +367,22 @@ class AdminRebuildService:
                 """,
                 (user_id, conversation_id),
             )
-            await self._connection.execute(
-                """
-                DELETE FROM summary_views
-                WHERE conversation_id = ?
-                """,
-                (conversation_id,),
-            )
-            await self._delete_memory_ids(user_id, memory_ids)
+            if summary_ids:
+                placeholders = ", ".join("?" for _ in summary_ids)
+                await self._connection.execute(
+                    """
+                    DELETE FROM summary_views
+                    WHERE user_id = ?
+                      AND id IN ({placeholders})
+                    """.format(placeholders=placeholders),
+                    (user_id, *summary_ids),
+                )
+            await self._delete_memory_ids(user_id, self._stable_ids([*memory_ids, *mirror_ids]))
             await self._connection.commit()
         except Exception:
             await self._connection.rollback()
             raise
-        await self._delete_embeddings(memory_ids)
+        await self._delete_embeddings(self._stable_ids([*memory_ids, *mirror_ids]))
 
     async def _purge_user_state(self, user_id: str) -> None:
         memory_ids = await self._memory_ids_for_user(user_id)
@@ -332,18 +398,9 @@ class AdminRebuildService:
             await self._connection.execute(
                 """
                 DELETE FROM summary_views
-                WHERE conversation_id IN (
-                    SELECT id
-                    FROM conversations
-                    WHERE user_id = ?
-                )
-                   OR workspace_id IN (
-                    SELECT id
-                    FROM workspaces
-                    WHERE user_id = ?
-                )
+                WHERE user_id = ?
                 """,
-                (user_id, user_id),
+                (user_id,),
             )
             await self._delete_memory_ids(user_id, memory_ids)
             await self._connection.commit()
@@ -405,6 +462,44 @@ class AdminRebuildService:
         )
         rows = await cursor.fetchall()
         return [str(row["id"]) for row in rows]
+
+    async def _summary_ids_for_conversation_purge(self, user_id: str, conversation_id: str) -> list[str]:
+        cursor = await self._connection.execute(
+            """
+            SELECT sv.id
+            FROM summary_views AS sv
+            LEFT JOIN conversations AS c ON c.id = ?
+            WHERE sv.user_id = ?
+              AND (
+                  sv.conversation_id = ?
+                  OR (c.workspace_id IS NOT NULL AND sv.workspace_id = c.workspace_id AND sv.summary_kind = ?)
+                  OR sv.summary_kind IN (?, ?)
+              )
+            ORDER BY sv.id ASC
+            """,
+            (
+                conversation_id,
+                user_id,
+                conversation_id,
+                CompactionJobKind.WORKSPACE_ROLLUP.value,
+                CompactionJobKind.EPISODE.value,
+                CompactionJobKind.THEMATIC_PROFILE.value,
+            ),
+        )
+        rows = await cursor.fetchall()
+        return [str(row["id"]) for row in rows]
+
+    @staticmethod
+    def _stable_ids(memory_ids: list[str]) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for memory_id in memory_ids:
+            normalized = str(memory_id).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        return ordered
 
     async def _memory_ids_for_user(self, user_id: str) -> list[str]:
         cursor = await self._connection.execute(
