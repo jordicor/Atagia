@@ -34,7 +34,19 @@ class ExtractionProvider(LLMProvider):
     name = "extractor-embeddings"
 
     def __init__(self, payload: dict[str, object]) -> None:
-        self.payload = payload
+        normalized_payload = dict(payload)
+        normalized_payload["evidences"] = [
+            (
+                {
+                    **item,
+                    "language_codes": ["en"],
+                }
+                if isinstance(item, dict) and "canonical_text" in item and "language_codes" not in item
+                else item
+            )
+            for item in normalized_payload.get("evidences", [])
+        ]
+        self.payload = normalized_payload
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         if request.metadata.get("purpose") == "intent_classifier_explicit":
@@ -359,9 +371,74 @@ async def test_protected_verbatim_memories_embed_only_index_text() -> None:
         persisted = await memories.list_for_user("usr_1", statuses=None)
         assert len(persisted) == 1
         assert persisted[0]["status"] == MemoryStatus.PENDING_USER_CONFIRMATION.value
-        assert len(embedding_index.calls) == 1
-        assert embedding_index.calls[0]["text"] == "User's banking card credential"
-        assert embedding_index.calls[0]["metadata"]["index_text"] is None
-        assert "4512" not in str(embedding_index.calls[0])
+        assert len(embedding_index.calls) == 0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_review_required_memories_do_not_create_embeddings() -> None:
+    embedding_index = TrackingEmbeddingIndex()
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 4, 10, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+    memories = MemoryObjectRepository(connection, clock)
+    await users.create_user("usr_1")
+    await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "Chat")
+    provider = ExtractionProvider(
+        {
+            "evidences": [
+                {
+                    "canonical_text": "Maybe concise replies would help.",
+                    "index_text": "Sensitive preference candidate for debugging.",
+                    "scope": "assistant_mode",
+                    "confidence": 0.9,
+                    "source_kind": "extracted",
+                    "privacy_level": 2,
+                    "payload": {},
+                }
+            ],
+            "beliefs": [],
+            "contract_signals": [],
+            "state_updates": [],
+            "mode_guess": None,
+            "nothing_durable": False,
+        }
+    )
+    extractor = MemoryExtractor(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=clock,
+        message_repository=messages,
+        memory_repository=memories,
+        storage_backend=InProcessBackend(),
+        embedding_index=embedding_index,
+    )
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["coding_debug"]
+    resolved_policy = PolicyResolver().resolve(manifest, None, None)
+    try:
+        message = await messages.create_message(
+            "msg_1",
+            "cnv_1",
+            "assistant",
+            1,
+            "Maybe concise replies would help.",
+            6,
+            {},
+        )
+
+        await extractor.extract(
+            message_text=str(message["text"]),
+            role="assistant",
+            conversation_context=_context(str(message["id"])),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        assert len(persisted) == 1
+        assert persisted[0]["status"] == MemoryStatus.REVIEW_REQUIRED.value
+        assert embedding_index.calls == []
     finally:
         await connection.close()

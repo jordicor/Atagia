@@ -6,6 +6,33 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+
+_DOTENV_LOADED = False
+
+
+def _load_dotenv_once() -> None:
+    """Load .env from the project root, idempotent across calls.
+
+    Walks up from this file to find the project root (where pyproject.toml
+    lives). Existing environment variables take precedence over .env values
+    so explicit overrides at run time still win.
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+
+    here = Path(__file__).resolve()
+    for parent in (here, *here.parents):
+        candidate = parent / "pyproject.toml"
+        if candidate.exists():
+            env_path = parent / ".env"
+            if env_path.exists():
+                load_dotenv(env_path, override=False)
+            return
+
 
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -39,7 +66,9 @@ class Settings:
     admin_api_key: str | None
     workers_enabled: bool
     debug: bool
+    allow_admin_export_anonymization: bool = False
     allow_insecure_http: bool = False
+    embedding_provider_name: str | None = None
     embedding_backend: str = "none"
     embedding_model: str | None = None
     embedding_dimension: int = 1536
@@ -48,6 +77,7 @@ class Settings:
     lifecycle_decay_rate: float = 0.9
     lifecycle_archive_vitality: float = 0.05
     lifecycle_archive_confidence: float = 0.3
+    ephemeral_scoring_hours: int = 24
     lifecycle_ephemeral_ttl_hours: int = 24
     lifecycle_review_ttl_days: int = 7
     promotion_conv_to_ws_min_conversations: int = 2
@@ -67,6 +97,22 @@ class Settings:
     lifecycle_min_interval_seconds: int = 3600
     lifecycle_worker_enabled: bool = False
     lifecycle_worker_interval_seconds: int = 3600
+    small_corpus_token_threshold_ratio: float = 0.7
+    # Wave 1 batch 2 (1-C): raw evidence as first-class search channel.
+    raw_message_channel: bool = True
+    # Raw evidence RRF weight, slightly lower than memory_objects by
+    # default because memories are more focused and raw evidence is a
+    # recall safety net. Tuning is deferred to Wave 2.
+    raw_message_rrf_weight: float = 0.75
+    # Maximum conversation windows fetched per sub-query from the raw
+    # evidence channel before fusion. Raw evidence is a secondary lane
+    # so this ceiling is modest.
+    raw_message_channel_limit: int = 8
+    # Conversation window size (messages per window) used by the raw
+    # evidence channel. 2-4 per the Wave 1-C spec; default 3 with 1-turn
+    # overlap keeps neighbouring evidence accessible.
+    raw_message_window_size: int = 3
+    raw_message_window_overlap: int = 1
 
     def __post_init__(self) -> None:
         if self.context_cache_min_ttl_seconds <= 0:
@@ -89,9 +135,28 @@ class Settings:
             raise ValueError("belief_tension_decrement must be positive")
         if self.belief_tension_threshold < 0:
             raise ValueError("belief_tension_threshold must be non-negative")
+        if self.ephemeral_scoring_hours <= 0:
+            raise ValueError("ephemeral_scoring_hours must be positive")
+        if not 0.0 <= self.small_corpus_token_threshold_ratio <= 1.0:
+            raise ValueError(
+                "small_corpus_token_threshold_ratio must be in the interval [0.0, 1.0]"
+            )
+        if not 0.0 <= self.raw_message_rrf_weight <= 2.0:
+            raise ValueError("raw_message_rrf_weight must be in the interval [0.0, 2.0]")
+        if self.raw_message_channel_limit < 0:
+            raise ValueError("raw_message_channel_limit must be non-negative")
+        if self.raw_message_window_size < 2 or self.raw_message_window_size > 4:
+            raise ValueError("raw_message_window_size must be between 2 and 4")
+        if self.raw_message_window_overlap < 0:
+            raise ValueError("raw_message_window_overlap must be non-negative")
+        if self.raw_message_window_overlap >= self.raw_message_window_size:
+            raise ValueError(
+                "raw_message_window_overlap must be strictly less than raw_message_window_size"
+            )
 
     @classmethod
     def from_env(cls) -> "Settings":
+        _load_dotenv_once()
         return cls(
             sqlite_path=os.getenv("ATAGIA_SQLITE_PATH", "./data/atagia.db"),
             migrations_path=os.getenv("ATAGIA_MIGRATIONS_PATH", "./migrations"),
@@ -113,9 +178,14 @@ class Settings:
                 or None
             ),
             llm_chat_model=os.getenv("ATAGIA_LLM_CHAT_MODEL") or None,
+            embedding_provider_name=os.getenv("ATAGIA_EMBEDDING_PROVIDER") or None,
             service_mode=_env_bool("ATAGIA_SERVICE_MODE", False),
             service_api_key=os.getenv("ATAGIA_SERVICE_API_KEY") or None,
             admin_api_key=os.getenv("ATAGIA_ADMIN_API_KEY") or None,
+            allow_admin_export_anonymization=_env_bool(
+                "ATAGIA_ALLOW_ADMIN_EXPORT_ANONYMIZATION",
+                False,
+            ),
             workers_enabled=_env_bool("ATAGIA_WORKERS_ENABLED", False),
             debug=_env_bool("ATAGIA_DEBUG", False),
             allow_insecure_http=_env_bool("ATAGIA_ALLOW_INSECURE_HTTP", False),
@@ -127,6 +197,7 @@ class Settings:
             lifecycle_decay_rate=float(os.getenv("ATAGIA_LIFECYCLE_DECAY_RATE", "0.9")),
             lifecycle_archive_vitality=float(os.getenv("ATAGIA_LIFECYCLE_ARCHIVE_VITALITY", "0.05")),
             lifecycle_archive_confidence=float(os.getenv("ATAGIA_LIFECYCLE_ARCHIVE_CONFIDENCE", "0.3")),
+            ephemeral_scoring_hours=int(os.getenv("ATAGIA_EPHEMERAL_SCORING_HOURS", "24")),
             lifecycle_ephemeral_ttl_hours=int(os.getenv("ATAGIA_LIFECYCLE_EPHEMERAL_TTL_HOURS", "24")),
             lifecycle_review_ttl_days=int(os.getenv("ATAGIA_LIFECYCLE_REVIEW_TTL_DAYS", "7")),
             promotion_conv_to_ws_min_conversations=int(
@@ -162,6 +233,22 @@ class Settings:
             lifecycle_worker_enabled=_env_bool("ATAGIA_LIFECYCLE_WORKER_ENABLED", False),
             lifecycle_worker_interval_seconds=int(
                 os.getenv("ATAGIA_LIFECYCLE_WORKER_INTERVAL_SECONDS", "3600")
+            ),
+            small_corpus_token_threshold_ratio=float(
+                os.getenv("ATAGIA_SMALL_CORPUS_TOKEN_THRESHOLD_RATIO", "0.7")
+            ),
+            raw_message_channel=_env_bool("ATAGIA_RAW_MESSAGE_CHANNEL", True),
+            raw_message_rrf_weight=float(
+                os.getenv("ATAGIA_RAW_MESSAGE_RRF_WEIGHT", "0.75")
+            ),
+            raw_message_channel_limit=int(
+                os.getenv("ATAGIA_RAW_MESSAGE_CHANNEL_LIMIT", "8")
+            ),
+            raw_message_window_size=int(
+                os.getenv("ATAGIA_RAW_MESSAGE_WINDOW_SIZE", "3")
+            ),
+            raw_message_window_overlap=int(
+                os.getenv("ATAGIA_RAW_MESSAGE_WINDOW_OVERLAP", "1")
             ),
         )
 

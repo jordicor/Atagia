@@ -40,7 +40,38 @@ class ContextCacheProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps([]),
+                output_text=json.dumps(
+                    {
+                        "needs": [],
+                        "temporal_range": None,
+                        "sub_queries": ["retry loop"],
+                        "sparse_query_hints": [
+                            {
+                                "sub_query_text": "retry loop",
+                                "fts_phrase": "retry loop",
+                            }
+                        ],
+                        "query_type": "default",
+                        "retrieval_levels": [0],
+                    }
+                ),
+            )
+        if purpose == "context_cache_signal_detection":
+            prompt = request.messages[1].content
+            short_followup = "continue" in prompt.lower()
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "contradiction_detected": False,
+                        "high_stakes_topic": False,
+                        "sensitive_content": False,
+                        "mode_shift_target": None,
+                        "short_followup": short_followup,
+                        "ambiguous_wording": False,
+                    }
+                ),
             )
         if purpose == "applicability_scoring":
             memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
@@ -84,6 +115,7 @@ def _settings(tmp_path: Path) -> Settings:
         workers_enabled=False,
         debug=False,
         allow_insecure_http=True,
+        small_corpus_token_threshold_ratio=0.0,
     )
 
 

@@ -11,8 +11,9 @@ from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.memory.lifecycle_runner import piggyback_lifecycle
 from atagia.core.summary_repository import SummaryRepository
-from atagia.core.timestamps import resolve_message_occurred_at
+from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
 from atagia.models.schemas_api import ChatResult
+from atagia.services.artifact_service import ArtifactService
 from atagia.services.chat_support import (
     CONTEXT_VIEW_TTL_SECONDS,
     RECENT_FETCH_LIMIT,
@@ -30,6 +31,7 @@ from atagia.services.chat_support import (
     summarize_memory_summaries,
 )
 from atagia.services.context_cache_service import ContextCacheService
+from atagia.services.confirmation_service import PendingConfirmationService
 from atagia.services.errors import ConversationNotFoundError, LLMUnavailableError
 from atagia.services.llm_client import LLMCompletionRequest, LLMError, LLMMessage
 
@@ -49,6 +51,7 @@ class ChatService:
         message_text: str,
         assistant_mode_id: str | None = None,
         *,
+        attachments: list[Any] | None = None,
         message_occurred_at: str | None = None,
         include_thinking: bool = False,
         metadata: dict[str, Any] | None = None,
@@ -65,6 +68,14 @@ class ChatService:
                 memories = MemoryObjectRepository(connection, self.runtime.clock)
                 events = RetrievalEventRepository(connection, self.runtime.clock)
                 summaries = SummaryRepository(connection, self.runtime.clock)
+                artifacts = ArtifactService(connection, self.runtime.clock)
+                confirmations = PendingConfirmationService(
+                    connection,
+                    self.runtime.clock,
+                    self.runtime.embedding_index,
+                    llm_client=self.runtime.llm_client,
+                    settings=self.runtime.settings,
+                )
 
                 conversation = await conversations.get_conversation(conversation_id, user_id)
                 if conversation is None:
@@ -79,6 +90,13 @@ class ChatService:
                     resolved_mode_id,
                     self.runtime.policy_resolver,
                 )
+                attachment_bundle = artifacts.prepare_attachments(
+                    message_text=message_text,
+                    attachments=attachments,
+                    user_id=user_id,
+                    conversation=conversation,
+                )
+                prompt_message_text = attachment_bundle.prompt_text
                 prior_messages = await messages.get_recent_messages(
                     conversation_id,
                     user_id,
@@ -105,11 +123,17 @@ class ChatService:
                     )
                     == 0
                 )
+                confirmation_plan = await confirmations.plan_turn(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    message_text=prompt_message_text,
+                )
+                invalidate_confirmation_cache = confirmation_plan.response_intent is not None
                 resolution = await cache_service.resolve_with_connection(
                     connection,
                     user_id=user_id,
                     conversation_id=conversation_id,
-                    message_text=message_text,
+                    message_text=prompt_message_text,
                     assistant_mode_id=assistant_mode_id,
                     stored_messages=prior_messages,
                     conversation=conversation,
@@ -118,6 +142,9 @@ class ChatService:
                     prior_messages,
                     conversation_chunks,
                     resolution.resolved_policy.transcript_budget_tokens,
+                    raw_context_access_mode=str(
+                        resolution.source_retrieval_plan.get("raw_context_access_mode", "normal")
+                    ),
                 )
                 transcript_trace = build_transcript_window_trace(
                     transcript_entries,
@@ -125,41 +152,46 @@ class ChatService:
                 )
                 transcript = [
                     *render_transcript_window(transcript_entries),
-                    {"role": "user", "text": message_text},
+                    {"role": "user", "text": prompt_message_text},
                 ]
-                try:
-                    llm_response = await self.runtime.llm_client.complete(
-                        LLMCompletionRequest(
-                            model=chat_model(self.runtime.settings),
-                            messages=[
-                                LLMMessage(
-                                    role="system",
-                                    content=build_system_prompt(
-                                        resolved_mode_id,
-                                        resolution.resolved_policy,
-                                        resolution.composed_context.contract_block,
-                                        resolution.composed_context.workspace_block,
-                                        resolution.composed_context.memory_block,
-                                        resolution.composed_context.state_block,
-                                    ),
+                llm_response = await self.runtime.llm_client.complete(
+                    LLMCompletionRequest(
+                        model=chat_model(self.runtime.settings),
+                        messages=[
+                            LLMMessage(
+                                role="system",
+                                content=build_system_prompt(
+                                    resolved_mode_id,
+                                    resolution.resolved_policy,
+                                    resolution.composed_context.contract_block,
+                                    resolution.composed_context.workspace_block,
+                                    resolution.composed_context.memory_block,
+                                    resolution.composed_context.state_block,
                                 ),
-                                *[
-                                    LLMMessage(role=str(message["role"]), content=str(message["text"]))
-                                    for message in transcript
-                                ],
+                            ),
+                            *[
+                                LLMMessage(role=str(message["role"]), content=str(message["text"]))
+                                for message in transcript
                             ],
-                            temperature=0.0,
-                            include_thinking=include_thinking,
-                            metadata={
-                                "user_id": user_id,
-                                "conversation_id": conversation_id,
-                                "assistant_mode_id": resolved_mode_id,
-                                "purpose": "chat_reply",
-                            },
-                        )
+                        ],
+                        temperature=0.0,
+                        include_thinking=include_thinking,
+                        metadata={
+                            "user_id": user_id,
+                            "conversation_id": conversation_id,
+                            "assistant_mode_id": resolved_mode_id,
+                            "purpose": "chat_reply",
+                        },
                     )
-                except LLMError as exc:
-                    raise LLMUnavailableError("LLM service unavailable") from exc
+                )
+                response_text = llm_response.output_text
+                if confirmation_plan.prompt_text is not None:
+                    response_text = f"{confirmation_plan.prompt_text}\n\n{llm_response.output_text}"
+                resolved_user_occurred_at = (
+                    normalize_optional_timestamp(message_occurred_at)
+                    or self.runtime.clock.now().isoformat()
+                )
+                assistant_occurred_at = self.runtime.clock.now().isoformat()
 
                 await connection.execute("BEGIN")
                 try:
@@ -168,12 +200,31 @@ class ChatService:
                         conversation_id=conversation_id,
                         role="user",
                         seq=None,
-                        text=message_text,
+                        text=prompt_message_text,
                         token_count=None,
-                        metadata=metadata or {},
-                        occurred_at=message_occurred_at,
+                        metadata={
+                            **(metadata or {}),
+                            "attachments": attachment_bundle.attachments,
+                            "attachment_count": len(attachment_bundle.artifacts),
+                            "attachment_artifact_ids": [
+                                str(prepared.artifact["id"]) for prepared in attachment_bundle.artifacts
+                            ],
+                            "artifact_backed": bool(attachment_bundle.artifacts),
+                            "skip_by_default": bool(attachment_bundle.artifacts),
+                            "include_raw": not bool(attachment_bundle.artifacts),
+                            "requires_explicit_request": bool(attachment_bundle.artifacts),
+                            "content_kind": "artifact" if attachment_bundle.artifacts else "text",
+                            "context_placeholder": attachment_bundle.context_placeholder,
+                        },
+                        occurred_at=resolved_user_occurred_at,
                         commit=False,
                     )
+                    if attachment_bundle.artifacts:
+                        await artifacts.persist_prepared_attachments(
+                            bundle=attachment_bundle,
+                            message_id=str(user_message["id"]),
+                            commit=False,
+                        )
                     assistant_message = await messages.create_message(
                         message_id=None,
                         conversation_id=conversation_id,
@@ -182,6 +233,7 @@ class ChatService:
                         text=llm_response.output_text,
                         token_count=None,
                         metadata={"thinking": llm_response.thinking} if llm_response.thinking else {},
+                        occurred_at=assistant_occurred_at,
                         commit=False,
                     )
                     retrieval_event = await events.create_event(
@@ -215,26 +267,43 @@ class ChatService:
                         },
                         commit=False,
                     )
+                    confirmation_embedding_upserts = await confirmations.apply_turn_plan(
+                        user_id=user_id,
+                        plan=confirmation_plan,
+                        commit=False,
+                    )
                     await connection.commit()
                 except Exception:
                     await connection.rollback()
                     raise
+                await confirmations.apply_post_commit_embeddings(confirmation_embedding_upserts)
 
                 post_commit_errors: list[str] = []
                 enqueued_job_ids: list[str] = []
                 background_tasks_enqueued = False
 
                 try:
-                    await cache_service.publish_pending_cache_entry(
-                        resolution,
-                        last_retrieval_message_seq=int(user_message["seq"]),
-                    )
+                    if invalidate_confirmation_cache:
+                        if resolution.cache_key is not None:
+                            await self.runtime.storage_backend.delete_context_view(str(resolution.cache_key))
+                    else:
+                        await cache_service.publish_pending_cache_entry(
+                            resolution,
+                            last_retrieval_message_seq=int(user_message["seq"]),
+                        )
                 except Exception:
-                    logger.exception(
-                        "Failed to publish pending cache entry for retrieval_event_id=%s",
-                        retrieval_event["id"],
-                    )
-                    post_commit_errors.append("cache_publish_failed")
+                    if invalidate_confirmation_cache:
+                        logger.exception(
+                            "Failed to invalidate cache entry after confirmation for retrieval_event_id=%s",
+                            retrieval_event["id"],
+                        )
+                        post_commit_errors.append("cache_invalidation_failed")
+                    else:
+                        logger.exception(
+                            "Failed to publish pending cache entry for retrieval_event_id=%s",
+                            retrieval_event["id"],
+                        )
+                        post_commit_errors.append("cache_publish_failed")
 
                 if self.runtime.settings.lifecycle_lazy_enabled:
                     try:
@@ -280,7 +349,7 @@ class ChatService:
                     conversation=conversation,
                     message_id=str(user_message["id"]),
                     prior_messages=prior_messages,
-                    message_text=message_text,
+                    message_text=prompt_message_text,
                     occurred_at=resolve_message_occurred_at(user_message),
                     role="user",
                 )
@@ -348,12 +417,14 @@ class ChatService:
                     conversation_id=conversation_id,
                     request_message_id=str(user_message["id"]),
                     response_message_id=str(assistant_message["id"]),
-                    response_text=llm_response.output_text,
+                    response_text=response_text,
                     retrieval_event_id=str(retrieval_event["id"]),
                     composed_context=resolution.composed_context,
                     detected_needs=resolution.detected_needs,
                     memories_used=summarize_memory_summaries(resolution.memory_summaries),
                     debug=debug_payload,
                 )
+            except LLMError as exc:
+                raise LLMUnavailableError("LLM service unavailable") from exc
             finally:
                 await connection.close()

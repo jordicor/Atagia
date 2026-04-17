@@ -2,343 +2,24 @@
 
 from __future__ import annotations
 
-import calendar
-from datetime import datetime, time, timedelta, tzinfo as datetime_tzinfo
 import re
 
-from atagia.core.clock import Clock
 from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.models.schemas_memory import (
-    DetectedNeed,
     ExtractionConversationContext,
     MemoryScope,
     MemoryStatus,
     NeedTrigger,
+    PlannedSubQuery,
+    QueryIntelligenceResult,
     RetrievalPlan,
-    TemporalQueryRange,
+    SparseQueryHint,
 )
 
-_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
-_STOPWORDS = frozenset(
-    {
-        "a",
-        "an",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "but",
-        "by",
-        "for",
-        "from",
-        "how",
-        "i",
-        "if",
-        "in",
-        "into",
-        "is",
-        "it",
-        "me",
-        "my",
-        "of",
-        "on",
-        "or",
-        "our",
-        "so",
-        "that",
-        "the",
-        "this",
-        "to",
-        "was",
-        "we",
-        "with",
-        "you",
-        "your",
-    }
-)
-# Expanded stopword list for question-shaped retrieval queries.
-# Covers question words, auxiliaries, pronouns, articles, prepositions,
-# conjunctions, and common filler words that pollute FTS5 AND queries.
-_RETRIEVAL_STOPWORDS = frozenset(
-    {
-        # question words
-        "what", "when", "where", "why", "who", "how",
-        # auxiliaries
-        "do", "does", "did", "has", "have", "had",
-        "is", "are", "was", "were", "will", "would",
-        "can", "could", "should",
-        # pronouns
-        "his", "her", "their", "its", "my", "your", "our",
-        "he", "she", "they", "it", "i", "you", "we",
-        # articles / prepositions / conjunctions
-        "the", "a", "an", "in", "on", "at", "to", "for", "of",
-        "with", "by", "from", "and", "or", "but", "not",
-        "about", "into", "also", "both", "as", "so", "if",
-        "than", "that", "this", "these", "those",
-        # common filler
-        "like", "just", "very", "really", "much", "some", "any",
-        "all", "each", "every", "been", "being",
-        # extras from _STOPWORDS not already covered
-        "be", "me",
-    }
-)
-_FTS_UNSAFE_PATTERN = re.compile(r"[^a-z0-9 ]")
+_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
+_FTS5_OPERATORS = frozenset({"and", "or", "not", "near"})
 _MAX_RETRIEVAL_QUERIES = 3
-_ISO_DATE_PATTERN = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
-_RELATIVE_DAY_PATTERN = re.compile(r"\b(yesterday|today|tomorrow)\b", re.IGNORECASE)
-_RELATIVE_SPAN_PATTERN = re.compile(r"\b(last|next)\s+(week|month|year)\b", re.IGNORECASE)
-_MONTH_PATTERN = re.compile(
-    r"\b("
-    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
-    r")"
-    r"(?:\s+(\d{4}))?\b",
-    re.IGNORECASE,
-)
-_RELATIVE_DAY_OFFSETS = {
-    "yesterday": -1,
-    "today": 0,
-    "tomorrow": 1,
-}
-_MONTH_NAME_TO_INDEX = {
-    "jan": 1,
-    "january": 1,
-    "feb": 2,
-    "february": 2,
-    "mar": 3,
-    "march": 3,
-    "apr": 4,
-    "april": 4,
-    "may": 5,
-    "jun": 6,
-    "june": 6,
-    "jul": 7,
-    "july": 7,
-    "aug": 8,
-    "august": 8,
-    "sep": 9,
-    "september": 9,
-    "oct": 10,
-    "october": 10,
-    "nov": 11,
-    "november": 11,
-    "dec": 12,
-    "december": 12,
-}
-_TEMPORAL_MONTH_PREFIXES = frozenset(
-    {"in", "during", "throughout", "through", "for", "from", "since", "on", "by", "until", "before", "after"}
-)
-_PATTERN_KEYWORDS = (
-    "prefer",
-    "preference",
-    "preferences",
-    "pattern",
-    "patterns",
-    "usually",
-    "often",
-    "typically",
-    "tend",
-    "tendency",
-    "tendencies",
-    "habit",
-    "habits",
-    "style",
-)
-_ABSTRACT_MULTI_SESSION_KEYWORDS = (
-    "across sessions",
-    "across conversations",
-    "across chats",
-    "in general",
-    "overall",
-    "themes",
-    "theme",
-    "profile",
-    "profiles",
-    "multi-session",
-    "multi session",
-    "long term",
-    "long-term",
-    "recurring",
-)
-_TEMPORAL_HISTORY_KEYWORDS = ("history", "historical")
-
-
-def _is_temporal_month_match(match: re.Match[str], message_text: str) -> bool:
-    explicit_year = match.group(2)
-    if explicit_year:
-        return True
-    prefix = message_text[: match.start()].rstrip().lower()
-    if not prefix:
-        return False
-    previous_token = prefix.split()[-1].strip("([{\"'")
-    return previous_token in _TEMPORAL_MONTH_PREFIXES
-
-
-def _strip_temporal_month_expressions(message_text: str) -> str:
-    sanitized_parts: list[str] = []
-    last_index = 0
-    for match in _MONTH_PATTERN.finditer(message_text):
-        if not _is_temporal_month_match(match, message_text):
-            continue
-        sanitized_parts.append(message_text[last_index:match.start()])
-        sanitized_parts.append(" ")
-        last_index = match.end()
-    sanitized_parts.append(message_text[last_index:])
-    return "".join(sanitized_parts)
-
-
-def _start_of_day(moment: datetime) -> datetime:
-    return datetime.combine(moment.date(), time.min, tzinfo=moment.tzinfo)
-
-
-def _end_of_day(moment: datetime) -> datetime:
-    return datetime.combine(moment.date(), time.max, tzinfo=moment.tzinfo)
-
-
-def _month_bounds(year: int, month: int, tzinfo: datetime_tzinfo | None) -> tuple[datetime, datetime]:
-    start = datetime(year, month, 1, tzinfo=tzinfo)
-    end = datetime(year, month, calendar.monthrange(year, month)[1], time.max.hour, time.max.minute, time.max.second, time.max.microsecond, tzinfo=tzinfo)
-    return start, end
-
-
-def _strip_temporal_expressions(message_text: str) -> str:
-    sanitized = _ISO_DATE_PATTERN.sub(" ", message_text)
-    sanitized = _RELATIVE_DAY_PATTERN.sub(" ", sanitized)
-    sanitized = _RELATIVE_SPAN_PATTERN.sub(" ", sanitized)
-    return _strip_temporal_month_expressions(sanitized)
-
-
-def _relative_span_range(anchor: datetime, direction: str, unit: str) -> tuple[datetime, datetime]:
-    step = -1 if direction == "last" else 1
-    if unit == "week":
-        current_week_start = _start_of_day(anchor) - timedelta(days=anchor.weekday())
-        start = current_week_start + timedelta(days=7 * step)
-        end = start + timedelta(days=6, hours=23, minutes=59, seconds=59, microseconds=999999)
-        return start, end
-    if unit == "month":
-        month_offset = anchor.month + step
-        year = anchor.year
-        if month_offset == 0:
-            month_offset = 12
-            year -= 1
-        elif month_offset == 13:
-            month_offset = 1
-            year += 1
-        return _month_bounds(year, month_offset, anchor.tzinfo)
-    year = anchor.year + step
-    start = datetime(year, 1, 1, tzinfo=anchor.tzinfo)
-    end = datetime(year, 12, 31, time.max.hour, time.max.minute, time.max.second, time.max.microsecond, tzinfo=anchor.tzinfo)
-    return start, end
-
-
-def _detected_temporal_intervals(message_text: str, anchor: datetime) -> list[tuple[datetime, datetime]]:
-    intervals: list[tuple[datetime, datetime]] = []
-    for year_text, month_text, day_text in _ISO_DATE_PATTERN.findall(message_text):
-        moment = datetime(
-            int(year_text),
-            int(month_text),
-            int(day_text),
-            tzinfo=anchor.tzinfo,
-        )
-        intervals.append((_start_of_day(moment), _end_of_day(moment)))
-    for relative_day in _RELATIVE_DAY_PATTERN.findall(message_text):
-        offset = _RELATIVE_DAY_OFFSETS[relative_day.lower()]
-        moment = anchor + timedelta(days=offset)
-        intervals.append((_start_of_day(moment), _end_of_day(moment)))
-    for direction, unit in _RELATIVE_SPAN_PATTERN.findall(message_text):
-        intervals.append(_relative_span_range(anchor, direction.lower(), unit.lower()))
-    for match in _MONTH_PATTERN.finditer(message_text):
-        if not _is_temporal_month_match(match, message_text):
-            continue
-        month_name = match.group(1)
-        explicit_year = match.group(2)
-        month = _MONTH_NAME_TO_INDEX[month_name.lower()]
-        year = int(explicit_year) if explicit_year else anchor.year
-        intervals.append(_month_bounds(year, month, anchor.tzinfo))
-    return intervals
-
-
-def build_temporal_query_range(message_text: str, anchor: datetime) -> TemporalQueryRange | None:
-    intervals = _detected_temporal_intervals(message_text, anchor)
-    if not intervals:
-        return None
-    return TemporalQueryRange(
-        start=min(start for start, _ in intervals),
-        end=max(end for _, end in intervals),
-    )
-
-
-def build_retrieval_fts_queries(message_text: str) -> list[str]:
-    """Generate multiple FTS5 queries from precise (AND) to broad (OR).
-
-    Designed for retrieval over question-shaped natural language where a
-    single AND query returns 0 hits because no document contains all terms.
-    """
-    sanitized_message_text = _strip_temporal_expressions(message_text)
-    content_tokens: list[str] = []
-    seen: set[str] = set()
-    for token in _TOKEN_PATTERN.findall(sanitized_message_text.lower()):
-        if token in seen or token in _RETRIEVAL_STOPWORDS:
-            continue
-        seen.add(token)
-        content_tokens.append(token)
-
-    if not content_tokens:
-        return []
-
-    # Sanitize each token for FTS5 safety
-    sanitized: list[str] = []
-    for token in content_tokens:
-        clean = _FTS_UNSAFE_PATTERN.sub("", token).strip()
-        if clean:
-            sanitized.append(clean)
-    if not sanitized:
-        return []
-
-    queries: list[str] = []
-
-    if len(sanitized) >= 4:
-        # AND with top 4 content tokens
-        queries.append(" ".join(sanitized[:4]))
-        # AND with top 3 content tokens
-        queries.append(" ".join(sanitized[:3]))
-        # OR with all content tokens
-        queries.append(" OR ".join(sanitized))
-    elif len(sanitized) == 3:
-        # AND with all 3
-        queries.append(" ".join(sanitized[:3]))
-        # OR with all
-        queries.append(" OR ".join(sanitized))
-    else:
-        # 1-2 tokens: single query (AND is same as listing them)
-        queries.append(" ".join(sanitized))
-
-    return queries[:_MAX_RETRIEVAL_QUERIES]
-
-
-def build_safe_fts_queries(message_text: str) -> list[str]:
-    """Build a single conservative FTS query for non-retrieval use cases.
-
-    Used by ConsequenceChainBuilder and other modules that need a simple
-    keyword query. For retrieval, use build_retrieval_fts_queries() instead.
-    """
-    content_tokens: list[str] = []
-    seen: set[str] = set()
-    for token in _TOKEN_PATTERN.findall(message_text.lower()):
-        if token in seen or token in _STOPWORDS:
-            continue
-        seen.add(token)
-        content_tokens.append(token)
-    if not content_tokens:
-        return []
-    sanitized = [
-        clean
-        for token in content_tokens[:8]
-        if (clean := _FTS_UNSAFE_PATTERN.sub("", token).strip())
-    ]
-    return [" ".join(sanitized)] if sanitized else []
-
+_MAX_HINT_QUERY_TOKENS = 6
 
 _DEFAULT_SCOPE_ORDER = (
     MemoryScope.EPHEMERAL_SESSION,
@@ -364,53 +45,225 @@ assert set(_NEED_BOOSTS.keys()) == set(NeedTrigger), (
 )
 
 
-class RetrievalPlanner:
-    """Pure planner that converts policy and need signals into a retrieval plan."""
+def build_retrieval_fts_queries(
+    message_text: str,
+    *,
+    quoted_phrases: list[str] | None = None,
+    must_keep_terms: list[str] | None = None,
+) -> list[str]:
+    """Generate multiple FTS5 queries from precise (AND) to broad (OR)."""
+    content_tokens = _collect_content_tokens(message_text)
+    normalized_quoted_phrases = _normalize_quoted_phrases(quoted_phrases or [])
+    normalized_must_keep_terms = _collect_tokens_from_values(must_keep_terms or [])
 
-    def __init__(self, clock: Clock) -> None:
-        self._clock = clock
+    if not normalized_quoted_phrases and not normalized_must_keep_terms:
+        return _build_default_fts_queries(content_tokens, original_text=message_text)
+
+    content_tokens = _stable_token_union(content_tokens, normalized_must_keep_terms)
+    if not content_tokens and not normalized_quoted_phrases:
+        raise ValueError(
+            f"Sub-query produced no searchable FTS tokens: {message_text!r}"
+        )
+
+    queries: list[str] = []
+    seen_queries: set[str] = set()
+    for phrase in normalized_quoted_phrases:
+        quoted_query = f'"{phrase}"'
+        if quoted_query in seen_queries:
+            continue
+        seen_queries.add(quoted_query)
+        queries.append(quoted_query)
+
+    if content_tokens:
+        anchor_tokens = _stable_token_union(
+            normalized_must_keep_terms,
+            _collect_tokens_from_values(normalized_quoted_phrases),
+        )
+        if anchor_tokens and normalized_must_keep_terms and not normalized_quoted_phrases:
+            anchor_first_query = " ".join(
+                _stable_token_union(anchor_tokens, content_tokens)[:_MAX_HINT_QUERY_TOKENS]
+            )
+            if anchor_first_query not in seen_queries:
+                seen_queries.add(anchor_first_query)
+                queries.append(anchor_first_query)
+
+        strong_query = " ".join(content_tokens[:_MAX_HINT_QUERY_TOKENS])
+        if strong_query not in seen_queries:
+            seen_queries.add(strong_query)
+            queries.append(strong_query)
+
+        if len(content_tokens) >= 3:
+            broad_query = " OR ".join(content_tokens)
+            if broad_query not in seen_queries:
+                seen_queries.add(broad_query)
+                queries.append(broad_query)
+
+    return queries[:_MAX_RETRIEVAL_QUERIES]
+
+
+def _build_default_fts_queries(
+    content_tokens: list[str],
+    *,
+    original_text: str,
+) -> list[str]:
+    if not content_tokens:
+        raise ValueError(
+            f"Sub-query produced no searchable FTS tokens: {original_text!r}"
+        )
+
+    queries: list[str] = []
+    if len(content_tokens) >= 4:
+        queries.append(" ".join(content_tokens[:4]))
+        queries.append(" ".join(content_tokens[:3]))
+        queries.append(" OR ".join(content_tokens))
+    elif len(content_tokens) == 3:
+        queries.append(" ".join(content_tokens[:3]))
+        queries.append(" OR ".join(content_tokens))
+    else:
+        queries.append(" ".join(content_tokens))
+    return queries[:_MAX_RETRIEVAL_QUERIES]
+
+
+def build_safe_fts_queries(message_text: str) -> list[str]:
+    """Build a single conservative FTS query for non-retrieval use cases."""
+    content_tokens = _collect_content_tokens(message_text)
+    if not content_tokens:
+        return []
+    return [" ".join(content_tokens[:8])]
+
+
+def _collect_content_tokens(message_text: str) -> list[str]:
+    return _collect_tokens_from_values([message_text])
+
+
+def _collect_tokens_from_values(values: list[str]) -> list[str]:
+    content_tokens: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for token in _TOKEN_PATTERN.findall(value.lower()):
+            clean = _sanitize_fts_token(token)
+            if clean is None or clean in seen:
+                continue
+            seen.add(clean)
+            content_tokens.append(clean)
+    return content_tokens
+
+
+def _normalize_quoted_phrases(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        tokens = _collect_content_tokens(value)
+        if len(tokens) < 2:
+            continue
+        phrase = " ".join(tokens)
+        if phrase in seen:
+            continue
+        seen.add(phrase)
+        normalized.append(phrase)
+    return normalized
+
+
+def _stable_token_union(primary: list[str], secondary: list[str]) -> list[str]:
+    merged = list(primary)
+    seen = set(primary)
+    for token in secondary:
+        if token in seen:
+            continue
+        seen.add(token)
+        merged.append(token)
+    return merged
+
+
+def _resolve_sparse_phrase(
+    sub_query: str,
+    sparse_hint: SparseQueryHint | None,
+) -> str:
+    if sparse_hint is None:
+        return sub_query
+    if sparse_hint.fts_phrase is not None:
+        return sparse_hint.fts_phrase
+    hint_tokens = _stable_token_union(
+        _collect_tokens_from_values(list(sparse_hint.quoted_phrases)),
+        _collect_tokens_from_values(list(sparse_hint.must_keep_terms)),
+    )
+    if hint_tokens:
+        return " ".join(hint_tokens[:_MAX_HINT_QUERY_TOKENS])
+    return sub_query
+
+
+def _sanitize_fts_token(token: str) -> str | None:
+    normalized = token.strip("_")
+    if not normalized:
+        return None
+    if not any(character.isalnum() for character in normalized):
+        return None
+    if normalized.lower() in _FTS5_OPERATORS:
+        return None
+    return normalized
+
+
+class RetrievalPlanner:
+    """Pure planner that converts query intelligence into a retrieval plan."""
 
     def build_plan(
         self,
-        message_text: str,
+        *,
+        original_query: str,
+        query_intelligence: QueryIntelligenceResult,
         conversation_context: ExtractionConversationContext,
         resolved_policy: ResolvedPolicy,
-        detected_needs: list[DetectedNeed],
         cold_start: bool,
     ) -> RetrievalPlan:
-        base_scope_filter = self._ordered_scopes(resolved_policy.allowed_scopes, _DEFAULT_SCOPE_ORDER)
-        temporal_query_range = build_temporal_query_range(message_text, self._clock.now())
+        base_scope_filter = self._ordered_scopes(
+            resolved_policy.allowed_scopes,
+            _DEFAULT_SCOPE_ORDER,
+        )
+        sub_query_plans = self._build_sub_query_plans(
+            query_intelligence.sub_queries,
+            query_intelligence.sparse_query_hints,
+        )
         plan = RetrievalPlan(
+            original_query=original_query,
             assistant_mode_id=conversation_context.assistant_mode_id,
             workspace_id=conversation_context.workspace_id,
             conversation_id=conversation_context.conversation_id,
-            fts_queries=self._build_fts_queries(message_text),
+            fts_queries=self._flatten_fts_queries(sub_query_plans),
+            sub_query_plans=sub_query_plans,
+            callback_bias=query_intelligence.callback_bias,
+            raw_context_access_mode=query_intelligence.raw_context_access_mode,
+            query_type=query_intelligence.query_type,
             scope_filter=base_scope_filter,
             status_filter=[MemoryStatus.ACTIVE],
             max_candidates=resolved_policy.retrieval_params.fts_limit,
             vector_limit=resolved_policy.retrieval_params.vector_limit,
             max_context_items=resolved_policy.retrieval_params.final_context_items,
             privacy_ceiling=resolved_policy.privacy_ceiling,
-            retrieval_levels=self._determine_retrieval_levels(
-                message_text,
-                temporal_query_range=temporal_query_range,
-            ),
-            temporal_query_range=temporal_query_range,
+            retrieval_levels=list(query_intelligence.retrieval_levels),
+            temporal_query_range=query_intelligence.temporal_range,
             consequence_search_enabled=False,
             require_evidence_regrounding=False,
             need_driven_boosts={},
             skip_retrieval=cold_start,
+            exact_recall_mode=bool(query_intelligence.exact_recall_needed),
+            exact_facets=list(query_intelligence.exact_facets),
         )
 
         sorted_needs = sorted(
-            detected_needs,
-            key=lambda need: (0 if need.need_type is NeedTrigger.MODE_SHIFT else 1, -need.confidence),
+            query_intelligence.needs,
+            key=lambda need: (
+                0 if need.need_type is NeedTrigger.MODE_SHIFT else 1,
+                -need.confidence,
+            ),
         )
         for need in sorted_needs:
             plan.need_driven_boosts[need.need_type] = _NEED_BOOSTS[need.need_type]
 
             if need.need_type is NeedTrigger.AMBIGUITY:
-                plan.scope_filter = self._ordered_scopes(resolved_policy.allowed_scopes, _BROAD_SCOPE_ORDER)
+                plan.scope_filter = self._ordered_scopes(
+                    resolved_policy.allowed_scopes,
+                    _BROAD_SCOPE_ORDER,
+                )
                 plan.max_candidates = self._increase_limit(plan.max_candidates)
                 plan.vector_limit = self._increase_limit(plan.vector_limit)
                 plan.consequence_search_enabled = True
@@ -421,7 +274,10 @@ class RetrievalPlanner:
                 plan.scope_filter = self._prioritize_recent_conversation(plan.scope_filter)
                 plan.consequence_search_enabled = True
             elif need.need_type is NeedTrigger.LOOP:
-                plan.scope_filter = self._ordered_scopes(resolved_policy.allowed_scopes, _BROAD_SCOPE_ORDER)
+                plan.scope_filter = self._ordered_scopes(
+                    resolved_policy.allowed_scopes,
+                    _BROAD_SCOPE_ORDER,
+                )
                 plan.max_candidates = self._increase_limit(plan.max_candidates)
                 plan.vector_limit = self._increase_limit(plan.vector_limit)
                 plan.consequence_search_enabled = True
@@ -444,7 +300,10 @@ class RetrievalPlanner:
             elif need.need_type is NeedTrigger.SENSITIVE_CONTEXT:
                 plan.privacy_ceiling = min(plan.privacy_ceiling, 1)
             elif need.need_type is NeedTrigger.UNDER_SPECIFIED_REQUEST:
-                plan.scope_filter = self._ordered_scopes(resolved_policy.allowed_scopes, _BROAD_SCOPE_ORDER)
+                plan.scope_filter = self._ordered_scopes(
+                    resolved_policy.allowed_scopes,
+                    _BROAD_SCOPE_ORDER,
+                )
                 plan.max_candidates = self._increase_limit(plan.max_candidates)
                 plan.vector_limit = self._increase_limit(plan.vector_limit)
                 plan.consequence_search_enabled = True
@@ -452,8 +311,48 @@ class RetrievalPlanner:
         return plan
 
     @staticmethod
-    def _build_fts_queries(message_text: str) -> list[str]:
-        return build_retrieval_fts_queries(message_text)
+    def _build_sub_query_plans(
+        sub_queries: list[str],
+        sparse_query_hints: list[SparseQueryHint],
+    ) -> list[PlannedSubQuery]:
+        sparse_hints_by_sub_query = {
+            hint.sub_query_text: hint for hint in sparse_query_hints
+        }
+        sub_query_plans: list[PlannedSubQuery] = []
+        for sub_query in sub_queries:
+            sparse_hint = sparse_hints_by_sub_query.get(sub_query)
+            sparse_phrase = _resolve_sparse_phrase(sub_query, sparse_hint)
+            quoted_phrases = list(sparse_hint.quoted_phrases) if sparse_hint is not None else []
+            must_keep_terms = list(sparse_hint.must_keep_terms) if sparse_hint is not None else []
+            fts_queries = build_retrieval_fts_queries(
+                sparse_phrase,
+                quoted_phrases=quoted_phrases,
+                must_keep_terms=must_keep_terms,
+            )
+            if not fts_queries:
+                raise ValueError(f"Sub-query did not produce any FTS rewrites: {sub_query!r}")
+            sub_query_plans.append(
+                PlannedSubQuery(
+                    text=sub_query,
+                    sparse_phrase=sparse_phrase,
+                    quoted_phrases=quoted_phrases,
+                    must_keep_terms=must_keep_terms,
+                    fts_queries=fts_queries,
+                )
+            )
+        return sub_query_plans
+
+    @staticmethod
+    def _flatten_fts_queries(sub_query_plans: list[PlannedSubQuery]) -> list[str]:
+        flattened: list[str] = []
+        seen: set[str] = set()
+        for sub_query in sub_query_plans:
+            for query in sub_query.fts_queries:
+                if query in seen:
+                    continue
+                seen.add(query)
+                flattened.append(query)
+        return flattened
 
     @staticmethod
     def _ordered_scopes(
@@ -473,18 +372,3 @@ class RetrievalPlanner:
         prioritized = [scope for scope in preferred if scope in scopes]
         prioritized.extend(scope for scope in scopes if scope not in prioritized)
         return prioritized
-
-    @staticmethod
-    def _determine_retrieval_levels(
-        message_text: str,
-        *,
-        temporal_query_range: TemporalQueryRange | None,
-    ) -> list[int]:
-        normalized = f" {message_text.lower()} "
-        if temporal_query_range is not None or any(keyword in normalized for keyword in _TEMPORAL_HISTORY_KEYWORDS):
-            return [0, 1]
-        if any(keyword in normalized for keyword in _ABSTRACT_MULTI_SESSION_KEYWORDS):
-            return [2, 1, 0]
-        if any(keyword in normalized for keyword in _PATTERN_KEYWORDS):
-            return [1, 0]
-        return [0]

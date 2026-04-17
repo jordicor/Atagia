@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import logging
 from typing import Any
@@ -13,8 +13,10 @@ from pydantic import BaseModel, ConfigDict
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
+from atagia.core.consent_repository import MemoryConsentProfileRepository, PendingMemoryConfirmationRepository
 from atagia.core.contract_repository import ContractDimensionRepository
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemoryStatus
+from atagia.memory.consent_confirmation import PENDING_USER_CONFIRMATION_TTL_DAYS
+from atagia.models.schemas_memory import MemoryCategory, MemoryObjectType, MemoryScope, MemoryStatus
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,7 @@ class LifecycleCycleResult(BaseModel):
     decayed_count: int = 0
     archived_count: int = 0
     deleted_count: int = 0
+    declined_count: int = 0
     skipped_evidence_count: int = 0
 
 
@@ -52,6 +55,8 @@ class MemoryLifecycleManager:
         self._embedding_index = embedding_index or NoneBackend()
         self._settings = settings or Settings.from_env()
         self._contract_repository = ContractDimensionRepository(connection, clock)
+        self._consent_profile_repository = MemoryConsentProfileRepository(connection, clock)
+        self._pending_confirmation_repository = PendingMemoryConfirmationRepository(connection, clock)
         self._affected_user_ids: set[str] = set()
 
     @property
@@ -67,6 +72,7 @@ class MemoryLifecycleManager:
             now - timedelta(hours=self._settings.lifecycle_ephemeral_ttl_hours)
         ).isoformat()
         review_cutoff = (now - timedelta(days=self._settings.lifecycle_review_ttl_days)).isoformat()
+        pending_cutoff = (now - timedelta(days=PENDING_USER_CONFIRMATION_TTL_DAYS)).isoformat()
         result = LifecycleCycleResult()
         self._affected_user_ids = set()
 
@@ -74,6 +80,8 @@ class MemoryLifecycleManager:
         try:
             decayed_refs = await self._decay_vitality(decay_cutoff, timestamp)
             result.decayed_count = len(decayed_refs)
+            declined_refs = await self._decline_expired_pending_confirmations(pending_cutoff, timestamp)
+            result.declined_count = len(declined_refs)
             expired_state_refs = await self._archive_expired_state_snapshots(timestamp)
             archived_refs = expired_state_refs + await self._archive_low_value_memories(timestamp)
             archived_ids = [ref.memory_id for ref in archived_refs]
@@ -85,7 +93,7 @@ class MemoryLifecycleManager:
             review_required_ids = [ref.memory_id for ref in review_required_refs]
             affected_user_ids = {
                 ref.user_id
-                for ref in decayed_refs + archived_refs + ephemeral_refs + review_required_refs
+                for ref in decayed_refs + declined_refs + archived_refs + ephemeral_refs + review_required_refs
             }
             projection_keys = await self._contract_repository.list_projection_keys_for_sources(
                 archived_ids + ephemeral_ids + review_required_ids
@@ -101,7 +109,9 @@ class MemoryLifecycleManager:
                 await self._connection.rollback()
             else:
                 await self._connection.commit()
-                await self._delete_embeddings(deleted_memory_ids)
+                await self._delete_embeddings(
+                    archived_ids + deleted_memory_ids + [ref.memory_id for ref in declined_refs]
+                )
                 self._affected_user_ids = affected_user_ids
             return result
         except BaseException:
@@ -195,20 +205,22 @@ class MemoryLifecycleManager:
     async def _archive_expired_state_snapshots(self, timestamp: str) -> list[_LifecycleMemoryRef]:
         cursor = await self._connection.execute(
             """
-            SELECT id, user_id, canonical_text, payload_json
+            SELECT id, user_id, canonical_text, payload_json, valid_from, valid_to, temporal_type
             FROM memory_objects
             WHERE status = ?
               AND object_type = ?
-              AND valid_to IS NOT NULL
-              AND valid_to < ?
             """,
             (
                 MemoryStatus.ACTIVE.value,
                 MemoryObjectType.STATE_SNAPSHOT.value,
-                timestamp,
             ),
         )
-        rows = await cursor.fetchall()
+        reference = self._parse_temporal_datetime(timestamp, self._clock.now())
+        rows = [
+            row
+            for row in await cursor.fetchall()
+            if self._is_expired_state_snapshot(dict(row), reference)
+        ]
         updates = [
             (
                 MemoryStatus.ARCHIVED.value,
@@ -239,6 +251,30 @@ class MemoryLifecycleManager:
             for row in rows
         ]
 
+    def _is_expired_state_snapshot(self, row: dict[str, Any], reference: datetime) -> bool:
+        temporal_type = str(row.get("temporal_type", "unknown"))
+        if temporal_type == "ephemeral":
+            valid_from = self._parse_temporal_datetime(row.get("valid_from"), reference)
+            if valid_from is None:
+                return True
+            valid_to = self._parse_temporal_datetime(row.get("valid_to"), reference)
+            effective_end = valid_to or (
+                valid_from + timedelta(hours=self._settings.ephemeral_scoring_hours)
+            )
+            return effective_end < reference
+
+        valid_to = self._parse_temporal_datetime(row.get("valid_to"), reference)
+        return valid_to is not None and valid_to < reference
+
+    @staticmethod
+    def _parse_temporal_datetime(value: Any, reference: datetime) -> datetime | None:
+        if value is None:
+            return None
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None and reference.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=reference.tzinfo)
+        return parsed
+
     async def _count_preserved_evidence(self) -> int:
         cursor = await self._connection.execute(
             """
@@ -258,6 +294,77 @@ class MemoryLifecycleManager:
         )
         row = await cursor.fetchone()
         return int(row["count"])
+
+    async def _decline_expired_pending_confirmations(
+        self,
+        cutoff: str,
+        timestamp: str,
+    ) -> list[_LifecycleMemoryRef]:
+        cursor = await self._connection.execute(
+            """
+            SELECT id, user_id, memory_category, payload_json
+            FROM memory_objects
+            WHERE status = ?
+              AND created_at < ?
+            """,
+            (
+                MemoryStatus.PENDING_USER_CONFIRMATION.value,
+                cutoff,
+            ),
+        )
+        rows = await cursor.fetchall()
+        updates = [
+            (
+                MemoryStatus.DECLINED.value,
+                json.dumps(
+                    self._declined_payload(row["payload_json"], decline_reason="ttl_expired"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                timestamp,
+                row["id"],
+            )
+            for row in rows
+        ]
+        if updates:
+            await self._connection.executemany(
+                """
+                UPDATE memory_objects
+                SET status = ?, payload_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                updates,
+            )
+            memory_ids_by_user: dict[str, list[str]] = {}
+            decline_counts: dict[tuple[str, str], int] = {}
+            for row in rows:
+                user_id = str(row["user_id"])
+                memory_ids_by_user.setdefault(user_id, []).append(str(row["id"]))
+                category_key = (user_id, str(row["memory_category"]))
+                decline_counts[category_key] = decline_counts.get(category_key, 0) + 1
+            for user_id, memory_ids in memory_ids_by_user.items():
+                await self._pending_confirmation_repository.clear_markers(
+                    user_id,
+                    memory_ids,
+                    commit=False,
+                )
+            for (user_id, category_str), count in decline_counts.items():
+                category = MemoryCategory(category_str)
+                profile = await self._consent_profile_repository.get_profile(user_id, category)
+                current_declined = int(profile.get("declined_count", 0)) if profile else 0
+                await self._consent_profile_repository.upsert_profile(
+                    user_id=user_id,
+                    category=category,
+                    confirmed_count=int(profile.get("confirmed_count", 0)) if profile else 0,
+                    declined_count=current_declined + count,
+                    last_confirmed_at=profile.get("last_confirmed_at") if profile else None,
+                    last_declined_at=timestamp,
+                    commit=False,
+                )
+        return [
+            _LifecycleMemoryRef(memory_id=str(row["id"]), user_id=str(row["user_id"]))
+            for row in rows
+        ]
 
     async def _delete_expired_ephemeral(self, cutoff: str) -> list[_LifecycleMemoryRef]:
         return await self._select_memory_refs(
@@ -377,4 +484,14 @@ class MemoryLifecycleManager:
         else:
             payload = {}
         payload.setdefault("archived_summary", canonical_text)
+        return payload
+
+    @staticmethod
+    def _declined_payload(raw_payload: str | None, *, decline_reason: str) -> dict[str, Any]:
+        payload: dict[str, Any]
+        if isinstance(raw_payload, str) and raw_payload:
+            payload = json.loads(raw_payload)
+        else:
+            payload = {}
+        payload["decline_reason"] = decline_reason
         return payload

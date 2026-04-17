@@ -9,12 +9,19 @@ import pytest
 
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
+from atagia.core.consent_repository import MemoryConsentProfileRepository, PendingMemoryConfirmationRepository
 from atagia.core.contract_repository import ContractDimensionRepository
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository
 from atagia.memory.lifecycle import MemoryLifecycleManager
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
+from atagia.models.schemas_memory import (
+    MemoryCategory,
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    MemoryStatus,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -74,8 +81,10 @@ async def _create_memory_at(
     assistant_mode_id: str | None = "coding_debug",
     conversation_id: str | None = "cnv_1",
     payload: dict[str, object] | None = None,
+    valid_from: str | None = None,
     valid_to: str | None = None,
     temporal_type: str = "unknown",
+    memory_category: MemoryCategory = MemoryCategory.UNKNOWN,
 ) -> dict[str, object]:
     original = clock.current
     clock.current = created_at
@@ -94,8 +103,10 @@ async def _create_memory_at(
             status=status,
             memory_id=memory_id,
             payload=payload,
+            valid_from=valid_from,
             valid_to=valid_to,
             temporal_type=temporal_type,
+            memory_category=memory_category,
         )
     finally:
         clock.current = original
@@ -310,6 +321,34 @@ async def test_non_expired_state_snapshot_is_not_archived_by_low_value_sweep() -
         assert result.archived_count == 0
         assert updated is not None
         assert updated["status"] == MemoryStatus.ACTIVE.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_ephemeral_state_snapshot_is_archived() -> None:
+    connection, clock, memories, _contracts = await _build_runtime()
+    try:
+        memory = await _create_memory_at(
+            memories,
+            clock,
+            created_at=clock.now() - timedelta(days=2),
+            memory_id="mem_state_ephemeral_expired",
+            object_type=MemoryObjectType.STATE_SNAPSHOT,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="User is at the airport.",
+            confidence=0.9,
+            vitality=0.9,
+            valid_from=(clock.now() - timedelta(days=2)).isoformat(),
+            temporal_type="ephemeral",
+        )
+
+        result = await MemoryLifecycleManager(connection, clock, _settings()).run_cycle()
+        updated = await memories.get_memory_object(str(memory["id"]), "usr_1")
+
+        assert result.archived_count == 1
+        assert updated is not None
+        assert updated["status"] == MemoryStatus.ARCHIVED.value
     finally:
         await connection.close()
 
@@ -639,5 +678,84 @@ async def test_lifecycle_does_not_delete_pending_or_declined_ephemeral_memories(
         assert result.deleted_count == 0
         assert await memories.get_memory_object("mem_pending_ephemeral", "usr_1") is not None
         assert await memories.get_memory_object("mem_declined_ephemeral", "usr_1") is not None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_declines_expired_pending_confirmation_and_clears_marker() -> None:
+    connection, clock, memories, _contracts = await _build_runtime()
+    try:
+        confirmations = PendingMemoryConfirmationRepository(connection, clock)
+        pending = await _create_memory_at(
+            memories,
+            clock,
+            created_at=clock.now() - timedelta(days=8),
+            memory_id="mem_pending_expired",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Pending confirmation memory",
+            confidence=0.9,
+            vitality=0.4,
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+        )
+        await confirmations.create_marker(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            memory_id=str(pending["id"]),
+            category=MemoryCategory.UNKNOWN,
+            created_at=str(pending["created_at"]),
+        )
+
+        result = await MemoryLifecycleManager(connection, clock, _settings()).run_cycle()
+
+        updated = await memories.get_memory_object("mem_pending_expired", "usr_1")
+        assert result.declined_count == 1
+        assert updated is not None
+        assert updated["status"] == MemoryStatus.DECLINED.value
+        assert updated["payload_json"]["decline_reason"] == "ttl_expired"
+        assert await confirmations.get_marker_for_memory("usr_1", "mem_pending_expired") is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_ttl_decline_increments_consent_profile_declined_count() -> None:
+    """TTL-expired PENDING memories must increment declined_count so category suppression works."""
+    connection, clock, memories, _contracts = await _build_runtime()
+    try:
+        confirmations = PendingMemoryConfirmationRepository(connection, clock)
+        profiles = MemoryConsentProfileRepository(connection, clock)
+
+        # Create two expired PENDING memories in the same category
+        for i in range(2):
+            mem = await _create_memory_at(
+                memories,
+                clock,
+                created_at=clock.now() - timedelta(days=8),
+                memory_id=f"mem_ttl_decline_{i}",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.CONVERSATION,
+                canonical_text=f"Expired pending memory {i}",
+                confidence=0.9,
+                vitality=0.4,
+                status=MemoryStatus.PENDING_USER_CONFIRMATION,
+                memory_category=MemoryCategory.PIN_OR_PASSWORD,
+            )
+            await confirmations.create_marker(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                memory_id=str(mem["id"]),
+                category=MemoryCategory.PIN_OR_PASSWORD,
+                created_at=str(mem["created_at"]),
+            )
+
+        result = await MemoryLifecycleManager(connection, clock, _settings()).run_cycle()
+
+        assert result.declined_count == 2
+        profile = await profiles.get_profile("usr_1", MemoryCategory.PIN_OR_PASSWORD)
+        assert profile is not None
+        assert int(profile["declined_count"]) == 2
+        assert int(profile["confirmed_count"]) == 0
     finally:
         await connection.close()

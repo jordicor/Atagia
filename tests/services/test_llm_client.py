@@ -55,8 +55,10 @@ class JsonProvider(LLMProvider):
 
     def __init__(self, payload: str) -> None:
         self.payload = payload
+        self.calls = 0
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.calls += 1
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
@@ -111,6 +113,30 @@ class SchemaFallbackProvider(LLMProvider):
             provider=self.name,
             model=request.model,
             output_text='{"label":"ok","score":8}',
+        )
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        return LLMEmbeddingResponse(
+            provider=self.name,
+            model=request.model,
+            vectors=[LLMEmbeddingVector(index=0, values=[0.3, 0.4])],
+        )
+
+
+class ArraySchemaFallbackProvider(LLMProvider):
+    name = "array-schema-fallback"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.calls += 1
+        if request.response_schema is not None:
+            raise LLMError("output_config.format.schema: For 'array' type, property 'maxItems' is not supported")
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text='{"label":"ok","score":6}',
         )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -255,6 +281,20 @@ async def test_complete_structured_falls_back_when_provider_rejects_schema_contr
 
 
 @pytest.mark.asyncio
+async def test_complete_structured_falls_back_when_provider_rejects_array_limits() -> None:
+    provider = ArraySchemaFallbackProvider()
+    client = LLMClient(provider_name="array-schema-fallback", providers=[provider])
+
+    payload = await client.complete_structured(
+        _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()}),
+        StructuredPayload,
+    )
+
+    assert payload == StructuredPayload(label="ok", score=6)
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
 async def test_complete_structured_normalizes_legacy_extraction_payload_shapes() -> None:
     client = LLMClient(
         provider_name="json",
@@ -318,6 +358,27 @@ async def test_complete_structured_defaults_legacy_item_confidence_when_missing(
     assert len(payload.contract_signals) == 1
     assert payload.contract_signals[0].confidence == 0.5
     assert payload.contract_signals[0].canonical_text == "Prefer concise replies."
+
+
+@pytest.mark.asyncio
+async def test_complete_structured_still_fails_fast_for_non_extraction_validation_errors() -> None:
+    provider = JsonProvider('{"label":"ok"}')
+    client = LLMClient(provider_name="json", providers=[provider])
+
+    with pytest.raises(StructuredOutputError):
+        await client.complete_structured(_request(), StructuredPayload)
+
+    assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_structured_exposes_sanitized_validation_details() -> None:
+    client = LLMClient(provider_name="json", providers=[JsonProvider('{"label":"ok"}')])
+
+    with pytest.raises(StructuredOutputError) as exc_info:
+        await client.complete_structured(_request(), StructuredPayload)
+
+    assert exc_info.value.details == ("$.score: Field required",)
 
 
 @pytest.mark.asyncio

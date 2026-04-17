@@ -18,7 +18,11 @@ from atagia.models.schemas_jobs import (
     JobType,
     MessageJobPayload,
 )
-from atagia.models.schemas_memory import ExtractionContextMessage, ExtractionConversationContext
+from atagia.models.schemas_memory import (
+    ExtractionContextMessage,
+    ExtractionConversationContext,
+    RawContextAccessMode,
+)
 from atagia.models.schemas_replay import PipelineResult
 from atagia.services.errors import AssistantModeMismatchError, UnknownAssistantModeError
 
@@ -87,7 +91,43 @@ class ChunkSummary:
         return estimate_tokens(self.content)
 
 
-type TranscriptEntry = RawMessage | ChunkSummary
+@dataclass(frozen=True, slots=True)
+class PlaceholderMessage:
+    """A stable placeholder rendered instead of hidden raw content."""
+
+    message: dict[str, Any]
+    placeholder_text: str
+
+    @property
+    def seq(self) -> int:
+        return int(self.message["seq"])
+
+    @property
+    def role(self) -> str:
+        return str(self.message.get("role", "user"))
+
+    @property
+    def message_id(self) -> str:
+        return str(self.message.get("id", f"msg_{self.seq}"))
+
+    @property
+    def content_kind(self) -> str:
+        return str(self.message.get("content_kind", "text"))
+
+    @property
+    def policy_reason(self) -> str:
+        return _message_policy_reason(self.message)
+
+    @property
+    def ref(self) -> str:
+        return str(self.message.get("id", self.message_id))
+
+    @property
+    def token_estimate(self) -> int:
+        return estimate_tokens(self.placeholder_text)
+
+
+TranscriptEntry = RawMessage | ChunkSummary | PlaceholderMessage
 
 
 def resolve_assistant_mode_id(
@@ -119,7 +159,14 @@ def resolve_policy(
 def recent_context(messages: list[dict[str, Any]]) -> list[ExtractionContextMessage]:
     """Build the short recent-message context used by retrieval and extraction."""
     return [
-        ExtractionContextMessage(role=str(message["role"]), content=str(message["text"]))
+        ExtractionContextMessage(
+            role=str(message["role"]),
+            content=(
+                _build_placeholder_text(message)
+                if _message_should_skip_by_default(message)
+                else str(message["text"])
+            ),
+        )
         for message in messages[-RECENT_CONTEXT_MESSAGES:]
     ]
 
@@ -132,6 +179,67 @@ def chat_model(settings: Settings) -> str:
 def estimate_tokens(text: str) -> int:
     """Estimate token usage with the shared context-composition heuristic."""
     return ContextComposer.estimate_tokens(text)
+
+
+def _normalize_raw_context_access_mode(raw_context_access_mode: RawContextAccessMode | str | None) -> str:
+    normalized = str(raw_context_access_mode or "normal").strip().lower()
+    if normalized in {"normal", "skipped_raw", "artifact", "verbatim"}:
+        return normalized
+    return "normal"
+
+
+def _message_include_raw(message: dict[str, Any]) -> bool:
+    value = message.get("include_raw", True)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return True
+        return normalized in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _message_should_skip_by_default(message: dict[str, Any]) -> bool:
+    return bool(message.get("skip_by_default")) and not _message_include_raw(message)
+
+
+def _message_content_kind(message: dict[str, Any]) -> str:
+    kind = " ".join(str(message.get("content_kind") or "text").split()).lower()[:64]
+    return kind or "text"
+
+
+def _message_policy_reason(message: dict[str, Any]) -> str:
+    reason = " ".join(str(message.get("policy_reason") or "").split())[:128].strip()
+    if reason:
+        return reason
+    if bool(message.get("artifact_backed")):
+        return "artifact_backed"
+    if bool(message.get("verbatim_required")):
+        return "verbatim_required"
+    if bool(message.get("heavy_content")):
+        return "heavy_content"
+    if bool(message.get("skip_by_default")):
+        return "skip_by_default"
+    return "normal"
+
+
+def _build_placeholder_text(message: dict[str, Any]) -> str:
+    existing = " ".join(str(message.get("context_placeholder") or "").split())[:300].strip()
+    if existing:
+        return existing
+    message_id = str(message.get("id") or f"msg_{message.get('seq', '?')}")
+    seq = message.get("seq")
+    seq_value = str(seq) if seq is not None else "?"
+    role = str(message.get("role") or "user")
+    content_kind = _message_content_kind(message)
+    policy_reason = _message_policy_reason(message)
+    return (
+        f"[Skipped message | id={message_id} seq={seq_value} role={role} "
+        f"kind={content_kind} policy={policy_reason} ref={message_id}]"
+    )
 
 
 def format_chunk_summary(chunk: dict[str, Any]) -> str:
@@ -152,8 +260,14 @@ def build_transcript_window(
     messages: list[dict[str, Any]],
     chunks: list[dict[str, Any]],
     budget_tokens: int,
+    *,
+    raw_context_access_mode: RawContextAccessMode | str = "normal",
 ) -> list[TranscriptEntry]:
     """Build a token-budgeted transcript window over prior conversation history."""
+    allow_skipped_raw = _normalize_raw_context_access_mode(raw_context_access_mode) in {
+        "skipped_raw",
+        "verbatim",
+    }
     covered_seqs: set[int] = set()
     for chunk in chunks:
         start_seq = int(chunk["source_message_start_seq"])
@@ -162,7 +276,6 @@ def build_transcript_window(
             continue
         covered_seqs.update(range(start_seq, end_seq + 1))
 
-    uncovered_messages = [message for message in messages if int(message["seq"]) not in covered_seqs]
     covered_messages_by_seq = {
         int(message["seq"]): message
         for message in messages
@@ -170,25 +283,45 @@ def build_transcript_window(
     }
 
     entries: list[TranscriptEntry] = []
-    raw_seqs: set[int] = set()
+    seen_seqs: set[int] = set()
     summarized_seqs: set[int] = set()
     remaining_tokens = budget_tokens
 
+    if not allow_skipped_raw:
+        for message in messages:
+            if int(message["seq"]) in covered_seqs:
+                continue
+            if not _message_should_skip_by_default(message):
+                continue
+            entry = PlaceholderMessage(message, _build_placeholder_text(message))
+            if entry.seq in seen_seqs:
+                continue
+            entries.append(entry)
+            seen_seqs.add(entry.seq)
+            remaining_tokens -= entry.token_estimate
+
     recency_floor = messages[-TRANSCRIPT_RECENCY_FLOOR_MESSAGES:]
     for message in recency_floor:
+        seq = int(message["seq"])
+        if seq in seen_seqs:
+            continue
         entry = RawMessage(message)
         entries.append(entry)
-        raw_seqs.add(entry.seq)
+        seen_seqs.add(entry.seq)
         remaining_tokens -= entry.token_estimate
 
-    uncovered_messages = [message for message in uncovered_messages if int(message["seq"]) not in raw_seqs]
+    uncovered_messages = [
+        message
+        for message in messages
+        if int(message["seq"]) not in covered_seqs and int(message["seq"]) not in seen_seqs
+    ]
 
     for message in reversed(uncovered_messages):
         entry = RawMessage(message)
         if entry.token_estimate > remaining_tokens:
             continue
         entries.append(entry)
-        raw_seqs.add(entry.seq)
+        seen_seqs.add(entry.seq)
         remaining_tokens -= entry.token_estimate
 
     for chunk in reversed(chunks):
@@ -204,26 +337,25 @@ def build_transcript_window(
         if chunk_seqs & summarized_seqs:
             continue
 
-        # Skip chunks already fully covered by raw messages (e.g. recency floor)
-        already_raw = chunk_seqs & raw_seqs
-        if already_raw == chunk_seqs:
-            continue
-
         chunk_messages = [
             covered_messages_by_seq[seq]
             for seq in range(chunk_start, chunk_end + 1)
-            if seq in covered_messages_by_seq and seq not in raw_seqs
+            if seq in covered_messages_by_seq and seq not in seen_seqs
         ]
-        # expected_count excludes seqs already in raw_seqs (recency floor)
-        expected_count = (chunk_end - chunk_start + 1) - len(already_raw)
-        chunk_complete = len(chunk_messages) == expected_count
+        expected_count = len(
+            [
+                seq
+                for seq in range(chunk_start, chunk_end + 1)
+                if seq not in seen_seqs
+            ]
+        )
         raw_tokens = sum(estimate_tokens(str(message["text"])) for message in chunk_messages)
 
-        if chunk_complete and chunk_messages and raw_tokens <= remaining_tokens:
+        if chunk_messages and len(chunk_messages) == expected_count and raw_tokens <= remaining_tokens:
             for message in chunk_messages:
                 entry = RawMessage(message)
                 entries.append(entry)
-                raw_seqs.add(entry.seq)
+                seen_seqs.add(entry.seq)
             remaining_tokens -= raw_tokens
             continue
 
@@ -256,14 +388,49 @@ def missing_uncovered_tail_start_seq(
     return None
 
 
-def render_transcript_window(entries: list[TranscriptEntry]) -> list[dict[str, str]]:
+def render_transcript_window(entries: list[TranscriptEntry]) -> list[dict[str, Any]]:
     """Render transcript entries into role/text dictionaries."""
-    rendered: list[dict[str, str]] = []
+    rendered: list[dict[str, Any]] = []
     for entry in entries:
         if isinstance(entry, RawMessage):
-            rendered.append({"role": entry.role, "text": entry.content})
+            rendered.append(
+                {
+                    "kind": "raw",
+                    "role": entry.role,
+                    "text": entry.content,
+                    "seq": entry.seq,
+                    "message_id": str(entry.message.get("id", f"msg_{entry.seq}")),
+                    "content_kind": _message_content_kind(entry.message),
+                    "policy_reason": _message_policy_reason(entry.message),
+                    "ref": str(entry.message.get("id", f"msg_{entry.seq}")),
+                }
+            )
             continue
-        rendered.append({"role": "assistant", "text": entry.content})
+        if isinstance(entry, PlaceholderMessage):
+            rendered.append(
+                {
+                    "kind": "placeholder",
+                    "role": entry.role,
+                    "text": entry.placeholder_text,
+                    "seq": entry.seq,
+                    "message_id": entry.message_id,
+                    "content_kind": entry.content_kind,
+                    "policy_reason": entry.policy_reason,
+                    "ref": entry.ref,
+                }
+            )
+            continue
+        rendered.append(
+            {
+                "kind": "summary",
+                "role": "assistant",
+                "text": entry.content,
+                "seq": entry.seq,
+                "chunk_id": entry.chunk_id,
+                "start_seq": entry.start_seq,
+                "end_seq": entry.end_seq,
+            }
+        )
     return rendered
 
 
@@ -272,11 +439,35 @@ def build_transcript_window_trace(
     budget_tokens: int,
 ) -> dict[str, Any]:
     """Return trace metadata for the assembled transcript window."""
+    placeholder_entries = [
+        entry
+        for entry in entries
+        if isinstance(entry, PlaceholderMessage)
+    ]
     return {
         "raw_message_seqs": [
             entry.seq
             for entry in entries
             if isinstance(entry, RawMessage)
+        ],
+        "placeholder_message_seqs": [
+            entry.seq
+            for entry in placeholder_entries
+        ],
+        "skipped_message_seqs": [
+            entry.seq
+            for entry in placeholder_entries
+        ],
+        "skipped_messages": [
+            {
+                "message_id": entry.message_id,
+                "seq": entry.seq,
+                "role": entry.role,
+                "content_kind": entry.content_kind,
+                "policy_reason": entry.policy_reason,
+                "ref": entry.ref,
+            }
+            for entry in placeholder_entries
         ],
         "chunk_ids": [
             entry.chunk_id
@@ -314,6 +505,12 @@ def build_system_prompt(
             "When listing items from memory (hobbies, activities, preferences, "
             "possessions, events), include all distinct items found across the "
             "retrieved memories, not just the most prominent ones."
+        ),
+        (
+            "Respect privacy and mode boundaries exactly as described by the "
+            "retrieved context. If a retrieved fact is marked private to this "
+            "conversation or mode, you may use it inside that same active "
+            "conversation/mode, but not outside it."
         ),
         f"Resolved policy hash: {resolved_policy.prompt_hash}",
         (

@@ -325,12 +325,21 @@ async def sync_assistant_modes(
         manifest = manifests[mode_id]
         await connection.execute(
             """
-            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO assistant_modes(
+                id,
+                display_name,
+                prompt_hash,
+                memory_policy_json,
+                privacy_ceiling,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 display_name = excluded.display_name,
                 prompt_hash = excluded.prompt_hash,
                 memory_policy_json = excluded.memory_policy_json,
+                privacy_ceiling = excluded.privacy_ceiling,
                 updated_at = excluded.updated_at
             """,
             (
@@ -338,6 +347,7 @@ async def sync_assistant_modes(
                 manifest.display_name,
                 manifest.prompt_hash or compute_prompt_hash(_manifest_payload(manifest)),
                 _manifest_json(manifest),
+                int(manifest.privacy_ceiling),
                 timestamp,
                 timestamp,
             ),

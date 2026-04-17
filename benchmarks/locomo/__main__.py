@@ -14,6 +14,7 @@ load_dotenv()
 from benchmarks.base import DEFAULT_SCORED_CATEGORIES
 from benchmarks.locomo.benchmark import LoCoMoBenchmark
 from benchmarks.base import BenchmarkReport, ConversationReport, QuestionResult
+from benchmarks.report_diff import build_benchmark_diff, load_benchmark_report, save_benchmark_diff
 from atagia.models.schemas_replay import AblationConfig
 
 _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
@@ -122,6 +123,26 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Embedding model name (required when backend is sqlite_vec)",
     )
+    parser.add_argument(
+        "--corrections",
+        default=None,
+        help="Path to corrections overlay JSON (substitutes ground truths before scoring)",
+    )
+    parser.add_argument(
+        "--community-corrections",
+        default=None,
+        help="Path to community audit errors.json (dial481/locomo-audit format)",
+    )
+    parser.add_argument(
+        "--diff-against",
+        default=None,
+        help="Optional baseline benchmark report JSON to diff against after the run",
+    )
+    parser.add_argument(
+        "--diff-output",
+        default=None,
+        help="Optional diff artifact output path; defaults next to the saved report",
+    )
     return parser
 
 
@@ -133,7 +154,12 @@ def _resolve_judge_model(args: argparse.Namespace) -> str | None:
     return None
 
 
-async def _run_async(args: argparse.Namespace) -> tuple[BenchmarkReport, Path]:
+def _default_diff_output_path(report_path: Path) -> Path:
+    timestamp = report_path.stem.removeprefix("locomo-report-")
+    return report_path.with_name(f"locomo-diff-{timestamp}.json")
+
+
+async def _run_async(args: argparse.Namespace) -> tuple[BenchmarkReport, Path, Path | None]:
     benchmark = LoCoMoBenchmark(
         data_path=args.data_path,
         llm_provider=args.provider,
@@ -143,6 +169,8 @@ async def _run_async(args: argparse.Namespace) -> tuple[BenchmarkReport, Path]:
         manifests_dir=args.manifests_dir,
         embedding_backend=args.embedding_backend,
         embedding_model=args.embedding_model,
+        corrections_path=args.corrections,
+        community_corrections_path=args.community_corrections,
     )
     report = await benchmark.run(
         ablation=_parse_ablation(args.ablation),
@@ -151,7 +179,24 @@ async def _run_async(args: argparse.Namespace) -> tuple[BenchmarkReport, Path]:
         max_questions=args.max_questions,
         max_turns=args.max_turns,
     )
-    return report, benchmark.save_report(report, args.output)
+    report_path = benchmark.save_report(report, args.output)
+
+    diff_path = None
+    if args.diff_against is not None:
+        baseline_report = load_benchmark_report(args.diff_against)
+        diff_report = build_benchmark_diff(
+            baseline_report,
+            report,
+            before_label=Path(args.diff_against).name,
+            after_label=report_path.name,
+        )
+        requested_diff_output = (
+            Path(args.diff_output).expanduser()
+            if args.diff_output is not None
+            else _default_diff_output_path(report_path)
+        )
+        diff_path = save_benchmark_diff(diff_report, requested_diff_output)
+    return report, report_path, diff_path
 
 
 def _format_duration(duration_seconds: float) -> str:
@@ -185,7 +230,11 @@ def _conversation_counts(conversation: ConversationReport) -> tuple[int, int]:
     return _score_counts(conversation.results)
 
 
-def _format_report_summary(report: BenchmarkReport, report_path: Path) -> str:
+def _format_report_summary(
+    report: BenchmarkReport,
+    report_path: Path,
+    diff_path: Path | None = None,
+) -> str:
     category_stats = _category_counts(report)
     lines = [
         "=" * 40,
@@ -223,6 +272,7 @@ def _format_report_summary(report: BenchmarkReport, report_path: Path) -> str:
         [
             "",
             f"Report saved to: {report_path}",
+            *( [f"Diff saved to: {diff_path}"] if diff_path is not None else [] ),
             "=" * 40,
         ]
     )
@@ -235,8 +285,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.embedding_backend == "sqlite_vec" and not args.embedding_model:
         parser.error("--embedding-model is required when --embedding-backend is sqlite_vec")
-    report, output_path = asyncio.run(_run_async(args))
-    print(_format_report_summary(report, output_path))
+    report, output_path, diff_path = asyncio.run(_run_async(args))
+    print(_format_report_summary(report, output_path, diff_path=diff_path))
 
 
 if __name__ == "__main__":

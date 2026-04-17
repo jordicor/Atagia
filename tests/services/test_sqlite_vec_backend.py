@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database
 from atagia.services.llm_client import (
+    ConfigurationError,
     LLMClient,
     LLMCompletionRequest,
     LLMCompletionResponse,
@@ -27,6 +29,7 @@ HAS_SQLITE_VEC = find_spec("sqlite_vec") is not None
 
 class EmbeddingProvider(LLMProvider):
     name = "sqlite-vec-tests"
+    supports_embedding_dimensions = True
 
     def __init__(self, vectors_by_text: dict[str, list[float]]) -> None:
         self.vectors_by_text = dict(vectors_by_text)
@@ -236,6 +239,88 @@ async def test_upsert_twice_updates_existing_embedding_idempotently() -> None:
 
 
 @pytest.mark.asyncio
+async def test_upsert_passes_dimensions_to_openai_compatible_provider() -> None:
+    connection, backend, provider = await _build_backend()
+    try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
+
+        await backend.upsert(
+            "mem_1",
+            "memory one",
+            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+        )
+
+        assert provider.requests[0].dimensions == 2
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_upsert_rejects_dimension_mismatch() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    provider = EmbeddingProvider({"memory one": [1.0, 0.0, 0.5]})
+    backend = SQLiteVecBackend(
+        connection,
+        LLMClient(provider_name=provider.name, providers=[provider]),
+        _settings(),
+    )
+    await backend.initialize()
+    try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
+
+        with pytest.raises(
+            ConfigurationError,
+            match="Embedding dimension mismatch: expected 2, received 3",
+        ):
+            await backend.upsert(
+                "mem_1",
+                "memory one",
+                {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+            )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_cleans_up_archived_embeddings(tmp_path: Path) -> None:
+    database_path = str(tmp_path / "atagia-cleanup.db")
+    connection, backend, _provider = await _build_backend(database_path)
+    try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
+        await backend.upsert(
+            "mem_1",
+            "memory one",
+            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+        )
+        await connection.execute(
+            "UPDATE memory_objects SET status = 'archived' WHERE id = 'mem_1'"
+        )
+        await connection.commit()
+    finally:
+        await connection.close()
+
+    reopened = await initialize_database(database_path, MIGRATIONS_DIR)
+    backend = SQLiteVecBackend(
+        reopened,
+        LLMClient(provider_name=EmbeddingProvider.name, providers=[EmbeddingProvider({"memory one": [1.0, 0.0]})]),
+        _settings(),
+    )
+    await backend.initialize()
+    try:
+        metadata_cursor = await reopened.execute(
+            "SELECT COUNT(*) AS count FROM memory_embedding_metadata WHERE memory_id = 'mem_1'"
+        )
+        vec_cursor = await reopened.execute(
+            "SELECT COUNT(*) AS count FROM vec_memory_embeddings WHERE memory_id = 'mem_1'"
+        )
+
+        assert (await metadata_cursor.fetchone())["count"] == 0
+        assert (await vec_cursor.fetchone())["count"] == 0
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_upsert_commits_metadata_durably(tmp_path: Path) -> None:
     database_path = str(tmp_path / "atagia-sqlite-vec.db")
     connection, backend, _provider = await _build_backend(database_path)
@@ -282,6 +367,46 @@ async def test_delete_commits_metadata_removal_durably(tmp_path: Path) -> None:
         assert (await cursor.fetchone())["count"] == 0
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_search_emits_starvation_warning_when_postfilter_yields_fewer_than_top_k(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When user filtering reduces results below top_k, a warning is logged."""
+    connection, backend, _provider = await _build_backend()
+    try:
+        # Create 2 memories for usr_other that are close to the query vector,
+        # but only 1 for usr_target. Requesting top_k=5 for usr_target should
+        # return 1 result and trigger the starvation warning.
+        await _insert_stub_memory(connection, "mem_target", "usr_target")
+        await _insert_stub_memory(connection, "mem_other_1", "usr_other")
+        await _insert_stub_memory(connection, "mem_other_2", "usr_other")
+        await backend.upsert(
+            "mem_target",
+            "memory one",
+            {"user_id": "usr_target", "object_type": "evidence", "scope": "conversation", "created_at": _TS},
+        )
+        await backend.upsert(
+            "mem_other_1",
+            "memory one",
+            {"user_id": "usr_other", "object_type": "evidence", "scope": "conversation", "created_at": _TS},
+        )
+        await backend.upsert(
+            "mem_other_2",
+            "memory two",
+            {"user_id": "usr_other", "object_type": "evidence", "scope": "conversation", "created_at": _TS},
+        )
+
+        with caplog.at_level(logging.WARNING, logger="atagia.services.sqlite_vec_backend"):
+            matches = await backend.search("query one", "usr_target", top_k=5)
+
+        assert len(matches) == 1
+        assert matches[0].memory_id == "mem_target"
+        assert any("fewer rows than requested" in record.message for record in caplog.records)
+        assert any("usr_target" in record.message for record in caplog.records)
+    finally:
+        await connection.close()
 
 
 @pytest.mark.asyncio

@@ -106,6 +106,22 @@ class RetrievalEventRepository(BaseRepository):
             (user_id, conversation_id, limit, offset),
         )
 
+    async def list_events_for_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            """
+            SELECT *
+            FROM retrieval_events
+            WHERE user_id = ?
+              AND conversation_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (user_id, conversation_id),
+        )
+
     async def update_outcome_fields(
         self,
         event_id: str,

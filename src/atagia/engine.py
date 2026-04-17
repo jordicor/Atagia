@@ -8,28 +8,22 @@ from typing import Any
 
 from atagia.app import AppRuntime, initialize_runtime
 from atagia.core.config import Settings
-from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository, WorkspaceRepository
-from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
-from atagia.core.timestamps import resolve_message_occurred_at
+from atagia.core.repositories import WorkspaceRepository
 from atagia.models.schemas_api import ChatResult, ContextResult
+from atagia.models.schemas_api import (
+    ActivitySnapshotResponse,
+    ConversationActivityStats,
+    VerbatimPinRecord,
+    WarmupConversationResponse,
+    WarmupRecommendedConversationsResponse,
+)
 from atagia.models.schemas_replay import AblationConfig
+from atagia.models.schemas_memory import MemoryScope, VerbatimPinStatus, VerbatimPinTargetKind
 from atagia.services.chat_service import ChatService
-from atagia.services.chat_support import (
-    DEFAULT_ASSISTANT_MODE_ID,
-    RECENT_FETCH_LIMIT,
-    build_message_jobs,
-    build_system_prompt,
-    enqueue_message_jobs,
-    resolve_policy,
-)
-from atagia.memory.lifecycle_runner import piggyback_lifecycle
-from atagia.services.context_cache_service import ContextCacheService
-from atagia.services.errors import (
-    AssistantModeMismatchError,
-    ConversationNotFoundError,
-    RuntimeNotInitializedError,
-    WorkspaceNotFoundError,
-)
+from atagia.services.conversation_activity_service import ConversationActivityService
+from atagia.services.sidecar_service import SidecarService
+from atagia.services.verbatim_pin_service import VerbatimPinService
+from atagia.services.errors import RuntimeNotInitializedError
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_MIGRATIONS_DIR = _PROJECT_ROOT / "migrations"
@@ -49,6 +43,7 @@ class Atagia:
         llm_model: str | None = None,
         embedding_backend: str = "none",
         embedding_model: str | None = None,
+        embedding_provider_name: str | None = None,
         skip_belief_revision: bool = False,
         skip_compaction: bool = False,
         context_cache_enabled: bool | None = None,
@@ -66,6 +61,7 @@ class Atagia:
         self._llm_model = llm_model
         self._embedding_backend = embedding_backend
         self._embedding_model = embedding_model
+        self._embedding_provider_name = embedding_provider_name
         self._skip_belief_revision = skip_belief_revision
         self._skip_compaction = skip_compaction
         self._context_cache_enabled = context_cache_enabled
@@ -101,95 +97,19 @@ class Atagia:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         ablation: AblationConfig | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> ContextResult:
         """Run retrieval, persist the user message, and return a ready system prompt."""
         runtime = await self._require_runtime()
-        cache_service = ContextCacheService(runtime)
-        async with cache_service.user_cache_guard(user_id):
-            await wait_for_in_memory_worker_quiescence(runtime)
-            connection = await runtime.open_connection()
-            try:
-                await self._ensure_user_exists(connection, runtime, user_id)
-                conversation = await self._ensure_conversation(
-                    connection,
-                    runtime,
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    workspace_id=workspace_id,
-                    assistant_mode_id=mode,
-                )
-                messages = MessageRepository(connection, runtime.clock)
-                prior_messages = await messages.get_recent_messages(
-                    conversation["id"],
-                    user_id,
-                    limit=RECENT_FETCH_LIMIT,
-                )
-                resolution = await cache_service.resolve_with_connection(
-                    connection,
-                    user_id=user_id,
-                    conversation_id=str(conversation["id"]),
-                    message_text=message,
-                    assistant_mode_id=mode,
-                    stored_messages=prior_messages,
-                    conversation=conversation,
-                    ablation=ablation,
-                )
-                messages = MessageRepository(connection, runtime.clock)
-                await connection.execute("BEGIN")
-                try:
-                    user_message = await messages.create_message(
-                        message_id=None,
-                        conversation_id=str(conversation["id"]),
-                        role="user",
-                        seq=None,
-                        text=message,
-                        token_count=None,
-                        metadata={},
-                        occurred_at=occurred_at,
-                        commit=False,
-                    )
-                    await connection.commit()
-                except Exception:
-                    await connection.rollback()
-                    raise
-            finally:
-                await connection.close()
-            await cache_service.publish_pending_cache_entry(
-                resolution,
-                last_retrieval_message_seq=int(user_message["seq"]),
-            )
-            await self._enqueue_message_jobs(
-                runtime,
-                conversation=conversation,
-                message=user_message,
-                prior_messages=prior_messages,
-                message_text=message,
-                role="user",
-            )
-            if runtime.settings.lifecycle_lazy_enabled:
-                runtime.spawn_background_task(
-                    piggyback_lifecycle(runtime),
-                    name="atagia-lifecycle-piggyback",
-                )
-        return ContextResult(
-            system_prompt=build_system_prompt(
-                str(conversation["assistant_mode_id"]),
-                resolution.resolved_policy,
-                resolution.composed_context.contract_block,
-                resolution.composed_context.workspace_block,
-                resolution.composed_context.memory_block,
-                resolution.composed_context.state_block,
-            ),
-            memories=resolution.memory_summaries,
-            contract=resolution.current_contract,
-            detected_needs=resolution.detected_needs,
-            stage_timings=resolution.stage_timings,
-            from_cache=resolution.from_cache,
-            staleness=resolution.staleness,
-            next_refresh_strategy=resolution.next_refresh_strategy,
-            cache_age_seconds=resolution.cache_age_seconds,
-            cache_source=resolution.cache_source,
-            need_detection_skipped=resolution.need_detection_skipped,
+        return await SidecarService(runtime).get_context(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message=message,
+            mode=mode,
+            workspace_id=workspace_id,
+            occurred_at=occurred_at,
+            ablation=ablation,
+            attachments=attachments,
         )
 
     async def flush(self, timeout_seconds: float = 30.0) -> bool:
@@ -208,66 +128,20 @@ class Atagia:
         mode: str | None = None,
         workspace_id: str | None = None,
         occurred_at: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         """Store a message and enqueue extraction without running retrieval."""
-        if role not in {"user", "assistant"}:
-            raise ValueError("ingest_message role must be 'user' or 'assistant'")
-
         runtime = await self._require_runtime()
-        cache_service = ContextCacheService(runtime)
-        async with cache_service.user_cache_guard(user_id):
-            await wait_for_in_memory_worker_quiescence(runtime)
-            connection = await runtime.open_connection()
-            conversation: dict[str, Any] | None = None
-            prior_messages: list[dict[str, Any]] = []
-            stored_message: dict[str, Any] | None = None
-            try:
-                await self._ensure_user_exists(connection, runtime, user_id)
-                conversation = await self._ensure_conversation(
-                    connection,
-                    runtime,
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    workspace_id=workspace_id,
-                    assistant_mode_id=mode,
-                )
-                messages = MessageRepository(connection, runtime.clock)
-                prior_messages = await messages.get_recent_messages(
-                    str(conversation["id"]),
-                    user_id,
-                    limit=RECENT_FETCH_LIMIT,
-                )
-                await connection.execute("BEGIN")
-                try:
-                    stored_message = await messages.create_message(
-                        message_id=None,
-                        conversation_id=str(conversation["id"]),
-                        role=role,
-                        seq=None,
-                        text=text,
-                        token_count=None,
-                        metadata={},
-                        occurred_at=occurred_at,
-                        commit=False,
-                    )
-                    await cache_service.invalidate_conversation_cache_for_conversation(conversation)
-                    await connection.commit()
-                except Exception:
-                    await connection.rollback()
-                    raise
-            finally:
-                await connection.close()
-
-            if conversation is None or stored_message is None:
-                raise RuntimeError("Message ingestion did not persist the message correctly")
-            await self._enqueue_message_jobs(
-                runtime,
-                conversation=conversation,
-                message=stored_message,
-                prior_messages=prior_messages,
-                message_text=text,
-                role=role,
-            )
+        await SidecarService(runtime).ingest_message(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            role=role,
+            text=text,
+            mode=mode,
+            workspace_id=workspace_id,
+            occurred_at=occurred_at,
+            attachments=attachments,
+        )
 
     async def add_response(
         self,
@@ -278,54 +152,12 @@ class Atagia:
     ) -> None:
         """Persist an assistant response in the conversation history."""
         runtime = await self._require_runtime()
-        cache_service = ContextCacheService(runtime)
-        async with cache_service.user_cache_guard(user_id):
-            await wait_for_in_memory_worker_quiescence(runtime)
-            connection = await runtime.open_connection()
-            conversation: dict[str, Any] | None = None
-            prior_messages: list[dict[str, Any]] = []
-            assistant_message: dict[str, Any] | None = None
-            try:
-                conversations = ConversationRepository(connection, runtime.clock)
-                conversation = await conversations.get_conversation(conversation_id, user_id)
-                if conversation is None:
-                    raise ConversationNotFoundError("Conversation not found for user")
-                messages = MessageRepository(connection, runtime.clock)
-                prior_messages = await messages.get_recent_messages(
-                    conversation_id,
-                    user_id,
-                    limit=RECENT_FETCH_LIMIT,
-                )
-                await connection.execute("BEGIN")
-                try:
-                    assistant_message = await messages.create_message(
-                        message_id=None,
-                        conversation_id=conversation_id,
-                        role="assistant",
-                        seq=None,
-                        text=text,
-                        token_count=None,
-                        metadata={},
-                        occurred_at=occurred_at,
-                        commit=False,
-                    )
-                    await cache_service.invalidate_conversation_cache_for_conversation(conversation)
-                    await connection.commit()
-                except Exception:
-                    await connection.rollback()
-                    raise
-            finally:
-                await connection.close()
-            if conversation is None or assistant_message is None:
-                raise RuntimeError("Assistant response did not persist correctly")
-            await self._enqueue_message_jobs(
-                runtime,
-                conversation=conversation,
-                message=assistant_message,
-                prior_messages=prior_messages,
-                message_text=text,
-                role="assistant",
-            )
+        await SidecarService(runtime).add_response(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            text=text,
+            occurred_at=occurred_at,
+        )
 
     async def chat(
         self,
@@ -335,15 +167,16 @@ class Atagia:
         mode: str | None = None,
         workspace_id: str | None = None,
         occurred_at: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> ChatResult:
         """Run the full chat flow, including the LLM response generation."""
         runtime = await self._require_runtime()
+        sidecar = SidecarService(runtime)
         connection = await runtime.open_connection()
         try:
-            await self._ensure_user_exists(connection, runtime, user_id)
-            await self._ensure_conversation(
+            await sidecar.ensure_user_exists(connection, user_id)
+            await sidecar.ensure_conversation(
                 connection,
-                runtime,
                 user_id=user_id,
                 conversation_id=conversation_id,
                 workspace_id=workspace_id,
@@ -356,6 +189,7 @@ class Atagia:
             conversation_id=conversation_id,
             message_text=message,
             assistant_mode_id=mode,
+            attachments=attachments,
             message_occurred_at=occurred_at,
         )
 
@@ -364,16 +198,17 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
-            await self._ensure_user_exists(connection, runtime, user_id)
+            await SidecarService(runtime).ensure_user_exists(connection, user_id)
         finally:
             await connection.close()
 
     async def create_workspace(self, user_id: str, workspace_id: str, name: str) -> None:
         """Create the workspace if it does not already exist."""
         runtime = await self._require_runtime()
+        sidecar = SidecarService(runtime)
         connection = await runtime.open_connection()
         try:
-            await self._ensure_user_exists(connection, runtime, user_id)
+            await sidecar.ensure_user_exists(connection, user_id)
             workspaces = WorkspaceRepository(connection, runtime.clock)
             if await workspaces.get_workspace(workspace_id, user_id) is None:
                 await workspaces.create_workspace(workspace_id, user_id, name)
@@ -389,18 +224,303 @@ class Atagia:
     ) -> str:
         """Create a conversation and return its identifier."""
         runtime = await self._require_runtime()
+        sidecar = SidecarService(runtime)
         connection = await runtime.open_connection()
         try:
-            await self._ensure_user_exists(connection, runtime, user_id)
-            conversation = await self._ensure_conversation(
+            await sidecar.ensure_user_exists(connection, user_id)
+            conversation = await sidecar.ensure_conversation(
                 connection,
-                runtime,
                 user_id=user_id,
                 conversation_id=conversation_id,
                 workspace_id=workspace_id,
                 assistant_mode_id=assistant_mode_id,
             )
             return str(conversation["id"])
+        finally:
+            await connection.close()
+
+    async def create_verbatim_pin(
+        self,
+        user_id: str,
+        *,
+        scope: MemoryScope,
+        target_kind: VerbatimPinTargetKind,
+        target_id: str,
+        workspace_id: str | None = None,
+        conversation_id: str | None = None,
+        assistant_mode_id: str | None = None,
+        canonical_text: str | None = None,
+        index_text: str | None = None,
+        target_span_start: int | None = None,
+        target_span_end: int | None = None,
+        privacy_level: int = 0,
+        reason: str | None = None,
+        created_by: str | None = None,
+        expires_at: str | None = None,
+        payload_json: dict[str, Any] | None = None,
+    ) -> VerbatimPinRecord:
+        """Create a verbatim pin and return the canonical record."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            await SidecarService(runtime).ensure_user_exists(connection, user_id)
+            created = await VerbatimPinService(runtime).create_verbatim_pin(
+                connection,
+                user_id=user_id,
+                scope=scope,
+                target_kind=target_kind,
+                target_id=target_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                assistant_mode_id=assistant_mode_id,
+                canonical_text=canonical_text,
+                index_text=index_text,
+                target_span_start=target_span_start,
+                target_span_end=target_span_end,
+                privacy_level=privacy_level,
+                reason=reason,
+                created_by=created_by,
+                expires_at=expires_at,
+                payload_json=payload_json,
+            )
+            return VerbatimPinRecord.model_validate(created)
+        finally:
+            await connection.close()
+
+    async def get_verbatim_pin(
+        self,
+        user_id: str,
+        pin_id: str,
+    ) -> VerbatimPinRecord | None:
+        """Return one verbatim pin by id, if it belongs to the user."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            row = await VerbatimPinService(runtime).get_verbatim_pin(
+                connection,
+                user_id=user_id,
+                pin_id=pin_id,
+            )
+            return None if row is None else VerbatimPinRecord.model_validate(row)
+        finally:
+            await connection.close()
+
+    async def list_verbatim_pins(
+        self,
+        user_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        scope_filter: list[MemoryScope] | None = None,
+        target_kind_filter: list[VerbatimPinTargetKind] | None = None,
+        status_filter: list[VerbatimPinStatus] | None = None,
+        target_id: str | None = None,
+        include_deleted: bool = False,
+        active_only: bool = False,
+        as_of: str | None = None,
+    ) -> list[VerbatimPinRecord]:
+        """Return verbatim pins owned by the user."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            rows = await VerbatimPinService(runtime).list_verbatim_pins(
+                connection,
+                user_id=user_id,
+                limit=limit,
+                offset=offset,
+                scope_filter=scope_filter,
+                target_kind_filter=target_kind_filter,
+                status_filter=status_filter,
+                target_id=target_id,
+                include_deleted=include_deleted,
+                active_only=active_only,
+                as_of=as_of,
+            )
+            return [VerbatimPinRecord.model_validate(row) for row in rows]
+        finally:
+            await connection.close()
+
+    async def update_verbatim_pin(
+        self,
+        user_id: str,
+        pin_id: str,
+        *,
+        canonical_text: str | None = None,
+        index_text: str | None = None,
+        target_span_start: int | None = None,
+        target_span_end: int | None = None,
+        privacy_level: int | None = None,
+        status: VerbatimPinStatus | None = None,
+        reason: str | None = None,
+        expires_at: str | None = None,
+        payload_json: dict[str, Any] | None = None,
+    ) -> VerbatimPinRecord | None:
+        """Update a verbatim pin lifecycle or content field."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            updated = await VerbatimPinService(runtime).update_verbatim_pin(
+                connection,
+                user_id=user_id,
+                pin_id=pin_id,
+                canonical_text=canonical_text,
+                index_text=index_text,
+                target_span_start=target_span_start,
+                target_span_end=target_span_end,
+                privacy_level=privacy_level,
+                status=status,
+                reason=reason,
+                expires_at=expires_at,
+                payload_json=payload_json,
+            )
+            return None if updated is None else VerbatimPinRecord.model_validate(updated)
+        finally:
+            await connection.close()
+
+    async def delete_verbatim_pin(
+        self,
+        user_id: str,
+        pin_id: str,
+    ) -> VerbatimPinRecord | None:
+        """Delete a verbatim pin while preserving its audit trail."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            deleted = await VerbatimPinService(runtime).delete_verbatim_pin(
+                connection,
+                user_id=user_id,
+                pin_id=pin_id,
+            )
+            return None if deleted is None else VerbatimPinRecord.model_validate(deleted)
+        finally:
+            await connection.close()
+
+    async def get_activity_snapshot(
+        self,
+        user_id: str,
+        conversation_id: str | None = None,
+        workspace_id: str | None = None,
+        assistant_mode_id: str | None = None,
+        as_of: str | None = None,
+        refresh: bool = True,
+    ) -> ActivitySnapshotResponse:
+        """Return a derived activity snapshot for one user or conversation scope."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            service = ConversationActivityService(runtime)
+            snapshot = await service.get_activity_snapshot(
+                connection,
+                user_id,
+                conversation_id=conversation_id,
+                workspace_id=workspace_id,
+                assistant_mode_id=assistant_mode_id,
+                as_of=as_of,
+                refresh=refresh,
+            )
+            return ActivitySnapshotResponse.model_validate(
+                {
+                    **snapshot,
+                    "conversations": [
+                        ConversationActivityStats.model_validate(row)
+                        for row in snapshot.get("conversations", [])
+                    ],
+                }
+            )
+        finally:
+            await connection.close()
+
+    async def list_hot_conversations(
+        self,
+        user_id: str,
+        limit: int = 5,
+        workspace_id: str | None = None,
+        assistant_mode_id: str | None = None,
+        as_of: str | None = None,
+        refresh: bool = True,
+    ) -> list[ConversationActivityStats]:
+        """Return the hottest active conversations for a user."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            service = ConversationActivityService(runtime)
+            rows = await service.list_hot_conversations(
+                connection,
+                user_id,
+                limit=limit,
+                workspace_id=workspace_id,
+                assistant_mode_id=assistant_mode_id,
+                as_of=as_of,
+                refresh=refresh,
+            )
+            return [ConversationActivityStats.model_validate(row) for row in rows]
+        finally:
+            await connection.close()
+
+    async def warmup_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+        max_messages: int = 12,
+        as_of: str | None = None,
+    ) -> WarmupConversationResponse:
+        """Warm a single conversation without generating a reply."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            service = ConversationActivityService(runtime)
+            result = await service.warmup_conversation(
+                connection,
+                user_id,
+                conversation_id,
+                max_messages=max_messages,
+                as_of=as_of,
+                refresh_stats=True,
+            )
+            return WarmupConversationResponse.model_validate(result)
+        finally:
+            await connection.close()
+
+    async def warmup_recommended_conversations(
+        self,
+        user_id: str,
+        limit: int = 3,
+        workspace_id: str | None = None,
+        assistant_mode_id: str | None = None,
+        as_of: str | None = None,
+        lead_time_minutes: int | None = None,
+        total_message_budget: int = 24,
+        per_conversation_message_budget: int = 12,
+    ) -> WarmupRecommendedConversationsResponse:
+        """Warm the most likely-to-be-used conversations for a user."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            service = ConversationActivityService(runtime)
+            result = await service.warmup_recommended_conversations(
+                connection,
+                user_id,
+                limit=limit,
+                workspace_id=workspace_id,
+                assistant_mode_id=assistant_mode_id,
+                as_of=as_of,
+                lead_time_minutes=lead_time_minutes,
+                total_message_budget=total_message_budget,
+                per_conversation_message_budget=per_conversation_message_budget,
+            )
+            return WarmupRecommendedConversationsResponse.model_validate(
+                {
+                    **result,
+                    "hot_conversations": [
+                        ConversationActivityStats.model_validate(row)
+                        for row in result.get("hot_conversations", [])
+                    ],
+                    "warmed_conversations": [
+                        WarmupConversationResponse.model_validate(row)
+                        for row in result.get("warmed_conversations", [])
+                    ],
+                }
+            )
         finally:
             await connection.close()
 
@@ -439,6 +559,9 @@ class Atagia:
             llm_scoring_model=self._llm_model or env_settings.llm_scoring_model,
             llm_classifier_model=self._llm_model or env_settings.llm_classifier_model,
             llm_chat_model=self._llm_model or env_settings.llm_chat_model,
+            embedding_provider_name=(
+                self._embedding_provider_name or env_settings.embedding_provider_name
+            ),
             service_mode=False,
             service_api_key=None,
             admin_api_key=None,
@@ -452,6 +575,7 @@ class Atagia:
             lifecycle_decay_rate=env_settings.lifecycle_decay_rate,
             lifecycle_archive_vitality=env_settings.lifecycle_archive_vitality,
             lifecycle_archive_confidence=env_settings.lifecycle_archive_confidence,
+            ephemeral_scoring_hours=env_settings.ephemeral_scoring_hours,
             lifecycle_ephemeral_ttl_hours=env_settings.lifecycle_ephemeral_ttl_hours,
             lifecycle_review_ttl_days=env_settings.lifecycle_review_ttl_days,
             lifecycle_lazy_enabled=env_settings.lifecycle_lazy_enabled,
@@ -476,6 +600,9 @@ class Atagia:
                 else self._chunking_enabled
             ),
             chunking_threshold_tokens=env_settings.chunking_threshold_tokens,
+            small_corpus_token_threshold_ratio=(
+                env_settings.small_corpus_token_threshold_ratio
+            ),
         )
 
     async def _require_runtime(self) -> AppRuntime:
@@ -484,85 +611,3 @@ class Atagia:
         if self._runtime is None:
             raise RuntimeNotInitializedError("Atagia runtime is not initialized")
         return self._runtime
-
-    async def _ensure_user_exists(
-        self,
-        connection: Any,
-        runtime: AppRuntime,
-        user_id: str,
-    ) -> None:
-        users = UserRepository(connection, runtime.clock)
-        if await users.get_user(user_id) is None:
-            await users.create_user(user_id)
-
-    async def _ensure_conversation(
-        self,
-        connection: Any,
-        runtime: AppRuntime,
-        *,
-        user_id: str,
-        conversation_id: str | None,
-        workspace_id: str | None,
-        assistant_mode_id: str | None,
-    ) -> dict[str, Any]:
-        conversations = ConversationRepository(connection, runtime.clock)
-        workspaces = WorkspaceRepository(connection, runtime.clock)
-        conversation = None
-        if conversation_id is not None:
-            conversation = await conversations.get_conversation(conversation_id, user_id)
-        if conversation is not None:
-            if (
-                assistant_mode_id is not None
-                and assistant_mode_id != conversation["assistant_mode_id"]
-            ):
-                raise AssistantModeMismatchError(
-                    "Requested assistant mode does not match the existing conversation mode"
-                )
-            if (
-                workspace_id is not None
-                and conversation["workspace_id"] != workspace_id
-            ):
-                raise ValueError(
-                    "Requested workspace does not match the existing conversation workspace"
-                )
-            return conversation
-
-        if workspace_id is not None:
-            workspace = await workspaces.get_workspace(workspace_id, user_id)
-            if workspace is None:
-                raise WorkspaceNotFoundError("Workspace not found for user")
-
-        resolved_mode = assistant_mode_id or DEFAULT_ASSISTANT_MODE_ID
-        resolve_policy(runtime.manifests, resolved_mode, runtime.policy_resolver)
-        return await conversations.create_conversation(
-            conversation_id=conversation_id,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            assistant_mode_id=resolved_mode,
-            title=None,
-            metadata={},
-        )
-
-    async def _enqueue_message_jobs(
-        self,
-        runtime: AppRuntime,
-        *,
-        conversation: dict[str, Any],
-        message: dict[str, Any],
-        prior_messages: list[dict[str, Any]],
-        message_text: str,
-        role: str,
-    ) -> None:
-        jobs = build_message_jobs(
-            clock=runtime.clock,
-            conversation=conversation,
-            message_id=str(message["id"]),
-            prior_messages=prior_messages,
-            message_text=message_text,
-            occurred_at=resolve_message_occurred_at(message),
-            role=role,
-        )
-        await enqueue_message_jobs(
-            storage_backend=runtime.storage_backend,
-            jobs=jobs,
-        )

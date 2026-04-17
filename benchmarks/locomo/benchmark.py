@@ -32,6 +32,24 @@ _DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
 _DEFAULT_ASSISTANT_MODE_ID = "general_qa"
 
 
+def _apply_corrections(
+    questions: list[BenchmarkQuestion],
+    corrections: dict[str, Any],
+) -> list[BenchmarkQuestion]:
+    """Substitute ground truths from a corrections overlay."""
+    if not corrections:
+        return questions
+    result: list[BenchmarkQuestion] = []
+    for question in questions:
+        correction = corrections.get(question.question_id)
+        if correction is not None:
+            question = question.model_copy(
+                update={"ground_truth": correction["corrected_ground_truth"]},
+            )
+        result.append(question)
+    return result
+
+
 class LoCoMoBenchmark(BenchmarkRunner):
     """Run the LoCoMo benchmark against Atagia."""
 
@@ -45,6 +63,8 @@ class LoCoMoBenchmark(BenchmarkRunner):
         manifests_dir: str | Path | None = None,
         embedding_backend: str = "none",
         embedding_model: str | None = None,
+        corrections_path: str | Path | None = None,
+        community_corrections_path: str | Path | None = None,
     ) -> None:
         self._data_path = Path(data_path).expanduser()
         self._llm_provider = llm_provider
@@ -59,6 +79,17 @@ class LoCoMoBenchmark(BenchmarkRunner):
         self._embedding_backend = embedding_backend
         self._embedding_model = embedding_model
         self._adapter = LoCoMoAdapter(self._data_path)
+        self._corrections: dict[str, Any] = {}
+        if community_corrections_path is not None:
+            from benchmarks.locomo.corrections import load_community_corrections
+
+            self._corrections = load_community_corrections(
+                Path(community_corrections_path).expanduser(),
+                self._data_path,
+            )
+        if corrections_path is not None:
+            with open(Path(corrections_path).expanduser()) as fh:
+                self._corrections.update(json.load(fh))
 
     async def run(
         self,
@@ -78,7 +109,10 @@ class LoCoMoBenchmark(BenchmarkRunner):
         total_questions = 0
 
         for conversation_index, conversation in enumerate(selected_conversations, start=1):
-            filtered_questions = conversation.filtered_questions(scored_categories)
+            filtered_questions = _apply_corrections(
+                conversation.filtered_questions(scored_categories),
+                self._corrections,
+            )
             report = await self._run_conversation(
                 conversation,
                 filtered_questions=filtered_questions,

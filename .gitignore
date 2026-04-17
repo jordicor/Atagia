@@ -16,7 +16,16 @@ dist/
 .venv/
 data/
 benchmarks/data/
+
+# Local editor / tool state (regenerated, machine-specific)
+.claude/
+tools/sync_github/output/
 benchmarks/results/
+# Keep benchmark artifacts trackable in this repo; GitHub mirror sync has its
+# own exclusion rules under tools/sync_github/.
+!benchmarks/results/
+!benchmarks/results/**
+!benchmarks/atagia_bench/data/
 
 # Internal work process docs (not public)
 CLAUDE.md

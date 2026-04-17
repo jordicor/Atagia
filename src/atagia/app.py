@@ -12,8 +12,10 @@ import aiosqlite
 from fastapi import FastAPI
 
 from atagia.api.routes_admin import router as admin_router
+from atagia.api.routes_activity import router as activity_router
 from atagia.api.routes_chat import router as chat_router
 from atagia.api.routes_memory import router as memory_router
+from atagia.api.routes_verbatim_pins import router as verbatim_pins_router
 from atagia.core.clock import Clock, SystemClock
 from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database, open_connection, resolve_runtime_database_path
@@ -205,6 +207,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
                 connection=revision_connection,
                 llm_client=llm_client,
                 clock=clock,
+                embedding_index=embedding_index,
                 settings=settings,
             )
             compaction_worker = CompactionWorker(
@@ -298,6 +301,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(chat_router)
+    app.include_router(activity_router)
     app.include_router(memory_router)
+    app.include_router(verbatim_pins_router)
     app.include_router(admin_router)
     return app

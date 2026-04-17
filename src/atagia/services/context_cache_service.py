@@ -93,7 +93,11 @@ class ContextCacheService:
     _staleness_scorer: ContextStalenessScorer = field(init=False)
 
     def __post_init__(self) -> None:
-        self._staleness_scorer = ContextStalenessScorer(clock=self.runtime.clock)
+        self._staleness_scorer = ContextStalenessScorer(
+            clock=self.runtime.clock,
+            llm_client=self.runtime.llm_client,
+            settings=self.runtime.settings,
+        )
 
     @asynccontextmanager
     async def user_cache_guard(self, user_id: str) -> AsyncIterator[None]:
@@ -163,7 +167,7 @@ class ContextCacheService:
         cache_age_seconds: float | None = None
         if raw_entry is not None:
             staleness_started = perf_counter()
-            cache_score = self._staleness_scorer.score(
+            cache_score = await self._staleness_scorer.score(
                 raw_entry,
                 ContextStalenessRequest(
                     user_id=user_id,

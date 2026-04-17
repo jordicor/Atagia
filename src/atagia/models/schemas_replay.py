@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from atagia.models.schemas_memory import ComposedContext, DetectedNeed, RetrievalPlan, ScoredCandidate
+from atagia.models.schemas_memory import ComposedContext, DetectedNeed, RetrievalPlan, RetrievalTrace, ScoredCandidate
 
 
 class GroundingLevel(str, Enum):
@@ -18,6 +18,21 @@ class GroundingLevel(str, Enum):
     DERIVED = "derived"
     INFERRED = "inferred"
     SUMMARY = "summary"
+
+
+class ExportAnonymizationMode(str, Enum):
+    """Available admin export anonymization modes."""
+
+    RAW = "raw"
+    STRICT = "strict"
+    READABLE = "readable"
+
+
+class ConversationExportKind(str, Enum):
+    """Top-level artifact type for conversation export."""
+
+    RAW_REPLAY = "raw_replay"
+    ANONYMIZED_PROJECTION = "anonymized_projection"
 
 
 class AblationConfig(BaseModel):
@@ -49,6 +64,9 @@ class PipelineResult(BaseModel):
     current_contract: dict[str, dict[str, Any]] = Field(default_factory=dict)
     user_state: dict[str, Any] = Field(default_factory=dict)
     stage_timings: dict[str, float] = Field(default_factory=dict)
+    trace: RetrievalTrace | None = None
+    small_corpus_mode: bool = False
+    degraded_mode: bool = False
 
 
 class ScoreDelta(BaseModel):
@@ -126,7 +144,27 @@ class ExportedMessage(BaseModel):
     role: str
     content: str
     occurred_at: str | None = None
-    created_at: str
+    created_at: str | None = None
+
+
+class ExportAnonymizedEntity(BaseModel):
+    """Safe placeholder metadata for an anonymized export."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    placeholder: str
+    readable_label: str
+
+
+class ExportAnonymizationSummary(BaseModel):
+    """Safe summary of export anonymization behavior."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: ExportAnonymizationMode
+    applied: bool = True
+    entity_count: int = Field(ge=0)
+    entities: list[ExportAnonymizedEntity] = Field(default_factory=list)
 
 
 class ExportedRetrievalTrace(BaseModel):
@@ -145,17 +183,20 @@ class ExportedRetrievalTrace(BaseModel):
 
 
 class ConversationExport(BaseModel):
-    """Conversation export payload for research and replay."""
+    """Conversation export payload for replay or anonymized projection use."""
 
     model_config = ConfigDict(extra="forbid")
 
     conversation_id: str
     user_id: str
     assistant_mode_id: str
+    export_kind: ConversationExportKind = ConversationExportKind.RAW_REPLAY
+    replay_compatible: bool = True
     workspace_id: str | None = None
     messages: list[ExportedMessage] = Field(default_factory=list)
     retrieval_traces: list[ExportedRetrievalTrace] | None = None
-    exported_at: str
+    exported_at: str | None = None
+    anonymization: ExportAnonymizationSummary | None = None
 
 
 class ReplayEventRequest(BaseModel):
@@ -192,3 +233,4 @@ class ConversationExportRequest(BaseModel):
 
     user_id: str
     include_retrieval_traces: bool = True
+    anonymization_mode: ExportAnonymizationMode = ExportAnonymizationMode.RAW

@@ -26,6 +26,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
+from atagia.services.embeddings import EmbeddingIndex
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -75,10 +76,11 @@ class QueueProvider(LLMProvider):
                         {
                             "episodes": [
                                 {
-                                    "source_summary_ids": chunk_ids,
+                                    "episode_key": "admin_rebuild",
                                     "summary_text": "Admin rebuild episode summary.",
                                 }
-                            ]
+                            ],
+                            "chunk_episode_keys": ["admin_rebuild"] * len(chunk_ids),
                         }
                     ),
                 )
@@ -112,6 +114,24 @@ class QueueProvider(LLMProvider):
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError("Embeddings are not used in admin route tests")
+
+
+class RecordingEmbeddingIndex(EmbeddingIndex):
+    def __init__(self) -> None:
+        self.upsert_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    @property
+    def vector_limit(self) -> int:
+        return 1
+
+    async def upsert(self, memory_id: str, text: str, metadata: dict[str, object]) -> None:
+        self.upsert_calls.append((memory_id, text, metadata))
+
+    async def search(self, query: str, user_id: str, top_k: int):
+        return []
+
+    async def delete(self, memory_id: str) -> None:
+        return None
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -578,3 +598,82 @@ def test_admin_can_compact_conversation_and_workspace(tmp_path: Path) -> None:
             assert workspace_summary is not None
             assert workspace_summary["summary_kind"] == "workspace_rollup"
             assert workspace_summary["summary_text"] == "Workspace prefers patch-first debugging."
+
+
+def test_admin_embeddings_backfill_route_returns_counters_and_honors_user_id(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime
+        runtime.clock = FrozenClock(datetime(2026, 4, 5, 10, 0, tzinfo=timezone.utc))
+        runtime.embedding_index = RecordingEmbeddingIndex()
+        with _connection(client) as connection:
+            users = UserRepository(connection, runtime.clock)
+            conversations = ConversationRepository(connection, runtime.clock)
+            memories = MemoryObjectRepository(connection, runtime.clock)
+
+            client.portal.call(users.create_user, "usr_1")
+            client.portal.call(users.create_user, "usr_2")
+            client.portal.call(
+                conversations.create_conversation,
+                "cnv_1",
+                "usr_1",
+                None,
+                "coding_debug",
+                "Chat",
+            )
+            client.portal.call(
+                conversations.create_conversation,
+                "cnv_2",
+                "usr_2",
+                None,
+                "coding_debug",
+                "Chat",
+            )
+            client.portal.call(
+                lambda: memories.create_memory_object(
+                    user_id="usr_1",
+                    conversation_id="cnv_1",
+                    assistant_mode_id="coding_debug",
+                    object_type=MemoryObjectType.EVIDENCE,
+                    scope=MemoryScope.CONVERSATION,
+                    canonical_text="Backfill me",
+                    source_kind=MemorySourceKind.EXTRACTED,
+                    confidence=0.8,
+                    privacy_level=0,
+                    status=MemoryStatus.ACTIVE,
+                    memory_id="mem_usr_1",
+                )
+            )
+            client.portal.call(
+                lambda: memories.create_memory_object(
+                    user_id="usr_2",
+                    conversation_id="cnv_2",
+                    assistant_mode_id="coding_debug",
+                    object_type=MemoryObjectType.EVIDENCE,
+                    scope=MemoryScope.CONVERSATION,
+                    canonical_text="Leave me alone",
+                    source_kind=MemorySourceKind.EXTRACTED,
+                    confidence=0.8,
+                    privacy_level=0,
+                    status=MemoryStatus.ACTIVE,
+                    memory_id="mem_usr_2",
+                )
+            )
+
+            response = client.post(
+                "/v1/admin/embeddings/backfill",
+                headers={"Authorization": "Bearer admin-key"},
+                json={"batch_size": 10, "delay_ms": 0, "user_id": "usr_1"},
+            )
+
+            assert response.status_code == 200
+            assert response.json() == {
+                "examined": 1,
+                "embedded": 1,
+                "skipped": 0,
+                "failed": 0,
+                "batch_size": 10,
+                "delay_ms": 0,
+                "user_id": "usr_1",
+            }
+            assert runtime.embedding_index.upsert_calls[0][0] == "mem_usr_1"

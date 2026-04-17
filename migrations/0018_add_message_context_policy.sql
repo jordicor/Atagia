@@ -1,0 +1,9 @@
+ALTER TABLE messages ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'text';
+ALTER TABLE messages ADD COLUMN include_raw INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE messages ADD COLUMN skip_by_default INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN heavy_content INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN artifact_backed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN verbatim_required INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN requires_explicit_request INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN context_placeholder TEXT;
+ALTER TABLE messages ADD COLUMN policy_reason TEXT;

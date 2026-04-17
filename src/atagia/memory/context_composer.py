@@ -6,148 +6,18 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import math
-import re
 from typing import Any
 
 from atagia.core.clock import Clock
 from atagia.memory.policy_manifest import ResolvedPolicy
-from atagia.models.schemas_memory import ComposedContext, ScoredCandidate
+from atagia.models.schemas_memory import ComposedContext, QueryType, ScoredCandidate
 
-_TOKEN_PATTERN = re.compile(r"[a-z0-9']+")
-_CAPITALIZED_TOKEN_PATTERN = re.compile(r"\b[A-Z][a-z]+\b")
-_SELECTION_STOPWORDS = frozenset(
-    {
-        "a",
-        "about",
-        "after",
-        "ago",
-        "all",
-        "am",
-        "an",
-        "and",
-        "any",
-        "are",
-        "as",
-        "at",
-        "be",
-        "been",
-        "before",
-        "but",
-        "busy",
-        "by",
-        "can",
-        "conversation",
-        "did",
-        "do",
-        "does",
-        "describes",
-        "describing",
-        "difficult",
-        "for",
-        "from",
-        "friends",
-        "growth",
-        "had",
-        "helped",
-        "has",
-        "have",
-        "her",
-        "here",
-        "hers",
-        "him",
-        "his",
-        "how",
-        "i",
-        "if",
-        "in",
-        "into",
-        "is",
-        "it",
-        "its",
-        "just",
-        "like",
-        "me",
-        "mentioning",
-        "mentions",
-        "more",
-        "most",
-        "my",
-        "network",
-        "new",
-        "of",
-        "on",
-        "or",
-        "our",
-        "ours",
-        "personal",
-        "recent",
-        "recently",
-        "reflecting",
-        "reflects",
-        "said",
-        "says",
-        "she",
-        "share",
-        "shared",
-        "shares",
-        "sharing",
-        "so",
-        "support",
-        "supported",
-        "supportive",
-        "than",
-        "that",
-        "the",
-        "their",
-        "them",
-        "there",
-        "these",
-        "they",
-        "thing",
-        "things",
-        "this",
-        "those",
-        "through",
-        "tells",
-        "to",
-        "talking",
-        "talks",
-        "times",
-        "up",
-        "was",
-        "we",
-        "were",
-        "what",
-        "when",
-        "where",
-        "which",
-        "who",
-        "why",
-        "with",
-        "would",
-        "work",
-        "year",
-        "years",
-        "you",
-        "your",
-        "yours",
-    }
-)
-_BROAD_LIST_PATTERNS = (
-    re.compile(r"\bwhat\s+(?:do|does|did)\b.*\blike\b"),
-    re.compile(r"\bwhat\s+activities\b"),
-    re.compile(r"\bwhat\s+kinds?\b"),
-    re.compile(r"\btell me about\b"),
-)
-_TEMPORAL_QUERY_PATTERN = re.compile(r"^\s*(?:when|how long|what date|what time)\b")
-_SLOT_FILL_QUERY_PATTERN = re.compile(r"^\s*(?:where|who|which|what)\b")
 
 
 @dataclass(frozen=True, slots=True)
 class _SelectionProfile:
     diversity_weight: float
     richness_weight: float
-    alignment_weight: float
     pool_extra: int
 
 
@@ -169,22 +39,32 @@ class ContextComposer:
         conversation_messages: list[dict[str, Any]],
         workspace_rollup: dict[str, Any] | None = None,
         query_text: str | None = None,
+        query_type: QueryType = "default",
+        exact_recall_mode: bool = False,
     ) -> ComposedContext:
+        coerced_candidates = [
+            candidate
+            for candidate in (
+                self._coerce_scored_candidate(candidate)
+                for candidate in scored_candidates
+            )
+            if str(candidate.memory_object.get("canonical_text", "")).strip()
+        ]
+        # Wave 1 batch 2 (1-D): when exact recall is flagged, push L0
+        # evidence ahead of L1/L2 summaries before any diversity pass.
         candidates = sorted(
-            (
-                candidate
-                for candidate in (
-                    self._coerce_scored_candidate(candidate)
-                    for candidate in scored_candidates
-                )
-                if str(candidate.memory_object.get("canonical_text", "")).strip()
+            coerced_candidates,
+            key=lambda candidate: (
+                self._exact_recall_level_priority(candidate, exact_recall_mode),
+                -candidate.final_score,
+                candidate.memory_id,
             ),
-            key=lambda candidate: (-candidate.final_score, candidate.memory_id),
         )
         candidates = self._selection_order(
             candidates,
             max_items=resolved_policy.retrieval_params.final_context_items,
             query_text=query_text,
+            query_type=query_type,
         )
         candidate_by_id = {
             candidate.memory_id: candidate
@@ -329,15 +209,15 @@ class ContextComposer:
         *,
         max_items: int,
         query_text: str | None,
+        query_type: QueryType,
     ) -> list[ScoredCandidate]:
         if len(candidates) <= 1 or not query_text or max_items <= 0:
             return candidates
 
-        profile = cls._selection_profile(query_text)
+        profile = cls._selection_profile(query_type)
         if (
             profile.diversity_weight <= 0.0
             and profile.richness_weight <= 0.0
-            and profile.alignment_weight <= 0.0
         ):
             return candidates
 
@@ -347,11 +227,8 @@ class ContextComposer:
         )
         pool = list(candidates[:pool_size])
         remainder = candidates[pool_size:]
-        subject_tokens = {
-            cls._normalize_token(match.group(0))
-            for match in _CAPITALIZED_TOKEN_PATTERN.finditer(query_text)
-        }
         query_tokens = cls._content_tokens(query_text)
+        repeated_pool_tokens = cls._repeated_pool_tokens(pool)
         selected: list[ScoredCandidate] = []
 
         while pool:
@@ -359,19 +236,21 @@ class ContextComposer:
             best_score = float("-inf")
             for index, candidate in enumerate(pool):
                 redundancy = max(
-                    cls._candidate_similarity(candidate, chosen, subject_tokens=subject_tokens)
+                    cls._candidate_similarity(
+                        candidate,
+                        chosen,
+                        ignored_tokens=repeated_pool_tokens,
+                    )
                     for chosen in selected
                 ) if selected else 0.0
                 richness = cls._candidate_richness(
                     candidate,
                     query_tokens=query_tokens,
-                    subject_tokens=subject_tokens,
+                    repeated_pool_tokens=repeated_pool_tokens,
                 )
-                alignment = cls._query_alignment_score(query_text, candidate)
                 selection_score = (
                     float(candidate.final_score)
                     + (profile.richness_weight * richness)
-                    + (profile.alignment_weight * alignment)
                     - (profile.diversity_weight * redundancy)
                 )
                 if selection_score > best_score:
@@ -394,40 +273,28 @@ class ContextComposer:
         return [*selected, *remainder]
 
     @staticmethod
-    def _selection_profile(query_text: str) -> _SelectionProfile:
-        normalized = query_text.strip().lower()
-        if not normalized:
-            return _SelectionProfile(
-                diversity_weight=0.0,
-                richness_weight=0.0,
-                alignment_weight=0.0,
-                pool_extra=0,
-            )
-        if any(pattern.search(normalized) for pattern in _BROAD_LIST_PATTERNS):
+    def _selection_profile(query_type: QueryType) -> _SelectionProfile:
+        if query_type == "broad_list":
             return _SelectionProfile(
                 diversity_weight=0.32,
                 richness_weight=0.12,
-                alignment_weight=0.0,
                 pool_extra=24,
             )
-        if _TEMPORAL_QUERY_PATTERN.search(normalized):
+        if query_type == "temporal":
             return _SelectionProfile(
                 diversity_weight=0.03,
                 richness_weight=0.01,
-                alignment_weight=0.0,
                 pool_extra=10,
             )
-        if _SLOT_FILL_QUERY_PATTERN.search(normalized):
+        if query_type == "slot_fill":
             return _SelectionProfile(
                 diversity_weight=0.18,
                 richness_weight=0.07,
-                alignment_weight=0.12,
                 pool_extra=16,
             )
         return _SelectionProfile(
             diversity_weight=0.08,
             richness_weight=0.03,
-            alignment_weight=0.0,
             pool_extra=12,
         )
 
@@ -437,15 +304,15 @@ class ContextComposer:
         candidate: ScoredCandidate,
         other: ScoredCandidate,
         *,
-        subject_tokens: set[str],
+        ignored_tokens: set[str],
     ) -> float:
         candidate_tokens = cls._content_tokens(
             str(candidate.memory_object.get("canonical_text", "")),
-            ignored_tokens=subject_tokens,
+            ignored_tokens=ignored_tokens,
         )
         other_tokens = cls._content_tokens(
             str(other.memory_object.get("canonical_text", "")),
-            ignored_tokens=subject_tokens,
+            ignored_tokens=ignored_tokens,
         )
         if not candidate_tokens or not other_tokens:
             return 0.0
@@ -462,33 +329,19 @@ class ContextComposer:
         candidate: ScoredCandidate,
         *,
         query_tokens: set[str],
-        subject_tokens: set[str],
+        repeated_pool_tokens: set[str],
     ) -> float:
-        ignored_tokens = {*(query_tokens - {"kids"}), *subject_tokens}
+        ignored_tokens = {*query_tokens, *repeated_pool_tokens}
         candidate_tokens = cls._content_tokens(
             str(candidate.memory_object.get("canonical_text", "")),
             ignored_tokens=ignored_tokens,
         )
         if not candidate_tokens:
             return 0.0
-        richness = min(1.0, len(candidate_tokens) / 8.0)
+        richness = min(1.0, sum(len(token) for token in candidate_tokens) / 40.0)
         if str(candidate.memory_object.get("object_type")) in {"belief", "interaction_contract", "state_snapshot"}:
             return richness * 0.7
         return richness
-
-    @classmethod
-    def _query_alignment_score(cls, query_text: str, candidate: ScoredCandidate) -> float:
-        normalized_query = query_text.strip().lower()
-        if not normalized_query.startswith("where"):
-            return 0.0
-        tokens = cls._content_tokens(str(candidate.memory_object.get("canonical_text", "")))
-        if not tokens:
-            return 0.0
-        if tokens & {"beach", "city", "country", "forest", "home", "lake", "mountain", "mountains", "park", "state", "town"}:
-            return 1.0
-        if any(token.endswith(("ian", "ish", "ese")) for token in tokens):
-            return 1.0
-        return 0.0
 
     @staticmethod
     def _candidate_source_window(candidate: ScoredCandidate) -> tuple[str, str] | None:
@@ -511,16 +364,47 @@ class ContextComposer:
         ignored = ignored_tokens or set()
         return {
             normalized
-            for token in _TOKEN_PATTERN.findall(text.lower())
+            for token in cls._tokenize(text)
             if (normalized := cls._normalize_token(token))
-            and normalized not in _SELECTION_STOPWORDS
             and normalized not in ignored
-            and len(normalized) > 2
+            and len(normalized) > 1
         }
 
     @staticmethod
     def _normalize_token(token: str) -> str:
-        return token.strip("'").removesuffix("'s")
+        normalized = token.strip("_")
+        if not normalized:
+            return ""
+        if not any(character.isalnum() for character in normalized):
+            return ""
+        return normalized
+
+    @classmethod
+    def _tokenize(cls, text: str) -> list[str]:
+        tokens: list[str] = []
+        current: list[str] = []
+        for character in text.lower():
+            if character.isalnum() or character == "_":
+                current.append(character)
+                continue
+            if current:
+                tokens.append("".join(current))
+                current = []
+        if current:
+            tokens.append("".join(current))
+        return tokens
+
+    @classmethod
+    def _repeated_pool_tokens(cls, candidates: list[ScoredCandidate]) -> set[str]:
+        token_counts: dict[str, int] = {}
+        for candidate in candidates:
+            for token in cls._content_tokens(str(candidate.memory_object.get("canonical_text", ""))):
+                token_counts[token] = token_counts.get(token, 0) + 1
+        return {
+            token
+            for token, count in token_counts.items()
+            if count >= 2
+        }
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
@@ -533,6 +417,33 @@ class ContextComposer:
         if isinstance(candidate, ScoredCandidate):
             return candidate
         return ScoredCandidate.model_validate(candidate)
+
+    @staticmethod
+    def _exact_recall_level_priority(
+        candidate: ScoredCandidate,
+        exact_recall_mode: bool,
+    ) -> int:
+        """Return the exact-recall hierarchy bucket for a candidate.
+
+        Lower is better. Concrete L0 evidence (including raw message
+        windows) sits in bucket 0, while episode/thematic summaries
+        drop to bucket 1. Outside exact-recall mode all candidates are
+        treated equally so ordering stays score-driven.
+        """
+        if not exact_recall_mode:
+            return 0
+        memory_object = candidate.memory_object
+        object_type = str(memory_object.get("object_type"))
+        if object_type != "summary_view":
+            return 0
+        payload_json = memory_object.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            return 1
+        try:
+            hierarchy_level = int(payload_json.get("hierarchy_level", 0))
+        except (TypeError, ValueError):
+            return 1
+        return 0 if hierarchy_level == 0 else 1
 
     def _format_contract_block(
         self,
@@ -617,6 +528,8 @@ class ContextComposer:
         valid_to = memory_object.get("valid_to")
         if valid_from or valid_to:
             metadata_parts.append(f"valid: {valid_from or '?'} to {valid_to or '?'}")
+        if candidate.resolved_date:
+            metadata_parts.append(f"resolved_date: {candidate.resolved_date}")
         lines = [
             f"{index}. ({', '.join(metadata_parts)})\n"
             f"   {memory_object.get('canonical_text', '')}"

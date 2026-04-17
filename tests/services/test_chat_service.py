@@ -46,7 +46,36 @@ class ChatServiceProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps([]),
+                output_text=json.dumps(
+                    {
+                        "needs": [],
+                        "temporal_range": None,
+                        "sub_queries": ["retry loop"],
+                        "sparse_query_hints": [
+                            {
+                                "sub_query_text": "retry loop",
+                                "fts_phrase": "retry loop",
+                            }
+                        ],
+                        "query_type": "default",
+                        "retrieval_levels": [0],
+                    }
+                ),
+            )
+        if purpose == "context_cache_signal_detection":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "contradiction_detected": False,
+                        "high_stakes_topic": False,
+                        "sensitive_content": False,
+                        "mode_shift_target": None,
+                        "short_followup": True,
+                        "ambiguous_wording": False,
+                    }
+                ),
             )
         if purpose == "applicability_scoring":
             memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
@@ -59,6 +88,19 @@ class ChatServiceProvider(LLMProvider):
                         for memory_id in memory_ids
                     ]
                 ),
+            )
+        if purpose == "consent_confirmation_intent":
+            prompt = request.messages[1].content.lower()
+            if "<user_reply>\nno" in prompt:
+                intent = "deny"
+            elif "<user_reply>\nyes" in prompt:
+                intent = "confirm"
+            else:
+                intent = "ambiguous"
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps({"intent": intent}),
             )
         if purpose == "chat_reply":
             return LLMCompletionResponse(
@@ -107,6 +149,7 @@ def _settings(tmp_path: Path) -> Settings:
         workers_enabled=False,
         debug=False,
         allow_insecure_http=True,
+        small_corpus_token_threshold_ratio=0.0,
     )
 
 
@@ -368,6 +411,82 @@ async def test_chat_reply_rolls_back_messages_when_llm_reply_fails(
         try:
             messages = MessageRepository(connection, runtime.clock)
             assert await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0) == []
+        finally:
+            await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_degrades_when_need_detection_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Wave 1-B: need detector is a counselor. A failure of the need
+    # detection LLM must not break retrieval — the base search still runs
+    # and the chat reply is produced in degraded mode.
+    provider = FailingChatServiceProvider("need_detection")
+    monkeypatch.setattr(
+        "atagia.app.build_llm_client",
+        lambda _settings: LLMClient(provider_name=provider.name, providers=[provider]),
+    )
+    runtime = await initialize_runtime(_settings(tmp_path))
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+
+        reply = await ChatService(runtime).chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="Please help me debug this retry loop.",
+            assistant_mode_id="coding_debug",
+        )
+        assert reply is not None
+
+        connection = await runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, runtime.clock)
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
+            assert len(stored_messages) >= 1
+            assert stored_messages[0]["text"] == "Please help me debug this retry loop."
+        finally:
+            await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_raises_llm_unavailable_when_cache_signal_detection_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ChatService(runtime)
+        await service.chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="Please help me debug this retry loop.",
+            assistant_mode_id="coding_debug",
+        )
+        provider = FailingChatServiceProvider("context_cache_signal_detection")
+        runtime.llm_client = LLMClient(provider_name=provider.name, providers=[provider])
+        service = ChatService(runtime)
+        with pytest.raises(LLMUnavailableError):
+            await service.chat_reply(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="continue",
+                assistant_mode_id="coding_debug",
+            )
+
+        connection = await runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, runtime.clock)
+            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            assert len(stored_messages) == 2
         finally:
             await connection.close()
     finally:

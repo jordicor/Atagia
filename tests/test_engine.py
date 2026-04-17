@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import re
 from pathlib import Path
@@ -9,8 +10,16 @@ from pathlib import Path
 import pytest
 
 from atagia import Atagia
+from atagia.core.clock import FrozenClock
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
-from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository, WorkspaceRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+    WorkspaceRepository,
+)
+from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.llm_client import (
     LLMClient,
@@ -38,7 +47,21 @@ class EngineProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps([]),
+                output_text=json.dumps(
+                    {
+                        "needs": [],
+                        "temporal_range": None,
+                        "sub_queries": ["retry loop"],
+                        "sparse_query_hints": [
+                            {
+                                "sub_query_text": "retry loop",
+                                "fts_phrase": "retry loop",
+                            }
+                        ],
+                        "query_type": "default",
+                        "retrieval_levels": [0],
+                    }
+                ),
             )
         if purpose == "applicability_scoring":
             memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
@@ -51,6 +74,27 @@ class EngineProvider(LLMProvider):
                         for memory_id in memory_ids
                     ]
                 ),
+            )
+        if purpose == "context_cache_signal_detection":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "contradiction_detected": False,
+                        "high_stakes_topic": False,
+                        "sensitive_content": False,
+                        "mode_shift_target": None,
+                        "short_followup": True,
+                        "ambiguous_wording": False,
+                    }
+                ),
+            )
+        if purpose == "consent_confirmation_intent":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps({"intent": "confirm"}),
             )
         if purpose == "chat_reply":
             return LLMCompletionResponse(
@@ -120,6 +164,10 @@ def _install_stub_client(monkeypatch: pytest.MonkeyPatch, provider: EngineProvid
         "atagia.app.build_llm_client",
         lambda _settings: LLMClient(provider_name=provider.name, providers=[provider]),
     )
+    # The engine tests assert the full retrieval pipeline runs (including
+    # need detection), so disable the small-corpus shortcut for the duration
+    # of the test. Individual tests can still override via setenv.
+    monkeypatch.setenv("ATAGIA_SMALL_CORPUS_TOKEN_THRESHOLD_RATIO", "0")
 
 
 @pytest.mark.asyncio
@@ -327,6 +375,7 @@ async def test_engine_chat(monkeypatch: pytest.MonkeyPatch) -> None:
 
     await engine.setup()
     try:
+        engine.runtime.clock = FrozenClock(datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc))
         result = await engine.chat(
             user_id="usr_1",
             conversation_id="cnv_1",
@@ -342,7 +391,8 @@ async def test_engine_chat(monkeypatch: pytest.MonkeyPatch) -> None:
             messages = MessageRepository(connection, engine.runtime.clock)
             stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
             assert stored_messages[0]["occurred_at"] == "2023-05-08T13:56:00"
-            assert stored_messages[1]["occurred_at"] == stored_messages[1]["created_at"]
+            assert stored_messages[1]["occurred_at"] == "2026-03-31T04:00:00+00:00"
+            assert stored_messages[1]["created_at"] == "2026-03-31T04:00:00+00:00"
         finally:
             await connection.close()
     finally:
@@ -550,6 +600,7 @@ async def test_engine_ingest_message(
             "cnv_1",
             assistant_mode_id="coding_debug",
         )
+        engine.runtime.clock = FrozenClock(datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc))
         await engine.ingest_message(
             user_id="usr_1",
             conversation_id="cnv_1",
@@ -578,6 +629,7 @@ async def test_engine_ingest_message(
             assert stored_messages[-2]["text"] == "Please help me debug this retry loop."
             assert stored_messages[-2]["occurred_at"] == "2023-05-08T13:56:00"
             assert stored_messages[-1]["text"] == "Check the retry guard first."
+            assert stored_messages[-1]["occurred_at"] == "2026-03-31T04:00:00+00:00"
         finally:
             await connection.close()
 
@@ -594,7 +646,61 @@ async def test_engine_ingest_message(
 
 
 @pytest.mark.asyncio
-async def test_engine_get_context_rolls_back_user_message_when_retrieval_fails(
+async def test_engine_get_context_rolls_back_user_message_when_scoring_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FailingEngineProvider("applicability_scoring")
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+        )
+        # Seed a memory so the shortlist is non-empty and scoring is invoked.
+        runtime = engine.runtime
+        assert runtime is not None
+        connection = await runtime.open_connection()
+        try:
+            memories = MemoryObjectRepository(connection, runtime.clock)
+            await memories.create_memory_object(
+                user_id="usr_1",
+                workspace_id=None,
+                conversation_id="cnv_1",
+                assistant_mode_id="coding_debug",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.CONVERSATION,
+                canonical_text="retry loop websocket backoff",
+                source_kind=MemorySourceKind.EXTRACTED,
+                confidence=0.9,
+                privacy_level=0,
+            )
+        finally:
+            await connection.close()
+
+        with pytest.raises(LLMError):
+            await engine.get_context(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message="Please help me debug this retry loop.",
+            )
+
+        connection = await engine.runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, engine.runtime.clock)
+            assert await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0) == []
+        finally:
+            await connection.close()
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_get_context_degrades_when_need_detector_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = FailingEngineProvider("need_detection")
@@ -610,17 +716,24 @@ async def test_engine_get_context_rolls_back_user_message_when_retrieval_fails(
             assistant_mode_id="coding_debug",
         )
 
-        with pytest.raises(LLMError):
-            await engine.get_context(
-                user_id="usr_1",
-                conversation_id="cnv_1",
-                message="Please help me debug this retry loop.",
-            )
+        # Need detector failure should no longer break retrieval. The pipeline
+        # falls back to the base search and the user message is persisted.
+        result = await engine.get_context(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message="Please help me debug this retry loop.",
+        )
+        assert result is not None
 
         connection = await engine.runtime.open_connection()
         try:
             messages = MessageRepository(connection, engine.runtime.clock)
-            assert await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0) == []
+            stored = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
+            assert [row["text"] for row in stored] == [
+                "Please help me debug this retry loop.",
+            ]
         finally:
             await connection.close()
     finally:

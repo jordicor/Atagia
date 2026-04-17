@@ -515,6 +515,8 @@ class IngestWorker:
                 "delivery_count": message.delivery_count,
                 "payload": message.payload,
                 "error": str(exc),
+                # Populated only for StructuredOutputError; other exceptions collapse to [].
+                "error_details": list(exc.details) if isinstance(exc, StructuredOutputError) else [],
             },
         )
         await self._storage_backend.stream_ack(

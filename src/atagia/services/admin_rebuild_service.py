@@ -146,6 +146,7 @@ class AdminRebuildService:
                 connection=self._connection,
                 llm_client=self._llm_client,
                 clock=self._clock,
+                embedding_index=self._embedding_index,
                 settings=self._settings,
             )
             compaction_worker = CompactionWorker(

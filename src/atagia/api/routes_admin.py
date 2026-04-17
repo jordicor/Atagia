@@ -36,6 +36,7 @@ from atagia.memory.lifecycle_runner import LifecycleLockError, run_lifecycle_dir
 from atagia.memory.metrics_computer import MetricsComputer, normalize_time_bucket
 from atagia.memory.policy_manifest import ManifestLoader
 from atagia.models.schemas_api import AdminMetricsComputeRequest
+from atagia.models.schemas_api import AdminEmbeddingBackfillRequest
 from atagia.models.schemas_evaluation import MetricName, RetrievalSummaryStats
 from atagia.models.schemas_jobs import EVALUATION_STREAM_NAME, EvaluationJobPayload, JobEnvelope, JobType
 from atagia.models.schemas_replay import (
@@ -49,8 +50,14 @@ from atagia.models.schemas_replay import (
 )
 from atagia.services.llm_client import LLMClient
 from atagia.services.embeddings import EmbeddingIndex
+from atagia.services.embedding_backfill_service import EmbeddingBackfillResult, EmbeddingBackfillService
 from atagia.services.admin_rebuild_service import AdminRebuildService, RebuildResult
-from atagia.services.dataset_exporter import DatasetExporter
+from atagia.services.dataset_exporter import (
+    AnonymizedExportDisabledError,
+    ConversationExportNotFoundError,
+    DatasetExporter,
+    UnsafeConversationExportRequestError,
+)
 from atagia.services.replay_service import ReplayService
 from atagia.services.retrieval_pipeline import RetrievalPipeline
 from atagia.core.storage_backend import StorageBackend
@@ -75,6 +82,40 @@ async def _audit_admin_action(
         target_id=target_id,
         metadata=metadata or {},
     )
+
+
+@router.post("/embeddings/backfill")
+async def backfill_embeddings(
+    payload: AdminEmbeddingBackfillRequest,
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+    embedding_index: EmbeddingIndex = Depends(get_embedding_index),
+) -> EmbeddingBackfillResult:
+    try:
+        result = await EmbeddingBackfillService(
+            connection=connection,
+            embedding_index=embedding_index,
+        ).run(
+            batch_size=payload.batch_size,
+            delay_ms=payload.delay_ms,
+            user_id=payload.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    await _audit_admin_action(
+        connection,
+        clock,
+        auth_context,
+        action="backfill_embeddings",
+        target_type="embeddings",
+        target_id=payload.user_id or "all_users",
+        metadata=result.model_dump(mode="json"),
+    )
+    return result
 
 
 @router.post("/rebuild/conversation/{conversation_id}")
@@ -650,20 +691,35 @@ async def export_conversation(
     auth_context: AuthContext = Depends(get_admin_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
+    llm_client: LLMClient[object] = Depends(get_llm_client),
+    settings: Settings = Depends(get_settings),
 ) -> ConversationExport:
     try:
-        result = await DatasetExporter(connection, clock).export_conversation(
+        result = await DatasetExporter(
+            connection,
+            clock,
+            llm_client=llm_client,
+            settings=settings,
+        ).export_conversation(
             conversation_id,
             payload.user_id,
             include_retrieval_traces=payload.include_retrieval_traces,
+            anonymization_mode=payload.anonymization_mode,
         )
         await AdminAuditRepository(connection, clock).create_audit_entry(
             admin_user_id=auth_context.actor_id,
             action="export_conversation",
             target_type="conversation",
             target_id=conversation_id,
-            metadata={"user_id": payload.user_id},
+            metadata={
+                "user_id": payload.user_id,
+                "anonymization_mode": payload.anonymization_mode.value,
+            },
         )
         return result
-    except ValueError as exc:
+    except ConversationExportNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except AnonymizedExportDisabledError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except UnsafeConversationExportRequestError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc

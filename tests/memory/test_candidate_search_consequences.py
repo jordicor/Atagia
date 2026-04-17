@@ -119,16 +119,26 @@ def _plan(
     fts_queries: list[str] | None = None,
     consequence_search_enabled: bool = False,
 ) -> RetrievalPlan:
+    resolved_fts_queries = fts_queries or ["regressions"]
     return RetrievalPlan(
         assistant_mode_id="coding_debug",
         workspace_id="wrk_1",
         conversation_id="cnv_1",
-        fts_queries=fts_queries or ["regressions"],
+        fts_queries=resolved_fts_queries,
+        sub_query_plans=[
+            {
+                "text": resolved_fts_queries[0],
+                "fts_queries": resolved_fts_queries,
+            }
+        ],
+        query_type="default",
         scope_filter=[MemoryScope.WORKSPACE, MemoryScope.CONVERSATION],
         status_filter=[MemoryStatus.ACTIVE],
+        vector_limit=0,
         max_candidates=10,
         max_context_items=8,
         privacy_ceiling=1,
+        retrieval_levels=[0],
         consequence_search_enabled=consequence_search_enabled,
         require_evidence_regrounding=False,
         need_driven_boosts={} if need_type is None else {need_type: 1.0},
@@ -238,15 +248,13 @@ async def test_consequence_channel_uses_best_rank_once_across_match_columns() ->
         outcome = next(candidate for candidate in candidates if candidate["id"] == outcome_id)
         assert outcome["retrieval_sources"] == ["fts", "consequence"]
         assert outcome["channel_ranks"]["consequence"] == 1
+        assert outcome["matched_sub_queries"] == ["refactor"]
+        assert outcome["subquery_ranks"] == {"refactor": int(outcome["position_rank"])}
         assert outcome["rrf_score_raw"] == pytest.approx(
-            sum(
-                1.0 / (60 + rank)
-                for rank in outcome["channel_ranks"].values()
-                if rank is not None
-            )
+            1.0 / (60 + int(outcome["position_rank"]))
         )
         assert outcome["rrf_score"] == pytest.approx(
-            outcome["rrf_score_raw"] / (3.0 / 61.0)
+            outcome["rrf_score_raw"] / (1.0 / 61.0)
         )
     finally:
         await connection.close()

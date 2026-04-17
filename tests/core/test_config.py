@@ -80,3 +80,11 @@ def test_chunking_threshold_must_be_positive(monkeypatch) -> None:
 
     with pytest.raises(ValueError):
         Settings.from_env()
+
+
+def test_ephemeral_scoring_hours_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_EPHEMERAL_SCORING_HOURS", "12")
+
+    settings = Settings.from_env()
+
+    assert settings.ephemeral_scoring_hours == 12

@@ -199,7 +199,7 @@ async def test_get_messages_from_seq_returns_tail_in_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_message_persists_occurred_at_and_defaults_to_created_at() -> None:
+async def test_create_message_persists_optional_occurred_at_without_created_at_fallback() -> None:
     connection, clock = await _connection_and_clock()
     try:
         users = UserRepository(connection, clock)
@@ -233,7 +233,93 @@ async def test_create_message_persists_occurred_at_and_defaults_to_created_at() 
 
         assert explicit["occurred_at"] == "2023-05-08T13:56:00"
         assert explicit["created_at"] == "2026-03-30T12:00:00+00:00"
-        assert defaulted["occurred_at"] == defaulted["created_at"] == "2026-03-30T12:00:00+00:00"
+        assert defaulted["occurred_at"] is None
+        assert defaulted["created_at"] == "2026-03-30T12:00:00+00:00"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_create_message_derives_context_policy_columns_from_metadata_and_size() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+
+        normal = await messages.create_message(
+            "msg_normal",
+            "cnv_a",
+            "user",
+            1,
+            "Short text",
+            3,
+            {},
+        )
+        explicit = await messages.create_message(
+            "msg_explicit",
+            "cnv_a",
+            "assistant",
+            2,
+            "Attached PDF payload",
+            6,
+            {
+                "content_kind": "pdf",
+                "include_raw": False,
+            },
+        )
+        mechanical = await messages.create_message(
+            "msg_mechanical",
+            "cnv_a",
+            "user",
+            3,
+            "x" * 5000,
+            700,
+            {},
+        )
+        auto_mechanical = await messages.create_message(
+            "msg_auto_mechanical",
+            "cnv_a",
+            "assistant",
+            None,
+            "y" * 5000,
+            700,
+            {},
+        )
+
+        assert normal["content_kind"] == "text"
+        assert normal["include_raw"] == 1
+        assert normal["skip_by_default"] == 0
+        assert normal["heavy_content"] == 0
+        assert normal["context_placeholder"] is None
+        assert normal["policy_reason"] is None
+
+        assert explicit["content_kind"] == "pdf"
+        assert explicit["include_raw"] == 0
+        assert explicit["skip_by_default"] == 1
+        assert explicit["heavy_content"] == 0
+        assert explicit["requires_explicit_request"] == 1
+        assert explicit["policy_reason"] == "skip_by_default"
+        assert explicit["context_placeholder"] is not None
+        assert "msg_explicit" in explicit["context_placeholder"]
+
+        assert mechanical["content_kind"] == "attachment"
+        assert mechanical["include_raw"] == 0
+        assert mechanical["skip_by_default"] == 1
+        assert mechanical["heavy_content"] == 1
+        assert mechanical["requires_explicit_request"] == 1
+        assert mechanical["policy_reason"] == "mechanical_size_threshold"
+        assert mechanical["context_placeholder"] is not None
+        assert "msg_mechanical" in mechanical["context_placeholder"]
+
+        assert auto_mechanical["seq"] == 4
+        assert auto_mechanical["context_placeholder"] is not None
+        assert "seq=4" in auto_mechanical["context_placeholder"]
+        assert "msg_auto_mechanical" in auto_mechanical["context_placeholder"]
     finally:
         await connection.close()
 
@@ -564,6 +650,58 @@ async def test_memory_repository_helpers_default_to_retrieval_eligible_statuses(
         assert all_has_msg_2 is True
         assert default_msg_2_rows == []
         assert {row["id"] for row in all_msg_2_rows} == {"mem_pending", "mem_declined"}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_get_state_snapshot_excludes_expired_ephemeral_rows() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+
+        await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.STATE_SNAPSHOT,
+            scope=MemoryScope.ASSISTANT_MODE,
+            canonical_text="User is working from home.",
+            payload={"status": "working"},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            memory_id="mem_state_assistant",
+        )
+        await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_a",
+            object_type=MemoryObjectType.STATE_SNAPSHOT,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="User is at the airport.",
+            payload={"status": "airport"},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            temporal_type="ephemeral",
+            valid_from="2026-03-28T09:00:00+00:00",
+            memory_id="mem_state_expired_ephemeral",
+        )
+
+        snapshot = await memories.get_state_snapshot(
+            "usr_a",
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_a",
+        )
+
+        assert snapshot == {"status": "working"}
     finally:
         await connection.close()
 

@@ -32,7 +32,19 @@ class CannedProvider(LLMProvider):
     name = "canned-belief-versioning"
 
     def __init__(self, payload: dict[str, object]) -> None:
-        self.payload = payload
+        normalized_payload = dict(payload)
+        normalized_payload["beliefs"] = [
+            (
+                {
+                    **item,
+                    "language_codes": ["en"],
+                }
+                if isinstance(item, dict) and "canonical_text" in item and "language_codes" not in item
+                else item
+            )
+            for item in normalized_payload.get("beliefs", [])
+        ]
+        self.payload = normalized_payload
         self.requests: list[LLMCompletionRequest] = []
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:

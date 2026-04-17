@@ -37,7 +37,24 @@ class BenchmarkProvider(LLMProvider):
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
         if purpose == "need_detection":
-            return self._response(request, json.dumps([]))
+            return self._response(
+                request,
+                json.dumps(
+                    {
+                        "needs": [],
+                        "temporal_range": None,
+                        "sub_queries": ["locomo benchmark"],
+                        "sparse_query_hints": [
+                            {
+                                "sub_query_text": "locomo benchmark",
+                                "fts_phrase": "locomo benchmark",
+                            }
+                        ],
+                        "query_type": "default",
+                        "retrieval_levels": [0],
+                    }
+                ),
+            )
         if purpose == "applicability_scoring":
             memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
             payload = [
@@ -66,6 +83,7 @@ class BenchmarkProvider(LLMProvider):
                             "confidence": 0.95,
                             "source_kind": "extracted",
                             "privacy_level": 0,
+                            "language_codes": ["en"],
                             "payload": {"kind": "fact"},
                         }
                     ],
@@ -155,6 +173,9 @@ def _install_stub_client(monkeypatch: pytest.MonkeyPatch, provider: BenchmarkPro
         "atagia.app.build_llm_client",
         lambda _settings: LLMClient(provider_name=provider.name, providers=[provider]),
     )
+    # LoCoMo asserts that need_detection runs for every question. Keep the
+    # full retrieval pipeline active by disabling the small-corpus shortcut.
+    monkeypatch.setenv("ATAGIA_SMALL_CORPUS_TOKEN_THRESHOLD_RATIO", "0")
 
 
 def _write_dataset(tmp_path: Path) -> Path:
@@ -416,6 +437,47 @@ async def test_benchmark_max_turns_limits_ingestion(
         ("user", "Alice: Alice keeps red notebooks in the studio.", "2023-05-08T13:56:00"),
         ("assistant", "Bob: I will remember your notebooks.", "2023-05-08T13:56:00"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_benchmark_corrections_overlay_substitutes_ground_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Corrections overlay replaces ground truths before scoring."""
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+
+    # The stub answers "yellow" for the lamp question, but ground truth is "green".
+    # Correction changes ground truth to "yellow" so it should now score as correct.
+    corrections_path = tmp_path / "corrections.json"
+    corrections_path.write_text(
+        json.dumps({
+            "conv-test-1:q3": {
+                "original_ground_truth": "green",
+                "corrected_ground_truth": "yellow",
+                "reason": "Test correction",
+            }
+        }),
+        encoding="utf-8",
+    )
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+        corrections_path=corrections_path,
+    )
+
+    report = await benchmark.run()
+
+    # Without corrections: q1=correct, q2=correct, q3=wrong (green vs yellow) → 2/3
+    # With correction on q3: ground truth becomes "yellow" → q3 now correct → 3/3
+    assert report.total_correct == 3
+    assert report.total_questions == 3
+    assert report.overall_accuracy == pytest.approx(1.0)
 
 
 def test_format_report_summary_includes_key_sections(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import re
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 mcp_available = pytest.importorskip("mcp", reason="mcp package not installed")
 
 from atagia import Atagia
+from atagia.core.clock import FrozenClock
 from atagia.core.repositories import MemoryObjectRepository, MessageRepository
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
 from atagia.mcp_server import (
@@ -20,6 +22,7 @@ from atagia.mcp_server import (
     _list_memories_impl,
     _search_memories_impl,
 )
+from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.llm_client import (
     LLMClient,
@@ -46,7 +49,21 @@ class MCPProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps([]),
+                output_text=json.dumps(
+                    {
+                        "needs": [],
+                        "temporal_range": None,
+                        "sub_queries": ["retry loop"],
+                        "sparse_query_hints": [
+                            {
+                                "sub_query_text": "retry loop",
+                                "fts_phrase": "retry loop",
+                            }
+                        ],
+                        "query_type": "default",
+                        "retrieval_levels": [0],
+                    }
+                ),
             )
         if purpose == "applicability_scoring":
             memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
@@ -106,11 +123,33 @@ class MCPProvider(LLMProvider):
         raise AssertionError(f"Embeddings are not used in MCP tests: {request.model}")
 
 
+class TrackingEmbeddingIndex(EmbeddingIndex):
+    def __init__(self) -> None:
+        self.deleted_memory_ids: list[str] = []
+
+    @property
+    def vector_limit(self) -> int:
+        return 1
+
+    async def upsert(self, memory_id: str, text: str, metadata: dict[str, object]) -> None:
+        return None
+
+    async def search(self, query: str, user_id: str, top_k: int):
+        return []
+
+    async def delete(self, memory_id: str) -> None:
+        self.deleted_memory_ids.append(memory_id)
+
+
 def _install_stub_client(monkeypatch: pytest.MonkeyPatch, provider: MCPProvider) -> None:
     monkeypatch.setattr(
         "atagia.app.build_llm_client",
         lambda _settings: LLMClient(provider_name=provider.name, providers=[provider]),
     )
+    # The MCP tests assert the full retrieval pipeline runs (including need
+    # detection), so disable the small-corpus shortcut for the duration of
+    # the test.
+    monkeypatch.setenv("ATAGIA_SMALL_CORPUS_TOKEN_THRESHOLD_RATIO", "0")
 
 
 async def _seed_memory(
@@ -261,6 +300,7 @@ async def test_mcp_add_memory(
 
     await engine.setup()
     try:
+        engine.runtime.clock = FrozenClock(datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc))
         await engine.create_user("usr_1")
         await engine.create_conversation("usr_1", "cnv_1", assistant_mode_id="coding_debug")
         cache_key = ContextCacheService.build_cache_key(
@@ -297,6 +337,7 @@ async def test_mcp_add_memory(
             stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
             assert stored_messages[-1]["role"] == "user"
             assert stored_messages[-1]["text"] == "Please remember that the retry loop needs a backoff."
+            assert stored_messages[-1]["occurred_at"] == "2026-03-31T04:00:00+00:00"
         finally:
             await connection.close()
         assert await engine.runtime.storage_backend.get_context_view(cache_key) is None
@@ -323,6 +364,10 @@ async def test_mcp_delete_memory(
 
     await engine.setup()
     try:
+        tracking_embeddings = TrackingEmbeddingIndex()
+        if engine.runtime is None:
+            raise AssertionError("Engine runtime should be initialized")
+        engine.runtime.embedding_index = tracking_embeddings
         await engine.create_user("usr_1")
         await engine.create_conversation("usr_1", "cnv_1", assistant_mode_id="coding_debug")
         await _seed_memory(
@@ -360,6 +405,7 @@ async def test_mcp_delete_memory(
             assert memory["status"] == "archived"
         finally:
             await connection.close()
+        assert tracking_embeddings.deleted_memory_ids == ["mem_1"]
         assert await engine.runtime.storage_backend.get_context_view("ctx:1") is None
         assert await engine.runtime.storage_backend.get_context_view("ctx:2") is None
         assert await engine.runtime.storage_backend.get_context_view("ctx:3") == {

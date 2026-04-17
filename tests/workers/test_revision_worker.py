@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -29,6 +30,7 @@ from atagia.models.schemas_jobs import (
     WORKER_GROUP_NAME,
 )
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
+from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -83,6 +85,25 @@ class QueueProvider(LLMProvider):
         raise AssertionError("Embeddings are not used in revision worker tests")
 
 
+class RecordingEmbeddingIndex(EmbeddingIndex):
+    def __init__(self) -> None:
+        self.upsert_calls: list[tuple[str, str, dict[str, object]]] = []
+        self.delete_calls: list[str] = []
+
+    @property
+    def vector_limit(self) -> int:
+        return 1
+
+    async def upsert(self, memory_id: str, text: str, metadata: dict[str, object]) -> None:
+        self.upsert_calls.append((memory_id, text, metadata))
+
+    async def search(self, query: str, user_id: str, top_k: int):
+        return []
+
+    async def delete(self, memory_id: str) -> None:
+        self.delete_calls.append(memory_id)
+
+
 def _settings() -> Settings:
     return Settings(
         sqlite_path=":memory:",
@@ -110,7 +131,7 @@ def _settings() -> Settings:
     )
 
 
-async def _build_runtime(outputs: list[str]):
+async def _build_runtime(outputs: list[str], embedding_index: EmbeddingIndex | None = None):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 1, 18, 0, tzinfo=timezone.utc))
     await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
@@ -158,6 +179,7 @@ async def _build_runtime(outputs: list[str]):
         connection=connection,
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         clock=clock,
+        embedding_index=embedding_index,
         settings=_settings(),
     )
     return connection, backend, memories, beliefs, worker
@@ -271,6 +293,7 @@ async def test_revision_worker_processes_revision_job_end_to_end_and_releases_lo
         [json.dumps({"action": "REINFORCE", "explanation": "This evidence reinforces the belief."})]
     )
     try:
+        worker._settings = replace(worker._settings, belief_tension_threshold=0.1)
         belief = await _seed_belief(memories, beliefs)
         evidence = await _seed_evidence(
             memories,
@@ -300,6 +323,50 @@ async def test_revision_worker_processes_revision_job_end_to_end_and_releases_lo
         assert result.failed == 0
         assert version["support_count"] == 2
         assert backend._locks == {}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_wires_embedding_index_into_successor_revisions() -> None:
+    embedding_index = RecordingEmbeddingIndex()
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [
+            json.dumps(
+                {
+                    "action": "SUPERSEDE",
+                    "explanation": "The belief should be replaced.",
+                    "successor_canonical_text": "Superseded worker successor.",
+                }
+            )
+        ],
+        embedding_index=embedding_index,
+    )
+    try:
+        worker._settings = replace(worker._settings, belief_tension_threshold=0.1)
+        belief = await _seed_belief(memories, beliefs)
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_embed",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+
+        result = await worker.process_job(
+            _revision_job(
+                belief_id=str(belief["id"]),
+                evidence_memory_ids=[str(evidence["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+                claim_value="concise",
+            ).model_dump(mode="json")
+        )
+
+        assert result is not None
+        assert result["action"] == "SUPERSEDE"
+        assert len(embedding_index.upsert_calls) == 1
+        assert embedding_index.upsert_calls[0][0] == result["new_belief_ids"][0]
     finally:
         await connection.close()
 

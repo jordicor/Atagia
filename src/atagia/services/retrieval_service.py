@@ -8,7 +8,7 @@ from typing import Any
 import aiosqlite
 
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
-from atagia.models.schemas_memory import ExtractionConversationContext
+from atagia.models.schemas_memory import ExtractionConversationContext, RetrievalTrace
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
@@ -33,6 +33,7 @@ class RetrievalService:
         message_text: str,
         mode: str | None = None,
         ablation: AblationConfig | None = None,
+        trace: RetrievalTrace | None = None,
     ) -> PipelineResult:
         """Execute the retrieval pipeline for the active conversation state."""
         connection = await self.runtime.open_connection()
@@ -44,6 +45,7 @@ class RetrievalService:
                 message_text=message_text,
                 mode=mode,
                 ablation=ablation,
+                trace=trace,
             )
         finally:
             await connection.close()
@@ -59,6 +61,7 @@ class RetrievalService:
         ablation: AblationConfig | None = None,
         conversation: dict[str, Any] | None = None,
         stored_messages: list[dict[str, Any]] | None = None,
+        trace: RetrievalTrace | None = None,
     ) -> PipelineResult:
         return await self.retrieve_with_connection(
             connection,
@@ -69,6 +72,7 @@ class RetrievalService:
             ablation=ablation,
             conversation=conversation,
             stored_messages=stored_messages,
+            trace=trace,
         )
 
     async def retrieve_with_connection(
@@ -82,6 +86,7 @@ class RetrievalService:
         ablation: AblationConfig | None = None,
         conversation: dict[str, Any] | None = None,
         stored_messages: list[dict[str, Any]] | None = None,
+        trace: RetrievalTrace | None = None,
     ) -> PipelineResult:
         conversations = ConversationRepository(connection, self.runtime.clock)
         messages = MessageRepository(connection, self.runtime.clock)
@@ -141,6 +146,7 @@ class RetrievalService:
             cold_start=cold_start,
             ablation=ablation,
             conversation_messages=transcript,
+            trace=trace,
         )
 
     @staticmethod

@@ -41,10 +41,29 @@ class QueueProvider(LLMProvider):
         self.requests.append(request)
         if not self.outputs:
             raise AssertionError("No queued LLM output left for this test")
+        output_text = self.outputs.pop(0)
+        if request.metadata.get("purpose") == "need_detection":
+            payload = json.loads(output_text)
+            if isinstance(payload, list):
+                output_text = json.dumps(
+                    {
+                        "needs": payload,
+                        "temporal_range": None,
+                        "sub_queries": ["retry loop"],
+                        "sparse_query_hints": [
+                            {
+                                "sub_query_text": "retry loop",
+                                "fts_phrase": "retry loop",
+                            }
+                        ],
+                        "query_type": "default",
+                        "retrieval_levels": [0],
+                    }
+                )
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
-            output_text=self.outputs.pop(0),
+            output_text=output_text,
         )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -82,6 +101,7 @@ def _settings(
         workers_enabled=False,
         debug=False,
         allow_insecure_http=allow_insecure_http,
+        small_corpus_token_threshold_ratio=0.0,
     )
 
 
@@ -114,6 +134,152 @@ def test_create_conversation_creates_and_returns_row(tmp_path: Path) -> None:
         assert payload["assistant_mode_id"] == "coding_debug"
         assert payload["title"] == "Debug Chat"
         assert payload["metadata_json"] == {"source": "api"}
+
+
+def test_create_conversation_reuses_existing_when_scope_matches(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        first = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_fixed",
+                "assistant_mode_id": "coding_debug",
+                "workspace_id": None,
+                "title": "Debug Chat",
+                "metadata": {"source": "api"},
+            },
+        )
+        second = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_fixed",
+                "assistant_mode_id": "coding_debug",
+                "workspace_id": None,
+                "title": "Ignored Recreate Title",
+                "metadata": {"source": "second-call"},
+            },
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["id"] == "cnv_fixed"
+        assert second.json()["title"] == "Debug Chat"
+        assert second.json()["metadata_json"] == {"source": "api"}
+
+
+def test_create_conversation_rejects_existing_mode_mismatch(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_fixed",
+                "assistant_mode_id": "coding_debug",
+                "workspace_id": None,
+                "title": "Debug Chat",
+                "metadata": {},
+            },
+        )
+        response = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_fixed",
+                "assistant_mode_id": "personal_assistant",
+                "workspace_id": None,
+                "title": "Different Mode",
+                "metadata": {},
+            },
+        )
+
+        assert created.status_code == 200
+        assert response.status_code == 409
+        assert "assistant mode" in response.json()["detail"]
+
+
+def test_create_conversation_rejects_existing_workspace_mismatch(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        workspace_a = client.post(
+            "/v1/workspaces",
+            json={
+                "user_id": "usr_1",
+                "workspace_id": "wrk_a",
+                "name": "Workspace A",
+                "metadata": {},
+            },
+        )
+        workspace_b = client.post(
+            "/v1/workspaces",
+            json={
+                "user_id": "usr_1",
+                "workspace_id": "wrk_b",
+                "name": "Workspace B",
+                "metadata": {},
+            },
+        )
+        created = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_fixed",
+                "assistant_mode_id": "coding_debug",
+                "workspace_id": "wrk_a",
+                "title": "Debug Chat",
+                "metadata": {},
+            },
+        )
+        response = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_fixed",
+                "assistant_mode_id": "coding_debug",
+                "workspace_id": "wrk_b",
+                "title": "Different Workspace",
+                "metadata": {},
+            },
+        )
+
+        assert workspace_a.status_code == 200
+        assert workspace_b.status_code == 200
+        assert created.status_code == 200
+        assert response.status_code == 409
+        assert "workspace" in response.json()["detail"]
+
+
+def test_create_conversation_handles_cross_user_id_collision(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_shared",
+                "assistant_mode_id": "coding_debug",
+                "workspace_id": None,
+                "title": "Debug Chat",
+                "metadata": {},
+            },
+        )
+        response = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_2",
+                "conversation_id": "cnv_shared",
+                "assistant_mode_id": "coding_debug",
+                "workspace_id": None,
+                "title": "Other User Chat",
+                "metadata": {},
+            },
+        )
+
+        assert created.status_code == 200
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Conversation not found for user"
 
 
 def test_create_app_rejects_insecure_http_by_default(tmp_path: Path) -> None:
@@ -167,6 +333,118 @@ def test_chat_reply_runs_full_flow_and_returns_response(tmp_path: Path) -> None:
         assert payload["debug"]["cold_start"] is True
         assert len(provider.requests) == 2
         assert provider.requests[1].model == "reply-test-model"
+
+
+def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base64_leak(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path))
+    provider = QueueProvider(
+        [
+            json.dumps([]),
+            "Attachment-aware reply.",
+        ]
+    )
+    with TestClient(app) as client:
+        client.app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        conversation = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_1",
+                "assistant_mode_id": "coding_debug",
+                "workspace_id": None,
+                "title": "Debug Chat",
+                "metadata": {},
+            },
+        ).json()
+
+        response = client.post(
+            f"/v1/chat/{conversation['id']}/reply",
+            json={
+                "user_id": "usr_1",
+                "message_text": "Please review the attachment.",
+                "attachments": [
+                    {
+                        "kind": "base64",
+                        "content_base64": "SGVsbG8sIHdvcmxkIQ==",
+                        "mime_type": "text/plain",
+                        "filename": "notes.txt",
+                        "title": "Notes",
+                        "source_ref": "upload-1",
+                        "privacy_level": 1,
+                        "preserve_verbatim": True,
+                        "skip_raw_by_default": True,
+                        "requires_explicit_request": True,
+                        "metadata": {"source": "api"},
+                    }
+                ],
+                "include_thinking": False,
+                "metadata": {"channel": "api"},
+                "debug": True,
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["reply_text"] == "Attachment-aware reply."
+        assert len(provider.requests) == 2
+        prompt_text = provider.requests[1].messages[1].content
+        assert "[Attachments omitted]" in prompt_text
+        assert "artifact_id=" in prompt_text
+        assert "SGVsbG8sIHdvcmxkIQ==" not in prompt_text
+
+        with _connection(client) as connection:
+            cursor = client.portal.call(
+                lambda: connection.execute(
+                    "SELECT id, artifact_type, source_kind, status, message_id, preserve_verbatim, skip_raw_by_default, requires_explicit_request FROM artifacts WHERE user_id = ?",
+                    ("usr_1",),
+                )
+            )
+            artifact_rows = client.portal.call(cursor.fetchall)
+            assert len(artifact_rows) == 1
+            artifact_row = artifact_rows[0]
+            assert artifact_row["artifact_type"] == "base64"
+            assert artifact_row["source_kind"] == "base64"
+            assert artifact_row["status"] == "ready"
+            assert artifact_row["message_id"] is not None
+            assert artifact_row["preserve_verbatim"] == 1
+            assert artifact_row["skip_raw_by_default"] == 1
+            assert artifact_row["requires_explicit_request"] == 1
+
+            link_cursor = client.portal.call(
+                lambda: connection.execute(
+                    "SELECT COUNT(*) FROM artifact_links WHERE artifact_id = ? AND message_id = ?",
+                    (artifact_row["id"], payload["request_message_id"]),
+                )
+            )
+            link_count = client.portal.call(link_cursor.fetchone)[0]
+            assert link_count == 1
+
+            chunk_cursor = client.portal.call(
+                lambda: connection.execute(
+                    "SELECT text FROM artifact_chunks WHERE artifact_id = ? ORDER BY chunk_index ASC",
+                    (artifact_row["id"],),
+                )
+            )
+            chunk_rows = client.portal.call(chunk_cursor.fetchall)
+            assert chunk_rows
+            assert all("SGVsbG8sIHdvcmxkIQ==" not in row["text"] for row in chunk_rows)
+
+            message_cursor = client.portal.call(
+                lambda: connection.execute(
+                    "SELECT text, metadata_json FROM messages WHERE id = ?",
+                    (payload["request_message_id"],),
+                )
+            )
+            message_row = client.portal.call(message_cursor.fetchone)
+            assert "SGVsbG8sIHdvcmxkIQ==" not in message_row["text"]
+            metadata_json = json.loads(message_row["metadata_json"])
+            assert metadata_json["attachment_count"] == 1
+            assert metadata_json["attachment_artifact_ids"] == [artifact_row["id"]]
+    return None
 
 
 def test_chat_reply_includes_current_user_state_in_system_prompt(tmp_path: Path) -> None:

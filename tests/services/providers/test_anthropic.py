@@ -155,6 +155,12 @@ async def test_anthropic_sanitizes_schema_and_filters_non_numeric_usage() -> Non
                         "type": "object",
                         "additionalProperties": True,
                         "properties": {
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1,
+                                "maxItems": 3,
+                            },
                             "ratio": {
                                 "type": "number",
                                 "exclusiveMinimum": 0,
@@ -212,6 +218,8 @@ async def test_anthropic_sanitizes_schema_and_filters_non_numeric_usage() -> Non
     assert completion_schema["properties"]["nested"]["additionalProperties"] is False
     assert "minimum" not in completion_schema["properties"]["score"]
     assert "maximum" not in completion_schema["properties"]["score"]
+    assert "minItems" not in completion_schema["properties"]["nested"]["properties"]["tags"]
+    assert "maxItems" not in completion_schema["properties"]["nested"]["properties"]["tags"]
     assert "exclusiveMinimum" not in completion_schema["properties"]["nested"]["properties"]["ratio"]
     assert "exclusiveMaximum" not in completion_schema["properties"]["nested"]["properties"]["ratio"]
     assert stream_schema == completion_schema

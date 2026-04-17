@@ -112,6 +112,7 @@ def _thinking_config(request: LLMCompletionRequest, max_tokens: int) -> dict[str
 
 
 _UNSUPPORTED_NUMBER_KEYS = {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}
+_UNSUPPORTED_ARRAY_KEYS = {"minItems", "maxItems"}
 
 
 def _sanitize_schema(node: Any) -> Any:
@@ -125,7 +126,7 @@ def _sanitize_schema(node: Any) -> Any:
         if key == "additionalProperties":
             cleaned[key] = False
             continue
-        if key in _UNSUPPORTED_NUMBER_KEYS:
+        if key in _UNSUPPORTED_NUMBER_KEYS or key in _UNSUPPORTED_ARRAY_KEYS:
             continue
         cleaned[key] = _sanitize_schema(value)
     return cleaned
@@ -155,6 +156,7 @@ class AnthropicProvider(LLMProvider):
     """Anthropic-backed implementation of the LLMProvider interface."""
 
     name = "anthropic"
+    supports_embeddings = False
 
     def __init__(
         self,

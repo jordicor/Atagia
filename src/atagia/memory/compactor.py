@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import html
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,11 +28,17 @@ from atagia.models.schemas_memory import (
     SummaryViewKind,
 )
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMMessage,
+    StructuredOutputError,
+)
 
 DEFAULT_CLASSIFIER_MODEL = "claude-sonnet-4-6"
 DEFAULT_SCORING_MODEL = "claude-sonnet-4-6"
 SUMMARY_MAYA_SCORE = 1.5
+COMPACTION_VALIDATION_MAX_CORRECTIVE_RETRIES = 2
 WORKSPACE_MEMORY_LIMIT = 100
 WORKSPACE_CHUNK_LIMIT = 50
 WORKSPACE_CHAIN_LIMIT = 30
@@ -92,13 +98,18 @@ Cite source memory IDs where possible.
 _EPISODE_SYNTHESIS_PROMPT_TEMPLATE = """Return JSON only, matching the schema exactly.
 
 Group these conversation chunk summaries into cross-session episodes for a single user.
-Each input chunk must appear exactly once across the output episodes.
+Each input chunk has a position. The output must assign each input position to exactly
+one cross-session episode.
 
-For each episode, return:
-- source_summary_ids: chunk summary IDs included in the episode
-- summary_text: a concise synthesis of the shared thread, repeated pattern, or continued initiative
+Return:
+- episodes: each episode_key and a concise summary_text for the shared thread,
+  repeated pattern, or continued initiative
+- chunk_episode_keys: one episode_key per input chunk, in the exact same order
+  as the input chunks
 
-Do not invent source IDs and do not leave any chunk unassigned.
+Do not copy chunk IDs into the episode assignments. If one chunk touches multiple
+themes, choose the single most useful episode for that chunk. Every episode_key
+listed in episodes must be used by at least one chunk.
 
 {data_only_instruction}
 
@@ -130,6 +141,21 @@ Only cite IDs present in the input corpus.
 </episode_mirrors>
 """
 
+COMPACTION_VALIDATION_RETRY_TEMPLATE = """Your previous response did not satisfy the required structured-output constraints.
+
+<validation_errors>
+{validation_errors}
+</validation_errors>
+
+Regenerate the full response from the original inputs.
+Do not reuse unsupported values from the failed attempt.
+Return corrected JSON only.
+Do not include markdown fences.
+Do not include explanations.
+"""
+
+_ResponseT = TypeVar("_ResponseT", bound=BaseModel)
+
 
 class _SegmentedEpisode(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -155,7 +181,7 @@ class _WorkspaceRollupResponse(BaseModel):
 class _EpisodeSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    source_summary_ids: list[str] = Field(min_length=1)
+    episode_key: str = Field(min_length=1)
     summary_text: str = Field(min_length=1)
 
 
@@ -163,6 +189,7 @@ class _EpisodeSynthesisResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     episodes: list[_EpisodeSummary] = Field(default_factory=list)
+    chunk_episode_keys: list[str] = Field(default_factory=list)
 
 
 class _ThematicProfileSummary(BaseModel):
@@ -525,29 +552,12 @@ class Compactor:
                 await self._delete_embeddings([f"sum_mem_{summary_id}" for summary_id in deleted_summary_ids])
             return []
 
-        response = await self._synthesize_episodes(user_id=user_id, chunk_rows=chunk_rows)
-        chunk_by_id = {str(row["id"]): row for row in chunk_rows}
-        assigned_ids: set[str] = set()
-        for episode in response.episodes:
-            source_summary_ids = self._unique_strings(episode.source_summary_ids)
-            if not source_summary_ids:
-                raise ValueError("Episode synthesis returned empty source_summary_ids")
-            unknown_ids = [summary_id for summary_id in source_summary_ids if summary_id not in chunk_by_id]
-            if unknown_ids:
-                raise ValueError("Episode synthesis returned unknown source_summary_ids")
-            overlap = assigned_ids.intersection(source_summary_ids)
-            if overlap:
-                raise ValueError("Episode synthesis returned overlapping source_summary_ids")
-            assigned_ids.update(source_summary_ids)
-        if assigned_ids != set(chunk_by_id):
-            raise ValueError("Episode synthesis must assign every conversation chunk exactly once")
+        episode_groups = await self._synthesize_episodes(user_id=user_id, chunk_rows=chunk_rows)
 
         created_summary_ids: list[str] = []
         try:
             await self._summary_repository.delete_summaries(user_id, deleted_summary_ids, commit=False)
-            for episode in response.episodes:
-                source_summary_ids = self._unique_strings(episode.source_summary_ids)
-                source_chunks = [chunk_by_id[summary_id] for summary_id in source_summary_ids]
+            for summary_text, source_chunks in episode_groups:
                 source_object_ids = self._merge_summary_source_ids(source_chunks)
                 source_memory_rows = await self._memory_rows_by_ids(user_id, source_object_ids)
                 summary_id = generate_prefixed_id("sum")
@@ -562,7 +572,7 @@ class Compactor:
                         "source_message_end_seq": None,
                         "summary_kind": SummaryViewKind.EPISODE.value,
                         "hierarchy_level": 1,
-                        "summary_text": episode.summary_text.strip(),
+                        "summary_text": summary_text,
                         "source_object_ids_json": source_object_ids,
                         "maya_score": SUMMARY_MAYA_SCORE,
                         "model": self._scoring_model,
@@ -575,13 +585,13 @@ class Compactor:
                     summary_view_id=summary_id,
                     summary_kind=SummaryViewKind.EPISODE,
                     hierarchy_level=1,
-                    summary_text=episode.summary_text.strip(),
+                    summary_text=summary_text,
                     source_object_ids=source_object_ids,
                     created_at=created_at,
                     updated_at=created_at,
                     index_text=self._summary_index_text(
                         summary_kind=SummaryViewKind.EPISODE,
-                        summary_text=episode.summary_text.strip(),
+                        summary_text=summary_text,
                         source_rows=source_memory_rows,
                     ),
                     scope=MemoryScope.GLOBAL_USER,
@@ -627,16 +637,14 @@ class Compactor:
             episode_rows=episode_rows,
         )
         input_rows_by_id = {str(row["id"]): row for row in [*belief_rows, *episode_rows]}
+        normalized_source_ids = self._validated_thematic_profile_source_ids(
+            response,
+            input_rows_by_id,
+        )
         created_summary_ids: list[str] = []
         try:
             await self._summary_repository.delete_summaries(user_id, deleted_summary_ids, commit=False)
-            for profile in response.profiles:
-                source_object_ids = self._unique_strings(profile.source_memory_ids)
-                if not source_object_ids:
-                    raise ValueError("Thematic profile synthesis returned empty source_memory_ids")
-                unknown_ids = [memory_id for memory_id in source_object_ids if memory_id not in input_rows_by_id]
-                if unknown_ids:
-                    raise ValueError("Thematic profile synthesis returned unknown source_memory_ids")
+            for profile, source_object_ids in zip(response.profiles, normalized_source_ids, strict=True):
                 source_rows = [input_rows_by_id[memory_id] for memory_id in source_object_ids]
                 summary_id = generate_prefixed_id("sum")
                 created_at = self._timestamp()
@@ -777,7 +785,7 @@ class Compactor:
         *,
         user_id: str,
         chunk_rows: list[dict[str, Any]],
-    ) -> _EpisodeSynthesisResponse:
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
         request = LLMCompletionRequest(
             model=self._scoring_model,
             messages=[
@@ -805,7 +813,12 @@ class Compactor:
                 "purpose": "episode_synthesis",
             },
         )
-        return await self._llm_client.complete_structured(request, _EpisodeSynthesisResponse)
+        response = await self._complete_structured_with_validation_retry(
+            request=request,
+            schema=_EpisodeSynthesisResponse,
+            validator=lambda result: self._episode_groups_from_assignments(result, chunk_rows),
+        )
+        return self._episode_groups_from_assignments(response, chunk_rows)
 
     async def _synthesize_thematic_profiles(
         self,
@@ -814,6 +827,7 @@ class Compactor:
         belief_rows: list[dict[str, Any]],
         episode_rows: list[dict[str, Any]],
     ) -> _ThematicProfileResponse:
+        input_rows_by_id = {str(row["id"]): row for row in [*belief_rows, *episode_rows]}
         request = LLMCompletionRequest(
             model=self._scoring_model,
             messages=[
@@ -842,7 +856,53 @@ class Compactor:
                 "purpose": "thematic_profile_synthesis",
             },
         )
-        return await self._llm_client.complete_structured(request, _ThematicProfileResponse)
+        return await self._complete_structured_with_validation_retry(
+            request=request,
+            schema=_ThematicProfileResponse,
+            validator=lambda result: self._validated_thematic_profile_source_ids(
+                result,
+                input_rows_by_id,
+            ),
+        )
+
+    async def _complete_structured_with_validation_retry(
+        self,
+        *,
+        request: LLMCompletionRequest,
+        schema: type[_ResponseT],
+        validator: Callable[[_ResponseT], Any] | None = None,
+    ) -> _ResponseT:
+        current_request = request
+        max_attempts = COMPACTION_VALIDATION_MAX_CORRECTIVE_RETRIES + 1
+        for attempt_index in range(max_attempts):
+            try:
+                response = await self._llm_client.complete_structured(current_request, schema)
+                if validator is not None:
+                    validator(response)
+                return response
+            except (StructuredOutputError, ValueError) as exc:
+                if attempt_index == max_attempts - 1:
+                    raise
+                current_request = current_request.model_copy(
+                    update={
+                        "messages": [
+                            *current_request.messages,
+                            LLMMessage(
+                                role="user",
+                                content=self._validation_retry_message(exc),
+                            ),
+                        ],
+                    }
+                )
+        raise AssertionError("Unreachable compaction validation retry state")
+
+    @staticmethod
+    def _validation_retry_message(exc: StructuredOutputError | ValueError) -> str:
+        details = exc.details if isinstance(exc, StructuredOutputError) and exc.details else (str(exc),)
+        validation_errors = "\n".join(f"- {detail}" for detail in details)
+        return COMPACTION_VALIDATION_RETRY_TEMPLATE.format(
+            validation_errors=validation_errors,
+        )
 
     async def _workspace_material_memories(self, user_id: str, workspace_id: str) -> list[dict[str, Any]]:
         return await self._memory_repository._fetch_all(  # noqa: SLF001
@@ -1065,14 +1125,80 @@ class Compactor:
         return "\n".join(
             (
                 f'<conversation_chunk id="{html.escape(str(row["id"]))}" '
+                f'position="{position}" '
+                f'conversation_id="{html.escape(str(row.get("conversation_id") or ""))}" '
                 f'workspace_id="{html.escape(str(row.get("workspace_id") or ""))}" '
                 f'start_seq="{html.escape(str(row.get("source_message_start_seq") or ""))}" '
                 f'end_seq="{html.escape(str(row.get("source_message_end_seq") or ""))}">'
                 f"{html.escape(str(row['summary_text']))}"
                 "</conversation_chunk>"
             )
-            for row in chunk_rows
+            for position, row in enumerate(chunk_rows, start=1)
         )
+
+    @staticmethod
+    def _episode_groups_from_assignments(
+        response: _EpisodeSynthesisResponse,
+        chunk_rows: list[dict[str, Any]],
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
+        if not response.episodes:
+            raise ValueError("Episode synthesis returned no episodes")
+        if len(response.chunk_episode_keys) != len(chunk_rows):
+            raise ValueError("Episode synthesis must assign one episode key per conversation chunk")
+
+        episode_text_by_key: dict[str, str] = {}
+        for episode in response.episodes:
+            episode_key = episode.episode_key.strip()
+            summary_text = episode.summary_text.strip()
+            if not episode_key:
+                raise ValueError("Episode synthesis returned empty episode_key")
+            if not summary_text:
+                raise ValueError("Episode synthesis returned empty summary_text")
+            if episode_key in episode_text_by_key:
+                raise ValueError("Episode synthesis returned duplicate episode_key")
+            episode_text_by_key[episode_key] = summary_text
+
+        chunks_by_episode_key: dict[str, list[dict[str, Any]]] = {
+            episode_key: [] for episode_key in episode_text_by_key
+        }
+        for chunk_row, episode_key_value in zip(chunk_rows, response.chunk_episode_keys, strict=True):
+            episode_key = str(episode_key_value).strip()
+            if not episode_key:
+                raise ValueError("Episode synthesis returned empty chunk episode key")
+            if episode_key not in chunks_by_episode_key:
+                raise ValueError(f"Episode synthesis assigned unknown episode_key: {episode_key}")
+            chunks_by_episode_key[episode_key].append(chunk_row)
+
+        episode_groups: list[tuple[str, list[dict[str, Any]]]] = []
+        for episode_key, summary_text in episode_text_by_key.items():
+            source_chunks = chunks_by_episode_key[episode_key]
+            if not source_chunks:
+                raise ValueError(f"Episode synthesis returned unused episode_key: {episode_key}")
+            episode_groups.append((summary_text, source_chunks))
+        return episode_groups
+
+    @classmethod
+    def _validated_thematic_profile_source_ids(
+        cls,
+        response: _ThematicProfileResponse,
+        input_rows_by_id: dict[str, dict[str, Any]],
+    ) -> list[list[str]]:
+        normalized_profiles: list[list[str]] = []
+        for profile_index, profile in enumerate(response.profiles, start=1):
+            source_object_ids = cls._unique_strings(profile.source_memory_ids)
+            if not source_object_ids:
+                raise ValueError(
+                    f"Thematic profile synthesis returned empty source_memory_ids for profile {profile_index}"
+                )
+            unknown_ids = [memory_id for memory_id in source_object_ids if memory_id not in input_rows_by_id]
+            if unknown_ids:
+                unknown_ids_text = ", ".join(sorted(unknown_ids))
+                raise ValueError(
+                    "Thematic profile synthesis returned unknown source_memory_ids: "
+                    f"{unknown_ids_text}"
+                )
+            normalized_profiles.append(source_object_ids)
+        return normalized_profiles
 
     @staticmethod
     def _episode_mirrors_xml(episode_rows: list[dict[str, Any]]) -> str:

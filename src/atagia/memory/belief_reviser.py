@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import logging
 import json
 import html
 from enum import Enum
@@ -22,10 +24,13 @@ from atagia.models.schemas_memory import (
     MemorySourceKind,
     MemoryStatus,
 )
+from atagia.services.embedding_payloads import build_embedding_upsert_payload
+from atagia.services.embeddings import EmbeddingIndex, NoneBackend
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
 
 DEFAULT_REVISION_MODEL = "claude-sonnet-4-6"
 STABILITY_DELTA_PER_EVIDENCE = 0.03
+logger = logging.getLogger(__name__)
 
 REVISION_PROMPT_TEMPLATE = """You are deciding how an assistant memory belief should revise in light of new evidence.
 
@@ -120,6 +125,19 @@ class RevisionResult(BaseModel):
     explanation: str
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingEmbeddingUpsert:
+    memory_id: str
+    canonical_text: str
+    index_text: str | None
+    privacy_level: int
+    preserve_verbatim: bool
+    user_id: str
+    object_type: str
+    scope: str
+    created_at: str
+
+
 class BeliefReviser:
     """Applies LLM-selected belief revision actions."""
 
@@ -128,11 +146,13 @@ class BeliefReviser:
         connection: aiosqlite.Connection,
         llm_client: LLMClient[Any],
         clock: Clock,
+        embedding_index: EmbeddingIndex | None = None,
         settings: Settings | None = None,
     ) -> None:
         self._connection = connection
         self._clock = clock
         self._llm_client = llm_client
+        self._embedding_index = embedding_index or NoneBackend()
         self._memory_repository = MemoryObjectRepository(connection, clock)
         self._belief_repository = BeliefRepository(connection, clock)
         resolved_settings = settings or Settings.from_env()
@@ -244,6 +264,8 @@ class BeliefReviser:
         new_evidence: list[dict[str, Any]],
         revision_context: RevisionContext,
     ) -> RevisionResult:
+        pending_embedding_upserts: list[_PendingEmbeddingUpsert] = []
+        pending_embedding_deletes: list[str] = []
         try:
             if decision.action is RevisionAction.REINFORCE:
                 result = await self._apply_reinforce(
@@ -270,6 +292,7 @@ class BeliefReviser:
                     context=revision_context,
                     decision=decision,
                     explanation=decision.explanation,
+                    pending_embedding_upserts=pending_embedding_upserts,
                 )
             elif decision.action is RevisionAction.SPLIT_BY_MODE:
                 result = await self._apply_split_by_mode(
@@ -278,6 +301,8 @@ class BeliefReviser:
                     context=revision_context,
                     decision=decision,
                     explanation=decision.explanation,
+                    pending_embedding_upserts=pending_embedding_upserts,
+                    pending_embedding_deletes=pending_embedding_deletes,
                 )
             elif decision.action is RevisionAction.SPLIT_BY_SCOPE:
                 result = await self._apply_split_by_scope(
@@ -286,6 +311,8 @@ class BeliefReviser:
                     context=revision_context,
                     decision=decision,
                     explanation=decision.explanation,
+                    pending_embedding_upserts=pending_embedding_upserts,
+                    pending_embedding_deletes=pending_embedding_deletes,
                 )
             elif decision.action is RevisionAction.SPLIT_BY_TIME:
                 result = await self._apply_split_by_time(
@@ -295,6 +322,7 @@ class BeliefReviser:
                     context=revision_context,
                     decision=decision,
                     explanation=decision.explanation,
+                    pending_embedding_upserts=pending_embedding_upserts,
                 )
             elif decision.action is RevisionAction.MARK_EXCEPTION:
                 result = await self._apply_mark_exception(
@@ -304,18 +332,24 @@ class BeliefReviser:
                     context=revision_context,
                     decision=decision,
                     explanation=decision.explanation,
+                    pending_embedding_upserts=pending_embedding_upserts,
                 )
             else:
                 result = await self._apply_archive(
                     belief_row=belief_row,
                     user_id=revision_context.user_id,
                     explanation=decision.explanation,
+                    pending_embedding_deletes=pending_embedding_deletes,
                 )
             await self._memory_repository.commit()
-            return result
         except Exception:
             await self._memory_repository.rollback()
             raise
+        await self._flush_pending_embeddings(
+            pending_embedding_upserts=pending_embedding_upserts,
+            pending_embedding_deletes=pending_embedding_deletes,
+        )
+        return result
 
     async def _decide_action(
         self,
@@ -512,6 +546,7 @@ class BeliefReviser:
         context: RevisionContext,
         decision: RevisionDecision,
         explanation: str,
+        pending_embedding_upserts: list[_PendingEmbeddingUpsert],
     ) -> RevisionResult:
         successor = await self._create_belief_memory(
             base_belief=belief_row,
@@ -548,6 +583,7 @@ class BeliefReviser:
             confidence=float(successor["confidence"]),
             commit=False,
         )
+        self._queue_embedding_upsert(successor, pending_embedding_upserts)
         await self._link_evidence(new_evidence, str(successor["id"]), "reinforces")
         return RevisionResult(
             action=RevisionAction.SUPERSEDE,
@@ -565,6 +601,8 @@ class BeliefReviser:
         context: RevisionContext,
         decision: RevisionDecision,
         explanation: str,
+        pending_embedding_upserts: list[_PendingEmbeddingUpsert],
+        pending_embedding_deletes: list[str],
     ) -> RevisionResult:
         successor = await self._create_belief_memory(
             base_belief=belief_row,
@@ -588,6 +626,8 @@ class BeliefReviser:
             confidence=float(successor["confidence"]),
             commit=False,
         )
+        self._queue_embedding_upsert(successor, pending_embedding_upserts)
+        pending_embedding_deletes.append(str(belief_row["id"]))
         return RevisionResult(
             action=RevisionAction.SPLIT_BY_MODE,
             belief_id=str(belief_row["id"]),
@@ -604,6 +644,8 @@ class BeliefReviser:
         context: RevisionContext,
         decision: RevisionDecision,
         explanation: str,
+        pending_embedding_upserts: list[_PendingEmbeddingUpsert],
+        pending_embedding_deletes: list[str],
     ) -> RevisionResult:
         successor = await self._create_belief_memory(
             base_belief=belief_row,
@@ -627,6 +669,8 @@ class BeliefReviser:
             confidence=float(successor["confidence"]),
             commit=False,
         )
+        self._queue_embedding_upsert(successor, pending_embedding_upserts)
+        pending_embedding_deletes.append(str(belief_row["id"]))
         return RevisionResult(
             action=RevisionAction.SPLIT_BY_SCOPE,
             belief_id=str(belief_row["id"]),
@@ -644,6 +688,7 @@ class BeliefReviser:
         context: RevisionContext,
         decision: RevisionDecision,
         explanation: str,
+        pending_embedding_upserts: list[_PendingEmbeddingUpsert],
     ) -> RevisionResult:
         now = self._timestamp()
         await self._connection.execute(
@@ -677,6 +722,7 @@ class BeliefReviser:
             confidence=float(successor["confidence"]),
             commit=False,
         )
+        self._queue_embedding_upsert(successor, pending_embedding_upserts)
         return RevisionResult(
             action=RevisionAction.SPLIT_BY_TIME,
             belief_id=str(belief_row["id"]),
@@ -694,6 +740,7 @@ class BeliefReviser:
         context: RevisionContext,
         decision: RevisionDecision,
         explanation: str,
+        pending_embedding_upserts: list[_PendingEmbeddingUpsert],
     ) -> RevisionResult:
         exception = await self._create_belief_memory(
             base_belief=belief_row,
@@ -716,6 +763,7 @@ class BeliefReviser:
             confidence=float(exception["confidence"]),
             commit=False,
         )
+        self._queue_embedding_upsert(exception, pending_embedding_upserts)
         return RevisionResult(
             action=RevisionAction.MARK_EXCEPTION,
             belief_id=str(belief_row["id"]),
@@ -730,8 +778,10 @@ class BeliefReviser:
         belief_row: dict[str, Any],
         user_id: str,
         explanation: str,
+        pending_embedding_deletes: list[str],
     ) -> RevisionResult:
         await self._archive_belief(str(belief_row["id"]), user_id)
+        pending_embedding_deletes.append(str(belief_row["id"]))
         return RevisionResult(
             action=RevisionAction.ARCHIVE,
             belief_id=str(belief_row["id"]),
@@ -775,6 +825,11 @@ class BeliefReviser:
             object_type=MemoryObjectType.BELIEF,
             scope=scope,
             canonical_text=canonical_text,
+            index_text=(
+                str(base_belief["index_text"])
+                if base_belief.get("index_text") is not None
+                else None
+            ),
             payload=payload,
             extraction_hash=None,
             source_kind=MemorySourceKind.INFERRED,
@@ -783,6 +838,7 @@ class BeliefReviser:
             vitality=float(base_belief["vitality"]),
             maya_score=float(base_belief["maya_score"]),
             privacy_level=int(base_belief["privacy_level"]),
+            preserve_verbatim=bool(int(base_belief.get("preserve_verbatim", 0))),
             status=MemoryStatus.ACTIVE,
             valid_from=valid_from,
             valid_to=None,
@@ -825,6 +881,72 @@ class BeliefReviser:
             """,
             (MemoryStatus.ARCHIVED.value, self._timestamp(), belief_id, user_id),
         )
+
+    def _queue_embedding_upsert(
+        self,
+        belief_row: dict[str, Any],
+        pending_embedding_upserts: list[_PendingEmbeddingUpsert],
+    ) -> None:
+        pending_embedding_upserts.append(
+            _PendingEmbeddingUpsert(
+                memory_id=str(belief_row["id"]),
+                canonical_text=str(belief_row["canonical_text"]),
+                index_text=(
+                    str(belief_row["index_text"])
+                    if belief_row.get("index_text") is not None
+                    else None
+                ),
+                privacy_level=int(belief_row.get("privacy_level", 0)),
+                preserve_verbatim=bool(int(belief_row.get("preserve_verbatim", 0))),
+                user_id=str(belief_row["user_id"]),
+                object_type=str(belief_row["object_type"]),
+                scope=str(belief_row["scope"]),
+                created_at=str(belief_row["created_at"]),
+            )
+        )
+
+    async def _flush_pending_embeddings(
+        self,
+        *,
+        pending_embedding_upserts: list[_PendingEmbeddingUpsert],
+        pending_embedding_deletes: list[str],
+    ) -> None:
+        if self._embedding_index.vector_limit == 0:
+            return
+        for pending in pending_embedding_upserts:
+            try:
+                payload = build_embedding_upsert_payload(
+                    canonical_text=pending.canonical_text,
+                    index_text=pending.index_text,
+                    privacy_level=pending.privacy_level,
+                    preserve_verbatim=pending.preserve_verbatim,
+                )
+                await self._embedding_index.upsert(
+                    memory_id=pending.memory_id,
+                    text=payload.text,
+                    metadata={
+                        "user_id": pending.user_id,
+                        "object_type": pending.object_type,
+                        "scope": pending.scope,
+                        "created_at": pending.created_at,
+                        "index_text": payload.index_text,
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "Belief revision embedding upsert failed for memory_id=%s",
+                    pending.memory_id,
+                    exc_info=True,
+                )
+        for memory_id in pending_embedding_deletes:
+            try:
+                await self._embedding_index.delete(memory_id)
+            except Exception:
+                logger.warning(
+                    "Belief revision embedding delete failed for memory_id=%s",
+                    memory_id,
+                    exc_info=True,
+                )
 
     def _exception_condition(self, context: RevisionContext) -> dict[str, Any]:
         condition: dict[str, Any] = {"scope": context.scope.value}

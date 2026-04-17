@@ -9,6 +9,7 @@ from typing import Any
 import aiosqlite
 
 from atagia.core.config import Settings
+from atagia.models.schemas_memory import MemoryStatus
 from atagia.services.embeddings import EmbeddingIndex, EmbeddingMatch
 from atagia.services.llm_client import ConfigurationError, LLMClient, LLMEmbeddingRequest
 
@@ -78,6 +79,7 @@ class SQLiteVecBackend(EmbeddingIndex):
             )
             """.format(dimension=self._dimension)
         )
+        await self._cleanup_ineligible_embeddings()
         await self._connection.commit()
 
     async def upsert(self, memory_id: str, text: str, metadata: dict[str, Any]) -> None:
@@ -132,7 +134,7 @@ class SQLiteVecBackend(EmbeddingIndex):
 
         Note: sqlite-vec vec0 returns k nearest neighbors BEFORE the user_id JOIN
         filter. In multi-tenant scenarios with skewed data, this may return fewer
-        results than top_k. The 5x over-fetch mitigates this. A per-user vec0 table
+        results than top_k. The current over-fetch mitigates this. A per-user vec0 table
         would solve it completely but is deferred to a future phase.
         """
         if top_k <= 0:
@@ -149,7 +151,7 @@ class SQLiteVecBackend(EmbeddingIndex):
             return []
 
         # TODO: add per-user partitioning when sqlite-vec multi-tenant scale matters.
-        fetch_k = max(50, top_k * 5)
+        fetch_k = max(100, top_k * 8)
         cursor = await self._connection.execute(
             """
             SELECT
@@ -174,6 +176,15 @@ class SQLiteVecBackend(EmbeddingIndex):
             ),
         )
         rows = await cursor.fetchall()
+        if len(rows) < top_k:
+            logger.warning(
+                "sqlite-vec search returned fewer rows than requested after user filtering: "
+                "user_id=%s requested_top_k=%s fetched_k=%s returned_count=%s",
+                user_id,
+                top_k,
+                fetch_k,
+                len(rows),
+            )
         return [
             EmbeddingMatch(
                 memory_id=str(row["memory_id"]),
@@ -209,14 +220,70 @@ class SQLiteVecBackend(EmbeddingIndex):
             LLMEmbeddingRequest(
                 model=self._embedding_model,
                 input_texts=texts,
+                dimensions=(
+                    self._dimension
+                    if self._llm_client.embedding_provider.supports_embedding_dimensions
+                    else None
+                ),
                 metadata=metadata,
             )
         )
         if not response.vectors:
             return []
-        return list(response.vectors[0].values)
+        vector = list(response.vectors[0].values)
+        if len(vector) != self._dimension:
+            raise ConfigurationError(
+                "Embedding dimension mismatch: expected "
+                f"{self._dimension}, received {len(vector)} from "
+                f"{response.provider}/{response.model}"
+            )
+        return vector
 
     def _serialize_vector(self, values: list[float]) -> Any:
         if self._sqlite_vec is None:
             raise RuntimeError("sqlite-vec backend used before initialization")
         return self._sqlite_vec.serialize_float32(values)
+
+    async def _cleanup_ineligible_embeddings(self) -> None:
+        cursor = await self._connection.execute(
+            """
+            SELECT v.memory_id
+            FROM vec_memory_embeddings AS v
+            LEFT JOIN memory_objects AS mo ON mo.id = v.memory_id
+            WHERE mo.id IS NULL
+               OR mo.status NOT IN (?, ?)
+            """,
+            (MemoryStatus.ACTIVE.value, MemoryStatus.SUPERSEDED.value),
+        )
+        rows = await cursor.fetchall()
+        stale_memory_ids = [str(row["memory_id"]) for row in rows]
+        metadata_cursor = await self._connection.execute(
+            """
+            SELECT mem.memory_id
+            FROM memory_embedding_metadata AS mem
+            LEFT JOIN memory_objects AS mo ON mo.id = mem.memory_id
+            LEFT JOIN vec_memory_embeddings AS v ON v.memory_id = mem.memory_id
+            WHERE mo.id IS NULL
+               OR mo.status NOT IN (?, ?)
+               OR v.memory_id IS NULL
+            """,
+            (MemoryStatus.ACTIVE.value, MemoryStatus.SUPERSEDED.value),
+        )
+        metadata_rows = await metadata_cursor.fetchall()
+        stale_metadata_ids = [str(row["memory_id"]) for row in metadata_rows]
+        if stale_memory_ids:
+            placeholders = ", ".join("?" for _ in stale_memory_ids)
+            await self._connection.execute(
+                f"DELETE FROM vec_memory_embeddings WHERE memory_id IN ({placeholders})",
+                tuple(stale_memory_ids),
+            )
+        stale_metadata_only = [
+            memory_id for memory_id in stale_metadata_ids if memory_id not in set(stale_memory_ids)
+        ]
+        if stale_memory_ids or stale_metadata_only:
+            metadata_ids = stale_memory_ids + stale_metadata_only
+            placeholders = ", ".join("?" for _ in metadata_ids)
+            await self._connection.execute(
+                f"DELETE FROM memory_embedding_metadata WHERE memory_id IN ({placeholders})",
+                tuple(metadata_ids),
+            )

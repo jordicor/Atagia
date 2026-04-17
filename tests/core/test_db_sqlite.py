@@ -35,7 +35,13 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
         assert {
             "admin_audit_log",
             "assistant_modes",
+            "artifact_blobs",
+            "artifact_chunks",
+            "artifact_chunks_fts",
+            "artifact_links",
+            "artifacts",
             "belief_versions",
+            "conversation_activity_stats",
             "contract_dimensions_current",
             "conversations",
             "evaluation_metrics",
@@ -47,21 +53,42 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "memory_objects_fts",
             "messages",
             "messages_fts",
+            "pending_memory_confirmations",
             "retrieval_events",
             "schema_migrations",
             "summary_views",
+            "verbatim_pins",
+            "verbatim_pins_fts",
             "users",
             "workspaces",
         }.issubset(names)
         assert await _fetch_one_value(connection, "PRAGMA foreign_keys;") == 1
         assert await _fetch_one_value(connection, "PRAGMA journal_mode;") != "wal"
-        assert await _fetch_one_value(connection, "SELECT COUNT(*) FROM schema_migrations;") == 13
+        assert await _fetch_one_value(connection, "SELECT COUNT(*) FROM schema_migrations;") == 20
+        assistant_modes_columns_cursor = await connection.execute(
+            "PRAGMA table_info(assistant_modes);"
+        )
+        assistant_modes_columns = {
+            row["name"] for row in await assistant_modes_columns_cursor.fetchall()
+        }
+        assert "privacy_ceiling" in assistant_modes_columns
         feedback_columns_cursor = await connection.execute("PRAGMA table_info(memory_feedback_events);")
         feedback_columns = {row["name"] for row in await feedback_columns_cursor.fetchall()}
         assert "user_id" in feedback_columns
         message_columns_cursor = await connection.execute("PRAGMA table_info(messages);")
         message_columns = {row["name"] for row in await message_columns_cursor.fetchall()}
-        assert "occurred_at" in message_columns
+        assert {
+            "occurred_at",
+            "content_kind",
+            "include_raw",
+            "skip_by_default",
+            "heavy_content",
+            "artifact_backed",
+            "verbatim_required",
+            "requires_explicit_request",
+            "context_placeholder",
+            "policy_reason",
+        }.issubset(message_columns)
         memory_columns_cursor = await connection.execute("PRAGMA table_info(memory_objects);")
         memory_columns = {row["name"] for row in await memory_columns_cursor.fetchall()}
         assert "extraction_hash" in memory_columns
@@ -74,15 +101,117 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
         consent_columns_cursor = await connection.execute("PRAGMA table_info(memory_consent_profile);")
         consent_columns = {row["name"] for row in await consent_columns_cursor.fetchall()}
         assert {"user_id", "category", "confirmed_count", "declined_count"}.issubset(consent_columns)
+        confirmation_columns_cursor = await connection.execute(
+            "PRAGMA table_info(pending_memory_confirmations);"
+        )
+        confirmation_columns = {row["name"] for row in await confirmation_columns_cursor.fetchall()}
+        assert {
+            "user_id",
+            "conversation_id",
+            "memory_id",
+            "memory_category",
+            "asked_at",
+            "confirmation_asked_once",
+        }.issubset(confirmation_columns)
         memory_fts_columns_cursor = await connection.execute("PRAGMA table_info(memory_objects_fts);")
         memory_fts_columns = {row["name"] for row in await memory_fts_columns_cursor.fetchall()}
         assert "canonical_text" in memory_fts_columns
         assert "index_text" in memory_fts_columns
+        pin_columns_cursor = await connection.execute("PRAGMA table_info(verbatim_pins);")
+        pin_columns = {row["name"] for row in await pin_columns_cursor.fetchall()}
+        assert {
+            "user_id",
+            "workspace_id",
+            "conversation_id",
+            "assistant_mode_id",
+            "scope",
+            "target_kind",
+            "target_id",
+            "canonical_text",
+            "index_text",
+            "privacy_level",
+            "status",
+            "created_by",
+            "created_at",
+            "updated_at",
+            "payload_json",
+        }.issubset(pin_columns)
+        pin_fts_columns_cursor = await connection.execute("PRAGMA table_info(verbatim_pins_fts);")
+        pin_fts_columns = {row["name"] for row in await pin_fts_columns_cursor.fetchall()}
+        assert "index_text" in pin_fts_columns
+        artifact_columns_cursor = await connection.execute("PRAGMA table_info(artifacts);")
+        artifact_columns = {row["name"] for row in await artifact_columns_cursor.fetchall()}
+        assert {
+            "user_id",
+            "workspace_id",
+            "conversation_id",
+            "message_id",
+            "artifact_type",
+            "source_kind",
+            "source_ref",
+            "mime_type",
+            "filename",
+            "title",
+            "content_hash",
+            "size_bytes",
+            "page_count",
+            "status",
+            "privacy_level",
+            "preserve_verbatim",
+            "skip_raw_by_default",
+            "requires_explicit_request",
+            "metadata_json",
+            "summary_text",
+            "index_text",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        }.issubset(artifact_columns)
+        artifact_chunks_columns_cursor = await connection.execute("PRAGMA table_info(artifact_chunks);")
+        artifact_chunks_columns = {row["name"] for row in await artifact_chunks_columns_cursor.fetchall()}
+        assert {
+            "artifact_id",
+            "user_id",
+            "chunk_index",
+            "source_start_offset",
+            "source_end_offset",
+            "text",
+            "token_count",
+            "kind",
+            "created_at",
+            "updated_at",
+        }.issubset(artifact_chunks_columns)
+        artifact_links_columns_cursor = await connection.execute("PRAGMA table_info(artifact_links);")
+        artifact_links_columns = {row["name"] for row in await artifact_links_columns_cursor.fetchall()}
+        assert {
+            "user_id",
+            "message_id",
+            "artifact_id",
+            "relation_kind",
+            "ordinal",
+            "created_at",
+        }.issubset(artifact_links_columns)
         summary_columns_cursor = await connection.execute("PRAGMA table_info(summary_views);")
         summary_columns = {row["name"] for row in await summary_columns_cursor.fetchall()}
         assert "model" in summary_columns
         assert "user_id" in summary_columns
         assert "hierarchy_level" in summary_columns
+        activity_columns_cursor = await connection.execute(
+            "PRAGMA table_info(conversation_activity_stats);"
+        )
+        activity_columns = {row["name"] for row in await activity_columns_cursor.fetchall()}
+        assert {
+            "user_id",
+            "conversation_id",
+            "workspace_id",
+            "assistant_mode_id",
+            "timezone",
+            "recent_1d_message_count",
+            "return_interval_histogram_json",
+            "main_thread_score",
+            "likely_soon_score",
+            "schedule_pattern_kind",
+        }.issubset(activity_columns)
     finally:
         await connection.close()
 
@@ -233,6 +362,142 @@ async def test_memory_objects_accept_pending_and_declined_statuses() -> None:
         assert [row["status"] for row in rows] == ["declined", "pending_user_confirmation"]
         assert all(row["memory_category"] == "pin_or_password" for row in rows)
         assert all(row["preserve_verbatim"] == 1 for row in rows)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_verbatim_pins_fts_uses_safe_index_text_and_honors_rowid() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    try:
+        await connection.execute(
+            """
+            INSERT INTO users(id, external_ref, created_at, updated_at, deleted_at)
+            VALUES ('usr_1', NULL, '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00', NULL)
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO verbatim_pins(
+                id, user_id, scope, target_kind, target_id, canonical_text, index_text,
+                privacy_level, status, reason, created_by, created_at, updated_at,
+                expires_at, deleted_at, payload_json
+            )
+            VALUES (
+                'vbp_1', 'usr_1', 'conversation', 'message', 'msg_1',
+                'Bank card PIN: 4512', 'bank card PIN',
+                3, 'active', 'banking', 'usr_1',
+                '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00',
+                NULL, NULL, '{}'
+            )
+            """
+        )
+        await connection.commit()
+
+        rowid = await _fetch_one_value(connection, "SELECT _rowid FROM verbatim_pins WHERE id = 'vbp_1';")
+        assert rowid == 1
+
+        safe_match = await _fetch_one_value(
+            connection,
+            "SELECT rowid FROM verbatim_pins_fts WHERE verbatim_pins_fts MATCH 'bank';",
+        )
+        assert safe_match == 1
+
+        sensitive_match = await _fetch_one_value(
+            connection,
+            "SELECT COUNT(*) FROM verbatim_pins_fts WHERE verbatim_pins_fts MATCH '4512';",
+        )
+        assert sensitive_match == 0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_artifact_chunks_fts_uses_safe_text_and_excludes_base64_payloads() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    try:
+        await connection.execute(
+            """
+            INSERT INTO users(id, external_ref, created_at, updated_at, deleted_at)
+            VALUES ('usr_1', NULL, '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00', NULL)
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+            VALUES ('coding_debug', 'Coding Debug', 'hash_1', '{}', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00')
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO conversations(id, user_id, workspace_id, assistant_mode_id, title, status, metadata_json, created_at, updated_at)
+            VALUES ('cnv_1', 'usr_1', NULL, 'coding_debug', 'Conversation', 'active', '{}', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00')
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO messages(id, conversation_id, role, seq, text, token_count, metadata_json, occurred_at, created_at)
+            VALUES ('msg_1', 'cnv_1', 'user', 1, 'Hello attachment world', 3, '{}', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00')
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO artifacts(
+                id, user_id, workspace_id, conversation_id, message_id, artifact_type, source_kind,
+                source_ref, mime_type, filename, title, content_hash, size_bytes, page_count, status,
+                privacy_level, preserve_verbatim, skip_raw_by_default, requires_explicit_request,
+                metadata_json, summary_text, index_text, created_at, updated_at, deleted_at
+            )
+            VALUES (
+                'art_1', 'usr_1', NULL, 'cnv_1', 'msg_1', 'base64', 'base64',
+                'upload.bin', 'application/octet-stream', 'upload.bin', 'Upload',
+                'abc123', 3, NULL, 'ready',
+                0, 0, 1, 1,
+                '{}', 'base64 attachment; artifact_id=art_1', 'Upload base64 attachment',
+                '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00', NULL
+            )
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO artifact_blobs(
+                artifact_id, storage_kind, blob_bytes, storage_uri, byte_size, sha256, created_at, updated_at
+            )
+            VALUES (
+                'art_1', 'sqlite_blob', X'48656C6C6F', NULL, 5, 'abc123',
+                '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+            )
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO artifact_chunks(
+                id, artifact_id, user_id, chunk_index, source_start_offset, source_end_offset,
+                text, token_count, kind, created_at, updated_at
+            )
+            VALUES (
+                'arc_1', 'art_1', 'usr_1', 0, NULL, NULL,
+                'base64 attachment; artifact_id=art_1', 6, 'summary',
+                '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+            )
+            """
+        )
+        await connection.commit()
+
+        rowid = await _fetch_one_value(connection, "SELECT _rowid FROM artifact_chunks WHERE id = 'arc_1';")
+        assert rowid == 1
+
+        safe_match = await _fetch_one_value(
+            connection,
+            "SELECT rowid FROM artifact_chunks_fts WHERE artifact_chunks_fts MATCH 'attachment';",
+        )
+        assert safe_match == 1
+
+        base64_match = await _fetch_one_value(
+            connection,
+            "SELECT COUNT(*) FROM artifact_chunks_fts WHERE artifact_chunks_fts MATCH '48656C6C6F';",
+        )
+        assert base64_match == 0
     finally:
         await connection.close()
 
@@ -456,7 +721,7 @@ async def test_migration_0012_backfills_summary_view_user_ids_and_drops_orphans(
         )
         rows = await rows_cursor.fetchall()
 
-        assert [migration.version for migration in applied] == [12, 13]
+        assert [migration.version for migration in applied] == [12, 13, 14, 15, 16, 17, 18, 19, 20]
         assert [row["id"] for row in rows] == ["sum_conv", "sum_rollup"]
         assert all(row["user_id"] == "usr_1" for row in rows)
         assert all(row["hierarchy_level"] == 0 for row in rows)

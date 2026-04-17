@@ -33,6 +33,7 @@ from atagia.models.schemas_memory import (
     MemorySourceKind,
     MemoryStatus,
 )
+from atagia.services.embeddings import EmbeddingIndex, NoneBackend
 from atagia.services.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -50,12 +51,14 @@ class RevisionWorker:
         connection: aiosqlite.Connection,
         llm_client: LLMClient[object],
         clock: Clock,
+        embedding_index: EmbeddingIndex | None = None,
         settings: Settings | None = None,
     ) -> None:
         self._storage_backend = storage_backend
         self._settings = settings or Settings.from_env()
         self._clock = clock
         self._llm_client = llm_client
+        self._embedding_index = embedding_index or NoneBackend()
         self._classifier_model = (
             self._settings.llm_classifier_model
             or self._settings.llm_scoring_model
@@ -69,6 +72,7 @@ class RevisionWorker:
             connection=connection,
             llm_client=llm_client,
             clock=clock,
+            embedding_index=self._embedding_index,
             settings=self._settings,
         )
 

@@ -172,6 +172,7 @@ class OpenAICompatibleProvider(LLMProvider):
     """Shared implementation for OpenAI-style chat completion APIs."""
 
     name = "openai-compatible"
+    supports_embedding_dimensions = True
 
     def __init__(
         self,
@@ -260,6 +261,8 @@ class OpenAICompatibleProvider(LLMProvider):
             "model": request.model,
             "input": request.input_texts,
         }
+        if request.dimensions is not None:
+            kwargs["dimensions"] = request.dimensions
         if request.metadata.get("user_id"):
             kwargs["user"] = str(request.metadata["user_id"])
         try:

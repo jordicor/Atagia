@@ -45,7 +45,25 @@ class ReplayProvider(LLMProvider):
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
         if purpose == "need_detection":
-            return LLMCompletionResponse(provider=self.name, model=request.model, output_text=json.dumps([]))
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "needs": [],
+                        "temporal_range": None,
+                        "sub_queries": ["retry loop"],
+                        "sparse_query_hints": [
+                            {
+                                "sub_query_text": "retry loop",
+                                "fts_phrase": "retry loop",
+                            }
+                        ],
+                        "query_type": "default",
+                        "retrieval_levels": [0],
+                    }
+                ),
+            )
         if purpose == "applicability_scoring":
             memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
             payload = [
@@ -83,6 +101,7 @@ def _settings() -> Settings:
         workers_enabled=False,
         debug=False,
         allow_insecure_http=True,
+        small_corpus_token_threshold_ratio=0.0,
     )
 
 

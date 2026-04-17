@@ -6,8 +6,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
+import logging
 import os
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from atagia import Atagia
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
@@ -163,6 +166,7 @@ async def _add_memory_impl(
             )
             await connection.execute("BEGIN")
             try:
+                message_occurred_at = runtime.clock.now().isoformat()
                 user_message = await messages.create_message(
                     message_id=None,
                     conversation_id=resolved_conversation_id,
@@ -171,6 +175,7 @@ async def _add_memory_impl(
                     text=message,
                     token_count=None,
                     metadata={"source": "mcp_add_memory"},
+                    occurred_at=message_occurred_at,
                     commit=False,
                 )
                 payload = build_job_payload(
@@ -306,6 +311,10 @@ async def _delete_memory_impl(engine: Atagia, user_id: str, memory_id: str) -> s
                 raise
         finally:
             await connection.close()
+    try:
+        await runtime.embedding_index.delete(memory_id)
+    except Exception:
+        logger.warning("Embedding cleanup failed for memory_id=%s", memory_id, exc_info=True)
     return f"Archived memory {memory_id}."
 
 

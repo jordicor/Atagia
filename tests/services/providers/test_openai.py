@@ -117,11 +117,13 @@ async def test_openai_embed_maps_vectors() -> None:
         LLMEmbeddingRequest(
             model="text-embedding-3-small",
             input_texts=["a", "b"],
+            dimensions=1536,
             metadata={"user_id": "usr_1"},
         )
     )
 
     assert [vector.values for vector in response.vectors] == [[0.1, 0.2], [0.3, 0.4]]
+    assert embeddings.calls[0]["dimensions"] == 1536
     assert embeddings.calls[0]["user"] == "usr_1"
 
 
@@ -150,4 +152,3 @@ async def test_openai_maps_retryable_and_permanent_errors() -> None:
         await transient_provider.complete(_request())
     with pytest.raises(LLMError):
         await permanent_provider.complete(_request())
-

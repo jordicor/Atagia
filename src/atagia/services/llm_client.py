@@ -25,6 +25,10 @@ class ConfigurationError(LLMError):
 class StructuredOutputError(LLMError):
     """Raised when structured output validation fails."""
 
+    def __init__(self, message: str, *, details: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.details = details
+
 
 class TransientLLMError(LLMError):
     """Raised for retryable provider failures."""
@@ -95,6 +99,7 @@ class LLMEmbeddingRequest(BaseModel):
 
     model: str
     input_texts: list[str]
+    dimensions: int | None = Field(default=None, ge=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -132,6 +137,8 @@ class LLMProvider:
     """Provider adapter interface."""
 
     name: str
+    supports_embeddings: bool = True
+    supports_embedding_dimensions: bool = False
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         raise NotImplementedError
@@ -182,6 +189,14 @@ class LLMClient(Generic[T]):
     @property
     def embedding_provider_name(self) -> str:
         return self._embedding_provider_name
+
+    @property
+    def provider(self) -> LLMProvider:
+        return self._provider()
+
+    @property
+    def embedding_provider(self) -> LLMProvider:
+        return self._provider(self._embedding_provider_name)
 
     def _provider(self, provider_name: str | None = None) -> LLMProvider:
         resolved_name = provider_name or self._provider_name
@@ -255,15 +270,22 @@ class LLMClient(Generic[T]):
         except json.JSONDecodeError as exc:
             if used_schema_fallback:
                 raise StructuredOutputError(
-                    "Provider returned non-JSON structured output after schema fallback"
+                    "Provider returned non-JSON structured output after schema fallback",
+                    details=self._structured_error_details(exc),
                 ) from exc
-            raise StructuredOutputError("Provider returned non-JSON structured output") from exc
+            raise StructuredOutputError(
+                "Provider returned non-JSON structured output",
+                details=self._structured_error_details(exc),
+            ) from exc
 
         adapter = TypeAdapter(schema)
         try:
             return adapter.validate_python(payload)
         except Exception as exc:
-            raise StructuredOutputError("Provider returned invalid structured output") from exc
+            raise StructuredOutputError(
+                "Provider returned invalid structured output",
+                details=self._structured_error_details(exc),
+            ) from exc
 
     async def _with_retries(self, operation: Any) -> Any:
         delay = self._retry_policy.base_delay_seconds
@@ -289,6 +311,7 @@ class LLMClient(Generic[T]):
         return (
             "compiled grammar is too large" in message
             or "additionalproperties" in message and "must be explicitly set to false" in message
+            or "maxitems" in message and "not supported" in message
         )
 
     @staticmethod
@@ -314,3 +337,31 @@ class LLMClient(Generic[T]):
             except json.JSONDecodeError:
                 continue
         raise json.JSONDecodeError("Expecting value", output_text, 0)
+
+    @classmethod
+    def _structured_error_details(cls, exc: Exception) -> tuple[str, ...]:
+        if isinstance(exc, json.JSONDecodeError):
+            return ("$: Response was not valid JSON.",)
+        errors = getattr(exc, "errors", None)
+        if callable(errors):
+            try:
+                normalized_errors = errors(include_url=False)
+            except TypeError:
+                normalized_errors = errors()
+            details = [
+                f"{cls._format_error_path(tuple(error.get('loc', ())))}: {error.get('msg', 'Invalid structured output')}"
+                for error in normalized_errors
+            ]
+            if details:
+                return tuple(details)
+        return ("$: Structured output validation failed.",)
+
+    @staticmethod
+    def _format_error_path(location: tuple[Any, ...]) -> str:
+        path = "$"
+        for segment in location:
+            if isinstance(segment, int):
+                path += f"[{segment}]"
+            else:
+                path += f".{segment}"
+        return path

@@ -67,6 +67,9 @@ async def _seed_memory(
     workspace_id: str | None = None,
     conversation_id: str | None = None,
     assistant_mode_id: str | None = "coding_debug",
+    temporal_type: str = "unknown",
+    valid_from: str | None = None,
+    valid_to: str | None = None,
 ) -> None:
     await memories.create_memory_object(
         user_id=user_id,
@@ -80,6 +83,9 @@ async def _seed_memory(
         confidence=0.8,
         privacy_level=0,
         status=MemoryStatus.ACTIVE,
+        temporal_type=temporal_type,
+        valid_from=valid_from,
+        valid_to=valid_to,
         memory_id=memory_id,
     )
 
@@ -90,17 +96,26 @@ def _plan(
     max_candidates: int = 10,
     fts_queries: list[str] | None = None,
 ) -> RetrievalPlan:
+    resolved_fts_queries = fts_queries or ["retry loop"]
     return RetrievalPlan(
         assistant_mode_id="coding_debug",
         workspace_id="wrk_1",
         conversation_id="cnv_1",
-        fts_queries=fts_queries or ["retry loop"],
+        fts_queries=resolved_fts_queries,
+        sub_query_plans=[
+            {
+                "text": resolved_fts_queries[0],
+                "fts_queries": resolved_fts_queries,
+            }
+        ],
+        query_type="default",
         scope_filter=[MemoryScope.CONVERSATION, MemoryScope.WORKSPACE, MemoryScope.ASSISTANT_MODE],
         status_filter=[MemoryStatus.ACTIVE],
         vector_limit=vector_limit,
         max_candidates=max_candidates,
         max_context_items=8,
         privacy_ceiling=1,
+        retrieval_levels=[0],
         require_evidence_regrounding=False,
         need_driven_boosts={},
         skip_retrieval=False,
@@ -284,6 +299,50 @@ async def test_search_by_embedding_enforces_vector_limit_after_overfetch() -> No
 
 
 @pytest.mark.asyncio
+async def test_search_by_embedding_overfetches_and_demotes_stale_ephemeral_hits() -> None:
+    connection, memories, search, embedding_index = await _build_runtime(
+        [
+            EmbeddingMatch(memory_id="mem_stale_ephemeral", score=0.95, position_rank=1),
+            EmbeddingMatch(memory_id="mem_current", score=0.91, position_rank=2),
+        ]
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_stale_ephemeral",
+            user_id="usr_1",
+            canonical_text="retry loop stale state",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            temporal_type="ephemeral",
+            valid_from="2026-04-03T09:00:00+00:00",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_current",
+            user_id="usr_1",
+            canonical_text="retry loop durable memory",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            temporal_type="permanent",
+        )
+
+        candidates = await search.search_by_embedding(
+            query_text="retry loop",
+            user_id="usr_1",
+            plan=_plan(vector_limit=1),
+            embedding_index=embedding_index,
+        )
+
+        assert [candidate["id"] for candidate in candidates] == ["mem_current"]
+        assert embedding_index.calls == [("retry loop", "usr_1", 2)]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_merged_fts_and_embedding_search_deduplicates_correctly() -> None:
     connection, memories, search, _embedding_index = await _build_runtime(
         [
@@ -311,11 +370,14 @@ async def test_merged_fts_and_embedding_search_deduplicates_correctly() -> None:
             conversation_id="cnv_1",
         )
 
-        candidates = await search.search(_plan(), "usr_1", query_text="retry loop")
+        candidates = await search.search(_plan(), "usr_1")
 
         assert [candidate["id"] for candidate in candidates] == ["mem_1", "mem_2"]
         assert [candidate["id"] for candidate in candidates].count("mem_1") == 1
         assert candidates[0]["retrieval_sources"] == ["fts", "embedding"]
+        assert "fts_rank" in candidates[0]
+        assert candidates[0]["embedding_similarity_score"] == pytest.approx(0.95)
+        assert "embedding_distance" in candidates[0]
         assert candidates[1]["retrieval_sources"] == ["embedding"]
         assert candidates[0]["rrf_score"] > candidates[1]["rrf_score"]
     finally:
@@ -343,7 +405,7 @@ async def test_merged_search_respects_max_candidates_cap() -> None:
                 conversation_id="cnv_1",
             )
 
-        candidates = await search.search(_plan(vector_limit=5, max_candidates=2), "usr_1", query_text="retry loop")
+            candidates = await search.search(_plan(vector_limit=5, max_candidates=2), "usr_1")
 
         assert len(candidates) == 2
     finally:
@@ -381,8 +443,53 @@ async def test_rrf_uses_best_fts_rank_once_across_query_rewrites() -> None:
         shared = next(candidate for candidate in candidates if candidate["id"] == "mem_shared")
 
         assert shared["retrieval_sources"] == ["fts"]
-        assert shared["channel_ranks"] == {"fts": 1, "embedding": None, "consequence": None}
-        assert shared["rrf_score_raw"] == pytest.approx(1.0 / 61.0)
-        assert shared["rrf_score"] == pytest.approx(1.0 / 3.0)
+        assert shared["channel_ranks"] == {
+            "fts": 1,
+            "embedding": None,
+            "consequence": None,
+            "raw_message": None,
+        }
+        assert shared["matched_sub_queries"] == ["retry loop fastapi"]
+        assert shared["subquery_ranks"]["retry loop fastapi"] >= 1
+        assert shared["rrf_score_raw"] == pytest.approx(
+            1.0 / (60 + int(shared["position_rank"]))
+        )
+        assert shared["rrf_score"] == pytest.approx(
+            shared["rrf_score_raw"] / (1.0 / 61.0)
+        )
     finally:
         await connection.close()
+
+
+def test_rank_fusion_prefers_exact_single_hit_for_default_queries() -> None:
+    search = CandidateSearch(None, FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)))
+
+    _raw_exact, exact_score = search._compute_rank_fusion_scores(  # noqa: SLF001
+        [1],
+        max_lists=3,
+        query_type="default",
+    )
+    _raw_generic, generic_score = search._compute_rank_fusion_scores(  # noqa: SLF001
+        [1, 2],
+        max_lists=3,
+        query_type="default",
+    )
+
+    assert exact_score > generic_score
+
+
+def test_rank_fusion_keeps_coverage_bias_for_broad_list_queries() -> None:
+    search = CandidateSearch(None, FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)))
+
+    _raw_exact, exact_score = search._compute_rank_fusion_scores(  # noqa: SLF001
+        [1],
+        max_lists=3,
+        query_type="broad_list",
+    )
+    _raw_generic, generic_score = search._compute_rank_fusion_scores(  # noqa: SLF001
+        [1, 2],
+        max_lists=3,
+        query_type="broad_list",
+    )
+
+    assert generic_score > exact_score

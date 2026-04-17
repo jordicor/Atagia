@@ -10,19 +10,28 @@ from atagia.memory.retrieval_comparator import RetrievalComparator
 
 
 def _pipeline_result(*, selected_ids: list[str], scores: dict[str, float], tokens: int = 100) -> PipelineResult:
+    resolved_fts_queries = ["retry"]
     return PipelineResult(
         detected_needs=[],
         retrieval_plan=RetrievalPlan(
             assistant_mode_id="coding_debug",
             workspace_id=None,
             conversation_id="cnv_1",
-            fts_queries=["retry"],
+            fts_queries=resolved_fts_queries,
+            sub_query_plans=[
+                {
+                    "text": resolved_fts_queries[0],
+                    "fts_queries": resolved_fts_queries,
+                }
+            ],
+            query_type="default",
             scope_filter=[],
             status_filter=[],
             vector_limit=0,
             max_candidates=10,
             max_context_items=8,
             privacy_ceiling=1,
+            retrieval_levels=[0],
             require_evidence_regrounding=False,
             need_driven_boosts={},
             skip_retrieval=False,

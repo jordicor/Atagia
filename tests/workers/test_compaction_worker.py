@@ -277,10 +277,11 @@ async def test_compaction_worker_orders_chunk_episode_and_thematic_jobs() -> Non
                     {
                         "episodes": [
                             {
-                                "source_summary_ids": ["sum_chunk_seed"],
+                                "episode_key": "debugging",
                                 "summary_text": "Cross-session debugging episode.",
                             }
-                        ]
+                        ],
+                        "chunk_episode_keys": ["debugging"],
                     }
                 )
             ],
@@ -346,5 +347,63 @@ async def test_compaction_worker_orders_chunk_episode_and_thematic_jobs() -> Non
         assert episode_rows
         assert thematic_rows
         assert thematic_rows[0]["summary_kind"] == SummaryViewKind.THEMATIC_PROFILE.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_worker_acks_episode_job_after_local_corrective_retry() -> None:
+    connection, backend, _messages, summaries, _memories, worker = await _build_runtime(
+        {
+            "episode_synthesis": [
+                json.dumps(
+                    {
+                        "episodes": [
+                            {"episode_key": "debugging", "summary_text": "Cross-session debugging episode."},
+                            {"episode_key": "unused", "summary_text": "Unused episode."},
+                        ],
+                        "chunk_episode_keys": ["debugging", "debugging"],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "episodes": [
+                            {"episode_key": "debugging", "summary_text": "Cross-session debugging episode."}
+                        ],
+                        "chunk_episode_keys": ["debugging", "debugging"],
+                    }
+                ),
+            ]
+        }
+    )
+    try:
+        for index, chunk_id in enumerate(("sum_chunk_a", "sum_chunk_b"), start=1):
+            await summaries.create_summary(
+                "usr_1",
+                {
+                    "id": chunk_id,
+                    "conversation_id": "cnv_1",
+                    "workspace_id": "wrk_1",
+                    "source_message_start_seq": index,
+                    "source_message_end_seq": index,
+                    "summary_kind": "conversation_chunk",
+                    "summary_text": f"Chunk {index}.",
+                    "source_object_ids_json": [],
+                    "maya_score": 1.5,
+                    "model": "classify-test-model",
+                    "created_at": f"2026-04-03T14:0{index}:00+00:00",
+                }
+            )
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(job_kind=CompactionJobKind.EPISODE.value).model_dump(mode="json"),
+        )
+
+        result = await worker.run_once()
+        episode_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE)
+
+        assert result.acked == 1
+        assert result.failed == 0
+        assert len(episode_rows) == 1
     finally:
         await connection.close()

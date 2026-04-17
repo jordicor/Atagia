@@ -44,7 +44,7 @@ What works today:
 - LoCoMo benchmark harness with ablation support and replay probes
 
 What is in progress or planned:
-- **Vector embeddings**: candidate search uses FTS5. This handles single-hop and temporal questions well, but multi-hop questions across hundreds of memories need semantic candidate generation. sqlite-vec integration is next.
+- **Vector embeddings**: candidate search now supports optional sqlite-vec semantic recall on top of FTS5. This is aimed at multi-hop and sparse-keyword questions across larger personal corpora.
 - **Benchmark coverage**: the LoCoMo harness runs end-to-end. A ground truth audit of the LoCoMo conv-26 subset found factual errors and ambiguous items in the dataset ([details](https://github.com/snap-research/locomo/issues/35)). A separate benchmark (Atagia-bench) is in design to cover behaviors LoCoMo does not test: verbatim recall, consent boundaries, privacy scoping, and abstention.
 - **Neo4j graph layer**: planned for relationship traversal where flat retrieval is insufficient. Will ship only if benchmark evidence justifies the complexity.
 
@@ -92,6 +92,74 @@ async with Atagia(
     print(result.response_text)
 ```
 
+### As a sidecar client for your own webchat
+
+Use `connect_atagia` when your app should work the same way whether Atagia is imported
+in-process or running as a local/remote HTTP service.
+
+Same-process local mode:
+
+```python
+from atagia.client import connect_atagia
+
+client = await connect_atagia(
+    transport="local",
+    db_path="memory.db",
+    llm_provider="anthropic",
+    llm_api_key="sk-ant-...",
+)
+
+context = await client.get_context(
+    user_id="user_1",
+    conversation_id="conv_1",
+    message="What did we decide about the migration?",
+    mode="coding_debug",
+)
+
+response_text = await my_llm_call(
+    system_prompt=context.system_prompt,
+    user_text="What did we decide about the migration?",
+)
+
+await client.add_response(
+    user_id="user_1",
+    conversation_id="conv_1",
+    text=response_text,
+)
+await client.close()
+```
+
+HTTP service mode:
+
+```python
+from atagia.client import connect_atagia
+
+client = await connect_atagia(
+    transport="http",
+    base_url="http://localhost:8100",
+    api_key="your-service-api-key",
+)
+
+result = await client.chat(
+    user_id="user_1",
+    conversation_id="conv_1",
+    message="Why is the test failing?",
+)
+print(result.response_text)
+```
+
+Auto mode uses HTTP when `base_url` or `ATAGIA_BASE_URL` is present, otherwise it
+uses local mode. It also reads `ATAGIA_SERVICE_API_KEY` for HTTP and `ATAGIA_DB_PATH`
+or `ATAGIA_SQLITE_PATH` for local mode:
+
+```python
+client = await connect_atagia(transport="auto")
+```
+
+MCP remains the right transport for Claude Desktop, Cursor, and other tool clients.
+For ordinary backend, desktop app, or webchat integrations, use the Python client
+facade instead.
+
 #### Offline ingestion
 
 For loading long conversations without triggering retrieval on every turn:
@@ -125,6 +193,7 @@ Messages accept an optional `occurred_at` ISO timestamp for historical data wher
 | `llm_api_key` | From env | API key for the LLM provider |
 | `llm_model` | From env | Model name for extraction, scoring, and chat |
 | `embedding_backend` | `"none"` | `"none"` or `"sqlite_vec"` |
+| `embedding_provider_name` | From env | Optional override for which provider handles embeddings |
 | `embedding_model` | `None` | Embedding model name (required when backend is `sqlite_vec`) |
 | `context_cache_enabled` | `True` | Enable adaptive context caching |
 | `chunking_enabled` | `True` | Enable intelligent chunking for long messages |
@@ -132,6 +201,18 @@ Messages accept an optional `occurred_at` ISO timestamp for historical data wher
 | `skip_compaction` | `False` | Disable compaction (for benchmarks/ablation) |
 
 SQLite is the only required storage dependency. An LLM API (Anthropic, OpenAI, or OpenRouter) is required for memory extraction, scoring, and chat. Redis accelerates queues and caching but is optional -- the engine works without it using in-process queues.
+
+For a dual-provider setup, a common production shape is Anthropic for chat/extraction/scoring plus sqlite-vec embeddings on OpenAI or OpenRouter. Example env:
+
+```bash
+ATAGIA_LLM_PROVIDER=anthropic
+ATAGIA_LLM_API_KEY=your-anthropic-key
+ATAGIA_OPENAI_API_KEY=your-openai-key
+ATAGIA_EMBEDDING_BACKEND=sqlite_vec
+ATAGIA_EMBEDDING_PROVIDER=openai
+ATAGIA_EMBEDDING_MODEL=text-embedding-3-small
+ATAGIA_EMBEDDING_DIMENSION=1536
+```
 
 ### As an MCP server (Claude Desktop, Cursor, Windsurf)
 
@@ -174,9 +255,14 @@ Service mode requires `ATAGIA_SERVICE_MODE=true` and `ATAGIA_SERVICE_API_KEY` in
 
 | Method | Path | Description |
 |--------|------|-------------|
+| POST | `/v1/users` | Create a user |
 | POST | `/v1/conversations` | Create a conversation |
 | POST | `/v1/workspaces` | Create a workspace |
 | POST | `/v1/chat/{conversation_id}/reply` | Send a message and get a response |
+| POST | `/v1/conversations/{conversation_id}/context` | Get sidecar context for a host-managed LLM call |
+| POST | `/v1/conversations/{conversation_id}/responses` | Persist a host-generated assistant response |
+| POST | `/v1/conversations/{conversation_id}/messages` | Ingest a user or assistant message without retrieval |
+| POST | `/v1/flush` | Wait for pending background work |
 | POST | `/v1/memory/feedback` | Submit memory feedback (used, useful, irrelevant, intrusive, stale) |
 | GET | `/v1/memory/objects/{memory_id}` | Inspect a memory object |
 | GET | `/v1/users/{user_id}/contract` | View the user's interaction contract |
@@ -365,7 +451,7 @@ Available ablation presets: `similarity_only`, `no_contract`, `no_scope`, `no_ne
 | 2.5 | Library mode, MCP server | Done |
 | 3 | Benchmark harness, adaptive context cache, text chunking, temporal timestamps | Done |
 | 3.5 | Retrieval quality: RRF hybrid scoring, temporal grounding, contextual indexing, memory hierarchy, natural memory capture, consent gating | Done |
-| 4 | Vector embeddings (sqlite-vec) for semantic candidate recall | Next |
+| 4 | Embeddings activation and tuning: sqlite-vec backfill, validation, and semantic recall operations | In progress |
 | 5 | Neo4j graph layer for relationship-aware retrieval | Planned |
 
 ## Research

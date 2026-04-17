@@ -15,7 +15,10 @@ from typing import Any
 from atagia.core.belief_repository import BeliefRepository
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
-from atagia.core.consent_repository import MemoryConsentProfileRepository
+from atagia.core.consent_repository import (
+    MemoryConsentProfileRepository,
+    PendingMemoryConfirmationRepository,
+)
 from atagia.core.repositories import MemoryObjectRepository, MessageRepository
 from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
 from atagia.memory.chunking_config import PRIOR_CHUNK_CONTEXT_MAX_TOKENS
@@ -36,8 +39,9 @@ from atagia.models.schemas_memory import (
     MemoryScope,
     MemoryStatus,
 )
+from atagia.services.embedding_payloads import build_embedding_upsert_payload
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
+from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage, StructuredOutputError
 
 DEFAULT_EXTRACTION_MODEL = "claude-sonnet-4-6"
 REVIEW_REQUIRED_CONFIDENCE = 0.4
@@ -49,6 +53,8 @@ DEFAULT_ACTIVE_THRESHOLD = 0.5
 DEDUPE_TTL_SECONDS = 24 * 60 * 60
 CONSENT_CONFIRM_THRESHOLD = 2
 CONSENT_DECLINE_SUPPRESSION_THRESHOLD = 2
+TEMPORAL_CONFIDENCE_THRESHOLD = 0.6
+EXTRACTION_VALIDATION_MAX_CORRECTIVE_RETRIES = 2
 logger = logging.getLogger(__name__)
 
 EXTRACTION_PROMPT_TEMPLATE = """You are extracting durable memory candidates for an assistant memory engine.
@@ -108,14 +114,41 @@ Rules:
 - Examples of good claim_keys: `response_style.verbosity`, `coding.language.primary`, `communication.formality`, `collaboration.autonomy`.
 - Contract signals represent collaboration preferences. State updates represent temporary current state.
 - For every extracted item, set:
-  - temporal_type: `permanent`, `bounded`, `event_triggered`, or `unknown`
-  - valid_from_iso / valid_to_iso as ISO-8601 timestamps when the message implies a durable time window
-  - temporal_confidence from 0.0 to 1.0
+  - `temporal_type`: must be exactly one of `permanent`, `bounded`, `event_triggered`, `ephemeral`, or `unknown`. Do not use any other value.
+  - `permanent`: timeless facts, stable traits, or durable preferences (e.g., "I'm vegetarian").
+  - `bounded`: true within an explicit or inferable time window (e.g., "I'm on vacation this week").
+  - `event_triggered`: tied to a specific event occurrence rather than an ongoing state.
+  - `ephemeral`: true at the time of mention, no explicit end time, expected to decay quickly (e.g., "I'm at the airport", "I have a headache").
+  - `unknown`: the temporal nature cannot be determined from the message.
+  - `valid_from_iso` / `valid_to_iso` as ISO-8601 timestamps when the message implies a durable time window.
+  - If both `valid_from_iso` and `valid_to_iso` are present, `valid_from_iso` must be earlier than or equal to `valid_to_iso`.
+  - If the end is uncertain, omit `valid_to_iso` instead of guessing.
+  - `temporal_confidence` from 0.0 to 1.0.
 - Use <message_timestamp> as the anchor for resolving relative dates like "yesterday", "today", "tomorrow", "next week", and "last month".
-- For timeless facts or stable traits, prefer temporal_type=`permanent` with null bounds.
+- Each extracted memory must include a `language_codes` field listing the
+  ISO 639-1 codes of the languages actually used in its `canonical_text`.
+  At least one code is required. Use multiple codes only when the text
+  genuinely mixes languages. Do not translate -- report the language of
+  the text as it exists, not what you think it should be in.
 
 Natural memory annotations:
 {natural_capture_block}
+"""
+EXTRACTION_VALIDATION_RETRY_TEMPLATE = """Your previous response did not satisfy the required JSON schema.
+
+<validation_errors>
+{validation_errors}
+</validation_errors>
+
+Regenerate the full response from the original source message and schema.
+Do not reuse unsupported values from the failed attempt.
+Every extracted item must include `canonical_text`.
+If both `valid_from_iso` and `valid_to_iso` are present, ensure `valid_from_iso`
+is earlier than or equal to `valid_to_iso`. If the end bound is uncertain, omit
+`valid_to_iso` instead of guessing or inverting the range.
+Return corrected JSON only.
+Do not include markdown fences.
+Do not include explanations.
 """
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
@@ -166,6 +199,10 @@ class MemoryExtractor:
         )
         self._belief_repository = BeliefRepository(memory_repository._connection, clock)
         self._consent_repository = MemoryConsentProfileRepository(memory_repository._connection, clock)
+        self._pending_confirmation_repository = PendingMemoryConfirmationRepository(
+            memory_repository._connection,
+            clock,
+        )
 
     async def extract(
         self,
@@ -481,7 +518,7 @@ class MemoryExtractor:
                     "purpose": "memory_extraction",
                 },
             )
-            result = await self._llm_client.complete_structured(request, ExtractionResult)
+            result = await self._complete_extraction_with_validation_retry(request)
             chunk_extractions.append(_ChunkExtraction(chunk=chunk, result=result))
             prior_chunk_context = self._extend_prior_chunk_context(prior_chunk_context, result)
             if chunk_plan.chunked:
@@ -496,6 +533,38 @@ class MemoryExtractor:
                     chunk.chunking_strategy or "single",
                 )
         return chunk_extractions
+
+    async def _complete_extraction_with_validation_retry(
+        self,
+        request: LLMCompletionRequest,
+    ) -> ExtractionResult:
+        current_request = request
+        max_attempts = EXTRACTION_VALIDATION_MAX_CORRECTIVE_RETRIES + 1
+        for attempt_index in range(max_attempts):
+            try:
+                return await self._llm_client.complete_structured(current_request, ExtractionResult)
+            except StructuredOutputError as exc:
+                if attempt_index == max_attempts - 1:
+                    raise
+                current_request = current_request.model_copy(
+                    update={
+                        "messages": [
+                            *current_request.messages,
+                            LLMMessage(
+                                role="user",
+                                content=self._validation_retry_message(exc),
+                            ),
+                        ],
+                    }
+                )
+
+    @staticmethod
+    def _validation_retry_message(exc: StructuredOutputError) -> str:
+        details = exc.details or ("$: Structured output validation failed.",)
+        validation_errors = "\n".join(f"- {detail}" for detail in details)
+        return EXTRACTION_VALIDATION_RETRY_TEMPLATE.format(
+            validation_errors=validation_errors,
+        )
 
     @staticmethod
     def _merge_chunk_results(chunk_extractions: list[_ChunkExtraction]) -> ExtractionResult:
@@ -650,7 +719,7 @@ class MemoryExtractor:
                     occurred_at=occurred_at,
                 )
 
-                created = await self._memory_repository.create_memory_object(
+                created, was_created = await self._memory_repository.create_memory_object_with_flag(
                     user_id=context.user_id,
                     workspace_id=scope_identifiers["workspace_id"],
                     conversation_id=scope_identifiers["conversation_id"],
@@ -672,10 +741,11 @@ class MemoryExtractor:
                     valid_from=valid_from,
                     valid_to=valid_to,
                     temporal_type=temporal_type,
+                    language_codes=item.language_codes,
                     status=decision.status,
                     commit=False,
                 )
-                if isinstance(item, ExtractedBelief):
+                if isinstance(item, ExtractedBelief) and was_created:
                     await self._belief_repository.create_first_version(
                         belief_id=str(created["id"]),
                         claim_key=item.claim_key,
@@ -693,19 +763,29 @@ class MemoryExtractor:
                     touch=False,
                     commit=False,
                 )
-                embedding_upserts.append(
-                    {
-                        "memory_id": str(created["id"]),
-                        "canonical_text": item.canonical_text,
-                        "index_text": item.index_text,
-                        "privacy_level": item.privacy_level,
-                        "preserve_verbatim": item.preserve_verbatim,
-                        "user_id": context.user_id,
-                        "object_type": object_type.value,
-                        "scope": item.scope.value,
-                        "created_at": str(created["created_at"]),
-                    }
-                )
+                if decision.status is MemoryStatus.PENDING_USER_CONFIRMATION:
+                    await self._pending_confirmation_repository.create_marker(
+                        user_id=context.user_id,
+                        conversation_id=context.conversation_id,
+                        memory_id=str(created["id"]),
+                        category=item.memory_category,
+                        created_at=str(created["created_at"]),
+                        commit=False,
+                    )
+                if decision.status in {MemoryStatus.ACTIVE, MemoryStatus.SUPERSEDED}:
+                    embedding_upserts.append(
+                        {
+                            "memory_id": str(created["id"]),
+                            "canonical_text": item.canonical_text,
+                            "index_text": item.index_text,
+                            "privacy_level": item.privacy_level,
+                            "preserve_verbatim": item.preserve_verbatim,
+                            "user_id": context.user_id,
+                            "object_type": object_type.value,
+                            "scope": item.scope.value,
+                            "created_at": str(created["created_at"]),
+                        }
+                    )
                 persisted.append(created)
         except Exception:
             if commit:
@@ -737,11 +817,13 @@ class MemoryExtractor:
         *,
         occurred_at: str | None,
     ) -> tuple[str | None, str | None, str]:
-        if item.temporal_confidence < 0.6:
+        if item.temporal_confidence < TEMPORAL_CONFIDENCE_THRESHOLD:
             return None, None, "unknown"
         anchor = self._parse_temporal_datetime(occurred_at)
         valid_from = self._normalize_temporal_iso(item.valid_from_iso, anchor=anchor)
         valid_to = self._normalize_temporal_iso(item.valid_to_iso, anchor=anchor)
+        if item.temporal_type == "ephemeral" and valid_from is None and anchor is not None:
+            valid_from = anchor.isoformat()
         return valid_from, valid_to, item.temporal_type
 
     @staticmethod
@@ -783,14 +865,14 @@ class MemoryExtractor:
         embedding_text = canonical_text
         embedding_index_text = index_text
         try:
-            if preserve_verbatim and privacy_level >= 2:
-                protected_index_text = str(index_text or "").strip()
-                if not protected_index_text:
-                    raise ValueError(
-                        "Protected verbatim memories require index_text for safe embedding generation"
-                    )
-                embedding_text = protected_index_text
-                embedding_index_text = None
+            payload = build_embedding_upsert_payload(
+                canonical_text=canonical_text,
+                index_text=index_text,
+                privacy_level=privacy_level,
+                preserve_verbatim=preserve_verbatim,
+            )
+            embedding_text = payload.text
+            embedding_index_text = payload.index_text
             await self._embedding_index.upsert(
                 memory_id=memory_id,
                 text=embedding_text,

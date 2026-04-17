@@ -14,6 +14,7 @@ from atagia.services.chat_support import (
     estimate_tokens,
     format_chunk_summary,
     missing_uncovered_tail_start_seq,
+    recent_context,
     render_transcript_window,
 )
 
@@ -159,6 +160,147 @@ def test_build_transcript_window_skips_newest_oversized_uncovered_message() -> N
     assert 2 not in _raw_seqs(entries)
 
 
+def test_build_transcript_window_renders_skip_by_default_messages_as_placeholders() -> None:
+    messages = [
+        _message(1, text="alpha"),
+        _message(2, text="beta"),
+        _message(3, text="gamma"),
+        {
+            "seq": 4,
+            "role": "user",
+            "text": "x" * 6000,
+            "id": "msg_4",
+            "content_kind": "attachment",
+            "include_raw": False,
+            "skip_by_default": True,
+            "heavy_content": True,
+            "requires_explicit_request": True,
+            "policy_reason": "heavy_content",
+        },
+    ]
+
+    entries = build_transcript_window(messages, [], budget_tokens=200)
+    rendered = render_transcript_window(entries)
+    trace = build_transcript_window_trace(entries, 200)
+
+    assert [entry["kind"] for entry in rendered] == ["raw", "raw", "raw", "placeholder"]
+    assert rendered[3]["text"].startswith("[Skipped message | id=msg_4 seq=4 role=user")
+    assert rendered[3]["content_kind"] == "attachment"
+    assert trace["raw_message_seqs"] == [1, 2, 3]
+    assert trace["placeholder_message_seqs"] == [4]
+    assert trace["skipped_message_seqs"] == [4]
+    assert trace["skipped_messages"][0]["policy_reason"] == "heavy_content"
+
+
+def test_recent_context_uses_placeholder_for_skip_by_default_messages() -> None:
+    messages = [
+        _message(1, text="short"),
+        {
+            "seq": 2,
+            "role": "user",
+            "text": "x" * 6000,
+            "id": "msg_2",
+            "content_kind": "attachment",
+            "include_raw": False,
+            "skip_by_default": True,
+            "heavy_content": True,
+            "requires_explicit_request": True,
+            "policy_reason": "heavy_content",
+        },
+    ]
+
+    context = recent_context(messages)
+
+    assert context[0].content == "short"
+    assert context[1].content.startswith("[Skipped message | id=msg_2 seq=2 role=user")
+    assert "x" * 100 not in context[1].content
+
+
+def test_context_placeholder_is_compact_when_host_supplies_long_value() -> None:
+    messages = [
+        {
+            "seq": 1,
+            "role": "user",
+            "text": "x" * 6000,
+            "id": "msg_1",
+            "content_kind": "attachment",
+            "include_raw": False,
+            "skip_by_default": True,
+            "context_placeholder": " ".join(["placeholder"] * 100),
+        },
+    ]
+
+    rendered = render_transcript_window(build_transcript_window(messages, [], budget_tokens=200))
+
+    assert rendered[0]["kind"] == "placeholder"
+    assert len(rendered[0]["text"]) <= 300
+
+
+def test_build_transcript_window_allows_explicit_raw_access_for_skipped_messages() -> None:
+    messages = [
+        _message(1, text="alpha"),
+        _message(2, text="beta"),
+        _message(3, text="gamma"),
+        {
+            "seq": 4,
+            "role": "user",
+            "text": "x" * 6000,
+            "id": "msg_4",
+            "content_kind": "attachment",
+            "include_raw": False,
+            "skip_by_default": True,
+            "heavy_content": True,
+            "requires_explicit_request": True,
+            "policy_reason": "heavy_content",
+        },
+    ]
+    budget = sum(estimate_tokens(str(message["text"])) for message in messages)
+
+    entries = build_transcript_window(
+        messages,
+        [],
+        budget_tokens=budget,
+        raw_context_access_mode="skipped_raw",
+    )
+    rendered = render_transcript_window(entries)
+    trace = build_transcript_window_trace(entries, budget)
+
+    assert [entry["kind"] for entry in rendered] == ["raw", "raw", "raw", "raw"]
+    assert rendered[3]["text"] == messages[3]["text"]
+    assert trace["placeholder_message_seqs"] == []
+    assert trace["skipped_message_seqs"] == []
+
+
+def test_build_transcript_window_keeps_old_heavy_message_hidden_by_default() -> None:
+    messages = [
+        {
+            "seq": 1,
+            "role": "user",
+            "text": "x" * 6000,
+            "id": "msg_1",
+            "content_kind": "attachment",
+            "include_raw": False,
+            "skip_by_default": True,
+            "heavy_content": True,
+            "requires_explicit_request": True,
+            "policy_reason": "heavy_content",
+        },
+        _message(2, text="beta"),
+        _message(3, text="gamma"),
+        _message(4, text="delta"),
+        _message(5, text="epsilon"),
+    ]
+
+    entries = build_transcript_window(messages, [], budget_tokens=250)
+    rendered = render_transcript_window(entries)
+    trace = build_transcript_window_trace(entries, 250)
+
+    assert rendered[0]["kind"] == "placeholder"
+    assert rendered[0]["seq"] == 1
+    assert rendered[0]["text"].startswith("[Skipped message | id=msg_1 seq=1 role=user")
+    assert trace["skipped_message_seqs"] == [1]
+
+
 def test_build_transcript_window_trace_and_system_prompt_include_summary_boundary() -> None:
     messages = [
         *[_message(seq, text=f"older-{seq}" * 50) for seq in range(1, 7)],
@@ -187,6 +329,7 @@ def test_build_transcript_window_trace_and_system_prompt_include_summary_boundar
     assert "last Saturday" in prompt
     assert "Calculate the actual calendar date when possible." in prompt
     assert "include all distinct items found across the retrieved memories" in prompt
+    assert "you may use it inside that same active conversation/mode" in prompt
     assert "[Conversation summary | historical context only | ...]" in prompt
     assert "[End of summary]" in prompt
 

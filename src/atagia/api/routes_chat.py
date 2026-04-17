@@ -13,12 +13,10 @@ from atagia.api.dependencies import (
     get_auth_context,
     get_clock,
     get_connection,
-    get_manifests,
     get_runtime,
 )
 from atagia.core.clock import Clock
 from atagia.core.repositories import (
-    ConversationRepository,
     UserRepository,
     WorkspaceRepository,
 )
@@ -26,7 +24,15 @@ from atagia.models.schemas_api import (
     ChatReplyRequest,
     ChatReplyResponse,
     CreateConversationRequest,
+    CreateUserRequest,
     CreateWorkspaceRequest,
+    ContextResult,
+    FlushRequest,
+    FlushResponse,
+    SidecarAddResponseRequest,
+    SidecarContextRequest,
+    SidecarIngestMessageRequest,
+    SidecarMutationResponse,
 )
 from atagia.services.chat_service import ChatService
 from atagia.services.errors import (
@@ -34,7 +40,9 @@ from atagia.services.errors import (
     ConversationNotFoundError,
     LLMUnavailableError,
     UnknownAssistantModeError,
+    WorkspaceNotFoundError,
 )
+from atagia.services.sidecar_service import SidecarService
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 
@@ -44,40 +52,66 @@ async def _ensure_user_exists(users: UserRepository, user_id: str) -> None:
         await users.create_user(user_id)
 
 
-@router.post("/conversations")
-async def create_conversation(
-    payload: CreateConversationRequest,
+@router.post("/users")
+async def create_user(
+    payload: CreateUserRequest,
     auth_context: AuthContext = Depends(get_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
-    manifests: dict[str, Any] = Depends(get_manifests),
 ) -> dict[str, Any]:
     ensure_user_access(payload.user_id, auth_context)
     users = UserRepository(connection, clock)
-    workspaces = WorkspaceRepository(connection, clock)
-    conversations = ConversationRepository(connection, clock)
+    existing = await users.get_user(payload.user_id)
+    if existing is not None:
+        return existing
+    return await users.create_user(payload.user_id)
 
-    if payload.assistant_mode_id not in manifests:
+
+@router.post("/conversations")
+async def create_conversation(
+    payload: CreateConversationRequest,
+    request: Request,
+    auth_context: AuthContext = Depends(get_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+) -> dict[str, Any]:
+    ensure_user_access(payload.user_id, auth_context)
+    sidecar = SidecarService(get_runtime(request))
+    try:
+        await sidecar.ensure_user_exists(connection, payload.user_id)
+        return await sidecar.ensure_conversation(
+            connection,
+            user_id=payload.user_id,
+            conversation_id=payload.conversation_id,
+            workspace_id=payload.workspace_id,
+            assistant_mode_id=payload.assistant_mode_id,
+            title=payload.title,
+            metadata=payload.metadata,
+        )
+    except ConversationNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Unknown assistant mode: {payload.assistant_mode_id}",
-        )
-    await _ensure_user_exists(users, payload.user_id)
-    if payload.workspace_id is not None:
-        workspace = await workspaces.get_workspace(payload.workspace_id, payload.user_id)
-        if workspace is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Workspace not found for user",
-            )
-    return await conversations.create_conversation(
-        conversation_id=None,
-        user_id=payload.user_id,
-        workspace_id=payload.workspace_id,
-        assistant_mode_id=payload.assistant_mode_id,
-        title=payload.title,
-        metadata=payload.metadata,
-    )
+            detail="Conversation not found for user",
+        ) from None
+    except WorkspaceNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except UnknownAssistantModeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except AssistantModeMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
 
 
 @router.post("/workspaces")
@@ -91,8 +125,12 @@ async def create_workspace(
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     await _ensure_user_exists(users, payload.user_id)
+    if payload.workspace_id is not None:
+        existing = await workspaces.get_workspace(payload.workspace_id, payload.user_id)
+        if existing is not None:
+            return existing
     return await workspaces.create_workspace(
-        workspace_id=None,
+        workspace_id=payload.workspace_id,
         user_id=payload.user_id,
         name=payload.name,
         metadata=payload.metadata,
@@ -116,6 +154,7 @@ async def chat_reply(
             include_thinking=payload.include_thinking,
             metadata=payload.metadata,
             debug=payload.debug,
+            attachments=payload.attachments,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -146,3 +185,136 @@ async def chat_reply(
         retrieval_event_id=result.retrieval_event_id,
         debug=result.debug,
     )
+
+
+@router.post("/conversations/{conversation_id}/context", response_model=ContextResult)
+async def get_sidecar_context(
+    conversation_id: str,
+    payload: SidecarContextRequest,
+    request: Request,
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> ContextResult:
+    ensure_user_access(payload.user_id, auth_context)
+    try:
+        return await SidecarService(get_runtime(request)).get_context(
+            user_id=payload.user_id,
+            conversation_id=conversation_id,
+            message=payload.message_text,
+            mode=payload.assistant_mode_id,
+            workspace_id=payload.workspace_id,
+            occurred_at=payload.message_occurred_at,
+            attachments=[
+                attachment.model_dump(mode="json") for attachment in payload.attachments
+            ],
+        )
+    except ConversationNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found for user",
+        ) from None
+    except WorkspaceNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except UnknownAssistantModeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except AssistantModeMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+
+@router.post("/conversations/{conversation_id}/messages", response_model=SidecarMutationResponse)
+async def ingest_sidecar_message(
+    conversation_id: str,
+    payload: SidecarIngestMessageRequest,
+    request: Request,
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> SidecarMutationResponse:
+    ensure_user_access(payload.user_id, auth_context)
+    try:
+        await SidecarService(get_runtime(request)).ingest_message(
+            user_id=payload.user_id,
+            conversation_id=conversation_id,
+            role=payload.role,
+            text=payload.text,
+            mode=payload.assistant_mode_id,
+            workspace_id=payload.workspace_id,
+            occurred_at=payload.occurred_at,
+            attachments=[
+                attachment.model_dump(mode="json") for attachment in payload.attachments
+            ],
+        )
+    except ConversationNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found for user",
+        ) from None
+    except WorkspaceNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except UnknownAssistantModeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except AssistantModeMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    return SidecarMutationResponse()
+
+
+@router.post("/conversations/{conversation_id}/responses", response_model=SidecarMutationResponse)
+async def add_sidecar_response(
+    conversation_id: str,
+    payload: SidecarAddResponseRequest,
+    request: Request,
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> SidecarMutationResponse:
+    ensure_user_access(payload.user_id, auth_context)
+    try:
+        await SidecarService(get_runtime(request)).add_response(
+            user_id=payload.user_id,
+            conversation_id=conversation_id,
+            text=payload.text,
+            occurred_at=payload.occurred_at,
+        )
+    except ConversationNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found for user",
+        ) from None
+    return SidecarMutationResponse()
+
+
+@router.post("/flush", response_model=FlushResponse)
+async def flush_sidecar_work(
+    payload: FlushRequest,
+    request: Request,
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> FlushResponse:
+    ensure_user_access(payload.user_id, auth_context)
+    runtime = get_runtime(request)
+    if not runtime.settings.workers_enabled:
+        return FlushResponse(completed=False)
+    completed = await runtime.storage_backend.drain(payload.timeout_seconds)
+    return FlushResponse(completed=completed)

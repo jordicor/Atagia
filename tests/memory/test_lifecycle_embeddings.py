@@ -9,11 +9,12 @@ import pytest
 
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
+from atagia.core.consent_repository import PendingMemoryConfirmationRepository
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository
 from atagia.memory.lifecycle import MemoryLifecycleManager
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
+from atagia.models.schemas_memory import MemoryCategory, MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -138,7 +139,7 @@ async def test_hard_delete_also_deletes_embedding() -> None:
 
 
 @pytest.mark.asyncio
-async def test_archive_does_not_delete_embedding() -> None:
+async def test_archive_also_deletes_embedding() -> None:
     connection, clock, memories = await _build_runtime()
     embedding_index = TrackingEmbeddingIndex()
     try:
@@ -165,7 +166,7 @@ async def test_archive_does_not_delete_embedding() -> None:
         assert result.archived_count == 1
         assert archived is not None
         assert archived["status"] == MemoryStatus.ARCHIVED.value
-        assert embedding_index.deleted_memory_ids == []
+        assert embedding_index.deleted_memory_ids == ["mem_archive_keep_embedding"]
     finally:
         await connection.close()
 
@@ -198,5 +199,47 @@ async def test_dry_run_skips_embedding_delete_side_effects() -> None:
         assert result.deleted_count == 1
         assert stored is not None
         assert embedding_index.deleted_memory_ids == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_confirmation_also_deletes_embedding_and_marker() -> None:
+    connection, clock, memories = await _build_runtime()
+    embedding_index = TrackingEmbeddingIndex()
+    confirmations = PendingMemoryConfirmationRepository(connection, clock)
+    try:
+        await _create_memory_at(
+            memories,
+            clock,
+            created_at=clock.now() - timedelta(days=8),
+            memory_id="mem_pending_expired",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.CONVERSATION,
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+            confidence=0.9,
+            vitality=0.4,
+        )
+        await confirmations.create_marker(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            memory_id="mem_pending_expired",
+            category=MemoryCategory.UNKNOWN,
+            created_at=(clock.now() - timedelta(days=8)).isoformat(),
+        )
+
+        result = await MemoryLifecycleManager(
+            connection,
+            clock,
+            _settings(),
+            embedding_index=embedding_index,
+        ).run_cycle()
+
+        stored = await memories.get_memory_object("mem_pending_expired", "usr_1")
+        assert result.declined_count == 1
+        assert stored is not None
+        assert stored["status"] == MemoryStatus.DECLINED.value
+        assert embedding_index.deleted_memory_ids == ["mem_pending_expired"]
+        assert await confirmations.get_marker_for_memory("usr_1", "mem_pending_expired") is None
     finally:
         await connection.close()

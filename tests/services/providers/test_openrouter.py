@@ -8,6 +8,7 @@ import pytest
 
 from atagia.core.config import Settings
 from atagia.services.llm_client import (
+    ConfigurationError,
     LLMCompletionRequest,
     LLMCompletionResponse,
     LLMEmbeddingRequest,
@@ -160,6 +161,7 @@ def test_openrouter_default_headers_and_factory_wiring(monkeypatch: pytest.Monke
         llm_scoring_model=None,
         llm_classifier_model=None,
         llm_chat_model=None,
+        embedding_provider_name=None,
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
@@ -224,11 +226,14 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
         llm_scoring_model=None,
         llm_classifier_model=None,
         llm_chat_model=None,
+        embedding_provider_name=None,
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
         workers_enabled=False,
         debug=False,
+        embedding_backend="sqlite_vec",
+        embedding_model="text-embedding-3-small",
     )
 
     client = build_llm_client(settings)
@@ -239,3 +244,139 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
     assert client.provider_name == "anthropic"
     assert client.embedding_provider_name == "openai"
     assert embedding.provider == "openai"
+
+
+def test_build_llm_client_requires_openai_for_anthropic_embeddings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAnthropicProvider(LLMProvider):
+        name = "anthropic"
+        supports_embeddings = False
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+
+        async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+            raise AssertionError("Embeddings should fail at startup before use")
+
+    class FakeOpenRouterProvider(LLMProvider):
+        name = "openrouter"
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+
+        async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+            return LLMEmbeddingResponse(provider=self.name, model=request.model, vectors=[])
+
+    monkeypatch.setattr("atagia.services.providers.AnthropicProvider", FakeAnthropicProvider)
+    monkeypatch.setattr("atagia.services.providers.OpenRouterProvider", FakeOpenRouterProvider)
+
+    settings = Settings(
+        sqlite_path=":memory:",
+        migrations_path="./migrations",
+        manifests_path="./manifests",
+        storage_backend="inprocess",
+        redis_url="redis://localhost:6379/0",
+        llm_provider="anthropic",
+        llm_api_key="anthropic-key",
+        openai_api_key=None,
+        openrouter_api_key="router-key",
+        llm_base_url=None,
+        openrouter_site_url="https://atagia.org",
+        openrouter_app_name="Atagia",
+        llm_extraction_model=None,
+        llm_scoring_model=None,
+        llm_classifier_model=None,
+        llm_chat_model=None,
+        embedding_provider_name=None,
+        service_mode=False,
+        service_api_key=None,
+        admin_api_key=None,
+        workers_enabled=False,
+        debug=False,
+        embedding_backend="sqlite_vec",
+        embedding_model="text-embedding-3-small",
+    )
+
+    with pytest.raises(ConfigurationError, match="OpenRouter is not auto-selected"):
+        build_llm_client(settings)
+
+
+@pytest.mark.asyncio
+async def test_build_llm_client_respects_explicit_embedding_provider_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAnthropicProvider(LLMProvider):
+        name = "anthropic"
+        supports_embeddings = False
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+
+        async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+            raise AssertionError("Anthropic provider should not handle embeddings in this configuration")
+
+    class FakeOpenRouterProvider(LLMProvider):
+        name = "openrouter"
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.embed_calls = 0
+
+        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+
+        async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+            self.embed_calls += 1
+            return LLMEmbeddingResponse(
+                provider=self.name,
+                model=request.model,
+                vectors=[LLMEmbeddingVector(index=0, values=[0.3, 0.4])],
+            )
+
+    monkeypatch.setattr("atagia.services.providers.AnthropicProvider", FakeAnthropicProvider)
+    monkeypatch.setattr("atagia.services.providers.OpenRouterProvider", FakeOpenRouterProvider)
+
+    settings = Settings(
+        sqlite_path=":memory:",
+        migrations_path="./migrations",
+        manifests_path="./manifests",
+        storage_backend="inprocess",
+        redis_url="redis://localhost:6379/0",
+        llm_provider="anthropic",
+        llm_api_key="anthropic-key",
+        openai_api_key=None,
+        openrouter_api_key="router-key",
+        llm_base_url=None,
+        openrouter_site_url="https://atagia.org",
+        openrouter_app_name="Atagia",
+        llm_extraction_model=None,
+        llm_scoring_model=None,
+        llm_classifier_model=None,
+        llm_chat_model=None,
+        embedding_provider_name="openrouter",
+        service_mode=False,
+        service_api_key=None,
+        admin_api_key=None,
+        workers_enabled=False,
+        debug=False,
+        embedding_backend="sqlite_vec",
+        embedding_model="text-embedding-3-small",
+    )
+
+    client = build_llm_client(settings)
+    embedding = await client.embed(
+        LLMEmbeddingRequest(model="text-embedding-3-small", input_texts=["hello"])
+    )
+
+    assert client.provider_name == "anthropic"
+    assert client.embedding_provider_name == "openrouter"
+    assert embedding.provider == "openrouter"

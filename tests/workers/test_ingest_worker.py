@@ -62,6 +62,32 @@ class QueueProvider(LLMProvider):
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
+        if request.metadata.get("purpose") == "need_detection":
+            if not self.outputs:
+                raise AssertionError("No queued output left for this test")
+            output_text = self.outputs.pop(0)
+            payload = json.loads(output_text)
+            if isinstance(payload, list):
+                output_text = json.dumps(
+                    {
+                        "needs": payload,
+                        "temporal_range": None,
+                        "sub_queries": ["retry loop"],
+                        "sparse_query_hints": [
+                            {
+                                "sub_query_text": "retry loop",
+                                "fts_phrase": "retry loop",
+                            }
+                        ],
+                        "query_type": "default",
+                        "retrieval_levels": [0],
+                    }
+                )
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=output_text,
+            )
         if request.metadata.get("purpose") == "intent_classifier_explicit":
             return LLMCompletionResponse(
                 provider=self.name,
@@ -102,10 +128,13 @@ class QueueProvider(LLMProvider):
             )
         if not self.outputs:
             raise AssertionError("No queued output left for this test")
+        output_text = self.outputs.pop(0)
+        if request.metadata.get("purpose") == "memory_extraction":
+            output_text = _with_default_language_codes_json(output_text)
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
-            output_text=self.outputs.pop(0),
+            output_text=output_text,
         )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -138,6 +167,31 @@ def _settings(**overrides: object) -> Settings:
         allow_insecure_http=True,
     )
     return Settings(**{**asdict(settings), **overrides})
+
+
+def _with_default_language_codes_json(output_text: str) -> str:
+    try:
+        payload = json.loads(output_text)
+    except json.JSONDecodeError:
+        return output_text
+    if not isinstance(payload, dict):
+        return output_text
+    for field_name in ("evidences", "beliefs", "contract_signals", "state_updates"):
+        items = payload.get(field_name)
+        if not isinstance(items, list):
+            continue
+        payload[field_name] = [
+            (
+                {
+                    **item,
+                    "language_codes": ["en"],
+                }
+                if isinstance(item, dict) and "canonical_text" in item and "language_codes" not in item
+                else item
+            )
+            for item in items
+        ]
+    return json.dumps(payload)
 
 
 async def _build_runtime(
@@ -312,7 +366,7 @@ async def test_ingest_worker_does_not_ack_failed_job() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_reclaims_failed_pending_job_and_retries_successfully() -> None:
+async def test_ingest_worker_succeeds_when_extraction_retry_recovers_invalid_output() -> None:
     payload = json.dumps(
         {
             "evidences": [
@@ -338,12 +392,11 @@ async def test_ingest_worker_reclaims_failed_pending_job_and_retries_successfull
     try:
         await backend.stream_add(EXTRACT_STREAM_NAME, _extract_job(str(message["id"])).model_dump(mode="json"))
 
-        first = await ingest_worker.run_once()
-        second = await ingest_worker.run_once()
+        result = await ingest_worker.run_once()
 
-        assert first.failed == 1
-        assert second.acked == 1
-        assert second.failed == 0
+        assert result.received == 1
+        assert result.acked == 1
+        assert result.failed == 0
         assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
         stored = await memories.list_for_user("usr_1")
         assert len(stored) == 1
@@ -371,6 +424,56 @@ async def test_ingest_worker_dead_letters_after_max_failed_deliveries() -> None:
         assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
         assert dead_letter is not None
         assert dead_letter["delivery_count"] == 3
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_worker_dead_letter_includes_structured_error_details_after_retry_budget_exhaustion() -> None:
+    invalid_payload = json.dumps(
+        {
+            "evidences": [],
+            "beliefs": [],
+            "contract_signals": [],
+            "state_updates": [
+                {
+                    "canonical_text": "I am on vacation this week.",
+                    "scope": "conversation",
+                    "confidence": 0.9,
+                    "source_kind": "extracted",
+                    "privacy_level": 0,
+                    "payload": {"focus": "vacation"},
+                    "temporal_type": "bounded",
+                    "valid_from_iso": "2023-05-12T00:00:00+00:00",
+                    "valid_to_iso": "2023-05-08T00:00:00+00:00",
+                    "temporal_confidence": 0.82,
+                }
+            ],
+            "mode_guess": None,
+            "nothing_durable": False,
+        }
+    )
+    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+        [invalid_payload] * 9
+    )
+    try:
+        await backend.stream_add(EXTRACT_STREAM_NAME, _extract_job(str(message["id"])).model_dump(mode="json"))
+
+        first = await ingest_worker.run_once()
+        second = await ingest_worker.run_once()
+        third = await ingest_worker.run_once()
+        dead_letter = await backend.dequeue_job(f"dead_letter:{EXTRACT_STREAM_NAME}", timeout_seconds=0)
+
+        assert first.failed == 1
+        assert second.failed == 1
+        assert third.failed == 1
+        assert third.dead_lettered == 1
+        assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
+        assert dead_letter is not None
+        assert dead_letter["error"] == "Provider returned invalid structured output"
+        assert dead_letter["error_details"] == [
+            "$.state_updates[0]: Value error, valid_from_iso must be <= valid_to_iso"
+        ]
     finally:
         await connection.close()
 
@@ -877,6 +980,7 @@ def test_chat_reply_enqueues_stream_jobs_and_worker_processes_extraction(tmp_pat
         workers_enabled=False,
         debug=False,
         allow_insecure_http=True,
+        small_corpus_token_threshold_ratio=0.0,
     )
     provider = QueueProvider(
         [

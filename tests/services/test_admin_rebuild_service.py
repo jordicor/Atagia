@@ -31,6 +31,7 @@ from atagia.models.schemas_memory import (
     MemoryStatus,
     SummaryViewKind,
 )
+from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.admin_rebuild_service import AdminRebuildService
 from atagia.services.llm_client import (
     LLMClient,
@@ -59,7 +60,19 @@ class ExtractorProvider(LLMProvider):
     name = "admin-rebuild-extractor"
 
     def __init__(self, payload: dict[str, object]) -> None:
-        self.payload = payload
+        normalized_payload = dict(payload)
+        normalized_payload["evidences"] = [
+            (
+                {
+                    **item,
+                    "language_codes": ["en"],
+                }
+                if isinstance(item, dict) and "canonical_text" in item and "language_codes" not in item
+                else item
+            )
+            for item in normalized_payload.get("evidences", [])
+        ]
+        self.payload = normalized_payload
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         if request.metadata.get("purpose") == "intent_classifier_claim_key_equivalence":
@@ -113,6 +126,7 @@ class RebuildReplayProvider(LLMProvider):
                                 "confidence": 0.92,
                                 "source_kind": "extracted",
                                 "privacy_level": 0,
+                                "language_codes": ["en"],
                                 "payload": {"kind": "fact"},
                             }
                         ],
@@ -195,10 +209,11 @@ class RebuildReplayProvider(LLMProvider):
                     {
                         "episodes": [
                             {
-                                "source_summary_ids": chunk_ids,
+                                "episode_key": "replay",
                                 "summary_text": "Replay episode summary.",
                             }
-                        ]
+                        ],
+                        "chunk_episode_keys": ["replay"] * len(chunk_ids),
                     }
                 ),
             )
@@ -229,6 +244,21 @@ class RebuildReplayProvider(LLMProvider):
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError(f"Embedding is not expected in this test: {request.metadata}")
+
+
+class RecordingEmbeddingIndex(EmbeddingIndex):
+    @property
+    def vector_limit(self) -> int:
+        return 1
+
+    async def upsert(self, memory_id: str, text: str, metadata: dict[str, object]) -> None:
+        return None
+
+    async def search(self, query: str, user_id: str, top_k: int):
+        return []
+
+    async def delete(self, memory_id: str) -> None:
+        return None
 
 
 def _settings() -> Settings:
@@ -795,5 +825,46 @@ async def test_rebuild_user_processes_workspace_rollups_synchronously() -> None:
         assert result.workspace_rollup_jobs_processed == 1
         assert len(workspace_rollups) == 1
         assert workspace_rollups[0]["summary_text"] == "Workspace summary"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_rebuild_service_passes_embedding_index_to_revision_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    captured: dict[str, object] = {}
+    embedding_index = RecordingEmbeddingIndex()
+    try:
+        await users.create_user("usr_1")
+
+        class FakeRevisionWorker:
+            def __init__(self, *, embedding_index, **kwargs) -> None:
+                captured["embedding_index"] = embedding_index
+
+            async def process_job(self, payload):
+                return None
+
+        monkeypatch.setattr("atagia.services.admin_rebuild_service.RevisionWorker", FakeRevisionWorker)
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=NoOpProvider.name,
+                providers=[NoOpProvider()],
+            ),
+            embedding_index=embedding_index,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        await service.rebuild_user("usr_1")
+
+        assert captured["embedding_index"] is embedding_index
     finally:
         await connection.close()
