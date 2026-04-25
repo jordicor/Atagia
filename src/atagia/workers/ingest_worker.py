@@ -299,6 +299,7 @@ class IngestWorker:
             message_ids=[payload.source_message_id],
             payload=payload.model_dump(mode="json"),
             created_at=envelope.created_at,
+            operational_profile=envelope.operational_profile,
         )
         await self._storage_backend.stream_add(
             REVISE_STREAM_NAME,
@@ -341,6 +342,7 @@ class IngestWorker:
                 job_kind=CompactionJobKind.CONVERSATION_CHUNK,
             ).model_dump(mode="json"),
             created_at=envelope.created_at,
+            operational_profile=envelope.operational_profile,
         )
         await self._storage_backend.stream_add(
             COMPACT_STREAM_NAME,

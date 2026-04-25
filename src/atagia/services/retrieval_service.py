@@ -9,6 +9,7 @@ import aiosqlite
 
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
 from atagia.models.schemas_memory import ExtractionConversationContext, RetrievalTrace
+from atagia.models.schemas_memory import ResolvedOperationalProfile
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
@@ -32,6 +33,7 @@ class RetrievalService:
         conversation_id: str,
         message_text: str,
         mode: str | None = None,
+        operational_profile: ResolvedOperationalProfile | None = None,
         ablation: AblationConfig | None = None,
         trace: RetrievalTrace | None = None,
     ) -> PipelineResult:
@@ -44,6 +46,7 @@ class RetrievalService:
                 conversation_id=conversation_id,
                 message_text=message_text,
                 mode=mode,
+                operational_profile=operational_profile,
                 ablation=ablation,
                 trace=trace,
             )
@@ -58,6 +61,7 @@ class RetrievalService:
         conversation_id: str,
         message_text: str,
         mode: str | None = None,
+        operational_profile: ResolvedOperationalProfile | None = None,
         ablation: AblationConfig | None = None,
         conversation: dict[str, Any] | None = None,
         stored_messages: list[dict[str, Any]] | None = None,
@@ -69,6 +73,7 @@ class RetrievalService:
             conversation_id=conversation_id,
             message_text=message_text,
             mode=mode,
+            operational_profile=operational_profile,
             ablation=ablation,
             conversation=conversation,
             stored_messages=stored_messages,
@@ -83,6 +88,7 @@ class RetrievalService:
         conversation_id: str,
         message_text: str,
         mode: str | None = None,
+        operational_profile: ResolvedOperationalProfile | None = None,
         ablation: AblationConfig | None = None,
         conversation: dict[str, Any] | None = None,
         stored_messages: list[dict[str, Any]] | None = None,
@@ -104,6 +110,7 @@ class RetrievalService:
             self.runtime.manifests,
             assistant_mode_id,
             self.runtime.policy_resolver,
+            operational_profile,
         )
         active_messages = stored_messages or await messages.get_recent_messages(
             conversation_id,

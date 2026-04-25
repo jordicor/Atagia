@@ -91,6 +91,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated category tags to filter questions",
     )
     parser.add_argument(
+        "--questions",
+        default=None,
+        help="Comma-separated question ids to run",
+    )
+    parser.add_argument(
         "--manifests-dir",
         default=str(_DEFAULT_MANIFESTS_DIR),
         help="Path to the Atagia manifests directory",
@@ -128,6 +133,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the data directory (default: built-in data/)",
     )
+    parser.add_argument(
+        "--trusted-evaluation",
+        action="store_true",
+        help=(
+            "Run in controlled local benchmark mode: raise retrieval privacy "
+            "ceiling and allow sensitive facts from retrieved benchmark context"
+        ),
+    )
     return parser
 
 
@@ -160,7 +173,9 @@ async def _run_async(
     report = await runner.run(
         persona_ids=_parse_csv_list(args.personas),
         category_tags=_parse_csv_list(args.categories),
+        question_ids=_parse_csv_list(args.questions),
         ablation=_parse_ablation(args.ablation),
+        trusted_evaluation=args.trusted_evaluation,
     )
     report_path = runner.save_report(report, args.output)
 
@@ -210,6 +225,7 @@ def _format_report_summary(
         f"Duration: {_format_duration(report.run_duration_seconds)}",
         f"Personas: {', '.join(report.personas_used)}",
         f"Model: {report.config.get('provider', '')} / {report.config.get('answer_model', '')}",
+        f"Trusted evaluation: {bool(report.config.get('trusted_evaluation', False))}",
         "",
         "Category breakdown:",
     ]

@@ -21,12 +21,13 @@ Atagia scores each candidate memory across multiple dimensions (task fit, mode f
 - **Consent-gated memory** -- sensitive information is stored only after user confirmation, with per-user category tracking
 - **Temporal grounding** -- resolves relative dates ("last Saturday", "three weeks ago") against source timestamps into actual calendar dates
 - **Adaptive context caching** -- deterministic staleness scoring serves cached results on follow-up turns when context has not significantly changed
+- **Operational profiles (experimental)** -- per-request runtime condition presets (`normal`, `low_power`, `offline`, `emergency`, `disaster`) are normalized, authorized, and carried through cache/events/jobs
 - **Two-level text chunking** -- rule-based + AI-assisted splitting handles voice transcriptions and long pastes before extraction
 - **All storage in SQLite** -- no external vector DB required; sqlite-vec available for optional embedding recall
 
 ## Current status
 
-Atagia is functional and under active development. The core pipeline is implemented and tested with 539 unit and integration tests.
+Atagia is functional and under active development. The core pipeline is implemented and covered by a broad unit, integration, API, MCP, worker, and benchmark-oriented test suite.
 
 What works today:
 - Memory extraction from conversations with LLM-based applicability scoring
@@ -38,14 +39,15 @@ What works today:
 - Belief revision with 8 strategies and full version history
 - Consequence chain learning and interaction contract observation
 - Adaptive context cache with deterministic staleness scoring
-- Two-level text chunking for long messages (voice transcriptions, pastes)
+- Operational profile plumbing for runtime condition-aware integrations
+- Optional two-level text chunking for long messages (voice transcriptions, pastes)
 - Query-aware context selection with diversity reranking
 - Library mode, REST API, and MCP server
 - LoCoMo benchmark harness with ablation support and replay probes
 
 What is in progress or planned:
-- **Vector embeddings**: candidate search now supports optional sqlite-vec semantic recall on top of FTS5. This is aimed at multi-hop and sparse-keyword questions across larger personal corpora.
-- **Benchmark coverage**: the LoCoMo harness runs end-to-end. A ground truth audit of the LoCoMo conv-26 subset found factual errors and ambiguous items in the dataset ([details](https://github.com/snap-research/locomo/issues/35)). A separate benchmark (Atagia-bench) is in design to cover behaviors LoCoMo does not test: verbatim recall, consent boundaries, privacy scoping, and abstention.
+- **Vector embeddings**: candidate search now supports optional sqlite-vec semantic recall on top of FTS5 for local/pre-alpha recall experiments. Service mode rejects sqlite-vec until vector ranking is user-partitioned before ranking.
+- **Benchmark coverage**: see the [Evaluation status](#evaluation-status) section below for current signals and methodology.
 - **Neo4j graph layer**: planned for relationship traversal where flat retrieval is insufficient. Will ship only if benchmark evidence justifies the complexity.
 
 ## Quick start
@@ -189,6 +191,7 @@ Messages accept an optional `occurred_at` ISO timestamp for historical data wher
 | `db_path` | `"atagia.db"` | SQLite database path |
 | `redis_url` | `None` | Optional Redis URL for cache and queues |
 | `manifests_dir` | Built-in | Directory with assistant mode JSON manifests |
+| `operational_profiles_dir` | Built-in | Directory with canonical operational profile JSON presets |
 | `llm_provider` | From env | `"anthropic"`, `"openai"`, or `"openrouter"` |
 | `llm_api_key` | From env | API key for the LLM provider |
 | `llm_model` | From env | Model name for extraction, scoring, and chat |
@@ -196,7 +199,7 @@ Messages accept an optional `occurred_at` ISO timestamp for historical data wher
 | `embedding_provider_name` | From env | Optional override for which provider handles embeddings |
 | `embedding_model` | `None` | Embedding model name (required when backend is `sqlite_vec`) |
 | `context_cache_enabled` | `True` | Enable adaptive context caching |
-| `chunking_enabled` | `True` | Enable intelligent chunking for long messages |
+| `chunking_enabled` | From env (`False` by default) | Enable intelligent chunking for long messages |
 | `skip_belief_revision` | `False` | Disable belief revision (for benchmarks/ablation) |
 | `skip_compaction` | `False` | Disable compaction (for benchmarks/ablation) |
 
@@ -328,6 +331,14 @@ Memory is not a flat global profile. Each assistant mode defines its own retriev
 
 Policies control which scopes are allowed, what memory types are preferred, privacy ceilings, context budgets, and retrieval parameters. Custom modes are defined as JSON manifests.
 
+### Operational profiles
+
+Operational profiles describe the runtime conditions for one request. Assistant modes answer "what kind of interaction is this?", while operational profiles answer "what condition is the device/person/environment in right now?"
+
+Phase 0 is intentionally behavior-neutral: Atagia validates and authorizes profiles, includes them in context-cache keys, stores profile snapshots in cache entries and job envelopes, and logs them in retrieval events. The built-in profile policy overrides are empty, so existing clients that do not pass `operational_profile` behave exactly like `operational_profile="normal"`.
+
+Canonical profiles are sealed for now: `normal`, `low_power`, `offline`, `emergency`, and `disaster`. High-risk profiles are opt-in via settings before they can be used.
+
 ### Belief revision
 
 When new evidence conflicts with an existing belief, the system chooses among eight actions:
@@ -352,7 +363,7 @@ These chains surface during retrieval when follow-up failure or loop signals are
 
 Atagia caches retrieval results and serves them on follow-up turns when the context has not significantly changed. A deterministic staleness scorer evaluates message count, elapsed time, topic continuity, and interaction pace to decide whether to serve from cache or refresh.
 
-Cache entries are bound to the active policy hash (manifest changes force misses), validated against the current workspace, and invalidated on any mutation (new messages, memory edits, rebuilds, workspace changes). MCP and benchmark paths always use fresh retrieval.
+Cache entries are bound to the active policy hash and operational profile token (manifest/profile changes force misses), validated against the current workspace, and invalidated on any mutation (new messages, memory edits, rebuilds, workspace changes). MCP and benchmark paths always use fresh retrieval.
 
 ### Intelligent chunking
 
@@ -427,9 +438,17 @@ pip install -e ".[dev,mcp]"
 python -m pytest tests/ -v
 ```
 
+## Evaluation status
+
+Atagia is evaluated with both LoCoMo and an internal regression suite, Atagia-bench.
+
+LoCoMo is useful as a community benchmark, but full runs are slow and some ground-truth issues in the dataset are still being audited ([details](https://github.com/snap-research/locomo/issues/35)). Atagia-bench is faster and focuses on the behaviors Atagia is designed to get right: consent gating, privacy and mode boundaries, abstention, belief revision, supersession, exact recall, cross-conversation aggregation, preferences, and multilingual smoke cases.
+
+Current internal signal: 60/64 pass rate (93.8%), with remaining failures concentrated around high-risk secret/code recall policy. These numbers are development signals, not public competitive claims; reproducible public baselines and holdout evaluation are still being hardened.
+
 ## Benchmarking
 
-Atagia includes a LoCoMo benchmark harness with a dataset downloader, LLM judge scorer, ablation presets, and CLI summary output.
+Atagia includes a LoCoMo benchmark harness with a dataset downloader, LLM judge scorer, correction overlays, ablation presets, diff reporting, and CLI summary output.
 
 ```bash
 python -m benchmarks.locomo.download
@@ -442,6 +461,8 @@ python -m benchmarks.locomo \
 
 Available ablation presets: `similarity_only`, `no_contract`, `no_scope`, `no_need_detection`, `no_revision`, `no_compaction`.
 
+Benchmark status is still pre-alpha. Use the harness for regression tracking and reproducibility work; do not treat current local numbers as a published competitive claim.
+
 ## Roadmap
 
 | Phase | Focus | Status |
@@ -449,10 +470,10 @@ Available ablation presets: `similarity_only`, `no_contract`, `no_scope`, `no_ne
 | 1 | Core memory system: extraction, retrieval, scoring, contracts, lifecycle, API | Done |
 | 2 | Belief revision, consequence chains, compaction, evaluation, replay | Done |
 | 2.5 | Library mode, MCP server | Done |
-| 3 | Benchmark harness, adaptive context cache, text chunking, temporal timestamps | Done |
-| 3.5 | Retrieval quality: RRF hybrid scoring, temporal grounding, contextual indexing, memory hierarchy, natural memory capture, consent gating | Done |
-| 4 | Embeddings activation and tuning: sqlite-vec backfill, validation, and semantic recall operations | In progress |
-| 5 | Neo4j graph layer for relationship-aware retrieval | Planned |
+| 3 | Benchmark foundation, offline ingestion, LoCoMo harness, ablations, reporting | In progress |
+| 3.5 | Retrieval quality waves, adaptive context cache, text chunking, temporal grounding, memory hierarchy, natural memory capture, consent gating | Mostly done / stabilizing |
+| 4 | Evidence and reliability: reproducible benchmark baselines, high-risk policy, retrieval hardening, compaction validation, relational memory slice | Next |
+| 5 | Graph or SaaS expansion | Deferred until benchmark evidence or user demand justifies it |
 
 ## Research
 

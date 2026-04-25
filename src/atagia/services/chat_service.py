@@ -27,6 +27,7 @@ from atagia.services.chat_support import (
     missing_uncovered_tail_start_seq,
     render_transcript_window,
     resolve_assistant_mode_id,
+    resolve_operational_profile,
     resolve_policy,
     summarize_memory_summaries,
 )
@@ -56,6 +57,8 @@ class ChatService:
         include_thinking: bool = False,
         metadata: dict[str, Any] | None = None,
         debug: bool = False,
+        operational_profile: str | None = None,
+        operational_signals: Any | None = None,
     ) -> ChatResult:
         """Run the full retrieval, generation, persistence, and background-job flow."""
         cache_service = ContextCacheService(self.runtime)
@@ -85,10 +88,17 @@ class ChatService:
                     str(conversation["assistant_mode_id"]),
                     assistant_mode_id,
                 )
+                resolved_operational_profile = resolve_operational_profile(
+                    loader=self.runtime.operational_profile_loader,
+                    settings=self.runtime.settings,
+                    operational_profile=operational_profile,
+                    operational_signals=operational_signals,
+                )
                 resolved_policy = resolve_policy(
                     self.runtime.manifests,
                     resolved_mode_id,
                     self.runtime.policy_resolver,
+                    resolved_operational_profile,
                 )
                 attachment_bundle = artifacts.prepare_attachments(
                     message_text=message_text,
@@ -137,6 +147,8 @@ class ChatService:
                     assistant_mode_id=assistant_mode_id,
                     stored_messages=prior_messages,
                     conversation=conversation,
+                    operational_profile=operational_profile,
+                    operational_signals=operational_signals,
                 )
                 transcript_entries = build_transcript_window(
                     prior_messages,
@@ -262,6 +274,9 @@ class ChatService:
                                 "scored_candidates": resolution.scored_candidates,
                                 "stage_timings_ms": resolution.stage_timings,
                                 "transcript_window": transcript_trace,
+                                "operational_profile": (
+                                    resolution.resolved_operational_profile.snapshot.model_dump(mode="json")
+                                ),
                                 **resolution.candidate_search_summary,
                             },
                         },
@@ -284,8 +299,7 @@ class ChatService:
 
                 try:
                     if invalidate_confirmation_cache:
-                        if resolution.cache_key is not None:
-                            await self.runtime.storage_backend.delete_context_view(str(resolution.cache_key))
+                        await cache_service.invalidate_conversation_cache_for_conversation(conversation)
                     else:
                         await cache_service.publish_pending_cache_entry(
                             resolution,
@@ -352,6 +366,7 @@ class ChatService:
                     message_text=prompt_message_text,
                     occurred_at=resolve_message_occurred_at(user_message),
                     role="user",
+                    operational_profile=resolution.resolved_operational_profile.snapshot,
                 )
                 assistant_jobs = build_message_jobs(
                     clock=self.runtime.clock,
@@ -361,6 +376,7 @@ class ChatService:
                     message_text=llm_response.output_text,
                     occurred_at=resolve_message_occurred_at(assistant_message),
                     role="assistant",
+                    operational_profile=resolution.resolved_operational_profile.snapshot,
                 )
                 try:
                     enqueued_job_ids = await enqueue_message_jobs(

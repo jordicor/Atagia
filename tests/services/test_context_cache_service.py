@@ -11,7 +11,13 @@ import pytest
 from atagia.app import AppRuntime, initialize_runtime
 from atagia.core.config import Settings
 from atagia.core.repositories import ConversationRepository, UserRepository
+from atagia.memory.policy_manifest import compute_effective_policy_hash
 from atagia.models.schemas_replay import AblationConfig
+from atagia.services.chat_support import (
+    default_operational_profile_snapshot,
+    resolve_operational_profile,
+    resolve_policy,
+)
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.llm_client import (
     LLMClient,
@@ -155,6 +161,73 @@ async def _seed_conversation(
         await connection.close()
 
 
+def _normal_cache_key(
+    runtime: AppRuntime,
+    service: ContextCacheService,
+    conversation: dict[str, object],
+) -> str:
+    snapshot = default_operational_profile_snapshot(
+        loader=runtime.operational_profile_loader,
+        settings=runtime.settings,
+    )
+    return service.build_cache_key(
+        user_id=str(conversation["user_id"]),
+        assistant_mode_id=str(conversation["assistant_mode_id"]),
+        conversation_id=str(conversation["id"]),
+        workspace_id=conversation.get("workspace_id"),
+        operational_profile_token=snapshot.token,
+    )
+
+
+def _cache_entry_payload(
+    runtime: AppRuntime,
+    *,
+    cache_key: str,
+    policy_prompt_hash: str | None = None,
+    workspace_id: str | None = None,
+) -> dict[str, object]:
+    resolved_operational_profile = resolve_operational_profile(
+        loader=runtime.operational_profile_loader,
+        settings=runtime.settings,
+    )
+    resolved_policy = resolve_policy(
+        runtime.manifests,
+        "coding_debug",
+        runtime.policy_resolver,
+        resolved_operational_profile,
+    )
+    return {
+        "cache_key": cache_key,
+        "user_id": "usr_1",
+        "conversation_id": "cnv_1",
+        "assistant_mode_id": "coding_debug",
+        "policy_prompt_hash": policy_prompt_hash or resolved_policy.prompt_hash,
+        "effective_policy_hash": compute_effective_policy_hash(resolved_policy),
+        "operational_profile": resolved_operational_profile.snapshot.model_dump(mode="json"),
+        "workspace_id": workspace_id,
+        "composed_context": {
+            "contract_block": "",
+            "workspace_block": "",
+            "memory_block": "",
+            "state_block": "",
+            "selected_memory_ids": [],
+            "total_tokens_estimate": 0,
+            "budget_tokens": 500,
+            "items_included": 0,
+            "items_dropped": 0,
+        },
+        "contract": {},
+        "memory_summaries": [],
+        "detected_needs": [],
+        "source_retrieval_plan": {},
+        "selected_memory_ids": [],
+        "cached_at": runtime.clock.now().isoformat(),
+        "last_retrieval_message_seq": 1,
+        "last_user_message_text": "retry loop",
+        "source": "sync",
+    }
+
+
 @pytest.mark.asyncio
 async def test_context_cache_service_cache_miss_builds_pending_entry_and_publishes(
     tmp_path: Path,
@@ -242,6 +315,47 @@ async def test_context_cache_service_cache_hit_skips_need_detection(
 
 
 @pytest.mark.asyncio
+async def test_context_cache_service_operational_profile_changes_cache_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+
+        connection = await runtime.open_connection()
+        try:
+            normal = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="Please help me debug this retry loop.",
+            )
+        finally:
+            await connection.close()
+        await service.publish_pending_cache_entry(normal, last_retrieval_message_seq=1)
+
+        connection = await runtime.open_connection()
+        try:
+            offline = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="continue",
+                operational_profile="offline",
+            )
+        finally:
+            await connection.close()
+
+        assert normal.cache_key != offline.cache_key
+        assert offline.from_cache is False
+        assert offline.resolved_operational_profile.snapshot.profile_id == "offline"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_context_cache_service_policy_hash_mismatch_forces_sync(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -250,42 +364,50 @@ async def test_context_cache_service_policy_hash_mismatch_forces_sync(
     try:
         conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
         service = ContextCacheService(runtime)
-        cache_key = service.build_cache_key(
-            user_id="usr_1",
-            assistant_mode_id=str(conversation["assistant_mode_id"]),
-            conversation_id="cnv_1",
-            workspace_id=conversation.get("workspace_id"),
-        )
+        cache_key = _normal_cache_key(runtime, service, conversation)
         await runtime.storage_backend.set_context_view(
             cache_key,
-            {
-                "cache_key": cache_key,
-                "user_id": "usr_1",
-                "conversation_id": "cnv_1",
-                "assistant_mode_id": "coding_debug",
-                "policy_prompt_hash": "mismatch",
-                "workspace_id": None,
-                "composed_context": {
-                    "contract_block": "",
-                    "workspace_block": "",
-                    "memory_block": "",
-                    "state_block": "",
-                    "selected_memory_ids": [],
-                    "total_tokens_estimate": 0,
-                    "budget_tokens": 500,
-                    "items_included": 0,
-                    "items_dropped": 0,
-                },
-                "contract": {},
-                "memory_summaries": [],
-                "detected_needs": [],
-                "source_retrieval_plan": {},
-                "selected_memory_ids": [],
-                "cached_at": runtime.clock.now().isoformat(),
-                "last_retrieval_message_seq": 1,
-                "last_user_message_text": "retry loop",
-                "source": "sync",
-            },
+            _cache_entry_payload(
+                runtime,
+                cache_key=cache_key,
+                policy_prompt_hash="mismatch",
+            ),
+            ttl_seconds=30,
+        )
+
+        connection = await runtime.open_connection()
+        try:
+            resolution = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="continue",
+            )
+        finally:
+            await connection.close()
+
+        assert resolution.from_cache is False
+        assert resolution.pending_cache_entry is not None
+        assert await runtime.storage_backend.get_context_view(cache_key) is None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_effective_policy_hash_mismatch_forces_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+        cache_key = _normal_cache_key(runtime, service, conversation)
+        payload = _cache_entry_payload(runtime, cache_key=cache_key)
+        payload["effective_policy_hash"] = "mismatch"
+        await runtime.storage_backend.set_context_view(
+            cache_key,
+            payload,
             ttl_seconds=30,
         )
 
@@ -316,42 +438,14 @@ async def test_context_cache_service_workspace_mismatch_forces_sync(
     try:
         conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
         service = ContextCacheService(runtime)
-        cache_key = service.build_cache_key(
-            user_id="usr_1",
-            assistant_mode_id=str(conversation["assistant_mode_id"]),
-            conversation_id="cnv_1",
-            workspace_id=conversation.get("workspace_id"),
-        )
+        cache_key = _normal_cache_key(runtime, service, conversation)
         await runtime.storage_backend.set_context_view(
             cache_key,
-            {
-                "cache_key": cache_key,
-                "user_id": "usr_1",
-                "conversation_id": "cnv_1",
-                "assistant_mode_id": "coding_debug",
-                "policy_prompt_hash": runtime.manifests["coding_debug"].prompt_hash,
-                "workspace_id": "wrk_1",
-                "composed_context": {
-                    "contract_block": "",
-                    "workspace_block": "",
-                    "memory_block": "",
-                    "state_block": "",
-                    "selected_memory_ids": [],
-                    "total_tokens_estimate": 0,
-                    "budget_tokens": 500,
-                    "items_included": 0,
-                    "items_dropped": 0,
-                },
-                "contract": {},
-                "memory_summaries": [],
-                "detected_needs": [],
-                "source_retrieval_plan": {},
-                "selected_memory_ids": [],
-                "cached_at": runtime.clock.now().isoformat(),
-                "last_retrieval_message_seq": 1,
-                "last_user_message_text": "retry loop",
-                "source": "sync",
-            },
+            _cache_entry_payload(
+                runtime,
+                cache_key=cache_key,
+                workspace_id="wrk_1",
+            ),
             ttl_seconds=30,
         )
 
@@ -382,12 +476,7 @@ async def test_context_cache_service_invalid_cache_entry_is_deleted_before_sync(
     try:
         conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
         service = ContextCacheService(runtime)
-        cache_key = service.build_cache_key(
-            user_id="usr_1",
-            assistant_mode_id=str(conversation["assistant_mode_id"]),
-            conversation_id="cnv_1",
-            workspace_id=conversation.get("workspace_id"),
-        )
+        cache_key = _normal_cache_key(runtime, service, conversation)
         await runtime.storage_backend.set_context_view(
             cache_key,
             {"cache_key": cache_key},

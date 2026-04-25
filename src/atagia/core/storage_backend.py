@@ -23,6 +23,15 @@ def extract_context_view_user_id(context_view: dict[str, Any]) -> str | None:
     return normalized or None
 
 
+def extract_context_view_conversation_id(context_view: dict[str, Any]) -> str | None:
+    """Best-effort conversation identifier extraction for cache invalidation indexes."""
+    conversation_id = context_view.get("conversation_id")
+    if not isinstance(conversation_id, str):
+        return None
+    normalized = conversation_id.strip()
+    return normalized or None
+
+
 class StorageBackend:
     """Interface for Redis-backed or in-process transient state."""
 
@@ -56,6 +65,13 @@ class StorageBackend:
         raise NotImplementedError
 
     async def delete_context_views_for_user(self, user_id: str) -> int:
+        raise NotImplementedError
+
+    async def delete_context_views_for_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> int:
         raise NotImplementedError
 
     async def enqueue_job(self, queue_name: str, payload: dict[str, Any]) -> None:
@@ -137,6 +153,7 @@ class InProcessBackend(StorageBackend):
     _recent_windows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _context_views: dict[str, "_InProcessContextViewEntry"] = field(default_factory=dict)
     _context_view_keys_by_user: dict[str, set[str]] = field(default_factory=dict)
+    _context_view_keys_by_conversation: dict[tuple[str, str], set[str]] = field(default_factory=dict)
     _dedupe_keys: dict[str, float] = field(default_factory=dict)
     _locks: dict[str, tuple[float, str]] = field(default_factory=dict)
     _cache_generations: dict[str, int] = field(default_factory=dict)
@@ -176,6 +193,13 @@ class InProcessBackend(StorageBackend):
                 keys.discard(key)
                 if not keys:
                     self._context_view_keys_by_user.pop(entry.user_id, None)
+        if entry.user_id is not None and entry.conversation_id is not None:
+            index_key = (entry.user_id, entry.conversation_id)
+            keys = self._context_view_keys_by_conversation.get(index_key)
+            if keys is not None:
+                keys.discard(key)
+                if not keys:
+                    self._context_view_keys_by_conversation.pop(index_key, None)
         return True
 
     def _store_context_view_locked(
@@ -188,14 +212,21 @@ class InProcessBackend(StorageBackend):
         self._delete_context_view_locked(key)
         expires_at = monotonic() + ttl_seconds
         user_id = extract_context_view_user_id(context_view)
+        conversation_id = extract_context_view_conversation_id(context_view)
         self._context_views[key] = _InProcessContextViewEntry(
             expires_at=expires_at,
             payload=copy.deepcopy(context_view),
             monotonic_seq=monotonic_seq,
             user_id=user_id,
+            conversation_id=conversation_id,
         )
         if user_id is not None:
             self._context_view_keys_by_user.setdefault(user_id, set()).add(key)
+            if conversation_id is not None:
+                self._context_view_keys_by_conversation.setdefault(
+                    (user_id, conversation_id),
+                    set(),
+                ).add(key)
 
     async def get_recent_window(self, key: str) -> list[dict[str, Any]] | None:
         with self._guard:
@@ -260,6 +291,20 @@ class InProcessBackend(StorageBackend):
         with self._guard:
             self._purge_expired()
             keys = list(self._context_view_keys_by_user.get(user_id, set()))
+            deleted = 0
+            for key in keys:
+                if self._delete_context_view_locked(key):
+                    deleted += 1
+            return deleted
+
+    async def delete_context_views_for_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> int:
+        with self._guard:
+            self._purge_expired()
+            keys = list(self._context_view_keys_by_conversation.get((user_id, conversation_id), set()))
             deleted = 0
             for key in keys:
                 if self._delete_context_view_locked(key):
@@ -451,6 +496,7 @@ class InProcessBackend(StorageBackend):
             self._recent_windows.clear()
             self._context_views.clear()
             self._context_view_keys_by_user.clear()
+            self._context_view_keys_by_conversation.clear()
             self._dedupe_keys.clear()
             self._locks.clear()
             self._cache_generations.clear()
@@ -468,3 +514,4 @@ class _InProcessContextViewEntry:
     payload: dict[str, Any]
     monotonic_seq: int | None = None
     user_id: str | None = None
+    conversation_id: str | None = None

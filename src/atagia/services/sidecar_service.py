@@ -25,6 +25,7 @@ from atagia.services.chat_support import (
     build_message_jobs,
     build_system_prompt,
     enqueue_message_jobs,
+    resolve_operational_profile,
     resolve_policy,
 )
 from atagia.services.context_cache_service import ContextCacheService
@@ -54,6 +55,8 @@ class SidecarService:
         occurred_at: str | None = None,
         ablation: AblationConfig | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        operational_profile: str | None = None,
+        operational_signals: Any | None = None,
     ) -> ContextResult:
         """Run retrieval, persist the user message, and return a ready system prompt."""
         cache_service = ContextCacheService(self.runtime)
@@ -91,6 +94,8 @@ class SidecarService:
                     assistant_mode_id=mode,
                     stored_messages=prior_messages,
                     conversation=conversation,
+                    operational_profile=operational_profile,
+                    operational_signals=operational_signals,
                     ablation=ablation,
                 )
                 await connection.execute("BEGIN")
@@ -145,6 +150,7 @@ class SidecarService:
                 prior_messages=prior_messages,
                 message_text=prompt_message_text,
                 role="user",
+                operational_profile=resolution.resolved_operational_profile.snapshot,
             )
             if self.runtime.settings.lifecycle_lazy_enabled:
                 self.runtime.spawn_background_task(
@@ -183,6 +189,8 @@ class SidecarService:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        operational_profile: str | None = None,
+        operational_signals: Any | None = None,
     ) -> None:
         """Store a message and enqueue extraction without running retrieval."""
         if role not in {"user", "assistant"}:
@@ -191,6 +199,12 @@ class SidecarService:
         cache_service = ContextCacheService(self.runtime)
         async with cache_service.user_cache_guard(user_id):
             await wait_for_in_memory_worker_quiescence(self.runtime)
+            resolved_operational_profile = resolve_operational_profile(
+                loader=self.runtime.operational_profile_loader,
+                settings=self.runtime.settings,
+                operational_profile=operational_profile,
+                operational_signals=operational_signals,
+            )
             connection = await self.runtime.open_connection()
             conversation: dict[str, Any] | None = None
             prior_messages: list[dict[str, Any]] = []
@@ -270,6 +284,7 @@ class SidecarService:
                 prior_messages=prior_messages,
                 message_text=prompt_message_text,
                 role=role,
+                operational_profile=resolved_operational_profile.snapshot,
             )
 
     async def add_response(
@@ -278,11 +293,20 @@ class SidecarService:
         conversation_id: str,
         text: str,
         occurred_at: str | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: Any | None = None,
     ) -> None:
         """Persist an assistant response in the conversation history."""
         cache_service = ContextCacheService(self.runtime)
         async with cache_service.user_cache_guard(user_id):
             await wait_for_in_memory_worker_quiescence(self.runtime)
+            resolved_operational_profile = resolve_operational_profile(
+                loader=self.runtime.operational_profile_loader,
+                settings=self.runtime.settings,
+                operational_profile=operational_profile,
+                operational_signals=operational_signals,
+            )
             connection = await self.runtime.open_connection()
             conversation: dict[str, Any] | None = None
             prior_messages: list[dict[str, Any]] = []
@@ -330,6 +354,7 @@ class SidecarService:
                 prior_messages=prior_messages,
                 message_text=text,
                 role="assistant",
+                operational_profile=resolved_operational_profile.snapshot,
             )
 
     async def ensure_user_exists(self, connection: aiosqlite.Connection, user_id: str) -> None:
@@ -396,6 +421,7 @@ class SidecarService:
         prior_messages: list[dict[str, Any]],
         message_text: str,
         role: str,
+        operational_profile: Any | None = None,
     ) -> None:
         jobs = build_message_jobs(
             clock=self.runtime.clock,
@@ -405,6 +431,7 @@ class SidecarService:
             message_text=message_text,
             occurred_at=resolve_message_occurred_at(message),
             role=role,
+            operational_profile=operational_profile,
         )
         await enqueue_message_jobs(
             storage_backend=self.runtime.storage_backend,

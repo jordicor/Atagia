@@ -41,6 +41,9 @@ class AtagiaClient(Protocol):
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> ContextResult:
         """Return memory context for a host-managed LLM call."""
 
@@ -50,6 +53,9 @@ class AtagiaClient(Protocol):
         conversation_id: str,
         text: str,
         occurred_at: str | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> None:
         """Persist a host-generated assistant response."""
 
@@ -63,6 +69,9 @@ class AtagiaClient(Protocol):
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> None:
         """Persist one historical or sidecar message."""
 
@@ -75,6 +84,9 @@ class AtagiaClient(Protocol):
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> ChatResult:
         """Run the full Atagia chat flow."""
 
@@ -137,6 +149,9 @@ class LocalAtagiaClient:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> ContextResult:
         return await self._engine.get_context(
             user_id=user_id,
@@ -146,6 +161,8 @@ class LocalAtagiaClient:
             workspace_id=workspace_id,
             occurred_at=occurred_at,
             attachments=attachments,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
 
     async def add_response(
@@ -154,12 +171,17 @@ class LocalAtagiaClient:
         conversation_id: str,
         text: str,
         occurred_at: str | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> None:
         await self._engine.add_response(
             user_id=user_id,
             conversation_id=conversation_id,
             text=text,
             occurred_at=occurred_at,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
 
     async def ingest_message(
@@ -172,6 +194,9 @@ class LocalAtagiaClient:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> None:
         await self._engine.ingest_message(
             user_id=user_id,
@@ -182,6 +207,8 @@ class LocalAtagiaClient:
             workspace_id=workspace_id,
             occurred_at=occurred_at,
             attachments=attachments,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
 
     async def chat(
@@ -193,6 +220,9 @@ class LocalAtagiaClient:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> ChatResult:
         return await self._engine.chat(
             user_id=user_id,
@@ -202,6 +232,8 @@ class LocalAtagiaClient:
             workspace_id=workspace_id,
             occurred_at=occurred_at,
             attachments=attachments,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
 
     async def flush(self, timeout_seconds: float = 30.0, user_id: str | None = None) -> bool:
@@ -289,6 +321,9 @@ class HttpAtagiaClient:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> ContextResult:
         response = await self._post(
             f"/v1/conversations/{conversation_id}/context",
@@ -300,6 +335,8 @@ class HttpAtagiaClient:
                 "workspace_id": workspace_id,
                 "message_occurred_at": occurred_at,
                 "attachments": attachments or [],
+                "operational_profile": operational_profile,
+                "operational_signals": operational_signals,
             },
         )
         return ContextResult.model_validate(response.json())
@@ -310,6 +347,9 @@ class HttpAtagiaClient:
         conversation_id: str,
         text: str,
         occurred_at: str | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> None:
         await self._post(
             f"/v1/conversations/{conversation_id}/responses",
@@ -318,6 +358,8 @@ class HttpAtagiaClient:
                 "user_id": user_id,
                 "text": text,
                 "occurred_at": occurred_at,
+                "operational_profile": operational_profile,
+                "operational_signals": operational_signals,
             },
         )
 
@@ -331,6 +373,9 @@ class HttpAtagiaClient:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> None:
         await self._post(
             f"/v1/conversations/{conversation_id}/messages",
@@ -343,6 +388,8 @@ class HttpAtagiaClient:
                 "workspace_id": workspace_id,
                 "occurred_at": occurred_at,
                 "attachments": attachments or [],
+                "operational_profile": operational_profile,
+                "operational_signals": operational_signals,
             },
         )
 
@@ -355,6 +402,9 @@ class HttpAtagiaClient:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> ChatResult:
         await self.create_conversation(
             user_id=user_id,
@@ -373,6 +423,8 @@ class HttpAtagiaClient:
                 "include_thinking": False,
                 "metadata": {},
                 "debug": False,
+                "operational_profile": operational_profile,
+                "operational_signals": operational_signals,
             },
         )
         payload = response.json()
@@ -432,6 +484,7 @@ async def connect_atagia(
     api_key: str | None = None,
     redis_url: str | None = None,
     manifests_dir: str | Path | None = None,
+    operational_profiles_dir: str | Path | None = None,
     llm_provider: str | None = None,
     llm_api_key: str | None = None,
     llm_model: str | None = None,
@@ -476,6 +529,7 @@ async def connect_atagia(
             db_path=resolved_db_path,
             redis_url=redis_url,
             manifests_dir=manifests_dir,
+            operational_profiles_dir=operational_profiles_dir,
             llm_provider=llm_provider,
             llm_api_key=llm_api_key,
             llm_model=llm_model,

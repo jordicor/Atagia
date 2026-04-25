@@ -34,6 +34,10 @@ from atagia.models.schemas_api import (
     SidecarIngestMessageRequest,
     SidecarMutationResponse,
 )
+from atagia.memory.operational_profile import (
+    OperationalProfileNotAuthorizedError,
+    UnknownOperationalProfileError,
+)
 from atagia.services.chat_service import ChatService
 from atagia.services.errors import (
     AssistantModeMismatchError,
@@ -155,6 +159,8 @@ async def chat_reply(
             metadata=payload.metadata,
             debug=payload.debug,
             attachments=payload.attachments,
+            operational_profile=payload.operational_profile,
+            operational_signals=payload.operational_signals,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -164,6 +170,16 @@ async def chat_reply(
     except UnknownAssistantModeError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except UnknownOperationalProfileError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except OperationalProfileNotAuthorizedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         ) from exc
     except AssistantModeMismatchError as exc:
@@ -206,6 +222,8 @@ async def get_sidecar_context(
             attachments=[
                 attachment.model_dump(mode="json") for attachment in payload.attachments
             ],
+            operational_profile=payload.operational_profile,
+            operational_signals=payload.operational_signals,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -220,6 +238,16 @@ async def get_sidecar_context(
     except UnknownAssistantModeError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except UnknownOperationalProfileError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except OperationalProfileNotAuthorizedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         ) from exc
     except AssistantModeMismatchError as exc:
@@ -254,6 +282,8 @@ async def ingest_sidecar_message(
             attachments=[
                 attachment.model_dump(mode="json") for attachment in payload.attachments
             ],
+            operational_profile=payload.operational_profile,
+            operational_signals=payload.operational_signals,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -268,6 +298,16 @@ async def ingest_sidecar_message(
     except UnknownAssistantModeError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except UnknownOperationalProfileError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except OperationalProfileNotAuthorizedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         ) from exc
     except AssistantModeMismatchError as exc:
@@ -297,12 +337,24 @@ async def add_sidecar_response(
             conversation_id=conversation_id,
             text=payload.text,
             occurred_at=payload.occurred_at,
+            operational_profile=payload.operational_profile,
+            operational_signals=payload.operational_signals,
         )
     except ConversationNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found for user",
         ) from None
+    except UnknownOperationalProfileError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except OperationalProfileNotAuthorizedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
     return SidecarMutationResponse()
 
 

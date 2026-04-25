@@ -13,6 +13,7 @@ from atagia.models.schemas_evaluation import MetricName
 from atagia.models.schemas_memory import (
     ComposedContext,
     MemoryScope,
+    OperationalSignals,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
@@ -72,6 +73,8 @@ class ChatReplyRequest(BaseModel):
     include_thinking: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
     debug: bool = False
+    operational_profile: str | None = Field(default=None, max_length=64)
+    operational_signals: OperationalSignals | None = None
 
     @field_validator("message_occurred_at")
     @classmethod
@@ -165,6 +168,8 @@ class SidecarContextRequest(BaseModel):
     workspace_id: str | None = None
     message_occurred_at: str | None = None
     attachments: list[AttachmentInput] = Field(default_factory=list)
+    operational_profile: str | None = Field(default=None, max_length=64)
+    operational_signals: OperationalSignals | None = None
 
     @field_validator("message_occurred_at")
     @classmethod
@@ -188,6 +193,8 @@ class SidecarIngestMessageRequest(BaseModel):
     workspace_id: str | None = None
     occurred_at: str | None = None
     attachments: list[AttachmentInput] = Field(default_factory=list)
+    operational_profile: str | None = Field(default=None, max_length=64)
+    operational_signals: OperationalSignals | None = None
 
     @field_validator("occurred_at")
     @classmethod
@@ -207,6 +214,8 @@ class SidecarAddResponseRequest(BaseModel):
     user_id: str
     text: str
     occurred_at: str | None = None
+    operational_profile: str | None = Field(default=None, max_length=64)
+    operational_signals: OperationalSignals | None = None
 
     @field_validator("occurred_at")
     @classmethod

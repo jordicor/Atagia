@@ -1093,8 +1093,8 @@ async def test_explicit_user_statement_with_evidence_promotes_fast() -> None:
 
         assert result.acked == 1
         assert len(beliefs) == 1
-        assert beliefs[0]["scope"] == MemoryScope.GLOBAL_USER.value
-        assert beliefs[0]["assistant_mode_id"] is None
+        assert beliefs[0]["scope"] == MemoryScope.ASSISTANT_MODE.value
+        assert beliefs[0]["assistant_mode_id"] == "coding_debug"
         assert beliefs[0]["workspace_id"] is None
         assert beliefs[0]["conversation_id"] is None
     finally:

@@ -18,6 +18,7 @@ from atagia.core.repositories import (
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
 from atagia.services.context_cache_service import ContextCacheService
+from atagia.services.chat_support import default_operational_profile_snapshot
 
 if TYPE_CHECKING:
     from atagia.app import AppRuntime
@@ -369,6 +370,10 @@ class ConversationActivityService:
                 if conversation.get("workspace_id") is not None
                 else None
             ),
+            operational_profile_token=default_operational_profile_snapshot(
+                loader=self.runtime.operational_profile_loader,
+                settings=self.runtime.settings,
+            ).token,
         )
         existing_cache_view = await self.runtime.storage_backend.get_context_view(cache_key)
         payload = _ConversationActivityPayload(

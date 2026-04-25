@@ -29,6 +29,7 @@ from atagia.models.schemas_memory import (
     ExtractionConversationContext,
     MemoryObjectType,
     MemoryScope,
+    NeedTrigger,
     NeedDetectionTrace,
     QueryIntelligenceResult,
     RetrievalParams,
@@ -37,6 +38,7 @@ from atagia.models.schemas_memory import (
     ScoredCandidate,
     ScoringTrace,
     SubQuerySearchCount,
+    SummaryViewKind,
 )
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.embeddings import EmbeddingIndex
@@ -308,16 +310,23 @@ class RetrievalPipeline:
             detected_needs,
             retrieval_plan=retrieval_plan,
         )
+        scoring_policy = self._expand_recall_or_recovery_scoring_budget(
+            effective_policy,
+            retrieval_plan,
+            degraded_mode=degraded_mode,
+            detected_needs=detected_needs,
+            item_count=len(filtered_candidates),
+        )
         shortlist = early_diversity_select(
             filtered_candidates,
             query_type=retrieval_plan.query_type,
-            shortlist_k=effective_policy.retrieval_params.rerank_top_k,
+            shortlist_k=scoring_policy.retrieval_params.rerank_top_k,
         )
         shortlist = await self._reground_summary_support_shortlist(
             shortlist=shortlist,
             filtered_candidates=filtered_candidates,
             conversation_context=conversation_context,
-            resolved_policy=effective_policy,
+            resolved_policy=scoring_policy,
             detected_needs=detected_needs,
             retrieval_plan=retrieval_plan,
         )
@@ -339,7 +348,7 @@ class RetrievalPipeline:
                     shortlist,
                     message_text=message_text,
                     conversation_context=conversation_context,
-                    resolved_policy=effective_policy,
+                    resolved_policy=scoring_policy,
                     detected_needs=detected_needs,
                     retrieval_plan=retrieval_plan,
                 ),
@@ -390,6 +399,12 @@ class RetrievalPipeline:
             ),
         )
 
+        composition_policy = self._expand_recall_or_recovery_context_items(
+            scoring_policy,
+            retrieval_plan,
+            degraded_mode=degraded_mode,
+            item_count=len(scored_candidates),
+        )
         composition_start = perf_counter() if trace is not None else 0.0
         composed_context = await self._measure_stage(
             stage_timings,
@@ -401,7 +416,7 @@ class RetrievalPipeline:
                 current_contract=current_contract,
                 workspace_rollup=effective_workspace_rollup,
                 user_state=user_state,
-                resolved_policy=effective_policy,
+                resolved_policy=composition_policy,
                 conversation_messages=transcript,
             ),
         )
@@ -412,7 +427,7 @@ class RetrievalPipeline:
             composition_elapsed = (perf_counter() - composition_start) * 1000.0
             trace.composition = self._build_composition_trace(
                 composed_context,
-                resolved_policy,
+                composition_policy,
                 composition_elapsed,
             )
             trace.degraded_mode = degraded_mode
@@ -480,30 +495,15 @@ class RetrievalPipeline:
         trace: RetrievalTrace | None,
         pipeline_start: float,
     ) -> PipelineResult:
-        """Small-corpus shortcut: pass all eligible memories to the composer."""
+        """Small-corpus shortcut: skip search fan-out, but keep applicability gates."""
         if trace is not None:
             trace.small_corpus_mode = True
-            trace.degraded_mode = False
-            trace.raw_context_access_mode = "normal"
-            trace.need_detection = NeedDetectionTrace(
-                detected_needs=[],
-                sub_queries=[message_text],
-                sparse_hints=[],
-                query_type="default",
-                raw_context_access_mode="normal",
-                temporal_range=None,
-                retrieval_levels=[0],
-                degraded_mode=False,
-                duration_ms=0.0,
-            )
-        stage_timings["need_detection"] = 0.0
         stage_timings["base_planning"] = 0.0
         stage_timings["base_candidate_search"] = 0.0
         stage_timings["enriched_planning"] = 0.0
         stage_timings["enriched_candidate_search"] = 0.0
-        stage_timings["applicability_scoring"] = 0.0
 
-        retrieval_plan = await self._measure_stage(
+        base_plan = await self._measure_stage(
             stage_timings,
             "planning",
             self._build_plan(
@@ -515,6 +515,103 @@ class RetrievalPipeline:
                 ablation=effective_ablation,
             ),
         )
+        retrieval_plan = base_plan
+        detected_needs: list[Any] = []
+        query_intelligence: QueryIntelligenceResult = _default_query_intelligence(message_text)
+        degraded_mode = False
+
+        if effective_ablation.skip_need_detection:
+            stage_timings["need_detection"] = 0.0
+            if trace is not None:
+                trace.need_detection = NeedDetectionTrace(
+                    detected_needs=[],
+                    sub_queries=[message_text],
+                    sparse_hints=[],
+                    query_type="default",
+                    raw_context_access_mode="normal",
+                    temporal_range=None,
+                    retrieval_levels=[0],
+                    degraded_mode=False,
+                    duration_ms=0.0,
+                )
+        else:
+            need_start = perf_counter() if trace is not None else 0.0
+            try:
+                user_language_profile = await self._candidate_search.aggregate_retrievable_language_mix(
+                    user_id=conversation_context.user_id,
+                    scope_filter=base_plan.scope_filter,
+                    assistant_mode_id=base_plan.assistant_mode_id,
+                    workspace_id=base_plan.workspace_id,
+                    conversation_id=base_plan.conversation_id,
+                    privacy_ceiling=base_plan.privacy_ceiling,
+                    limit=PROFILE_TOP_N,
+                )
+                query_intelligence = await self._measure_stage(
+                    stage_timings,
+                    "need_detection",
+                    self._need_detector.detect(
+                        message_text=message_text,
+                        role="user",
+                        conversation_context=conversation_context,
+                        resolved_policy=resolved_policy,
+                        user_language_profile=user_language_profile,
+                    ),
+                )
+            except Exception as exc:
+                degraded_mode = True
+                stage_timings.setdefault("need_detection", (perf_counter() - need_start) * 1000.0)
+                logger.warning(
+                    "small_corpus_need_detector_failed_using_default_plan",
+                    extra={
+                        "user_id": conversation_context.user_id,
+                        "conversation_id": conversation_context.conversation_id,
+                        "error": str(exc),
+                    },
+                )
+                if trace is not None:
+                    trace.need_detection = NeedDetectionTrace(
+                        degraded_mode=True,
+                        duration_ms=(perf_counter() - need_start) * 1000.0,
+                        raw_context_access_mode="normal",
+                    )
+            else:
+                detected_needs = list(query_intelligence.needs)
+                retrieval_plan = await self._measure_stage(
+                    stage_timings,
+                    "planning",
+                    self._build_plan(
+                        message_text=message_text,
+                        query_intelligence=query_intelligence,
+                        conversation_context=conversation_context,
+                        resolved_policy=resolved_policy,
+                        cold_start=False,
+                        ablation=effective_ablation,
+                    ),
+                )
+                if trace is not None:
+                    trace.need_detection = NeedDetectionTrace(
+                        detected_needs=[need.need_type.value for need in query_intelligence.needs],
+                        sub_queries=list(query_intelligence.sub_queries),
+                        sparse_hints=[
+                            hint.fts_phrase or hint.sub_query_text
+                            for hint in query_intelligence.sparse_query_hints
+                        ],
+                        query_type=query_intelligence.query_type,
+                        raw_context_access_mode=query_intelligence.raw_context_access_mode,
+                        temporal_range=(
+                            f"{query_intelligence.temporal_range.start.isoformat()}/{query_intelligence.temporal_range.end.isoformat()}"
+                            if query_intelligence.temporal_range is not None
+                            else None
+                        ),
+                        retrieval_levels=list(query_intelligence.retrieval_levels),
+                        degraded_mode=False,
+                        duration_ms=(perf_counter() - need_start) * 1000.0,
+                        exact_recall_needed=bool(query_intelligence.exact_recall_needed),
+                        exact_facets=[facet.value for facet in query_intelligence.exact_facets],
+                    )
+
+        if trace is not None:
+            trace.raw_context_access_mode = query_intelligence.raw_context_access_mode
 
         candidate_start = perf_counter() if trace is not None else 0.0
         raw_candidates = await self._measure_stage(
@@ -529,32 +626,75 @@ class RetrievalPipeline:
                 privacy_ceiling=resolved_policy.privacy_ceiling,
             ),
         )
+        if retrieval_plan.exact_recall_mode or retrieval_plan.raw_context_access_mode in {"verbatim", "artifact"}:
+            searched_candidates = await self._measure_stage(
+                stage_timings,
+                "candidate_search_exact_recall",
+                self._candidate_search.search(
+                    retrieval_plan,
+                    conversation_context.user_id,
+                ),
+            )
+            raw_candidates = self._merge_candidates(raw_candidates, searched_candidates)
         raw_candidates = self._apply_regrounding_requirements(raw_candidates, retrieval_plan)
         if trace is not None:
             candidate_elapsed = (perf_counter() - candidate_start) * 1000.0
-            trace.candidate_search = CandidateSearchTrace(
-                fts_candidates_count=0,
-                embedding_candidates_count=0,
-                consequence_candidates_count=0,
-                raw_message_candidates_count=0,
-                entity_candidates_count=0,
-                total_before_fusion=len(raw_candidates),
-                total_after_fusion=len(raw_candidates),
-                per_subquery_counts=[],
-                duration_ms=candidate_elapsed,
+            trace.candidate_search = self._build_candidate_search_trace(
+                raw_candidates,
+                retrieval_plan,
+                candidate_elapsed,
             )
 
-        scored_candidates = self._score_small_corpus_candidates(raw_candidates)
+        filtered_candidates = self._scorer.filter_candidates(
+            raw_candidates,
+            resolved_policy,
+            detected_needs,
+            retrieval_plan=retrieval_plan,
+        )
+        scoring_policy = self._expand_candidate_budget(
+            resolved_policy,
+            item_count=len(filtered_candidates),
+        )
+        shortlist = early_diversity_select(
+            filtered_candidates,
+            query_type=retrieval_plan.query_type,
+            shortlist_k=scoring_policy.retrieval_params.rerank_top_k,
+        )
+        shortlist = await self._reground_summary_support_shortlist(
+            shortlist=shortlist,
+            filtered_candidates=filtered_candidates,
+            conversation_context=conversation_context,
+            resolved_policy=scoring_policy,
+            detected_needs=detected_needs,
+            retrieval_plan=retrieval_plan,
+        )
+
+        scoring_start = perf_counter() if trace is not None else 0.0
+        if effective_ablation.skip_applicability_scoring:
+            scored_candidates = await self._measure_stage(
+                stage_timings,
+                "applicability_scoring",
+                self._score_without_llm(shortlist),
+            )
+        else:
+            scored_candidates = await self._measure_stage(
+                stage_timings,
+                "applicability_scoring",
+                self._scorer.score_shortlist(
+                    shortlist,
+                    message_text=message_text,
+                    conversation_context=conversation_context,
+                    resolved_policy=scoring_policy,
+                    detected_needs=detected_needs,
+                    retrieval_plan=retrieval_plan,
+                ),
+            )
         if trace is not None:
-            trace.scoring = ScoringTrace(
-                candidates_received=len(raw_candidates),
-                candidates_scored=len(scored_candidates),
-                candidates_rejected=0,
-                rejection_reasons={},
-                top_score=1.0 if scored_candidates else 0.0,
-                median_score=1.0 if scored_candidates else 0.0,
-                min_score=1.0 if scored_candidates else 0.0,
-                duration_ms=0.0,
+            trace.scoring = self._build_scoring_trace(
+                raw_candidates,
+                filtered_candidates,
+                scored_candidates,
+                (perf_counter() - scoring_start) * 1000.0,
             )
 
         if effective_ablation.skip_contract_memory:
@@ -594,10 +734,6 @@ class RetrievalPipeline:
             ),
         )
 
-        composition_policy = self._expand_final_context_items(
-            resolved_policy,
-            item_count=len(scored_candidates),
-        )
         composition_start = perf_counter() if trace is not None else 0.0
         composed_context = await self._measure_stage(
             stage_timings,
@@ -609,7 +745,7 @@ class RetrievalPipeline:
                 current_contract=current_contract,
                 workspace_rollup=effective_workspace_rollup,
                 user_state=user_state,
-                resolved_policy=composition_policy,
+                resolved_policy=scoring_policy,
                 conversation_messages=transcript,
             ),
         )
@@ -620,13 +756,14 @@ class RetrievalPipeline:
             composition_elapsed = (perf_counter() - composition_start) * 1000.0
             trace.composition = self._build_composition_trace(
                 composed_context,
-                resolved_policy,
+                scoring_policy,
                 composition_elapsed,
             )
             trace.total_duration_ms = (perf_counter() - pipeline_start) * 1000.0
+            trace.degraded_mode = degraded_mode
 
         return PipelineResult(
-            detected_needs=[],
+            detected_needs=detected_needs,
             retrieval_plan=retrieval_plan,
             raw_candidates=raw_candidates,
             scored_candidates=scored_candidates,
@@ -636,20 +773,80 @@ class RetrievalPipeline:
             stage_timings=stage_timings,
             trace=trace,
             small_corpus_mode=True,
-            degraded_mode=False,
+            degraded_mode=degraded_mode,
         )
 
     @staticmethod
-    def _expand_final_context_items(
+    def _expand_candidate_budget(
         resolved_policy: ResolvedPolicy,
         *,
         item_count: int,
     ) -> ResolvedPolicy:
-        """Allow the composer to emit every eligible small-corpus memory."""
-        if item_count <= resolved_policy.retrieval_params.final_context_items:
+        """Allow small-corpus scoring/composition to consider every eligible memory."""
+        retrieval_params = resolved_policy.retrieval_params
+        if (
+            item_count <= retrieval_params.final_context_items
+            and item_count <= retrieval_params.rerank_top_k
+        ):
+            return resolved_policy
+        expanded_retrieval = retrieval_params.model_copy(
+            update={
+                "final_context_items": max(retrieval_params.final_context_items, item_count),
+                "rerank_top_k": max(retrieval_params.rerank_top_k, item_count),
+            }
+        )
+        return resolved_policy.model_copy(update={"retrieval_params": expanded_retrieval})
+
+    @staticmethod
+    def _expand_recall_or_recovery_scoring_budget(
+        resolved_policy: ResolvedPolicy,
+        retrieval_plan: RetrievalPlan,
+        *,
+        degraded_mode: bool,
+        detected_needs: list[Any],
+        item_count: int,
+    ) -> ResolvedPolicy:
+        """Score all recall/recovery candidates while the candidate set is bounded."""
+        recovery_needs = {
+            NeedTrigger.AMBIGUITY,
+            NeedTrigger.FOLLOW_UP_FAILURE,
+            NeedTrigger.UNDER_SPECIFIED_REQUEST,
+        }
+        need_expansion = any(
+            getattr(need, "need_type", None) in recovery_needs
+            for need in detected_needs
+        )
+        if not retrieval_plan.exact_recall_mode and not degraded_mode and not need_expansion:
+            return resolved_policy
+        if item_count <= resolved_policy.retrieval_params.rerank_top_k:
             return resolved_policy
         expanded_retrieval = resolved_policy.retrieval_params.model_copy(
-            update={"final_context_items": item_count}
+            update={"rerank_top_k": item_count}
+        )
+        return resolved_policy.model_copy(update={"retrieval_params": expanded_retrieval})
+
+    @staticmethod
+    def _expand_recall_or_recovery_context_items(
+        resolved_policy: ResolvedPolicy,
+        retrieval_plan: RetrievalPlan,
+        *,
+        degraded_mode: bool,
+        item_count: int,
+    ) -> ResolvedPolicy:
+        """Use already-scored recall/recovery candidates when token budget permits."""
+        if not retrieval_plan.exact_recall_mode and not degraded_mode:
+            return resolved_policy
+        target_items = min(
+            item_count,
+            max(
+                resolved_policy.retrieval_params.final_context_items,
+                resolved_policy.retrieval_params.rerank_top_k,
+            ),
+        )
+        if target_items <= resolved_policy.retrieval_params.final_context_items:
+            return resolved_policy
+        expanded_retrieval = resolved_policy.retrieval_params.model_copy(
+            update={"final_context_items": target_items}
         )
         return resolved_policy.model_copy(update={"retrieval_params": expanded_retrieval})
 
@@ -812,13 +1009,32 @@ class RetrievalPipeline:
             return candidates
         allowed_types = {
             MemoryObjectType.EVIDENCE.value,
+            MemoryObjectType.INTERACTION_CONTRACT.value,
             MemoryObjectType.STATE_SNAPSHOT.value,
         }
         return [
             candidate
             for candidate in candidates
             if str(candidate.get("object_type")) in allowed_types
+            or RetrievalPipeline._is_grounded_conversation_chunk(candidate)
         ]
+
+    @staticmethod
+    def _is_grounded_conversation_chunk(candidate: dict[str, Any]) -> bool:
+        if str(candidate.get("object_type")) != MemoryObjectType.SUMMARY_VIEW.value:
+            return False
+        payload_json = candidate.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            return False
+        try:
+            hierarchy_level = int(payload_json.get("hierarchy_level", -1))
+        except (TypeError, ValueError):
+            return False
+        return (
+            hierarchy_level == 0
+            and payload_json.get("summary_kind") == SummaryViewKind.CONVERSATION_CHUNK.value
+            and bool(payload_json.get("source_excerpt_messages"))
+        )
 
     async def _reground_summary_support_shortlist(
         self,

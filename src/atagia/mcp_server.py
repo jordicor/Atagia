@@ -25,7 +25,16 @@ from atagia.models.schemas_jobs import (
 )
 from atagia.models.schemas_memory import ExtractionConversationContext, MemoryStatus
 from atagia.models.schemas_replay import AblationConfig
-from atagia.services.chat_support import RECENT_FETCH_LIMIT, build_job_payload, recent_context
+from atagia.memory.operational_profile import (
+    OperationalProfileNotAuthorizedError,
+    UnknownOperationalProfileError,
+)
+from atagia.services.chat_support import (
+    RECENT_FETCH_LIMIT,
+    build_job_payload,
+    recent_context,
+    resolve_operational_profile,
+)
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.errors import (
     AssistantModeMismatchError,
@@ -111,6 +120,8 @@ async def _get_context_impl(
     message: str,
     conversation_id: str | None = None,
     mode: str | None = None,
+    operational_profile: str | None = None,
+    operational_signals: dict[str, Any] | None = None,
 ) -> str:
     """Retrieve relevant memories for a message as a JSON string."""
     resolved_conversation_id = await _ensure_conversation_id(
@@ -124,6 +135,8 @@ async def _get_context_impl(
         conversation_id=resolved_conversation_id,
         message=message,
         mode=mode,
+        operational_profile=operational_profile,
+        operational_signals=operational_signals,
         ablation=AblationConfig(disable_context_cache=True),
     )
     return json.dumps(
@@ -145,10 +158,18 @@ async def _add_memory_impl(
     user_id: str,
     message: str,
     conversation_id: str | None = None,
+    operational_profile: str | None = None,
+    operational_signals: dict[str, Any] | None = None,
 ) -> str:
     """Store a user message and enqueue extraction jobs."""
     resolved_conversation_id = await _ensure_conversation_id(engine, user_id, conversation_id)
     runtime = await _runtime(engine)
+    resolved_operational_profile = resolve_operational_profile(
+        loader=runtime.operational_profile_loader,
+        settings=runtime.settings,
+        operational_profile=operational_profile,
+        operational_signals=operational_signals,
+    )
     cache_service = ContextCacheService(runtime)
     async with cache_service.user_cache_guard(user_id):
         await wait_for_in_memory_worker_quiescence(runtime)
@@ -200,6 +221,7 @@ async def _add_memory_impl(
             message_ids=[str(user_message["id"])],
             payload=payload,
             created_at=runtime.clock.now(),
+            operational_profile=resolved_operational_profile.snapshot,
         )
         contract_job = JobEnvelope(
             job_id=new_job_id(),
@@ -209,6 +231,7 @@ async def _add_memory_impl(
             message_ids=[str(user_message["id"])],
             payload=payload,
             created_at=runtime.clock.now(),
+            operational_profile=resolved_operational_profile.snapshot,
         )
         await runtime.storage_backend.stream_add(
             EXTRACT_STREAM_NAME,
@@ -267,6 +290,8 @@ async def _list_memories_impl(
     try:
         rows = await MemoryObjectRepository(connection, runtime.clock).list_for_user(
             user_id,
+            # ARCHIVED includes PVG audit-only mirrors. They carry
+            # audit_only_mirror=true and their canonical_text is post-refine safe.
             statuses=(MemoryStatus.ACTIVE, MemoryStatus.ARCHIVED),
         )
     finally:
@@ -342,7 +367,9 @@ _EXPECTED_TOOL_ERRORS = (
     AssistantModeMismatchError,
     ConversationNotFoundError,
     KeyError,
+    OperationalProfileNotAuthorizedError,
     UnknownAssistantModeError,
+    UnknownOperationalProfileError,
     ValueError,
     WorkspaceNotFoundError,
 )
@@ -353,6 +380,8 @@ async def atagia_get_context(
     message: str,
     conversation_id: str | None = None,
     mode: str | None = None,
+    operational_profile: str | None = None,
+    operational_signals: dict[str, Any] | None = None,
     ctx: Context[ServerSession, AtagiaContext] | None = None,
 ) -> str:
     """Retrieve relevant memories for a message. Returns enriched context."""
@@ -365,6 +394,8 @@ async def atagia_get_context(
             message,
             conversation_id=conversation_id,
             mode=mode,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
     except _EXPECTED_TOOL_ERRORS as exc:
         return _tool_error(exc)
@@ -374,6 +405,8 @@ async def atagia_get_context(
 async def atagia_add_memory(
     message: str,
     conversation_id: str | None = None,
+    operational_profile: str | None = None,
+    operational_signals: dict[str, Any] | None = None,
     ctx: Context[ServerSession, AtagiaContext] | None = None,
 ) -> str:
     """Store a message and trigger background extraction."""
@@ -385,6 +418,8 @@ async def atagia_add_memory(
             ctx.request_context.lifespan_context.user_id,
             message,
             conversation_id=conversation_id,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
     except _EXPECTED_TOOL_ERRORS as exc:
         return _tool_error(exc)

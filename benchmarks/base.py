@@ -97,6 +97,7 @@ class QuestionResult(BaseModel):
     score_result: ScoreResult
     memories_used: int = Field(ge=0)
     retrieval_time_ms: float = Field(ge=0.0)
+    trace: dict[str, Any] = Field(default_factory=dict)
 
 
 class ConversationReport(BaseModel):

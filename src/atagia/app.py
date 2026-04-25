@@ -21,6 +21,7 @@ from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database, open_connection, resolve_runtime_database_path
 from atagia.core.redis_client import RedisBackend
 from atagia.core.storage_backend import InProcessBackend, StorageBackend
+from atagia.memory.operational_profile import OperationalProfileLoader
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, load_and_sync_assistant_modes
 from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
@@ -50,6 +51,8 @@ class AppRuntime:
     database_path: str
     manifest_loader: ManifestLoader
     manifests: dict[str, Any]
+    operational_profile_loader: OperationalProfileLoader
+    operational_profiles: dict[str, Any]
     policy_resolver: PolicyResolver
     llm_client: LLMClient[Any]
     embedding_index: EmbeddingIndex
@@ -147,6 +150,8 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             settings.manifests_dir(),
             clock,
         )
+        operational_profile_loader = OperationalProfileLoader(settings.operational_profiles_dir())
+        operational_profiles = operational_profile_loader.load_all()
         llm_client = build_llm_client(settings)
         if settings.embedding_backend != "none":
             embedding_connection = await open_connection(database_path)
@@ -251,6 +256,8 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             database_path=database_path,
             manifest_loader=manifest_loader,
             manifests=manifests,
+            operational_profile_loader=operational_profile_loader,
+            operational_profiles=operational_profiles,
             policy_resolver=PolicyResolver(),
             llm_client=llm_client,
             embedding_index=embedding_index,

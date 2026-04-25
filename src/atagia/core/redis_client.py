@@ -9,7 +9,12 @@ from time import monotonic
 from typing import Any
 from uuid import uuid4
 
-from atagia.core.storage_backend import StorageBackend, extract_context_view_user_id
+from atagia.core.canonical import canonical_json_hash
+from atagia.core.storage_backend import (
+    StorageBackend,
+    extract_context_view_conversation_id,
+    extract_context_view_user_id,
+)
 from atagia.models.schemas_jobs import StreamMessage
 
 try:
@@ -34,6 +39,8 @@ CONTEXT_VIEW_PREFIX = "context_view:"
 CONTEXT_VIEW_SEQ_PREFIX = "context_view_seq:"
 CONTEXT_VIEW_OWNER_PREFIX = "context_view_owner:"
 CONTEXT_VIEW_USER_INDEX_PREFIX = "context_view_user:"
+CONTEXT_VIEW_CONVERSATION_OWNER_PREFIX = "context_view_conversation_owner:"
+CONTEXT_VIEW_CONVERSATION_INDEX_PREFIX = "context_view_conversation:"
 
 SET_CONTEXT_VIEW_IF_NEWER_SCRIPT = """
 local current_seq = redis.call("get", KEYS[2])
@@ -100,7 +107,10 @@ class RedisBackend(StorageBackend):
         serialized = json.dumps(context_view, ensure_ascii=False, sort_keys=True)
         owner_key = self._context_view_owner_key(key)
         previous_user_id = await self._client.get(owner_key)
+        conversation_owner_key = self._context_view_conversation_owner_key(key)
+        previous_conversation_subject = await self._client.get(conversation_owner_key)
         user_id = extract_context_view_user_id(context_view)
+        conversation_id = extract_context_view_conversation_id(context_view)
         await self._client.set(
             self._context_view_key(key),
             serialized,
@@ -113,6 +123,13 @@ class RedisBackend(StorageBackend):
             previous_user_id=previous_user_id,
             ttl_seconds=ttl_seconds,
         )
+        await self._sync_context_view_conversation_owner(
+            key=key,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            previous_conversation_subject=previous_conversation_subject,
+            ttl_seconds=ttl_seconds,
+        )
 
     async def set_context_view_if_newer(
         self,
@@ -122,6 +139,10 @@ class RedisBackend(StorageBackend):
         monotonic_seq: int,
     ) -> bool:
         user_id = extract_context_view_user_id(context_view) or ""
+        conversation_id = extract_context_view_conversation_id(context_view)
+        previous_conversation_subject = await self._client.get(
+            self._context_view_conversation_owner_key(key)
+        )
         result = await self._client.eval(
             SET_CONTEXT_VIEW_IF_NEWER_SCRIPT,
             4,
@@ -136,33 +157,84 @@ class RedisBackend(StorageBackend):
             key,
             CONTEXT_VIEW_USER_INDEX_PREFIX,
         )
-        return bool(result)
+        if not result:
+            return False
+        await self._sync_context_view_conversation_owner(
+            key=key,
+            user_id=user_id or None,
+            conversation_id=conversation_id,
+            previous_conversation_subject=previous_conversation_subject,
+            ttl_seconds=ttl_seconds,
+        )
+        return True
 
     async def delete_context_view(self, key: str) -> None:
         owner_key = self._context_view_owner_key(key)
         user_id = await self._client.get(owner_key)
+        conversation_subject = await self._client.get(
+            self._context_view_conversation_owner_key(key)
+        )
         await self._client.delete(
             self._context_view_key(key),
             self._context_view_seq_key(key),
             owner_key,
+            self._context_view_conversation_owner_key(key),
         )
         if user_id:
             await self._client.srem(self._context_view_user_index_key(user_id), key)
+        if conversation_subject:
+            await self._client.srem(
+                self._context_view_conversation_index_key(conversation_subject),
+                key,
+            )
 
     async def delete_context_views_for_user(self, user_id: str) -> int:
         cache_keys = await self._client.smembers(self._context_view_user_index_key(user_id))
+        deleted = 0
+        for cache_key in cache_keys:
+            conversation_subject = await self._client.get(
+                self._context_view_conversation_owner_key(str(cache_key))
+            )
+            removed = await self._client.delete(
+                self._context_view_key(str(cache_key)),
+                self._context_view_seq_key(str(cache_key)),
+                self._context_view_owner_key(str(cache_key)),
+                self._context_view_conversation_owner_key(str(cache_key)),
+            )
+            if int(removed or 0) > 0:
+                deleted += 1
+                if conversation_subject:
+                    await self._client.srem(
+                        self._context_view_conversation_index_key(conversation_subject),
+                        str(cache_key),
+                    )
+                continue
+            await self._client.srem(self._context_view_user_index_key(user_id), str(cache_key))
+        await self._client.delete(self._context_view_user_index_key(user_id))
+        return deleted
+
+    async def delete_context_views_for_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> int:
+        conversation_subject = self._conversation_subject(user_id, conversation_id)
+        index_key = self._context_view_conversation_index_key(conversation_subject)
+        cache_keys = await self._client.smembers(index_key)
         deleted = 0
         for cache_key in cache_keys:
             removed = await self._client.delete(
                 self._context_view_key(str(cache_key)),
                 self._context_view_seq_key(str(cache_key)),
                 self._context_view_owner_key(str(cache_key)),
+                self._context_view_conversation_owner_key(str(cache_key)),
             )
             if int(removed or 0) > 0:
                 deleted += 1
+                await self._client.srem(self._context_view_user_index_key(user_id), str(cache_key))
                 continue
-            await self._client.srem(self._context_view_user_index_key(user_id), str(cache_key))
-        await self._client.delete(self._context_view_user_index_key(user_id))
+            await self._client.srem(index_key, str(cache_key))
+        await self._client.delete(index_key)
         return deleted
 
     async def enqueue_job(self, queue_name: str, payload: dict[str, Any]) -> None:
@@ -367,6 +439,39 @@ class RedisBackend(StorageBackend):
         else:
             await self._client.delete(self._context_view_owner_key(key))
 
+    async def _sync_context_view_conversation_owner(
+        self,
+        *,
+        key: str,
+        user_id: str | None,
+        conversation_id: str | None,
+        previous_conversation_subject: str | None,
+        ttl_seconds: int,
+    ) -> None:
+        conversation_subject = (
+            self._conversation_subject(user_id, conversation_id)
+            if user_id and conversation_id
+            else None
+        )
+        if previous_conversation_subject and previous_conversation_subject != conversation_subject:
+            await self._client.srem(
+                self._context_view_conversation_index_key(previous_conversation_subject),
+                key,
+            )
+        if conversation_subject:
+            await self._client.set(
+                self._context_view_conversation_owner_key(key),
+                conversation_subject,
+                ex=ttl_seconds,
+            )
+            index_key = self._context_view_conversation_index_key(conversation_subject)
+            await self._client.sadd(index_key, key)
+            current_ttl = await self._client.ttl(index_key)
+            if current_ttl < 0 or current_ttl < ttl_seconds:
+                await self._client.expire(index_key, ttl_seconds)
+        else:
+            await self._client.delete(self._context_view_conversation_owner_key(key))
+
     @staticmethod
     def _context_view_key(key: str) -> str:
         return f"{CONTEXT_VIEW_PREFIX}{key}"
@@ -380,8 +485,25 @@ class RedisBackend(StorageBackend):
         return f"{CONTEXT_VIEW_OWNER_PREFIX}{key}"
 
     @staticmethod
+    def _context_view_conversation_owner_key(key: str) -> str:
+        return f"{CONTEXT_VIEW_CONVERSATION_OWNER_PREFIX}{key}"
+
+    @staticmethod
     def _context_view_user_index_key(user_id: str) -> str:
         return f"{CONTEXT_VIEW_USER_INDEX_PREFIX}{user_id}"
+
+    @staticmethod
+    def _context_view_conversation_index_key(conversation_subject: str) -> str:
+        return f"{CONTEXT_VIEW_CONVERSATION_INDEX_PREFIX}{conversation_subject}"
+
+    @staticmethod
+    def _conversation_subject(user_id: str, conversation_id: str) -> str:
+        return canonical_json_hash(
+            {
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+            }
+        )
 
     async def _extend_context_view_user_index_ttl(
         self,

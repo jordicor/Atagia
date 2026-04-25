@@ -14,6 +14,7 @@ mcp_available = pytest.importorskip("mcp", reason="mcp package not installed")
 from atagia import Atagia
 from atagia.core.clock import FrozenClock
 from atagia.core.repositories import MemoryObjectRepository, MessageRepository
+from atagia.models.schemas_jobs import EXTRACT_STREAM_NAME, JobEnvelope, WORKER_GROUP_NAME
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
 from atagia.mcp_server import (
     _add_memory_impl,
@@ -24,6 +25,7 @@ from atagia.mcp_server import (
 )
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.context_cache_service import ContextCacheService
+from atagia.services.chat_support import default_operational_profile_snapshot
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -152,6 +154,15 @@ def _install_stub_client(monkeypatch: pytest.MonkeyPatch, provider: MCPProvider)
     monkeypatch.setenv("ATAGIA_SMALL_CORPUS_TOKEN_THRESHOLD_RATIO", "0")
 
 
+def _normal_operational_profile_token(engine: Atagia) -> str:
+    if engine.runtime is None:
+        raise AssertionError("Engine runtime should be initialized")
+    return default_operational_profile_snapshot(
+        loader=engine.runtime.operational_profile_loader,
+        settings=engine.runtime.settings,
+    ).token
+
+
 async def _seed_memory(
     engine: Atagia,
     *,
@@ -226,6 +237,7 @@ async def test_mcp_get_context(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             workspace_id=None,
+            operational_profile_token=_normal_operational_profile_token(engine),
         )
         assert await engine.runtime.storage_backend.get_context_view(cache_key) is None
     finally:
@@ -308,6 +320,7 @@ async def test_mcp_add_memory(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             workspace_id=None,
+            operational_profile_token=_normal_operational_profile_token(engine),
         )
         await engine.runtime.storage_backend.set_context_view(
             cache_key,
@@ -345,6 +358,50 @@ async def test_mcp_add_memory(
             "user_id": "usr_2",
             "conversation_id": "cnv_2",
         }
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_add_memory_carries_operational_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = MCPProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-mcp.db",
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation("usr_1", "cnv_1", assistant_mode_id="coding_debug")
+
+        await _add_memory_impl(
+            engine,
+            "usr_1",
+            "Please remember that offline mode should keep answers short.",
+            conversation_id="cnv_1",
+            operational_profile="offline",
+        )
+
+        runtime = engine.runtime
+        if runtime is None:
+            raise AssertionError("Engine runtime should remain initialized")
+        messages = await runtime.storage_backend.stream_read(
+            EXTRACT_STREAM_NAME,
+            WORKER_GROUP_NAME,
+            "test-consumer",
+            count=1,
+            block_ms=0,
+        )
+        assert messages
+        envelope = JobEnvelope.model_validate(messages[0].payload)
+        assert envelope.operational_profile is not None
+        assert envelope.operational_profile.profile_id == "offline"
     finally:
         await engine.close()
 

@@ -1,0 +1,13 @@
+{
+  "operational_profile_id": "disaster",
+  "display_name": "Disaster",
+  "risk_level": "high_risk",
+  "signals": {
+    "power": "constrained",
+    "connectivity": "offline",
+    "safety": "high_stakes",
+    "incident_scope": "disaster",
+    "compute": "local_only"
+  },
+  "policy_override": {}
+}

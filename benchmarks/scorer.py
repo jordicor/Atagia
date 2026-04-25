@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 
 from benchmarks.base import ScoreResult
-from ai_json_cleanroom import validate_ai_json
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
 
+try:
+    from ai_json_cleanroom import validate_ai_json
+except ImportError:  # pragma: no cover - exercised in isolated benchmark envs.
+    validate_ai_json = None
+
 _DEFAULT_REASONING = "Judge response could not be parsed as valid verdict JSON."
+_JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 logger = logging.getLogger(__name__)
 
 
@@ -83,7 +90,30 @@ class LLMJudgeScorer:
 
     @staticmethod
     def _extract_json_payload(raw_output: str) -> dict[str, object] | None:
-        result = validate_ai_json(raw_output)
-        if result.json_valid and isinstance(result.data, dict):
-            return result.data
+        if validate_ai_json is not None:
+            result = validate_ai_json(raw_output)
+            if result.json_valid and isinstance(result.data, dict):
+                return result.data
+            return None
+        payload = _fallback_json_payload(raw_output)
+        if isinstance(payload, dict):
+            return payload
         return None
+
+
+def _fallback_json_payload(raw_output: str) -> object | None:
+    """Parse simple JSON judge payloads without optional cleanroom dependency."""
+    candidates = [raw_output.strip()]
+    candidates.extend(match.group(1).strip() for match in _JSON_FENCE_PATTERN.finditer(raw_output))
+    start = raw_output.find("{")
+    end = raw_output.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(raw_output[start : end + 1])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None

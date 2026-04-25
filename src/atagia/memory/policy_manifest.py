@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -11,6 +10,7 @@ import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from atagia.core.clock import Clock
+from atagia.core.canonical import canonical_json_bytes, canonical_json_hash
 from atagia.models.schemas_memory import (
     AssistantModeId,
     AssistantModeManifest,
@@ -18,6 +18,7 @@ from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
     NeedTrigger,
+    OperationalPolicyOverride,
     RetrievalParams,
 )
 
@@ -30,26 +31,17 @@ def _ensure_unique_values[T](values: list[T]) -> list[T]:
     return values
 
 
-def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-
-
 def _manifest_payload(manifest: AssistantModeManifest) -> dict[str, Any]:
     return manifest.model_dump(mode="json")
 
 
 def _manifest_json(manifest: AssistantModeManifest) -> str:
-    return _canonical_json_bytes(_manifest_payload(manifest)).decode("utf-8")
+    return canonical_json_bytes(_manifest_payload(manifest)).decode("utf-8")
 
 
 def compute_prompt_hash(payload: dict[str, Any]) -> str:
     """Compute a stable manifest hash from canonical JSON bytes."""
-    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+    return canonical_json_hash(payload)
 
 
 class RetrievalParamsOverride(BaseModel):
@@ -176,9 +168,16 @@ class PolicyResolver:
         manifest: AssistantModeManifest,
         workspace_override: dict[str, Any] | None,
         conversation_override: dict[str, Any] | None,
+        operational_override: OperationalPolicyOverride | dict[str, Any] | None = None,
     ) -> ResolvedPolicy:
         workspace = PolicyOverride.model_validate(workspace_override or {})
         conversation = PolicyOverride.model_validate(conversation_override or {})
+        operational = OperationalPolicyOverride.model_validate(operational_override or {})
+        base_retrieval_params = self._resolve_retrieval_params(
+            manifest.retrieval_params,
+            workspace.retrieval_params,
+            conversation.retrieval_params,
+        )
 
         return ResolvedPolicy(
             assistant_mode_id=manifest.assistant_mode_id,
@@ -193,41 +192,52 @@ class PolicyResolver:
                 manifest.allowed_scopes,
                 workspace.allowed_scopes,
                 conversation.allowed_scopes,
+                operational.allowed_scopes,
             ),
             preferred_memory_types=self._pick_most_specific_list(
                 manifest.preferred_memory_types,
                 workspace.preferred_memory_types,
                 conversation.preferred_memory_types,
+                operational.preferred_memory_types,
             ),
-            need_triggers=self._pick_most_specific_list(
-                manifest.need_triggers,
-                workspace.need_triggers,
-                conversation.need_triggers,
+            need_triggers=self._resolve_need_triggers(
+                self._pick_most_specific_list(
+                    manifest.need_triggers,
+                    workspace.need_triggers,
+                    conversation.need_triggers,
+                ),
+                operational.need_triggers,
             ),
             contract_dimensions_priority=self._pick_most_specific_list(
                 manifest.contract_dimensions_priority,
                 workspace.contract_dimensions_priority,
                 conversation.contract_dimensions_priority,
+                operational.contract_dimensions_priority,
             ),
             privacy_ceiling=self._resolve_privacy_ceiling(
                 manifest.privacy_ceiling,
                 workspace.privacy_ceiling,
                 conversation.privacy_ceiling,
             ),
-            context_budget_tokens=self._pick_most_specific_scalar(
-                manifest.context_budget_tokens,
-                workspace.context_budget_tokens,
-                conversation.context_budget_tokens,
+            context_budget_tokens=self._resolve_restricted_scalar(
+                self._pick_most_specific_scalar(
+                    manifest.context_budget_tokens,
+                    workspace.context_budget_tokens,
+                    conversation.context_budget_tokens,
+                ),
+                operational.context_budget_tokens,
             ),
-            transcript_budget_tokens=self._pick_most_specific_scalar(
-                manifest.transcript_budget_tokens,
-                workspace.transcript_budget_tokens,
-                conversation.transcript_budget_tokens,
+            transcript_budget_tokens=self._resolve_restricted_scalar(
+                self._pick_most_specific_scalar(
+                    manifest.transcript_budget_tokens,
+                    workspace.transcript_budget_tokens,
+                    conversation.transcript_budget_tokens,
+                ),
+                operational.transcript_budget_tokens,
             ),
-            retrieval_params=self._resolve_retrieval_params(
-                manifest.retrieval_params,
-                workspace.retrieval_params,
-                conversation.retrieval_params,
+            retrieval_params=self._resolve_operational_retrieval_params(
+                base_retrieval_params,
+                operational.retrieval_params,
             ),
             context_cache_policy=manifest.context_cache_policy,
         )
@@ -245,9 +255,10 @@ class PolicyResolver:
         manifest_scopes: list[MemoryScope],
         workspace_scopes: list[MemoryScope] | None,
         conversation_scopes: list[MemoryScope] | None,
+        operational_scopes: list[MemoryScope] | None = None,
     ) -> list[MemoryScope]:
         allowed = list(manifest_scopes)
-        for override_scopes in (workspace_scopes, conversation_scopes):
+        for override_scopes in (workspace_scopes, conversation_scopes, operational_scopes):
             if override_scopes is None:
                 continue
             override_set = set(override_scopes)
@@ -283,14 +294,34 @@ class PolicyResolver:
         manifest_value: list[T],
         workspace_value: list[T] | None,
         conversation_value: list[T] | None,
+        operational_value: list[T] | None = None,
     ) -> list[T]:
-        return list(
-            PolicyResolver._pick_most_specific_scalar(
-                manifest_value,
-                workspace_value,
-                conversation_value,
-            )
+        resolved = PolicyResolver._pick_most_specific_scalar(
+            manifest_value,
+            workspace_value,
+            conversation_value,
         )
+        return list(operational_value if operational_value is not None else resolved)
+
+    @staticmethod
+    def _resolve_need_triggers(
+        resolved_value: list[NeedTrigger],
+        operational_value: list[NeedTrigger] | None,
+    ) -> list[NeedTrigger]:
+        if operational_value is None:
+            return list(resolved_value)
+        merged: list[NeedTrigger] = []
+        for trigger in [*resolved_value, *operational_value]:
+            if trigger in merged:
+                continue
+            merged.append(trigger)
+        return merged
+
+    @staticmethod
+    def _resolve_restricted_scalar[T](resolved_value: T, operational_value: T | None) -> T:
+        if operational_value is None:
+            return resolved_value
+        return min(resolved_value, operational_value)
 
     @staticmethod
     def _resolve_retrieval_params(
@@ -307,6 +338,25 @@ class PolicyResolver:
                 if override_value is not None:
                     resolved[field_name] = override_value
         return RetrievalParams.model_validate(resolved)
+
+    @staticmethod
+    def _resolve_operational_retrieval_params(
+        resolved_value: RetrievalParams,
+        operational_value: Any | None,
+    ) -> RetrievalParams:
+        if operational_value is None:
+            return resolved_value
+        resolved = resolved_value.model_dump()
+        for field_name in RetrievalParams.model_fields:
+            override_value = getattr(operational_value, field_name)
+            if override_value is not None:
+                resolved[field_name] = min(resolved[field_name], override_value)
+        return RetrievalParams.model_validate(resolved)
+
+
+def compute_effective_policy_hash(resolved: ResolvedPolicy) -> str:
+    """Compute a stable hash for the fully resolved runtime policy."""
+    return canonical_json_hash(resolved.model_dump(mode="json", exclude={"prompt_hash"}))
 
 
 async def sync_assistant_modes(

@@ -10,10 +10,20 @@ from atagia.models.schemas_cache import ContextCacheEntry
 def _cache_entry_payload() -> dict[str, object]:
     return {
         "cache_key": "ctx:v1:test",
+        "version": 2,
         "user_id": "usr_1",
         "conversation_id": "cnv_1",
         "assistant_mode_id": "coding_debug",
         "policy_prompt_hash": "abc123",
+        "effective_policy_hash": "def456",
+        "operational_profile": {
+            "profile_id": "normal",
+            "signals": {},
+            "risk_level": "normal",
+            "authorized": True,
+            "profile_hash": "profile123",
+            "token": "token123",
+        },
         "workspace_id": "wrk_1",
         "composed_context": {
             "contract_block": "Direct, concise.",
@@ -49,7 +59,7 @@ def _cache_entry_payload() -> dict[str, object]:
 def test_context_cache_entry_validates_successfully() -> None:
     entry = ContextCacheEntry.model_validate(_cache_entry_payload())
 
-    assert entry.version == 1
+    assert entry.version == 2
     assert entry.composed_context.selected_memory_ids == ["mem_1", "mem_2"]
     assert entry.memory_summaries[0].memory_id == "mem_1"
 

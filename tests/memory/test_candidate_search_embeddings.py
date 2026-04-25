@@ -444,6 +444,8 @@ async def test_rrf_uses_best_fts_rank_once_across_query_rewrites() -> None:
 
         assert shared["retrieval_sources"] == ["fts"]
         assert shared["channel_ranks"] == {
+            "verbatim_pin": None,
+            "artifact_chunk": None,
             "fts": 1,
             "embedding": None,
             "consequence": None,

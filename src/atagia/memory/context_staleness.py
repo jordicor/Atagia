@@ -12,7 +12,7 @@ from atagia.core.clock import Clock, SystemClock
 from atagia.core.config import Settings
 from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.models.schemas_cache import ContextCacheEntry
-from atagia.models.schemas_memory import AssistantModeId
+from atagia.models.schemas_memory import AssistantModeId, OperationalProfileSnapshot
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
 
 MESSAGE_PENALTY_PER_MESSAGE = 0.1
@@ -76,6 +76,8 @@ class ContextStalenessRequest(BaseModel):
     message_text: str = Field(min_length=1)
     current_message_seq: int = Field(ge=0)
     cache_enabled: bool = True
+    operational_profile: OperationalProfileSnapshot
+    effective_policy_hash: str = Field(min_length=1)
     benchmark_mode: bool = False
     replay_mode: bool = False
     evaluation_mode: bool = False
@@ -433,6 +435,10 @@ class ContextStalenessScorer:
             return "workspace_id_mismatch"
         if cache_entry.policy_prompt_hash != resolved_policy.prompt_hash:
             return "policy_prompt_hash_mismatch"
+        if cache_entry.effective_policy_hash != request.effective_policy_hash:
+            return "effective_policy_hash_mismatch"
+        if cache_entry.operational_profile.token != request.operational_profile.token:
+            return "operational_profile_mismatch"
         if request.current_message_seq < cache_entry.last_retrieval_message_seq:
             return "message_sequence_rewind"
         return None

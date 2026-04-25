@@ -379,7 +379,9 @@ class RevisionWorker:
         target_scope = self._promotion_target_scope(payload, active_beliefs, stats)
         if target_scope is None:
             if explicit_user_statement and payload.evidence_memory_ids and not same_message_beliefs:
-                target_scope = MemoryScope.GLOBAL_USER
+                target_scope = self._explicit_statement_target_scope(payload)
+                if target_scope is None:
+                    return {"status": "below_threshold", "claim_key": payload.claim_key}
             else:
                 return {"status": "below_threshold", "claim_key": payload.claim_key}
 
@@ -445,6 +447,19 @@ class RevisionWorker:
                     return None
             return MemoryScope.GLOBAL_USER
 
+        return None
+
+    @staticmethod
+    def _explicit_statement_target_scope(payload: RevisionJobPayload) -> MemoryScope | None:
+        current_scope = MemoryScope(payload.scope)
+        if current_scope is MemoryScope.CONVERSATION:
+            if payload.workspace_id is not None:
+                return MemoryScope.WORKSPACE
+            if payload.assistant_mode_id is not None:
+                return MemoryScope.ASSISTANT_MODE
+            return None
+        if current_scope in {MemoryScope.WORKSPACE, MemoryScope.ASSISTANT_MODE}:
+            return current_scope
         return None
 
     async def _create_promoted_belief(

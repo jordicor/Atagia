@@ -298,7 +298,12 @@ class RetrievalPlanner:
             elif need.need_type is NeedTrigger.FRUSTRATION:
                 plan.max_context_items = max(1, int(plan.max_context_items * 0.75))
             elif need.need_type is NeedTrigger.SENSITIVE_CONTEXT:
-                plan.privacy_ceiling = min(plan.privacy_ceiling, 1)
+                # Sensitive-context detection should make retrieval more careful,
+                # but the resolved policy remains the authority for what this
+                # mode may see. Lowering the ceiling here hides the very facts a
+                # same-user personal assistant may be allowed to recall.
+                plan.max_candidates = self._increase_limit(plan.max_candidates)
+                plan.vector_limit = self._increase_limit(plan.vector_limit)
             elif need.need_type is NeedTrigger.UNDER_SPECIFIED_REQUEST:
                 plan.scope_filter = self._ordered_scopes(
                     resolved_policy.allowed_scopes,

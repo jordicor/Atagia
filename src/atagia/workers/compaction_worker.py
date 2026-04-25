@@ -113,6 +113,7 @@ class CompactionWorker:
             await self._enqueue_hierarchy_job(
                 user_id=job_payload.user_id,
                 job_kind=CompactionJobKind.EPISODE,
+                parent=envelope,
             )
             return {"job_kind": job_payload.job_kind.value, "summary_ids": summary_ids}
         if job_payload.job_kind is CompactionJobKind.WORKSPACE_ROLLUP:
@@ -128,6 +129,7 @@ class CompactionWorker:
             await self._enqueue_hierarchy_job(
                 user_id=job_payload.user_id,
                 job_kind=CompactionJobKind.THEMATIC_PROFILE,
+                parent=envelope,
             )
             return {"job_kind": job_payload.job_kind.value, "summary_ids": summary_ids}
         if job_payload.job_kind is CompactionJobKind.THEMATIC_PROFILE:
@@ -140,6 +142,7 @@ class CompactionWorker:
         *,
         user_id: str,
         job_kind: CompactionJobKind,
+        parent: JobEnvelope,
     ) -> None:
         await self._storage_backend.stream_add(
             COMPACT_STREAM_NAME,
@@ -152,6 +155,7 @@ class CompactionWorker:
                     job_kind=job_kind,
                 ).model_dump(mode="json"),
                 created_at=None,
+                operational_profile=parent.operational_profile,
             ).model_dump(mode="json"),
         )
 

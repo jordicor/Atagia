@@ -21,6 +21,7 @@ from atagia.core.repositories import (
 )
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
 from atagia.services.context_cache_service import ContextCacheService
+from atagia.services.chat_support import default_operational_profile_snapshot
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -168,6 +169,15 @@ def _install_stub_client(monkeypatch: pytest.MonkeyPatch, provider: EngineProvid
     # need detection), so disable the small-corpus shortcut for the duration
     # of the test. Individual tests can still override via setenv.
     monkeypatch.setenv("ATAGIA_SMALL_CORPUS_TOKEN_THRESHOLD_RATIO", "0")
+
+
+def _normal_operational_profile_token(engine: Atagia) -> str:
+    if engine.runtime is None:
+        raise AssertionError("Engine runtime should be initialized")
+    return default_operational_profile_snapshot(
+        loader=engine.runtime.operational_profile_loader,
+        settings=engine.runtime.settings,
+    ).token
 
 
 @pytest.mark.asyncio
@@ -468,6 +478,7 @@ async def test_engine_add_response_invalidates_stable_context_cache(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             workspace_id=None,
+            operational_profile_token=_normal_operational_profile_token(engine),
         )
         assert await engine.runtime.storage_backend.get_context_view(cache_key) is not None
 
@@ -509,6 +520,7 @@ async def test_engine_ingest_message_invalidates_stable_context_cache(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             workspace_id=None,
+            operational_profile_token=_normal_operational_profile_token(engine),
         )
         assert await engine.runtime.storage_backend.get_context_view(cache_key) is not None
 

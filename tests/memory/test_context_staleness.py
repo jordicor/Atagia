@@ -10,7 +10,11 @@ import pytest
 
 from atagia.core.clock import FrozenClock
 from atagia.memory.context_staleness import ContextStalenessScorer
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
+from atagia.memory.policy_manifest import (
+    ManifestLoader,
+    PolicyResolver,
+    compute_effective_policy_hash,
+)
 from atagia.models.schemas_memory import AssistantModeId
 from atagia.services.llm_client import (
     LLMClient,
@@ -21,6 +25,14 @@ from atagia.services.llm_client import (
 )
 
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+OPERATIONAL_PROFILE = {
+    "profile_id": "normal",
+    "signals": {},
+    "risk_level": "normal",
+    "authorized": True,
+    "profile_hash": "profile123",
+    "token": "token123",
+}
 
 
 class StubStructuredProvider(LLMProvider):
@@ -56,11 +68,14 @@ def _entry_payload(
 ) -> dict[str, object]:
     resolved_policy = _resolved_policy(mode_id)
     return {
-        "cache_key": "ctx:v1:test",
+        "version": 2,
+        "cache_key": "ctx:v2:test",
         "user_id": "usr_1",
         "conversation_id": "cnv_1",
         "assistant_mode_id": mode_id,
         "policy_prompt_hash": prompt_hash or resolved_policy.prompt_hash,
+        "effective_policy_hash": compute_effective_policy_hash(resolved_policy),
+        "operational_profile": OPERATIONAL_PROFILE,
         "workspace_id": workspace_id,
         "composed_context": {
             "contract_block": "Direct and concise.",
@@ -96,6 +111,7 @@ def _entry_payload(
 def _request_payload(
     *,
     message_text: str,
+    mode_id: str = "general_qa",
     current_message_seq: int = 11,
     workspace_id: str | None = None,
     cache_enabled: bool = True,
@@ -111,6 +127,8 @@ def _request_payload(
         "message_text": message_text,
         "current_message_seq": current_message_seq,
         "cache_enabled": cache_enabled,
+        "operational_profile": OPERATIONAL_PROFILE,
+        "effective_policy_hash": compute_effective_policy_hash(_resolved_policy(mode_id)),
         "benchmark_mode": benchmark_mode,
         "replay_mode": replay_mode,
         "evaluation_mode": evaluation_mode,
@@ -146,7 +164,10 @@ async def test_low_staleness_same_topic_continuation_stays_cacheable() -> None:
 
     score = await scorer.score(
         _entry_payload(mode_id="coding_debug"),
-        _request_payload(message_text="Continue with the login test"),
+        _request_payload(
+            message_text="Continue with the login test",
+            mode_id="coding_debug",
+        ),
         resolved_policy,
     )
 
@@ -230,7 +251,10 @@ async def test_explicit_mode_shift_forces_sync() -> None:
 
     score = await scorer.score(
         _entry_payload(mode_id="coding_debug"),
-        _request_payload(message_text="Switch to research mode and compare the papers."),
+        _request_payload(
+            message_text="Switch to research mode and compare the papers.",
+            mode_id="coding_debug",
+        ),
         resolved_policy,
     )
 

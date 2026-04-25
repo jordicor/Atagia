@@ -319,6 +319,7 @@ def test_build_transcript_window_trace_and_system_prompt_include_summary_boundar
         "",
         "",
         "",
+        current_user_display_name="Alex Rivera",
     )
 
     assert trace["chunk_ids"] == ["sum_trace"]
@@ -329,7 +330,10 @@ def test_build_transcript_window_trace_and_system_prompt_include_summary_boundar
     assert "last Saturday" in prompt
     assert "Calculate the actual calendar date when possible." in prompt
     assert "include all distinct items found across the retrieved memories" in prompt
+    assert "Do not substitute nearby, inferred, or related facts" in prompt
     assert "you may use it inside that same active conversation/mode" in prompt
+    assert "The current authenticated user is Alex Rivera." in prompt
+    assert "Do not refuse solely because a retrieved fact is sensitive." in prompt
     assert "[Conversation summary | historical context only | ...]" in prompt
     assert "[End of summary]" in prompt
 

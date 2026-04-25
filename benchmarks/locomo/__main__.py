@@ -11,9 +11,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from benchmarks.base import DEFAULT_SCORED_CATEGORIES
+from benchmarks.base import (
+    DEFAULT_SCORED_CATEGORIES,
+    BenchmarkReport,
+    ConversationReport,
+    QuestionResult,
+)
 from benchmarks.locomo.benchmark import LoCoMoBenchmark
-from benchmarks.base import BenchmarkReport, ConversationReport, QuestionResult
 from benchmarks.report_diff import build_benchmark_diff, load_benchmark_report, save_benchmark_diff
 from atagia.models.schemas_replay import AblationConfig
 
@@ -89,6 +93,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated scored categories to evaluate",
     )
     parser.add_argument(
+        "--questions",
+        default=None,
+        help="Comma-separated question ids to run after conversation/category filtering",
+    )
+    parser.add_argument(
         "--ablation",
         default=None,
         help=(
@@ -143,6 +152,22 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional diff artifact output path; defaults next to the saved report",
     )
+    parser.add_argument(
+        "--checkpoint-output",
+        default=None,
+        help=(
+            "Path to a JSON checkpoint overwritten after each scored question; "
+            "defaults to locomo-checkpoint.json in the output directory"
+        ),
+    )
+    parser.add_argument(
+        "--trusted-evaluation",
+        action="store_true",
+        help=(
+            "Run in controlled local benchmark mode: raise retrieval privacy "
+            "ceiling and allow sensitive facts from retrieved benchmark context"
+        ),
+    )
     return parser
 
 
@@ -159,7 +184,13 @@ def _default_diff_output_path(report_path: Path) -> Path:
     return report_path.with_name(f"locomo-diff-{timestamp}.json")
 
 
-async def _run_async(args: argparse.Namespace) -> tuple[BenchmarkReport, Path, Path | None]:
+def _default_checkpoint_output_path(output_dir: str | Path) -> Path:
+    return Path(output_dir).expanduser() / "locomo-checkpoint.json"
+
+
+async def _run_async(
+    args: argparse.Namespace,
+) -> tuple[BenchmarkReport, Path, Path | None, Path]:
     benchmark = LoCoMoBenchmark(
         data_path=args.data_path,
         llm_provider=args.provider,
@@ -172,12 +203,21 @@ async def _run_async(args: argparse.Namespace) -> tuple[BenchmarkReport, Path, P
         corrections_path=args.corrections,
         community_corrections_path=args.community_corrections,
     )
+    checkpoint_path = (
+        Path(args.checkpoint_output).expanduser()
+        if args.checkpoint_output is not None
+        else _default_checkpoint_output_path(args.output)
+    )
+    print(f"Checkpoint will be updated at: {checkpoint_path}", flush=True)
     report = await benchmark.run(
         ablation=_parse_ablation(args.ablation),
         conversation_ids=_parse_csv_list(args.conversations),
         categories=_parse_categories(args.categories),
+        question_ids=_parse_csv_list(args.questions),
         max_questions=args.max_questions,
         max_turns=args.max_turns,
+        checkpoint_path=checkpoint_path,
+        trusted_evaluation=args.trusted_evaluation,
     )
     report_path = benchmark.save_report(report, args.output)
 
@@ -196,7 +236,7 @@ async def _run_async(args: argparse.Namespace) -> tuple[BenchmarkReport, Path, P
             else _default_diff_output_path(report_path)
         )
         diff_path = save_benchmark_diff(diff_report, requested_diff_output)
-    return report, report_path, diff_path
+    return report, report_path, diff_path, checkpoint_path
 
 
 def _format_duration(duration_seconds: float) -> str:
@@ -234,6 +274,7 @@ def _format_report_summary(
     report: BenchmarkReport,
     report_path: Path,
     diff_path: Path | None = None,
+    checkpoint_path: Path | None = None,
 ) -> str:
     category_stats = _category_counts(report)
     lines = [
@@ -247,6 +288,7 @@ def _format_report_summary(
             f"{report.model_info.get('provider', '')} / "
             f"{report.model_info.get('answer_model', '')}"
         ),
+        f"Trusted evaluation: {bool(report.model_info.get('trusted_evaluation', False))}",
         "",
         "Category breakdown:",
     ]
@@ -272,7 +314,12 @@ def _format_report_summary(
         [
             "",
             f"Report saved to: {report_path}",
-            *( [f"Diff saved to: {diff_path}"] if diff_path is not None else [] ),
+            *(
+                [f"Checkpoint saved to: {checkpoint_path}"]
+                if checkpoint_path is not None
+                else []
+            ),
+            *([f"Diff saved to: {diff_path}"] if diff_path is not None else []),
             "=" * 40,
         ]
     )
@@ -285,8 +332,15 @@ def main() -> None:
     args = parser.parse_args()
     if args.embedding_backend == "sqlite_vec" and not args.embedding_model:
         parser.error("--embedding-model is required when --embedding-backend is sqlite_vec")
-    report, output_path, diff_path = asyncio.run(_run_async(args))
-    print(_format_report_summary(report, output_path, diff_path=diff_path))
+    report, output_path, diff_path, checkpoint_path = asyncio.run(_run_async(args))
+    print(
+        _format_report_summary(
+            report,
+            output_path,
+            diff_path=diff_path,
+            checkpoint_path=checkpoint_path,
+        )
+    )
 
 
 if __name__ == "__main__":

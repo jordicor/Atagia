@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -44,6 +45,7 @@ from atagia.services.llm_client import (
     LLMProvider,
     StructuredOutputError,
 )
+from atagia.services.privacy_filter_client import PrivacyFilterDetection, PrivacyFilterSpan
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -156,6 +158,7 @@ async def _build_runtime(
     explicit_result: bool = True,
     workspace_id: str | None = None,
     settings: Settings | None = None,
+    privacy_filter_client: Any | None = None,
 ):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 3, 30, 18, 0, tzinfo=timezone.utc))
@@ -179,6 +182,7 @@ async def _build_runtime(
         memory_repository=memories,
         storage_backend=InProcessBackend(),
         settings=settings,
+        privacy_filter_client=privacy_filter_client,
     )
     manifest = ManifestLoader(MANIFESTS_DIR).load_all()[mode_id]
     resolved_policy = PolicyResolver().resolve(manifest, None, None)
@@ -268,6 +272,16 @@ class SequencedExtractionProvider(LLMProvider):
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError("Embeddings are not used by the extractor tests")
+
+
+class FakePrivacyFilterClient:
+    def __init__(self, detection: PrivacyFilterDetection) -> None:
+        self.detection = detection
+        self.texts: list[str] = []
+
+    async def detect(self, text: str) -> PrivacyFilterDetection:
+        self.texts.append(text)
+        return self.detection
 
 
 async def _create_source_message(
@@ -397,6 +411,77 @@ async def test_normal_extraction_persists_grounded_items() -> None:
         assert by_type["belief"]["payload_json"]["source_message_ids"] == ["msg_1"]
         assert "extraction_hash" in by_type["belief"]["payload_json"]
         assert by_type["state_snapshot"]["scope"] == "conversation"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_opf_pre_signal_raises_privacy_level_without_raw_span_text() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "The lobby code is 3847",
+                "scope": "conversation",
+                "confidence": 0.9,
+                "source_kind": "extracted",
+                "privacy_level": 0,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    privacy_filter = FakePrivacyFilterClient(
+        PrivacyFilterDetection(
+            spans=[
+                PrivacyFilterSpan(
+                    label="private_address",
+                    start=18,
+                    end=22,
+                    text_sha256="hashed",
+                )
+            ],
+            endpoint_used="http://opf.test",
+            latency_ms=7.5,
+        )
+    )
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+        payload,
+        settings=_settings(opf_privacy_filter_enabled=True),
+        privacy_filter_client=privacy_filter,
+    )
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="The lobby code is 3847.",
+        )
+
+        result = await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
+
+        rows = await memories.list_for_user("usr_1", statuses=None)
+        assert rows[0]["privacy_level"] == 2
+        assert result.evidences[0].privacy_level == 2
+        assert privacy_filter.texts == ["The lobby code is 3847"]
+        audit = rows[0]["payload_json"]["privacy_filter_pre_signal"]
+        assert audit["triggered"] is True
+        assert audit["labels"] == ["private_address"]
+        assert audit["spans"] == [
+            {
+                "label": "private_address",
+                "start": 18,
+                "end": 22,
+                "text_sha256": "hashed",
+            }
+        ]
+        assert "3847" not in json.dumps(audit)
     finally:
         await connection.close()
 
@@ -934,6 +1019,12 @@ def test_extraction_prompt_template_instructs_temporal_bound_ordering() -> None:
         "earlier than or equal to `valid_to_iso`."
     ) in EXTRACTION_PROMPT_TEMPLATE
     assert "If the end is uncertain, omit `valid_to_iso` instead of guessing." in EXTRACTION_PROMPT_TEMPLATE
+
+
+def test_extraction_prompt_template_preserves_structured_fact_granularity() -> None:
+    assert "Do not classify factual details as contract signals" in EXTRACTION_PROMPT_TEMPLATE
+    assert "multiple independent durable facts" in EXTRACTION_PROMPT_TEMPLATE
+    assert "keep that condition attached to the extracted item" in EXTRACTION_PROMPT_TEMPLATE
 
 
 @pytest.mark.asyncio
@@ -1748,6 +1839,56 @@ async def test_high_privacy_user_items_start_pending_without_prior_confirmation(
         assert marker["memory_category"] == MemoryCategory.PIN_OR_PASSWORD.value
         assert marker["asked_at"] is None
         assert marker["confirmation_asked_once"] == 0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_high_risk_category_starts_pending_even_when_privacy_is_underclassified() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "I take 10mg of the medication every night.",
+                "index_text": "User's medication dosage",
+                "scope": "global_user",
+                "confidence": 0.96,
+                "source_kind": "extracted",
+                "privacy_level": 1,
+                "memory_category": "medication",
+                "preserve_verbatim": False,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+        payload,
+        mode_id="personal_assistant",
+    )
+    try:
+        confirmations = PendingMemoryConfirmationRepository(connection, clock)
+        source_message = await _create_source_message(
+            messages,
+            text="I take 10mg of the medication every night.",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        assert len(persisted) == 1
+        assert persisted[0]["status"] == MemoryStatus.PENDING_USER_CONFIRMATION.value
+        marker = await confirmations.get_marker_for_memory("usr_1", str(persisted[0]["id"]))
+        assert marker is not None
+        assert marker["memory_category"] == MemoryCategory.MEDICATION.value
     finally:
         await connection.close()
 

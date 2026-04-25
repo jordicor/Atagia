@@ -889,7 +889,7 @@ class CandidateSearch:
                     user_id=user_id,
                     channel_scope=channel_scope,
                 )
-                if window_candidate is None:
+                if window_candidate is None or not self._matches_plan_filters(window_candidate, plan):
                     continue
                 window_id = str(window_candidate["id"])
                 existing = aggregated.get(window_id)
@@ -950,6 +950,10 @@ class CandidateSearch:
             or window_messages[-1].get("created_at")
         )
         source_message_ids = [str(message["id"]) for message in window_messages]
+        privacy_level = await self._max_privacy_level_for_source_messages(
+            user_id=user_id,
+            source_message_ids=source_message_ids,
+        )
         payload: dict[str, Any] = {
             "source_message_ids": source_message_ids,
             "source_kind_variant": "conversation_window",
@@ -984,7 +988,7 @@ class CandidateSearch:
             "stability": 0.5,
             "vitality": 0.0,
             "maya_score": 0.0,
-            "privacy_level": 0,
+            "privacy_level": privacy_level,
             "temporal_type": "unknown",
             "valid_from": None,
             "valid_to": None,
@@ -1000,6 +1004,35 @@ class CandidateSearch:
             "raw_window_end_seq": end_seq,
             "raw_window_message_ids": source_message_ids,
         }
+
+    async def _max_privacy_level_for_source_messages(
+        self,
+        *,
+        user_id: str,
+        source_message_ids: list[str],
+    ) -> int:
+        normalized_message_ids = [
+            str(message_id).strip()
+            for message_id in source_message_ids
+            if str(message_id).strip()
+        ]
+        if not normalized_message_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in normalized_message_ids)
+        cursor = await self._connection.execute(
+            """
+            SELECT MAX(mo.privacy_level) AS max_privacy_level
+            FROM memory_objects AS mo
+            JOIN json_each(mo.payload_json, '$.source_message_ids') AS source_ids ON 1 = 1
+            WHERE mo.user_id = ?
+              AND CAST(source_ids.value AS TEXT) IN ({placeholders})
+            """.format(placeholders=placeholders),
+            (user_id, *normalized_message_ids),
+        )
+        row = await cursor.fetchone()
+        if row is None or row["max_privacy_level"] is None:
+            return 0
+        return int(row["max_privacy_level"])
 
     @staticmethod
     def _build_artifact_chunk_candidate(

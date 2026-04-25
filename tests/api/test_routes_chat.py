@@ -290,6 +290,60 @@ def test_create_app_rejects_insecure_http_by_default(tmp_path: Path) -> None:
         create_app(_settings(tmp_path, service_mode=False, allow_insecure_http=False))
 
 
+def test_sidecar_context_unknown_operational_profile_returns_404(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        conversation = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_1",
+                "assistant_mode_id": "coding_debug",
+                "workspace_id": None,
+                "title": "Debug Chat",
+                "metadata": {},
+            },
+        ).json()
+
+        response = client.post(
+            f"/v1/conversations/{conversation['id']}/context",
+            json={
+                "user_id": "usr_1",
+                "message_text": "Please help me debug this retry loop.",
+                "operational_profile": "space_station",
+            },
+        )
+
+        assert response.status_code == 404
+        assert "Unknown operational profile" in response.json()["detail"]
+
+
+def test_sidecar_context_high_risk_operational_profile_requires_opt_in(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        conversation = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_1",
+                "assistant_mode_id": "coding_debug",
+                "workspace_id": None,
+                "title": "Debug Chat",
+                "metadata": {},
+            },
+        ).json()
+
+        response = client.post(
+            f"/v1/conversations/{conversation['id']}/context",
+            json={
+                "user_id": "usr_1",
+                "message_text": "Please help me debug this retry loop.",
+                "operational_profile": "emergency",
+            },
+        )
+
+        assert response.status_code == 403
+        assert "not authorized" in response.json()["detail"]
+
+
 def test_chat_reply_runs_full_flow_and_returns_response(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     provider = QueueProvider(

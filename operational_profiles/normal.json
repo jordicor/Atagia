@@ -1,0 +1,13 @@
+{
+  "operational_profile_id": "normal",
+  "display_name": "Normal",
+  "risk_level": "normal",
+  "signals": {
+    "power": "normal",
+    "connectivity": "online",
+    "safety": "normal",
+    "incident_scope": "none",
+    "compute": "remote_allowed"
+  },
+  "policy_override": {}
+}

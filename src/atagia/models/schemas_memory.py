@@ -237,6 +237,145 @@ class RetrievalParams(BaseModel):
     final_context_items: int = Field(gt=0)
 
 
+class OperationalPower(str, Enum):
+    NORMAL = "normal"
+    CONSTRAINED = "constrained"
+    CRITICAL = "critical"
+
+
+class OperationalConnectivity(str, Enum):
+    ONLINE = "online"
+    DEGRADED = "degraded"
+    OFFLINE = "offline"
+
+
+class OperationalSafety(str, Enum):
+    NORMAL = "normal"
+    HIGH_STAKES = "high_stakes"
+    EMERGENCY = "emergency"
+
+
+class OperationalIncidentScope(str, Enum):
+    NONE = "none"
+    LOCAL_DISRUPTION = "local_disruption"
+    DISASTER = "disaster"
+
+
+class OperationalCompute(str, Enum):
+    REMOTE_ALLOWED = "remote_allowed"
+    LOCAL_PREFERRED = "local_preferred"
+    LOCAL_ONLY = "local_only"
+
+
+class OperationalSignals(BaseModel):
+    """Structured operational signals supplied by a client/device."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    power: OperationalPower | None = None
+    connectivity: OperationalConnectivity | None = None
+    safety: OperationalSafety | None = None
+    incident_scope: OperationalIncidentScope | None = None
+    compute: OperationalCompute | None = None
+
+
+class OperationalRetrievalParamsOverride(BaseModel):
+    """Operational restriction for retrieval knobs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    fts_limit: int | None = Field(default=None, ge=0)
+    vector_limit: int | None = Field(default=None, ge=0)
+    graph_hops: int | None = Field(default=None, ge=0)
+    rerank_top_k: int | None = Field(default=None, gt=0)
+    final_context_items: int | None = Field(default=None, gt=0)
+
+
+class OperationalPolicyOverride(BaseModel):
+    """Fields an operational profile may restrict in Phase 0."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    allowed_scopes: list[MemoryScope] | None = None
+    preferred_memory_types: list[MemoryObjectType] | None = None
+    need_triggers: list[NeedTrigger] | None = None
+    contract_dimensions_priority: list[str] | None = None
+    context_budget_tokens: int | None = Field(default=None, gt=0)
+    transcript_budget_tokens: int | None = Field(default=None, gt=0)
+    retrieval_params: OperationalRetrievalParamsOverride | None = None
+
+    @field_validator("allowed_scopes")
+    @classmethod
+    def validate_allowed_scopes(cls, values: list[MemoryScope] | None) -> list[MemoryScope] | None:
+        return None if values is None else _ensure_unique_values(values)
+
+    @field_validator("preferred_memory_types")
+    @classmethod
+    def validate_preferred_memory_types(
+        cls,
+        values: list[MemoryObjectType] | None,
+    ) -> list[MemoryObjectType] | None:
+        return None if values is None else _ensure_unique_values(values)
+
+    @field_validator("need_triggers")
+    @classmethod
+    def validate_need_triggers(cls, values: list[NeedTrigger] | None) -> list[NeedTrigger] | None:
+        return None if values is None else _ensure_unique_values(values)
+
+    @field_validator("contract_dimensions_priority")
+    @classmethod
+    def validate_contract_dimensions_priority(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        if any(not value.strip() for value in values):
+            raise ValueError("Contract dimensions must be non-empty strings")
+        return _ensure_unique_values(values)
+
+    def to_policy_override_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude_none=True)
+
+
+class OperationalRiskLevel(str, Enum):
+    NORMAL = "normal"
+    SENSITIVE = "sensitive"
+    HIGH_RISK = "high_risk"
+
+
+class OperationalProfile(BaseModel):
+    """Canonical operational profile preset."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operational_profile_id: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(min_length=1, max_length=128)
+    risk_level: OperationalRiskLevel
+    signals: OperationalSignals
+    policy_override: OperationalPolicyOverride = Field(default_factory=OperationalPolicyOverride)
+    profile_hash: str | None = Field(default=None, exclude=True)
+
+
+class OperationalProfileSnapshot(BaseModel):
+    """Stable operational profile shape carried by cache entries and jobs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    profile_id: str = Field(min_length=1, max_length=64)
+    signals: OperationalSignals
+    risk_level: OperationalRiskLevel
+    authorized: bool
+    profile_hash: str = Field(min_length=1)
+    token: str = Field(min_length=1)
+
+
+class ResolvedOperationalProfile(BaseModel):
+    """Resolved operational profile with effective signals and policy overlay."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    snapshot: OperationalProfileSnapshot
+    policy_override: OperationalPolicyOverride = Field(default_factory=OperationalPolicyOverride)
+
+
 class ContextCachePolicy(BaseModel):
     """Adaptive context-cache settings attached to an assistant mode."""
 

@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from atagia.models.schemas_api import MemorySummary
-from atagia.models.schemas_memory import ComposedContext
+from atagia.models.schemas_memory import ComposedContext, OperationalProfileSnapshot
 
 
 class ContextCacheEntry(BaseModel):
@@ -15,12 +15,14 @@ class ContextCacheEntry(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: int = Field(default=1, ge=1)
+    version: int = Field(default=2, ge=2)
     cache_key: str = Field(min_length=1)
     user_id: str = Field(min_length=1)
     conversation_id: str = Field(min_length=1)
     assistant_mode_id: str = Field(min_length=1)
     policy_prompt_hash: str = Field(min_length=1)
+    effective_policy_hash: str = Field(min_length=1)
+    operational_profile: OperationalProfileSnapshot
     workspace_id: str | None = None
     composed_context: ComposedContext
     contract: dict[str, dict[str, Any]] = Field(default_factory=dict)

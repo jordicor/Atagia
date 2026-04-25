@@ -168,6 +168,21 @@ class BenchmarkProvider(LLMProvider):
         return None
 
 
+class FailingSecondAnswerProvider(BenchmarkProvider):
+    """Provider that fails after the first scored answer is checkpointed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.answer_generation_calls = 0
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        if request.metadata.get("purpose") == "benchmark_answer_generation":
+            self.answer_generation_calls += 1
+            if self.answer_generation_calls == 2:
+                raise RuntimeError("simulated benchmark interruption")
+        return await super().complete(request)
+
+
 def _install_stub_client(monkeypatch: pytest.MonkeyPatch, provider: BenchmarkProvider) -> None:
     monkeypatch.setattr(
         "atagia.app.build_llm_client",
@@ -284,6 +299,11 @@ async def test_benchmark_single_conversation(
     assert conversation_report.conversation_id == "conv-test-1"
     assert conversation_report.accuracy == pytest.approx(2 / 3)
     assert len(conversation_report.results) == 3
+    assert conversation_report.results[0].trace["diagnosis_bucket"] == "passed"
+    assert conversation_report.results[0].trace["retrieval_trace"]["query_text"] == (
+        "What color notebooks does Alice keep?"
+    )
+    assert "selected_memory_ids" in conversation_report.results[0].trace
     assert report.model_info["provider"] == "openai"
     assert report.model_info["answer_model"] == "answer-model"
     assert report.model_info["judge_model"] == "judge-model"
@@ -316,6 +336,7 @@ async def test_benchmark_with_ablation(
         message_text: str,
         mode: str | None = None,
         ablation: AblationConfig | None = None,
+        trace: object | None = None,
     ):
         if message_text == "What color notebooks does Alice keep?":
             observed_ablation.append(ablation)
@@ -326,6 +347,7 @@ async def test_benchmark_with_ablation(
             message_text=message_text,
             mode=mode,
             ablation=ablation,
+            trace=trace,
         )
 
     monkeypatch.setattr(RetrievalService, "retrieve", _capture_retrieve)
@@ -386,6 +408,68 @@ async def test_benchmark_max_questions_limits_validation_run(
         for request in provider.requests
         if request.metadata.get("purpose") == "memory_extraction"
     ) == 6
+
+
+@pytest.mark.asyncio
+async def test_benchmark_question_ids_filter_validation_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await benchmark.run(question_ids=["conv-test-1:q2"])
+
+    assert report.total_questions == 1
+    assert report.conversations[0].results[0].question.question_id == "conv-test-1:q2"
+
+
+@pytest.mark.asyncio
+async def test_benchmark_writes_partial_checkpoint_before_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FailingSecondAnswerProvider()
+    _install_stub_client(monkeypatch, provider)
+    checkpoint_path = tmp_path / "checkpoints" / "locomo-checkpoint.json"
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated benchmark interruption"):
+        await benchmark.run(max_questions=2, checkpoint_path=checkpoint_path)
+
+    checkpoint = BenchmarkReport.model_validate_json(checkpoint_path.read_text())
+    assert checkpoint.total_questions == 1
+    assert checkpoint.total_correct == 1
+    assert checkpoint.overall_accuracy == pytest.approx(1.0)
+    assert len(checkpoint.conversations) == 1
+    assert checkpoint.conversations[0].conversation_id == "conv-test-1"
+    assert checkpoint.conversations[0].results[0].question.question_text == (
+        "What color notebooks does Alice keep?"
+    )
+    assert checkpoint.model_info["checkpoint"] == {
+        "partial": True,
+        "conversation_id": "conv-test-1",
+        "conversation_index": 1,
+        "conversation_count": 1,
+        "completed_questions": 1,
+        "selected_questions": 2,
+        "trusted_evaluation": False,
+    }
 
 
 @pytest.mark.asyncio

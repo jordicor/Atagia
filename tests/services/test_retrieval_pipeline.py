@@ -17,11 +17,13 @@ from atagia.core.repositories import ConversationRepository, MemoryObjectReposit
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
 from atagia.models.schemas_memory import (
+    DetectedNeed,
     ExtractionConversationContext,
     MemoryObjectType,
     MemoryScope,
     MemorySourceKind,
     MemoryStatus,
+    NeedTrigger,
     PlannedSubQuery,
     RetrievalPlan,
     RetrievalTrace,
@@ -640,7 +642,7 @@ async def test_pipeline_high_stakes_filters_derived_memory_and_workspace_rollup(
 
 
 @pytest.mark.asyncio
-async def test_pipeline_small_corpus_shortcut_returns_all_eligible_memories() -> None:
+async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None:
     provider = PipelineProvider()
     connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
         provider=provider,
@@ -673,19 +675,54 @@ async def test_pipeline_small_corpus_shortcut_returns_all_eligible_memories() ->
         assert result.small_corpus_mode is True
         assert result.degraded_mode is False
         assert result.detected_needs == []
-        assert not any(
+        assert any(
             request.metadata.get("purpose") == "need_detection" for request in provider.requests
         )
-        assert not any(
+        assert any(
             request.metadata.get("purpose") == "applicability_scoring"
             for request in provider.requests
         )
         returned_ids = {candidate["id"] for candidate in result.raw_candidates}
         assert returned_ids == {"mem_conv", "mem_mode"}
         assert set(result.composed_context.selected_memory_ids) == {"mem_conv", "mem_mode"}
-        assert result.stage_timings["need_detection"] == 0.0
+        assert result.stage_timings["need_detection"] >= 0.0
         assert result.stage_timings["candidate_search"] >= 0.0
-        assert result.stage_timings["applicability_scoring"] == 0.0
+        assert result.stage_timings["applicability_scoring"] >= 0.0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_small_corpus_shortcut_composes_all_eligible_memories() -> None:
+    provider = PipelineProvider()
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        provider=provider,
+        settings=_settings(small_corpus_token_threshold_ratio=0.7),
+    )
+    try:
+        memory_count = resolved_policy.retrieval_params.final_context_items + 2
+        for index in range(memory_count):
+            await _seed_memory(
+                memories,
+                memory_id=f"mem_small_{index}",
+                canonical_text=f"small corpus exact fact {index}",
+                scope=MemoryScope.CONVERSATION,
+            )
+
+        result = await pipeline.execute(
+            message_text="small corpus exact fact",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "small corpus exact fact"},
+            ],
+        )
+
+        assert result.small_corpus_mode is True
+        assert len(_score_request_memory_ids(provider)) == memory_count
+        assert len(result.composed_context.selected_memory_ids) == memory_count
+        assert result.composed_context.items_dropped == 0
     finally:
         await connection.close()
 
@@ -727,9 +764,78 @@ async def test_pipeline_small_corpus_shortcut_sets_trace_flag() -> None:
         assert trace.degraded_mode is False
         assert trace.need_detection is not None
         assert trace.need_detection.degraded_mode is False
-        assert trace.need_detection.duration_ms == 0.0
+        assert trace.need_detection.duration_ms >= 0.0
         assert trace.candidate_search is not None
         assert trace.candidate_search.total_after_fusion == 1
+        assert trace.scoring is not None
+        assert trace.scoring.candidates_scored == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_small_corpus_exact_recall_includes_raw_message_windows() -> None:
+    from atagia.core.repositories import MessageRepository
+
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["panique prochaine étape"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "panique prochaine étape",
+                    "fts_phrase": "panique prochaine étape",
+                }
+            ],
+            "query_type": "slot_fill",
+            "retrieval_levels": [0],
+            "exact_recall_needed": True,
+            "exact_facets": ["other_verbatim"],
+            "raw_context_access_mode": "verbatim",
+        },
+    )
+    connection, _memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        provider=provider,
+        settings=_settings(small_corpus_token_threshold_ratio=0.7),
+    )
+    try:
+        messages = MessageRepository(
+            connection,
+            FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)),
+        )
+        await messages.create_message(
+            message_id=None,
+            conversation_id="cnv_1",
+            role="user",
+            seq=None,
+            text="Quand je panique, aide-moi avec une seule prochaine étape.",
+        )
+
+        trace = RetrievalTrace(
+            query_text="Comment m'aider quand je panique ?",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-09T12:00:00Z",
+        )
+        result = await pipeline.execute(
+            message_text="Comment m'aider quand je panique ?",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "Comment m'aider quand je panique ?"},
+            ],
+            trace=trace,
+        )
+
+        assert result.small_corpus_mode is True
+        assert trace.candidate_search is not None
+        assert trace.candidate_search.raw_message_candidates_count >= 1
+        assert any(
+            candidate.get("is_raw_message_window")
+            for candidate in result.raw_candidates
+        )
     finally:
         await connection.close()
 
@@ -833,6 +939,95 @@ async def test_pipeline_small_corpus_shortcut_excludes_pending_memories() -> Non
         assert result.small_corpus_mode is True
         returned_ids = {candidate["id"] for candidate in result.raw_candidates}
         assert returned_ids == {"mem_active"}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_exact_recall_composes_scored_candidates_up_to_rerank_budget() -> None:
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["needle exact detail"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "needle exact detail",
+                    "fts_phrase": "needle exact detail",
+                }
+            ],
+            "query_type": "slot_fill",
+            "retrieval_levels": [0],
+            "exact_recall_needed": True,
+            "exact_facets": ["other_verbatim"],
+        },
+    )
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        provider=provider,
+        settings=_settings(small_corpus_token_threshold_ratio=0.0),
+    )
+    try:
+        memory_count = resolved_policy.retrieval_params.rerank_top_k + 2
+        assert memory_count <= resolved_policy.retrieval_params.fts_limit
+        for index in range(memory_count):
+            await _seed_memory(
+                memories,
+                memory_id=f"mem_exact_{index}",
+                canonical_text=f"needle exact detail {index}",
+                scope=MemoryScope.CONVERSATION,
+            )
+
+        result = await pipeline.execute(
+            message_text="Which needle exact details are available?",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "Which needle exact details are available?"},
+            ],
+        )
+
+        assert result.small_corpus_mode is False
+        assert result.retrieval_plan.exact_recall_mode is True
+        assert len(_score_request_memory_ids(provider)) == memory_count
+        assert len(result.composed_context.selected_memory_ids) == memory_count
+        assert result.composed_context.items_dropped == 0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_degraded_need_detection_composes_scored_candidates_for_recovery() -> None:
+    provider = FailingPipelineProvider("need_detection")
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        provider=provider,
+        settings=_settings(small_corpus_token_threshold_ratio=0.0),
+    )
+    try:
+        memory_count = resolved_policy.retrieval_params.rerank_top_k + 2
+        assert memory_count <= resolved_policy.retrieval_params.fts_limit
+        for index in range(memory_count):
+            await _seed_memory(
+                memories,
+                memory_id=f"mem_degraded_{index}",
+                canonical_text=f"needle degraded recovery detail {index}",
+                scope=MemoryScope.CONVERSATION,
+            )
+
+        result = await pipeline.execute(
+            message_text="needle degraded recovery detail",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "needle degraded recovery detail"},
+            ],
+        )
+
+        assert result.degraded_mode is True
+        assert len(_score_request_memory_ids(provider)) == memory_count
+        assert len(result.composed_context.selected_memory_ids) == memory_count
+        assert result.composed_context.items_dropped == 0
     finally:
         await connection.close()
 
@@ -1143,6 +1338,74 @@ def test_merge_candidates_handles_empty_lists() -> None:
     assert RetrievalPipeline._merge_candidates(base, []) == base
     assert RetrievalPipeline._merge_candidates([], base) == base
     assert RetrievalPipeline._merge_candidates([], []) == []
+
+
+def test_regrounding_requirements_keep_grounded_l0_summary_chunks() -> None:
+    plan = _slot_fill_plan()
+    plan.require_evidence_regrounding = True
+    evidence = _candidate_record(
+        memory_id="mem_evidence",
+        canonical_text="Concrete evidence.",
+    )
+    interaction_contract = _candidate_record(
+        memory_id="mem_contract",
+        canonical_text="Only disclose this value in the matching active context.",
+        object_type=MemoryObjectType.INTERACTION_CONTRACT,
+    )
+    grounded_chunk = _candidate_record(
+        memory_id="sum_chunk",
+        canonical_text="Grounded chunk summary.",
+        object_type=MemoryObjectType.SUMMARY_VIEW,
+        payload_json={
+            "summary_kind": SummaryViewKind.CONVERSATION_CHUNK.value,
+            "hierarchy_level": 0,
+            "source_excerpt_messages": [{"role": "user", "text": "Concrete transcript."}],
+        },
+    )
+    episode = _candidate_record(
+        memory_id="sum_episode",
+        canonical_text="Abstract episode summary.",
+        object_type=MemoryObjectType.SUMMARY_VIEW,
+        payload_json={
+            "summary_kind": SummaryViewKind.EPISODE.value,
+            "hierarchy_level": 1,
+            "source_excerpt_messages": [{"role": "user", "text": "Concrete transcript."}],
+        },
+    )
+
+    filtered = RetrievalPipeline._apply_regrounding_requirements(
+        [evidence, interaction_contract, grounded_chunk, episode],
+        plan,
+    )
+
+    assert [candidate["id"] for candidate in filtered] == [
+        "mem_evidence",
+        "mem_contract",
+        "sum_chunk",
+    ]
+
+
+def test_ambiguity_recovery_expands_scoring_budget() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    plan = _slot_fill_plan(exact_recall_mode=False)
+
+    expanded = RetrievalPipeline._expand_recall_or_recovery_scoring_budget(
+        policy,
+        plan,
+        degraded_mode=False,
+        detected_needs=[
+            DetectedNeed(
+                need_type=NeedTrigger.AMBIGUITY,
+                confidence=0.8,
+                reasoning="Several memories may match this underspecified request.",
+            )
+        ],
+        item_count=32,
+    )
+
+    assert policy.retrieval_params.rerank_top_k < 32
+    assert expanded.retrieval_params.rerank_top_k == 32
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
-import json
 import logging
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Literal
@@ -16,15 +15,16 @@ from typing import TYPE_CHECKING, Any, Literal
 import aiosqlite
 
 from atagia.core.repositories import ConversationRepository, MessageRepository
+from atagia.core.canonical import canonical_json_bytes
 from atagia.memory.context_staleness import (
     ContextStalenessRequest,
     ContextStalenessScore,
     ContextStalenessScorer,
 )
-from atagia.memory.policy_manifest import ResolvedPolicy
+from atagia.memory.policy_manifest import ResolvedPolicy, compute_effective_policy_hash
 from atagia.models.schemas_api import MemorySummary
 from atagia.models.schemas_cache import ContextCacheEntry
-from atagia.models.schemas_memory import ComposedContext
+from atagia.models.schemas_memory import ComposedContext, ResolvedOperationalProfile
 from atagia.memory.lifecycle_runner import cache_generation_key
 from atagia.models.schemas_replay import AblationConfig
 
@@ -33,7 +33,9 @@ if TYPE_CHECKING:
 from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
     build_memory_summaries,
+    default_operational_profile_snapshot,
     resolve_assistant_mode_id,
+    resolve_operational_profile,
     resolve_policy,
 )
 from atagia.services.errors import ConversationNotFoundError
@@ -51,7 +53,9 @@ DISCARDABLE_CACHE_SIGNALS = frozenset(
         "cache_entry_validation_failed",
         "cached_at_invalid",
         "conversation_id_mismatch",
+        "effective_policy_hash_mismatch",
         "message_sequence_rewind",
+        "operational_profile_mismatch",
         "policy_prompt_hash_mismatch",
         "user_id_mismatch",
         "workspace_id_mismatch",
@@ -65,6 +69,7 @@ class AdaptiveContextResolution:
 
     conversation: dict[str, Any]
     resolved_policy: ResolvedPolicy
+    resolved_operational_profile: ResolvedOperationalProfile
     composed_context: ComposedContext
     current_contract: dict[str, dict[str, Any]]
     memory_summaries: list[MemorySummary]
@@ -122,6 +127,8 @@ class ContextCacheService:
         assistant_mode_id: str | None = None,
         stored_messages: list[dict[str, Any]] | None = None,
         conversation: dict[str, Any] | None = None,
+        operational_profile: str | None = None,
+        operational_signals: Any | None = None,
         ablation: AblationConfig | None = None,
     ) -> AdaptiveContextResolution:
         cache_generation = await self.runtime.storage_backend.get_cache_generation(
@@ -137,11 +144,19 @@ class ContextCacheService:
             str(active_conversation["assistant_mode_id"]),
             assistant_mode_id,
         )
+        resolved_operational_profile = resolve_operational_profile(
+            loader=self.runtime.operational_profile_loader,
+            settings=self.runtime.settings,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
+        )
         resolved_policy = resolve_policy(
             self.runtime.manifests,
             resolved_mode_id,
             self.runtime.policy_resolver,
+            resolved_operational_profile,
         )
+        effective_policy_hash = compute_effective_policy_hash(resolved_policy)
         current_messages = stored_messages
         if current_messages is None:
             current_messages = await messages.get_recent_messages(
@@ -155,6 +170,7 @@ class ContextCacheService:
             assistant_mode_id=resolved_mode_id,
             conversation_id=conversation_id,
             workspace_id=active_conversation.get("workspace_id"),
+            operational_profile_token=resolved_operational_profile.snapshot.token,
         )
         current_message_seq = self._next_message_seq(current_messages)
         cache_lookup_started = perf_counter()
@@ -176,6 +192,8 @@ class ContextCacheService:
                     message_text=message_text,
                     current_message_seq=current_message_seq,
                     cache_enabled=self._cache_enabled(ablation),
+                    operational_profile=resolved_operational_profile.snapshot,
+                    effective_policy_hash=effective_policy_hash,
                     benchmark_mode=False,
                     replay_mode=False,
                     evaluation_mode=False,
@@ -192,6 +210,7 @@ class ContextCacheService:
                 return AdaptiveContextResolution(
                     conversation=active_conversation,
                     resolved_policy=resolved_policy,
+                    resolved_operational_profile=resolved_operational_profile,
                     composed_context=entry.composed_context,
                     current_contract=entry.contract,
                     memory_summaries=entry.memory_summaries,
@@ -226,6 +245,7 @@ class ContextCacheService:
             ablation=ablation,
             conversation=active_conversation,
             stored_messages=current_messages,
+            operational_profile=resolved_operational_profile,
         )
         memory_summaries = build_memory_summaries(pipeline_result)
         pending_entry: ContextCacheEntry | None = None
@@ -237,6 +257,8 @@ class ContextCacheService:
                 conversation_id=conversation_id,
                 assistant_mode_id=resolved_mode_id,
                 policy_prompt_hash=resolved_policy.prompt_hash,
+                effective_policy_hash=effective_policy_hash,
+                operational_profile=resolved_operational_profile.snapshot,
                 workspace_id=active_conversation.get("workspace_id"),
                 composed_context=pipeline_result.composed_context,
                 contract=pipeline_result.current_contract,
@@ -259,6 +281,7 @@ class ContextCacheService:
         return AdaptiveContextResolution(
             conversation=active_conversation,
             resolved_policy=resolved_policy,
+            resolved_operational_profile=resolved_operational_profile,
             composed_context=pipeline_result.composed_context,
             current_contract=pipeline_result.current_contract,
             memory_summaries=memory_summaries,
@@ -330,28 +353,30 @@ class ContextCacheService:
         conversation_id: str,
         workspace_id: str | None,
     ) -> str:
+        operational_snapshot = default_operational_profile_snapshot(
+            loader=self.runtime.operational_profile_loader,
+            settings=self.runtime.settings,
+        )
         cache_key = self.build_cache_key(
             user_id=user_id,
             assistant_mode_id=assistant_mode_id,
             conversation_id=conversation_id,
             workspace_id=workspace_id,
+            operational_profile_token=operational_snapshot.token,
         )
-        await self.runtime.storage_backend.delete_context_view(cache_key)
+        await self.runtime.storage_backend.delete_context_views_for_conversation(
+            user_id,
+            conversation_id,
+        )
         return cache_key
 
     async def invalidate_conversation_cache_for_conversation(
         self,
         conversation: dict[str, Any],
-    ) -> str:
-        return await self.invalidate_conversation_cache(
-            user_id=str(conversation["user_id"]),
-            assistant_mode_id=str(conversation["assistant_mode_id"]),
-            conversation_id=str(conversation["id"]),
-            workspace_id=(
-                str(conversation["workspace_id"])
-                if conversation.get("workspace_id") is not None
-                else None
-            ),
+    ) -> int:
+        return await self.runtime.storage_backend.delete_context_views_for_conversation(
+            str(conversation["user_id"]),
+            str(conversation["id"]),
         )
 
     async def invalidate_user_cache(self, user_id: str) -> int:
@@ -363,13 +388,7 @@ class ContextCacheService:
             "v": 1,
             "user_id": user_id,
         }
-        payload = json.dumps(
-            guard_subject,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return "ctx-guard:user:v1:" + hashlib.sha256(payload).hexdigest()
+        return "ctx-guard:user:v1:" + hashlib.sha256(canonical_json_bytes(guard_subject)).hexdigest()
 
     @staticmethod
     def build_cache_key(
@@ -378,21 +397,17 @@ class ContextCacheService:
         assistant_mode_id: str,
         conversation_id: str,
         workspace_id: str | None,
+        operational_profile_token: str,
     ) -> str:
         cache_subject = {
-            "v": 1,
+            "v": 2,
             "assistant_mode_id": assistant_mode_id,
             "conversation_id": conversation_id,
+            "operational_profile_token": operational_profile_token,
             "user_id": user_id,
             "workspace_id": workspace_id,
         }
-        payload = json.dumps(
-            cache_subject,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return "ctx:v1:" + hashlib.sha256(payload).hexdigest()
+        return "ctx:v2:" + hashlib.sha256(canonical_json_bytes(cache_subject)).hexdigest()
 
     def _cache_enabled(self, ablation: AblationConfig | None) -> bool:
         if not self.runtime.settings.context_cache_enabled:

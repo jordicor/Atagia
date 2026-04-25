@@ -28,6 +28,7 @@ from atagia.services.errors import RuntimeNotInitializedError
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_MIGRATIONS_DIR = _PROJECT_ROOT / "migrations"
 _DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
+_DEFAULT_OPERATIONAL_PROFILES_DIR = _PROJECT_ROOT / "operational_profiles"
 
 
 class Atagia:
@@ -38,6 +39,7 @@ class Atagia:
         db_path: str | Path = "atagia.db",
         redis_url: str | None = None,
         manifests_dir: str | Path | None = None,
+        operational_profiles_dir: str | Path | None = None,
         llm_provider: str | None = None,
         llm_api_key: str | None = None,
         llm_model: str | None = None,
@@ -55,6 +57,11 @@ class Atagia:
             str(Path(manifests_dir).expanduser())
             if isinstance(manifests_dir, Path)
             else manifests_dir
+        )
+        self._operational_profiles_dir = (
+            str(Path(operational_profiles_dir).expanduser())
+            if isinstance(operational_profiles_dir, Path)
+            else operational_profiles_dir
         )
         self._llm_provider = llm_provider
         self._llm_api_key = llm_api_key
@@ -98,6 +105,9 @@ class Atagia:
         occurred_at: str | None = None,
         ablation: AblationConfig | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> ContextResult:
         """Run retrieval, persist the user message, and return a ready system prompt."""
         runtime = await self._require_runtime()
@@ -110,6 +120,8 @@ class Atagia:
             occurred_at=occurred_at,
             ablation=ablation,
             attachments=attachments,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
 
     async def flush(self, timeout_seconds: float = 30.0) -> bool:
@@ -129,6 +141,9 @@ class Atagia:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> None:
         """Store a message and enqueue extraction without running retrieval."""
         runtime = await self._require_runtime()
@@ -141,6 +156,8 @@ class Atagia:
             workspace_id=workspace_id,
             occurred_at=occurred_at,
             attachments=attachments,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
 
     async def add_response(
@@ -149,6 +166,9 @@ class Atagia:
         conversation_id: str,
         text: str,
         occurred_at: str | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> None:
         """Persist an assistant response in the conversation history."""
         runtime = await self._require_runtime()
@@ -157,6 +177,8 @@ class Atagia:
             conversation_id=conversation_id,
             text=text,
             occurred_at=occurred_at,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
 
     async def chat(
@@ -168,6 +190,9 @@ class Atagia:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, Any] | None = None,
     ) -> ChatResult:
         """Run the full chat flow, including the LLM response generation."""
         runtime = await self._require_runtime()
@@ -191,6 +216,8 @@ class Atagia:
             assistant_mode_id=mode,
             attachments=attachments,
             message_occurred_at=occurred_at,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
 
     async def create_user(self, user_id: str) -> None:
@@ -539,6 +566,11 @@ class Atagia:
             or os.getenv("ATAGIA_MANIFESTS_PATH")
             or str(_DEFAULT_MANIFESTS_DIR)
         )
+        operational_profiles_path = (
+            self._operational_profiles_dir
+            or os.getenv("ATAGIA_OPERATIONAL_PROFILES_PATH")
+            or str(_DEFAULT_OPERATIONAL_PROFILES_DIR)
+        )
         migrations_path = os.getenv("ATAGIA_MIGRATIONS_PATH") or str(_DEFAULT_MIGRATIONS_DIR)
         use_env_redis = self._redis_url is None and env_settings.storage_backend == "redis"
         storage_backend = "redis" if self._redis_url is not None or use_env_redis else "inprocess"
@@ -546,6 +578,7 @@ class Atagia:
             sqlite_path=self._db_path,
             migrations_path=migrations_path,
             manifests_path=manifests_path,
+            operational_profiles_path=operational_profiles_path,
             storage_backend=storage_backend,
             redis_url=self._redis_url or env_settings.redis_url,
             llm_provider=(self._llm_provider or env_settings.llm_provider).strip().lower(),

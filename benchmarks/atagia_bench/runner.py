@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -21,7 +22,14 @@ from benchmarks.atagia_bench.adapter import (
 )
 from benchmarks.atagia_bench.graders import GradeResult, resolve_grader
 from benchmarks.scorer import LLMJudgeScorer
+from benchmarks.trusted_eval import (
+    TRUSTED_EVALUATION_PROMPT_NOTE,
+    activate_trusted_evaluation_memories,
+    trusted_evaluation_ablation,
+)
 from atagia import Atagia
+from atagia.core.repositories import MemoryObjectRepository, MessageRepository
+from atagia.models.schemas_memory import RetrievalTrace
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.chat_support import build_system_prompt, chat_model, resolve_policy
 from atagia.services.llm_client import LLMCompletionRequest, LLMMessage
@@ -121,13 +129,16 @@ class AtagiaBenchRunner:
         self,
         persona_ids: list[str] | None = None,
         category_tags: list[str] | None = None,
+        question_ids: list[str] | None = None,
         ablation: AblationConfig | None = None,
+        trusted_evaluation: bool = False,
     ) -> AtagiaBenchReport:
         """Run the benchmark and return a structured report."""
         dataset = self._adapter.load(persona_ids)
         started_at = perf_counter()
         all_results: list[AtagiaQuestionResult] = []
         category_filter = set(category_tags) if category_tags else None
+        question_filter = set(question_ids) if question_ids else None
 
         for persona_index, persona_data in enumerate(dataset.personas, start=1):
             persona_id = persona_data.persona.persona_id
@@ -139,7 +150,9 @@ class AtagiaBenchRunner:
             results = await self._run_persona(
                 persona_data,
                 category_filter=category_filter,
+                question_filter=question_filter,
                 ablation=ablation,
+                trusted_evaluation=trusted_evaluation,
             )
             all_results.extend(results)
 
@@ -150,6 +163,8 @@ class AtagiaBenchRunner:
             duration_seconds=duration,
             persona_ids=[p.persona.persona_id for p in dataset.personas],
             category_tags=category_tags,
+            question_ids=question_ids,
+            trusted_evaluation=trusted_evaluation,
         )
 
     async def _run_persona(
@@ -157,7 +172,9 @@ class AtagiaBenchRunner:
         persona_data: AtagiaBenchPersonaData,
         *,
         category_filter: set[str] | None,
+        question_filter: set[str] | None,
         ablation: AblationConfig | None,
+        trusted_evaluation: bool,
     ) -> list[AtagiaQuestionResult]:
         """Run all conversations and questions for one persona."""
         persona_id = persona_data.persona.persona_id
@@ -177,6 +194,7 @@ class AtagiaBenchRunner:
             ) as engine:
                 user_id = f"bench-{persona_id}"
                 await engine.create_user(user_id)
+                turn_message_ids: dict[str, str] = {}
 
                 # Ingest all conversations
                 for conv_index, conversation in enumerate(
@@ -193,10 +211,12 @@ class AtagiaBenchRunner:
                         conversation.conversation_id,
                         assistant_mode_id=conversation.assistant_mode_id,
                     )
-                    await self._ingest_conversation(
-                        engine,
-                        user_id=user_id,
-                        conversation=conversation,
+                    turn_message_ids.update(
+                        await self._ingest_conversation(
+                            engine,
+                            user_id=user_id,
+                            conversation=conversation,
+                        )
                     )
 
                 # Wait for all extraction workers to finish
@@ -205,6 +225,11 @@ class AtagiaBenchRunner:
                     raise RuntimeError(
                         f"Timed out draining workers for persona {persona_id}"
                     )
+                trusted_activation_count = (
+                    await activate_trusted_evaluation_memories(engine.runtime, user_id)
+                    if trusted_evaluation and engine.runtime is not None
+                    else 0
+                )
 
                 # Set up judge
                 runtime = engine.runtime
@@ -219,6 +244,7 @@ class AtagiaBenchRunner:
                 questions = self._filter_questions(
                     persona_data.questions,
                     category_filter,
+                    question_filter,
                 )
                 results: list[AtagiaQuestionResult] = []
                 for q_index, question in enumerate(questions, start=1):
@@ -233,7 +259,14 @@ class AtagiaBenchRunner:
                         user_id=user_id,
                         persona_data=persona_data,
                         question=question,
-                        ablation=ablation,
+                        ablation=(
+                            trusted_evaluation_ablation(ablation)
+                            if trusted_evaluation
+                            else ablation
+                        ),
+                        turn_message_ids=turn_message_ids,
+                        trusted_evaluation=trusted_evaluation,
+                        trusted_activation_count=trusted_activation_count,
                     )
                     results.append(result)
 
@@ -245,7 +278,7 @@ class AtagiaBenchRunner:
         *,
         user_id: str,
         conversation: AtagiaBenchConversation,
-    ) -> None:
+    ) -> dict[str, str]:
         """Ingest all turns from a single conversation."""
         runtime = engine.runtime
         if runtime is None:
@@ -266,6 +299,24 @@ class AtagiaBenchRunner:
                         f"Timed out draining workers during ingestion "
                         f"for {conversation.conversation_id}"
                     )
+        connection = await runtime.open_connection()
+        try:
+            messages = await MessageRepository(
+                connection,
+                runtime.clock,
+            ).list_messages_for_conversation(conversation.conversation_id, user_id)
+        finally:
+            await connection.close()
+        if len(messages) != len(conversation.turns):
+            raise RuntimeError(
+                "Benchmark turn/message mapping failed for "
+                f"{conversation.conversation_id}: expected {len(conversation.turns)} "
+                f"messages, found {len(messages)}"
+            )
+        return {
+            turn.turn_id: str(message["id"])
+            for turn, message in zip(conversation.turns, messages, strict=True)
+        }
 
     async def _run_question(
         self,
@@ -276,6 +327,9 @@ class AtagiaBenchRunner:
         persona_data: AtagiaBenchPersonaData,
         question: AtagiaBenchQuestion,
         ablation: AblationConfig | None,
+        turn_message_ids: dict[str, str],
+        trusted_evaluation: bool,
+        trusted_activation_count: int,
     ) -> AtagiaQuestionResult:
         """Retrieve context, generate answer, and grade one question."""
         # Find the conversation this question relates to (use the first
@@ -299,6 +353,15 @@ class AtagiaBenchRunner:
                 persona_data,
             )
 
+        runtime = engine.runtime
+        if runtime is None:
+            raise RuntimeError("Atagia runtime unavailable")
+        retrieval_trace = RetrievalTrace(
+            query_text=question.question_text,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            timestamp_iso=runtime.clock.now().isoformat(),
+        )
         retrieval_started_at = perf_counter()
         pipeline_result = await self._retrieve_context(
             engine,
@@ -307,12 +370,9 @@ class AtagiaBenchRunner:
             question_text=question.question_text,
             assistant_mode_id=assistant_mode_id,
             ablation=ablation,
+            trace=retrieval_trace,
         )
         retrieval_time_ms = (perf_counter() - retrieval_started_at) * 1000.0
-
-        runtime = engine.runtime
-        if runtime is None:
-            raise RuntimeError("Atagia runtime unavailable")
 
         prediction = await self._generate_answer(
             runtime=runtime,
@@ -320,6 +380,8 @@ class AtagiaBenchRunner:
             pipeline_result=pipeline_result,
             question_text=question.question_text,
             question_id=question.question_id,
+            current_user_display_name=persona_data.persona.display_name,
+            trusted_evaluation=trusted_evaluation,
         )
 
         # Grade
@@ -331,6 +393,19 @@ class AtagiaBenchRunner:
             prediction=prediction,
             ground_truth=question.ground_truth,
             config=grader_config,
+        )
+        trace_payload = await self._build_question_trace(
+            engine,
+            user_id=user_id,
+            question=question,
+            pipeline_result=pipeline_result,
+            retrieval_trace=retrieval_trace,
+            assistant_mode_id=assistant_mode_id,
+            conversation_id=conversation_id,
+            turn_message_ids=turn_message_ids,
+            grade=grade,
+            trusted_evaluation=trusted_evaluation,
+            trusted_activation_count=trusted_activation_count,
         )
 
         return AtagiaQuestionResult(
@@ -346,7 +421,7 @@ class AtagiaBenchRunner:
             retrieval_time_ms=retrieval_time_ms,
             conversation_id=conversation_id,
             persona_id=persona_data.persona.persona_id,
-            trace={},  # Placeholder for Wave 0-B
+            trace=trace_payload,
         )
 
     async def _retrieve_context(
@@ -358,6 +433,7 @@ class AtagiaBenchRunner:
         question_text: str,
         assistant_mode_id: str,
         ablation: AblationConfig | None,
+        trace: RetrievalTrace | None = None,
     ) -> PipelineResult:
         """Run the retrieval pipeline for a question."""
         runtime = engine.runtime
@@ -370,7 +446,169 @@ class AtagiaBenchRunner:
             message_text=question_text,
             mode=assistant_mode_id,
             ablation=ablation,
+            trace=trace,
         )
+
+    async def _build_question_trace(
+        self,
+        engine: Atagia,
+        *,
+        user_id: str,
+        question: AtagiaBenchQuestion,
+        pipeline_result: PipelineResult,
+        retrieval_trace: RetrievalTrace,
+        assistant_mode_id: str,
+        conversation_id: str,
+        turn_message_ids: dict[str, str],
+        grade: GradeResult,
+        trusted_evaluation: bool,
+        trusted_activation_count: int,
+    ) -> dict[str, Any]:
+        runtime = engine.runtime
+        if runtime is None:
+            raise RuntimeError("Atagia runtime unavailable")
+
+        evidence_message_ids = [
+            turn_message_ids[turn_id]
+            for turn_id in question.evidence_turn_ids
+            if turn_id in turn_message_ids
+        ]
+        missing_evidence_turn_ids = [
+            turn_id
+            for turn_id in question.evidence_turn_ids
+            if turn_id not in turn_message_ids
+        ]
+        selected_memory_ids = list(pipeline_result.composed_context.selected_memory_ids)
+
+        connection = await runtime.open_connection()
+        try:
+            memories = MemoryObjectRepository(connection, runtime.clock)
+            selected_rows = await memories.list_memory_objects_by_ids(
+                user_id,
+                selected_memory_ids,
+            )
+            evidence_rows_by_id: dict[str, dict[str, Any]] = {}
+            for message_id in evidence_message_ids:
+                for row in await memories.list_for_source_message(
+                    user_id=user_id,
+                    source_message_id=message_id,
+                    statuses=None,
+                ):
+                    evidence_rows_by_id[str(row["id"])] = row
+        finally:
+            await connection.close()
+
+        evidence_rows = list(evidence_rows_by_id.values())
+        active_evidence_count = sum(
+            1 for row in evidence_rows if str(row.get("status")) == "active"
+        )
+        selected_evidence_ids = sorted(
+            set(selected_memory_ids).intersection(evidence_rows_by_id)
+        )
+        context = pipeline_result.composed_context
+        return {
+            "diagnosis_bucket": self._diagnosis_bucket(
+                passed=grade.passed,
+                has_evidence_turns=bool(question.evidence_turn_ids),
+                evidence_message_count=len(evidence_message_ids),
+                evidence_memory_count=len(evidence_rows),
+                active_evidence_count=active_evidence_count,
+                candidate_count=(
+                    retrieval_trace.candidate_search.total_after_fusion
+                    if retrieval_trace.candidate_search is not None
+                    else 0
+                ),
+                selected_memory_count=len(selected_memory_ids),
+                selected_evidence_count=len(selected_evidence_ids),
+            ),
+            "trusted_evaluation": trusted_evaluation,
+            "trusted_activation_count": trusted_activation_count,
+            "assistant_mode_id": assistant_mode_id,
+            "retrieval_conversation_id": conversation_id,
+            "evidence_turn_ids": list(question.evidence_turn_ids),
+            "evidence_message_ids": evidence_message_ids,
+            "missing_evidence_turn_ids": missing_evidence_turn_ids,
+            "evidence_memory_count": len(evidence_rows),
+            "active_evidence_count": active_evidence_count,
+            "evidence_memory_status_counts": self._count_field(evidence_rows, "status"),
+            "evidence_memory_privacy_counts": self._count_int_field(
+                evidence_rows,
+                "privacy_level",
+            ),
+            "evidence_memory_ids": sorted(evidence_rows_by_id),
+            "evidence_memory_summaries": self._memory_summaries(evidence_rows),
+            "selected_memory_ids": selected_memory_ids,
+            "selected_memory_rows_found": len(selected_rows),
+            "selected_evidence_memory_ids": selected_evidence_ids,
+            "selected_memory_summaries": self._memory_summaries(selected_rows),
+            "context": {
+                "items_included": context.items_included,
+                "items_dropped": context.items_dropped,
+                "budget_tokens": context.budget_tokens,
+                "total_tokens_estimate": context.total_tokens_estimate,
+                "contract_block_chars": len(context.contract_block),
+                "workspace_block_chars": len(context.workspace_block),
+                "memory_block_chars": len(context.memory_block),
+                "state_block_chars": len(context.state_block),
+            },
+            "retrieval_trace": retrieval_trace.model_dump(mode="json"),
+        }
+
+    @staticmethod
+    def _diagnosis_bucket(
+        *,
+        passed: bool,
+        has_evidence_turns: bool,
+        evidence_message_count: int,
+        evidence_memory_count: int,
+        active_evidence_count: int,
+        candidate_count: int,
+        selected_memory_count: int,
+        selected_evidence_count: int,
+    ) -> str:
+        if passed:
+            return "passed"
+        if has_evidence_turns and evidence_message_count == 0:
+            return "evidence_mapping_missing"
+        if has_evidence_turns and evidence_memory_count == 0:
+            return "missing_extraction"
+        if evidence_memory_count > 0 and active_evidence_count == 0:
+            return "memory_not_active"
+        if candidate_count == 0:
+            return "retrieval_no_candidates"
+        if selected_memory_count == 0:
+            return "composition_selected_none"
+        if evidence_memory_count > 0 and selected_evidence_count == 0:
+            return "retrieval_or_ranking_miss"
+        return "answer_policy_or_grading"
+
+    @staticmethod
+    def _count_field(rows: list[dict[str, Any]], field_name: str) -> dict[str, int]:
+        return dict(Counter(str(row.get(field_name) or "") for row in rows))
+
+    @staticmethod
+    def _count_int_field(rows: list[dict[str, Any]], field_name: str) -> dict[str, int]:
+        return dict(Counter(str(int(row.get(field_name) or 0)) for row in rows))
+
+    @staticmethod
+    def _memory_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        summaries: list[dict[str, Any]] = []
+        for row in rows:
+            summaries.append(
+                {
+                    "memory_id": str(row.get("id") or ""),
+                    "object_type": str(row.get("object_type") or ""),
+                    "scope": str(row.get("scope") or ""),
+                    "status": str(row.get("status") or ""),
+                    "privacy_level": int(row.get("privacy_level") or 0),
+                    "memory_category": str(row.get("memory_category") or ""),
+                    "source_kind": str(row.get("source_kind") or ""),
+                    "canonical_preview": " ".join(
+                        str(row.get("canonical_text") or "").split()
+                    )[:180],
+                }
+            )
+        return summaries
 
     async def _generate_answer(
         self,
@@ -380,6 +618,8 @@ class AtagiaBenchRunner:
         pipeline_result: PipelineResult,
         question_text: str,
         question_id: str,
+        current_user_display_name: str | None = None,
+        trusted_evaluation: bool = False,
     ) -> str:
         """Generate an answer from the retrieval context."""
         resolved_policy = resolve_policy(
@@ -394,7 +634,10 @@ class AtagiaBenchRunner:
             pipeline_result.composed_context.workspace_block,
             pipeline_result.composed_context.memory_block,
             pipeline_result.composed_context.state_block,
+            current_user_display_name=current_user_display_name,
         )
+        if trusted_evaluation:
+            system_prompt = f"{system_prompt}\n\n{TRUSTED_EVALUATION_PROMPT_NOTE}"
         response = await runtime.llm_client.complete(
             LLMCompletionRequest(
                 model=self._llm_model or chat_model(runtime.settings),
@@ -475,17 +718,21 @@ class AtagiaBenchRunner:
                 return conv.assistant_mode_id
         return "general_qa"
 
+    @staticmethod
     def _filter_questions(
-        self,
         questions: list[AtagiaBenchQuestion],
         category_filter: set[str] | None,
+        question_filter: set[str] | None,
     ) -> list[AtagiaBenchQuestion]:
         """Filter questions by category tags if a filter is provided."""
-        if category_filter is None:
+        if category_filter is None and question_filter is None:
             return questions
         return [
             q for q in questions
-            if category_filter.intersection(q.category_tags)
+            if (
+                (category_filter is None or category_filter.intersection(q.category_tags))
+                and (question_filter is None or q.question_id in question_filter)
+            )
         ]
 
     def _build_report(
@@ -496,6 +743,8 @@ class AtagiaBenchRunner:
         duration_seconds: float,
         persona_ids: list[str],
         category_tags: list[str] | None,
+        question_ids: list[str] | None,
+        trusted_evaluation: bool,
     ) -> AtagiaBenchReport:
         """Build the aggregated benchmark report."""
         total = len(results)
@@ -540,6 +789,8 @@ class AtagiaBenchRunner:
                 "judge_model": self._judge_model or self._llm_model or "",
                 "embedding_backend": self._embedding_backend,
                 "category_filter": category_tags,
+                "question_filter": question_ids,
+                "trusted_evaluation": trusted_evaluation,
             },
             personas_used=persona_ids,
             total_questions=total,

@@ -42,6 +42,9 @@ from atagia.models.schemas_memory import (
 from atagia.services.embedding_payloads import build_embedding_upsert_payload
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage, StructuredOutputError
+from atagia.services.privacy_filter_client import (
+    OpenAIPrivacyFilterClient,
+)
 
 DEFAULT_EXTRACTION_MODEL = "claude-sonnet-4-6"
 REVIEW_REQUIRED_CONFIDENCE = 0.4
@@ -53,6 +56,12 @@ DEFAULT_ACTIVE_THRESHOLD = 0.5
 DEDUPE_TTL_SECONDS = 24 * 60 * 60
 CONSENT_CONFIRM_THRESHOLD = 2
 CONSENT_DECLINE_SUPPRESSION_THRESHOLD = 2
+HIGH_RISK_MEMORY_CATEGORIES = {
+    MemoryCategory.PIN_OR_PASSWORD,
+    MemoryCategory.MEDICATION,
+    MemoryCategory.FINANCIAL,
+    MemoryCategory.DATE_OF_BIRTH,
+}
 TEMPORAL_CONFIDENCE_THRESHOLD = 0.6
 EXTRACTION_VALIDATION_MAX_CORRECTIVE_RETRIES = 2
 logger = logging.getLogger(__name__)
@@ -113,6 +122,20 @@ Rules:
 - Reuse normalized vocabulary patterns instead of inventing synonyms.
 - Examples of good claim_keys: `response_style.verbosity`, `coding.language.primary`, `communication.formality`, `collaboration.autonomy`.
 - Contract signals represent collaboration preferences. State updates represent temporary current state.
+- Do not classify factual details as contract signals merely because they may
+  guide future assistance. Use evidence or state updates for facts about people,
+  places, contact details, health details, credentials, dates, quantities, and
+  other remembered values. Reserve contract signals for instructions about how
+  the assistant should behave, format responses, or apply disclosure boundaries.
+- If a source message contains multiple independent durable facts, preserve each
+  fact so future slot-filling questions can retrieve it. It is acceptable to
+  emit multiple extracted items from one message when the items describe
+  different people, roles, contact channels, locations, values, times, or
+  conditions.
+- When a message gives a sensitive value together with a scope, purpose, or
+  disclosure condition, keep that condition attached to the extracted item in
+  canonical_text, index_text, or payload so retrieval can decide when the value
+  may be used.
 - For every extracted item, set:
   - `temporal_type`: must be exactly one of `permanent`, `bounded`, `event_triggered`, `ephemeral`, or `unknown`. Do not use any other value.
   - `permanent`: timeless facts, stable traits, or durable preferences (e.g., "I'm vegetarian").
@@ -178,6 +201,7 @@ class MemoryExtractor:
         storage_backend: StorageBackend,
         embedding_index: EmbeddingIndex | None = None,
         settings: Settings | None = None,
+        privacy_filter_client: OpenAIPrivacyFilterClient | None = None,
     ) -> None:
         self._llm_client = llm_client
         self._message_repository = message_repository
@@ -185,6 +209,16 @@ class MemoryExtractor:
         self._storage_backend = storage_backend
         self._embedding_index = embedding_index or NoneBackend()
         resolved_settings = settings or Settings.from_env()
+        self._opf_enabled = resolved_settings.opf_privacy_filter_enabled
+        self._privacy_filter_client = (
+            privacy_filter_client
+            if privacy_filter_client is not None
+            else (
+                OpenAIPrivacyFilterClient.from_settings(resolved_settings)
+                if self._opf_enabled
+                else None
+            )
+        )
         self._extraction_model = resolved_settings.llm_extraction_model or DEFAULT_EXTRACTION_MODEL
         self._classifier_model = (
             resolved_settings.llm_classifier_model
@@ -638,6 +672,10 @@ class MemoryExtractor:
                 if not self._is_grounded(item.canonical_text, message_text):
                     continue
 
+                privacy_filter_audit = await self._privacy_filter_pre_signal(item.canonical_text)
+                if privacy_filter_audit is not None and privacy_filter_audit["triggered"]:
+                    item.privacy_level = max(item.privacy_level, 2)
+
                 scope_hash_seed = self._scope_hash_seed(item.scope, context)
                 if scope_hash_seed is None:
                     continue
@@ -697,6 +735,8 @@ class MemoryExtractor:
                     continue
 
                 payload = dict(item.payload)
+                if privacy_filter_audit is not None:
+                    payload["privacy_filter_pre_signal"] = privacy_filter_audit
                 if item.informational_mention is not None:
                     payload["informational_mention"] = item.informational_mention
                 if chunked:
@@ -887,6 +927,19 @@ class MemoryExtractor:
         except Exception:
             logger.warning("Embedding upsert failed for memory_id=%s", memory_id, exc_info=True)
 
+    async def _privacy_filter_pre_signal(self, text: str) -> dict[str, Any] | None:
+        if not self._opf_enabled or self._privacy_filter_client is None:
+            return None
+        detection = await self._privacy_filter_client.detect(text)
+        return {
+            "triggered": detection.span_count > 0,
+            "labels": detection.labels,
+            "spans": [span.to_audit_dict() for span in detection.spans],
+            "span_count": detection.span_count,
+            "opf_latency_ms": round(detection.latency_ms, 3),
+            "opf_endpoint_used": detection.endpoint_used,
+        }
+
     def _iter_items(
         self,
         result: ExtractionResult,
@@ -960,11 +1013,14 @@ class MemoryExtractor:
         declined_count = int(consent_profile.get("declined_count", 0)) if consent_profile is not None else 0
         if declined_count >= CONSENT_DECLINE_SUPPRESSION_THRESHOLD:
             return _PersistenceDecision(status=None, skip_item=True)
-        # For user-role items with privacy_level >= 3, consent gating takes precedence
-        # over the ceiling-based REVIEW_REQUIRED path. Retrieval-time
-        # privacy_level <= ceiling filtering remains the actual enforcement layer,
-        # so pending confirmation is the correct initial status here.
-        if item.privacy_level >= 3 and confirmed_count < CONSENT_CONFIRM_THRESHOLD:
+        # For user-role high-risk items, consent gating takes precedence over
+        # the ceiling-based REVIEW_REQUIRED path. Retrieval-time privacy
+        # filtering remains the actual enforcement layer, so pending
+        # confirmation is the correct initial status here.
+        if (
+            item.privacy_level >= 3
+            or item.memory_category in HIGH_RISK_MEMORY_CATEGORIES
+        ) and confirmed_count < CONSENT_CONFIRM_THRESHOLD:
             return _PersistenceDecision(status=MemoryStatus.PENDING_USER_CONFIRMATION)
         return _PersistenceDecision(
             status=self._resolve_status(

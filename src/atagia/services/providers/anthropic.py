@@ -202,7 +202,11 @@ class AnthropicProvider(LLMProvider):
             response = await self._client.messages.create(**kwargs)
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
-        except (BadRequestError, APIStatusError, APIError) as exc:
+        except APIStatusError as exc:
+            if int(getattr(exc, "status_code", 0) or 0) in {408, 409, 425, 429, 500, 502, 503, 504, 529}:
+                raise TransientLLMError(str(exc)) from exc
+            raise LLMError(str(exc)) from exc
+        except (BadRequestError, APIError) as exc:
             raise LLMError(str(exc)) from exc
 
         output_text = ""
@@ -287,7 +291,11 @@ class AnthropicProvider(LLMProvider):
                 final_message = await stream.get_final_message()
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
-        except (BadRequestError, APIStatusError, APIError) as exc:
+        except APIStatusError as exc:
+            if int(getattr(exc, "status_code", 0) or 0) in {408, 409, 425, 429, 500, 502, 503, 504, 529}:
+                raise TransientLLMError(str(exc)) from exc
+            raise LLMError(str(exc)) from exc
+        except (BadRequestError, APIError) as exc:
             raise LLMError(str(exc)) from exc
 
         yield LLMStreamEvent(

@@ -41,6 +41,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_csv_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = tuple(part.strip() for part in value.split(",") if part.strip())
+    return normalized or default
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Runtime settings for Atagia."""
@@ -66,6 +74,7 @@ class Settings:
     admin_api_key: str | None
     workers_enabled: bool
     debug: bool
+    operational_profiles_path: str = "./operational_profiles"
     allow_admin_export_anonymization: bool = False
     allow_insecure_http: bool = False
     embedding_provider_name: str | None = None
@@ -88,6 +97,18 @@ class Settings:
     belief_tension_threshold: float = 0.5
     skip_belief_revision: bool = False
     skip_compaction: bool = False
+    opf_privacy_filter_enabled: bool = False
+    opf_primary_url: str = "http://127.0.0.1:8008"
+    opf_fallback_url: str = "http://127.0.0.1:8008"
+    opf_timeout_seconds: float = 2.0
+    privacy_validation_gate_enabled: bool = False
+    privacy_validation_gate_timeout_seconds: float = 20.0
+    privacy_validation_gate_max_source_chars: int = 6000
+    privacy_validation_gate_max_summaries_gated_per_job: int = 50
+    privacy_validation_gate_judge_model: str | None = None
+    privacy_validation_gate_refiner_model: str | None = None
+    operational_high_risk_enabled: bool = False
+    operational_allowed_profiles: tuple[str, ...] = ("normal", "low_power", "offline")
     context_cache_enabled: bool = True
     context_cache_min_ttl_seconds: int = 60
     context_cache_max_ttl_seconds: int = 3600
@@ -137,6 +158,18 @@ class Settings:
             raise ValueError("belief_tension_threshold must be non-negative")
         if self.ephemeral_scoring_hours <= 0:
             raise ValueError("ephemeral_scoring_hours must be positive")
+        if self.opf_timeout_seconds <= 0:
+            raise ValueError("opf_timeout_seconds must be positive")
+        if self.privacy_validation_gate_timeout_seconds <= 0:
+            raise ValueError("privacy_validation_gate_timeout_seconds must be positive")
+        if self.privacy_validation_gate_max_source_chars <= 0:
+            raise ValueError("privacy_validation_gate_max_source_chars must be positive")
+        if self.privacy_validation_gate_max_summaries_gated_per_job < 0:
+            raise ValueError("privacy_validation_gate_max_summaries_gated_per_job must be non-negative")
+        if not self.operational_allowed_profiles:
+            raise ValueError("operational_allowed_profiles must contain at least one profile")
+        if any(not profile_id.strip() for profile_id in self.operational_allowed_profiles):
+            raise ValueError("operational_allowed_profiles cannot contain blank profile ids")
         if not 0.0 <= self.small_corpus_token_threshold_ratio <= 1.0:
             raise ValueError(
                 "small_corpus_token_threshold_ratio must be in the interval [0.0, 1.0]"
@@ -161,6 +194,10 @@ class Settings:
             sqlite_path=os.getenv("ATAGIA_SQLITE_PATH", "./data/atagia.db"),
             migrations_path=os.getenv("ATAGIA_MIGRATIONS_PATH", "./migrations"),
             manifests_path=os.getenv("ATAGIA_MANIFESTS_PATH", "./manifests"),
+            operational_profiles_path=os.getenv(
+                "ATAGIA_OPERATIONAL_PROFILES_PATH",
+                "./operational_profiles",
+            ),
             storage_backend=os.getenv("ATAGIA_STORAGE_BACKEND", "inprocess").strip().lower(),
             redis_url=os.getenv("ATAGIA_REDIS_URL", "redis://localhost:6379/0"),
             llm_provider=os.getenv("ATAGIA_LLM_PROVIDER", "anthropic").strip().lower(),
@@ -215,6 +252,37 @@ class Settings:
             belief_tension_threshold=float(os.getenv("ATAGIA_BELIEF_TENSION_THRESHOLD", "0.5")),
             skip_belief_revision=_env_bool("ATAGIA_SKIP_BELIEF_REVISION", False),
             skip_compaction=_env_bool("ATAGIA_SKIP_COMPACTION", False),
+            opf_privacy_filter_enabled=_env_bool("ATAGIA_OPF_PRIVACY_FILTER_ENABLED", False),
+            opf_primary_url=os.getenv("ATAGIA_OPF_PRIMARY_URL", "http://127.0.0.1:8008"),
+            opf_fallback_url=os.getenv("ATAGIA_OPF_FALLBACK_URL", "http://127.0.0.1:8008"),
+            opf_timeout_seconds=float(os.getenv("ATAGIA_OPF_TIMEOUT_SECONDS", "2.0")),
+            privacy_validation_gate_enabled=_env_bool(
+                "ATAGIA_PRIVACY_VALIDATION_GATE_ENABLED",
+                False,
+            ),
+            privacy_validation_gate_timeout_seconds=float(
+                os.getenv("ATAGIA_PRIVACY_VALIDATION_GATE_TIMEOUT_SECONDS", "20.0")
+            ),
+            privacy_validation_gate_max_source_chars=int(
+                os.getenv("ATAGIA_PRIVACY_VALIDATION_GATE_MAX_SOURCE_CHARS", "6000")
+            ),
+            privacy_validation_gate_max_summaries_gated_per_job=int(
+                os.getenv("ATAGIA_PRIVACY_VALIDATION_GATE_MAX_SUMMARIES_GATED_PER_JOB", "50")
+            ),
+            privacy_validation_gate_judge_model=(
+                os.getenv("ATAGIA_PRIVACY_VALIDATION_GATE_JUDGE_MODEL") or None
+            ),
+            privacy_validation_gate_refiner_model=(
+                os.getenv("ATAGIA_PRIVACY_VALIDATION_GATE_REFINER_MODEL") or None
+            ),
+            operational_high_risk_enabled=_env_bool(
+                "ATAGIA_OPERATIONAL_HIGH_RISK_ENABLED",
+                False,
+            ),
+            operational_allowed_profiles=_env_csv_tuple(
+                "ATAGIA_OPERATIONAL_ALLOWED_PROFILES",
+                ("normal", "low_power", "offline"),
+            ),
             context_cache_enabled=_env_bool("ATAGIA_CONTEXT_CACHE_ENABLED", True),
             context_cache_min_ttl_seconds=int(
                 os.getenv("ATAGIA_CONTEXT_CACHE_MIN_TTL_SECONDS", "60")
@@ -259,3 +327,7 @@ class Settings:
     def manifests_dir(self, root: Path | None = None) -> Path:
         base = root or Path.cwd()
         return (base / self.manifests_path).resolve()
+
+    def operational_profiles_dir(self, root: Path | None = None) -> Path:
+        base = root or Path.cwd()
+        return (base / self.operational_profiles_path).resolve()

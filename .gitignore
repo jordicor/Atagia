@@ -3,6 +3,7 @@
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.third_party_venv/
 __pycache__/
 *.py[cod]
 *.sqlite3
@@ -19,18 +20,23 @@ benchmarks/data/
 
 # Local editor / tool state (regenerated, machine-specific)
 .claude/
+_blog_engine/
 tools/sync_github/output/
 benchmarks/results/
 # Keep benchmark artifacts trackable in this repo; GitHub mirror sync has its
 # own exclusion rules under tools/sync_github/.
 !benchmarks/results/
 !benchmarks/results/**
+benchmarks/results/.DS_Store
+benchmarks/results/**/.DS_Store
 !benchmarks/atagia_bench/data/
 
 # Internal work process docs (not public)
 CLAUDE.md
 AGENTS.md
 atagia.command
-docs/
+docs/*
+!docs/IMPLEMENTATION_PLAN_v2.md
+!docs/PLATFORM_STATUS.md
 !docs/BEYOND_HUMAN_MEMORY.md
 !docs/Beyond_Similarity_Applicability_Governed_Memory.md

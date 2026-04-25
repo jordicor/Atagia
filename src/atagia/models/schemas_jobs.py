@@ -9,6 +9,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from atagia.models.schemas_memory import OperationalProfileSnapshot
+
 
 class JobType(str, Enum):
     EXTRACT_MEMORY_CANDIDATES = "extract_memory_candidates"
@@ -38,6 +40,7 @@ class JobEnvelope(BaseModel):
     message_ids: list[str] = Field(default_factory=list)
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime | None = None
+    operational_profile: OperationalProfileSnapshot | None = None
 
 
 class StreamMessage(BaseModel):

@@ -30,7 +30,13 @@ class StubProvider(LLMProvider):
         )
 
 
-def _settings(*, backend: str, model: str | None = None, dimension: int = 2) -> Settings:
+def _settings(
+    *,
+    backend: str,
+    model: str | None = None,
+    dimension: int = 2,
+    service_mode: bool = False,
+) -> Settings:
     return Settings(
         sqlite_path=":memory:",
         migrations_path=str(MIGRATIONS_DIR),
@@ -48,9 +54,9 @@ def _settings(*, backend: str, model: str | None = None, dimension: int = 2) -> 
         llm_scoring_model="score-test-model",
         llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
-        service_mode=False,
-        service_api_key=None,
-        admin_api_key=None,
+        service_mode=service_mode,
+        service_api_key="service-key" if service_mode else None,
+        admin_api_key="admin-key" if service_mode else None,
         workers_enabled=False,
         debug=False,
         allow_insecure_http=True,
@@ -115,6 +121,24 @@ async def test_create_embedding_index_requires_model_for_sqlite_vec() -> None:
         with pytest.raises(ConfigurationError, match="ATAGIA_EMBEDDING_MODEL is required when backend is sqlite_vec"):
             await create_embedding_index(
                 _settings(backend="sqlite_vec", model=None),
+                connection,
+                LLMClient(provider_name="embedding-factory-tests", providers=[StubProvider()]),
+            )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_create_embedding_index_rejects_sqlite_vec_in_service_mode() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    try:
+        with pytest.raises(ConfigurationError, match="sqlite_vec embedding backend is local/dev only"):
+            await create_embedding_index(
+                _settings(
+                    backend="sqlite_vec",
+                    model="embed-test-model",
+                    service_mode=True,
+                ),
                 connection,
                 LLMClient(provider_name="embedding-factory-tests", providers=[StubProvider()]),
             )
