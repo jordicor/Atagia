@@ -47,7 +47,7 @@ class EvaluationMetricRecord(BaseModel):
 class ContractComplianceEvaluation(BaseModel):
     """Structured LLM judgment for contract compliance."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     compliance_score: float = Field(ge=0.0, le=1.0)
     reasoning: str = Field(min_length=1)

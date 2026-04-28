@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import html
+import logging
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
+from atagia.core.llm_output_limits import APPLICABILITY_SCORER_MAX_OUTPUT_TOKENS
 from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.models.schemas_memory import (
     DetectedNeed,
@@ -20,9 +22,16 @@ from atagia.models.schemas_memory import (
     RetrievalPlan,
     ScoredCandidate,
 )
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMMessage,
+    StructuredOutputError,
+)
+from atagia.services.model_resolution import resolve_component_model
 
-DEFAULT_SCORING_MODEL = "claude-sonnet-4-6"
+logger = logging.getLogger(__name__)
+
 _HIGH_STAKES_TYPES = {MemoryObjectType.EVIDENCE.value, MemoryObjectType.BELIEF.value}
 _AMBIGUITY_TYPES = {MemoryObjectType.EVIDENCE.value, MemoryObjectType.STATE_SNAPSHOT.value}
 _FOLLOW_UP_FAILURE_TYPES = {MemoryObjectType.CONSEQUENCE_CHAIN.value, MemoryObjectType.EVIDENCE.value}
@@ -39,7 +48,9 @@ _MISSING_EPHEMERAL_START_PENALTY = 0.03
 
 APPLICABILITY_PROMPT_TEMPLATE = """You are scoring memory applicability for an assistant memory engine.
 
-Return JSON only, as an array of objects matching the provided schema exactly.
+Return JSON only, as a single object with a `scores` array matching the provided schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 Score each candidate from 0.0 to 1.0 based on how useful it is for responding right now.
 
 IMPORTANT:
@@ -80,11 +91,25 @@ Privacy ceiling: {privacy_ceiling}
 
 
 class _ApplicabilityScore(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
-    memory_id: str
+    memory_id: str | None = None
     llm_applicability: float = Field(ge=0.0, le=1.0)
     resolved_date: str | None = None
+
+
+class _ApplicabilityScores(BaseModel):
+    """Object wrapper around the score list.
+
+    Some providers (OpenAI structured outputs, Gemini object-only schemas) reject
+    array-root response schemas. Wrapping the list in an object lets every
+    supported provider accept the schema in a single call and avoids the
+    raw-JSON fallback path that used to be the normal path for OpenAI.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    scores: list[_ApplicabilityScore] = Field(default_factory=list)
 
 
 class ApplicabilityScorer:
@@ -95,10 +120,9 @@ class ApplicabilityScorer:
         self._clock = clock
         resolved_settings = settings or Settings.from_env()
         self._settings = resolved_settings
-        self._scoring_model = (
-            resolved_settings.llm_scoring_model
-            or resolved_settings.llm_extraction_model
-            or DEFAULT_SCORING_MODEL
+        self._scoring_model = resolve_component_model(
+            resolved_settings,
+            "applicability_scorer",
         )
 
     async def score(
@@ -151,7 +175,9 @@ class ApplicabilityScorer:
         scored: list[ScoredCandidate] = []
         for candidate in candidates:
             memory_id = str(candidate["id"])
-            llm_score = llm_scores[memory_id]
+            llm_score = llm_scores.get(memory_id)
+            if llm_score is None:
+                continue
             llm_applicability = llm_score.llm_applicability
             retrieval_score = self._retrieval_score(candidate.get("rrf_score"))
             vitality_boost = self._vitality_boost(candidate)
@@ -194,20 +220,15 @@ class ApplicabilityScorer:
         retrieval_plan: RetrievalPlan | None = None,
     ) -> list[dict[str, Any]]:
         allowed_scopes = {scope.value for scope in resolved_policy.allowed_scopes}
-        allowed_statuses = self._allowed_statuses(detected_needs)
-        now = self._clock.now()
         filtered: list[dict[str, Any]] = []
         for candidate in candidates:
-            if str(candidate.get("scope")) not in allowed_scopes:
-                continue
-            if str(candidate.get("status")) not in allowed_statuses:
-                continue
-            if int(candidate.get("privacy_level", 0)) > resolved_policy.privacy_ceiling:
-                continue
-            if (
-                (retrieval_plan is None or retrieval_plan.temporal_query_range is None)
-                and self._is_future_valid(candidate, now)
-            ):
+            if self.candidate_filter_reason(
+                candidate,
+                resolved_policy,
+                detected_needs,
+                retrieval_plan=retrieval_plan,
+                allowed_scopes=allowed_scopes,
+            ) is not None:
                 continue
             filtered.append(candidate)
         preferred_ordered = self._prioritize_preferred_types(filtered, resolved_policy)
@@ -249,7 +270,78 @@ class ApplicabilityScorer:
         ]
         return preserved + remainder
 
+    def candidate_filter_reason(
+        self,
+        candidate: dict[str, Any],
+        resolved_policy: ResolvedPolicy,
+        detected_needs: list[DetectedNeed],
+        retrieval_plan: RetrievalPlan | None = None,
+        *,
+        allowed_scopes: set[str] | None = None,
+    ) -> str | None:
+        """Return the deterministic pre-scoring filter reason for a candidate."""
+        effective_scopes = allowed_scopes or {scope.value for scope in resolved_policy.allowed_scopes}
+        if str(candidate.get("scope")) not in effective_scopes:
+            return "policy_filtered_scope"
+        if str(candidate.get("status")) not in self._allowed_statuses(detected_needs):
+            return "policy_filtered_status"
+        if int(candidate.get("privacy_level", 0)) > resolved_policy.privacy_ceiling:
+            return "policy_filtered_privacy"
+        if (
+            (retrieval_plan is None or retrieval_plan.temporal_query_range is None)
+            and self._is_future_valid(candidate, self._clock.now())
+        ):
+            return "policy_filtered_future_valid"
+        return None
+
     async def _score_with_llm(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        message_text: str,
+        role: str,
+        conversation_context: ExtractionConversationContext,
+        resolved_policy: ResolvedPolicy,
+        detected_needs: list[DetectedNeed],
+    ) -> dict[str, _ApplicabilityScore]:
+        by_id = await self._score_with_llm_once(
+            candidates,
+            message_text=message_text,
+            role=role,
+            conversation_context=conversation_context,
+            resolved_policy=resolved_policy,
+            detected_needs=detected_needs,
+        )
+        missing = self._missing_score_ids(candidates, by_id)
+        if missing:
+            missing_ids = set(missing)
+            missing_candidates = [
+                candidate
+                for candidate in candidates
+                if str(candidate["id"]) in missing_ids
+            ]
+            retry_scores = await self._score_with_llm_once(
+                missing_candidates,
+                message_text=message_text,
+                role=role,
+                conversation_context=conversation_context,
+                resolved_policy=resolved_policy,
+                detected_needs=detected_needs,
+            )
+            by_id.update(retry_scores)
+            missing = self._missing_score_ids(candidates, by_id)
+            if missing:
+                logger.warning(
+                    "Applicability scorer missing LLM scores after retry; dropping unscored candidates",
+                    extra={
+                        "memory_ids": missing,
+                        "user_id": conversation_context.user_id,
+                        "conversation_id": conversation_context.conversation_id,
+                    },
+                )
+        return by_id
+
+    async def _score_with_llm_once(
         self,
         candidates: list[dict[str, Any]],
         *,
@@ -274,7 +366,8 @@ class ApplicabilityScorer:
                 LLMMessage(role="user", content=prompt),
             ],
             temperature=0.0,
-            response_schema=TypeAdapter(list[_ApplicabilityScore]).json_schema(),
+            max_output_tokens=APPLICABILITY_SCORER_MAX_OUTPUT_TOKENS,
+            response_schema=_ApplicabilityScores.model_json_schema(),
             metadata={
                 "user_id": conversation_context.user_id,
                 "conversation_id": conversation_context.conversation_id,
@@ -282,12 +375,62 @@ class ApplicabilityScorer:
                 "purpose": "applicability_scoring",
             },
         )
-        llm_scores = await self._llm_client.complete_structured(request, list[_ApplicabilityScore])
-        by_id = {item.memory_id: item for item in llm_scores}
-        missing = [str(candidate["id"]) for candidate in candidates if str(candidate["id"]) not in by_id]
-        if missing:
-            raise ValueError(f"Applicability scorer missing LLM scores for memory ids: {', '.join(missing)}")
+        try:
+            wrapped = await self._llm_client.complete_structured(request, _ApplicabilityScores)
+            llm_scores = wrapped.scores
+        except StructuredOutputError as exc:
+            logger.warning(
+                "Applicability scorer received invalid structured LLM scores",
+                extra={
+                    "error": str(exc),
+                    "user_id": conversation_context.user_id,
+                    "conversation_id": conversation_context.conversation_id,
+                },
+            )
+            return {}
+        candidate_ids = {str(candidate["id"]) for candidate in candidates}
+        by_id: dict[str, _ApplicabilityScore] = {}
+        malformed_count = 0
+        unknown_ids: list[str] = []
+        duplicate_ids: set[str] = set()
+        for item in llm_scores:
+            memory_id = str(item.memory_id).strip() if item.memory_id is not None else ""
+            if not memory_id:
+                malformed_count += 1
+                continue
+            if memory_id not in candidate_ids:
+                unknown_ids.append(memory_id)
+                continue
+            if memory_id in by_id:
+                duplicate_ids.add(memory_id)
+                by_id.pop(memory_id, None)
+                continue
+            if memory_id in duplicate_ids:
+                continue
+            by_id[memory_id] = item
+        if malformed_count or unknown_ids or duplicate_ids:
+            logger.warning(
+                "Applicability scorer ignored malformed LLM scores",
+                extra={
+                    "malformed_count": malformed_count,
+                    "unknown_memory_ids": unknown_ids,
+                    "duplicate_memory_ids": sorted(duplicate_ids),
+                    "user_id": conversation_context.user_id,
+                    "conversation_id": conversation_context.conversation_id,
+                },
+            )
         return by_id
+
+    @staticmethod
+    def _missing_score_ids(
+        candidates: list[dict[str, Any]],
+        by_id: dict[str, _ApplicabilityScore],
+    ) -> list[str]:
+        return [
+            str(candidate["id"])
+            for candidate in candidates
+            if str(candidate["id"]) not in by_id
+        ]
 
     @staticmethod
     def _allowed_statuses(detected_needs: list[DetectedNeed]) -> set[str]:
@@ -339,8 +482,16 @@ class ApplicabilityScorer:
         source_window_start = ""
         source_window_end = ""
         if isinstance(payload_json, dict):
-            source_window_start = str(payload_json.get("source_message_window_start_occurred_at") or "")
-            source_window_end = str(payload_json.get("source_message_window_end_occurred_at") or "")
+            source_window_start = str(
+                payload_json.get("source_message_window_start_occurred_at")
+                or payload_json.get("source_window_start_occurred_at")
+                or ""
+            )
+            source_window_end = str(
+                payload_json.get("source_message_window_end_occurred_at")
+                or payload_json.get("source_window_end_occurred_at")
+                or ""
+            )
         return (
             f'<candidate memory_id="{html.escape(str(candidate["id"]))}" '
             f'object_type="{html.escape(str(candidate.get("object_type", "")))}" '

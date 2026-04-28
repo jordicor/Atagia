@@ -114,7 +114,10 @@ def _settings(tmp_path: Path) -> Settings:
         llm_extraction_model="extract-test-model",
         llm_scoring_model="score-test-model",
         llm_classifier_model="classify-test-model",
-        llm_chat_model="reply-test-model",
+        llm_chat_model="openai/reply-test-model",
+        llm_ingest_model="openai/extract-test-model",
+        llm_retrieval_model="openai/score-test-model",
+        llm_component_models={"intent_classifier": "openai/classify-test-model"},
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
@@ -557,6 +560,35 @@ async def test_context_cache_service_ablation_disables_cache(
                 conversation_id="cnv_1",
                 message_text="Please help me debug this retry loop.",
                 ablation=AblationConfig(disable_context_cache=True),
+            )
+        finally:
+            await connection.close()
+
+        assert resolution.from_cache is False
+        assert resolution.pending_cache_entry is None
+        assert resolution.cache_key is not None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_budgeted_composer_strategy_disables_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+
+        connection = await runtime.open_connection()
+        try:
+            resolution = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="Please help me debug this retry loop.",
+                ablation=AblationConfig(composer_strategy="budgeted_marginal"),
             )
         finally:
             await connection.close()

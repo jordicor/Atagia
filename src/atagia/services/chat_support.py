@@ -32,9 +32,9 @@ from atagia.models.schemas_memory import (
 )
 from atagia.models.schemas_replay import PipelineResult
 from atagia.services.errors import AssistantModeMismatchError, UnknownAssistantModeError
+from atagia.services.model_resolution import resolve_component_model
 
 DEFAULT_ASSISTANT_MODE_ID = "general_qa"
-DEFAULT_CHAT_MODEL = "claude-sonnet-4-6"
 RECENT_CONTEXT_MESSAGES = 6
 RECENT_WINDOW_MESSAGES = 12
 RECENT_FETCH_LIMIT = 500
@@ -219,7 +219,7 @@ def recent_context(messages: list[dict[str, Any]]) -> list[ExtractionContextMess
 
 def chat_model(settings: Settings) -> str:
     """Resolve the chat model used for full reply generation."""
-    return settings.llm_chat_model or DEFAULT_CHAT_MODEL
+    return resolve_component_model(settings, "chat")
 
 
 def estimate_tokens(text: str) -> int:
@@ -554,11 +554,17 @@ def build_system_prompt(
             "retrieved memories, not just the most prominent ones."
         ),
         (
-            "When the user asks for a specific fact and the retrieved context "
-            "does not contain that exact fact, say that you do not have that "
-            "information. Do not substitute nearby, inferred, or related facts, "
-            "especially for medical, legal, financial, credential, or other "
-            "private details."
+            "When the question asks for a specific fact, answer with the best "
+            "available evidence from the retrieved context. If the exact answer "
+            "is present, give it directly. If only adjacent or partial evidence "
+            "is present, you may combine and infer from that evidence — name "
+            "the entity (book, place, person, date, etc.) the user is asking "
+            "about whenever it is named anywhere in the retrieved context, "
+            "even if the linkage to the question phrasing is implicit. Only say "
+            "you do not have that information when the retrieved context truly "
+            "lacks any evidence about the asked entity. For medical, legal, "
+            "financial, credential, or other clearly private details, do not "
+            "substitute nearby or inferred facts."
         ),
         (
             "Respect privacy and mode boundaries exactly as described by the "

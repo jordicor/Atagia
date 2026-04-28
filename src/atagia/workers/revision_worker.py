@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from typing import Any
 
 import aiosqlite
 
+from atagia.core import json_utils
 from atagia.core.belief_repository import BeliefRepository
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
@@ -34,7 +34,8 @@ from atagia.models.schemas_memory import (
     MemoryStatus,
 )
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
-from atagia.services.llm_client import LLMClient
+from atagia.services.llm_client import LLMClient, StructuredOutputError
+from atagia.services.model_resolution import resolve_component_model
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
@@ -59,11 +60,9 @@ class RevisionWorker:
         self._clock = clock
         self._llm_client = llm_client
         self._embedding_index = embedding_index or NoneBackend()
-        self._classifier_model = (
-            self._settings.llm_classifier_model
-            or self._settings.llm_scoring_model
-            or self._settings.llm_extraction_model
-            or "claude-sonnet-4-6"
+        self._classifier_model = resolve_component_model(
+            self._settings,
+            "intent_classifier",
         )
         self._memory_repository = MemoryObjectRepository(connection, clock)
         self._belief_repository = BeliefRepository(connection, clock)
@@ -114,7 +113,15 @@ class RevisionWorker:
                 acked += 1
             except Exception as exc:
                 failed += 1
-                logger.exception("Failed to process revision job %s", message.message_id)
+                if isinstance(exc, StructuredOutputError):
+                    details = "; ".join(exc.details) if exc.details else str(exc)
+                    logger.warning(
+                        "Failed to process revision job %s due to structured output: %s",
+                        message.message_id,
+                        details,
+                    )
+                else:
+                    logger.exception("Failed to process revision job %s", message.message_id)
                 if await self._dead_letter_if_exhausted(message, exc):
                     dead_lettered += 1
         return WorkerIterationResult(
@@ -606,6 +613,11 @@ class RevisionWorker:
                 "delivery_count": message.delivery_count,
                 "payload": message.payload,
                 "error": str(exc),
+                "error_details": (
+                    list(exc.details)
+                    if isinstance(exc, StructuredOutputError)
+                    else []
+                ),
             },
         )
         await self._storage_backend.stream_ack(
@@ -644,13 +656,13 @@ class RevisionWorker:
     @staticmethod
     def _parse_claim_value(claim_value: str) -> Any:
         try:
-            return json.loads(claim_value)
-        except json.JSONDecodeError:
+            return json_utils.loads(claim_value)
+        except json_utils.JSONDecodeError:
             return claim_value
 
     @staticmethod
     def _normalize_claim_value(claim_value: Any) -> str:
-        return json.dumps(claim_value, ensure_ascii=False, sort_keys=True)
+        return json_utils.dumps(claim_value, sort_keys=True)
 
     def _canonical_text(
         self,
@@ -660,7 +672,7 @@ class RevisionWorker:
     ) -> str:
         if seed_belief is not None:
             return str(seed_belief["canonical_text"])
-        rendered_value = claim_value if isinstance(claim_value, str) else json.dumps(claim_value, sort_keys=True)
+        rendered_value = claim_value if isinstance(claim_value, str) else json_utils.dumps(claim_value, sort_keys=True)
         return f"{payload.claim_key}: {rendered_value}"
 
     def _timestamp(self) -> str:

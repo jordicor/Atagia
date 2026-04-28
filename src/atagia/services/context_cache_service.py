@@ -84,6 +84,10 @@ class AdaptiveContextResolution:
     cache_key: str | None
     source_retrieval_plan: dict[str, Any]
     scored_candidates: list[dict[str, Any]]
+    candidate_custody: list[dict[str, Any]]
+    retrieval_custody_v2_status: Literal["fresh", "cache_hit_no_candidate_custody"]
+    retrieval_sufficiency: dict[str, Any] | None
+    sufficiency_diagnostics_v1_status: Literal["fresh", "cache_hit_no_sufficiency_diagnostics"]
     candidate_search_summary: dict[str, Any]
     pending_cache_entry: ContextCacheEntry | None
     cache_ttl_seconds: int | None
@@ -228,6 +232,10 @@ class ContextCacheService:
                     cache_key=cache_key,
                     source_retrieval_plan=dict(entry.source_retrieval_plan),
                     scored_candidates=[],
+                    candidate_custody=[],
+                    retrieval_custody_v2_status="cache_hit_no_candidate_custody",
+                    retrieval_sufficiency=None,
+                    sufficiency_diagnostics_v1_status="cache_hit_no_sufficiency_diagnostics",
                     candidate_search_summary={},
                     pending_cache_entry=None,
                     cache_ttl_seconds=None,
@@ -301,6 +309,14 @@ class ContextCacheService:
                 candidate.model_dump(mode="json")
                 for candidate in pipeline_result.scored_candidates
             ],
+            candidate_custody=list(pipeline_result.candidate_custody),
+            retrieval_custody_v2_status="fresh",
+            retrieval_sufficiency=(
+                pipeline_result.retrieval_sufficiency.model_dump(mode="json")
+                if pipeline_result.retrieval_sufficiency is not None
+                else None
+            ),
+            sufficiency_diagnostics_v1_status="fresh",
             candidate_search_summary=self._summarize_candidate_channels(
                 pipeline_result.raw_candidates,
                 top_k=pipeline_result.retrieval_plan.max_candidates,
@@ -413,6 +429,8 @@ class ContextCacheService:
         if not self.runtime.settings.context_cache_enabled:
             return False
         if ablation is not None and ablation.disable_context_cache:
+            return False
+        if ablation is not None and ablation.composer_strategy not in {None, "score_first"}:
             return False
         return True
 

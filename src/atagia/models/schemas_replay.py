@@ -4,11 +4,18 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from atagia.models.schemas_memory import ComposedContext, DetectedNeed, RetrievalPlan, RetrievalTrace, ScoredCandidate
+from atagia.models.schemas_memory import (
+    ComposedContext,
+    DetectedNeed,
+    RetrievalPlan,
+    RetrievalSufficiencyDiagnostic,
+    RetrievalTrace,
+    ScoredCandidate,
+)
 
 
 class GroundingLevel(str, Enum):
@@ -48,6 +55,7 @@ class AblationConfig(BaseModel):
     skip_belief_revision: bool = False
     skip_compaction: bool = False
     disable_context_cache: bool = False
+    composer_strategy: Literal["score_first", "budgeted_marginal"] | None = None
     override_retrieval_params: dict[str, Any] | None = None
 
 
@@ -60,6 +68,8 @@ class PipelineResult(BaseModel):
     retrieval_plan: RetrievalPlan
     raw_candidates: list[dict[str, Any]] = Field(default_factory=list)
     scored_candidates: list[ScoredCandidate] = Field(default_factory=list)
+    candidate_custody: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_sufficiency: RetrievalSufficiencyDiagnostic | None = None
     composed_context: ComposedContext
     current_contract: dict[str, dict[str, Any]] = Field(default_factory=dict)
     user_state: dict[str, Any] = Field(default_factory=dict)
@@ -108,6 +118,7 @@ class ReplayResult(BaseModel):
     original_event_id: str
     replay_pipeline_result: PipelineResult
     comparison: RetrievalComparison
+    ablation_config: dict[str, Any] | None = None
 
 
 class GroundingItem(BaseModel):

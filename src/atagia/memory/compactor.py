@@ -15,6 +15,12 @@ from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.consequence_repository import ConsequenceRepository
 from atagia.core.ids import generate_prefixed_id
+from atagia.core.llm_output_limits import (
+    COMPACTOR_CONVERSATION_CHUNK_MAX_OUTPUT_TOKENS,
+    COMPACTOR_EPISODE_SYNTHESIS_MAX_OUTPUT_TOKENS,
+    COMPACTOR_THEMATIC_PROFILE_MAX_OUTPUT_TOKENS,
+    COMPACTOR_WORKSPACE_ROLLUP_MAX_OUTPUT_TOKENS,
+)
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
@@ -39,14 +45,13 @@ from atagia.services.llm_client import (
     LLMMessage,
     StructuredOutputError,
 )
+from atagia.services.model_resolution import resolve_component_model
 from atagia.services.privacy_filter_client import (
     OpenAIPrivacyFilterClient,
     PrivacyFilterDetection,
     PrivacyFilterError,
 )
 
-DEFAULT_CLASSIFIER_MODEL = "claude-sonnet-4-6"
-DEFAULT_SCORING_MODEL = "claude-sonnet-4-6"
 SUMMARY_MAYA_SCORE = 1.5
 COMPACTION_VALIDATION_MAX_CORRECTIVE_RETRIES = 2
 WORKSPACE_MEMORY_LIMIT = 100
@@ -95,6 +100,8 @@ def _xml_list_attr(values: Any) -> str | None:
 
 
 _SEGMENTATION_PROMPT_TEMPLATE = """Return JSON only, matching the schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 
 <context>
   <reference_time_utc>{reference_time_utc}</reference_time_utc>
@@ -116,6 +123,8 @@ Do not create overlapping episodes.
 """
 
 _WORKSPACE_ROLLUP_PROMPT_TEMPLATE = """Return JSON only, matching the schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 
 <context>
   <reference_time_utc>{reference_time_utc}</reference_time_utc>
@@ -155,6 +164,8 @@ sensitive facts rather than storing the restriction as retrievable text.
 """
 
 _EPISODE_SYNTHESIS_PROMPT_TEMPLATE = """Return JSON only, matching the schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 
 <context>
   <reference_time_utc>{reference_time_utc}</reference_time_utc>
@@ -196,6 +207,8 @@ listed in episodes must be used by at least one chunk.
 """
 
 _THEMATIC_PROFILE_PROMPT_TEMPLATE = """Return JSON only, matching the schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 
 <context>
   <reference_time_utc>{reference_time_utc}</reference_time_utc>
@@ -245,8 +258,8 @@ COMPACTION_VALIDATION_RETRY_TEMPLATE = """Your previous response did not satisfy
 Regenerate the full response from the original inputs.
 Do not reuse unsupported values from the failed attempt.
 Return corrected JSON only.
-Do not include markdown fences.
-Do not include explanations.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 """
 
 _ResponseT = TypeVar("_ResponseT", bound=BaseModel)
@@ -282,7 +295,7 @@ class _ValidatedSummaryDraft:
 
 
 class _SegmentedEpisode(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     start_seq: int = Field(ge=1)
     end_seq: int = Field(ge=1)
@@ -290,41 +303,41 @@ class _SegmentedEpisode(BaseModel):
 
 
 class _SegmentationResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     episodes: list[_SegmentedEpisode] = Field(default_factory=list)
 
 
 class _WorkspaceRollupResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     summary_text: str = Field(min_length=1)
     cited_memory_ids: list[str] = Field(default_factory=list)
 
 
 class _EpisodeSummary(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     episode_key: str = Field(min_length=1)
     summary_text: str = Field(min_length=1)
 
 
 class _EpisodeSynthesisResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     episodes: list[_EpisodeSummary] = Field(default_factory=list)
     chunk_episode_keys: list[str] = Field(default_factory=list)
 
 
 class _ThematicProfileSummary(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     source_memory_ids: list[str] = Field(min_length=1)
     summary_text: str = Field(min_length=1)
 
 
 class _ThematicProfileResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     profiles: list[_ThematicProfileSummary] = Field(default_factory=list)
 
@@ -364,25 +377,15 @@ class Compactor:
                 else None
             )
         )
-        self._classifier_model = (
-            resolved_settings.llm_classifier_model
-            or resolved_settings.llm_scoring_model
-            or resolved_settings.llm_extraction_model
-            or DEFAULT_CLASSIFIER_MODEL
+        self._classifier_model = resolve_component_model(resolved_settings, "compactor")
+        self._scoring_model = resolve_component_model(resolved_settings, "compactor")
+        privacy_judge_model = resolve_component_model(
+            resolved_settings,
+            "summary_privacy_judge",
         )
-        self._scoring_model = (
-            resolved_settings.llm_scoring_model
-            or resolved_settings.llm_classifier_model
-            or resolved_settings.llm_extraction_model
-            or DEFAULT_SCORING_MODEL
-        )
-        privacy_judge_model = (
-            resolved_settings.privacy_validation_gate_judge_model
-            or self._scoring_model
-        )
-        privacy_refiner_model = (
-            resolved_settings.privacy_validation_gate_refiner_model
-            or privacy_judge_model
+        privacy_refiner_model = resolve_component_model(
+            resolved_settings,
+            "summary_privacy_refiner",
         )
         self._privacy_judge = (
             privacy_judge
@@ -777,7 +780,9 @@ class Compactor:
             episode_groups = await self._synthesize_episodes(user_id=user_id, chunk_rows=chunk_rows)
         except (StructuredOutputError, ValueError) as exc:
             logger.warning(
-                "episode_synthesis_failed_preserving_existing_summaries",
+                "episode_synthesis_failed_preserving_existing_summaries user_id=%s error=%s",
+                user_id,
+                exc,
                 extra={"user_id": user_id, "error": str(exc)},
             )
             return deleted_summary_ids
@@ -889,7 +894,9 @@ class Compactor:
             )
         except (StructuredOutputError, ValueError) as exc:
             logger.warning(
-                "thematic_profile_synthesis_failed_preserving_existing_summaries",
+                "thematic_profile_synthesis_failed_preserving_existing_summaries user_id=%s error=%s",
+                user_id,
+                exc,
                 extra={"user_id": user_id, "error": str(exc)},
             )
             return deleted_summary_ids
@@ -1005,6 +1012,7 @@ class Compactor:
                 ),
             ],
             temperature=0.0,
+            max_output_tokens=COMPACTOR_CONVERSATION_CHUNK_MAX_OUTPUT_TOKENS,
             response_schema=_SegmentationResponse.model_json_schema(),
             metadata={
                 "user_id": user_id,
@@ -1017,6 +1025,7 @@ class Compactor:
             request=request,
             schema=_SegmentationResponse,
             validator=lambda result: self._validate_segmentation_response(result, messages),
+            final_repairer=lambda result: self._repair_segmentation_gap_coverage(result, messages),
         )
 
     async def _synthesize_workspace_rollup(
@@ -1052,6 +1061,7 @@ class Compactor:
                 ),
             ],
             temperature=0.0,
+            max_output_tokens=COMPACTOR_WORKSPACE_ROLLUP_MAX_OUTPUT_TOKENS,
             response_schema=_WorkspaceRollupResponse.model_json_schema(),
             metadata={
                 "user_id": user_id,
@@ -1091,6 +1101,7 @@ class Compactor:
                 ),
             ],
             temperature=0.0,
+            max_output_tokens=COMPACTOR_EPISODE_SYNTHESIS_MAX_OUTPUT_TOKENS,
             response_schema=_EpisodeSynthesisResponse.model_json_schema(),
             metadata={
                 "user_id": user_id,
@@ -1137,6 +1148,7 @@ class Compactor:
                 ),
             ],
             temperature=0.0,
+            max_output_tokens=COMPACTOR_THEMATIC_PROFILE_MAX_OUTPUT_TOKENS,
             response_schema=_ThematicProfileResponse.model_json_schema(),
             metadata={
                 "user_id": user_id,
@@ -1160,6 +1172,7 @@ class Compactor:
         request: LLMCompletionRequest,
         schema: type[_ResponseT],
         validator: Callable[[_ResponseT], Any] | None = None,
+        final_repairer: Callable[[_ResponseT], _ResponseT] | None = None,
     ) -> _ResponseT:
         current_request = request
         max_attempts = COMPACTION_VALIDATION_MAX_CORRECTIVE_RETRIES + 1
@@ -1167,7 +1180,14 @@ class Compactor:
             try:
                 response = await self._llm_client.complete_structured(current_request, schema)
                 if validator is not None:
-                    validator(response)
+                    try:
+                        validator(response)
+                    except ValueError:
+                        if attempt_index == max_attempts - 1 and final_repairer is not None:
+                            repaired_response = final_repairer(response)
+                            validator(repaired_response)
+                            return repaired_response
+                        raise
                 return response
             except (StructuredOutputError, ValueError) as exc:
                 if attempt_index == max_attempts - 1:
@@ -1247,6 +1267,77 @@ class Compactor:
 
         if errors:
             raise ValueError("; ".join(errors))
+
+    @classmethod
+    def _repair_segmentation_gap_coverage(
+        cls,
+        response: _SegmentationResponse,
+        messages: list[dict[str, Any]],
+    ) -> _SegmentationResponse:
+        if not messages or not response.episodes:
+            return response
+
+        requested_seqs = sorted(int(message["seq"]) for message in messages)
+        min_seq = requested_seqs[0]
+        max_seq = requested_seqs[-1]
+        episodes = sorted(
+            response.episodes,
+            key=lambda episode: (int(episode.start_seq), int(episode.end_seq)),
+        )
+
+        previous_end: int | None = None
+        for episode in episodes:
+            start_seq = int(episode.start_seq)
+            end_seq = int(episode.end_seq)
+            if start_seq > end_seq or start_seq < min_seq or end_seq > max_seq:
+                return response
+            if previous_end is not None and start_seq <= previous_end:
+                return response
+            previous_end = end_seq
+
+        repaired_episodes: list[_SegmentedEpisode] = []
+        for index, episode in enumerate(episodes):
+            start_seq = int(episode.start_seq)
+            end_seq = int(episode.end_seq)
+            if index == 0:
+                start_seq = min_seq
+            else:
+                previous_episode = repaired_episodes[-1]
+                missing_before_current = [
+                    seq
+                    for seq in requested_seqs
+                    if int(previous_episode.end_seq) < seq < start_seq
+                ]
+                if missing_before_current:
+                    repaired_episodes[-1] = previous_episode.model_copy(
+                        update={"end_seq": missing_before_current[-1]}
+                    )
+            if index == len(episodes) - 1:
+                end_seq = max_seq
+            repaired_episodes.append(
+                episode.model_copy(
+                    update={
+                        "start_seq": start_seq,
+                        "end_seq": end_seq,
+                    }
+                )
+            )
+
+        repaired_response = response.model_copy(update={"episodes": repaired_episodes})
+        try:
+            cls._validate_segmentation_response(repaired_response, messages)
+        except ValueError:
+            return response
+        logger.warning(
+            "conversation_segmentation_gap_coverage_repaired original_episode_count=%s repaired_episode_count=%s",
+            len(response.episodes),
+            len(repaired_response.episodes),
+            extra={
+                "original_episode_count": len(response.episodes),
+                "repaired_episode_count": len(repaired_response.episodes),
+            },
+        )
+        return repaired_response
 
     @staticmethod
     def _format_seq_list(seqs: list[int]) -> str:

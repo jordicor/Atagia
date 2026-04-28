@@ -4,17 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-import json
 import html
 from enum import Enum
 from typing import Any
 
 import aiosqlite
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from atagia.core import json_utils
 from atagia.core.belief_repository import BeliefRepository
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
+from atagia.core.llm_output_limits import BELIEF_REVISER_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import MemoryObjectRepository
 from atagia.memory.intent_classifier import are_claim_keys_equivalent
 from atagia.memory.scope_utils import resolve_scope_identifiers
@@ -27,14 +28,16 @@ from atagia.models.schemas_memory import (
 from atagia.services.embedding_payloads import build_embedding_upsert_payload
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
+from atagia.services.model_resolution import resolve_component_model
 
-DEFAULT_REVISION_MODEL = "claude-sonnet-4-6"
 STABILITY_DELTA_PER_EVIDENCE = 0.03
 logger = logging.getLogger(__name__)
 
 REVISION_PROMPT_TEMPLATE = """You are deciding how an assistant memory belief should revise in light of new evidence.
 
 Return JSON only, matching the schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 Choose exactly one action from the allowed list.
 
 Current belief:
@@ -91,11 +94,25 @@ class RevisionAction(str, Enum):
 class RevisionDecision(BaseModel):
     """Structured LLM output for action selection."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     action: RevisionAction
     explanation: str = Field(min_length=1)
     successor_canonical_text: str | None = None
+
+    @model_validator(mode="after")
+    def validate_successor_text_for_successor_actions(self) -> "RevisionDecision":
+        if self.action not in {
+            RevisionAction.SUPERSEDE,
+            RevisionAction.SPLIT_BY_MODE,
+            RevisionAction.SPLIT_BY_SCOPE,
+            RevisionAction.SPLIT_BY_TIME,
+            RevisionAction.MARK_EXCEPTION,
+        }:
+            return self
+        if self.successor_canonical_text and self.successor_canonical_text.strip():
+            return self
+        raise ValueError("successor_canonical_text is required for successor-creating actions")
 
 
 class RevisionContext(BaseModel):
@@ -156,16 +173,8 @@ class BeliefReviser:
         self._memory_repository = MemoryObjectRepository(connection, clock)
         self._belief_repository = BeliefRepository(connection, clock)
         resolved_settings = settings or Settings.from_env()
-        self._revision_model = (
-            resolved_settings.llm_scoring_model
-            or resolved_settings.llm_extraction_model
-            or DEFAULT_REVISION_MODEL
-        )
-        self._classifier_model = (
-            resolved_settings.llm_classifier_model
-            or resolved_settings.llm_scoring_model
-            or self._revision_model
-        )
+        self._revision_model = resolve_component_model(resolved_settings, "belief_reviser")
+        self._classifier_model = resolve_component_model(resolved_settings, "intent_classifier")
 
     async def revise(
         self,
@@ -374,6 +383,7 @@ class BeliefReviser:
                 LLMMessage(role="user", content=prompt),
             ],
             temperature=0.0,
+            max_output_tokens=BELIEF_REVISER_MAX_OUTPUT_TOKENS,
             response_schema=RevisionDecision.model_json_schema(),
             metadata={
                 "user_id": context.user_id,
@@ -972,13 +982,13 @@ class BeliefReviser:
     @staticmethod
     def _parse_claim_value(claim_value: str) -> Any:
         try:
-            return json.loads(claim_value)
-        except json.JSONDecodeError:
+            return json_utils.loads(claim_value)
+        except json_utils.JSONDecodeError:
             return claim_value
 
     @staticmethod
     def _json_text(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return json_utils.dumps(value, sort_keys=True)
 
     def _timestamp(self) -> str:
         return self._clock.now().isoformat()

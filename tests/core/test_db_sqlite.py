@@ -42,6 +42,9 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "artifacts",
             "belief_versions",
             "conversation_activity_stats",
+            "conversation_topic_events",
+            "conversation_topic_sources",
+            "conversation_topics",
             "contract_dimensions_current",
             "conversations",
             "evaluation_metrics",
@@ -64,7 +67,10 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
         }.issubset(names)
         assert await _fetch_one_value(connection, "PRAGMA foreign_keys;") == 1
         assert await _fetch_one_value(connection, "PRAGMA journal_mode;") != "wal"
-        assert await _fetch_one_value(connection, "SELECT COUNT(*) FROM schema_migrations;") == 20
+        assert await _fetch_one_value(
+            connection,
+            "SELECT COUNT(*) FROM schema_migrations;",
+        ) == len(MigrationManager(MIGRATIONS_DIR).discover())
         assistant_modes_columns_cursor = await connection.execute(
             "PRAGMA table_info(assistant_modes);"
         )
@@ -721,7 +727,7 @@ async def test_migration_0012_backfills_summary_view_user_ids_and_drops_orphans(
         )
         rows = await rows_cursor.fetchall()
 
-        assert [migration.version for migration in applied] == [12, 13, 14, 15, 16, 17, 18, 19, 20]
+        assert [migration.version for migration in applied] == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
         assert [row["id"] for row in rows] == ["sum_conv", "sum_rollup"]
         assert all(row["user_id"] == "usr_1" for row in rows)
         assert all(row["hierarchy_level"] == 0 for row in rows)

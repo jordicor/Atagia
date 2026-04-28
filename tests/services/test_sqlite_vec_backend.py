@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import logging
+import importlib
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -75,7 +75,7 @@ def _settings() -> Settings:
         debug=False,
         allow_insecure_http=True,
         embedding_backend="sqlite_vec",
-        embedding_model="embed-test-model",
+        embedding_model="openai/embed-test-model",
         embedding_dimension=2,
     )
 
@@ -176,6 +176,42 @@ async def test_search_returns_nearest_neighbors_filtered_by_user_id() -> None:
 
         assert [match.memory_id for match in matches] == ["mem_1"]
         assert matches[0].score > 0.9
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_search_prefilters_user_partition_before_knn_limit() -> None:
+    connection, backend, _provider = await _build_backend()
+    try:
+        await _insert_stub_memory(connection, "mem_target", "usr_target")
+        await backend.upsert(
+            "mem_target",
+            "memory two",
+            {
+                "user_id": "usr_target",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": _TS,
+            },
+        )
+        for index in range(120):
+            memory_id = f"mem_other_{index}"
+            await _insert_stub_memory(connection, memory_id, "usr_other")
+            await backend.upsert(
+                memory_id,
+                "memory one",
+                {
+                    "user_id": "usr_other",
+                    "object_type": "evidence",
+                    "scope": "conversation",
+                    "created_at": _TS,
+                },
+            )
+
+        matches = await backend.search("query one", "usr_target", top_k=1)
+
+        assert [match.memory_id for match in matches] == ["mem_target"]
     finally:
         await connection.close()
 
@@ -370,15 +406,11 @@ async def test_delete_commits_metadata_removal_durably(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_emits_starvation_warning_when_postfilter_yields_fewer_than_top_k(
+async def test_search_returns_available_user_rows_without_postfilter_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """When user filtering reduces results below top_k, a warning is logged."""
     connection, backend, _provider = await _build_backend()
     try:
-        # Create 2 memories for usr_other that are close to the query vector,
-        # but only 1 for usr_target. Requesting top_k=5 for usr_target should
-        # return 1 result and trigger the starvation warning.
         await _insert_stub_memory(connection, "mem_target", "usr_target")
         await _insert_stub_memory(connection, "mem_other_1", "usr_other")
         await _insert_stub_memory(connection, "mem_other_2", "usr_other")
@@ -398,13 +430,12 @@ async def test_search_emits_starvation_warning_when_postfilter_yields_fewer_than
             {"user_id": "usr_other", "object_type": "evidence", "scope": "conversation", "created_at": _TS},
         )
 
-        with caplog.at_level(logging.WARNING, logger="atagia.services.sqlite_vec_backend"):
+        with caplog.at_level("WARNING", logger="atagia.services.sqlite_vec_backend"):
             matches = await backend.search("query one", "usr_target", top_k=5)
 
         assert len(matches) == 1
         assert matches[0].memory_id == "mem_target"
-        assert any("fewer rows than requested" in record.message for record in caplog.records)
-        assert any("usr_target" in record.message for record in caplog.records)
+        assert not caplog.records
     finally:
         await connection.close()
 
@@ -429,5 +460,64 @@ async def test_upsert_embeds_canonical_and_index_text_together() -> None:
         assert provider.requests[0].input_texts == [
             "memory one\nretry policies for websocket incidents"
         ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_rebuilds_legacy_unpartitioned_vector_table() -> None:
+    sqlite_vec = importlib.import_module("sqlite_vec")
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    provider = EmbeddingProvider(
+        {
+            "memory one": [1.0, 0.0],
+            "query one": [1.0, 0.0],
+        }
+    )
+    try:
+        await connection.enable_load_extension(True)
+        try:
+            await connection._execute(sqlite_vec.load, connection._conn)  # noqa: SLF001
+        finally:
+            await connection.enable_load_extension(False)
+        await connection.execute(
+            """
+            CREATE VIRTUAL TABLE vec_memory_embeddings USING vec0(
+                memory_id TEXT PRIMARY KEY,
+                embedding float[2]
+            )
+            """
+        )
+        await _insert_stub_memory(connection, "mem_legacy", "usr_1")
+        await connection.execute(
+            """
+            INSERT INTO vec_memory_embeddings(memory_id, embedding)
+            VALUES (?, ?)
+            """,
+            ("mem_legacy", sqlite_vec.serialize_float32([1.0, 0.0])),
+        )
+        await connection.execute(
+            """
+            INSERT INTO memory_embedding_metadata(memory_id, user_id, object_type, scope, created_at)
+            VALUES ('mem_legacy', 'usr_1', 'evidence', 'conversation', ?)
+            """,
+            (_TS,),
+        )
+        await connection.commit()
+
+        backend = SQLiteVecBackend(
+            connection,
+            LLMClient(provider_name=provider.name, providers=[provider]),
+            _settings(),
+        )
+        await backend.initialize()
+        matches = await backend.search("query one", "usr_1", top_k=1)
+        schema_cursor = await connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'vec_memory_embeddings'"
+        )
+        schema = str((await schema_cursor.fetchone())["sql"])
+
+        assert "user_id text partition key" in schema.lower()
+        assert [match.memory_id for match in matches] == ["mem_legacy"]
     finally:
         await connection.close()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -634,6 +635,43 @@ async def test_compute_ccr_llm_evaluation_produces_compliance_score() -> None:
 
 
 @pytest.mark.asyncio
+async def test_compute_ccr_ignores_provider_extra_fields() -> None:
+    connection, clock, messages, _memories, events, _feedback, _beliefs, computer = await _build_runtime()
+    try:
+        await _create_message_at(messages, clock, message_id="msg_1", conversation_id="cnv_dbg_1", role="user", seq=1, text="Need terse help", at=_dt(10, 0))
+        await _create_message_at(messages, clock, message_id="msg_2", conversation_id="cnv_dbg_1", role="assistant", seq=2, text="Short answer.", at=_dt(10, 1))
+        await _create_event_at(
+            events,
+            event_id="ret_1",
+            user_id="usr_1",
+            conversation_id="cnv_dbg_1",
+            request_message_id="msg_1",
+            response_message_id="msg_2",
+            assistant_mode_id="coding_debug",
+            selected_memory_ids=[],
+            contract_block="[Interaction Contract]\n- brevity: high",
+            at=_dt(10, 2),
+        )
+        provider = CCRProvider(
+            [
+                {
+                    "compliance_score": 0.82,
+                    "reasoning": "Compliant.",
+                    "provider_notes": "ignored",
+                }
+            ]
+        )
+        llm_client = LLMClient(provider_name=provider.name, providers=[provider])
+
+        result = await computer.compute_ccr("usr_1", "coding_debug", "2026-03-31", llm_client)
+
+        assert result.value == pytest.approx(0.82)
+        assert result.sample_count == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_compute_ccr_handles_llm_failure_gracefully() -> None:
     connection, clock, messages, _memories, events, _feedback, _beliefs, computer = await _build_runtime()
     try:
@@ -661,6 +699,46 @@ async def test_compute_ccr_handles_llm_failure_gracefully() -> None:
 
         assert result.value == 0.0
         assert result.sample_count == 0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_compute_ccr_logs_structured_failure_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    connection, clock, messages, _memories, events, _feedback, _beliefs, computer = await _build_runtime()
+    try:
+        await _create_message_at(messages, clock, message_id="msg_1", conversation_id="cnv_dbg_1", role="user", seq=1, text="Need terse help", at=_dt(10, 0))
+        await _create_message_at(messages, clock, message_id="msg_2", conversation_id="cnv_dbg_1", role="assistant", seq=2, text="Short answer.", at=_dt(10, 1))
+        await _create_event_at(
+            events,
+            event_id="ret_1",
+            user_id="usr_1",
+            conversation_id="cnv_dbg_1",
+            request_message_id="msg_1",
+            response_message_id="msg_2",
+            assistant_mode_id="coding_debug",
+            selected_memory_ids=[],
+            contract_block="[Interaction Contract]\n- brevity: high",
+            at=_dt(10, 2),
+        )
+        provider = CCRProvider([{"compliance_score": 0.82}])
+        llm_client = LLMClient(provider_name=provider.name, providers=[provider])
+
+        with caplog.at_level(logging.WARNING, logger="atagia.memory.metrics_computer"):
+            result = await computer.compute_ccr("usr_1", "coding_debug", "2026-03-31", llm_client)
+
+        structured_records = [
+            record
+            for record in caplog.records
+            if "CCR evaluation structured-output fallback" in record.getMessage()
+        ]
+        assert result.value == 0.0
+        assert result.sample_count == 0
+        assert len(structured_records) == 1
+        assert structured_records[0].exc_info is None
+        assert "Field required" in structured_records[0].getMessage()
     finally:
         await connection.close()
 

@@ -70,10 +70,12 @@ class EngineProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
-                    [
-                        {"memory_id": memory_id, "llm_applicability": 0.5}
-                        for memory_id in memory_ids
-                    ]
+                    {
+                        "scores": [
+                            {"memory_id": memory_id, "llm_applicability": 0.5}
+                            for memory_id in memory_ids
+                        ],
+                    }
                 ),
             )
         if purpose == "context_cache_signal_detection":

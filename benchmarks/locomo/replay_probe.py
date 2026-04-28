@@ -15,6 +15,7 @@ from typing import Any
 import aiosqlite
 
 from atagia import Atagia
+from atagia.core.llm_output_limits import LOCOMO_REPLAY_PROBE_ANSWER_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import ConversationRepository, summary_mirror_id
 from atagia.memory.retrieval_planner import build_retrieval_fts_queries
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
@@ -22,6 +23,7 @@ from atagia.services.chat_support import build_system_prompt, chat_model, resolv
 from atagia.services.llm_client import LLMCompletionRequest, LLMMessage
 from atagia.services.retrieval_service import RetrievalService
 from benchmarks.base import BenchmarkConversation, BenchmarkQuestion
+from benchmarks.json_artifacts import write_json_atomic
 from benchmarks.locomo.adapter import LoCoMoAdapter
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -284,7 +286,7 @@ async def _generate_answer(
                 LLMMessage(role="user", content=question_text),
             ],
             temperature=0.0,
-            max_output_tokens=512,
+            max_output_tokens=LOCOMO_REPLAY_PROBE_ANSWER_MAX_OUTPUT_TOKENS,
             metadata={
                 "purpose": "benchmark_answer_generation",
                 "question": question_text,
@@ -390,11 +392,7 @@ async def _run(args: argparse.Namespace) -> Path:
         "answer_error": answer_error,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    output_path.write_text(
-        json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    return output_path
+    return write_json_atomic(output_path, artifact)
 
 
 def main() -> None:

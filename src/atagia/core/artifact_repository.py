@@ -44,6 +44,8 @@ class ArtifactRepository(BaseRepository):
         storage_kind: str | None = None,
         blob_bytes: bytes | None = None,
         storage_uri: str | None = None,
+        blob_byte_size: int | None = None,
+        blob_sha256: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_artifact_id = artifact_id or generate_prefixed_id("art")
@@ -108,6 +110,14 @@ class ArtifactRepository(BaseRepository):
         )
         if blob_bytes is not None or storage_kind is not None or storage_uri is not None:
             resolved_storage_kind = storage_kind or ("external_ref" if storage_uri is not None else "sqlite_blob")
+            resolved_byte_size = blob_byte_size if blob_byte_size is not None else (
+                len(blob_bytes) if blob_bytes is not None else 0
+            )
+            resolved_sha256 = blob_sha256 or hashlib.sha256(
+                blob_bytes
+                if blob_bytes is not None
+                else str(storage_uri or resolved_artifact_id).encode("utf-8")
+            ).hexdigest()
             await self._connection.execute(
                 """
                 INSERT INTO artifact_blobs(
@@ -127,12 +137,8 @@ class ArtifactRepository(BaseRepository):
                     resolved_storage_kind,
                     blob_bytes,
                     storage_uri,
-                    len(blob_bytes) if blob_bytes is not None else 0,
-                    hashlib.sha256(
-                        blob_bytes
-                        if blob_bytes is not None
-                        else str(storage_uri or resolved_artifact_id).encode("utf-8")
-                    ).hexdigest(),
+                    resolved_byte_size,
+                    resolved_sha256,
                     timestamp,
                     timestamp,
                 ),
@@ -151,6 +157,18 @@ class ArtifactRepository(BaseRepository):
             FROM artifacts
             WHERE id = ?
               AND user_id = ?
+            """,
+            (artifact_id, user_id),
+        )
+
+    async def get_artifact_blob(self, artifact_id: str, user_id: str) -> dict[str, Any] | None:
+        return await self._fetch_one(
+            """
+            SELECT ab.*
+            FROM artifact_blobs AS ab
+            JOIN artifacts AS a ON a.id = ab.artifact_id
+            WHERE ab.artifact_id = ?
+              AND a.user_id = ?
             """,
             (artifact_id, user_id),
         )

@@ -17,7 +17,7 @@ from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
 )
-from atagia.memory.belief_reviser import BeliefReviser, RevisionContext
+from atagia.memory.belief_reviser import BeliefReviser, RevisionContext, RevisionDecision
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
 from atagia.services.embeddings import EmbeddingIndex
@@ -81,6 +81,21 @@ class RecordingEmbeddingIndex(EmbeddingIndex):
 
     async def delete(self, memory_id: str) -> None:
         self.delete_calls.append(memory_id)
+
+
+def test_revision_decision_ignores_provider_extra_fields() -> None:
+    decision = RevisionDecision.model_validate(
+        {
+            "action": "REINFORCE",
+            "explanation": "The new evidence supports the existing belief.",
+            "successor_canonical_text": None,
+            "confidence": 0.82,
+            "rationale": "Provider-specific explanation field.",
+        }
+    )
+
+    assert decision.action.value == "REINFORCE"
+    assert decision.explanation == "The new evidence supports the existing belief."
 
 
 async def _build_runtime(action: str, embedding_index: EmbeddingIndex | None = None):

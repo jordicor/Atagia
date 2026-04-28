@@ -215,7 +215,7 @@ class CandidateSearch:
             # Collapse raw windows that overlap memory-object candidates
             # already retrieved for this sub-query. Memories are more
             # focused, raw evidence is the recall safety net.
-            self._dedupe_raw_messages_against_memories(sub_query_aggregated)
+            self._dedupe_raw_messages_against_memories(sub_query_aggregated, plan=plan)
             if plan.callback_bias and sub_query_aggregated:
                 await self._populate_callback_source_flags(
                     list(sub_query_aggregated.values()),
@@ -237,7 +237,7 @@ class CandidateSearch:
         # sub-query. The per-sub-query dedup call above only sees one
         # sub-query at a time, so we repeat the pass against the fully
         # merged aggregated set before final ranking.
-        self._dedupe_raw_messages_against_memories(aggregated)
+        self._dedupe_raw_messages_against_memories(aggregated, plan=plan)
         if plan.callback_bias and aggregated:
             await self._populate_callback_source_flags(
                 list(aggregated.values()),
@@ -954,22 +954,24 @@ class CandidateSearch:
             user_id=user_id,
             source_message_ids=source_message_ids,
         )
+        source_window_start = str(
+            window_messages[0].get("occurred_at")
+            or window_messages[0].get("created_at")
+            or ""
+        )
+        source_window_end = str(
+            window_messages[-1].get("occurred_at")
+            or window_messages[-1].get("created_at")
+            or ""
+        )
         payload: dict[str, Any] = {
             "source_message_ids": source_message_ids,
             "source_kind_variant": "conversation_window",
             "window_start_seq": start_seq,
             "window_end_seq": end_seq,
             "window_size": len(window_messages),
-            "source_window_start_occurred_at": str(
-                window_messages[0].get("occurred_at")
-                or window_messages[0].get("created_at")
-                or ""
-            ),
-            "source_window_end_occurred_at": str(
-                window_messages[-1].get("occurred_at")
-                or window_messages[-1].get("created_at")
-                or ""
-            ),
+            "source_message_window_start_occurred_at": source_window_start,
+            "source_message_window_end_occurred_at": source_window_end,
         }
         fts_rank = float(seed_row.get("rank") or 0.0)
         return {
@@ -1234,6 +1236,8 @@ class CandidateSearch:
     @staticmethod
     def _dedupe_raw_messages_against_memories(
         aggregated: dict[str, dict[str, Any]],
+        *,
+        plan: RetrievalPlan,
     ) -> None:
         """Drop raw-window candidates already covered by a memory object.
 
@@ -1241,6 +1245,9 @@ class CandidateSearch:
         message ids appears in ``payload_json.source_message_ids`` of a
         non-raw candidate that also scored for the same sub-query.
         """
+        if plan.exact_recall_mode or plan.raw_context_access_mode == "verbatim":
+            return
+
         covered_message_ids: set[str] = set()
         for candidate in aggregated.values():
             if candidate.get("is_raw_message_window"):

@@ -7,6 +7,7 @@ import logging
 import re
 
 from benchmarks.base import ScoreResult
+from atagia.core.llm_output_limits import GENERIC_JUDGE_MAX_OUTPUT_TOKENS
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
 
 try:
@@ -25,6 +26,10 @@ class LLMJudgeScorer:
     def __init__(self, llm_client: LLMClient[object], judge_model: str) -> None:
         self._llm_client = llm_client
         self._judge_model = judge_model
+
+    @property
+    def judge_model(self) -> str:
+        return self._judge_model
 
     async def score(
         self,
@@ -57,7 +62,7 @@ class LLMJudgeScorer:
                     ),
                 ],
                 temperature=0.0,
-                max_output_tokens=256,
+                max_output_tokens=GENERIC_JUDGE_MAX_OUTPUT_TOKENS,
                 metadata={
                     "purpose": "benchmark_judge",
                     "question": question,

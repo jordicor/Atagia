@@ -109,6 +109,7 @@ class ConversationReport(BaseModel):
     results: list[QuestionResult] = Field(default_factory=list)
     accuracy: float = Field(ge=0.0, le=1.0)
     category_breakdown: dict[int, float] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class BenchmarkReport(BaseModel):

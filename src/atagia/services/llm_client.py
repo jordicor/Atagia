@@ -3,15 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from dataclasses import dataclass
-import re
 from typing import Any, AsyncIterator, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
+from atagia.core.llm_output_limits import apply_min_output_threshold
+from atagia.services.structured_json import (
+    StructuredJSONDecodeError,
+    decode_structured_json_payload,
+)
+from atagia.services.model_profiles import MODEL_PROFILES
+from atagia.services.model_resolution import (
+    ModelResolutionError,
+    ParsedModelSpec,
+    parse_model_spec,
+)
+
 T = TypeVar("T")
-_JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+
+_STRICT_JSON_FALLBACK_INSTRUCTION = (
+    "Return exactly one raw JSON object or array. Start with { or [. "
+    "Do not include markdown fences, explanations, preambles, tags, or any text "
+    "outside the JSON value. Anything outside the first JSON value will be ignored. "
+    "Every item you want Atagia to consider must be represented inside the JSON fields."
+)
 
 
 class LLMError(RuntimeError):
@@ -32,6 +50,10 @@ class StructuredOutputError(LLMError):
 
 class TransientLLMError(LLMError):
     """Raised for retryable provider failures."""
+
+
+class OutputLimitExceededError(LLMError):
+    """Raised when the model truncates output (finish_reason=length / stop_reason=max_tokens)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,32 +185,34 @@ class LLMClient(Generic[T]):
 
     def __init__(
         self,
-        provider_name: str,
+        provider_name: str | None = None,
         providers: list[LLMProvider] | None = None,
         embedding_provider_name: str | None = None,
         retry_policy: RetryPolicy | None = None,
+        allow_unqualified_single_provider_models: bool = False,
     ) -> None:
-        self._provider_name = provider_name.strip().lower()
-        self._providers = {
-            provider.name.strip().lower(): provider for provider in (providers or [])
-        }
+        self._provider_name = provider_name.strip().lower() if provider_name is not None else None
         self._embedding_provider_name = (
             embedding_provider_name.strip().lower()
             if embedding_provider_name is not None
-            else self._provider_name
+            else None
         )
+        self._providers = {
+            provider.name.strip().lower(): provider for provider in (providers or [])
+        }
         self._retry_policy = retry_policy or RetryPolicy()
+        self._allow_unqualified_single_provider_models = allow_unqualified_single_provider_models
 
     def register_provider(self, provider: LLMProvider) -> None:
         self._providers[provider.name.strip().lower()] = provider
 
     @property
-    def provider_name(self) -> str:
+    def provider_name(self) -> str | None:
         return self._provider_name
 
     @property
-    def embedding_provider_name(self) -> str:
-        return self._embedding_provider_name
+    def embedding_provider_name(self) -> str | None:
+        return self._embedding_provider_name or self._provider_name
 
     @property
     def provider(self) -> LLMProvider:
@@ -196,31 +220,48 @@ class LLMClient(Generic[T]):
 
     @property
     def embedding_provider(self) -> LLMProvider:
-        return self._provider(self._embedding_provider_name)
+        return self._provider(self.embedding_provider_name)
 
     def _provider(self, provider_name: str | None = None) -> LLMProvider:
         resolved_name = provider_name or self._provider_name
+        if resolved_name is None:
+            if len(self._providers) == 1:
+                return next(iter(self._providers.values()))
+            raise ConfigurationError("No LLM provider was selected for this request")
         provider = self._providers.get(resolved_name)
         if provider is None:
             raise ConfigurationError(f"Unsupported LLM provider: {resolved_name}")
         return provider
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        return await self._with_retries(lambda: self._provider().complete(request))
+        normalized_request = request.model_copy(
+            update={"max_output_tokens": apply_min_output_threshold(request.max_output_tokens)}
+        )
+        provider, provider_request = self._completion_provider_request(normalized_request)
+        return await self._with_retries(lambda: provider.complete(provider_request))
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        return await self._with_retries(
-            lambda: self._provider(self._embedding_provider_name).embed(request)
-        )
+        provider, provider_request = self._embedding_provider_request(request)
+        return await self._with_retries(lambda: provider.embed(provider_request))
+
+    def supports_embedding_dimensions(self, model_spec: str) -> bool:
+        """Return whether the provider for an embedding model supports dimensions."""
+        if self._provider_name is not None:
+            return self.embedding_provider.supports_embedding_dimensions
+        parsed = self._parse_model_spec(model_spec, allow_thinking=False)
+        return self._provider(parsed.provider_name).supports_embedding_dimensions
 
     async def stream(self, request: LLMCompletionRequest) -> AsyncIterator[LLMStreamEvent]:
+        normalized_request = request.model_copy(
+            update={"max_output_tokens": apply_min_output_threshold(request.max_output_tokens)}
+        )
+        provider, provider_request = self._completion_provider_request(normalized_request)
         delay = self._retry_policy.base_delay_seconds
         last_error: Exception | None = None
         for attempt in range(1, self._retry_policy.attempts + 1):
             emitted_any = False
             try:
-                provider = self._provider()
-                async for event in provider.stream(request):
+                async for event in provider.stream(provider_request):
                     emitted_any = True
                     yield event
                 return
@@ -235,6 +276,133 @@ class LLMClient(Generic[T]):
         if last_error is None:
             raise LLMError("LLM stream failed without a captured error")
         raise last_error
+
+    def _completion_provider_request(
+        self,
+        request: LLMCompletionRequest,
+    ) -> tuple[LLMProvider, LLMCompletionRequest]:
+        if self._provider_name is not None:
+            return self.provider, request
+        parsed = self._parse_model_spec(request.model, allow_thinking=True)
+        provider = self._provider(parsed.provider_name)
+        return provider, self._completion_request_for_provider(request, parsed)
+
+    def _embedding_provider_request(
+        self,
+        request: LLMEmbeddingRequest,
+    ) -> tuple[LLMProvider, LLMEmbeddingRequest]:
+        if self._provider_name is not None:
+            return self._provider(self._provider_name), request
+        parsed = self._parse_model_spec(request.model, allow_thinking=False)
+        provider = self._provider(parsed.provider_name)
+        metadata = dict(request.metadata)
+        metadata.setdefault("atagia_model_spec", parsed.canonical_model)
+        provider_request = request.model_copy(
+            update={
+                "model": parsed.request_model,
+                "metadata": metadata,
+            }
+        )
+        return provider, provider_request
+
+    def _parse_model_spec(self, model: str, *, allow_thinking: bool) -> ParsedModelSpec:
+        try:
+            return parse_model_spec(model, allow_thinking=allow_thinking)
+        except ModelResolutionError as exc:
+            if self._allow_unqualified_single_provider_models and len(self._providers) == 1:
+                provider = next(iter(self._providers))
+                return ParsedModelSpec(
+                    raw_spec=model,
+                    canonical_spec=model,
+                    canonical_model=model,
+                    provider_slug=provider,
+                    provider_name=provider,
+                    request_model=model,
+                    thinking_level=None,
+                )
+            raise ConfigurationError(str(exc)) from exc
+
+    def _completion_request_for_provider(
+        self,
+        request: LLMCompletionRequest,
+        parsed: ParsedModelSpec,
+    ) -> LLMCompletionRequest:
+        metadata = copy.deepcopy(request.metadata)
+        metadata.setdefault("atagia_model_spec", parsed.canonical_spec)
+        metadata.setdefault("atagia_canonical_model", parsed.canonical_model)
+        metadata.setdefault("atagia_provider_slug", parsed.provider_slug)
+        metadata = self._apply_model_profile(parsed, metadata)
+        return request.model_copy(
+            update={
+                "model": parsed.request_model,
+                "metadata": metadata,
+            }
+        )
+
+    def _apply_model_profile(
+        self,
+        parsed: ParsedModelSpec,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        profile = MODEL_PROFILES.get(parsed.canonical_model)
+        if profile is None:
+            return metadata
+
+        if profile.extra_kwargs:
+            metadata.update(copy.deepcopy(profile.extra_kwargs))
+
+        provider_value: str | int | None = None
+        level = parsed.thinking_level or profile.default_thinking_level
+        if level is not None and profile.thinking_level_map:
+            if level in profile.thinking_level_map:
+                provider_value = profile.thinking_level_map[level]
+            elif profile.default_thinking_level in profile.thinking_level_map:
+                provider_value = profile.thinking_level_map[profile.default_thinking_level]
+
+        if parsed.provider_slug == "openai":
+            if provider_value is not None:
+                metadata["reasoning_effort"] = provider_value
+            return metadata
+
+        if parsed.provider_slug == "anthropic":
+            if provider_value == -1:
+                metadata["anthropic_thinking_adaptive"] = True
+                metadata.pop("thinking_budget_tokens", None)
+            elif isinstance(provider_value, int) and provider_value > 0:
+                metadata["thinking_budget_tokens"] = provider_value
+                metadata.pop("anthropic_thinking_adaptive", None)
+            return metadata
+
+        if parsed.provider_slug == "google":
+            if provider_value is not None:
+                metadata["gemini_thinking_level"] = provider_value
+            return metadata
+
+        if parsed.provider_slug == "openrouter":
+            profile_body = copy.deepcopy(profile.extra_body or {})
+            request_body = copy.deepcopy(metadata.get("provider_extra_body") or {})
+            body = self._deep_merge_dicts(profile_body, request_body)
+            if provider_value is not None:
+                reasoning = body.get("reasoning")
+                if not isinstance(reasoning, dict):
+                    reasoning = {}
+                reasoning["effort"] = provider_value
+                body["reasoning"] = reasoning
+            if body:
+                metadata["provider_extra_body"] = body
+            return metadata
+
+        return metadata
+
+    @classmethod
+    def _deep_merge_dicts(cls, base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(base)
+        for key, value in overlay.items():
+            if isinstance(value, dict) and isinstance(result.get(key), dict):
+                result[key] = cls._deep_merge_dicts(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
 
     async def complete_structured(
         self,
@@ -256,10 +424,7 @@ class LLMClient(Generic[T]):
                             *request.messages,
                             LLMMessage(
                                 role="user",
-                                content=(
-                                    "Return raw JSON only. Do not include markdown fences, "
-                                    "explanations, or any text outside the JSON object."
-                                ),
+                                content=_STRICT_JSON_FALLBACK_INSTRUCTION,
                             ),
                         ],
                     }
@@ -267,15 +432,15 @@ class LLMClient(Generic[T]):
             )
         try:
             payload = self._decode_json_payload(response.output_text)
-        except json.JSONDecodeError as exc:
+        except StructuredJSONDecodeError as exc:
             if used_schema_fallback:
                 raise StructuredOutputError(
                     "Provider returned non-JSON structured output after schema fallback",
-                    details=self._structured_error_details(exc),
+                    details=exc.details,
                 ) from exc
             raise StructuredOutputError(
                 "Provider returned non-JSON structured output",
-                details=self._structured_error_details(exc),
+                details=exc.details,
             ) from exc
 
         adapter = TypeAdapter(schema)
@@ -316,27 +481,7 @@ class LLMClient(Generic[T]):
 
     @staticmethod
     def _decode_json_payload(output_text: str) -> Any:
-        try:
-            return json.loads(output_text)
-        except json.JSONDecodeError:
-            pass
-
-        stripped = output_text.strip()
-        fence_match = _JSON_FENCE_PATTERN.search(stripped)
-        if fence_match is not None:
-            fenced_payload = fence_match.group(1).strip()
-            return json.loads(fenced_payload)
-
-        decoder = json.JSONDecoder()
-        for index, character in enumerate(stripped):
-            if character not in "[{":
-                continue
-            try:
-                payload, _ = decoder.raw_decode(stripped[index:])
-                return payload
-            except json.JSONDecodeError:
-                continue
-        raise json.JSONDecodeError("Expecting value", output_text, 0)
+        return decode_structured_json_payload(output_text).data
 
     @classmethod
     def _structured_error_details(cls, exc: Exception) -> tuple[str, ...]:

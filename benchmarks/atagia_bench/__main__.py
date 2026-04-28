@@ -6,22 +6,36 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from benchmarks.atagia_bench.runner import AtagiaBenchReport, AtagiaBenchRunner
+from benchmarks.artifact_hash import sha256_file_if_exists
+from benchmarks.atagia_bench.custody_report import (
+    build_failed_question_custody_report,
+    save_failed_question_custody_report,
+)
 from benchmarks.atagia_bench.report_diff import (
     build_diff,
     format_diff_summary,
     load_atagia_bench_report,
     save_diff,
 )
+from benchmarks.atagia_bench.runner import AtagiaBenchReport, AtagiaBenchRunner, load_holdout_question_ids
+from benchmarks.custody_summary import format_retrieval_custody_summary
+from benchmarks.failure_taxonomy import (
+    build_failure_taxonomy_report,
+    failure_taxonomy_manifest_summary,
+    format_failure_taxonomy_summary,
+    save_failure_taxonomy_report,
+)
 from atagia.models.schemas_replay import AblationConfig
 
 _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+_DEFAULT_HOLDOUT_FILE = Path(__file__).resolve().parent / "data" / "holdout_v0.json"
 _DEFAULT_ANTHROPIC_JUDGE_MODEL = "claude-opus-4-6"
 
 
@@ -41,6 +55,7 @@ def _parse_ablation(raw_value: str | None) -> AblationConfig | None:
         "no_need_detection": AblationConfig(skip_need_detection=True),
         "no_revision": AblationConfig(skip_belief_revision=True),
         "no_compaction": AblationConfig(skip_compaction=True),
+        "composer_budgeted_marginal": AblationConfig(composer_strategy="budgeted_marginal"),
     }
     preset = presets.get(raw_value)
     if preset is not None:
@@ -94,6 +109,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--questions",
         default=None,
         help="Comma-separated question ids to run",
+    )
+    parser.add_argument(
+        "--benchmark-split",
+        choices=("all", "development", "holdout"),
+        default="all",
+        help=(
+            "Question split to run. development excludes the frozen holdout; "
+            "holdout runs only frozen holdout ids."
+        ),
+    )
+    parser.add_argument(
+        "--holdout-file",
+        default=str(_DEFAULT_HOLDOUT_FILE),
+        help="Frozen Atagia-bench holdout manifest JSON",
     )
     parser.add_argument(
         "--manifests-dir",
@@ -157,9 +186,41 @@ def _default_diff_output_path(report_path: Path) -> Path:
     return report_path.with_name(f"atagia-bench-diff-{timestamp}.json")
 
 
+def _default_custody_output_path(report_path: Path) -> Path:
+    timestamp = report_path.stem.removeprefix("atagia-bench-report-")
+    return report_path.with_name(f"atagia-bench-failed-custody-{timestamp}.json")
+
+
+def _default_taxonomy_output_path(report_path: Path) -> Path:
+    timestamp = report_path.stem.removeprefix("atagia-bench-report-")
+    return report_path.with_name(f"atagia-bench-failure-taxonomy-{timestamp}.json")
+
+
+def _question_filters_for_split(
+    *,
+    explicit_question_ids: list[str] | None,
+    benchmark_split: str,
+    holdout_ids: list[str],
+) -> tuple[list[str] | None, list[str] | None]:
+    if benchmark_split == "all":
+        return explicit_question_ids, None
+    holdout_set = set(holdout_ids)
+    if benchmark_split == "holdout":
+        if explicit_question_ids is None:
+            return sorted(holdout_set), None
+        return sorted(set(explicit_question_ids).intersection(holdout_set)), None
+    return explicit_question_ids, sorted(holdout_set)
+
+
 async def _run_async(
     args: argparse.Namespace,
-) -> tuple[AtagiaBenchReport, Path, Path | None]:
+) -> tuple[AtagiaBenchReport, Path, Path | None, Any, Path, Path, Path, dict[str, object]]:
+    holdout_ids = load_holdout_question_ids(args.holdout_file)
+    question_ids, exclude_question_ids = _question_filters_for_split(
+        explicit_question_ids=_parse_csv_list(args.questions),
+        benchmark_split=args.benchmark_split,
+        holdout_ids=holdout_ids,
+    )
     runner = AtagiaBenchRunner(
         llm_provider=args.provider,
         llm_api_key=args.api_key,
@@ -173,7 +234,10 @@ async def _run_async(
     report = await runner.run(
         persona_ids=_parse_csv_list(args.personas),
         category_tags=_parse_csv_list(args.categories),
-        question_ids=_parse_csv_list(args.questions),
+        question_ids=question_ids,
+        exclude_question_ids=exclude_question_ids,
+        benchmark_split=args.benchmark_split,
+        holdout_question_ids=holdout_ids,
         ablation=_parse_ablation(args.ablation),
         trusted_evaluation=args.trusted_evaluation,
     )
@@ -188,6 +252,8 @@ async def _run_async(
             report,
             before_label=Path(args.diff_against).name,
             after_label=report_path.name,
+            before_report_sha256=sha256_file_if_exists(args.diff_against),
+            after_report_sha256=sha256_file_if_exists(report_path),
         )
         requested_diff_output = (
             Path(args.diff_output).expanduser()
@@ -196,7 +262,26 @@ async def _run_async(
         )
         diff_path = save_diff(diff_report, requested_diff_output)
 
-    return report, report_path, diff_path, diff_report
+    custody_path = _default_custody_output_path(report_path)
+    save_failed_question_custody_report(
+        build_failed_question_custody_report(report, source_report=str(report_path)),
+        custody_path,
+    )
+    taxonomy_report = build_failure_taxonomy_report(report, source_report=str(report_path))
+    taxonomy_summary = failure_taxonomy_manifest_summary(taxonomy_report)
+    taxonomy_path = _default_taxonomy_output_path(report_path)
+    save_failure_taxonomy_report(taxonomy_report, taxonomy_path)
+    manifest_path = runner.save_run_manifest(
+        report,
+        report_path=report_path,
+        diff_path=diff_path,
+        holdout_path=args.holdout_file,
+        custody_path=custody_path,
+        taxonomy_path=taxonomy_path,
+        failure_taxonomy_summary=taxonomy_summary,
+    )
+
+    return report, report_path, diff_path, diff_report, manifest_path, custody_path, taxonomy_path, taxonomy_summary
 
 
 def _format_duration(duration_seconds: float) -> str:
@@ -214,6 +299,10 @@ def _format_report_summary(
     report: AtagiaBenchReport,
     report_path: Path,
     diff_path: Path | None = None,
+    manifest_path: Path | None = None,
+    custody_path: Path | None = None,
+    taxonomy_path: Path | None = None,
+    failure_taxonomy_summary: dict[str, object] | None = None,
 ) -> str:
     lines = [
         "=" * 50,
@@ -226,6 +315,14 @@ def _format_report_summary(
         f"Personas: {', '.join(report.personas_used)}",
         f"Model: {report.config.get('provider', '')} / {report.config.get('answer_model', '')}",
         f"Trusted evaluation: {bool(report.config.get('trusted_evaluation', False))}",
+        f"Benchmark split: {report.config.get('benchmark_split', 'all')}",
+        format_retrieval_custody_summary(
+            report.config.get("retrieval_custody_summary")
+        ),
+        format_failure_taxonomy_summary(
+            failure_taxonomy_summary
+            or report.config.get("failure_taxonomy_summary")
+        ),
         "",
         "Category breakdown:",
     ]
@@ -253,6 +350,21 @@ def _format_report_summary(
         "",
         f"Report saved to: {report_path}",
         *(
+            [f"Run manifest saved to: {manifest_path}"]
+            if manifest_path is not None
+            else []
+        ),
+        *(
+            [f"Failed-question custody saved to: {custody_path}"]
+            if custody_path is not None
+            else []
+        ),
+        *(
+            [f"Failure taxonomy saved to: {taxonomy_path}"]
+            if taxonomy_path is not None
+            else []
+        ),
+        *(
             [f"Diff saved to: {diff_path}"]
             if diff_path is not None
             else []
@@ -272,9 +384,28 @@ def main() -> None:
             "--embedding-model is required when --embedding-backend is sqlite_vec"
         )
 
-    report, report_path, diff_path, diff_report = asyncio.run(_run_async(args))
+    (
+        report,
+        report_path,
+        diff_path,
+        diff_report,
+        manifest_path,
+        custody_path,
+        taxonomy_path,
+        failure_taxonomy_summary,
+    ) = asyncio.run(_run_async(args))
 
-    print(_format_report_summary(report, report_path, diff_path=diff_path))
+    print(
+        _format_report_summary(
+            report,
+            report_path,
+            diff_path=diff_path,
+            manifest_path=manifest_path,
+            custody_path=custody_path,
+            taxonomy_path=taxonomy_path,
+            failure_taxonomy_summary=failure_taxonomy_summary,
+        )
+    )
 
     if diff_report is not None:
         print()

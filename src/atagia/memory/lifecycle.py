@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import json
 import logging
 from typing import Any
 
 import aiosqlite
 from pydantic import BaseModel, ConfigDict
 
+from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.consent_repository import MemoryConsentProfileRepository, PendingMemoryConfirmationRepository
@@ -175,9 +175,8 @@ class MemoryLifecycleManager:
         updates = [
             (
                 MemoryStatus.ARCHIVED.value,
-                json.dumps(
+                json_utils.dumps(
                     self._archived_payload(row["payload_json"], row["canonical_text"]),
-                    ensure_ascii=False,
                     sort_keys=True,
                 ),
                 timestamp,
@@ -224,9 +223,8 @@ class MemoryLifecycleManager:
         updates = [
             (
                 MemoryStatus.ARCHIVED.value,
-                json.dumps(
+                json_utils.dumps(
                     self._archived_payload(row["payload_json"], row["canonical_text"]),
-                    ensure_ascii=False,
                     sort_keys=True,
                 ),
                 timestamp,
@@ -316,9 +314,8 @@ class MemoryLifecycleManager:
         updates = [
             (
                 MemoryStatus.DECLINED.value,
-                json.dumps(
+                json_utils.dumps(
                     self._declined_payload(row["payload_json"], decline_reason="ttl_expired"),
-                    ensure_ascii=False,
                     sort_keys=True,
                 ),
                 timestamp,
@@ -480,7 +477,7 @@ class MemoryLifecycleManager:
     def _archived_payload(raw_payload: str | None, canonical_text: str) -> dict[str, Any]:
         payload: dict[str, Any]
         if isinstance(raw_payload, str) and raw_payload:
-            payload = json.loads(raw_payload)
+            payload = json_utils.loads(raw_payload)
         else:
             payload = {}
         payload.setdefault("archived_summary", canonical_text)
@@ -490,7 +487,7 @@ class MemoryLifecycleManager:
     def _declined_payload(raw_payload: str | None, *, decline_reason: str) -> dict[str, Any]:
         payload: dict[str, Any]
         if isinstance(raw_payload, str) and raw_payload:
-            payload = json.loads(raw_payload)
+            payload = json_utils.loads(raw_payload)
         else:
             payload = {}
         payload["decline_reason"] = decline_reason

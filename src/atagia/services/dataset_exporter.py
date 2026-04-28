@@ -25,6 +25,7 @@ from atagia.services.export_anonymizer import (
     ExportAnonymizer,
 )
 from atagia.services.llm_client import LLMClient
+from atagia.services.model_resolution import resolve_component_model
 
 
 class ConversationExportNotFoundError(ValueError):
@@ -199,16 +200,7 @@ class DatasetExporter:
             raise UnsafeConversationExportRequestError(
                 "Anonymized export requires runtime settings"
             )
-        for candidate in (
-            self._settings.llm_classifier_model,
-            self._settings.llm_extraction_model,
-            self._settings.llm_chat_model,
-        ):
-            if candidate is not None and candidate.strip():
-                return candidate.strip()
-        raise UnsafeConversationExportRequestError(
-            "Anonymized export requires at least one configured LLM model"
-        )
+        return resolve_component_model(self._settings, "export_anonymizer")
 
     @staticmethod
     def _coerce_workspace_id(value: Any) -> str | None:

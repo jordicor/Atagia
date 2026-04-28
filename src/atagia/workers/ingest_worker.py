@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 
 import aiosqlite
 
+from atagia.core import json_utils
 from atagia.core.belief_repository import BeliefRepository
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
@@ -40,8 +40,9 @@ from atagia.models.schemas_memory import (
     ExtractionResult,
     MemoryObjectType,
 )
-from atagia.services.llm_client import LLMClient, StructuredOutputError
+from atagia.services.llm_client import LLMClient, StructuredOutputError, TransientLLMError
 from atagia.services.embeddings import EmbeddingIndex
+from atagia.services.model_resolution import resolve_component_model
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
@@ -75,11 +76,9 @@ class IngestWorker:
         self._summary_repository = SummaryRepository(connection, clock)
         resolved_settings = settings or Settings.from_env()
         self._settings = resolved_settings
-        self._classifier_model = (
-            resolved_settings.llm_classifier_model
-            or resolved_settings.llm_scoring_model
-            or resolved_settings.llm_extraction_model
-            or "claude-sonnet-4-6"
+        self._classifier_model = resolve_component_model(
+            resolved_settings,
+            "intent_classifier",
         )
         self._extractor = MemoryExtractor(
             llm_client=llm_client,
@@ -140,7 +139,7 @@ class IngestWorker:
                 acked += 1
             except Exception as exc:
                 failed += 1
-                logger.exception("Failed to process extraction job %s", message.message_id)
+                self._log_job_failure(message, exc)
                 if await self._dead_letter_if_exhausted(message, exc):
                     dead_lettered += 1
         return WorkerIterationResult(
@@ -149,6 +148,17 @@ class IngestWorker:
             failed=failed,
             dead_lettered=dead_lettered,
         )
+
+    @staticmethod
+    def _log_job_failure(message: StreamMessage, exc: Exception) -> None:
+        if isinstance(exc, (StructuredOutputError, TransientLLMError)):
+            logger.warning(
+                "Failed to process extraction job %s: %s",
+                message.message_id,
+                exc,
+            )
+            return
+        logger.exception("Failed to process extraction job %s", message.message_id)
 
     async def process_job(self, payload: dict[str, object]) -> None:
         envelope = JobEnvelope.model_validate(payload)
@@ -181,10 +191,11 @@ class IngestWorker:
         except StructuredOutputError as exc:
             if "after schema fallback" not in str(exc):
                 raise
+            details = "; ".join(exc.details) if exc.details else str(exc)
             logger.warning(
-                "Skipping extraction job %s after schema fallback returned non-JSON output",
+                "Skipping extraction job %s after schema fallback returned non-JSON output: %s",
                 job_payload.message_id,
-                exc_info=True,
+                details,
             )
             result = ExtractionResult(nothing_durable=True)
             persisted = []
@@ -243,9 +254,8 @@ class IngestWorker:
                 payload=RevisionJobPayload(
                     belief_id=existing_belief_id or "",
                     claim_key=claim_key,
-                    claim_value=json.dumps(
+                    claim_value=json_utils.dumps(
                         payload_json.get("claim_value"),
-                        ensure_ascii=False,
                         sort_keys=True,
                     ),
                     evidence_memory_ids=evidence_ids,
@@ -270,9 +280,8 @@ class IngestWorker:
                 payload=RevisionJobPayload(
                     belief_id="",
                     claim_key=claim_key,
-                    claim_value=json.dumps(
+                    claim_value=json_utils.dumps(
                         payload_json.get("claim_value"),
-                        ensure_ascii=False,
                         sort_keys=True,
                     ),
                     evidence_memory_ids=[str(evidence_row["id"])],

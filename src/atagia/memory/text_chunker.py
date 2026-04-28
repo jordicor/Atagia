@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import hashlib
-import json
 import logging
 import re
 import secrets
 from typing import Any
 
+from atagia.core import json_utils
+from atagia.core.llm_output_limits import TEXT_CHUNKER_MAX_OUTPUT_TOKENS
 from atagia.memory.chunking_config import (
     BLANK_BLOCK_PATTERN,
     CHUNKING_THRESHOLD_TOKENS,
@@ -33,6 +34,8 @@ _MARKER_INDEX_PATTERN = re.compile(r"_(\d+)>>>$")
 _LEVEL1_PROMPT = """You are chunking a very large user message for downstream memory extraction.
 
 Return JSON only.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 Schema:
 {{
   "cut_markers": ["<<<BM_XXXXXXXX_3>>>", "<<<BM_XXXXXXXX_7>>>"]
@@ -378,13 +381,14 @@ class TextChunker:
                 ),
             ],
             temperature=0.0,
+            max_output_tokens=TEXT_CHUNKER_MAX_OUTPUT_TOKENS,
             metadata={"purpose": "text_chunking_level1"},
         )
         response = await self._llm_client.complete(request)
         raw_response = response.output_text
         try:
-            payload = json.loads(raw_response)
-        except json.JSONDecodeError as exc:
+            payload = json_utils.loads(raw_response)
+        except json_utils.JSONDecodeError as exc:
             raise Level1ChunkingError(
                 "malformed_json",
                 attempts=attempts,

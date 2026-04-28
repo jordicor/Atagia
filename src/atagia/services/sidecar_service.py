@@ -73,7 +73,11 @@ class SidecarService:
                     assistant_mode_id=mode,
                 )
                 messages = MessageRepository(connection, self.runtime.clock)
-                artifacts = ArtifactService(connection, self.runtime.clock)
+                artifacts = ArtifactService(
+                    connection,
+                    self.runtime.clock,
+                    blob_store=self.runtime.artifact_blob_store,
+                )
                 attachment_bundle = artifacts.prepare_attachments(
                     message_text=message,
                     attachments=attachments,
@@ -219,7 +223,11 @@ class SidecarService:
                     assistant_mode_id=mode,
                 )
                 messages = MessageRepository(connection, self.runtime.clock)
-                artifacts = ArtifactService(connection, self.runtime.clock)
+                artifacts = ArtifactService(
+                    connection,
+                    self.runtime.clock,
+                    blob_store=self.runtime.artifact_blob_store,
+                )
                 attachment_bundle = artifacts.prepare_attachments(
                     message_text=text,
                     attachments=attachments,

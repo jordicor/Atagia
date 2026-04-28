@@ -95,7 +95,7 @@ def _settings() -> Settings:
 
 
 @pytest.mark.asyncio
-async def test_need_detector_detects_allowed_need_and_uses_scoring_model() -> None:
+async def test_need_detector_detects_allowed_need_and_uses_resolved_model() -> None:
     provider = CannedNeedProvider(
         {
             "needs": [
@@ -103,6 +103,7 @@ async def test_need_detector_detects_allowed_need_and_uses_scoring_model() -> No
                     "need_type": "ambiguity",
                     "confidence": 0.79,
                     "reasoning": "The request leaves the desired output shape unclear.",
+                    "evidence": "Provider-specific explanation field.",
                 }
             ],
             "temporal_range": None,
@@ -111,10 +112,12 @@ async def test_need_detector_detects_allowed_need_and_uses_scoring_model() -> No
                 {
                     "sub_query_text": "fix websocket timeout",
                     "fts_phrase": "fix websocket timeout",
+                    "rationale": "Provider-specific sparse-hint field.",
                 }
             ],
             "query_type": "default",
             "retrieval_levels": [0],
+            "confidence": 0.88,
         }
     )
     detector = NeedDetector(
@@ -133,7 +136,7 @@ async def test_need_detector_detects_allowed_need_and_uses_scoring_model() -> No
 
     assert [need.need_type.value for need in detected.needs] == ["ambiguity"]
     assert detected.sub_queries == ["fix websocket timeout"]
-    assert provider.requests[0].model == "score-model"
+    assert provider.requests[0].model == "openrouter/google/gemini-3.1-flash-lite-preview"
     assert "reference_time_iso" in provider.requests[0].messages[1].content
 
 

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from benchmarks.atagia_bench.adapter import AtagiaBenchQuestion
-from benchmarks.atagia_bench.runner import AtagiaBenchRunner
+from benchmarks.atagia_bench.graders import GradeResult
+from benchmarks.atagia_bench.runner import AtagiaBenchRunner, AtagiaQuestionResult
 from benchmarks.trusted_eval import trusted_evaluation_ablation
+from atagia.models.schemas_memory import RetrievalTrace
 from atagia.models.schemas_replay import AblationConfig
 
 
@@ -57,6 +59,89 @@ def test_diagnosis_bucket_retrieval_or_ranking_miss() -> None:
 
 def test_diagnosis_bucket_answer_policy_or_grading() -> None:
     assert _bucket() == "answer_policy_or_grading"
+
+
+def _trace(*, raw_context_access_mode: str = "normal") -> RetrievalTrace:
+    return RetrievalTrace(
+        query_text="Where is the evidence?",
+        user_id="usr_1",
+        conversation_id="cnv_1",
+        timestamp_iso="2026-04-26T06:55:00Z",
+        raw_context_access_mode=raw_context_access_mode,
+    )
+
+
+def test_sufficiency_diagnostic_passed() -> None:
+    assert (
+        AtagiaBenchRunner._sufficiency_diagnostic("passed", retrieval_trace=_trace())
+        == "retrieval_sufficient"
+    )
+
+
+def test_sufficiency_diagnostic_missing_artifact_support() -> None:
+    assert (
+        AtagiaBenchRunner._sufficiency_diagnostic(
+            "retrieval_no_candidates",
+            retrieval_trace=_trace(raw_context_access_mode="artifact"),
+        )
+        == "missing_artifact_support"
+    )
+
+
+def test_sufficiency_diagnostic_ranking_miss() -> None:
+    assert (
+        AtagiaBenchRunner._sufficiency_diagnostic(
+            "retrieval_or_ranking_miss",
+            retrieval_trace=_trace(),
+        )
+        == "retrieval_insufficient"
+    )
+
+
+def test_warning_counts_include_failure_buckets_and_degraded_traces() -> None:
+    result = AtagiaQuestionResult(
+        question_id="q1",
+        question_text="Question?",
+        ground_truth="Answer",
+        prediction="Wrong",
+        answer_type="fact",
+        grade=GradeResult(
+            passed=False,
+            score=0.0,
+            reason="miss",
+            grader_name="exact_match",
+        ),
+        memories_used=0,
+        retrieval_time_ms=1.0,
+        conversation_id="cnv_1",
+        persona_id="persona_1",
+        trace={
+            "diagnosis_bucket": "retrieval_no_candidates",
+            "retrieval_trace": {
+                "degraded_mode": True,
+                "need_detection": {"degraded_mode": True},
+            },
+            "retrieval_custody": [
+                {
+                    "candidate_kind": "evidence",
+                    "channels": ["fts"],
+                    "selected": True,
+                }
+            ],
+        },
+    )
+
+    counts = AtagiaBenchRunner._aggregate_warning_counts([result])
+    custody_summary = AtagiaBenchRunner._aggregate_retrieval_custody_summary([result])
+
+    assert counts["failed_questions"] == 1
+    assert counts["retrieval_no_candidates"] == 1
+    assert counts["degraded_retrievals"] == 1
+    assert counts["need_detection_degraded"] == 1
+    assert counts["structured_output_retries"] == 0
+    assert counts["failed_worker_jobs"] == 0
+    assert custody_summary["candidate_count"] == 1
+    assert custody_summary["selected_channel_counts"] == {"fts": 1}
 
 
 def test_trusted_evaluation_ablation_raises_privacy_ceiling() -> None:

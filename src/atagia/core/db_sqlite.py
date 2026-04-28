@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+from typing import TypeVar
 from uuid import uuid4
 
 import aiosqlite
 
 _MIGRATION_PATTERN = re.compile(r"^(?P<version>\d+)_(?P<name>[a-z0-9_]+)\.sql$")
 _FOREIGN_KEYS_OFF_MARKER = "-- atagia:foreign_keys_off"
+_T = TypeVar("_T")
 
 
 def is_in_memory_database(database_path: str) -> bool:
@@ -48,13 +52,48 @@ async def apply_startup_pragmas(
     await connection.execute("PRAGMA temp_store = MEMORY;")
 
 
+async def _finish_even_if_cancelled(awaitable: Awaitable[_T]) -> _T:
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            return await task
+        finally:
+            raise
+
+
+async def close_connection(connection: aiosqlite.Connection) -> None:
+    """Close an aiosqlite connection even if the owning task is cancelled."""
+    await _finish_even_if_cancelled(connection.close())
+
+
+async def _connect_tracked(database_path: str, connections: list[aiosqlite.Connection]) -> aiosqlite.Connection:
+    pending_connection = aiosqlite.connect(database_path, uri=_should_use_uri(database_path))
+    task = asyncio.ensure_future(pending_connection)
+    try:
+        connection = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        connection = await task
+        await close_connection(connection)
+        raise
+    connections.append(connection)
+    return connection
+
+
 async def open_connection(database_path: str) -> aiosqlite.Connection:
     """Open an SQLite connection with startup pragmas and row factory."""
     _ensure_parent_directory(database_path)
-    connection = await aiosqlite.connect(database_path, uri=_should_use_uri(database_path))
-    connection.row_factory = aiosqlite.Row
-    await apply_startup_pragmas(connection, database_path)
-    return connection
+    connections: list[aiosqlite.Connection] = []
+    try:
+        connection = await _connect_tracked(database_path, connections)
+        connection.row_factory = aiosqlite.Row
+        await apply_startup_pragmas(connection, database_path)
+        return connection
+    except BaseException:
+        for connection in connections:
+            await close_connection(connection)
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +220,6 @@ async def initialize_database(
     try:
         await manager.apply_all(connection)
     except Exception:
-        await connection.close()
+        await close_connection(connection)
         raise
     return connection

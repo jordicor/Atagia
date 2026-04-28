@@ -94,7 +94,10 @@ def _settings(
         llm_extraction_model="chat-test-model",
         llm_scoring_model="score-test-model",
         llm_classifier_model="classify-test-model",
-        llm_chat_model="reply-test-model",
+        llm_chat_model="openai/reply-test-model",
+        llm_ingest_model="openai/chat-test-model",
+        llm_retrieval_model="openai/score-test-model",
+        llm_component_models={"intent_classifier": "openai/classify-test-model"},
         service_mode=service_mode,
         service_api_key="service-key" if service_mode else None,
         admin_api_key="admin-key" if service_mode else None,
@@ -386,7 +389,7 @@ def test_chat_reply_runs_full_flow_and_returns_response(tmp_path: Path) -> None:
         assert payload["retrieval_event_id"] is not None
         assert payload["debug"]["cold_start"] is True
         assert len(provider.requests) == 2
-        assert provider.requests[1].model == "reply-test-model"
+        assert provider.requests[1].model == "openai/reply-test-model"
 
 
 def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base64_leak(
@@ -453,7 +456,7 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
         with _connection(client) as connection:
             cursor = client.portal.call(
                 lambda: connection.execute(
-                    "SELECT id, artifact_type, source_kind, status, message_id, preserve_verbatim, skip_raw_by_default, requires_explicit_request FROM artifacts WHERE user_id = ?",
+                    "SELECT id, artifact_type, source_kind, status, message_id, preserve_verbatim, skip_raw_by_default, requires_explicit_request, metadata_json FROM artifacts WHERE user_id = ?",
                     ("usr_1",),
                 )
             )
@@ -467,6 +470,10 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
             assert artifact_row["preserve_verbatim"] == 1
             assert artifact_row["skip_raw_by_default"] == 1
             assert artifact_row["requires_explicit_request"] == 1
+            artifact_metadata = json.loads(artifact_row["metadata_json"])
+            assert artifact_metadata["source"] == "api"
+            assert artifact_metadata["relevance_state"] == "active_work_material"
+            assert artifact_metadata["relevance_source"] == "attachment_ingest"
 
             link_cursor = client.portal.call(
                 lambda: connection.execute(
@@ -498,6 +505,8 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
             metadata_json = json.loads(message_row["metadata_json"])
             assert metadata_json["attachment_count"] == 1
             assert metadata_json["attachment_artifact_ids"] == [artifact_row["id"]]
+            assert metadata_json["attachments"][0]["relevance_state"] == "active_work_material"
+            assert metadata_json["attachments"][0]["relevance_source"] == "attachment_ingest"
     return None
 
 
@@ -712,6 +721,9 @@ def test_create_app_rejects_equal_service_and_admin_keys(tmp_path: Path) -> None
         llm_scoring_model=settings.llm_scoring_model,
         llm_classifier_model=settings.llm_classifier_model,
         llm_chat_model=settings.llm_chat_model,
+        llm_ingest_model=settings.llm_ingest_model,
+        llm_retrieval_model=settings.llm_retrieval_model,
+        llm_component_models=settings.llm_component_models,
         service_mode=True,
         service_api_key="same-key",
         admin_api_key="same-key",

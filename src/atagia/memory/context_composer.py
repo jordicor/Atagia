@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-import json
 import math
-from typing import Any
+from typing import Any, Literal
 
+from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.models.schemas_memory import ComposedContext, QueryType, ScoredCandidate
 
+
+ComposerStrategy = Literal["score_first", "budgeted_marginal"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +21,22 @@ class _SelectionProfile:
     diversity_weight: float
     richness_weight: float
     pool_extra: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectionAction:
+    items: tuple[ScoredCandidate, ...]
+    blocked_ids: frozenset[str]
+    token_cost: int
+    utility: float
+    exact_priority: int
+    first_order: int
+
+
+@dataclass(slots=True)
+class _MemorySelection:
+    selected: list[ScoredCandidate]
+    memory_lines: list[str]
 
 
 class ContextComposer:
@@ -41,6 +59,7 @@ class ContextComposer:
         query_text: str | None = None,
         query_type: QueryType = "default",
         exact_recall_mode: bool = False,
+        composer_strategy: ComposerStrategy | None = None,
     ) -> ComposedContext:
         coerced_candidates = [
             candidate
@@ -104,80 +123,31 @@ class ContextComposer:
             else:
                 remaining_budget = 0
 
-        selected: list[ScoredCandidate] = []
-        selected_ids: set[str] = set()
-        memory_lines: list[str] = []
         max_items = resolved_policy.retrieval_params.final_context_items
-        for candidate in candidates:
-            if len(selected) >= max_items:
-                break
-            if remaining_budget <= 0:
-                break
-            if candidate.memory_id in selected_ids:
-                continue
-
-            if self._is_hierarchical_summary_candidate(candidate):
-                conflicting_l0 = self._find_conflicting_fresher_l0(
-                    candidate,
-                    candidates,
-                    selected_ids,
-                )
-                if conflicting_l0 is not None:
-                    remaining_budget = self._append_candidate_if_possible(
-                        conflicting_l0,
-                        selected=selected,
-                        selected_ids=selected_ids,
-                        memory_lines=memory_lines,
-                        remaining_budget=remaining_budget,
-                        max_items=max_items,
-                    )
-                    continue
-
-                supporting_l0 = self._supporting_l0_candidate(
-                    candidate,
-                    candidate_by_id,
-                    selected_ids,
-                )
-                if supporting_l0 is None:
-                    continue
-                if supporting_l0.memory_id not in selected_ids:
-                    required_items = 2
-                    required_tokens = (
-                        self.estimate_tokens(self._format_memory_entry(len(selected) + 1, supporting_l0))
-                        + self.estimate_tokens(self._format_memory_entry(len(selected) + 2, candidate))
-                    )
-                    if len(selected) + required_items > max_items or required_tokens > remaining_budget:
-                        continue
-                    remaining_budget = self._append_candidate_if_possible(
-                        supporting_l0,
-                        selected=selected,
-                        selected_ids=selected_ids,
-                        memory_lines=memory_lines,
-                        remaining_budget=remaining_budget,
-                        max_items=max_items,
-                    )
-                remaining_budget = self._append_candidate_if_possible(
-                    candidate,
-                    selected=selected,
-                    selected_ids=selected_ids,
-                    memory_lines=memory_lines,
-                    remaining_budget=remaining_budget,
-                    max_items=max_items,
-                )
-                continue
-
-            remaining_budget = self._append_candidate_if_possible(
-                candidate,
-                selected=selected,
-                selected_ids=selected_ids,
-                memory_lines=memory_lines,
+        strategy = composer_strategy or "score_first"
+        if strategy == "score_first":
+            selection = self._select_score_first(
+                candidates,
+                candidate_by_id=candidate_by_id,
                 remaining_budget=remaining_budget,
                 max_items=max_items,
             )
+        elif strategy == "budgeted_marginal":
+            selection = self._select_budgeted_marginal(
+                candidates,
+                candidate_by_id=candidate_by_id,
+                remaining_budget=remaining_budget,
+                max_items=max_items,
+                query_text=query_text,
+                query_type=query_type,
+                exact_recall_mode=exact_recall_mode,
+            )
+        else:
+            raise ValueError(f"Unsupported composer strategy: {strategy}")
 
         memory_block = (
-            memory_header + "\n".join(memory_lines)
-            if memory_lines
+            memory_header + "\n".join(selection.memory_lines)
+            if selection.memory_lines
             else ""
         )
         total_tokens_estimate = (
@@ -188,6 +158,7 @@ class ContextComposer:
         )
         if total_tokens_estimate > budget_tokens:
             raise RuntimeError("Context composition exceeded the resolved token budget")
+        selected = selection.selected
         items_included = len(selected)
         items_dropped = len(candidates) - items_included
         return ComposedContext(
@@ -200,6 +171,166 @@ class ContextComposer:
             budget_tokens=budget_tokens,
             items_included=items_included,
             items_dropped=items_dropped,
+        )
+
+    @classmethod
+    def _select_score_first(
+        cls,
+        candidates: list[ScoredCandidate],
+        *,
+        candidate_by_id: dict[str, ScoredCandidate],
+        remaining_budget: int,
+        max_items: int,
+    ) -> _MemorySelection:
+        selected: list[ScoredCandidate] = []
+        selected_ids: set[str] = set()
+        memory_lines: list[str] = []
+        for candidate in candidates:
+            if len(selected) >= max_items or remaining_budget <= 0:
+                break
+            if candidate.memory_id in selected_ids:
+                continue
+
+            if cls._is_hierarchical_summary_candidate(candidate):
+                conflicting_l0 = cls._find_conflicting_fresher_l0(
+                    candidate,
+                    candidates,
+                    selected_ids,
+                )
+                if conflicting_l0 is not None:
+                    remaining_budget = cls._append_candidate_if_possible(
+                        conflicting_l0,
+                        selected=selected,
+                        selected_ids=selected_ids,
+                        memory_lines=memory_lines,
+                        remaining_budget=remaining_budget,
+                        max_items=max_items,
+                    )
+                    continue
+
+                supporting_l0 = cls._supporting_l0_candidate(
+                    candidate,
+                    candidate_by_id,
+                    selected_ids,
+                )
+                if supporting_l0 is None:
+                    continue
+                if supporting_l0.memory_id not in selected_ids:
+                    required_items = 2
+                    required_tokens = (
+                        cls.estimate_tokens(cls._format_memory_entry(len(selected) + 1, supporting_l0))
+                        + cls.estimate_tokens(cls._format_memory_entry(len(selected) + 2, candidate))
+                    )
+                    if len(selected) + required_items > max_items or required_tokens > remaining_budget:
+                        continue
+                    remaining_budget = cls._append_candidate_if_possible(
+                        supporting_l0,
+                        selected=selected,
+                        selected_ids=selected_ids,
+                        memory_lines=memory_lines,
+                        remaining_budget=remaining_budget,
+                        max_items=max_items,
+                    )
+                remaining_budget = cls._append_candidate_if_possible(
+                    candidate,
+                    selected=selected,
+                    selected_ids=selected_ids,
+                    memory_lines=memory_lines,
+                    remaining_budget=remaining_budget,
+                    max_items=max_items,
+                )
+                continue
+
+            remaining_budget = cls._append_candidate_if_possible(
+                candidate,
+                selected=selected,
+                selected_ids=selected_ids,
+                memory_lines=memory_lines,
+                remaining_budget=remaining_budget,
+                max_items=max_items,
+            )
+        return _MemorySelection(
+            selected=selected,
+            memory_lines=memory_lines,
+        )
+
+    @classmethod
+    def _select_budgeted_marginal(
+        cls,
+        candidates: list[ScoredCandidate],
+        *,
+        candidate_by_id: dict[str, ScoredCandidate],
+        remaining_budget: int,
+        max_items: int,
+        query_text: str | None,
+        query_type: QueryType,
+        exact_recall_mode: bool,
+    ) -> _MemorySelection:
+        selected: list[ScoredCandidate] = []
+        selected_ids: set[str] = set()
+        blocked_ids: set[str] = set()
+        memory_lines: list[str] = []
+        order_by_id = {
+            candidate.memory_id: index
+            for index, candidate in enumerate(candidates)
+        }
+        query_tokens = cls._content_tokens(query_text or "")
+        repeated_pool_tokens = cls._repeated_pool_tokens(candidates)
+        profile = cls._selection_profile(query_type)
+
+        while len(selected) < max_items and remaining_budget > 0:
+            best_action: _SelectionAction | None = None
+            best_key: tuple[float, float, float, float, float, str] | None = None
+            for candidate in candidates:
+                if candidate.memory_id in selected_ids or candidate.memory_id in blocked_ids:
+                    continue
+                action = cls._budgeted_action_for_candidate(
+                    candidate,
+                    candidates=candidates,
+                    candidate_by_id=candidate_by_id,
+                    selected=selected,
+                    selected_ids=selected_ids,
+                    blocked_ids=blocked_ids,
+                    remaining_budget=remaining_budget,
+                    max_items=max_items,
+                    query_tokens=query_tokens,
+                    repeated_pool_tokens=repeated_pool_tokens,
+                    profile=profile,
+                    exact_recall_mode=exact_recall_mode,
+                    order_by_id=order_by_id,
+                )
+                if action is None:
+                    continue
+                density = action.utility / max(1, action.token_cost)
+                action_key = (
+                    float(-action.exact_priority),
+                    density,
+                    action.utility,
+                    float(-action.token_cost),
+                    float(-action.first_order),
+                    "|".join(item.memory_id for item in action.items),
+                )
+                if best_key is None or action_key > best_key:
+                    best_key = action_key
+                    best_action = action
+
+            if best_action is None:
+                break
+
+            for item in best_action.items:
+                remaining_budget = cls._append_candidate_if_possible(
+                    item,
+                    selected=selected,
+                    selected_ids=selected_ids,
+                    memory_lines=memory_lines,
+                    remaining_budget=remaining_budget,
+                    max_items=max_items,
+                )
+            blocked_ids.update(best_action.blocked_ids)
+
+        return _MemorySelection(
+            selected=selected,
+            memory_lines=memory_lines,
         )
 
     @classmethod
@@ -299,6 +430,140 @@ class ContextComposer:
         )
 
     @classmethod
+    def _budgeted_action_for_candidate(
+        cls,
+        candidate: ScoredCandidate,
+        *,
+        candidates: list[ScoredCandidate],
+        candidate_by_id: dict[str, ScoredCandidate],
+        selected: list[ScoredCandidate],
+        selected_ids: set[str],
+        blocked_ids: set[str],
+        remaining_budget: int,
+        max_items: int,
+        query_tokens: set[str],
+        repeated_pool_tokens: set[str],
+        profile: _SelectionProfile,
+        exact_recall_mode: bool,
+        order_by_id: dict[str, int],
+    ) -> _SelectionAction | None:
+        action_items: tuple[ScoredCandidate, ...]
+        action_blocked_ids: frozenset[str] = frozenset()
+        if cls._is_hierarchical_summary_candidate(candidate):
+            conflicting_l0 = cls._find_conflicting_fresher_l0(
+                candidate,
+                candidates,
+                set(),
+            )
+            if conflicting_l0 is not None:
+                blocked_ids.add(candidate.memory_id)
+                if conflicting_l0.memory_id in selected_ids:
+                    return None
+                action_items = (conflicting_l0,)
+                action_blocked_ids = frozenset({candidate.memory_id})
+            else:
+                supporting_l0 = cls._supporting_l0_candidate(
+                    candidate,
+                    candidate_by_id,
+                    selected_ids,
+                )
+                if supporting_l0 is None:
+                    blocked_ids.add(candidate.memory_id)
+                    return None
+                if supporting_l0.memory_id not in selected_ids and supporting_l0.memory_id in blocked_ids:
+                    return None
+                action_items = (
+                    (candidate,)
+                    if supporting_l0.memory_id in selected_ids
+                    else (supporting_l0, candidate)
+                )
+        else:
+            action_items = (candidate,)
+
+        new_items = tuple(
+            item
+            for item in action_items
+            if item.memory_id not in selected_ids and item.memory_id not in blocked_ids
+        )
+        if not new_items:
+            return None
+        if len(selected) + len(new_items) > max_items:
+            return None
+
+        token_cost = cls._action_token_cost(new_items, selected_count=len(selected))
+        if token_cost > remaining_budget:
+            return None
+
+        utility = sum(
+            cls._budgeted_marginal_utility(
+                item,
+                selected=selected,
+                query_tokens=query_tokens,
+                repeated_pool_tokens=repeated_pool_tokens,
+                profile=profile,
+            )
+            for item in new_items
+        )
+        exact_priority = max(
+            cls._exact_recall_level_priority(item, exact_recall_mode)
+            for item in new_items
+        )
+        first_order = min(
+            order_by_id.get(item.memory_id, len(order_by_id))
+            for item in new_items
+        )
+        return _SelectionAction(
+            items=new_items,
+            blocked_ids=action_blocked_ids,
+            token_cost=token_cost,
+            utility=utility,
+            exact_priority=exact_priority,
+            first_order=first_order,
+        )
+
+    @classmethod
+    def _action_token_cost(
+        cls,
+        items: tuple[ScoredCandidate, ...],
+        *,
+        selected_count: int,
+    ) -> int:
+        return sum(
+            cls.estimate_tokens(cls._format_memory_entry(selected_count + offset, item))
+            for offset, item in enumerate(items, start=1)
+        )
+
+    @classmethod
+    def _budgeted_marginal_utility(
+        cls,
+        candidate: ScoredCandidate,
+        *,
+        selected: list[ScoredCandidate],
+        query_tokens: set[str],
+        repeated_pool_tokens: set[str],
+        profile: _SelectionProfile,
+    ) -> float:
+        redundancy = max(
+            cls._candidate_similarity(
+                candidate,
+                chosen,
+                ignored_tokens=repeated_pool_tokens,
+            )
+            for chosen in selected
+        ) if selected else 0.0
+        richness = cls._candidate_richness(
+            candidate,
+            query_tokens=query_tokens,
+            repeated_pool_tokens=repeated_pool_tokens,
+        )
+        return max(
+            0.0,
+            float(candidate.final_score)
+            + (profile.richness_weight * richness)
+            - (profile.diversity_weight * redundancy),
+        )
+
+    @classmethod
     def _candidate_similarity(
         cls,
         candidate: ScoredCandidate,
@@ -348,8 +613,16 @@ class ContextComposer:
         payload_json = candidate.memory_object.get("payload_json") or {}
         if not isinstance(payload_json, dict):
             return None
-        start = str(payload_json.get("source_message_window_start_occurred_at") or "").strip()
-        end = str(payload_json.get("source_message_window_end_occurred_at") or "").strip()
+        start = str(
+            payload_json.get("source_message_window_start_occurred_at")
+            or payload_json.get("source_window_start_occurred_at")
+            or ""
+        ).strip()
+        end = str(
+            payload_json.get("source_message_window_end_occurred_at")
+            or payload_json.get("source_window_end_occurred_at")
+            or ""
+        ).strip()
         if not start and not end:
             return None
         return (start, end)
@@ -473,7 +746,7 @@ class ContextComposer:
         label = value.get("label")
         if label is None:
             extras = {key: item for key, item in value.items() if key not in {"score", "confidence"}}
-            label = json.dumps(extras or value, ensure_ascii=False, sort_keys=True)
+            label = json_utils.dumps(extras or value, sort_keys=True)
         rendered = str(label)
         confidence = value.get("confidence", value.get("score"))
         if isinstance(confidence, (int, float)):
@@ -517,13 +790,12 @@ class ContextComposer:
             f"confidence: {confidence:.2f}",
             f"scope: {memory_object.get('scope')}",
         ]
-        if is_conversation_chunk:
-            source_window_start = payload_json.get("source_message_window_start_occurred_at")
-            source_window_end = payload_json.get("source_message_window_end_occurred_at")
-            if source_window_start or source_window_end:
-                metadata_parts.append(
-                    f"source_window: {source_window_start or '?'} to {source_window_end or '?'}"
-                )
+        source_window = ContextComposer._candidate_source_window(candidate)
+        if source_window is not None:
+            source_window_start, source_window_end = source_window
+            metadata_parts.append(
+                f"source_window: {source_window_start or '?'} to {source_window_end or '?'}"
+            )
         valid_from = memory_object.get("valid_from")
         valid_to = memory_object.get("valid_to")
         if valid_from or valid_to:
@@ -547,7 +819,7 @@ class ContextComposer:
         lines = ["[Current User State]"]
         for key, value in sorted(user_state.items()):
             if isinstance(value, (dict, list)):
-                rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+                rendered = json_utils.dumps(value, sort_keys=True)
             else:
                 rendered = str(value)
             lines.append(f"- {key}: {rendered}")
@@ -737,7 +1009,7 @@ class ContextComposer:
             if not claim_key:
                 continue
             expected_values_by_key.setdefault(claim_key, set()).add(
-                json.dumps(signature.get("claim_value"), ensure_ascii=False, sort_keys=True)
+                json_utils.dumps(signature.get("claim_value"), sort_keys=True)
             )
         if not expected_values_by_key:
             return None
@@ -754,7 +1026,7 @@ class ContextComposer:
             claim_key = str(other_payload.get("claim_key") or "").strip()
             if claim_key not in expected_values_by_key:
                 continue
-            claim_value = json.dumps(other_payload.get("claim_value"), ensure_ascii=False, sort_keys=True)
+            claim_value = json_utils.dumps(other_payload.get("claim_value"), sort_keys=True)
             if claim_value in expected_values_by_key[claim_key]:
                 continue
             other_updated_at = cls._parse_candidate_datetime(other.memory_object.get("updated_at"))

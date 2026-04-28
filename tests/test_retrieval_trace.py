@@ -12,10 +12,12 @@ from atagia.models.schemas_memory import (
     ComposedContext,
     CompositionTrace,
     NeedDetectionTrace,
+    RetrievalSufficiencyDiagnostic,
     RetrievalTrace,
     ScoredCandidate,
     ScoringTrace,
     SubQuerySearchCount,
+    TopicWorkingSetTrace,
 )
 from atagia.models.schemas_replay import PipelineResult
 
@@ -149,6 +151,36 @@ class TestCompositionTrace:
         assert trace.token_budget_used == 3200
 
 
+class TestRetrievalSufficiencyDiagnostic:
+    def test_minimal_construction(self) -> None:
+        diagnostic = RetrievalSufficiencyDiagnostic(
+            state="insufficient_no_candidates",
+            confidence=0.95,
+            rationale_codes=["raw_candidates_empty"],
+            would_expand_channels=["fts", "embedding"],
+            would_abstain=True,
+        )
+
+        assert diagnostic.state == "insufficient_no_candidates"
+        assert diagnostic.candidate_count == 0
+        assert diagnostic.would_abstain is True
+
+    def test_forbids_extra_fields(self) -> None:
+        with pytest.raises(Exception):
+            RetrievalSufficiencyDiagnostic(
+                state="retrieval_sufficient",
+                confidence=0.8,
+                bad_field=True,
+            )
+
+    def test_rejects_unknown_state(self) -> None:
+        with pytest.raises(Exception):
+            RetrievalSufficiencyDiagnostic(
+                state="free_form_state",
+                confidence=0.8,
+            )
+
+
 class TestRetrievalTrace:
     def test_minimal_construction(self) -> None:
         trace = RetrievalTrace(
@@ -163,6 +195,9 @@ class TestRetrievalTrace:
         assert trace.candidate_search is None
         assert trace.scoring is None
         assert trace.composition is None
+        assert trace.retrieval_sufficiency is None
+        assert trace.topic_snapshot.active_topics == []
+        assert trace.topic_snapshot.parked_topics == []
         assert trace.total_duration_ms == 0.0
 
     def test_degraded_mode_flag_can_be_set(self) -> None:
@@ -223,13 +258,70 @@ class TestRetrievalTrace:
                 token_budget_used=2000,
                 duration_ms=5.0,
             ),
+            retrieval_sufficiency=RetrievalSufficiencyDiagnostic(
+                state="retrieval_sufficient",
+                confidence=0.8,
+                rationale_codes=["scored_candidates_available"],
+                scored_candidate_count=3,
+                top_score=0.9,
+            ),
             total_duration_ms=65.0,
         )
         assert trace.need_detection is not None
         assert trace.candidate_search is not None
         assert trace.scoring is not None
         assert trace.composition is not None
+        assert trace.retrieval_sufficiency is not None
+        assert trace.retrieval_sufficiency.state == "retrieval_sufficient"
         assert trace.total_duration_ms == 65.0
+
+    def test_topic_snapshot_serializes_compact_working_set(self) -> None:
+        trace = RetrievalTrace(
+            query_text="q",
+            user_id="u",
+            conversation_id="c",
+            timestamp_iso="2026-04-09T12:00:00Z",
+            topic_snapshot=TopicWorkingSetTrace.model_validate(
+                {
+                    "active_topics": [
+                        {
+                            "id": "tpc_active",
+                            "status": "active",
+                            "title": "Active work",
+                            "summary": "Current thread",
+                            "active_goal": "Keep tracing only",
+                            "open_questions": ["What evidence was missed?"],
+                            "decisions": ["Do not boost rankings yet."],
+                            "artifact_ids": ["art_1"],
+                            "source_counts": {"message": 2, "artifact": 1},
+                            "source_refs": [
+                                {
+                                    "source_kind": "artifact",
+                                    "source_id": "art_1",
+                                    "relation_kind": "evidence",
+                                }
+                            ],
+                            "last_touched_seq": 7,
+                            "last_touched_at": "2026-04-09T12:00:00Z",
+                            "confidence": 0.7,
+                            "privacy_level": 1,
+                        }
+                    ],
+                    "parked_topics": [],
+                }
+            ),
+        )
+
+        payload = trace.model_dump(mode="json")
+        assert payload["topic_snapshot"]["active_topics"][0]["id"] == "tpc_active"
+        restored = RetrievalTrace.model_validate(payload)
+        assert restored.topic_snapshot.active_topics[0].open_questions == [
+            "What evidence was missed?"
+        ]
+        assert restored.topic_snapshot.active_topics[0].source_counts == {
+            "message": 2,
+            "artifact": 1,
+        }
 
     def test_forbids_extra_fields(self) -> None:
         with pytest.raises(Exception):
@@ -352,6 +444,18 @@ class TestPipelineResultTraceField:
         result = self._minimal_pipeline_result()
         assert result.small_corpus_mode is False
         assert result.degraded_mode is False
+        assert result.retrieval_sufficiency is None
+
+    def test_pipeline_result_exposes_retrieval_sufficiency(self) -> None:
+        diagnostic = RetrievalSufficiencyDiagnostic(
+            state="retrieval_sufficient",
+            confidence=0.8,
+            rationale_codes=["scored_candidates_available"],
+        )
+        result = self._minimal_pipeline_result().model_copy(
+            update={"retrieval_sufficiency": diagnostic}
+        )
+        assert result.retrieval_sufficiency is diagnostic
 
 
 # ---------------------------------------------------------------------------

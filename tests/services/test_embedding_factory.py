@@ -129,19 +129,26 @@ async def test_create_embedding_index_requires_model_for_sqlite_vec() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_embedding_index_rejects_sqlite_vec_in_service_mode() -> None:
+async def test_create_embedding_index_allows_sqlite_vec_in_service_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _no_op_initialize(self) -> None:
+        return None
+
+    monkeypatch.setattr(SQLiteVecBackend, "initialize", _no_op_initialize)
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     try:
-        with pytest.raises(ConfigurationError, match="sqlite_vec embedding backend is local/dev only"):
-            await create_embedding_index(
-                _settings(
-                    backend="sqlite_vec",
-                    model="embed-test-model",
-                    service_mode=True,
-                ),
-                connection,
-                LLMClient(provider_name="embedding-factory-tests", providers=[StubProvider()]),
-            )
+        index = await create_embedding_index(
+            _settings(
+                backend="sqlite_vec",
+                model="embed-test-model",
+                service_mode=True,
+            ),
+            connection,
+            LLMClient(provider_name="embedding-factory-tests", providers=[StubProvider()]),
+        )
+
+        assert isinstance(index, SQLiteVecBackend)
     finally:
         await connection.close()
 

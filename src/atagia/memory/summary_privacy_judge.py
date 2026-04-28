@@ -9,6 +9,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from atagia.core.llm_output_limits import (
+    SUMMARY_PRIVACY_JUDGE_MAX_OUTPUT_TOKENS,
+    SUMMARY_PRIVACY_REFINER_MAX_OUTPUT_TOKENS,
+)
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
 
 
@@ -19,6 +23,8 @@ _DATA_ONLY_INSTRUCTION = (
 
 
 _JUDGE_PROMPT_TEMPLATE = """Return JSON only, matching the schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 
 You are the privacy validation gate for an assistant memory engine.
 
@@ -49,6 +55,8 @@ Do not repeat sensitive literals in reasoning, unsafe_detail_categories, or requ
 
 
 _REFINER_PROMPT_TEMPLATE = """Return JSON only, matching the schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 
 You are refining a compacted memory summary so it can safely be published for retrieval.
 
@@ -83,7 +91,7 @@ Do not repeat sensitive literals in reasoning or removed_or_changed.
 class SummaryPrivacyVerdict(BaseModel):
     """Structured privacy verdict for one summary draft."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     is_safe_to_publish: bool
     reasoning: str = Field(min_length=1)
@@ -94,7 +102,7 @@ class SummaryPrivacyVerdict(BaseModel):
 class SummaryPrivacyRefinement(BaseModel):
     """Safe rewrite returned after a failed privacy verdict."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     summary_text: str = Field(min_length=1)
     retrieval_constraints: list[str] = Field(default_factory=list)
@@ -223,7 +231,7 @@ class SummaryPrivacyJudge:
                 ),
             ],
             temperature=0.0,
-            max_output_tokens=512,
+            max_output_tokens=SUMMARY_PRIVACY_JUDGE_MAX_OUTPUT_TOKENS,
             response_schema=SummaryPrivacyVerdict.model_json_schema(),
             metadata={
                 "user_id": user_id,
@@ -269,7 +277,7 @@ class SummaryPrivacyJudge:
                 ),
             ],
             temperature=0.0,
-            max_output_tokens=768,
+            max_output_tokens=SUMMARY_PRIVACY_REFINER_MAX_OUTPUT_TOKENS,
             response_schema=SummaryPrivacyRefinement.model_json_schema(),
             metadata={
                 "user_id": user_id,

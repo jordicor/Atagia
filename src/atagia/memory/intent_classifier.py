@@ -8,7 +8,16 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
+from atagia.core.llm_output_limits import (
+    INTENT_CLASSIFIER_CLAIM_KEY_MAX_OUTPUT_TOKENS,
+    INTENT_CLASSIFIER_STATEMENT_MAX_OUTPUT_TOKENS,
+)
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMMessage,
+    StructuredOutputError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,14 +28,14 @@ _DATA_ONLY_INSTRUCTION = (
 
 
 class _ExplicitStatementResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     is_explicit: bool
     reasoning: str = Field(min_length=1)
 
 
 class _ClaimKeyEquivalenceResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     equivalent: bool
 
@@ -53,6 +62,8 @@ async def is_explicit_user_statement(
                 role="user",
                 content=(
                     "Return JSON only.\n"
+                    "Do not include markdown fences, preambles, tags, or explanations.\n"
+                    "Anything outside the first JSON object will be ignored.\n"
                     'Schema: {"is_explicit": bool, "reasoning": str}\n'
                     "True only when the message explicitly states a durable user preference, style, "
                     "identity, workflow, or habit that should persist beyond this one request.\n"
@@ -65,11 +76,19 @@ async def is_explicit_user_statement(
             ),
         ],
         temperature=0.0,
+        max_output_tokens=INTENT_CLASSIFIER_STATEMENT_MAX_OUTPUT_TOKENS,
         response_schema=_ExplicitStatementResult.model_json_schema(),
         metadata={"purpose": "intent_classifier_explicit"},
     )
     try:
         response = await llm_client.complete_structured(request, _ExplicitStatementResult)
+    except StructuredOutputError as exc:
+        details = "; ".join(exc.details) if exc.details else str(exc)
+        logger.warning(
+            "Intent classifier structured-output fallback for explicit user statement: %s",
+            details,
+        )
+        return False
     except Exception:
         logger.warning("Intent classifier fallback for explicit user statement", exc_info=True)
         return False
@@ -101,6 +120,8 @@ async def are_claim_keys_equivalent(
                 role="user",
                 content=(
                     "Return JSON only.\n"
+                    "Do not include markdown fences, preambles, tags, or explanations.\n"
+                    "Anything outside the first JSON object will be ignored.\n"
                     'Schema: {"equivalent": bool}\n'
                     "Treat minor wording variation, token order, or close schema synonyms as equivalent.\n"
                     "Do not mark broader/narrower concepts as equivalent.\n"
@@ -115,11 +136,19 @@ async def are_claim_keys_equivalent(
             ),
         ],
         temperature=0.0,
+        max_output_tokens=INTENT_CLASSIFIER_CLAIM_KEY_MAX_OUTPUT_TOKENS,
         response_schema=_ClaimKeyEquivalenceResult.model_json_schema(),
         metadata={"purpose": "intent_classifier_claim_key_equivalence"},
     )
     try:
         response = await llm_client.complete_structured(request, _ClaimKeyEquivalenceResult)
+    except StructuredOutputError as exc:
+        details = "; ".join(exc.details) if exc.details else str(exc)
+        logger.warning(
+            "Intent classifier structured-output fallback for claim key equivalence: %s",
+            details,
+        )
+        return False
     except Exception:
         logger.warning("Intent classifier fallback for claim key equivalence", exc_info=True)
         return False

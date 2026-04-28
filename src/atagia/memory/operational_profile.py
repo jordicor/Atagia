@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from atagia.core import json_utils
 from atagia.core.canonical import canonical_json_hash
 from atagia.models.schemas_memory import (
     OperationalCompute,
@@ -74,7 +74,7 @@ class OperationalProfileLoader:
 
         profiles: dict[str, OperationalProfile] = {}
         for path in sorted(self._profiles_dir.glob("*.json")):
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json_utils.loads(path.read_text(encoding="utf-8"))
             profile = OperationalProfile.model_validate(payload)
             profile_id = profile.operational_profile_id
             if profile_id != path.stem:

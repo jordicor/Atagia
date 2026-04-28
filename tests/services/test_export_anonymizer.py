@@ -527,6 +527,26 @@ class TestEdgeCases:
         assert result.summary.entity_count == 2
 
     @pytest.mark.asyncio
+    async def test_provider_extra_fields_are_ignored(self) -> None:
+        provider = _CannedProvider()
+        messages = _two_message_conversation()
+        rewrite_payload = _good_rewrite_payload(messages)
+        rewrite_payload["provider_notes"] = "ignored"
+        rewrite_payload["entities"][0]["confidence"] = 0.99
+        rewrite_payload["messages"][0]["source_evidence"] = ["ignored"]
+        verification_payload = _approved_verification_payload()
+        verification_payload["provider_notes"] = "ignored"
+
+        provider.set_rewrite_responses(rewrite_payload)
+        provider.set_verify_responses(verification_payload)
+
+        anonymizer = _build(provider)
+        result = await anonymizer.anonymize_messages(messages, ExportAnonymizationMode.STRICT)
+
+        assert result.summary.entity_count == 2
+        assert result.strict_messages["msg_1"].startswith("[person_001]")
+
+    @pytest.mark.asyncio
     async def test_no_entities_to_anonymize(self) -> None:
         provider = _CannedProvider()
         messages = [

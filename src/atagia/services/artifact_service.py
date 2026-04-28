@@ -15,6 +15,7 @@ from atagia.core.clock import Clock
 from atagia.core.ids import generate_prefixed_id
 from atagia.memory.context_composer import ContextComposer
 from atagia.models.schemas_api import AttachmentInput
+from atagia.services.artifact_blob_store import ArtifactBlobStore
 
 _ATTACHMENT_PROMPT_HEADER = "[Attachments omitted]"
 _ATTACHMENT_PLACEHOLDER_HEADER = "[Artifact omitted]"
@@ -44,12 +45,34 @@ class AttachmentBundle:
     artifacts: list[PreparedArtifact]
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactPayload:
+    """User-scoped artifact serving payload with conservative raw access gates."""
+
+    artifact: dict[str, Any]
+    storage_kind: str | None
+    content_bytes: bytes | None
+    storage_uri: str | None
+    byte_size: int
+    sha256: str | None
+    raw_available: bool
+    raw_returned: bool
+    raw_block_reason: str | None
+
+
 class ArtifactService:
     """Plan, store, and surface artifact-backed attachments."""
 
-    def __init__(self, connection: aiosqlite.Connection, clock: Clock) -> None:
+    def __init__(
+        self,
+        connection: aiosqlite.Connection,
+        clock: Clock,
+        *,
+        blob_store: ArtifactBlobStore | None = None,
+    ) -> None:
         self._connection = connection
         self._clock = clock
+        self._blob_store = blob_store
 
     def prepare_attachments(
         self,
@@ -107,6 +130,7 @@ class ArtifactService:
         created: list[dict[str, Any]] = []
         for prepared in bundle.artifacts:
             artifact = prepared.artifact
+            blob = self._blob_for_persistence(prepared.blob, user_id=str(artifact["user_id"]))
             created_artifact = await repository.create_artifact(
                 artifact_id=str(artifact["id"]),
                 user_id=str(artifact["user_id"]),
@@ -130,9 +154,11 @@ class ArtifactService:
                 metadata_json=dict(artifact.get("metadata_json") or {}),
                 summary_text=artifact.get("summary_text"),
                 index_text=artifact.get("index_text"),
-                storage_kind=prepared.blob.get("storage_kind") if prepared.blob else None,
-                blob_bytes=prepared.blob.get("blob_bytes") if prepared.blob else None,
-                storage_uri=prepared.blob.get("storage_uri") if prepared.blob else None,
+                storage_kind=blob.get("storage_kind") if blob else None,
+                blob_bytes=blob.get("blob_bytes") if blob else None,
+                storage_uri=blob.get("storage_uri") if blob else None,
+                blob_byte_size=blob.get("byte_size") if blob else None,
+                blob_sha256=blob.get("sha256") if blob else None,
                 commit=False,
             )
             artifact_id = str(created_artifact["id"])
@@ -165,6 +191,48 @@ class ArtifactService:
         if commit:
             await self._connection.commit()
         return created
+
+    async def fetch_artifact_payload(
+        self,
+        *,
+        user_id: str,
+        artifact_id: str,
+        include_raw: bool = False,
+    ) -> ArtifactPayload | None:
+        repository = ArtifactRepository(self._connection, self._clock)
+        artifact = await repository.get_artifact(artifact_id, user_id)
+        if artifact is None or artifact.get("status") in {"deleted", "purged"}:
+            return None
+        blob = await repository.get_artifact_blob(artifact_id, user_id)
+        storage_kind = str(blob["storage_kind"]) if blob is not None else None
+        raw_available = blob is not None and (
+            blob.get("blob_bytes") is not None or blob.get("storage_uri") is not None
+        )
+        raw_block_reason = self._raw_block_reason(artifact, include_raw, raw_available)
+        content_bytes = None
+        storage_uri = None
+        if raw_available and raw_block_reason is None:
+            if storage_kind == "local_file":
+                if self._blob_store is None:
+                    raw_block_reason = "local_file_store_unavailable"
+                else:
+                    content_bytes = self._blob_store.read_bytes(str(blob["storage_uri"]))
+            else:
+                content_bytes = blob.get("blob_bytes")
+                storage_uri = blob.get("storage_uri")
+            if content_bytes is not None:
+                self._validate_blob_hash(content_bytes, str(blob["sha256"]))
+        return ArtifactPayload(
+            artifact=artifact,
+            storage_kind=storage_kind,
+            content_bytes=content_bytes,
+            storage_uri=storage_uri,
+            byte_size=int(blob["byte_size"]) if blob is not None else 0,
+            sha256=str(blob["sha256"]) if blob is not None else None,
+            raw_available=raw_available,
+            raw_returned=raw_available and raw_block_reason is None,
+            raw_block_reason=raw_block_reason,
+        )
 
     def _prepare_artifact(
         self,
@@ -199,6 +267,9 @@ class ArtifactService:
             summary_text=summary_text,
             ordinal=ordinal,
         )
+        metadata = dict(attachment.metadata)
+        metadata.setdefault("relevance_state", "active_work_material")
+        metadata.setdefault("relevance_source", "attachment_ingest")
         return PreparedArtifact(
             artifact={
                 "id": artifact_id,
@@ -220,7 +291,7 @@ class ArtifactService:
                 "preserve_verbatim": attachment.preserve_verbatim,
                 "skip_raw_by_default": attachment.skip_raw_by_default,
                 "requires_explicit_request": attachment.requires_explicit_request,
-                "metadata_json": dict(attachment.metadata),
+                "metadata_json": metadata,
                 "summary_text": summary_text,
                 "index_text": index_text,
             },
@@ -244,6 +315,50 @@ class ArtifactService:
             },
             prompt_placeholder=prompt_placeholder,
         )
+
+    @staticmethod
+    def _raw_block_reason(
+        artifact: dict[str, Any],
+        include_raw: bool,
+        raw_available: bool,
+    ) -> str | None:
+        if not raw_available:
+            return None
+        if include_raw:
+            return None
+        if bool(artifact.get("requires_explicit_request")):
+            return "explicit_request_required"
+        if bool(artifact.get("skip_raw_by_default")):
+            return "skip_raw_by_default"
+        return "raw_not_requested"
+
+    def _blob_for_persistence(
+        self,
+        blob: dict[str, Any] | None,
+        *,
+        user_id: str,
+    ) -> dict[str, Any] | None:
+        if blob is None:
+            return None
+        if blob.get("storage_kind") != "local_file" or blob.get("blob_bytes") is None:
+            return blob
+        if self._blob_store is None:
+            raise ValueError("Local artifact blob storage is not configured")
+        stored = self._blob_store.store_bytes(user_id=user_id, content_bytes=bytes(blob["blob_bytes"]))
+        return {
+            **blob,
+            "storage_kind": stored.storage_kind,
+            "blob_bytes": stored.blob_bytes,
+            "storage_uri": stored.storage_uri,
+            "byte_size": stored.byte_size,
+            "sha256": stored.sha256,
+        }
+
+    @staticmethod
+    def _validate_blob_hash(content_bytes: bytes, expected_sha256: str) -> None:
+        actual_sha256 = hashlib.sha256(content_bytes).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError("Artifact blob hash mismatch")
 
     @staticmethod
     def _source_kind(attachment: AttachmentInput) -> str:
@@ -310,10 +425,14 @@ class ArtifactService:
             return "external_ref", None, storage_uri, 0, sha256
         if decoded_bytes is not None:
             sha256 = hashlib.sha256(decoded_bytes).hexdigest()
+            if self._blob_store is not None:
+                return "local_file", decoded_bytes, None, len(decoded_bytes), sha256
             return "sqlite_blob", decoded_bytes, None, len(decoded_bytes), sha256
         if text_payload is not None:
             encoded = text_payload.encode("utf-8")
             sha256 = hashlib.sha256(encoded).hexdigest()
+            if self._blob_store is not None:
+                return "local_file", encoded, None, len(encoded), sha256
             return "sqlite_blob", encoded, None, len(encoded), sha256
         reference = self._source_ref(attachment)
         if reference is not None:
@@ -509,6 +628,9 @@ class ArtifactService:
     @staticmethod
     def _attachment_metadata(prepared: PreparedArtifact) -> dict[str, Any]:
         artifact = prepared.artifact
+        artifact_metadata = artifact.get("metadata_json")
+        if not isinstance(artifact_metadata, dict):
+            artifact_metadata = {}
         return {
             "artifact_id": artifact["id"],
             "artifact_type": artifact["artifact_type"],
@@ -524,6 +646,8 @@ class ArtifactService:
             "preserve_verbatim": artifact.get("preserve_verbatim", False),
             "skip_raw_by_default": artifact.get("skip_raw_by_default", True),
             "requires_explicit_request": artifact.get("requires_explicit_request", True),
+            "relevance_state": artifact_metadata.get("relevance_state"),
+            "relevance_source": artifact_metadata.get("relevance_source"),
             "status": artifact.get("status", "ready"),
             "summary_text": artifact.get("summary_text"),
             "index_text": artifact.get("index_text"),

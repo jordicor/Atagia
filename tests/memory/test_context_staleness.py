@@ -152,7 +152,8 @@ async def test_low_staleness_same_topic_continuation_stays_cacheable() -> None:
           "sensitive_content": false,
           "mode_shift_target": null,
           "short_followup": true,
-          "ambiguous_wording": false
+          "ambiguous_wording": false,
+          "rationale": "Provider-specific explanation field."
         }
         """
     )

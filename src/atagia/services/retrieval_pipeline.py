@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 import logging
 from time import perf_counter
@@ -21,6 +22,8 @@ from atagia.memory.context_composer import ContextComposer
 from atagia.memory.contract_projection import ContractProjector
 from atagia.memory.need_detector import NeedDetector
 from atagia.memory.policy_manifest import ResolvedPolicy
+from atagia.memory.retrieval_diagnostics import build_retrieval_sufficiency_diagnostic
+from atagia.memory.retrieval_custody import build_candidate_custody
 from atagia.memory.retrieval_planner import RetrievalPlanner
 from atagia.models.schemas_memory import (
     CandidateSearchTrace,
@@ -287,7 +290,17 @@ class RetrievalPipeline:
         # Regrounding is decided by the winning plan (enriched when available)
         # so the base search does not inject derived memories when high-stakes
         # needs require direct evidence.
+        pre_regrounding_candidates = list(raw_candidates)
         raw_candidates = self._apply_regrounding_requirements(raw_candidates, retrieval_plan)
+        filter_reasons_by_id = {
+            **self._regrounding_filter_reasons(pre_regrounding_candidates, raw_candidates),
+            **self._candidate_filter_reasons(
+                raw_candidates,
+                effective_policy,
+                detected_needs,
+                retrieval_plan,
+            ),
+        }
         # Aggregate the two lanes into single "planning" and "candidate_search"
         # keys so downstream telemetry stays consistent across pipeline variants.
         stage_timings["planning"] = stage_timings.get("base_planning", 0.0) + stage_timings.get(
@@ -356,11 +369,23 @@ class RetrievalPipeline:
         if trace is not None:
             scoring_elapsed = (perf_counter() - scoring_start) * 1000.0
             trace.scoring = self._build_scoring_trace(
-                raw_candidates,
+                pre_regrounding_candidates,
                 filtered_candidates,
                 scored_candidates,
                 scoring_elapsed,
+                rejection_reasons=self._rejection_reason_counts(filter_reasons_by_id),
             )
+
+        retrieval_sufficiency = build_retrieval_sufficiency_diagnostic(
+            raw_candidates=pre_regrounding_candidates,
+            filtered_candidates=filtered_candidates,
+            shortlist=shortlist,
+            scored_candidates=scored_candidates,
+            retrieval_plan=retrieval_plan,
+            contradiction_tension_threshold=self._settings.belief_tension_threshold,
+        )
+        if trace is not None:
+            trace.retrieval_sufficiency = retrieval_sufficiency
 
         if effective_ablation.skip_contract_memory:
             current_contract: dict[str, dict[str, Any]] = {}
@@ -418,10 +443,21 @@ class RetrievalPipeline:
                 user_state=user_state,
                 resolved_policy=composition_policy,
                 conversation_messages=transcript,
+                composer_strategy=effective_ablation.composer_strategy,
             ),
         )
         if effective_ablation.skip_contract_memory:
             composed_context = self._without_contract_block(composed_context)
+
+        candidate_custody = build_candidate_custody(
+            raw_candidates=pre_regrounding_candidates,
+            filtered_candidates=filtered_candidates,
+            shortlist=shortlist,
+            scored_candidates=scored_candidates,
+            selected_memory_ids=list(composed_context.selected_memory_ids),
+            retrieval_plan=retrieval_plan,
+            filter_reasons_by_id=filter_reasons_by_id,
+        )
 
         if trace is not None:
             composition_elapsed = (perf_counter() - composition_start) * 1000.0
@@ -438,6 +474,8 @@ class RetrievalPipeline:
             retrieval_plan=retrieval_plan,
             raw_candidates=raw_candidates,
             scored_candidates=scored_candidates,
+            candidate_custody=candidate_custody,
+            retrieval_sufficiency=retrieval_sufficiency,
             composed_context=composed_context,
             current_contract=current_contract,
             user_state=user_state,
@@ -636,7 +674,17 @@ class RetrievalPipeline:
                 ),
             )
             raw_candidates = self._merge_candidates(raw_candidates, searched_candidates)
+        pre_regrounding_candidates = list(raw_candidates)
         raw_candidates = self._apply_regrounding_requirements(raw_candidates, retrieval_plan)
+        filter_reasons_by_id = {
+            **self._regrounding_filter_reasons(pre_regrounding_candidates, raw_candidates),
+            **self._candidate_filter_reasons(
+                raw_candidates,
+                resolved_policy,
+                detected_needs,
+                retrieval_plan,
+            ),
+        }
         if trace is not None:
             candidate_elapsed = (perf_counter() - candidate_start) * 1000.0
             trace.candidate_search = self._build_candidate_search_trace(
@@ -691,11 +739,23 @@ class RetrievalPipeline:
             )
         if trace is not None:
             trace.scoring = self._build_scoring_trace(
-                raw_candidates,
+                pre_regrounding_candidates,
                 filtered_candidates,
                 scored_candidates,
                 (perf_counter() - scoring_start) * 1000.0,
+                rejection_reasons=self._rejection_reason_counts(filter_reasons_by_id),
             )
+
+        retrieval_sufficiency = build_retrieval_sufficiency_diagnostic(
+            raw_candidates=pre_regrounding_candidates,
+            filtered_candidates=filtered_candidates,
+            shortlist=shortlist,
+            scored_candidates=scored_candidates,
+            retrieval_plan=retrieval_plan,
+            contradiction_tension_threshold=self._settings.belief_tension_threshold,
+        )
+        if trace is not None:
+            trace.retrieval_sufficiency = retrieval_sufficiency
 
         if effective_ablation.skip_contract_memory:
             current_contract: dict[str, dict[str, Any]] = {}
@@ -747,10 +807,21 @@ class RetrievalPipeline:
                 user_state=user_state,
                 resolved_policy=scoring_policy,
                 conversation_messages=transcript,
+                composer_strategy=effective_ablation.composer_strategy,
             ),
         )
         if effective_ablation.skip_contract_memory:
             composed_context = self._without_contract_block(composed_context)
+
+        candidate_custody = build_candidate_custody(
+            raw_candidates=pre_regrounding_candidates,
+            filtered_candidates=filtered_candidates,
+            shortlist=shortlist,
+            scored_candidates=scored_candidates,
+            selected_memory_ids=list(composed_context.selected_memory_ids),
+            retrieval_plan=retrieval_plan,
+            filter_reasons_by_id=filter_reasons_by_id,
+        )
 
         if trace is not None:
             composition_elapsed = (perf_counter() - composition_start) * 1000.0
@@ -767,6 +838,8 @@ class RetrievalPipeline:
             retrieval_plan=retrieval_plan,
             raw_candidates=raw_candidates,
             scored_candidates=scored_candidates,
+            candidate_custody=candidate_custody,
+            retrieval_sufficiency=retrieval_sufficiency,
             composed_context=composed_context,
             current_contract=current_contract,
             user_state=user_state,
@@ -1020,6 +1093,42 @@ class RetrievalPipeline:
         ]
 
     @staticmethod
+    def _regrounding_filter_reasons(
+        before_candidates: list[dict[str, Any]],
+        after_candidates: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        after_ids = {str(candidate.get("id") or "") for candidate in after_candidates}
+        return {
+            str(candidate.get("id") or ""): "regrounding_filtered"
+            for candidate in before_candidates
+            if str(candidate.get("id") or "") not in after_ids
+        }
+
+    def _candidate_filter_reasons(
+        self,
+        candidates: list[dict[str, Any]],
+        resolved_policy: ResolvedPolicy,
+        detected_needs: list[Any],
+        retrieval_plan: RetrievalPlan,
+    ) -> dict[str, str]:
+        reasons: dict[str, str] = {}
+        for candidate in candidates:
+            candidate_id = str(candidate.get("id") or "")
+            reason = self._scorer.candidate_filter_reason(
+                candidate,
+                resolved_policy,
+                detected_needs,
+                retrieval_plan=retrieval_plan,
+            )
+            if reason is not None:
+                reasons[candidate_id] = reason
+        return reasons
+
+    @staticmethod
+    def _rejection_reason_counts(filter_reasons_by_id: dict[str, str]) -> dict[str, int]:
+        return dict(sorted(Counter(filter_reasons_by_id.values()).items()))
+
+    @staticmethod
     def _is_grounded_conversation_chunk(candidate: dict[str, Any]) -> bool:
         if str(candidate.get("object_type")) != MemoryObjectType.SUMMARY_VIEW.value:
             return False
@@ -1244,6 +1353,7 @@ class RetrievalPipeline:
         user_state: dict[str, Any],
         resolved_policy: ResolvedPolicy,
         conversation_messages: list[dict[str, Any]],
+        composer_strategy: str | None = None,
     ) -> ComposedContext:
         return self._context_composer.compose(
             scored_candidates=scored_candidates,
@@ -1255,6 +1365,7 @@ class RetrievalPipeline:
             query_text=message_text,
             query_type=retrieval_plan.query_type,
             exact_recall_mode=retrieval_plan.exact_recall_mode,
+            composer_strategy=composer_strategy,
         )
 
     def _override_policy(
@@ -1380,6 +1491,7 @@ class RetrievalPipeline:
         filtered_candidates: list[dict[str, Any]],
         scored_candidates: list[ScoredCandidate],
         duration_ms: float,
+        rejection_reasons: dict[str, int] | None = None,
     ) -> ScoringTrace:
         candidates_received = len(raw_candidates)
         candidates_rejected = candidates_received - len(filtered_candidates)
@@ -1400,7 +1512,7 @@ class RetrievalPipeline:
             candidates_received=candidates_received,
             candidates_scored=len(scored_candidates),
             candidates_rejected=candidates_rejected,
-            rejection_reasons={},
+            rejection_reasons=rejection_reasons or {},
             top_score=top_score,
             median_score=median_score,
             min_score=min_passing,

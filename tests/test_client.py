@@ -63,10 +63,12 @@ class ClientProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
-                    [
-                        {"memory_id": memory_id, "llm_applicability": 0.5}
-                        for memory_id in memory_ids
-                    ]
+                    {
+                        "scores": [
+                            {"memory_id": memory_id, "llm_applicability": 0.5}
+                            for memory_id in memory_ids
+                        ],
+                    }
                 ),
             )
         if purpose == "context_cache_signal_detection":
@@ -163,6 +165,7 @@ def _settings(tmp_path: Path, *, workers_enabled: bool = False) -> Settings:
         llm_scoring_model="client-score-model",
         llm_classifier_model="client-classifier-model",
         llm_chat_model="client-reply-model",
+        llm_forced_global_model="openai/client-reply-model",
         service_mode=True,
         service_api_key="service-key",
         admin_api_key="admin-key",

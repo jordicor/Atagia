@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-import json
 from typing import Any
 
 import aiosqlite
 
+from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.ids import generate_prefixed_id, new_memory_id
@@ -31,14 +31,14 @@ def _decode_json_columns(row: aiosqlite.Row | None) -> dict[str, Any] | None:
     payload = dict(row)
     for key, value in tuple(payload.items()):
         if key.endswith("_json") and isinstance(value, str):
-            payload[key] = json.loads(value)
+            payload[key] = json_utils.loads(value)
     return payload
 
 
 def _encode_json(value: dict[str, Any] | list[Any] | None) -> str:
     if value is None:
-        return json.dumps({}, ensure_ascii=False, sort_keys=True)
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return json_utils.dumps({}, sort_keys=True)
+    return json_utils.dumps(value, sort_keys=True)
 
 
 def _encode_language_codes(language_codes: list[str] | None) -> str | None:
@@ -53,7 +53,7 @@ def _encode_language_codes(language_codes: list[str] | None) -> str | None:
     )
     if not normalized:
         return None
-    return json.dumps(normalized, ensure_ascii=False)
+    return json_utils.dumps(normalized)
 
 
 _HEAVY_MESSAGE_TOKEN_THRESHOLD = 512
@@ -1682,15 +1682,33 @@ class MemoryObjectRepository(BaseRepository):
             elif scope is MemoryScope.ASSISTANT_MODE and assistant_mode_id is not None:
                 clauses.append("(scope = 'assistant_mode' AND assistant_mode_id = ?)")
                 parameters.append(assistant_mode_id)
-            elif scope is MemoryScope.WORKSPACE and workspace_id is not None:
-                clauses.append("(scope = 'workspace' AND workspace_id = ?)")
-                parameters.append(workspace_id)
-            elif scope is MemoryScope.CONVERSATION and conversation_id is not None:
-                clauses.append("(scope = 'conversation' AND conversation_id = ?)")
-                parameters.append(conversation_id)
-            elif scope is MemoryScope.EPHEMERAL_SESSION and conversation_id is not None:
-                clauses.append("(scope = 'ephemeral_session' AND conversation_id = ?)")
-                parameters.append(conversation_id)
+            elif (
+                scope is MemoryScope.WORKSPACE
+                and workspace_id is not None
+                and assistant_mode_id is not None
+            ):
+                clauses.append(
+                    "(scope = 'workspace' AND assistant_mode_id = ? AND workspace_id = ?)"
+                )
+                parameters.extend([assistant_mode_id, workspace_id])
+            elif (
+                scope is MemoryScope.CONVERSATION
+                and conversation_id is not None
+                and assistant_mode_id is not None
+            ):
+                clauses.append(
+                    "(scope = 'conversation' AND assistant_mode_id = ? AND conversation_id = ?)"
+                )
+                parameters.extend([assistant_mode_id, conversation_id])
+            elif (
+                scope is MemoryScope.EPHEMERAL_SESSION
+                and conversation_id is not None
+                and assistant_mode_id is not None
+            ):
+                clauses.append(
+                    "(scope = 'ephemeral_session' AND assistant_mode_id = ? AND conversation_id = ?)"
+                )
+                parameters.extend([assistant_mode_id, conversation_id])
         return clauses, parameters
 
     async def get_state_snapshot(

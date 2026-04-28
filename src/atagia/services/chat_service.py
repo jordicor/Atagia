@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import logging
 from typing import Any
 
+from atagia.core.llm_output_limits import CHAT_REPLY_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
@@ -71,7 +72,11 @@ class ChatService:
                 memories = MemoryObjectRepository(connection, self.runtime.clock)
                 events = RetrievalEventRepository(connection, self.runtime.clock)
                 summaries = SummaryRepository(connection, self.runtime.clock)
-                artifacts = ArtifactService(connection, self.runtime.clock)
+                artifacts = ArtifactService(
+                    connection,
+                    self.runtime.clock,
+                    blob_store=self.runtime.artifact_blob_store,
+                )
                 confirmations = PendingConfirmationService(
                     connection,
                     self.runtime.clock,
@@ -187,6 +192,7 @@ class ChatService:
                             ],
                         ],
                         temperature=0.0,
+                        max_output_tokens=CHAT_REPLY_MAX_OUTPUT_TOKENS,
                         include_thinking=include_thinking,
                         metadata={
                             "user_id": user_id,
@@ -272,6 +278,12 @@ class ChatService:
                                 ),
                                 "background_tasks_enqueued": False,
                                 "scored_candidates": resolution.scored_candidates,
+                                "retrieval_custody_v2": resolution.candidate_custody,
+                                "retrieval_custody_v2_status": resolution.retrieval_custody_v2_status,
+                                "sufficiency_diagnostics_v1": resolution.retrieval_sufficiency,
+                                "sufficiency_diagnostics_v1_status": (
+                                    resolution.sufficiency_diagnostics_v1_status
+                                ),
                                 "stage_timings_ms": resolution.stage_timings,
                                 "transcript_window": transcript_trace,
                                 "operational_profile": (

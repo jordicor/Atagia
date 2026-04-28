@@ -8,13 +8,14 @@ import logging
 from typing import Any
 
 import aiosqlite
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from atagia.core.belief_repository import BeliefRepository
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.consequence_repository import ConsequenceRepository
 from atagia.core.ids import generate_prefixed_id
+from atagia.core.llm_output_limits import CONSEQUENCE_BUILDER_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import MemoryObjectRepository
 from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.memory.retrieval_planner import build_safe_fts_queries
@@ -28,9 +29,14 @@ from atagia.models.schemas_memory import (
     MemorySourceKind,
     MemoryStatus,
 )
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMMessage,
+    StructuredOutputError,
+)
+from atagia.services.model_resolution import resolve_component_model
 
-DEFAULT_TENDENCY_MODEL = "claude-sonnet-4-6"
 DEFAULT_TENDENCY_MAYA_SCORE = 1.2
 
 logger = logging.getLogger(__name__)
@@ -41,6 +47,8 @@ _DATA_ONLY_INSTRUCTION = (
 )
 
 _TENDENCY_PROMPT_TEMPLATE = """Return JSON only, matching the schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 
 Infer the concise lesson or tendency suggested by this action and outcome.
 Write a short, specific memory statement that would help avoid repeating mistakes
@@ -61,9 +69,20 @@ If the evidence is too weak to infer a tendency, return an empty tendency_text.
 
 
 class _TendencyResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     tendency_text: str = Field(default="")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_memory_statement_alias(cls, value: Any) -> Any:
+        if isinstance(value, dict) and not value.get("tendency_text"):
+            memory_statement = value.get("memory_statement")
+            if isinstance(memory_statement, str):
+                normalized = dict(value)
+                normalized["tendency_text"] = memory_statement
+                return normalized
+        return value
 
 
 class ConsequenceChainBuilder:
@@ -83,11 +102,9 @@ class ConsequenceChainBuilder:
         self._link_repository = BeliefRepository(connection, clock)
         self._consequence_repository = ConsequenceRepository(connection, clock)
         resolved_settings = settings or Settings.from_env()
-        self._tendency_model = (
-            resolved_settings.llm_scoring_model
-            or resolved_settings.llm_classifier_model
-            or resolved_settings.llm_extraction_model
-            or DEFAULT_TENDENCY_MODEL
+        self._tendency_model = resolve_component_model(
+            resolved_settings,
+            "consequence_builder",
         )
 
     async def build_chain(
@@ -482,6 +499,7 @@ class ConsequenceChainBuilder:
                 ),
             ],
             temperature=0.0,
+            max_output_tokens=CONSEQUENCE_BUILDER_MAX_OUTPUT_TOKENS,
             response_schema=_TendencyResult.model_json_schema(),
             metadata={
                 "user_id": conversation_context.user_id,
@@ -492,6 +510,13 @@ class ConsequenceChainBuilder:
         )
         try:
             result = await self._llm_client.complete_structured(request, _TendencyResult)
+        except StructuredOutputError as exc:
+            details = "; ".join(exc.details) if exc.details else str(exc)
+            logger.warning(
+                "Consequence tendency inference structured-output fallback to chain without tendency: %s",
+                details,
+            )
+            return ""
         except Exception:
             logger.warning("Consequence tendency inference fallback to chain without tendency", exc_info=True)
             return ""

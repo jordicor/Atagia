@@ -78,6 +78,19 @@ async def test_classify_confirmation_response_supports_mixed_answers_via_schema(
     assert "Yes for the phone, but no for the address." in provider.requests[0].messages[1].content
 
 
+@pytest.mark.asyncio
+async def test_classify_confirmation_response_ignores_provider_extra_fields() -> None:
+    client, _provider = _client('{"intent":"deny","reasoning":"The reply refuses retention."}')
+
+    result = await classify_confirmation_response(
+        "No guardes eso.",
+        client,
+        prompt_text="Want me to keep this for next time?",
+    )
+
+    assert result is ConsentResponseIntent.DENY
+
+
 def test_safe_confirmation_label_prefers_sanitized_index_text() -> None:
     assert (
         safe_confirmation_label("Banking card PIN 4512 for emergency access", MemoryCategory.PIN_OR_PASSWORD)

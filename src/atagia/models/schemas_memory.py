@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-import json
 import re
 from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from atagia.core import json_utils
 
 
 class MemoryObjectType(str, Enum):
@@ -133,6 +134,7 @@ RawContextAccessMode = Literal["normal", "skipped_raw", "artifact", "verbatim"]
 _VALID_TEMPORAL_TYPES = frozenset(get_args(TemporalType))
 _QUERY_HINT_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 _FTS5_OPERATOR_TOKENS = frozenset({"and", "or", "not", "near"})
+_EXPLICIT_TEMPORAL_FIELDS_DEFAULT_CONFIDENCE = 0.6
 
 
 def _ensure_unique_values(values: list[Any]) -> list[Any]:
@@ -495,7 +497,14 @@ class ExtractedMemoryBase(BaseModel):
         normalized.setdefault("privacy_level", 0)
         normalized.setdefault("payload", {})
         normalized.setdefault("temporal_type", "unknown")
-        normalized.setdefault("temporal_confidence", 0.0)
+        if "temporal_confidence" not in normalized:
+            has_temporal_bounds = bool(normalized.get("valid_from_iso") or normalized.get("valid_to_iso"))
+            temporal_type = str(normalized.get("temporal_type") or "unknown").strip().lower()
+            normalized["temporal_confidence"] = (
+                _EXPLICIT_TEMPORAL_FIELDS_DEFAULT_CONFIDENCE
+                if has_temporal_bounds or temporal_type not in {"", "unknown"}
+                else 0.0
+            )
         return normalized
 
     @field_validator("index_text")
@@ -639,7 +648,7 @@ class ExtractionResult(BaseModel):
                     elif claim_value_raw is None:
                         claim_value = ""
                     else:
-                        claim_value = json.dumps(claim_value_raw, ensure_ascii=False, sort_keys=True)
+                        claim_value = json_utils.dumps(claim_value_raw, sort_keys=True)
                     if claim_key and claim_value:
                         normalized_item["claim_key"] = claim_key
                         normalized_item["claim_value"] = claim_value
@@ -683,6 +692,8 @@ class ExtractionResult(BaseModel):
                 normalized["nothing_durable"] = bool(metadata["nothing_durable"])
             if normalized.get("mode_guess") is None and isinstance(metadata.get("mode_guess"), str):
                 normalized["mode_guess"] = metadata["mode_guess"]
+        if evidences or beliefs or contract_signals or state_updates:
+            normalized["nothing_durable"] = False
         return normalized
 
     @model_validator(mode="after")
@@ -697,12 +708,12 @@ class ExtractionResult(BaseModel):
 class ContractSignal(BaseModel):
     """Contract preference signal extracted from a message."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     canonical_text: str = Field(min_length=1)
     dimension_name: str = Field(min_length=1)
     value_json: dict[str, Any] = Field(default_factory=dict)
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     scope: MemoryScope
     source_kind: MemorySourceKind = MemorySourceKind.INFERRED
     privacy_level: int = Field(ge=0, le=3, default=1)
@@ -719,10 +730,52 @@ class ContractSignal(BaseModel):
 class ContractProjectionResult(BaseModel):
     """Structured output returned by the contract projector."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     signals: list[ContractSignal] = Field(default_factory=list)
     nothing_durable: bool = False
+
+    @staticmethod
+    def _normalize_signal_payload(value: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(value)
+        signals = []
+        for signal in normalized["signals"]:
+            if isinstance(signal, dict) and signal.get("nothing_durable") is True:
+                continue
+            if not isinstance(signal, dict):
+                continue
+            if (
+                not signal.get("canonical_text")
+                or not signal.get("dimension_name")
+                or not signal.get("scope")
+            ):
+                continue
+            normalized_signal = dict(signal)
+            if not isinstance(normalized_signal.get("value_json"), dict):
+                aliased_value = _first_present_contract_signal_value(
+                    normalized_signal,
+                    ("signal_value", "preference", "value", "extracted_value"),
+                )
+                if isinstance(aliased_value, dict):
+                    normalized_signal["value_json"] = aliased_value
+                elif aliased_value is not None:
+                    normalized_signal["value_json"] = {"label": str(aliased_value)}
+            signals.append(normalized_signal)
+        normalized["signals"] = signals
+        if signals:
+            normalized["nothing_durable"] = False
+        else:
+            normalized["nothing_durable"] = True
+        return normalized
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_root_list(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return cls._normalize_signal_payload({"signals": value, "nothing_durable": not value})
+        if isinstance(value, dict) and isinstance(value.get("signals"), list):
+            return cls._normalize_signal_payload(value)
+        return value
 
     @model_validator(mode="after")
     def validate_nothing_durable_consistency(self) -> "ContractProjectionResult":
@@ -731,10 +784,20 @@ class ContractProjectionResult(BaseModel):
         return self
 
 
+def _first_present_contract_signal_value(
+    signal: dict[str, Any],
+    keys: tuple[str, ...],
+) -> Any | None:
+    for key in keys:
+        if key in signal:
+            return signal[key]
+    return None
+
+
 class DetectedNeed(BaseModel):
     """Need signal detected from the active message and recent context."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     need_type: NeedTrigger
     confidence: float = Field(ge=0.0, le=1.0)
@@ -752,7 +815,7 @@ class DetectedNeed(BaseModel):
 class ConsequenceSignal(BaseModel):
     """Detected report of an outcome caused by prior assistant action."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     is_consequence: bool
     action_description: str = ""
@@ -760,6 +823,27 @@ class ConsequenceSignal(BaseModel):
     outcome_sentiment: ConsequenceSentiment = ConsequenceSentiment.NEUTRAL
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)
     likely_action_message_id: str | None = None
+
+    @field_validator("action_description", "outcome_description", mode="before")
+    @classmethod
+    def normalize_nullable_descriptions(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value)
+
+    @field_validator("outcome_sentiment", mode="before")
+    @classmethod
+    def normalize_nullable_sentiment(cls, value: Any) -> Any:
+        if value is None:
+            return ConsequenceSentiment.NEUTRAL
+        return value
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def normalize_nullable_confidence(cls, value: Any) -> Any:
+        if value is None:
+            return 0.0
+        return value
 
     @field_validator("action_description", "outcome_description")
     @classmethod
@@ -788,7 +872,7 @@ class ConsequenceChainResult(BaseModel):
 class TemporalQueryRange(BaseModel):
     """Normalized temporal range derived from a user query."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     start: datetime
     end: datetime
@@ -803,7 +887,7 @@ class TemporalQueryRange(BaseModel):
 class SparseQueryHint(BaseModel):
     """Sparse lexical shaping hints for one semantic sub-query."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     sub_query_text: str = Field(min_length=1)
     fts_phrase: str | None = None
@@ -836,7 +920,7 @@ class SparseQueryHint(BaseModel):
 class QueryIntelligenceResult(BaseModel):
     """Structured query understanding returned by need detection."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     needs: list[DetectedNeed] = Field(default_factory=list)
     temporal_range: TemporalQueryRange | None = None
@@ -850,6 +934,17 @@ class QueryIntelligenceResult(BaseModel):
     # pipeline resolves deterministically.
     exact_recall_needed: bool = False
     exact_facets: list[ExactFacet] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_exact_recall_flag(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if not data.get("exact_facets"):
+            return data
+        normalized = dict(data)
+        normalized["exact_recall_needed"] = True
+        return normalized
 
     @field_validator("exact_facets")
     @classmethod
@@ -1255,6 +1350,92 @@ class CompositionTrace(BaseModel):
     duration_ms: float = Field(ge=0.0)
 
 
+RetrievalSufficiencyState = Literal[
+    "retrieval_sufficient",
+    "retrieval_insufficient",
+    "insufficient_no_candidates",
+    "insufficient_no_scored_candidates",
+    "insufficient_need_more_raw_evidence",
+    "insufficient_need_artifact",
+    "insufficient_summary_support",
+    "contradictory_candidates",
+]
+
+RetrievalExpansionChannel = Literal[
+    "fts",
+    "embedding",
+    "raw_message",
+    "artifact_chunk",
+    "consequence",
+    "verbatim_pin",
+]
+
+RetrievalSufficiencyRationaleCode = Literal[
+    "raw_candidates_empty",
+    "scored_candidates_empty",
+    "artifact_requested_no_artifact_candidates",
+    "raw_evidence_requested_no_direct_candidates",
+    "unsupported_summary_only",
+    "top_candidate_unsupported_summary",
+    "contradictory_belief_candidate",
+    "top_score_below_floor",
+    "scored_candidates_available",
+]
+
+
+class RetrievalSufficiencyDiagnostic(BaseModel):
+    """Text-free shadow diagnostic for retrieval sufficiency."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: RetrievalSufficiencyState
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale_codes: list[RetrievalSufficiencyRationaleCode] = Field(default_factory=list)
+    would_expand_channels: list[RetrievalExpansionChannel] = Field(default_factory=list)
+    would_abstain: bool = False
+    candidate_count: int = Field(ge=0, default=0)
+    filtered_candidate_count: int = Field(ge=0, default=0)
+    shortlist_count: int = Field(ge=0, default=0)
+    scored_candidate_count: int = Field(ge=0, default=0)
+    top_score: float = Field(ge=0.0, default=0.0)
+    direct_evidence_candidate_count: int = Field(ge=0, default=0)
+    summary_candidate_count: int = Field(ge=0, default=0)
+    raw_message_candidate_count: int = Field(ge=0, default=0)
+    artifact_candidate_count: int = Field(ge=0, default=0)
+    unsupported_summary_candidate_count: int = Field(ge=0, default=0)
+    contradictory_candidate_count: int = Field(ge=0, default=0)
+
+
+class TopicTraceItem(BaseModel):
+    """Compact read-only topic item included in retrieval traces."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    status: str
+    title: str
+    summary: str
+    active_goal: str | None = None
+    open_questions: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
+    artifact_ids: list[str] = Field(default_factory=list)
+    source_counts: dict[str, int] = Field(default_factory=dict)
+    source_refs: list[dict[str, str]] = Field(default_factory=list)
+    last_touched_seq: int | None = None
+    last_touched_at: str | None = None
+    confidence: float | None = None
+    privacy_level: int | None = None
+
+
+class TopicWorkingSetTrace(BaseModel):
+    """Read-only snapshot of active and parked conversation topics."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    active_topics: list[TopicTraceItem] = Field(default_factory=list)
+    parked_topics: list[TopicTraceItem] = Field(default_factory=list)
+
+
 class RetrievalTrace(BaseModel):
     """Complete trace of a retrieval operation."""
 
@@ -1267,8 +1448,10 @@ class RetrievalTrace(BaseModel):
     small_corpus_mode: bool = False
     degraded_mode: bool = False
     raw_context_access_mode: str = "normal"
+    topic_snapshot: TopicWorkingSetTrace = Field(default_factory=TopicWorkingSetTrace)
     need_detection: NeedDetectionTrace | None = None
     candidate_search: CandidateSearchTrace | None = None
     scoring: ScoringTrace | None = None
     composition: CompositionTrace | None = None
+    retrieval_sufficiency: RetrievalSufficiencyDiagnostic | None = None
     total_duration_ms: float = Field(ge=0.0, default=0.0)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -175,6 +176,114 @@ async def test_builds_chain_without_tendency_when_llm_inference_fails() -> None:
         cursor = await connection.execute("SELECT tendency_belief_id FROM consequence_chains WHERE id = ?", (result.chain_id,))
         row = await cursor.fetchone()
         assert row["tendency_belief_id"] is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_tendency_inference_ignores_provider_extra_fields() -> None:
+    connection, memories, builder, resolved_policy, context = await _build_runtime(
+        outputs=[
+            json.dumps(
+                {
+                    "tendency_text": "Use incremental changes when the workspace is fragile.",
+                    "memory_statement": "Provider-specific duplicate field.",
+                }
+            )
+        ]
+    )
+    try:
+        await _seed_action_memory(memories)
+        result = await builder.build_chain(
+            ConsequenceSignal(
+                is_consequence=True,
+                action_description="Suggested a large refactor.",
+                outcome_description="Regressions appeared afterwards.",
+                outcome_sentiment="negative",
+                confidence=0.72,
+                likely_action_message_id="msg_assistant_1",
+            ),
+            user_id="usr_1",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+        )
+
+        assert result is not None
+        assert result.tendency_belief_id is not None
+        tendency = await memories.get_memory_object(str(result.tendency_belief_id), "usr_1")
+        assert tendency is not None
+        assert tendency["canonical_text"] == "Use incremental changes when the workspace is fragile."
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_tendency_inference_accepts_memory_statement_alias() -> None:
+    connection, memories, builder, resolved_policy, context = await _build_runtime(
+        outputs=[
+            json.dumps(
+                {
+                    "memory_statement": "Use incremental changes when the workspace is fragile.",
+                }
+            )
+        ]
+    )
+    try:
+        await _seed_action_memory(memories)
+        result = await builder.build_chain(
+            ConsequenceSignal(
+                is_consequence=True,
+                action_description="Suggested a large refactor.",
+                outcome_description="Regressions appeared afterwards.",
+                outcome_sentiment="negative",
+                confidence=0.72,
+                likely_action_message_id="msg_assistant_1",
+            ),
+            user_id="usr_1",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+        )
+
+        assert result is not None
+        assert result.tendency_belief_id is not None
+        tendency = await memories.get_memory_object(str(result.tendency_belief_id), "usr_1")
+        assert tendency is not None
+        assert tendency["canonical_text"] == "Use incremental changes when the workspace is fragile."
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_tendency_failure_logs_compact_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    connection, memories, builder, resolved_policy, context = await _build_runtime(outputs=["not json"])
+    try:
+        await _seed_action_memory(memories)
+        with caplog.at_level(logging.WARNING, logger="atagia.memory.consequence_builder"):
+            result = await builder.build_chain(
+                ConsequenceSignal(
+                    is_consequence=True,
+                    action_description="Suggested a large refactor.",
+                    outcome_description="Regressions appeared afterwards.",
+                    outcome_sentiment="negative",
+                    confidence=0.72,
+                    likely_action_message_id="msg_assistant_1",
+                ),
+                user_id="usr_1",
+                conversation_context=context,
+                resolved_policy=resolved_policy,
+            )
+
+        assert result is not None
+        assert result.tendency_belief_id is None
+        compact_records = [
+            record
+            for record in caplog.records
+            if "structured-output fallback" in record.getMessage()
+        ]
+        assert compact_records
+        assert compact_records[0].exc_info is None
     finally:
         await connection.close()
 

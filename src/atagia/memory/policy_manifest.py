@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.core.canonical import canonical_json_bytes, canonical_json_hash
 from atagia.models.schemas_memory import (
@@ -138,7 +138,7 @@ class ManifestLoader:
 
         manifests: dict[str, AssistantModeManifest] = {}
         for path in sorted(self._manifests_dir.glob("*.json")):
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json_utils.loads(path.read_text(encoding="utf-8"))
             manifest = AssistantModeManifest.model_validate(payload)
             manifest = manifest.model_copy(update={"prompt_hash": compute_prompt_hash(_manifest_payload(manifest))})
             mode_id = manifest.assistant_mode_id.value

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
+from atagia.core import json_utils
 from atagia.core.ids import generate_prefixed_id
 from atagia.core.repositories import BaseRepository, _decode_json_columns, _encode_json
 from atagia.models.schemas_memory import (
@@ -79,7 +79,7 @@ class ContractDimensionRepository(BaseRepository):
         row = await cursor.fetchone()
         if row is None:
             raise KeyError(f"Unknown assistant mode: {assistant_mode_id}")
-        manifest = AssistantModeManifest.model_validate(json.loads(row["memory_policy_json"]))
+        manifest = AssistantModeManifest.model_validate(json_utils.loads(row["memory_policy_json"]))
         return list(manifest.contract_dimensions_priority)
 
     async def upsert_projection(
@@ -251,7 +251,7 @@ class ContractDimensionRepository(BaseRepository):
 
         payload = row["payload_json"]
         if isinstance(payload, str):
-            payload = json.loads(payload)
+            payload = json_utils.loads(payload)
         value_json = payload.get("value_json", {})
         if not isinstance(value_json, dict):
             value_json = {}

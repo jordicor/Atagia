@@ -103,6 +103,11 @@ class AtagiaBenchAdapter:
     def __init__(self, data_dir: str | Path | None = None) -> None:
         self._data_dir = Path(data_dir) if data_dir else _DATA_DIR
 
+    @property
+    def data_dir(self) -> Path:
+        """Return the dataset directory used by this adapter."""
+        return self._data_dir
+
     def load(
         self,
         persona_ids: list[str] | None = None,

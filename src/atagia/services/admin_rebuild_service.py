@@ -26,7 +26,12 @@ from atagia.models.schemas_jobs import (
     WORKER_GROUP_NAME,
 )
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
-from atagia.services.llm_client import LLMClient
+from atagia.services.llm_client import (
+    LLMClient,
+    OutputLimitExceededError,
+    StructuredOutputError,
+    TransientLLMError,
+)
 from atagia.workers.compaction_worker import CompactionWorker
 from atagia.workers.contract_worker import ContractWorker
 from atagia.workers.ingest_worker import IngestWorker
@@ -53,6 +58,11 @@ class RebuildResult(BaseModel):
     episode_compaction_jobs_processed: int = 0
     thematic_profile_jobs_processed: int = 0
     workspace_rollup_jobs_processed: int = 0
+    recoverable_job_failures: int = 0
+    recoverable_extract_job_failures: int = 0
+    recoverable_contract_job_failures: int = 0
+    recoverable_revision_job_failures: int = 0
+    recoverable_compaction_job_failures: int = 0
 
 
 class AdminRebuildService:
@@ -79,7 +89,13 @@ class AdminRebuildService:
         self._conversation_repository = ConversationRepository(connection, clock)
         self._message_repository = MessageRepository(connection, clock)
 
-    async def rebuild_conversation(self, user_id: str, conversation_id: str) -> RebuildResult:
+    async def rebuild_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        skip_final_compaction: bool = False,
+    ) -> RebuildResult:
         conversation = await self._conversation_repository.get_conversation(conversation_id, user_id)
         if conversation is None:
             raise ValueError(f"Unknown conversation_id: {conversation_id}")
@@ -94,7 +110,11 @@ class AdminRebuildService:
                 conversation_ids=[conversation_id],
                 workspace_ids=[workspace_id] if workspace_id is not None else [],
             )
-            await self._rebuild_conversations([conversation], result)
+            await self._rebuild_conversations(
+                [conversation],
+                result,
+                skip_final_compaction=skip_final_compaction,
+            )
             return result
         finally:
             await self._invalidate_user_cache(user_id)
@@ -111,7 +131,11 @@ class AdminRebuildService:
                 conversation_ids=[str(row["id"]) for row in conversations],
                 workspace_ids=workspace_ids,
             )
-            await self._rebuild_conversations(conversations, result)
+            await self._rebuild_conversations(
+                conversations,
+                result,
+                skip_final_compaction=False,
+            )
             return result
         finally:
             await self._invalidate_user_cache(user_id)
@@ -120,6 +144,8 @@ class AdminRebuildService:
         self,
         conversations: list[dict[str, Any]],
         result: RebuildResult,
+        *,
+        skip_final_compaction: bool,
     ) -> None:
         rebuild_backend = InProcessBackend()
         try:
@@ -149,13 +175,17 @@ class AdminRebuildService:
                 embedding_index=self._embedding_index,
                 settings=self._settings,
             )
-            compaction_worker = CompactionWorker(
-                storage_backend=rebuild_backend,
-                connection=self._connection,
-                llm_client=self._llm_client,
-                clock=self._clock,
-                embedding_index=self._embedding_index,
-                settings=self._settings,
+            compaction_worker = (
+                None
+                if skip_final_compaction
+                else CompactionWorker(
+                    storage_backend=rebuild_backend,
+                    connection=self._connection,
+                    llm_client=self._llm_client,
+                    clock=self._clock,
+                    embedding_index=self._embedding_index,
+                    settings=self._settings,
+                )
             )
             conversations_with_messages: list[dict[str, Any]] = []
 
@@ -190,39 +220,51 @@ class AdminRebuildService:
                         ),
                         recent_messages=recent_messages,
                     )
-                    await ingest_worker.process_job(
-                        self._message_job(
+                    extract_processed, _ = await self._process_rebuild_job(
+                        result=result,
+                        stage="extract",
+                        handler=ingest_worker.process_job,
+                        payload=self._message_job(
                             user_id=str(conversation["user_id"]),
                             conversation_id=str(conversation["id"]),
                             payload=payload,
                             job_type=JobType.EXTRACT_MEMORY_CANDIDATES,
-                        )
+                        ),
                     )
                     result.processed_messages += 1
-                    result.extract_jobs_processed += 1
+                    if extract_processed:
+                        result.extract_jobs_processed += 1
                     if message_role == "user":
-                        await contract_worker.process_job(
-                            self._message_job(
+                        contract_processed, _ = await self._process_rebuild_job(
+                            result=result,
+                            stage="contract",
+                            handler=contract_worker.process_job,
+                            payload=self._message_job(
                                 user_id=str(conversation["user_id"]),
                                 conversation_id=str(conversation["id"]),
                                 payload=payload,
                                 job_type=JobType.PROJECT_CONTRACT,
-                            )
+                            ),
                         )
-                        result.contract_jobs_processed += 1
+                        if contract_processed:
+                            result.contract_jobs_processed += 1
 
             revision_results = await self._drain_stream(
                 rebuild_backend,
                 REVISE_STREAM_NAME,
                 revision_worker.process_job,
+                result=result,
+                stage="revision",
             )
             result.revision_jobs_processed += len(revision_results)
 
-            for conversation in conversations_with_messages:
-                self._record_compaction_result(
-                    result,
-                    await compaction_worker.process_job(
-                        self._conversation_chunk_job(
+            if compaction_worker is not None:
+                for conversation in conversations_with_messages:
+                    compaction_processed, compaction_result = await self._process_rebuild_job(
+                        result=result,
+                        stage="compaction",
+                        handler=compaction_worker.process_job,
+                        payload=self._conversation_chunk_job(
                             user_id=str(conversation["user_id"]),
                             conversation_id=str(conversation["id"]),
                             workspace_id=(
@@ -230,26 +272,33 @@ class AdminRebuildService:
                                 if conversation.get("workspace_id") is not None
                                 else None
                             ),
-                        )
-                    ),
-                )
-
-            compaction_results = await self._drain_stream(
-                rebuild_backend,
-                COMPACT_STREAM_NAME,
-                compaction_worker.process_job,
-            )
-            for item in compaction_results:
-                self._record_compaction_result(result, item)
-
-            for workspace_id in result.workspace_ids:
-                await compaction_worker.process_job(
-                    self._workspace_rollup_job(
-                        user_id=result.user_id,
-                        workspace_id=workspace_id,
+                        ),
                     )
+                    if compaction_processed:
+                        self._record_compaction_result(result, compaction_result)
+
+                compaction_results = await self._drain_stream(
+                    rebuild_backend,
+                    COMPACT_STREAM_NAME,
+                    compaction_worker.process_job,
+                    result=result,
+                    stage="compaction",
                 )
-                result.workspace_rollup_jobs_processed += 1
+                for item in compaction_results:
+                    self._record_compaction_result(result, item)
+
+                for workspace_id in result.workspace_ids:
+                    rollup_processed, _ = await self._process_rebuild_job(
+                        result=result,
+                        stage="compaction",
+                        handler=compaction_worker.process_job,
+                        payload=self._workspace_rollup_job(
+                            user_id=result.user_id,
+                            workspace_id=workspace_id,
+                        ),
+                    )
+                    if rollup_processed:
+                        result.workspace_rollup_jobs_processed += 1
         finally:
             await rebuild_backend.close()
 
@@ -327,11 +376,52 @@ class AdminRebuildService:
         elif job_kind == CompactionJobKind.THEMATIC_PROFILE.value:
             result.thematic_profile_jobs_processed += 1
 
+    async def _process_rebuild_job(
+        self,
+        *,
+        result: RebuildResult,
+        stage: str,
+        handler: Callable[[dict[str, object]], Awaitable[dict[str, Any] | None]],
+        payload: dict[str, object],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        try:
+            return True, await handler(payload)
+        except (StructuredOutputError, TransientLLMError, OutputLimitExceededError) as exc:
+            self._record_recoverable_job_failure(result, stage)
+            logger.warning(
+                "Skipping recoverable %s rebuild job",
+                stage,
+                extra={
+                    "stage": stage,
+                    "job_id": payload.get("job_id"),
+                    "job_type": payload.get("job_type"),
+                    "user_id": payload.get("user_id"),
+                    "conversation_id": payload.get("conversation_id"),
+                    "error": str(exc),
+                },
+            )
+            return False, None
+
+    @staticmethod
+    def _record_recoverable_job_failure(result: RebuildResult, stage: str) -> None:
+        result.recoverable_job_failures += 1
+        if stage == "extract":
+            result.recoverable_extract_job_failures += 1
+        elif stage == "contract":
+            result.recoverable_contract_job_failures += 1
+        elif stage == "revision":
+            result.recoverable_revision_job_failures += 1
+        elif stage == "compaction":
+            result.recoverable_compaction_job_failures += 1
+
     async def _drain_stream(
         self,
         storage_backend: InProcessBackend,
         stream_name: str,
         handler: Callable[[dict[str, object]], Awaitable[dict[str, Any] | None]],
+        *,
+        result: RebuildResult,
+        stage: str,
     ) -> list[dict[str, Any] | None]:
         await storage_backend.stream_ensure_group(stream_name, WORKER_GROUP_NAME)
         results: list[dict[str, Any] | None] = []
@@ -346,13 +436,19 @@ class AdminRebuildService:
             if not messages:
                 return results
             for message in messages:
-                result = await handler(message.payload)
+                processed, job_result = await self._process_rebuild_job(
+                    result=result,
+                    stage=stage,
+                    handler=handler,
+                    payload=message.payload,
+                )
                 await storage_backend.stream_ack(
                     stream_name,
                     WORKER_GROUP_NAME,
                     message.message_id,
                 )
-                results.append(result)
+                if processed:
+                    results.append(job_result)
 
     async def _purge_conversation_state(self, user_id: str, conversation_id: str) -> None:
         memory_ids = await self._memory_ids_for_conversation(user_id, conversation_id)

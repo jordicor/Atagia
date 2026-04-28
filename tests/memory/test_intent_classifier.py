@@ -36,6 +36,7 @@ class ClassifierProvider(LLMProvider):
                     {
                         "is_explicit": is_explicit,
                         "reasoning": "Stubbed classifier result.",
+                        "confidence": 0.9,
                     }
                 ),
             )
@@ -48,7 +49,7 @@ class ClassifierProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps({"equivalent": equivalent}),
+                output_text=json.dumps({"equivalent": equivalent, "rationale": "Stubbed."}),
             )
         raise AssertionError(f"Unexpected classifier purpose: {purpose}")
 
@@ -61,6 +62,20 @@ class FailingClassifierProvider(LLMProvider):
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         raise RuntimeError(f"synthetic failure for {request.metadata.get('purpose')}")
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        raise AssertionError("Embeddings are not used in classifier tests")
+
+
+class InvalidStructuredClassifierProvider(LLMProvider):
+    name = "classifier-invalid-structured-tests"
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text="not-json",
+        )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError("Embeddings are not used in classifier tests")
@@ -176,3 +191,35 @@ async def test_claim_key_equivalence_falls_back_to_false_on_llm_failure(
 
     assert result is False
     assert "Intent classifier fallback for claim key equivalence" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_intent_classifiers_log_structured_failures_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = InvalidStructuredClassifierProvider()
+    client = LLMClient(provider_name=provider.name, providers=[provider])
+
+    with caplog.at_level("WARNING", logger="atagia.memory.intent_classifier"):
+        explicit = await is_explicit_user_statement(
+            client,
+            "classify-model",
+            "I prefer concise debugging answers.",
+        )
+        equivalent = await are_claim_keys_equivalent(
+            client,
+            "classify-model",
+            "response_style.verbosity",
+            "response_style.debugging",
+        )
+
+    structured_records = [
+        record
+        for record in caplog.records
+        if "structured-output fallback" in record.getMessage()
+    ]
+    assert explicit is False
+    assert equivalent is False
+    assert len(structured_records) == 2
+    assert all(record.exc_info is None for record in structured_records)
+    assert "Traceback" not in caplog.text

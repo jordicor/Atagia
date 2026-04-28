@@ -8,8 +8,9 @@ from typing import Any
 import aiosqlite
 
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
+from atagia.core.topic_repository import TopicRepository
 from atagia.models.schemas_memory import ExtractionConversationContext, RetrievalTrace
-from atagia.models.schemas_memory import ResolvedOperationalProfile
+from atagia.models.schemas_memory import ResolvedOperationalProfile, TopicWorkingSetTrace
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
@@ -140,6 +141,12 @@ class RetrievalService:
             )
             == 0
         )
+        await self._attach_topic_snapshot(
+            connection,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            trace=trace,
+        )
         return await RetrievalPipeline(
             connection=connection,
             llm_client=self.runtime.llm_client,
@@ -155,6 +162,22 @@ class RetrievalService:
             conversation_messages=transcript,
             trace=trace,
         )
+
+    async def _attach_topic_snapshot(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        conversation_id: str,
+        trace: RetrievalTrace | None,
+    ) -> None:
+        if trace is None:
+            return
+        snapshot = await TopicRepository(connection, self.runtime.clock).get_topic_snapshot(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+        trace.topic_snapshot = TopicWorkingSetTrace.model_validate(snapshot)
 
     @staticmethod
     def _pipeline_inputs(

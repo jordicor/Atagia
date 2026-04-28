@@ -143,6 +143,7 @@ def _settings(tmp_path: Path) -> Settings:
         llm_scoring_model="score-test-model",
         llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
+        llm_forced_global_model="openai/reply-test-model",
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
@@ -211,6 +212,17 @@ async def test_chat_reply_basic(
             stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
             assert [message["role"] for message in stored_messages[-2:]] == ["user", "assistant"]
             assert stored_messages[-1]["text"] == "Check the retry guard first."
+            event = await RetrievalEventRepository(connection, runtime.clock).get_event(
+                result.retrieval_event_id,
+                "usr_1",
+            )
+            assert event is not None
+            assert event["outcome_json"]["retrieval_custody_v2_status"] == "fresh"
+            assert event["outcome_json"]["retrieval_custody_v2"] == []
+            assert event["outcome_json"]["sufficiency_diagnostics_v1_status"] == "fresh"
+            assert event["outcome_json"]["sufficiency_diagnostics_v1"]["state"] == (
+                "insufficient_no_candidates"
+            )
         finally:
             await connection.close()
     finally:
@@ -544,10 +556,22 @@ async def test_chat_reply_cache_hit_creates_retrieval_event_and_debug_metadata(
             events = RetrievalEventRepository(connection, runtime.clock)
             listed = await events.list_events("usr_1", "cnv_1", limit=10)
             latest = listed[0]
+            first_event = next(event for event in listed if event["id"] == first.retrieval_event_id)
             assert latest["id"] == second.retrieval_event_id
             assert latest["outcome_json"]["from_cache"] is True
             assert latest["outcome_json"]["need_detection_skipped"] is True
             assert latest["outcome_json"]["detected_needs"] == []
+            assert latest["outcome_json"]["retrieval_custody_v2_status"] == "cache_hit_no_candidate_custody"
+            assert latest["outcome_json"]["retrieval_custody_v2"] == []
+            assert latest["outcome_json"]["sufficiency_diagnostics_v1_status"] == (
+                "cache_hit_no_sufficiency_diagnostics"
+            )
+            assert latest["outcome_json"]["sufficiency_diagnostics_v1"] is None
+            cache_key = first_event["outcome_json"]["cache_key"]
+            cache_entry = await runtime.storage_backend.get_context_view(cache_key)
+            assert cache_entry is not None
+            assert "sufficiency_diagnostics_v1" not in cache_entry
+            assert "retrieval_sufficiency" not in cache_entry
         finally:
             await connection.close()
     finally:

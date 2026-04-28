@@ -24,6 +24,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingRequest,
     LLMEmbeddingResponse,
     LLMProvider,
+    StructuredOutputError,
 )
 from atagia.workers.compaction_worker import CompactionWorker
 
@@ -218,7 +219,7 @@ async def test_compaction_worker_processes_workspace_rollup_job() -> None:
 @pytest.mark.asyncio
 async def test_compaction_worker_dead_letters_after_max_failed_deliveries() -> None:
     connection, backend, messages, _summaries, _memories, worker = await _build_runtime(
-        {"summary_chunk_segmentation": ["not-json", "not-json", "not-json"]}
+        {"summary_chunk_segmentation": ["not-json"] * 9}
     )
     try:
         await _seed_messages(messages)
@@ -235,6 +236,8 @@ async def test_compaction_worker_dead_letters_after_max_failed_deliveries() -> N
         assert third.dead_lettered == 1
         assert dead_letter is not None
         assert dead_letter["delivery_count"] == 3
+        assert dead_letter["error_details"][0] == "$: Response was not valid JSON."
+        assert any("No JSON payload found" in detail for detail in dead_letter["error_details"])
     finally:
         await connection.close()
 
@@ -255,6 +258,42 @@ async def test_compaction_worker_handles_llm_failure_gracefully() -> None:
         assert result.acked == 0
         assert result.failed == 1
         assert rows == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_worker_logs_structured_job_failure_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def fail_compaction(*args, **kwargs):
+        del args, kwargs
+        raise StructuredOutputError(
+            "Provider returned invalid structured output",
+            details=("$.episodes: Field required",),
+        )
+
+    connection, backend, messages, _summaries, _memories, worker = await _build_runtime({})
+    try:
+        await _seed_messages(messages)
+        worker._compactor.generate_conversation_chunks = fail_compaction
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(job_kind="conversation_chunk").model_dump(mode="json"),
+        )
+
+        with caplog.at_level("WARNING", logger="atagia.workers.compaction_worker"):
+            result = await worker.run_once()
+
+        records = [
+            record
+            for record in caplog.records
+            if "due to structured output" in record.getMessage()
+        ]
+        assert result.failed == 1
+        assert records
+        assert records[0].exc_info is None
+        assert "Traceback" not in caplog.text
     finally:
         await connection.close()
 

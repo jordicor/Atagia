@@ -10,15 +10,18 @@ import re
 from pydantic import BaseModel, ConfigDict
 
 from atagia.core.config import Settings
+from atagia.core.llm_output_limits import CONSENT_CONFIRMATION_MAX_OUTPUT_TOKENS
 from atagia.models.schemas_memory import MemoryCategory
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
+from atagia.services.model_resolution import resolve_component_model
 
 PENDING_USER_CONFIRMATION_TTL_DAYS = 7
-DEFAULT_CONSENT_MODEL = "claude-sonnet-4-6"
 
 CONSENT_PROMPT_TEMPLATE = """You are classifying a user's reply to a memory-retention confirmation prompt.
 
 Return JSON only, matching the provided schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 
 The reply may be written in any language.
 
@@ -42,7 +45,7 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 
 class _ConsentReplyResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     intent: Literal["confirm", "deny", "ambiguous"]
 
@@ -61,12 +64,7 @@ class ConsentConfirmationClassifier:
     def __init__(self, llm_client: LLMClient[Any], settings: Settings | None = None) -> None:
         resolved_settings = settings or Settings.from_env()
         self._llm_client = llm_client
-        self._model = (
-            resolved_settings.llm_classifier_model
-            or resolved_settings.llm_scoring_model
-            or resolved_settings.llm_extraction_model
-            or DEFAULT_CONSENT_MODEL
-        )
+        self._model = resolve_component_model(resolved_settings, "consent_confirmation")
 
     async def classify(
         self,
@@ -87,6 +85,7 @@ class ConsentConfirmationClassifier:
                 ),
             ],
             temperature=0.0,
+            max_output_tokens=CONSENT_CONFIRMATION_MAX_OUTPUT_TOKENS,
             response_schema=_ConsentReplyResult.model_json_schema(),
             metadata={
                 "purpose": "consent_confirmation_intent",

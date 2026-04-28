@@ -8,6 +8,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from atagia.core.llm_output_limits import (
+    EXPORT_ANONYMIZER_REWRITE_MAX_OUTPUT_TOKENS,
+    EXPORT_ANONYMIZER_VERIFICATION_MAX_OUTPUT_TOKENS,
+)
 from atagia.models.schemas_replay import (
     ExportAnonymizationMode,
     ExportAnonymizationSummary,
@@ -18,7 +22,6 @@ from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessa
 
 _MAX_MESSAGES = 200
 _MAX_TRANSCRIPT_CHARS = 50_000
-_MAX_OUTPUT_TOKENS = 6_000
 _MAX_ATTEMPTS = 2
 
 
@@ -44,7 +47,7 @@ class ExportAnonymizationProjection:
 
 
 class _RewriteEntity(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     placeholder: str = Field(min_length=3)
     readable_label: str = Field(min_length=3)
@@ -52,7 +55,7 @@ class _RewriteEntity(BaseModel):
 
 
 class _RewriteMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     message_id: str
     strict_content: str = Field(min_length=1)
@@ -60,14 +63,14 @@ class _RewriteMessage(BaseModel):
 
 
 class _RewriteResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     entities: list[_RewriteEntity] = Field(default_factory=list)
     messages: list[_RewriteMessage] = Field(default_factory=list)
 
 
 class _VerificationResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     approved: bool = False
     remaining_identifiers: list[str] = Field(default_factory=list)
@@ -171,6 +174,8 @@ class ExportAnonymizer:
             "- Readable labels must not introduce new descriptive clues.\n"
             "- Return `source_forms` only for anchors that were actually anonymized.\n"
             "- Follow the response schema exactly.\n"
+            "- Do not include markdown fences, preambles, tags, or explanations.\n"
+            "- Anything outside the first JSON object will be ignored.\n"
             f"\nTranscript:\n{transcript}"
         )
         if retry_feedback is not None:
@@ -180,13 +185,14 @@ class ExportAnonymizer:
         request = LLMCompletionRequest(
             model=self._model,
             temperature=0.0,
-            max_output_tokens=_MAX_OUTPUT_TOKENS,
+            max_output_tokens=EXPORT_ANONYMIZER_REWRITE_MAX_OUTPUT_TOKENS,
             messages=[
                 LLMMessage(
                     role="system",
                     content=(
                         "You generate privacy-safe anonymized projection exports for Atagia. "
-                        "Obey the schema exactly and never include commentary."
+                        "Obey the schema exactly and never include commentary, markdown fences, "
+                        "preambles, or tags."
                     ),
                 ),
                 LLMMessage(role="user", content=content),
@@ -211,7 +217,7 @@ class ExportAnonymizer:
         request = LLMCompletionRequest(
             model=self._model,
             temperature=0.0,
-            max_output_tokens=1_500,
+            max_output_tokens=EXPORT_ANONYMIZER_VERIFICATION_MAX_OUTPUT_TOKENS,
             messages=[
                 LLMMessage(
                     role="system",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from benchmarks.artifact_hash import (
+    sha256_directory,
+    sha256_file,
+    sha256_file_if_exists,
+)
 from benchmarks.atagia_bench.adapter import (
     AtagiaBenchAdapter,
     AtagiaBenchConversation,
@@ -21,6 +27,11 @@ from benchmarks.atagia_bench.adapter import (
     AtagiaBenchQuestion,
 )
 from benchmarks.atagia_bench.graders import GradeResult, resolve_grader
+from benchmarks.custody_summary import summarize_retrieval_custody
+from benchmarks.json_artifacts import write_json_atomic
+from benchmarks.migration_metadata import benchmark_migration_metadata
+from benchmarks.numeric_summary import summarize_numeric_values
+from benchmarks.retrieval_custody import build_retrieval_custody
 from benchmarks.scorer import LLMJudgeScorer
 from benchmarks.trusted_eval import (
     TRUSTED_EVALUATION_PROMPT_NOTE,
@@ -28,17 +39,25 @@ from benchmarks.trusted_eval import (
     trusted_evaluation_ablation,
 )
 from atagia import Atagia
+from atagia.core.llm_output_limits import ATAGIA_BENCH_ANSWER_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import MemoryObjectRepository, MessageRepository
 from atagia.models.schemas_memory import RetrievalTrace
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.chat_support import build_system_prompt, chat_model, resolve_policy
-from atagia.services.llm_client import LLMCompletionRequest, LLMMessage
+from atagia.services.llm_client import (
+    LLMCompletionRequest,
+    LLMError,
+    LLMMessage,
+    StructuredOutputError,
+)
+from atagia.services.model_resolution import provider_qualified_model
 from atagia.services.retrieval_service import RetrievalService
 
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
+_DEFAULT_HOLDOUT_PATH = Path(__file__).resolve().parent / "data" / "holdout_v0.json"
 
 
 # ---- Report models ----
@@ -114,8 +133,12 @@ class AtagiaBenchRunner:
     ) -> None:
         self._llm_provider = llm_provider
         self._llm_api_key = llm_api_key
-        self._llm_model = llm_model
-        self._judge_model = judge_model or llm_model
+        self._llm_model = provider_qualified_model(llm_provider, llm_model)
+        self._judge_model = (
+            provider_qualified_model(llm_provider, judge_model)
+            if judge_model is not None
+            else self._llm_model
+        )
         self._manifests_dir = (
             Path(manifests_dir).expanduser()
             if manifests_dir is not None
@@ -130,6 +153,9 @@ class AtagiaBenchRunner:
         persona_ids: list[str] | None = None,
         category_tags: list[str] | None = None,
         question_ids: list[str] | None = None,
+        exclude_question_ids: list[str] | None = None,
+        benchmark_split: str = "all",
+        holdout_question_ids: list[str] | None = None,
         ablation: AblationConfig | None = None,
         trusted_evaluation: bool = False,
     ) -> AtagiaBenchReport:
@@ -139,6 +165,7 @@ class AtagiaBenchRunner:
         all_results: list[AtagiaQuestionResult] = []
         category_filter = set(category_tags) if category_tags else None
         question_filter = set(question_ids) if question_ids else None
+        exclude_question_filter = set(exclude_question_ids) if exclude_question_ids else None
 
         for persona_index, persona_data in enumerate(dataset.personas, start=1):
             persona_id = persona_data.persona.persona_id
@@ -151,6 +178,7 @@ class AtagiaBenchRunner:
                 persona_data,
                 category_filter=category_filter,
                 question_filter=question_filter,
+                exclude_question_filter=exclude_question_filter,
                 ablation=ablation,
                 trusted_evaluation=trusted_evaluation,
             )
@@ -164,6 +192,10 @@ class AtagiaBenchRunner:
             persona_ids=[p.persona.persona_id for p in dataset.personas],
             category_tags=category_tags,
             question_ids=question_ids,
+            exclude_question_ids=exclude_question_ids,
+            benchmark_split=benchmark_split,
+            holdout_question_ids=holdout_question_ids,
+            ablation=ablation,
             trusted_evaluation=trusted_evaluation,
         )
 
@@ -173,6 +205,7 @@ class AtagiaBenchRunner:
         *,
         category_filter: set[str] | None,
         question_filter: set[str] | None,
+        exclude_question_filter: set[str] | None,
         ablation: AblationConfig | None,
         trusted_evaluation: bool,
     ) -> list[AtagiaQuestionResult]:
@@ -245,6 +278,7 @@ class AtagiaBenchRunner:
                     persona_data.questions,
                     category_filter,
                     question_filter,
+                    exclude_question_filter,
                 )
                 results: list[AtagiaQuestionResult] = []
                 for q_index, question in enumerate(questions, start=1):
@@ -356,73 +390,108 @@ class AtagiaBenchRunner:
         runtime = engine.runtime
         if runtime is None:
             raise RuntimeError("Atagia runtime unavailable")
-        retrieval_trace = RetrievalTrace(
-            query_text=question.question_text,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            timestamp_iso=runtime.clock.now().isoformat(),
-        )
-        retrieval_started_at = perf_counter()
-        pipeline_result = await self._retrieve_context(
-            engine,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            question_text=question.question_text,
-            assistant_mode_id=assistant_mode_id,
-            ablation=ablation,
-            trace=retrieval_trace,
-        )
-        retrieval_time_ms = (perf_counter() - retrieval_started_at) * 1000.0
+        # LLM errors during answer generation or judging must not abort the
+        # whole persona run; tolerate the failure as a 0-score result with a
+        # clear reason so the rest of the questions still execute.
+        try:
+            retrieval_trace = RetrievalTrace(
+                query_text=question.question_text,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                timestamp_iso=runtime.clock.now().isoformat(),
+            )
+            retrieval_started_at = perf_counter()
+            pipeline_result = await self._retrieve_context(
+                engine,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                question_text=question.question_text,
+                assistant_mode_id=assistant_mode_id,
+                ablation=ablation,
+                trace=retrieval_trace,
+            )
+            retrieval_time_ms = (perf_counter() - retrieval_started_at) * 1000.0
 
-        prediction = await self._generate_answer(
-            runtime=runtime,
-            assistant_mode_id=assistant_mode_id,
-            pipeline_result=pipeline_result,
-            question_text=question.question_text,
-            question_id=question.question_id,
-            current_user_display_name=persona_data.persona.display_name,
-            trusted_evaluation=trusted_evaluation,
-        )
+            prediction = await self._generate_answer(
+                runtime=runtime,
+                assistant_mode_id=assistant_mode_id,
+                pipeline_result=pipeline_result,
+                question_text=question.question_text,
+                question_id=question.question_id,
+                current_user_display_name=persona_data.persona.display_name,
+                trusted_evaluation=trusted_evaluation,
+            )
 
-        # Grade
-        grader = resolve_grader(question.grader, llm_judge=judge)
-        grader_config = dict(question.grader_config or {})
-        if "question_text" not in grader_config:
-            grader_config["question_text"] = question.question_text
-        grade = await grader.grade(
-            prediction=prediction,
-            ground_truth=question.ground_truth,
-            config=grader_config,
-        )
-        trace_payload = await self._build_question_trace(
-            engine,
-            user_id=user_id,
-            question=question,
-            pipeline_result=pipeline_result,
-            retrieval_trace=retrieval_trace,
-            assistant_mode_id=assistant_mode_id,
-            conversation_id=conversation_id,
-            turn_message_ids=turn_message_ids,
-            grade=grade,
-            trusted_evaluation=trusted_evaluation,
-            trusted_activation_count=trusted_activation_count,
-        )
+            # Grade
+            grader = resolve_grader(question.grader, llm_judge=judge)
+            grader_config = dict(question.grader_config or {})
+            if "question_text" not in grader_config:
+                grader_config["question_text"] = question.question_text
+            grade = await grader.grade(
+                prediction=prediction,
+                ground_truth=question.ground_truth,
+                config=grader_config,
+            )
+            trace_payload = await self._build_question_trace(
+                engine,
+                user_id=user_id,
+                question=question,
+                pipeline_result=pipeline_result,
+                retrieval_trace=retrieval_trace,
+                assistant_mode_id=assistant_mode_id,
+                conversation_id=conversation_id,
+                turn_message_ids=turn_message_ids,
+                grade=grade,
+                trusted_evaluation=trusted_evaluation,
+                trusted_activation_count=trusted_activation_count,
+            )
 
-        return AtagiaQuestionResult(
-            question_id=question.question_id,
-            question_text=question.question_text,
-            ground_truth=question.ground_truth,
-            prediction=prediction,
-            answer_type=question.answer_type,
-            category_tags=question.category_tags,
-            evidence_turn_ids=question.evidence_turn_ids,
-            grade=grade,
-            memories_used=len(pipeline_result.composed_context.selected_memory_ids),
-            retrieval_time_ms=retrieval_time_ms,
-            conversation_id=conversation_id,
-            persona_id=persona_data.persona.persona_id,
-            trace=trace_payload,
-        )
+            return AtagiaQuestionResult(
+                question_id=question.question_id,
+                question_text=question.question_text,
+                ground_truth=question.ground_truth,
+                prediction=prediction,
+                answer_type=question.answer_type,
+                category_tags=question.category_tags,
+                evidence_turn_ids=question.evidence_turn_ids,
+                grade=grade,
+                memories_used=len(pipeline_result.composed_context.selected_memory_ids),
+                retrieval_time_ms=retrieval_time_ms,
+                conversation_id=conversation_id,
+                persona_id=persona_data.persona.persona_id,
+                trace=trace_payload,
+            )
+        except (LLMError, StructuredOutputError) as exc:
+            exc_class = type(exc).__name__
+            message = str(exc)
+            truncated = message if len(message) <= 500 else f"{message[:500]}..."
+            logger.warning(
+                "Atagia-bench question scoring failed for persona_id=%s question_id=%s: %s: %s",
+                persona_data.persona.persona_id,
+                question.question_id,
+                exc_class,
+                truncated,
+            )
+            return AtagiaQuestionResult(
+                question_id=question.question_id,
+                question_text=question.question_text,
+                ground_truth=question.ground_truth,
+                prediction="",
+                answer_type=question.answer_type,
+                category_tags=question.category_tags,
+                evidence_turn_ids=question.evidence_turn_ids,
+                grade=GradeResult(
+                    passed=False,
+                    score=0.0,
+                    reason=f"Judge call failed: {exc_class}: {truncated}",
+                    grader_name=question.grader,
+                ),
+                memories_used=0,
+                retrieval_time_ms=0.0,
+                conversation_id=conversation_id,
+                persona_id=persona_data.persona.persona_id,
+                trace={"judge_failure": {"exception_class": exc_class, "message": truncated}},
+            )
 
     async def _retrieve_context(
         self,
@@ -506,20 +575,30 @@ class AtagiaBenchRunner:
             set(selected_memory_ids).intersection(evidence_rows_by_id)
         )
         context = pipeline_result.composed_context
+        diagnosis_bucket = self._diagnosis_bucket(
+            passed=grade.passed,
+            has_evidence_turns=bool(question.evidence_turn_ids),
+            evidence_message_count=len(evidence_message_ids),
+            evidence_memory_count=len(evidence_rows),
+            active_evidence_count=active_evidence_count,
+            candidate_count=(
+                retrieval_trace.candidate_search.total_after_fusion
+                if retrieval_trace.candidate_search is not None
+                else 0
+            ),
+            selected_memory_count=len(selected_memory_ids),
+            selected_evidence_count=len(selected_evidence_ids),
+        )
         return {
-            "diagnosis_bucket": self._diagnosis_bucket(
-                passed=grade.passed,
-                has_evidence_turns=bool(question.evidence_turn_ids),
-                evidence_message_count=len(evidence_message_ids),
-                evidence_memory_count=len(evidence_rows),
-                active_evidence_count=active_evidence_count,
-                candidate_count=(
-                    retrieval_trace.candidate_search.total_after_fusion
-                    if retrieval_trace.candidate_search is not None
-                    else 0
-                ),
-                selected_memory_count=len(selected_memory_ids),
-                selected_evidence_count=len(selected_evidence_ids),
+            "diagnosis_bucket": diagnosis_bucket,
+            "sufficiency_diagnostic": self._sufficiency_diagnostic(
+                diagnosis_bucket,
+                retrieval_trace=retrieval_trace,
+            ),
+            "shadow_sufficiency_diagnostics": (
+                pipeline_result.retrieval_sufficiency.model_dump(mode="json")
+                if pipeline_result.retrieval_sufficiency is not None
+                else None
             ),
             "trusted_evaluation": trusted_evaluation,
             "trusted_activation_count": trusted_activation_count,
@@ -551,6 +630,11 @@ class AtagiaBenchRunner:
                 "memory_block_chars": len(context.memory_block),
                 "state_block_chars": len(context.state_block),
             },
+            "retrieval_custody": build_retrieval_custody(
+                pipeline_result=pipeline_result,
+                selected_memory_ids=selected_memory_ids,
+                user_id=user_id,
+            ),
             "retrieval_trace": retrieval_trace.model_dump(mode="json"),
         }
 
@@ -581,6 +665,88 @@ class AtagiaBenchRunner:
         if evidence_memory_count > 0 and selected_evidence_count == 0:
             return "retrieval_or_ranking_miss"
         return "answer_policy_or_grading"
+
+    @staticmethod
+    def _aggregate_warning_counts(results: list[AtagiaQuestionResult]) -> dict[str, int]:
+        counts: Counter[str] = Counter(
+            {
+                "failed_questions": 0,
+                "degraded_retrievals": 0,
+                "need_detection_degraded": 0,
+                "retrieval_no_candidates": 0,
+                "composition_selected_none": 0,
+                "missing_extraction": 0,
+                "memory_not_active": 0,
+                "retrieval_or_ranking_miss": 0,
+                "answer_policy_or_grading": 0,
+                "structured_output_retries": 0,
+                "synthesis_preservation": 0,
+                "applicability_fallback": 0,
+                "provider_rate_limits": 0,
+                "tracebacks": 0,
+                "failed_worker_jobs": 0,
+            }
+        )
+        for result in results:
+            if not result.grade.passed:
+                counts["failed_questions"] += 1
+            diagnosis = str(result.trace.get("diagnosis_bucket") or "")
+            if diagnosis in counts:
+                counts[diagnosis] += 1
+            retrieval_trace = result.trace.get("retrieval_trace")
+            if isinstance(retrieval_trace, dict):
+                if retrieval_trace.get("degraded_mode"):
+                    counts["degraded_retrievals"] += 1
+                need_detection = retrieval_trace.get("need_detection")
+                if isinstance(need_detection, dict) and need_detection.get("degraded_mode"):
+                    counts["need_detection_degraded"] += 1
+        return dict(counts)
+
+    @staticmethod
+    def _trace_field_counts(
+        results: list[AtagiaQuestionResult],
+        field_name: str,
+    ) -> dict[str, int]:
+        counts: Counter[str] = Counter()
+        for result in results:
+            trace = result.trace if isinstance(result.trace, dict) else {}
+            raw_value = trace.get(field_name)
+            value = str(raw_value).strip() if raw_value is not None else ""
+            counts[value or "unknown"] += 1
+        return dict(sorted(counts.items()))
+
+    @staticmethod
+    def _aggregate_retrieval_custody_summary(
+        results: list[AtagiaQuestionResult],
+    ) -> dict[str, object]:
+        return summarize_retrieval_custody(
+            result.trace.get("retrieval_custody", [])
+            if isinstance(result.trace, dict)
+            else []
+            for result in results
+        )
+
+    @staticmethod
+    def _sufficiency_diagnostic(
+        diagnosis_bucket: str,
+        *,
+        retrieval_trace: RetrievalTrace,
+    ) -> str:
+        if diagnosis_bucket == "passed":
+            return "retrieval_sufficient"
+        if diagnosis_bucket == "evidence_mapping_missing":
+            return "missing_raw_evidence"
+        if diagnosis_bucket == "missing_extraction":
+            return "missing_memory_extraction"
+        if diagnosis_bucket == "memory_not_active":
+            return "unsafe_or_requires_confirmation"
+        if diagnosis_bucket == "retrieval_no_candidates":
+            if retrieval_trace.raw_context_access_mode == "artifact":
+                return "missing_artifact_support"
+            return "missing_raw_evidence"
+        if diagnosis_bucket in {"composition_selected_none", "retrieval_or_ranking_miss"}:
+            return "retrieval_insufficient"
+        return "answer_or_judge_issue"
 
     @staticmethod
     def _count_field(rows: list[dict[str, Any]], field_name: str) -> dict[str, int]:
@@ -646,7 +812,7 @@ class AtagiaBenchRunner:
                     LLMMessage(role="user", content=question_text),
                 ],
                 temperature=0.0,
-                max_output_tokens=512,
+                max_output_tokens=ATAGIA_BENCH_ANSWER_MAX_OUTPUT_TOKENS,
                 metadata={
                     "purpose": "atagia_bench_answer_generation",
                     "question_id": question_id,
@@ -723,15 +889,17 @@ class AtagiaBenchRunner:
         questions: list[AtagiaBenchQuestion],
         category_filter: set[str] | None,
         question_filter: set[str] | None,
+        exclude_question_filter: set[str] | None = None,
     ) -> list[AtagiaBenchQuestion]:
         """Filter questions by category tags if a filter is provided."""
-        if category_filter is None and question_filter is None:
+        if category_filter is None and question_filter is None and exclude_question_filter is None:
             return questions
         return [
             q for q in questions
             if (
                 (category_filter is None or category_filter.intersection(q.category_tags))
                 and (question_filter is None or q.question_id in question_filter)
+                and (exclude_question_filter is None or q.question_id not in exclude_question_filter)
             )
         ]
 
@@ -744,6 +912,10 @@ class AtagiaBenchRunner:
         persona_ids: list[str],
         category_tags: list[str] | None,
         question_ids: list[str] | None,
+        exclude_question_ids: list[str] | None,
+        benchmark_split: str,
+        holdout_question_ids: list[str] | None,
+        ablation: AblationConfig | None,
         trusted_evaluation: bool,
     ) -> AtagiaBenchReport:
         """Build the aggregated benchmark report."""
@@ -790,7 +962,17 @@ class AtagiaBenchRunner:
                 "embedding_backend": self._embedding_backend,
                 "category_filter": category_tags,
                 "question_filter": question_ids,
+                "exclude_question_filter": exclude_question_ids,
+                "benchmark_split": benchmark_split,
+                "holdout_question_ids": holdout_question_ids,
+                "ablation_config": (
+                    ablation.model_dump(mode="json", exclude_none=True)
+                    if ablation is not None
+                    else None
+                ),
                 "trusted_evaluation": trusted_evaluation,
+                "warning_counts": self._aggregate_warning_counts(results),
+                "retrieval_custody_summary": self._aggregate_retrieval_custody_summary(results),
             },
             personas_used=persona_ids,
             total_questions=total,
@@ -802,6 +984,147 @@ class AtagiaBenchRunner:
             per_category=per_category,
         )
 
+    def build_run_manifest(
+        self,
+        report: AtagiaBenchReport,
+        *,
+        report_path: str | Path,
+        diff_path: str | Path | None = None,
+        holdout_path: str | Path | None = None,
+        custody_path: str | Path | None = None,
+        taxonomy_path: str | Path | None = None,
+        failure_taxonomy_summary: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build an auditable manifest for one saved Atagia-bench report."""
+        report_file = Path(report_path).expanduser()
+        diff_file = Path(diff_path).expanduser() if diff_path is not None else None
+        custody_file = (
+            Path(custody_path).expanduser()
+            if custody_path is not None
+            else None
+        )
+        taxonomy_file = (
+            Path(taxonomy_path).expanduser()
+            if taxonomy_path is not None
+            else None
+        )
+        resolved_holdout_path = (
+            Path(holdout_path).expanduser()
+            if holdout_path is not None
+            else _DEFAULT_HOLDOUT_PATH
+        )
+        return {
+            "manifest_kind": "atagia_bench_run_manifest",
+            "benchmark_name": report.benchmark_name,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "report_timestamp": report.timestamp,
+            "report_path": str(report_file),
+            "report_sha256": sha256_file_if_exists(report_file),
+            "diff_path": str(diff_file) if diff_file is not None else None,
+            "diff_sha256": (
+                sha256_file_if_exists(diff_file)
+                if diff_file is not None
+                else None
+            ),
+            "custody_path": (
+                str(custody_file)
+                if custody_file is not None
+                else None
+            ),
+            "custody_sha256": (
+                sha256_file_if_exists(custody_file)
+                if custody_file is not None
+                else None
+            ),
+            "taxonomy_path": (
+                str(taxonomy_file)
+                if taxonomy_file is not None
+                else None
+            ),
+            "taxonomy_sha256": (
+                sha256_file_if_exists(taxonomy_file)
+                if taxonomy_file is not None
+                else None
+            ),
+            "dataset": {
+                "path": str(self._adapter.data_dir),
+                "sha256": sha256_directory(self._adapter.data_dir),
+                "holdout_path": str(resolved_holdout_path),
+                "holdout_sha256": (
+                    sha256_file(resolved_holdout_path)
+                    if resolved_holdout_path.exists()
+                    else ""
+                ),
+            },
+            "manifests": {
+                "path": str(self._manifests_dir),
+                "sha256": sha256_directory(self._manifests_dir),
+            },
+            "migrations": benchmark_migration_metadata(),
+            "git": _git_state(),
+            "config": report.config,
+            "selection": _selection_summary(report),
+            "retrieval_custody_summary": report.config.get(
+                "retrieval_custody_summary",
+                {},
+            ),
+            "failure_taxonomy_summary": failure_taxonomy_summary or {},
+            "diagnosis_bucket_counts": self._trace_field_counts(
+                report.per_question,
+                "diagnosis_bucket",
+            ),
+            "sufficiency_diagnostic_counts": self._trace_field_counts(
+                report.per_question,
+                "sufficiency_diagnostic",
+            ),
+            "result_summary": {
+                "total_questions": report.total_questions,
+                "total_passed": report.total_passed,
+                "pass_rate": report.pass_rate,
+                "avg_score": report.avg_score,
+                "critical_error_count": report.critical_error_count,
+                "run_duration_seconds": report.run_duration_seconds,
+                "retrieval_time_ms": _question_result_numeric_summary(
+                    report.per_question,
+                    "retrieval_time_ms",
+                ),
+                "memories_used": _question_result_numeric_summary(
+                    report.per_question,
+                    "memories_used",
+                ),
+            },
+            "personas_used": report.personas_used,
+            "question_ids": [result.question_id for result in report.per_question],
+            "category_breakdown": [
+                stats.model_dump(mode="json") for stats in report.per_category
+            ],
+            "benchmark_questions_persisted_as_messages": False,
+        }
+
+    def save_run_manifest(
+        self,
+        report: AtagiaBenchReport,
+        *,
+        report_path: str | Path,
+        diff_path: str | Path | None = None,
+        holdout_path: str | Path | None = None,
+        custody_path: str | Path | None = None,
+        taxonomy_path: str | Path | None = None,
+        failure_taxonomy_summary: dict[str, Any] | None = None,
+    ) -> Path:
+        """Persist a benchmark run manifest beside the saved report."""
+        manifest = self.build_run_manifest(
+            report,
+            report_path=report_path,
+            diff_path=diff_path,
+            holdout_path=holdout_path,
+            custody_path=custody_path,
+            taxonomy_path=taxonomy_path,
+            failure_taxonomy_summary=failure_taxonomy_summary,
+        )
+        destination = _manifest_path_for_report(Path(report_path).expanduser())
+        return write_json_atomic(destination, manifest)
+
     @staticmethod
     def save_report(report: AtagiaBenchReport, output_dir: str | Path) -> Path:
         """Persist a benchmark report as JSON and return its path."""
@@ -809,16 +1132,76 @@ class AtagiaBenchRunner:
         output_path.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         report_path = output_path / f"atagia-bench-report-{timestamp}.json"
-        report_path.write_text(
-            json.dumps(
-                report.model_dump(mode="json"),
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
-        return report_path
+        return write_json_atomic(report_path, report.model_dump(mode="json"))
+
+
+def load_holdout_question_ids(path: str | Path = _DEFAULT_HOLDOUT_PATH) -> list[str]:
+    """Load the frozen Atagia-bench holdout question ID list."""
+    payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    question_ids = payload.get("question_ids")
+    if not isinstance(question_ids, list) or not all(isinstance(item, str) for item in question_ids):
+        raise ValueError("Holdout manifest must contain a string question_ids list")
+    return sorted(set(question_ids))
+
+
+def _question_result_numeric_summary(
+    results: list[AtagiaQuestionResult],
+    field_name: str,
+) -> dict[str, float | int | None]:
+    return summarize_numeric_values(getattr(result, field_name) for result in results)
+
+
+def _selection_summary(report: AtagiaBenchReport) -> dict[str, object]:
+    holdout_ids = report.config.get("holdout_question_ids")
+    question_filter = report.config.get("question_filter")
+    exclude_question_filter = report.config.get("exclude_question_filter")
+    return {
+        "benchmark_split": report.config.get("benchmark_split", "all"),
+        "question_filter": (
+            question_filter
+            if isinstance(question_filter, list)
+            else None
+        ),
+        "exclude_question_filter": (
+            exclude_question_filter
+            if isinstance(exclude_question_filter, list)
+            else None
+        ),
+        "holdout_question_count": (
+            len(holdout_ids)
+            if isinstance(holdout_ids, list)
+            else 0
+        ),
+        "selected_question_count": len(report.per_question),
+    }
+
+
+def _manifest_path_for_report(report_path: Path) -> Path:
+    timestamp = report_path.stem.removeprefix("atagia-bench-report-")
+    return report_path.with_name(f"atagia-bench-run-manifest-{timestamp}.json")
+
+
+def _git_state() -> dict[str, Any]:
+    def run_git(args: list[str]) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=_PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        return result.stdout.strip()
+
+    commit = run_git(["rev-parse", "HEAD"])
+    status = run_git(["status", "--short"])
+    return {
+        "commit": commit,
+        "dirty": bool(status),
+        "status_short": status,
+    }
 
 
 def _is_critical(result: AtagiaQuestionResult) -> bool:

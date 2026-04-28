@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+import json
 from typing import Any
 
 from openai import (
@@ -25,6 +26,7 @@ from atagia.services.llm_client import (
     LLMError,
     LLMProvider,
     LLMStreamEvent,
+    OutputLimitExceededError,
     TransientLLMError,
 )
 
@@ -53,6 +55,11 @@ def _usage_to_dict(usage: Any) -> dict[str, Any]:
     return {}
 
 
+def _is_transient_status_error(exc: APIStatusError) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    return status_code == 429 or (isinstance(status_code, int) and status_code >= 500)
+
+
 def _stringify_content(content: Any) -> str:
     if content is None:
         return ""
@@ -69,6 +76,73 @@ def _stringify_content(content: Any) -> str:
 def _uses_max_completion_tokens(model: str) -> bool:
     model_lower = model.lower()
     return model_lower.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+_TRUNCATION_FINISH_REASONS = frozenset({"length"})
+_BLOCKED_FINISH_REASONS = frozenset({"content_filter"})
+_TRANSIENT_FINISH_REASONS = frozenset({"error"})
+_SUCCESS_FINISH_REASONS = frozenset({"stop", "tool_calls", "function_call"})
+
+
+def _finish_reason_label(value: Any) -> str | None:
+    if value is None:
+        return None
+    label = str(value).strip().lower()
+    return label or None
+
+
+def _choice_finish_reason(choice: Any) -> str | None:
+    return _finish_reason_label(_getattr_or_key(choice, "finish_reason"))
+
+
+def _choice_error_detail(choice: Any) -> str | None:
+    error = _getattr_or_key(choice, "error")
+    if error is None:
+        return None
+    message = _getattr_or_key(error, "message")
+    if message:
+        return str(message)
+    if isinstance(error, dict) and error:
+        return json.dumps(error, sort_keys=True)
+    return str(error)
+
+
+def _finish_reason_error(
+    provider_name: str,
+    finish_reason: str | None,
+    *,
+    choice: Any = None,
+) -> LLMError | None:
+    if finish_reason is None or finish_reason in _SUCCESS_FINISH_REASONS:
+        return None
+    if finish_reason in _TRUNCATION_FINISH_REASONS:
+        return OutputLimitExceededError(
+            f"{provider_name} stopped because it reached max output tokens "
+            f"(finish_reason={finish_reason})"
+        )
+    if finish_reason in _BLOCKED_FINISH_REASONS:
+        return LLMError(
+            f"{provider_name} blocked the response (finish_reason={finish_reason})"
+        )
+    if finish_reason in _TRANSIENT_FINISH_REASONS:
+        detail = _choice_error_detail(choice)
+        suffix = f": {detail}" if detail else ""
+        return TransientLLMError(
+            f"{provider_name} returned retryable finish reason: {finish_reason}{suffix}"
+        )
+    return LLMError(
+        f"{provider_name} returned unsupported finish reason: {finish_reason}"
+    )
+
+
+def _empty_content_error(
+    provider_name: str,
+    finish_reason: str | None,
+) -> TransientLLMError:
+    label = finish_reason or "unknown"
+    return TransientLLMError(
+        f"{provider_name} returned no output content (finish_reason={label})"
+    )
 
 
 def _openai_messages(request: LLMCompletionRequest) -> list[dict[str, Any]]:
@@ -126,28 +200,28 @@ def _has_free_form_objects(schema: dict[str, Any]) -> bool:
     )
 
 
-def _add_additional_properties_false(schema: dict[str, Any]) -> dict[str, Any]:
-    """Add ``additionalProperties: false`` to objects that have ``properties``.
+def _sanitize_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a schema for OpenAI strict structured outputs.
 
-    Only touches structured objects (those with explicit property definitions).
-    Bare ``{"type": "object"}`` nodes (from ``dict[str, Any]``) are left
-    untouched so they remain valid free-form maps.
+    OpenAI requires strict schemas to set ``additionalProperties: false`` on
+    every object and to list every declared property in ``required``. Optional
+    Pydantic fields remain optional semantically by accepting ``null`` or their
+    default value, but the model must emit the key.
     """
     if not isinstance(schema, dict):
         return schema
     result = dict(schema)
-    if (
-        result.get("type") == "object"
-        and "properties" in result
-        and "additionalProperties" not in result
-    ):
-        result["additionalProperties"] = False
+    result.pop("default", None)
+    properties = result.get("properties")
+    if result.get("type") == "object" and isinstance(properties, dict):
+        result.setdefault("additionalProperties", False)
+        result["required"] = list(properties)
     for key, value in result.items():
         if isinstance(value, dict):
-            result[key] = _add_additional_properties_false(value)
+            result[key] = _sanitize_strict_schema(value)
         elif isinstance(value, list):
             result[key] = [
-                _add_additional_properties_false(item) if isinstance(item, dict) else item
+                _sanitize_strict_schema(item) if isinstance(item, dict) else item
                 for item in value
             ]
     return result
@@ -157,7 +231,7 @@ def _response_format(schema: dict[str, Any] | None) -> dict[str, Any] | None:
     if schema is None:
         return None
     strict = not _has_free_form_objects(schema)
-    sanitized = _add_additional_properties_false(schema) if strict else schema
+    sanitized = _sanitize_strict_schema(schema) if strict else schema
     return {
         "type": "json_schema",
         "json_schema": {
@@ -205,6 +279,9 @@ class OpenAICompatibleProvider(LLMProvider):
             kwargs["user"] = str(request.metadata["user_id"])
         if request.metadata.get("reasoning_effort"):
             kwargs["reasoning_effort"] = request.metadata["reasoning_effort"]
+        provider_extra_body = request.metadata.get("provider_extra_body")
+        if isinstance(provider_extra_body, dict) and provider_extra_body:
+            kwargs["extra_body"] = provider_extra_body
         if request.metadata.get("verbosity"):
             kwargs["verbosity"] = request.metadata["verbosity"]
         if request.temperature is not None and not _uses_max_completion_tokens(request.model):
@@ -225,6 +302,7 @@ class OpenAICompatibleProvider(LLMProvider):
         choices = _getattr_or_key(response, "choices", [])
         first_choice = choices[0] if choices else None
         message = _getattr_or_key(first_choice, "message")
+        finish_reason = _choice_finish_reason(first_choice)
         tool_calls = []
         for tool_call in _getattr_or_key(message, "tool_calls", []) or []:
             function = _getattr_or_key(tool_call, "function", {})
@@ -236,12 +314,23 @@ class OpenAICompatibleProvider(LLMProvider):
                     "arguments": _getattr_or_key(function, "arguments", ""),
                 }
             )
+        output_text = _stringify_content(_getattr_or_key(message, "content"))
+        finish_error = _finish_reason_error(
+            self.name,
+            finish_reason,
+            choice=first_choice,
+        )
+        if finish_error is not None:
+            raise finish_error
+        if not output_text and not tool_calls:
+            raise _empty_content_error(self.name, finish_reason)
 
         return LLMCompletionResponse(
             provider=self.name,
-            model=_getattr_or_key(response, "model", request.model),
-            output_text=_stringify_content(_getattr_or_key(message, "content")),
-            thinking=_getattr_or_key(message, "reasoning", None),
+            model=str(_getattr_or_key(response, "model", None) or request.model),
+            output_text=output_text,
+            thinking=_getattr_or_key(message, "reasoning", None)
+            or _getattr_or_key(message, "reasoning_content", None),
             tool_calls=tool_calls,
             usage=_usage_to_dict(_getattr_or_key(response, "usage")),
             raw_response=_model_dump(response),
@@ -250,9 +339,17 @@ class OpenAICompatibleProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         try:
             response = await self._client.chat.completions.create(**self._completion_kwargs(request, stream=False))
+        except json.JSONDecodeError as exc:
+            raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
-        except (BadRequestError, APIStatusError, APIError) as exc:
+        except BadRequestError as exc:
+            raise LLMError(str(exc)) from exc
+        except APIStatusError as exc:
+            if _is_transient_status_error(exc):
+                raise TransientLLMError(str(exc)) from exc
+            raise LLMError(str(exc)) from exc
+        except APIError as exc:
             raise LLMError(str(exc)) from exc
         return self._map_completion_response(request, response)
 
@@ -267,9 +364,17 @@ class OpenAICompatibleProvider(LLMProvider):
             kwargs["user"] = str(request.metadata["user_id"])
         try:
             response = await self._client.embeddings.create(**kwargs)
+        except json.JSONDecodeError as exc:
+            raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
-        except (BadRequestError, APIStatusError, APIError) as exc:
+        except BadRequestError as exc:
+            raise LLMError(str(exc)) from exc
+        except APIStatusError as exc:
+            if _is_transient_status_error(exc):
+                raise TransientLLMError(str(exc)) from exc
+            raise LLMError(str(exc)) from exc
+        except APIError as exc:
             raise LLMError(str(exc)) from exc
 
         vectors = [
@@ -278,7 +383,7 @@ class OpenAICompatibleProvider(LLMProvider):
         ]
         return LLMEmbeddingResponse(
             provider=self.name,
-            model=_getattr_or_key(response, "model", request.model),
+            model=str(_getattr_or_key(response, "model", None) or request.model),
             vectors=vectors,
             raw_response=_model_dump(response),
         )
@@ -286,13 +391,24 @@ class OpenAICompatibleProvider(LLMProvider):
     async def stream(self, request: LLMCompletionRequest) -> AsyncIterator[LLMStreamEvent]:
         try:
             stream = await self._client.chat.completions.create(**self._completion_kwargs(request, stream=True))
+        except json.JSONDecodeError as exc:
+            raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
-        except (BadRequestError, APIStatusError, APIError) as exc:
+        except BadRequestError as exc:
+            raise LLMError(str(exc)) from exc
+        except APIStatusError as exc:
+            if _is_transient_status_error(exc):
+                raise TransientLLMError(str(exc)) from exc
+            raise LLMError(str(exc)) from exc
+        except APIError as exc:
             raise LLMError(str(exc)) from exc
 
         usage: dict[str, Any] = {}
         tool_buffers: dict[int, dict[str, Any]] = {}
+        emitted_output_or_tool = False
+        pending_error: Exception | None = None
+        last_finish_reason: str | None = None
 
         try:
             async for chunk in stream:
@@ -310,6 +426,7 @@ class OpenAICompatibleProvider(LLMProvider):
 
                     content = _getattr_or_key(delta, "content")
                     if content:
+                        emitted_output_or_tool = True
                         yield LLMStreamEvent(type="text", content=content)
 
                     for tool_call in _getattr_or_key(delta, "tool_calls", []) or []:
@@ -332,18 +449,44 @@ class OpenAICompatibleProvider(LLMProvider):
                         if arguments:
                             buffer["arguments"] += arguments
 
-                    if _getattr_or_key(choice, "finish_reason") == "tool_calls":
+                    finish_reason = _choice_finish_reason(choice)
+                    if finish_reason is not None:
+                        last_finish_reason = finish_reason
+                    if finish_reason == "tool_calls":
                         for index in sorted(tool_buffers):
+                            emitted_output_or_tool = True
                             yield LLMStreamEvent(type="tool_call", payload=tool_buffers[index])
                         tool_buffers.clear()
+                    finish_error = _finish_reason_error(
+                        self.name,
+                        finish_reason,
+                        choice=choice,
+                    )
+                    if finish_error is not None:
+                        pending_error = finish_error
+                        break
+                if pending_error is not None:
+                    break
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
-        except (BadRequestError, APIStatusError, APIError) as exc:
+        except BadRequestError as exc:
+            raise LLMError(str(exc)) from exc
+        except APIStatusError as exc:
+            if _is_transient_status_error(exc):
+                raise TransientLLMError(str(exc)) from exc
+            raise LLMError(str(exc)) from exc
+        except APIError as exc:
             raise LLMError(str(exc)) from exc
 
-        for index in sorted(tool_buffers):
-            yield LLMStreamEvent(type="tool_call", payload=tool_buffers[index])
+        if pending_error is None:
+            for index in sorted(tool_buffers):
+                emitted_output_or_tool = True
+                yield LLMStreamEvent(type="tool_call", payload=tool_buffers[index])
+        if pending_error is None and not emitted_output_or_tool:
+            pending_error = _empty_content_error(self.name, last_finish_reason)
         yield LLMStreamEvent(type="done", payload={"usage": usage})
+        if pending_error is not None:
+            raise pending_error
 
 
 class OpenAIProvider(OpenAICompatibleProvider):

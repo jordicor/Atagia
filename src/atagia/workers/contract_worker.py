@@ -28,7 +28,7 @@ from atagia.models.schemas_memory import (
     ExtractionContextMessage,
     ExtractionConversationContext,
 )
-from atagia.services.llm_client import LLMClient
+from atagia.services.llm_client import LLMClient, StructuredOutputError
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
@@ -99,7 +99,15 @@ class ContractWorker:
                 acked += 1
             except Exception as exc:
                 failed += 1
-                logger.exception("Failed to process contract job %s", message.message_id)
+                if isinstance(exc, StructuredOutputError):
+                    details = "; ".join(exc.details) if exc.details else str(exc)
+                    logger.warning(
+                        "Failed to process contract job %s due to structured output: %s",
+                        message.message_id,
+                        details,
+                    )
+                else:
+                    logger.exception("Failed to process contract job %s", message.message_id)
                 if await self._dead_letter_if_exhausted(message, exc):
                     dead_lettered += 1
         return WorkerIterationResult(
@@ -198,6 +206,11 @@ class ContractWorker:
                 "delivery_count": message.delivery_count,
                 "payload": message.payload,
                 "error": str(exc),
+                "error_details": (
+                    list(exc.details)
+                    if isinstance(exc, StructuredOutputError)
+                    else []
+                ),
             },
         )
         await self._storage_backend.stream_ack(

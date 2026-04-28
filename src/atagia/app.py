@@ -18,7 +18,12 @@ from atagia.api.routes_memory import router as memory_router
 from atagia.api.routes_verbatim_pins import router as verbatim_pins_router
 from atagia.core.clock import Clock, SystemClock
 from atagia.core.config import Settings
-from atagia.core.db_sqlite import initialize_database, open_connection, resolve_runtime_database_path
+from atagia.core.db_sqlite import (
+    close_connection,
+    initialize_database,
+    open_connection,
+    resolve_runtime_database_path,
+)
 from atagia.core.redis_client import RedisBackend
 from atagia.core.storage_backend import InProcessBackend, StorageBackend
 from atagia.memory.operational_profile import OperationalProfileLoader
@@ -31,8 +36,10 @@ from atagia.models.schemas_jobs import (
     REVISE_STREAM_NAME,
     WORKER_GROUP_NAME,
 )
+from atagia.services.artifact_blob_store import ArtifactBlobStore
 from atagia.services.embeddings import EmbeddingIndex, create_embedding_index
 from atagia.services.llm_client import ConfigurationError, LLMClient
+from atagia.services.model_resolution import log_resolution
 from atagia.services.providers import build_llm_client
 from atagia.workers.compaction_worker import CompactionWorker
 from atagia.workers.contract_worker import ContractWorker
@@ -56,6 +63,7 @@ class AppRuntime:
     policy_resolver: PolicyResolver
     llm_client: LLMClient[Any]
     embedding_index: EmbeddingIndex
+    artifact_blob_store: ArtifactBlobStore | None
     storage_backend: StorageBackend
     ingest_worker: IngestWorker | None
     contract_worker: ContractWorker | None
@@ -96,16 +104,22 @@ class AppRuntime:
             await asyncio.gather(*bg_tasks, return_exceptions=True)
         await self.storage_backend.close()
         for worker_connection in self.worker_connections:
-            await worker_connection.close()
+            await close_connection(worker_connection)
         if self.embedding_connection is not None:
-            await self.embedding_connection.close()
-        await self.bootstrap_connection.close()
+            await close_connection(self.embedding_connection)
+        await close_connection(self.bootstrap_connection)
 
 
 def _build_storage_backend(settings: Settings) -> StorageBackend:
     if settings.storage_backend == "redis":
         return RedisBackend(settings.redis_url)
     return InProcessBackend()
+
+
+def _build_artifact_blob_store(settings: Settings) -> ArtifactBlobStore | None:
+    if settings.artifact_blob_storage_kind == "local_file":
+        return ArtifactBlobStore(settings.artifact_blobs_dir())
+    return None
 
 
 def _validate_settings(settings: Settings) -> None:
@@ -152,6 +166,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
         )
         operational_profile_loader = OperationalProfileLoader(settings.operational_profiles_dir())
         operational_profiles = operational_profile_loader.load_all()
+        log_resolution(settings)
         llm_client = build_llm_client(settings)
         if settings.embedding_backend != "none":
             embedding_connection = await open_connection(database_path)
@@ -160,6 +175,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             embedding_connection or bootstrap_connection,
             llm_client,
         )
+        artifact_blob_store = _build_artifact_blob_store(settings)
         storage_backend = _build_storage_backend(settings)
         ingest_worker: IngestWorker | None = None
         contract_worker: ContractWorker | None = None
@@ -261,6 +277,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             policy_resolver=PolicyResolver(),
             llm_client=llm_client,
             embedding_index=embedding_index,
+            artifact_blob_store=artifact_blob_store,
             storage_backend=storage_backend,
             ingest_worker=ingest_worker,
             contract_worker=contract_worker,
@@ -281,10 +298,10 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
         if storage_backend is not None:
             await storage_backend.close()
         for worker_connection in worker_connections:
-            await worker_connection.close()
+            await close_connection(worker_connection)
         if embedding_connection is not None:
-            await embedding_connection.close()
-        await bootstrap_connection.close()
+            await close_connection(embedding_connection)
+        await close_connection(bootstrap_connection)
         raise
 
 

@@ -63,8 +63,8 @@ from atagia import Atagia
 
 async with Atagia(
     db_path="memory.db",
-    llm_provider="anthropic",      # or "openai", "openrouter"
-    llm_api_key="sk-ant-...",
+    anthropic_api_key="sk-ant-...",
+    llm_forced_global_model="anthropic/claude-sonnet-4-6",
 ) as engine:
     # Create resources
     await engine.create_user("user_1")
@@ -107,8 +107,8 @@ from atagia.client import connect_atagia
 client = await connect_atagia(
     transport="local",
     db_path="memory.db",
-    llm_provider="anthropic",
-    llm_api_key="sk-ant-...",
+    anthropic_api_key="sk-ant-...",
+    llm_forced_global_model="anthropic/claude-sonnet-4-6",
 )
 
 context = await client.get_context(
@@ -192,28 +192,52 @@ Messages accept an optional `occurred_at` ISO timestamp for historical data wher
 | `redis_url` | `None` | Optional Redis URL for cache and queues |
 | `manifests_dir` | Built-in | Directory with assistant mode JSON manifests |
 | `operational_profiles_dir` | Built-in | Directory with canonical operational profile JSON presets |
-| `llm_provider` | From env | `"anthropic"`, `"openai"`, or `"openrouter"` |
-| `llm_api_key` | From env | API key for the LLM provider |
-| `llm_model` | From env | Model name for extraction, scoring, and chat |
+| `anthropic_api_key` / `openai_api_key` / `google_api_key` / `openrouter_api_key` | From env | Provider-specific LLM API keys |
+| `llm_forced_global_model` | From env | Optional `provider/model[,thinking_level]` override for all LLM-backed components |
+| `llm_model` | `None` | Legacy constructor shortcut, converted with `llm_provider` to `llm_forced_global_model` |
 | `embedding_backend` | `"none"` | `"none"` or `"sqlite_vec"` |
-| `embedding_provider_name` | From env | Optional override for which provider handles embeddings |
-| `embedding_model` | `None` | Embedding model name (required when backend is `sqlite_vec`) |
+| `embedding_model` | `openai/text-embedding-3-small` | Provider-qualified embedding model |
 | `context_cache_enabled` | `True` | Enable adaptive context caching |
 | `chunking_enabled` | From env (`False` by default) | Enable intelligent chunking for long messages |
 | `skip_belief_revision` | `False` | Disable belief revision (for benchmarks/ablation) |
 | `skip_compaction` | `False` | Disable compaction (for benchmarks/ablation) |
 
-SQLite is the only required storage dependency. An LLM API (Anthropic, OpenAI, or OpenRouter) is required for memory extraction, scoring, and chat. Redis accelerates queues and caching but is optional -- the engine works without it using in-process queues.
+SQLite is the only required storage dependency. LLM models are configured per
+component with provider-qualified specs such as `anthropic/claude-sonnet-4-6`
+or `openrouter/google/gemini-3.1-flash-lite-preview`. Redis accelerates queues
+and caching but is optional -- the engine works without it using in-process
+queues.
 
-For a dual-provider setup, a common production shape is Anthropic for chat/extraction/scoring plus sqlite-vec embeddings on OpenAI or OpenRouter. Example env:
+The built-in defaults use OpenRouter-hosted Gemini Flash-Lite for Tier 1/Tier 2
+ingest and retrieval intelligence, while privacy, consent, PII, and chat
+components stay on Anthropic Claude Sonnet. The default runtime therefore
+requires both `ATAGIA_OPENROUTER_API_KEY` and `ATAGIA_ANTHROPIC_API_KEY`. To run
+every component on one provider, set `ATAGIA_LLM_FORCED_GLOBAL_MODEL`.
+
+Example mixed-provider env:
 
 ```bash
-ATAGIA_LLM_PROVIDER=anthropic
-ATAGIA_LLM_API_KEY=your-anthropic-key
+ATAGIA_ANTHROPIC_API_KEY=your-anthropic-key
+ATAGIA_OPENROUTER_API_KEY=your-openrouter-key
 ATAGIA_OPENAI_API_KEY=your-openai-key
 ATAGIA_EMBEDDING_BACKEND=sqlite_vec
-ATAGIA_EMBEDDING_PROVIDER=openai
-ATAGIA_EMBEDDING_MODEL=text-embedding-3-small
+ATAGIA_EMBEDDING_MODEL=openai/text-embedding-3-small
+ATAGIA_EMBEDDING_DIMENSION=1536
+```
+
+Single-provider development env:
+
+```bash
+ATAGIA_ANTHROPIC_API_KEY=your-anthropic-key
+ATAGIA_LLM_FORCED_GLOBAL_MODEL=anthropic/claude-sonnet-4-6
+```
+
+Gemini can be used natively with the Google Gen AI SDK:
+
+```bash
+ATAGIA_GOOGLE_API_KEY=your-google-key
+ATAGIA_LLM_FORCED_GLOBAL_MODEL=google/gemini-3-flash-preview
+ATAGIA_EMBEDDING_MODEL=google/gemini-embedding-2
 ATAGIA_EMBEDDING_DIMENSION=1536
 ```
 
@@ -232,8 +256,8 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
       "command": "/path/to/.venv/bin/atagia-mcp",
       "env": {
         "ATAGIA_DB_PATH": "/path/to/memory.db",
-        "ATAGIA_LLM_PROVIDER": "anthropic",
-        "ATAGIA_LLM_API_KEY": "sk-ant-..."
+        "ATAGIA_ANTHROPIC_API_KEY": "sk-ant-...",
+        "ATAGIA_LLM_FORCED_GLOBAL_MODEL": "anthropic/claude-sonnet-4-6"
       }
     }
   }
@@ -448,7 +472,7 @@ Current internal signal: 60/64 pass rate (93.8%), with remaining failures concen
 
 ## Benchmarking
 
-Atagia includes a LoCoMo benchmark harness with a dataset downloader, LLM judge scorer, correction overlays, ablation presets, diff reporting, and CLI summary output.
+Atagia includes a LoCoMo benchmark harness with a dataset downloader, LLM judge scorer, correction overlays, ablation presets, diff reporting, failed-question custody reports, run manifests, and CLI summary output.
 
 ```bash
 python -m benchmarks.locomo.download
@@ -458,6 +482,28 @@ python -m benchmarks.locomo \
   --model claude-sonnet-4-6 \
   --max-questions 25
 ```
+
+Retained LoCoMo DB snapshots can be listed in text or JSON form:
+
+```bash
+python -m benchmarks.locomo --list-benchmark-dbs
+python -m benchmarks.locomo --list-benchmark-dbs-json
+```
+
+The JSON form includes DB/WAL/SHM byte counts, file mtimes, metadata/progress
+hashes, and best-effort SQLite row counts, which is useful for checking
+long-running retained-DB ingests.
+
+Active retained-DB runs can also be inspected without waiting for a final report:
+
+```bash
+python -m benchmarks.locomo --summarize-run-log docs/tmp/night_run/run.log
+python -m benchmarks.locomo --diff-benchmark-db-list before.json after.json
+```
+
+Benchmark reports, diffs, custody reports, and run manifests carry warning
+counters, selection metadata, retrieval latency and memory-use summaries, and
+retrieval-custody summaries for reproducible regression review.
 
 Available ablation presets: `similarity_only`, `no_contract`, `no_scope`, `no_need_detection`, `no_revision`, `no_compaction`.
 

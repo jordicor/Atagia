@@ -8,10 +8,15 @@ from typing import Any
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
+from atagia.core.llm_output_limits import CONSEQUENCE_DETECTOR_MAX_OUTPUT_TOKENS
 from atagia.models.schemas_memory import ConsequenceSignal, ExtractionConversationContext
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
-
-DEFAULT_CLASSIFIER_MODEL = "claude-sonnet-4-6"
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMMessage,
+    StructuredOutputError,
+)
+from atagia.services.model_resolution import resolve_component_model
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +26,8 @@ _DATA_ONLY_INSTRUCTION = (
 )
 
 _PROMPT_TEMPLATE = """Return JSON only, matching the schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 
 Determine whether the user is explicitly reporting the outcome or consequence of
 something the assistant previously recommended, suggested, or did.
@@ -66,11 +73,9 @@ class ConsequenceDetector:
         self._llm_client = llm_client
         self._clock = clock
         resolved_settings = settings or Settings.from_env()
-        self._classifier_model = (
-            resolved_settings.llm_classifier_model
-            or resolved_settings.llm_scoring_model
-            or resolved_settings.llm_extraction_model
-            or DEFAULT_CLASSIFIER_MODEL
+        self._classifier_model = resolve_component_model(
+            resolved_settings,
+            "consequence_detector",
         )
 
     async def detect(
@@ -103,6 +108,7 @@ class ConsequenceDetector:
                 ),
             ],
             temperature=0.0,
+            max_output_tokens=CONSEQUENCE_DETECTOR_MAX_OUTPUT_TOKENS,
             response_schema=ConsequenceSignal.model_json_schema(),
             metadata={
                 "user_id": conversation_context.user_id,
@@ -113,6 +119,13 @@ class ConsequenceDetector:
         )
         try:
             signal = await self._llm_client.complete_structured(request, ConsequenceSignal)
+        except StructuredOutputError as exc:
+            details = "; ".join(exc.details) if exc.details else str(exc)
+            logger.warning(
+                "Consequence detector structured-output fallback to None: %s",
+                details,
+            )
+            return None
         except Exception:
             logger.warning("Consequence detector fallback to None", exc_info=True)
             return None

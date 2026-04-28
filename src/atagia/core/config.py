@@ -2,14 +2,32 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import logging
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from atagia.services.model_resolution import (
+    DEFAULT_EMBEDDING_MODEL,
+    component_env_models_from_env,
+)
+
 
 _DOTENV_LOADED = False
+logger = logging.getLogger(__name__)
+_LEGACY_LLM_ENV_VARS = (
+    "ATAGIA_LLM_PROVIDER",
+    "ATAGIA_LLM_API_KEY",
+    "ATAGIA_LLM_BASE_URL",
+    "ATAGIA_LLM_EXTRACTION_MODEL",
+    "ATAGIA_LLM_SCORING_MODEL",
+    "ATAGIA_LLM_CLASSIFIER_MODEL",
+    "ATAGIA_EMBEDDING_PROVIDER",
+    "ATAGIA_PRIVACY_VALIDATION_GATE_JUDGE_MODEL",
+    "ATAGIA_PRIVACY_VALIDATION_GATE_REFINER_MODEL",
+)
 
 
 def _load_dotenv_once() -> None:
@@ -74,7 +92,18 @@ class Settings:
     admin_api_key: str | None
     workers_enabled: bool
     debug: bool
+    anthropic_api_key: str | None = None
+    google_api_key: str | None = None
+    anthropic_base_url: str | None = None
+    openai_base_url: str | None = None
+    openrouter_base_url: str | None = None
+    llm_forced_global_model: str | None = None
+    llm_ingest_model: str | None = None
+    llm_retrieval_model: str | None = None
+    llm_component_models: dict[str, str] = field(default_factory=dict)
     operational_profiles_path: str = "./operational_profiles"
+    artifact_blob_storage_kind: str = "sqlite_blob"
+    artifact_blob_storage_path: str = "./data/artifact_blobs"
     allow_admin_export_anonymization: bool = False
     allow_insecure_http: bool = False
     embedding_provider_name: str | None = None
@@ -170,6 +199,10 @@ class Settings:
             raise ValueError("operational_allowed_profiles must contain at least one profile")
         if any(not profile_id.strip() for profile_id in self.operational_allowed_profiles):
             raise ValueError("operational_allowed_profiles cannot contain blank profile ids")
+        if self.artifact_blob_storage_kind not in {"sqlite_blob", "local_file"}:
+            raise ValueError("artifact_blob_storage_kind must be 'sqlite_blob' or 'local_file'")
+        if self.artifact_blob_storage_kind == "local_file" and not self.artifact_blob_storage_path.strip():
+            raise ValueError("artifact_blob_storage_path is required for local_file artifact storage")
         if not 0.0 <= self.small_corpus_token_threshold_ratio <= 1.0:
             raise ValueError(
                 "small_corpus_token_threshold_ratio must be in the interval [0.0, 1.0]"
@@ -190,6 +223,14 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         _load_dotenv_once()
+        for env_name in _LEGACY_LLM_ENV_VARS:
+            if (os.getenv(env_name) or "").strip():
+                logger.warning(
+                    "%s is a legacy LLM configuration variable and is ignored by "
+                    "model resolution. Use provider-qualified model variables and "
+                    "provider-specific API keys instead.",
+                    env_name,
+                )
         return cls(
             sqlite_path=os.getenv("ATAGIA_SQLITE_PATH", "./data/atagia.db"),
             migrations_path=os.getenv("ATAGIA_MIGRATIONS_PATH", "./migrations"),
@@ -198,13 +239,25 @@ class Settings:
                 "ATAGIA_OPERATIONAL_PROFILES_PATH",
                 "./operational_profiles",
             ),
+            artifact_blob_storage_kind=os.getenv(
+                "ATAGIA_ARTIFACT_BLOB_STORAGE_KIND",
+                "sqlite_blob",
+            ).strip().lower(),
+            artifact_blob_storage_path=os.getenv(
+                "ATAGIA_ARTIFACT_BLOB_STORAGE_PATH",
+                "./data/artifact_blobs",
+            ),
             storage_backend=os.getenv("ATAGIA_STORAGE_BACKEND", "inprocess").strip().lower(),
             redis_url=os.getenv("ATAGIA_REDIS_URL", "redis://localhost:6379/0"),
             llm_provider=os.getenv("ATAGIA_LLM_PROVIDER", "anthropic").strip().lower(),
             llm_api_key=os.getenv("ATAGIA_LLM_API_KEY") or None,
+            anthropic_api_key=os.getenv("ATAGIA_ANTHROPIC_API_KEY") or None,
             openai_api_key=os.getenv("ATAGIA_OPENAI_API_KEY") or None,
             openrouter_api_key=os.getenv("ATAGIA_OPENROUTER_API_KEY") or None,
             llm_base_url=os.getenv("ATAGIA_LLM_BASE_URL") or None,
+            anthropic_base_url=os.getenv("ATAGIA_ANTHROPIC_BASE_URL") or None,
+            openai_base_url=os.getenv("ATAGIA_OPENAI_BASE_URL") or None,
+            openrouter_base_url=os.getenv("ATAGIA_OPENROUTER_BASE_URL") or None,
             openrouter_site_url=os.getenv("ATAGIA_OPENROUTER_SITE_URL", "http://localhost"),
             openrouter_app_name=os.getenv("ATAGIA_OPENROUTER_APP_NAME", "Atagia"),
             llm_extraction_model=os.getenv("ATAGIA_LLM_EXTRACTION_MODEL") or None,
@@ -215,6 +268,10 @@ class Settings:
                 or None
             ),
             llm_chat_model=os.getenv("ATAGIA_LLM_CHAT_MODEL") or None,
+            llm_forced_global_model=os.getenv("ATAGIA_LLM_FORCED_GLOBAL_MODEL") or None,
+            llm_ingest_model=os.getenv("ATAGIA_LLM_INGEST_MODEL") or None,
+            llm_retrieval_model=os.getenv("ATAGIA_LLM_RETRIEVAL_MODEL") or None,
+            llm_component_models=component_env_models_from_env(os.environ),
             embedding_provider_name=os.getenv("ATAGIA_EMBEDDING_PROVIDER") or None,
             service_mode=_env_bool("ATAGIA_SERVICE_MODE", False),
             service_api_key=os.getenv("ATAGIA_SERVICE_API_KEY") or None,
@@ -225,9 +282,10 @@ class Settings:
             ),
             workers_enabled=_env_bool("ATAGIA_WORKERS_ENABLED", False),
             debug=_env_bool("ATAGIA_DEBUG", False),
+            google_api_key=os.getenv("ATAGIA_GOOGLE_API_KEY") or None,
             allow_insecure_http=_env_bool("ATAGIA_ALLOW_INSECURE_HTTP", False),
             embedding_backend=os.getenv("ATAGIA_EMBEDDING_BACKEND", "none").strip().lower(),
-            embedding_model=os.getenv("ATAGIA_EMBEDDING_MODEL") or None,
+            embedding_model=os.getenv("ATAGIA_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL,
             embedding_dimension=int(os.getenv("ATAGIA_EMBEDDING_DIMENSION", "1536")),
             rrf_k=int(os.getenv("ATAGIA_RRF_K", "60")),
             lifecycle_decay_days=int(os.getenv("ATAGIA_LIFECYCLE_DECAY_DAYS", "7")),
@@ -331,3 +389,7 @@ class Settings:
     def operational_profiles_dir(self, root: Path | None = None) -> Path:
         base = root or Path.cwd()
         return (base / self.operational_profiles_path).resolve()
+
+    def artifact_blobs_dir(self, root: Path | None = None) -> Path:
+        base = root or Path.cwd()
+        return (base / self.artifact_blob_storage_path).resolve()

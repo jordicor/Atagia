@@ -159,6 +159,7 @@ def _settings(**overrides: object) -> Settings:
         llm_scoring_model="score-test-model",
         llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
+        llm_forced_global_model="openai/reply-test-model",
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
@@ -479,6 +480,39 @@ async def test_ingest_worker_dead_letter_includes_structured_error_details_after
 
 
 @pytest.mark.asyncio
+async def test_ingest_worker_logs_structured_job_failure_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def fake_extract(*args, **kwargs):
+        del args, kwargs
+        raise StructuredOutputError("Provider returned invalid structured output")
+
+    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+        [],
+    )
+    try:
+        ingest_worker._extractor.extract_with_persistence_details = fake_extract
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"])).model_dump(mode="json"),
+        )
+
+        with caplog.at_level("WARNING", logger="atagia.workers.ingest_worker"):
+            result = await ingest_worker.run_once()
+
+        failure_records = [
+            record
+            for record in caplog.records
+            if "Failed to process extraction job" in record.message
+        ]
+        assert result.failed == 1
+        assert failure_records
+        assert all(record.exc_info is None for record in failure_records)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_ingest_worker_enqueues_compaction_job_for_workspace_after_threshold() -> None:
     payload = json.dumps(
         {
@@ -618,10 +652,15 @@ async def test_ingest_skips_revision_when_disabled() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ingest_treats_non_json_after_schema_fallback_as_noop() -> None:
+async def test_ingest_treats_non_json_after_schema_fallback_as_noop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     async def fake_extract(*args, **kwargs):
         del args, kwargs
-        raise StructuredOutputError("Provider returned non-JSON structured output after schema fallback")
+        raise StructuredOutputError(
+            "Provider returned non-JSON structured output after schema fallback",
+            details=("$: Response was not valid JSON.",),
+        )
 
     async def skip_side_effects(*args, **kwargs) -> None:
         del args, kwargs
@@ -638,12 +677,21 @@ async def test_ingest_treats_non_json_after_schema_fallback_as_noop() -> None:
             _extract_job(str(message["id"])).model_dump(mode="json"),
         )
 
-        result = await ingest_worker.run_once()
+        with caplog.at_level("WARNING", logger="atagia.workers.ingest_worker"):
+            result = await ingest_worker.run_once()
         stored = await memories.list_for_user("usr_1")
+        records = [
+            record
+            for record in caplog.records
+            if "after schema fallback returned non-JSON output" in record.getMessage()
+        ]
 
         assert result.acked == 1
         assert result.failed == 0
         assert stored == []
+        assert records
+        assert records[0].exc_info is None
+        assert "Traceback" not in caplog.text
     finally:
         await connection.close()
 
@@ -917,7 +965,9 @@ async def test_contract_worker_projects_even_when_ingest_already_persisted_contr
 
 
 @pytest.mark.asyncio
-async def test_contract_worker_reclaims_failed_pending_job_and_retries_successfully() -> None:
+async def test_contract_worker_reclaims_failed_pending_job_and_retries_successfully(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     payload = json.dumps(
         {
             "signals": [
@@ -940,8 +990,9 @@ async def test_contract_worker_reclaims_failed_pending_job_and_retries_successfu
     try:
         await backend.stream_add(CONTRACT_STREAM_NAME, _contract_job(str(message["id"])).model_dump(mode="json"))
 
-        first = await contract_worker.run_once()
-        second = await contract_worker.run_once()
+        with caplog.at_level("WARNING", logger="atagia.workers.contract_worker"):
+            first = await contract_worker.run_once()
+            second = await contract_worker.run_once()
 
         contract_memories = [
             row
@@ -952,6 +1003,13 @@ async def test_contract_worker_reclaims_failed_pending_job_and_retries_successfu
         assert second.acked == 1
         assert len(contract_memories) == 1
         assert len(provider.requests) == 2
+        compact_records = [
+            record
+            for record in caplog.records
+            if "due to structured output" in record.getMessage()
+        ]
+        assert compact_records
+        assert compact_records[0].exc_info is None
     finally:
         await connection.close()
 
@@ -974,6 +1032,7 @@ def test_chat_reply_enqueues_stream_jobs_and_worker_processes_extraction(tmp_pat
         llm_scoring_model="score-test-model",
         llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
+        llm_forced_global_model="openai/reply-test-model",
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
@@ -1022,59 +1081,62 @@ def test_chat_reply_enqueues_stream_jobs_and_worker_processes_extraction(tmp_pat
     with TestClient(app) as client:
         runtime = client.app.state.runtime
         connection = client.portal.call(runtime.open_connection)
-        runtime.clock = FrozenClock(datetime(2026, 3, 31, 4, 30, tzinfo=timezone.utc))
-        runtime.llm_client = LLMClient(provider_name=provider.name, providers=[provider])
+        try:
+            runtime.clock = FrozenClock(datetime(2026, 3, 31, 4, 30, tzinfo=timezone.utc))
+            runtime.llm_client = LLMClient(provider_name=provider.name, providers=[provider])
 
-        conversation = client.post(
-            "/v1/conversations",
-            json={
-                "user_id": "usr_1",
-                "assistant_mode_id": "coding_debug",
-                "workspace_id": None,
-                "title": "Debug Chat",
-                "metadata": {},
-            },
-        ).json()
+            conversation = client.post(
+                "/v1/conversations",
+                json={
+                    "user_id": "usr_1",
+                    "assistant_mode_id": "coding_debug",
+                    "workspace_id": None,
+                    "title": "Debug Chat",
+                    "metadata": {},
+                },
+            ).json()
 
-        response = client.post(
-            f"/v1/chat/{conversation['id']}/reply",
-            json={
-                "user_id": "usr_1",
-                "message_text": "I prefer concise debugging answers for retry issues.",
-                "include_thinking": False,
-                "metadata": {},
-                "debug": True,
-            },
-        )
+            response = client.post(
+                f"/v1/chat/{conversation['id']}/reply",
+                json={
+                    "user_id": "usr_1",
+                    "message_text": "I prefer concise debugging answers for retry issues.",
+                    "include_thinking": False,
+                    "metadata": {},
+                    "debug": True,
+                },
+            )
 
-        assert response.status_code == 200
-        assert len(response.json()["debug"]["enqueued_job_ids"]) == 3
+            assert response.status_code == 200
+            assert len(response.json()["debug"]["enqueued_job_ids"]) == 3
 
-        ingest_worker = IngestWorker(
-            storage_backend=runtime.storage_backend,
-            connection=connection,
-            llm_client=runtime.llm_client,
-            clock=runtime.clock,
-            manifest_loader=runtime.manifest_loader,
-            settings=runtime.settings,
-        )
-        contract_worker = ContractWorker(
-            storage_backend=runtime.storage_backend,
-            connection=connection,
-            llm_client=runtime.llm_client,
-            clock=runtime.clock,
-            manifest_loader=runtime.manifest_loader,
-            settings=runtime.settings,
-        )
-        memories = MemoryObjectRepository(connection, runtime.clock)
-        assert client.portal.call(memories.list_for_user, "usr_1") == []
+            ingest_worker = IngestWorker(
+                storage_backend=runtime.storage_backend,
+                connection=connection,
+                llm_client=runtime.llm_client,
+                clock=runtime.clock,
+                manifest_loader=runtime.manifest_loader,
+                settings=runtime.settings,
+            )
+            contract_worker = ContractWorker(
+                storage_backend=runtime.storage_backend,
+                connection=connection,
+                llm_client=runtime.llm_client,
+                clock=runtime.clock,
+                manifest_loader=runtime.manifest_loader,
+                settings=runtime.settings,
+            )
+            memories = MemoryObjectRepository(connection, runtime.clock)
+            assert client.portal.call(memories.list_for_user, "usr_1") == []
 
-        ingest_result = client.portal.call(ingest_worker.run_once)
-        contract_result = client.portal.call(contract_worker.run_once)
-        second_ingest_result = client.portal.call(ingest_worker.run_once)
-        stored = client.portal.call(memories.list_for_user, "usr_1")
+            ingest_result = client.portal.call(ingest_worker.run_once)
+            contract_result = client.portal.call(contract_worker.run_once)
+            second_ingest_result = client.portal.call(ingest_worker.run_once)
+            stored = client.portal.call(memories.list_for_user, "usr_1")
 
-        assert ingest_result.acked == 1
-        assert second_ingest_result.acked == 1
-        assert contract_result.acked == 1
-        assert len(stored) == 1
+            assert ingest_result.acked == 1
+            assert second_ingest_result.acked == 1
+            assert contract_result.acked == 1
+            assert len(stored) == 1
+        finally:
+            client.portal.call(connection.close)

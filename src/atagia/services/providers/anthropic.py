@@ -16,6 +16,7 @@ from anthropic import (
     RateLimitError,
 )
 
+from atagia.core.llm_output_limits import ANTHROPIC_FALLBACK_MAX_OUTPUT_TOKENS
 from atagia.services.llm_client import (
     LLMCompletionRequest,
     LLMCompletionResponse,
@@ -24,6 +25,7 @@ from atagia.services.llm_client import (
     LLMError,
     LLMProvider,
     LLMStreamEvent,
+    OutputLimitExceededError,
     TransientLLMError,
 )
 
@@ -46,6 +48,48 @@ def _usage_to_dict(usage: Any) -> dict[str, int | float]:
     elif isinstance(usage, dict):
         raw = {k: v for k, v in usage.items() if v is not None}
     return {k: v for k, v in raw.items() if isinstance(v, (int, float))}
+
+
+_TRUNCATION_STOP_REASONS = frozenset({"max_tokens", "model_context_window_exceeded"})
+_BLOCKED_STOP_REASONS = frozenset({"refusal"})
+_TRANSIENT_STOP_REASONS = frozenset({"pause_turn"})
+_SUCCESS_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "tool_use"})
+
+
+def _stop_reason_label(value: Any) -> str | None:
+    if value is None:
+        return None
+    label = str(value).strip().lower()
+    return label or None
+
+
+def _stop_reason_error(stop_reason: str | None) -> LLMError | None:
+    if stop_reason is None or stop_reason in _SUCCESS_STOP_REASONS:
+        return None
+    if stop_reason == "max_tokens":
+        return OutputLimitExceededError(
+            "Anthropic stopped because it reached max output tokens "
+            f"(stop_reason={stop_reason})"
+        )
+    if stop_reason == "model_context_window_exceeded":
+        return LLMError(
+            "Anthropic stopped because it reached the model context window "
+            f"(stop_reason={stop_reason})"
+        )
+    if stop_reason in _BLOCKED_STOP_REASONS:
+        return LLMError(f"Anthropic blocked the response (stop_reason={stop_reason})")
+    if stop_reason in _TRANSIENT_STOP_REASONS:
+        return TransientLLMError(
+            f"Anthropic returned retryable stop reason: {stop_reason}"
+        )
+    return LLMError(f"Anthropic returned unsupported stop reason: {stop_reason}")
+
+
+def _empty_content_error(stop_reason: str | None) -> TransientLLMError:
+    label = stop_reason or "unknown"
+    return TransientLLMError(
+        f"Anthropic returned no output content (stop_reason={label})"
+    )
 
 
 def _split_messages(
@@ -89,26 +133,17 @@ def _split_messages(
 
 
 def _thinking_config(request: LLMCompletionRequest, max_tokens: int) -> dict[str, Any] | None:
-    if not request.include_thinking:
-        return None
-
+    if request.metadata.get("anthropic_thinking_adaptive"):
+        return {"type": "adaptive"}
     budget = request.metadata.get("thinking_budget_tokens")
-    model_lower = request.model.lower()
-    is_adaptive_model = any(name in model_lower for name in ("opus-4-6", "sonnet-4-6"))
-
-    if budget == -1 and is_adaptive_model:
+    if budget == -1:
         return {"type": "adaptive"}
-
     if isinstance(budget, int) and budget > 0:
-        return {"type": "enabled", "budget_tokens": min(budget, max_tokens - 1)}
-
-    if is_adaptive_model:
-        return {"type": "adaptive"}
-
-    default_budget = min(1024, max_tokens - 1)
-    if default_budget < 1:
-        return None
-    return {"type": "enabled", "budget_tokens": default_budget}
+        capped_budget = min(budget, max_tokens - 1)
+        if capped_budget < 1:
+            return None
+        return {"type": "enabled", "budget_tokens": capped_budget}
+    return None
 
 
 _UNSUPPORTED_NUMBER_KEYS = {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}
@@ -116,7 +151,12 @@ _UNSUPPORTED_ARRAY_KEYS = {"minItems", "maxItems"}
 
 
 def _sanitize_schema(node: Any) -> Any:
-    """Strip JSON Schema features that the Anthropic API does not accept."""
+    """Strip JSON Schema features that the Anthropic API does not accept.
+
+    Anthropic also requires every object node with `properties` to declare
+    `additionalProperties: false` explicitly, even when the input schema omits
+    the field entirely (Pydantic models with `extra="ignore"` do not emit it).
+    """
     if not isinstance(node, dict):
         if isinstance(node, list):
             return [_sanitize_schema(item) for item in node]
@@ -129,6 +169,8 @@ def _sanitize_schema(node: Any) -> Any:
         if key in _UNSUPPORTED_NUMBER_KEYS or key in _UNSUPPORTED_ARRAY_KEYS:
             continue
         cleaned[key] = _sanitize_schema(value)
+    if cleaned.get("type") == "object" and isinstance(cleaned.get("properties"), dict):
+        cleaned.setdefault("additionalProperties", False)
     return cleaned
 
 
@@ -173,7 +215,7 @@ class AnthropicProvider(LLMProvider):
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         system_blocks, messages = _split_messages(request)
-        max_tokens = max(1, request.max_output_tokens or 8192)
+        max_tokens = max(1, request.max_output_tokens or ANTHROPIC_FALLBACK_MAX_OUTPUT_TOKENS)
         kwargs: dict[str, Any] = {
             "model": request.model,
             "messages": messages,
@@ -228,9 +270,16 @@ class AnthropicProvider(LLMProvider):
                     }
                 )
 
+        stop_reason = _stop_reason_label(getattr(response, "stop_reason", None))
+        stop_error = _stop_reason_error(stop_reason)
+        if stop_error is not None:
+            raise stop_error
+        if not output_text and not tool_calls:
+            raise _empty_content_error(stop_reason)
+
         return LLMCompletionResponse(
             provider=self.name,
-            model=getattr(response, "model", request.model),
+            model=str(getattr(response, "model", None) or request.model),
             output_text=output_text,
             thinking=thinking_text or None,
             tool_calls=tool_calls,
@@ -243,7 +292,7 @@ class AnthropicProvider(LLMProvider):
 
     async def stream(self, request: LLMCompletionRequest) -> AsyncIterator[LLMStreamEvent]:
         system_blocks, messages = _split_messages(request)
-        max_tokens = max(1, request.max_output_tokens or 8192)
+        max_tokens = max(1, request.max_output_tokens or ANTHROPIC_FALLBACK_MAX_OUTPUT_TOKENS)
         kwargs: dict[str, Any] = {
             "model": request.model,
             "messages": messages,
@@ -269,16 +318,20 @@ class AnthropicProvider(LLMProvider):
         if thinking is not None:
             kwargs["thinking"] = thinking
 
+        emitted_output_or_tool = False
+        pending_error: Exception | None = None
         try:
             async with self._client.messages.stream(**kwargs) as stream:
                 async for event in stream:
                     if event.type == "text":
+                        emitted_output_or_tool = True
                         yield LLMStreamEvent(type="text", content=event.text)
                     elif event.type == "thinking":
                         yield LLMStreamEvent(type="thinking", content=event.thinking)
                     elif event.type == "content_block_stop":
                         content_block = getattr(event, "content_block", None)
                         if getattr(content_block, "type", None) == "tool_use":
+                            emitted_output_or_tool = True
                             yield LLMStreamEvent(
                                 type="tool_call",
                                 payload={
@@ -289,6 +342,14 @@ class AnthropicProvider(LLMProvider):
                                 },
                             )
                 final_message = await stream.get_final_message()
+                stop_reason = _stop_reason_label(
+                    getattr(final_message, "stop_reason", None)
+                )
+                stop_error = _stop_reason_error(stop_reason)
+                if stop_error is not None:
+                    pending_error = stop_error
+                elif stop_reason is not None and not emitted_output_or_tool:
+                    pending_error = _empty_content_error(stop_reason)
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
         except APIStatusError as exc:
@@ -302,3 +363,5 @@ class AnthropicProvider(LLMProvider):
             type="done",
             payload={"usage": _usage_to_dict(getattr(final_message, "usage", None))},
         )
+        if pending_error is not None:
+            raise pending_error

@@ -19,7 +19,7 @@ from atagia.core.repositories import (
 )
 from atagia.memory.contract_projection import ContractProjector
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
-from atagia.models.schemas_memory import ExtractionConversationContext
+from atagia.models.schemas_memory import ContractProjectionResult, ExtractionConversationContext, MemoryStatus
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -121,6 +121,193 @@ def _context(
         assistant_mode_id=mode_id,
         recent_messages=[],
     )
+
+
+def test_contract_projection_result_accepts_root_signal_list() -> None:
+    result = ContractProjectionResult.model_validate(
+        [
+            {
+                "canonical_text": "I prefer direct concise answers",
+                "dimension_name": "directness",
+                "value_json": {"label": "direct", "score": 0.88},
+                "confidence": 0.82,
+                "scope": "assistant_mode",
+                "source_kind": "inferred",
+                "privacy_level": 1,
+            }
+        ]
+    )
+
+    assert result.nothing_durable is False
+    assert len(result.signals) == 1
+    assert result.signals[0].dimension_name == "directness"
+
+
+def test_contract_projection_result_ignores_provider_extra_signal_fields() -> None:
+    result = ContractProjectionResult.model_validate(
+        {
+            "signals": [
+                {
+                    "canonical_text": "I prefer direct concise answers",
+                    "dimension_name": "directness",
+                    "value_json": {"label": "direct", "score": 0.88},
+                    "confidence": 0.82,
+                    "scope": "assistant_mode",
+                    "source_kind": "inferred",
+                    "privacy_level": 1,
+                    "nothing_durable": False,
+                    "rationale": "The message states a durable response style preference.",
+                }
+            ],
+            "nothing_durable": False,
+        }
+    )
+
+    assert len(result.signals) == 1
+    assert result.signals[0].dimension_name == "directness"
+
+
+def test_contract_projection_result_accepts_provider_value_aliases() -> None:
+    result = ContractProjectionResult.model_validate(
+        {
+            "signals": [
+                {
+                    "canonical_text": "I prefer a relaxed pace",
+                    "dimension_name": "pace",
+                    "signal_value": "relaxed",
+                    "confidence": 0.72,
+                    "scope": "conversation",
+                    "source_kind": "inferred",
+                    "privacy_level": 1,
+                },
+                {
+                    "canonical_text": "I prefer supportive collaboration",
+                    "dimension_name": "tone",
+                    "preference": "supportive and collaborative",
+                    "confidence": 0.81,
+                    "scope": "assistant_mode",
+                    "source_kind": "inferred",
+                    "privacy_level": 1,
+                },
+                {
+                    "canonical_text": "I prefer direct short answers",
+                    "dimension_name": "directness",
+                    "extracted_value": "short and direct",
+                    "confidence": 0.76,
+                    "scope": "assistant_mode",
+                    "source_kind": "inferred",
+                    "privacy_level": 1,
+                },
+            ],
+            "nothing_durable": False,
+        }
+    )
+
+    assert result.signals[0].value_json == {"label": "relaxed"}
+    assert result.signals[1].value_json == {"label": "supportive and collaborative"}
+    assert result.signals[2].value_json == {"label": "short and direct"}
+
+
+def test_contract_projection_result_ignores_provider_extra_root_fields() -> None:
+    result = ContractProjectionResult.model_validate(
+        {
+            "signals": [
+                {
+                    "canonical_text": "I prefer direct concise answers",
+                    "dimension_name": "directness",
+                    "value_json": {"label": "direct", "score": 0.88},
+                    "confidence": 0.82,
+                    "scope": "assistant_mode",
+                    "source_kind": "inferred",
+                    "privacy_level": 1,
+                }
+            ],
+            "nothing_durable": False,
+            "confidence": 0.9,
+            "privacy_level": 0,
+        }
+    )
+
+    assert len(result.signals) == 1
+    assert result.signals[0].dimension_name == "directness"
+
+
+def test_contract_projection_result_defaults_missing_signal_confidence() -> None:
+    result = ContractProjectionResult.model_validate(
+        {
+            "signals": [
+                {
+                    "canonical_text": "I prefer direct concise answers",
+                    "dimension_name": "directness",
+                    "value_json": {"label": "direct", "score": 0.88},
+                    "scope": "assistant_mode",
+                    "source_kind": "inferred",
+                    "privacy_level": 1,
+                }
+            ],
+            "nothing_durable": False,
+        }
+    )
+
+    assert len(result.signals) == 1
+    assert result.signals[0].confidence == 0.0
+
+
+def test_contract_projection_result_drops_per_signal_nothing_durable_placeholders() -> None:
+    result = ContractProjectionResult.model_validate(
+        {
+            "signals": [
+                {
+                    "dimension_name": "none",
+                    "value_json": {},
+                    "nothing_durable": True,
+                }
+            ],
+            "nothing_durable": False,
+        }
+    )
+
+    assert result.nothing_durable is True
+    assert result.signals == []
+
+
+def test_contract_projection_result_drops_incomplete_signals() -> None:
+    result = ContractProjectionResult.model_validate(
+        {
+            "signals": [
+                {
+                    "canonical_text": "I prefer direct concise answers",
+                    "dimension_name": "directness",
+                    "value_json": {"label": "direct", "score": 0.88},
+                    "confidence": 0.82,
+                    "source_kind": "inferred",
+                    "privacy_level": 1,
+                }
+            ],
+            "nothing_durable": False,
+        }
+    )
+
+    assert result.nothing_durable is True
+    assert result.signals == []
+
+
+def test_contract_projection_result_drops_incomplete_root_list_signals() -> None:
+    result = ContractProjectionResult.model_validate(
+        [
+            {
+                "canonical_text": "I prefer warmer encouragement",
+                "dimension_name": "tone",
+                "value_json": {"label": "warm"},
+                "confidence": 0.6,
+                "source_kind": "inferred",
+                "privacy_level": 1,
+            }
+        ]
+    )
+
+    assert result.nothing_durable is True
+    assert result.signals == []
 
 
 @pytest.mark.asyncio
@@ -470,6 +657,61 @@ async def test_cold_start_persists_projection_at_lower_threshold() -> None:
         projected_rows = await contracts.list_for_context("usr_1", "coding_debug", None, "cnv_1")
         assert len(projected_rows) == 1
         assert projected_rows[0]["dimension_name"] == "depth"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_confidence_requires_review_and_does_not_project() -> None:
+    payload = {
+        "signals": [
+            {
+                "canonical_text": "I prefer concise explanations",
+                "dimension_name": "depth",
+                "value_json": {"label": "concise"},
+                "scope": "assistant_mode",
+                "source_kind": "inferred",
+                "privacy_level": 1,
+            }
+        ],
+        "nothing_durable": False,
+    }
+    (
+        connection,
+        _clock,
+        conversations,
+        messages,
+        memories,
+        contracts,
+        projector,
+        _provider,
+        loader,
+    ) = await _build_runtime([payload])
+    try:
+        await _create_conversation(conversations, "coding_debug")
+        await _create_message(
+            messages,
+            conversation_id="cnv_1",
+            message_id="msg_1",
+            seq=1,
+            text="I prefer concise explanations.",
+        )
+
+        signals = await projector.project(
+            message_text="I prefer concise explanations.",
+            role="user",
+            conversation_context=_context(conversation_id="cnv_1", message_id="msg_1", mode_id="coding_debug"),
+            resolved_policy=_resolved_policy(loader, "coding_debug"),
+            user_id="usr_1",
+        )
+
+        persisted = await memories.list_for_user("usr_1", statuses=None)
+        projected_rows = await contracts.list_for_context("usr_1", "coding_debug", None, "cnv_1")
+        assert len(signals) == 1
+        assert signals[0].confidence == 0.0
+        assert len(persisted) == 1
+        assert persisted[0]["status"] == MemoryStatus.REVIEW_REQUIRED.value
+        assert projected_rows == []
     finally:
         await connection.close()
 

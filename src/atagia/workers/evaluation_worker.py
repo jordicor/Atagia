@@ -22,7 +22,7 @@ from atagia.models.schemas_jobs import (
     WORKER_GROUP_NAME,
     WorkerIterationResult,
 )
-from atagia.services.llm_client import LLMClient
+from atagia.services.llm_client import LLMClient, StructuredOutputError, TransientLLMError
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
@@ -82,7 +82,7 @@ class EvaluationWorker:
                 acked += 1
             except Exception as exc:
                 failed += 1
-                logger.exception("Failed to process evaluation job %s", message.message_id)
+                self._log_job_failure(message, exc)
                 if await self._dead_letter_if_exhausted(message, exc):
                     dead_lettered += 1
         return WorkerIterationResult(
@@ -91,6 +91,25 @@ class EvaluationWorker:
             failed=failed,
             dead_lettered=dead_lettered,
         )
+
+    @staticmethod
+    def _log_job_failure(message: StreamMessage, exc: Exception) -> None:
+        if isinstance(exc, StructuredOutputError):
+            details = "; ".join(exc.details) if exc.details else str(exc)
+            logger.warning(
+                "Failed to process evaluation job %s due to structured output: %s",
+                message.message_id,
+                details,
+            )
+            return
+        if isinstance(exc, TransientLLMError):
+            logger.warning(
+                "Failed to process evaluation job %s due to transient provider error: %s",
+                message.message_id,
+                exc,
+            )
+            return
+        logger.exception("Failed to process evaluation job %s", message.message_id)
 
     async def process_job(self, payload: dict[str, object]) -> dict[str, Any]:
         envelope = JobEnvelope.model_validate(payload)
@@ -165,6 +184,11 @@ class EvaluationWorker:
                 "delivery_count": message.delivery_count,
                 "payload": message.payload,
                 "error": str(exc),
+                "error_details": (
+                    list(exc.details)
+                    if isinstance(exc, StructuredOutputError)
+                    else []
+                ),
             },
         )
         await self._storage_backend.stream_ack(

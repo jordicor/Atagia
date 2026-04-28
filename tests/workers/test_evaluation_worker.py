@@ -25,6 +25,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingRequest,
     LLMEmbeddingResponse,
     LLMProvider,
+    StructuredOutputError,
 )
 from atagia.workers.evaluation_worker import EvaluationWorker
 
@@ -213,5 +214,38 @@ async def test_evaluation_worker_dead_letters_after_max_retries() -> None:
         assert third.dead_lettered == 1
         assert dead_letter is not None
         assert dead_letter["delivery_count"] == 3
+        assert dead_letter["error_details"] == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_evaluation_worker_logs_structured_job_failure_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def fail_metric(*args, **kwargs):
+        del args, kwargs
+        raise StructuredOutputError(
+            "Provider returned invalid structured output",
+            details=("$.compliance_score: Field required",),
+        )
+
+    connection, backend, _metrics, worker = await _build_runtime()
+    try:
+        worker._metrics_computer.compute_named_metric = fail_metric
+        await backend.stream_add(EVALUATION_STREAM_NAME, _job(["ccr"]).model_dump(mode="json"))
+
+        with caplog.at_level("WARNING", logger="atagia.workers.evaluation_worker"):
+            result = await worker.run_once()
+
+        records = [
+            record
+            for record in caplog.records
+            if "due to structured output" in record.getMessage()
+        ]
+        assert result.failed == 1
+        assert records
+        assert records[0].exc_info is None
+        assert "Traceback" not in caplog.text
     finally:
         await connection.close()

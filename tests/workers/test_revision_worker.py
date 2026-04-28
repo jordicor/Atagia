@@ -919,6 +919,48 @@ async def test_revision_worker_dead_letters_after_max_failed_deliveries() -> Non
         assert third.dead_lettered == 1
         assert dead_letter is not None
         assert dead_letter["delivery_count"] == 3
+        assert dead_letter["error_details"][0] == "$: Response was not valid JSON."
+        assert any("No JSON payload found" in detail for detail in dead_letter["error_details"])
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_logs_structured_job_failure_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    connection, backend, memories, beliefs, worker = await _build_runtime(["not-json"])
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_structured_fail",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+        await backend.stream_add(
+            REVISE_STREAM_NAME,
+            _revision_job(
+                belief_id=str(belief["id"]),
+                evidence_memory_ids=[str(evidence["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+            ).model_dump(mode="json"),
+        )
+
+        with caplog.at_level("WARNING", logger="atagia.workers.revision_worker"):
+            result = await worker.run_once()
+
+        records = [
+            record
+            for record in caplog.records
+            if "due to structured output" in record.getMessage()
+        ]
+        assert result.failed == 1
+        assert records
+        assert records[0].exc_info is None
+        assert "Traceback" not in caplog.text
     finally:
         await connection.close()
 

@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from typing import Any
+
+from atagia.core import json_utils
 
 
 def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
     """Return stable UTF-8 JSON bytes for hashing and cache keys."""
-    return json.dumps(
+    return json_utils.dumps_bytes(
         payload,
-        ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
-    ).encode("utf-8")
+    )
 
 
 def canonical_json_hash(payload: dict[str, Any]) -> str:

@@ -10,6 +10,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from benchmarks.scorer import LLMJudgeScorer
+from atagia.core.llm_output_limits import (
+    ATAGIA_BENCH_ABSTENTION_GRADER_MAX_OUTPUT_TOKENS,
+    ATAGIA_BENCH_GATED_FACT_GRADER_MAX_OUTPUT_TOKENS,
+    ATAGIA_BENCH_SUPERSESSION_GRADER_MAX_OUTPUT_TOKENS,
+)
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
 
 logger = logging.getLogger(__name__)
@@ -345,7 +350,7 @@ class AbstentionGrader(Grader):
                 ),
             ],
             temperature=0.0,
-            max_output_tokens=256,
+            max_output_tokens=ATAGIA_BENCH_ABSTENTION_GRADER_MAX_OUTPUT_TOKENS,
             response_schema=_AbstentionVerdict.model_json_schema(),
             metadata={"purpose": "benchmark_grader_abstention"},
         )
@@ -475,7 +480,7 @@ class GatedGrader(Grader):
                 ),
             ],
             temperature=0.0,
-            max_output_tokens=256,
+            max_output_tokens=ATAGIA_BENCH_GATED_FACT_GRADER_MAX_OUTPUT_TOKENS,
             response_schema=_GatedFactVerdict.model_json_schema(),
             metadata={"purpose": "benchmark_grader_gated_fact"},
         )
@@ -547,7 +552,7 @@ class SupersessionGrader(Grader):
                 ),
             ],
             temperature=0.0,
-            max_output_tokens=256,
+            max_output_tokens=ATAGIA_BENCH_SUPERSESSION_GRADER_MAX_OUTPUT_TOKENS,
             response_schema=_SupersessionVerdict.model_json_schema(),
             metadata={"purpose": "benchmark_grader_supersession"},
         )

@@ -10,7 +10,11 @@ import pytest
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.memory.consequence_detector import ConsequenceDetector
-from atagia.models.schemas_memory import ConsequenceSignal, ExtractionConversationContext
+from atagia.models.schemas_memory import (
+    ConsequenceSentiment,
+    ConsequenceSignal,
+    ExtractionConversationContext,
+)
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -95,6 +99,7 @@ async def test_consequence_detector_detects_explicit_negative_feedback() -> None
                     "outcome_sentiment": "negative",
                     "confidence": 0.88,
                     "likely_action_message_id": "msg_assistant_1",
+                    "rationale": "Provider-specific explanation field.",
                 }
             )
         ]
@@ -211,6 +216,35 @@ async def test_consequence_detector_handles_llm_failure_gracefully(
 
 
 @pytest.mark.asyncio
+async def test_consequence_detector_structured_failure_logs_compact_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = QueueProvider(["not json"])
+    detector = ConsequenceDetector(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=FrozenClock(datetime(2026, 4, 2, 13, 0, tzinfo=timezone.utc)),
+        settings=_settings(),
+    )
+
+    with caplog.at_level("WARNING", logger="atagia.memory.consequence_detector"):
+        signal = await detector.detect(
+            message_text="That broke everything.",
+            role="user",
+            conversation_context=_context(),
+            recent_assistant_messages=[{"id": "msg_assistant_1", "text": "Earlier suggestion."}],
+        )
+
+    assert signal is None
+    compact_records = [
+        record
+        for record in caplog.records
+        if "structured-output fallback" in record.getMessage()
+    ]
+    assert compact_records
+    assert compact_records[0].exc_info is None
+
+
+@pytest.mark.asyncio
 async def test_consequence_detector_uses_xml_tags_and_escapes_prompt_content() -> None:
     provider = QueueProvider(
         [
@@ -264,3 +298,22 @@ def test_consequence_signal_rejects_true_with_too_low_confidence() -> None:
             confidence=0.05,
             likely_action_message_id=None,
         )
+
+
+def test_consequence_signal_accepts_nullable_non_consequence_fields() -> None:
+    signal = ConsequenceSignal.model_validate(
+        {
+            "is_consequence": False,
+            "action_description": None,
+            "outcome_description": None,
+            "outcome_sentiment": None,
+            "confidence": None,
+            "likely_action_message_id": None,
+        }
+    )
+
+    assert signal.is_consequence is False
+    assert signal.action_description == ""
+    assert signal.outcome_description == ""
+    assert signal.outcome_sentiment is ConsequenceSentiment.NEUTRAL
+    assert signal.confidence == 0.0

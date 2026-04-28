@@ -16,6 +16,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingVector,
     LLMMessage,
     LLMProvider,
+    TransientLLMError,
 )
 from atagia.services.providers import build_llm_client
 from atagia.services.providers.openrouter import OpenRouterProvider
@@ -122,6 +123,38 @@ async def test_openrouter_stream_maps_text_tool_call_and_done() -> None:
     assert completions.calls[0]["stream_options"] == {"include_usage": True}
 
 
+@pytest.mark.asyncio
+async def test_openrouter_complete_raises_transient_on_error_finish_reason() -> None:
+    response = SimpleNamespace(
+        model="anthropic/claude-sonnet-4.6",
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=None),
+                finish_reason="error",
+                error={"message": "upstream provider failed"},
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "gen_1"},
+    )
+    completions = FakeChatCompletions(response)
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://atagia.org",
+        app_name="Atagia",
+        client=FakeOpenAIClient(completions),
+    )
+
+    request = LLMCompletionRequest(
+        model="anthropic/claude-sonnet-4.6",
+        messages=[LLMMessage(role="user", content="hello")],
+        max_output_tokens=128,
+    )
+
+    with pytest.raises(TransientLLMError, match="upstream provider failed"):
+        await provider.complete(request)
+
+
 def test_openrouter_default_headers_and_factory_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
@@ -167,9 +200,11 @@ def test_openrouter_default_headers_and_factory_wiring(monkeypatch: pytest.Monke
         admin_api_key=None,
         workers_enabled=False,
         debug=False,
+        llm_forced_global_model="openrouter/deepseek/deepseek-v4-flash",
     )
     client = build_llm_client(settings)
-    assert client.provider_name == "openrouter"
+    assert client.provider_name is None
+    assert client._provider("openrouter").name == "openrouter"
 
 
 @pytest.mark.asyncio
@@ -216,7 +251,8 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         llm_provider="anthropic",
-        llm_api_key="anthropic-key",
+        llm_api_key=None,
+        anthropic_api_key="anthropic-key",
         openai_api_key="openai-key",
         openrouter_api_key=None,
         llm_base_url=None,
@@ -232,17 +268,18 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
         admin_api_key=None,
         workers_enabled=False,
         debug=False,
+        llm_forced_global_model="anthropic/claude-sonnet-4-6",
         embedding_backend="sqlite_vec",
-        embedding_model="text-embedding-3-small",
+        embedding_model="openai/text-embedding-3-small",
     )
 
     client = build_llm_client(settings)
     embedding = await client.embed(
-        LLMEmbeddingRequest(model="text-embedding-3-small", input_texts=["hello"])
+        LLMEmbeddingRequest(model="openai/text-embedding-3-small", input_texts=["hello"])
     )
 
-    assert client.provider_name == "anthropic"
-    assert client.embedding_provider_name == "openai"
+    assert client.provider_name is None
+    assert client.embedding_provider_name is None
     assert embedding.provider == "openai"
 
 
@@ -284,7 +321,8 @@ def test_build_llm_client_requires_openai_for_anthropic_embeddings(
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         llm_provider="anthropic",
-        llm_api_key="anthropic-key",
+        llm_api_key=None,
+        anthropic_api_key="anthropic-key",
         openai_api_key=None,
         openrouter_api_key="router-key",
         llm_base_url=None,
@@ -300,11 +338,12 @@ def test_build_llm_client_requires_openai_for_anthropic_embeddings(
         admin_api_key=None,
         workers_enabled=False,
         debug=False,
+        llm_forced_global_model="anthropic/claude-sonnet-4-6",
         embedding_backend="sqlite_vec",
-        embedding_model="text-embedding-3-small",
+        embedding_model="openai/text-embedding-3-small",
     )
 
-    with pytest.raises(ConfigurationError, match="OpenRouter is not auto-selected"):
+    with pytest.raises(ConfigurationError, match="openai"):
         build_llm_client(settings)
 
 
@@ -352,7 +391,8 @@ async def test_build_llm_client_respects_explicit_embedding_provider_override(
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         llm_provider="anthropic",
-        llm_api_key="anthropic-key",
+        llm_api_key=None,
+        anthropic_api_key="anthropic-key",
         openai_api_key=None,
         openrouter_api_key="router-key",
         llm_base_url=None,
@@ -368,15 +408,19 @@ async def test_build_llm_client_respects_explicit_embedding_provider_override(
         admin_api_key=None,
         workers_enabled=False,
         debug=False,
+        llm_forced_global_model="anthropic/claude-sonnet-4-6",
         embedding_backend="sqlite_vec",
-        embedding_model="text-embedding-3-small",
+        embedding_model="openrouter/openai/text-embedding-3-small",
     )
 
     client = build_llm_client(settings)
     embedding = await client.embed(
-        LLMEmbeddingRequest(model="text-embedding-3-small", input_texts=["hello"])
+        LLMEmbeddingRequest(
+            model="openrouter/openai/text-embedding-3-small",
+            input_texts=["hello"],
+        )
     )
 
-    assert client.provider_name == "anthropic"
-    assert client.embedding_provider_name == "openrouter"
+    assert client.provider_name is None
+    assert client.embedding_provider_name is None
     assert embedding.provider == "openrouter"

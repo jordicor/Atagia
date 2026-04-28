@@ -66,10 +66,12 @@ class ReplayProvider(LLMProvider):
             )
         if purpose == "applicability_scoring":
             memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
-            payload = [
-                {"memory_id": memory_id, "llm_applicability": self.score_map.get(memory_id, 0.5)}
-                for memory_id in memory_ids
-            ]
+            payload = {
+                "scores": [
+                    {"memory_id": memory_id, "llm_applicability": self.score_map.get(memory_id, 0.5)}
+                    for memory_id in memory_ids
+                ],
+            }
             return LLMCompletionResponse(provider=self.name, model=request.model, output_text=json.dumps(payload))
         raise AssertionError(f"Unexpected purpose: {purpose}")
 
@@ -239,12 +241,28 @@ async def test_replay_event_with_ablation_changes_result() -> None:
             "usr_1",
             ablation=AblationConfig(
                 skip_applicability_scoring=True,
+                composer_strategy="budgeted_marginal",
                 override_retrieval_params={"final_context_items": 1, "privacy_ceiling": 0},
             ),
         )
 
         assert result.comparison.memories_only_original == ["mem_2"]
         assert result.comparison.memories_only_replay == ["mem_1"]
+        assert result.ablation_config == {
+            "skip_need_detection": False,
+            "skip_applicability_scoring": True,
+            "skip_contract_memory": False,
+            "skip_workspace_rollup": False,
+            "force_all_scopes": False,
+            "skip_belief_revision": False,
+            "skip_compaction": False,
+            "disable_context_cache": False,
+            "composer_strategy": "budgeted_marginal",
+            "override_retrieval_params": {
+                "final_context_items": 1,
+                "privacy_ceiling": 0,
+            },
+        }
     finally:
         await connection.close()
 

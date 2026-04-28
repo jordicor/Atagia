@@ -12,6 +12,7 @@ from atagia.core.config import Settings
 from atagia.models.schemas_memory import MemoryStatus
 from atagia.services.embeddings import EmbeddingIndex, EmbeddingMatch
 from atagia.services.llm_client import ConfigurationError, LLMClient, LLMEmbeddingRequest
+from atagia.services.model_resolution import DEFAULT_EMBEDDING_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +36,10 @@ class SQLiteVecBackend(EmbeddingIndex):
         llm_client: LLMClient[Any],
         settings: Settings,
     ) -> None:
-        if not settings.embedding_model:
-            raise ConfigurationError(
-                "ATAGIA_EMBEDDING_MODEL is required when ATAGIA_EMBEDDING_BACKEND=sqlite_vec"
-            )
         self._connection = connection
         self._llm_client = llm_client
         self._settings = settings
-        self._embedding_model = settings.embedding_model
+        self._embedding_model = settings.embedding_model or DEFAULT_EMBEDDING_MODEL
         self._dimension = settings.embedding_dimension
         if not (1 <= self._dimension <= 8192):
             raise ConfigurationError("embedding_dimension must be between 1 and 8192")
@@ -71,14 +68,7 @@ class SQLiteVecBackend(EmbeddingIndex):
         finally:
             await self._connection.enable_load_extension(False)
 
-        await self._connection.execute(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory_embeddings USING vec0(
-                memory_id TEXT PRIMARY KEY,
-                embedding float[{dimension}]
-            )
-            """.format(dimension=self._dimension)
-        )
+        await self._ensure_vector_table()
         await self._cleanup_ineligible_embeddings()
         await self._connection.commit()
 
@@ -97,11 +87,12 @@ class SQLiteVecBackend(EmbeddingIndex):
             )
             await self._connection.execute(
                 """
-                INSERT INTO vec_memory_embeddings(memory_id, embedding)
-                VALUES (?, ?)
+                INSERT INTO vec_memory_embeddings(memory_id, user_id, embedding)
+                VALUES (?, ?, ?)
                 """,
                 (
                     memory_id,
+                    str(metadata["user_id"]),
                     self._serialize_vector(embedding),
                 ),
             )
@@ -130,13 +121,7 @@ class SQLiteVecBackend(EmbeddingIndex):
             raise
 
     async def search(self, query: str, user_id: str, top_k: int) -> list[EmbeddingMatch]:
-        """Return semantic matches for a user-scoped query.
-
-        Note: sqlite-vec vec0 returns k nearest neighbors BEFORE the user_id JOIN
-        filter. In multi-tenant scenarios with skewed data, this may return fewer
-        results than top_k. The current over-fetch mitigates this. A per-user vec0 table
-        would solve it completely but is deferred to a future phase.
-        """
+        """Return semantic matches for a user-scoped query."""
         if top_k <= 0:
             return []
         try:
@@ -150,8 +135,6 @@ class SQLiteVecBackend(EmbeddingIndex):
         if not query_embedding:
             return []
 
-        # TODO: add per-user partitioning when sqlite-vec multi-tenant scale matters.
-        fetch_k = max(100, top_k * 8)
         cursor = await self._connection.execute(
             """
             SELECT
@@ -163,6 +146,7 @@ class SQLiteVecBackend(EmbeddingIndex):
             FROM vec_memory_embeddings AS v
             JOIN memory_embedding_metadata AS m ON m.memory_id = v.memory_id
             WHERE v.embedding MATCH ?
+              AND v.user_id = ?
               AND k = ?
               AND m.user_id = ?
             ORDER BY v.distance ASC
@@ -170,21 +154,13 @@ class SQLiteVecBackend(EmbeddingIndex):
             """,
             (
                 self._serialize_vector(query_embedding),
-                fetch_k,
                 user_id,
-                fetch_k,
+                top_k,
+                user_id,
+                top_k,
             ),
         )
         rows = await cursor.fetchall()
-        if len(rows) < top_k:
-            logger.warning(
-                "sqlite-vec search returned fewer rows than requested after user filtering: "
-                "user_id=%s requested_top_k=%s fetched_k=%s returned_count=%s",
-                user_id,
-                top_k,
-                fetch_k,
-                len(rows),
-            )
         return [
             EmbeddingMatch(
                 memory_id=str(row["memory_id"]),
@@ -222,7 +198,7 @@ class SQLiteVecBackend(EmbeddingIndex):
                 input_texts=texts,
                 dimensions=(
                     self._dimension
-                    if self._llm_client.embedding_provider.supports_embedding_dimensions
+                    if self._llm_client.supports_embedding_dimensions(self._embedding_model)
                     else None
                 ),
                 metadata=metadata,
@@ -243,6 +219,67 @@ class SQLiteVecBackend(EmbeddingIndex):
         if self._sqlite_vec is None:
             raise RuntimeError("sqlite-vec backend used before initialization")
         return self._sqlite_vec.serialize_float32(values)
+
+    async def _ensure_vector_table(self) -> None:
+        if await self._vector_table_has_user_partition():
+            return
+        if await self._vector_table_exists():
+            await self._rebuild_vector_table_with_user_partition()
+            return
+        await self._create_vector_table()
+
+    async def _vector_table_exists(self) -> bool:
+        cursor = await self._connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'vec_memory_embeddings'
+            """
+        )
+        return await cursor.fetchone() is not None
+
+    async def _vector_table_has_user_partition(self) -> bool:
+        if not await self._vector_table_exists():
+            return False
+        cursor = await self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'vec_memory_embeddings'"
+        )
+        row = await cursor.fetchone()
+        sql = str(row["sql"] if row is not None else "").lower()
+        return "user_id" in sql and "partition key" in sql
+
+    async def _create_vector_table(self) -> None:
+        await self._connection.execute(
+            """
+            CREATE VIRTUAL TABLE vec_memory_embeddings USING vec0(
+                memory_id TEXT PRIMARY KEY,
+                user_id TEXT partition key,
+                embedding float[{dimension}]
+            )
+            """.format(dimension=self._dimension)
+        )
+
+    async def _rebuild_vector_table_with_user_partition(self) -> None:
+        await self._connection.execute(
+            """
+            CREATE TEMP TABLE atagia_vec_memory_embeddings_rebuild AS
+            SELECT v.memory_id, m.user_id, v.embedding
+            FROM vec_memory_embeddings AS v
+            JOIN memory_embedding_metadata AS m ON m.memory_id = v.memory_id
+            WHERE m.user_id IS NOT NULL
+            """
+        )
+        await self._connection.execute("DROP TABLE vec_memory_embeddings")
+        await self._create_vector_table()
+        await self._connection.execute(
+            """
+            INSERT INTO vec_memory_embeddings(memory_id, user_id, embedding)
+            SELECT memory_id, user_id, embedding
+            FROM atagia_vec_memory_embeddings_rebuild
+            """
+        )
+        await self._connection.execute("DROP TABLE atagia_vec_memory_embeddings_rebuild")
 
     async def _cleanup_ineligible_embeddings(self) -> None:
         cursor = await self._connection.execute(

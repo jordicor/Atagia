@@ -71,12 +71,6 @@ async def create_embedding_index(
     if settings.embedding_backend == "none":
         return NoneBackend()
     if settings.embedding_backend == "sqlite_vec":
-        if settings.service_mode:
-            raise ConfigurationError(
-                "sqlite_vec embedding backend is local/dev only until vector ranking is "
-                "partitioned before user filtering; use ATAGIA_EMBEDDING_BACKEND=none "
-                "in service mode"
-            )
         if not settings.embedding_model:
             raise ConfigurationError(
                 "ATAGIA_EMBEDDING_MODEL is required when backend is sqlite_vec"

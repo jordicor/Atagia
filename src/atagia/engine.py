@@ -24,6 +24,7 @@ from atagia.services.conversation_activity_service import ConversationActivitySe
 from atagia.services.sidecar_service import SidecarService
 from atagia.services.verbatim_pin_service import VerbatimPinService
 from atagia.services.errors import RuntimeNotInitializedError
+from atagia.services.model_resolution import provider_qualified_model
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_MIGRATIONS_DIR = _PROJECT_ROOT / "migrations"
@@ -43,6 +44,11 @@ class Atagia:
         llm_provider: str | None = None,
         llm_api_key: str | None = None,
         llm_model: str | None = None,
+        llm_forced_global_model: str | None = None,
+        anthropic_api_key: str | None = None,
+        openai_api_key: str | None = None,
+        google_api_key: str | None = None,
+        openrouter_api_key: str | None = None,
         embedding_backend: str = "none",
         embedding_model: str | None = None,
         embedding_provider_name: str | None = None,
@@ -66,6 +72,11 @@ class Atagia:
         self._llm_provider = llm_provider
         self._llm_api_key = llm_api_key
         self._llm_model = llm_model
+        self._llm_forced_global_model = llm_forced_global_model
+        self._anthropic_api_key = anthropic_api_key
+        self._openai_api_key = openai_api_key
+        self._google_api_key = google_api_key
+        self._openrouter_api_key = openrouter_api_key
         self._embedding_backend = embedding_backend
         self._embedding_model = embedding_model
         self._embedding_provider_name = embedding_provider_name
@@ -574,6 +585,25 @@ class Atagia:
         migrations_path = os.getenv("ATAGIA_MIGRATIONS_PATH") or str(_DEFAULT_MIGRATIONS_DIR)
         use_env_redis = self._redis_url is None and env_settings.storage_backend == "redis"
         storage_backend = "redis" if self._redis_url is not None or use_env_redis else "inprocess"
+        legacy_provider = (self._llm_provider or env_settings.llm_provider).strip().lower()
+        anthropic_api_key = self._anthropic_api_key or env_settings.anthropic_api_key
+        openai_api_key = self._openai_api_key or env_settings.openai_api_key
+        google_api_key = self._google_api_key or env_settings.google_api_key
+        openrouter_api_key = self._openrouter_api_key or env_settings.openrouter_api_key
+        if self._llm_api_key:
+            if legacy_provider == "anthropic":
+                anthropic_api_key = self._llm_api_key
+            elif legacy_provider == "openai":
+                openai_api_key = self._llm_api_key
+            elif legacy_provider in {"gemini", "google"}:
+                google_api_key = self._llm_api_key
+            elif legacy_provider == "openrouter":
+                openrouter_api_key = self._llm_api_key
+        forced_global_model = (
+            self._llm_forced_global_model
+            or provider_qualified_model(legacy_provider, self._llm_model)
+            or env_settings.llm_forced_global_model
+        )
         return Settings(
             sqlite_path=self._db_path,
             migrations_path=migrations_path,
@@ -581,17 +611,26 @@ class Atagia:
             operational_profiles_path=operational_profiles_path,
             storage_backend=storage_backend,
             redis_url=self._redis_url or env_settings.redis_url,
-            llm_provider=(self._llm_provider or env_settings.llm_provider).strip().lower(),
+            llm_provider=legacy_provider,
             llm_api_key=self._llm_api_key or env_settings.llm_api_key,
-            openai_api_key=env_settings.openai_api_key,
-            openrouter_api_key=env_settings.openrouter_api_key,
+            anthropic_api_key=anthropic_api_key,
+            openai_api_key=openai_api_key,
+            google_api_key=google_api_key,
+            openrouter_api_key=openrouter_api_key,
             llm_base_url=env_settings.llm_base_url,
+            anthropic_base_url=env_settings.anthropic_base_url,
+            openai_base_url=env_settings.openai_base_url,
+            openrouter_base_url=env_settings.openrouter_base_url,
             openrouter_site_url=env_settings.openrouter_site_url,
             openrouter_app_name=env_settings.openrouter_app_name,
-            llm_extraction_model=self._llm_model or env_settings.llm_extraction_model,
-            llm_scoring_model=self._llm_model or env_settings.llm_scoring_model,
-            llm_classifier_model=self._llm_model or env_settings.llm_classifier_model,
-            llm_chat_model=self._llm_model or env_settings.llm_chat_model,
+            llm_extraction_model=env_settings.llm_extraction_model,
+            llm_scoring_model=env_settings.llm_scoring_model,
+            llm_classifier_model=env_settings.llm_classifier_model,
+            llm_chat_model=env_settings.llm_chat_model,
+            llm_forced_global_model=forced_global_model,
+            llm_ingest_model=env_settings.llm_ingest_model,
+            llm_retrieval_model=env_settings.llm_retrieval_model,
+            llm_component_models=dict(env_settings.llm_component_models),
             embedding_provider_name=(
                 self._embedding_provider_name or env_settings.embedding_provider_name
             ),

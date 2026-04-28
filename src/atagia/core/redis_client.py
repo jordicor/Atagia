@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from math import ceil
 from time import monotonic
 from typing import Any
 from uuid import uuid4
 
 from atagia.core.canonical import canonical_json_hash
+from atagia.core import json_utils
 from atagia.core.storage_backend import (
     StorageBackend,
     extract_context_view_conversation_id,
@@ -84,19 +84,19 @@ class RedisBackend(StorageBackend):
         raw = await self._client.get(f"recent_window:{key}")
         if raw is None:
             return None
-        return json.loads(raw)
+        return json_utils.loads(raw)
 
     async def set_recent_window(self, key: str, messages: list[dict[str, Any]]) -> None:
         await self._client.set(
             f"recent_window:{key}",
-            json.dumps(messages, ensure_ascii=False, sort_keys=True),
+            json_utils.dumps(messages, sort_keys=True),
         )
 
     async def get_context_view(self, key: str) -> dict[str, Any] | None:
         raw = await self._client.get(self._context_view_key(key))
         if raw is None:
             return None
-        return json.loads(raw)
+        return json_utils.loads(raw)
 
     async def set_context_view(
         self,
@@ -104,7 +104,7 @@ class RedisBackend(StorageBackend):
         context_view: dict[str, Any],
         ttl_seconds: int,
     ) -> None:
-        serialized = json.dumps(context_view, ensure_ascii=False, sort_keys=True)
+        serialized = json_utils.dumps(context_view, sort_keys=True)
         owner_key = self._context_view_owner_key(key)
         previous_user_id = await self._client.get(owner_key)
         conversation_owner_key = self._context_view_conversation_owner_key(key)
@@ -150,7 +150,7 @@ class RedisBackend(StorageBackend):
             self._context_view_seq_key(key),
             self._context_view_owner_key(key),
             self._context_view_user_index_key(user_id),
-            json.dumps(context_view, ensure_ascii=False, sort_keys=True),
+            json_utils.dumps(context_view, sort_keys=True),
             ttl_seconds,
             monotonic_seq,
             user_id,
@@ -240,7 +240,7 @@ class RedisBackend(StorageBackend):
     async def enqueue_job(self, queue_name: str, payload: dict[str, Any]) -> None:
         await self._client.rpush(
             f"queue:{queue_name}",
-            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            json_utils.dumps(payload, sort_keys=True),
         )
 
     async def dequeue_job(
@@ -252,19 +252,19 @@ class RedisBackend(StorageBackend):
             raw_payload = await self._client.lpop(f"queue:{queue_name}")
             if raw_payload is None:
                 return None
-            return json.loads(raw_payload)
+            return json_utils.loads(raw_payload)
         # None means "block forever", matching the in-process backend semantics.
         timeout = 0 if timeout_seconds is None else max(1, ceil(timeout_seconds))
         item = await self._client.blpop(f"queue:{queue_name}", timeout=timeout)
         if item is None:
             return None
         _, raw_payload = item
-        return json.loads(raw_payload)
+        return json_utils.loads(raw_payload)
 
     async def stream_add(self, stream_name: str, payload: dict[str, Any]) -> str:
         return await self._client.xadd(
             stream_name,
-            {"payload": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
+            {"payload": json_utils.dumps(payload, sort_keys=True)},
         )
 
     async def stream_read(
@@ -291,7 +291,7 @@ class RedisBackend(StorageBackend):
                 messages.append(
                     StreamMessage(
                         message_id=message_id,
-                        payload=json.loads(raw_payload),
+                        payload=json_utils.loads(raw_payload),
                         delivery_count=1,
                     )
                 )
@@ -330,7 +330,7 @@ class RedisBackend(StorageBackend):
             messages.append(
                 StreamMessage(
                     message_id=message_id,
-                    payload=json.loads(raw_payload),
+                    payload=json_utils.loads(raw_payload),
                     delivery_count=delivery_counts.get(message_id, 2),
                 )
             )

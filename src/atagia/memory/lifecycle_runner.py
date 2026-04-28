@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from typing import TYPE_CHECKING
 
+import aiosqlite
+
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
-from atagia.core.db_sqlite import open_connection
+from atagia.core.db_sqlite import close_connection, open_connection
 from atagia.core.storage_backend import StorageBackend
 from atagia.memory.lifecycle import LifecycleCycleResult, MemoryLifecycleManager
 from atagia.services.embeddings import EmbeddingIndex
@@ -23,6 +26,28 @@ LOCK_TTL_SECONDS = 300  # 5 min safety net for one cycle
 
 class LifecycleLockError(Exception):
     """Raised when a lifecycle cycle cannot acquire the execution lock."""
+
+
+async def _open_tracked_connection(
+    database_path: str,
+    connections: list[aiosqlite.Connection],
+) -> aiosqlite.Connection:
+    task = asyncio.create_task(open_connection(database_path))
+    try:
+        connection = await task
+    except asyncio.CancelledError:
+        if task.done() and not task.cancelled():
+            connection = task.result()
+            await close_connection(connection)
+        else:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        raise
+    connections.append(connection)
+    return connection
 
 
 def _runtime_prefix(database_path: str) -> str:
@@ -56,7 +81,7 @@ async def try_run_lifecycle(
     if token is None:
         return False
 
-    connection = None
+    connections: list[aiosqlite.Connection] = []
     try:
         should_run = await storage_backend.remember_dedupe(
             cooldown_key, settings.lifecycle_min_interval_seconds,
@@ -64,7 +89,7 @@ async def try_run_lifecycle(
         if not should_run:
             return False
 
-        connection = await open_connection(database_path)
+        connection = await _open_tracked_connection(database_path, connections)
         manager = MemoryLifecycleManager(
             connection, clock,
             settings=settings,
@@ -84,8 +109,8 @@ async def try_run_lifecycle(
         )
         return True
     finally:
-        if connection is not None:
-            await connection.close()
+        for connection in connections:
+            await close_connection(connection)
         await storage_backend.release_lock(lock_key, token)
 
 
@@ -113,9 +138,9 @@ async def run_lifecycle_direct(
     if token is None:
         raise LifecycleLockError("A lifecycle cycle is already running")
 
-    connection = None
+    connections: list[aiosqlite.Connection] = []
     try:
-        connection = await open_connection(database_path)
+        connection = await _open_tracked_connection(database_path, connections)
         manager = MemoryLifecycleManager(
             connection, clock,
             settings=settings,
@@ -133,8 +158,8 @@ async def run_lifecycle_direct(
                 )
         return result
     finally:
-        if connection is not None:
-            await connection.close()
+        for connection in connections:
+            await close_connection(connection)
         await storage_backend.release_lock(lock_key, token)
 
 

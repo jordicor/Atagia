@@ -9,6 +9,7 @@ from pydantic import TypeAdapter
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
+from atagia.core.llm_output_limits import NEED_DETECTOR_MAX_OUTPUT_TOKENS
 from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.models.schemas_memory import (
     DetectedNeed,
@@ -17,8 +18,7 @@ from atagia.models.schemas_memory import (
     QueryIntelligenceResult,
 )
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
-
-DEFAULT_NEED_MODEL = "claude-sonnet-4-6"
+from atagia.services.model_resolution import resolve_component_model
 
 _NEED_DESCRIPTIONS: dict[NeedTrigger, str] = {
     NeedTrigger.AMBIGUITY: "The user request is unclear, underspecified, or could be interpreted in multiple ways.",
@@ -35,6 +35,8 @@ _NEED_DESCRIPTIONS: dict[NeedTrigger, str] = {
 NEED_DETECTOR_PROMPT_TEMPLATE = """You are producing query intelligence for an assistant memory engine.
 
 Return JSON only, matching the provided schema exactly.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
 
 The user message may be written in any language. Understand it natively.
 Do not rely on English keywords. Do not translate unless needed to keep
@@ -183,11 +185,7 @@ class NeedDetector:
         self._llm_client = llm_client
         self._clock = clock
         resolved_settings = settings or Settings.from_env()
-        self._scoring_model = (
-            resolved_settings.llm_scoring_model
-            or resolved_settings.llm_extraction_model
-            or DEFAULT_NEED_MODEL
-        )
+        self._scoring_model = resolve_component_model(resolved_settings, "need_detector")
 
     async def detect(
         self,
@@ -214,6 +212,7 @@ class NeedDetector:
                 LLMMessage(role="user", content=prompt),
             ],
             temperature=0.0,
+            max_output_tokens=NEED_DETECTOR_MAX_OUTPUT_TOKENS,
             response_schema=TypeAdapter(QueryIntelligenceResult).json_schema(),
             metadata={
                 "user_id": context.user_id,

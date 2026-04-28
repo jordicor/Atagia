@@ -16,6 +16,7 @@ from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository, WorkspaceRepository
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
+from atagia.memory.context_composer import ContextComposer
 from atagia.models.schemas_memory import (
     DetectedNeed,
     ExtractionConversationContext,
@@ -84,10 +85,12 @@ class PipelineProvider(LLMProvider):
             )
         if purpose == "applicability_scoring":
             memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
-            payload = [
-                {"memory_id": memory_id, "llm_applicability": self.score_map.get(memory_id, 0.5)}
-                for memory_id in memory_ids
-            ]
+            payload = {
+                "scores": [
+                    {"memory_id": memory_id, "llm_applicability": self.score_map.get(memory_id, 0.5)}
+                    for memory_id in memory_ids
+                ],
+            }
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
@@ -117,6 +120,116 @@ class FailingPipelineProvider(PipelineProvider):
             self.requests.append(request)
             raise LLMError(f"Injected {self._fail_purpose} failure")
         return await super().complete(request)
+
+
+class OmitFirstApplicabilityScoreProvider(PipelineProvider):
+    """Provider that omits one scored memory on the first scoring call."""
+
+    def __init__(
+        self,
+        omitted_memory_id: str,
+        *,
+        need_response: dict[str, object] | None = None,
+        score_map: dict[str, float] | None = None,
+    ) -> None:
+        super().__init__(need_response=need_response, score_map=score_map)
+        self._omitted_memory_id = omitted_memory_id
+        self._scoring_calls = 0
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        if str(request.metadata.get("purpose")) != "applicability_scoring":
+            return await super().complete(request)
+
+        self.requests.append(request)
+        self._scoring_calls += 1
+        memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+        payload = {
+            "scores": [
+                {"memory_id": memory_id, "llm_applicability": self.score_map.get(memory_id, 0.5)}
+                for memory_id in memory_ids
+                if not (self._scoring_calls == 1 and memory_id == self._omitted_memory_id)
+            ],
+        }
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text=json.dumps(payload),
+        )
+
+
+class MalformedFirstApplicabilityScoreProvider(PipelineProvider):
+    """Provider that returns one score without memory_id on the first scoring call."""
+
+    def __init__(
+        self,
+        malformed_memory_id: str,
+        *,
+        need_response: dict[str, object] | None = None,
+        score_map: dict[str, float] | None = None,
+    ) -> None:
+        super().__init__(need_response=need_response, score_map=score_map)
+        self._malformed_memory_id = malformed_memory_id
+        self._scoring_calls = 0
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        if str(request.metadata.get("purpose")) != "applicability_scoring":
+            return await super().complete(request)
+
+        self.requests.append(request)
+        self._scoring_calls += 1
+        memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+        scores: list[dict[str, object]] = []
+        for memory_id in memory_ids:
+            score = self.score_map.get(memory_id, 0.5)
+            if self._scoring_calls == 1 and memory_id == self._malformed_memory_id:
+                scores.append({"llm_applicability": score})
+            else:
+                scores.append({"memory_id": memory_id, "llm_applicability": score})
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text=json.dumps({"scores": scores}),
+        )
+
+
+class InvalidFirstApplicabilityScoreProvider(PipelineProvider):
+    """Provider that returns schema-invalid scores on the first scoring call."""
+
+    def __init__(
+        self,
+        *,
+        need_response: dict[str, object] | None = None,
+        score_map: dict[str, float] | None = None,
+    ) -> None:
+        super().__init__(need_response=need_response, score_map=score_map)
+        self._scoring_calls = 0
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        if str(request.metadata.get("purpose")) != "applicability_scoring":
+            return await super().complete(request)
+
+        self.requests.append(request)
+        self._scoring_calls += 1
+        if self._scoring_calls == 1:
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {"scores": [{"memory_id": "mem_present", "llm_applicability": 2.0}]}
+                ),
+            )
+        memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+        payload = {
+            "scores": [
+                {"memory_id": memory_id, "llm_applicability": self.score_map.get(memory_id, 0.5)}
+                for memory_id in memory_ids
+            ],
+        }
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text=json.dumps(payload),
+        )
 
 
 def _settings(*, small_corpus_token_threshold_ratio: float = 0.0) -> Settings:
@@ -357,6 +470,14 @@ async def test_pipeline_executes_full_flow() -> None:
         assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_1"]
         assert [candidate.memory_id for candidate in result.scored_candidates] == ["mem_1"]
         assert result.composed_context.selected_memory_ids == ["mem_1"]
+        assert result.retrieval_sufficiency is not None
+        assert result.retrieval_sufficiency.state == "retrieval_sufficient"
+        assert result.retrieval_sufficiency.scored_candidate_count == 1
+        assert result.candidate_custody[0]["candidate_id"] == "mem_1"
+        assert result.candidate_custody[0]["shortlist_status"] == "shortlisted"
+        assert result.candidate_custody[0]["score_status"] == "scored"
+        assert result.candidate_custody[0]["composer_decision"] == "selected"
+        assert result.candidate_custody[0]["matched_subquery_indexes"] == [0]
         assert {
             "need_detection",
             "planning",
@@ -368,6 +489,216 @@ async def test_pipeline_executes_full_flow() -> None:
             "context_composition",
         }.issubset(result.stage_timings)
         assert all(value >= 0.0 for value in result.stage_timings.values())
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_forwards_budgeted_composer_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_strategies: list[str | None] = []
+    original_compose = ContextComposer.compose
+
+    def _capture_compose(self: ContextComposer, *args, **kwargs):
+        observed_strategies.append(kwargs.get("composer_strategy"))
+        return original_compose(self, *args, **kwargs)
+
+    monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
+    provider = PipelineProvider(score_map={"mem_1": 0.91})
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(composer_strategy="budgeted_marginal"),
+            conversation_messages=[{"role": "user", "text": "retry loop websocket backoff"}],
+        )
+
+        assert observed_strategies == ["budgeted_marginal"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_small_corpus_forwards_budgeted_composer_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_strategies: list[str | None] = []
+    original_compose = ContextComposer.compose
+
+    def _capture_compose(self: ContextComposer, *args, **kwargs):
+        observed_strategies.append(kwargs.get("composer_strategy"))
+        return original_compose(self, *args, **kwargs)
+
+    monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
+    provider = PipelineProvider(score_map={"mem_1": 0.91})
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        provider=provider,
+        settings=_settings(small_corpus_token_threshold_ratio=1.0),
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(composer_strategy="budgeted_marginal"),
+            conversation_messages=[{"role": "user", "text": "retry loop websocket backoff"}],
+        )
+
+        assert observed_strategies == ["budgeted_marginal"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_retries_partial_applicability_scores_without_crashing() -> None:
+    message_text = "retry loop websocket backoff"
+    provider = OmitFirstApplicabilityScoreProvider(
+        "mem_missing_first",
+        score_map={"mem_present": 0.7, "mem_missing_first": 0.86},
+    )
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_present",
+            canonical_text="retry loop websocket backoff present memory",
+            scope=MemoryScope.CONVERSATION,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_missing_first",
+            canonical_text="retry loop websocket backoff omitted on first scoring response",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        result = await pipeline.execute(
+            message_text=message_text,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": message_text}],
+        )
+
+        scored_ids = {candidate.memory_id for candidate in result.scored_candidates}
+        assert scored_ids == {"mem_present", "mem_missing_first"}
+        scoring_requests = [
+            request
+            for request in provider.requests
+            if str(request.metadata.get("purpose")) == "applicability_scoring"
+        ]
+        assert len(scoring_requests) == 2
+        assert _MEMORY_ID_PATTERN.findall(scoring_requests[1].messages[1].content) == [
+            "mem_missing_first"
+        ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_retries_malformed_applicability_scores_without_crashing() -> None:
+    message_text = "retry loop websocket backoff"
+    provider = MalformedFirstApplicabilityScoreProvider(
+        "mem_malformed_first",
+        score_map={"mem_present": 0.7, "mem_malformed_first": 0.86},
+    )
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_present",
+            canonical_text="retry loop websocket backoff present memory",
+            scope=MemoryScope.CONVERSATION,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_malformed_first",
+            canonical_text="retry loop websocket backoff malformed on first scoring response",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        result = await pipeline.execute(
+            message_text=message_text,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": message_text}],
+        )
+
+        scored_ids = {candidate.memory_id for candidate in result.scored_candidates}
+        assert scored_ids == {"mem_present", "mem_malformed_first"}
+        scoring_requests = [
+            request
+            for request in provider.requests
+            if str(request.metadata.get("purpose")) == "applicability_scoring"
+        ]
+        assert len(scoring_requests) == 2
+        assert _MEMORY_ID_PATTERN.findall(scoring_requests[1].messages[1].content) == [
+            "mem_malformed_first"
+        ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_retries_invalid_applicability_scores_without_crashing() -> None:
+    message_text = "retry loop websocket backoff"
+    provider = InvalidFirstApplicabilityScoreProvider(
+        score_map={"mem_present": 0.7, "mem_retry": 0.86},
+    )
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_present",
+            canonical_text="retry loop websocket backoff present memory",
+            scope=MemoryScope.CONVERSATION,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_retry",
+            canonical_text="retry loop websocket backoff retry memory",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        result = await pipeline.execute(
+            message_text=message_text,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": message_text}],
+        )
+
+        scored_ids = {candidate.memory_id for candidate in result.scored_candidates}
+        assert scored_ids == {"mem_present", "mem_retry"}
+        scoring_requests = [
+            request
+            for request in provider.requests
+            if str(request.metadata.get("purpose")) == "applicability_scoring"
+        ]
+        assert len(scoring_requests) == 2
+        assert set(_MEMORY_ID_PATTERN.findall(scoring_requests[1].messages[1].content)) == {
+            "mem_present",
+            "mem_retry",
+        }
     finally:
         await connection.close()
 
@@ -632,6 +963,13 @@ async def test_pipeline_high_stakes_filters_derived_memory_and_workspace_rollup(
         assert result.composed_context.selected_memory_ids == ["mem_evidence"]
         assert result.composed_context.workspace_block == ""
         assert "mem_belief" not in result.composed_context.memory_block
+        custody_by_id = {
+            record["candidate_id"]: record
+            for record in result.candidate_custody
+        }
+        assert custody_by_id["mem_belief"]["filter_reason"] == "regrounding_filtered"
+        assert custody_by_id["mem_belief"]["score_status"] == "filtered_before_scoring"
+        assert custody_by_id["mem_evidence"]["composer_decision"] == "selected"
     finally:
         await connection.close()
 
@@ -685,6 +1023,18 @@ async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None
         returned_ids = {candidate["id"] for candidate in result.raw_candidates}
         assert returned_ids == {"mem_conv", "mem_mode"}
         assert set(result.composed_context.selected_memory_ids) == {"mem_conv", "mem_mode"}
+        assert result.retrieval_sufficiency is not None
+        assert result.retrieval_sufficiency.state == "retrieval_sufficient"
+        assert result.retrieval_sufficiency.scored_candidate_count == 2
+        custody_by_id = {
+            record["candidate_id"]: record
+            for record in result.candidate_custody
+        }
+        assert set(custody_by_id) == {"mem_conv", "mem_mode"}
+        assert all(
+            record["score_status"] == "scored"
+            for record in custody_by_id.values()
+        )
         assert result.stage_timings["need_detection"] >= 0.0
         assert result.stage_timings["candidate_search"] >= 0.0
         assert result.stage_timings["applicability_scoring"] >= 0.0
@@ -769,6 +1119,8 @@ async def test_pipeline_small_corpus_shortcut_sets_trace_flag() -> None:
         assert trace.candidate_search.total_after_fusion == 1
         assert trace.scoring is not None
         assert trace.scoring.candidates_scored == 1
+        assert trace.retrieval_sufficiency is not None
+        assert trace.retrieval_sufficiency.state == "retrieval_sufficient"
     finally:
         await connection.close()
 
@@ -1182,6 +1534,7 @@ async def test_pipeline_degraded_mode_trace_is_recorded() -> None:
         assert trace.need_detection is not None
         assert trace.need_detection.degraded_mode is True
         assert trace.candidate_search is not None
+        assert trace.retrieval_sufficiency is not None
     finally:
         await connection.close()
 

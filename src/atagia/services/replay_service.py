@@ -90,6 +90,11 @@ class ReplayService:
             original_event_id=event_id,
             replay_pipeline_result=replay_pipeline_result,
             comparison=comparison,
+            ablation_config=(
+                ablation.model_dump(mode="json", exclude_none=True)
+                if ablation is not None
+                else None
+            ),
         )
 
     async def replay_conversation(

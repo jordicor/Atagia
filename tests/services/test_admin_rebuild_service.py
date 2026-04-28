@@ -31,8 +31,9 @@ from atagia.models.schemas_memory import (
     MemoryStatus,
     SummaryViewKind,
 )
-from atagia.services.embeddings import EmbeddingIndex
+import atagia.services.admin_rebuild_service as admin_rebuild_module
 from atagia.services.admin_rebuild_service import AdminRebuildService
+from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -40,6 +41,8 @@ from atagia.services.llm_client import (
     LLMEmbeddingRequest,
     LLMEmbeddingResponse,
     LLMProvider,
+    OutputLimitExceededError,
+    StructuredOutputError,
 )
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
@@ -792,6 +795,63 @@ async def test_rebuild_conversation_recreates_hierarchy_for_short_conversation()
 
 
 @pytest.mark.asyncio
+async def test_rebuild_conversation_can_skip_final_compaction() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+    summaries = SummaryRepository(connection, clock)
+    provider = RebuildReplayProvider()
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00")
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=RebuildReplayProvider.name,
+                providers=[provider],
+            ),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        result = await service.rebuild_conversation(
+            "usr_1",
+            "cnv_1",
+            skip_final_compaction=True,
+        )
+
+        assert result.processed_messages == 1
+        assert result.conversation_compaction_jobs_processed == 0
+        assert result.episode_compaction_jobs_processed == 0
+        assert result.thematic_profile_jobs_processed == 0
+        assert result.workspace_rollup_jobs_processed == 0
+        assert await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10) == []
+        assert await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE) == []
+        assert await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.THEMATIC_PROFILE) == []
+        assert not any(
+            request.metadata.get("purpose")
+            in {
+                "summary_chunk_segmentation",
+                "episode_synthesis",
+                "thematic_profile_synthesis",
+                "workspace_rollup_synthesis",
+            }
+            for request in provider.requests
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_rebuild_user_processes_workspace_rollups_synchronously() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
@@ -866,5 +926,167 @@ async def test_admin_rebuild_service_passes_embedding_index_to_revision_worker(
         await service.rebuild_user("usr_1")
 
         assert captured["embedding_index"] is embedding_index
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_conversation_skips_recoverable_contract_projection_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+
+    class FailingContractWorker:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def process_job(self, payload):
+            raise StructuredOutputError(
+                "Provider returned invalid structured output",
+                details=("contract projection validation failed",),
+            )
+
+    monkeypatch.setattr(admin_rebuild_module, "ContractWorker", FailingContractWorker)
+
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=RebuildReplayProvider.name,
+                providers=[RebuildReplayProvider()],
+            ),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        result = await service.rebuild_conversation(
+            "usr_1",
+            "cnv_1",
+            skip_final_compaction=True,
+        )
+
+        assert result.processed_messages == 1
+        assert result.extract_jobs_processed == 1
+        assert result.contract_jobs_processed == 0
+        assert result.recoverable_job_failures == 1
+        assert result.recoverable_contract_job_failures == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_conversation_skips_recoverable_output_limit_extract_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+
+    class TruncatingIngestWorker:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def process_job(self, payload):
+            raise OutputLimitExceededError(
+                "openrouter stopped because it reached max output tokens "
+                "(finish_reason=length)"
+            )
+
+    monkeypatch.setattr(admin_rebuild_module, "IngestWorker", TruncatingIngestWorker)
+
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=RebuildReplayProvider.name,
+                providers=[RebuildReplayProvider()],
+            ),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        result = await service.rebuild_conversation(
+            "usr_1",
+            "cnv_1",
+            skip_final_compaction=True,
+        )
+
+        assert result.processed_messages == 1
+        assert result.extract_jobs_processed == 0
+        assert result.recoverable_job_failures >= 1
+        assert result.recoverable_extract_job_failures == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_conversation_propagates_non_llm_contract_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+
+    class BrokenContractWorker:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def process_job(self, payload):
+            raise RuntimeError("database invariant failed")
+
+    monkeypatch.setattr(admin_rebuild_module, "ContractWorker", BrokenContractWorker)
+
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=RebuildReplayProvider.name,
+                providers=[RebuildReplayProvider()],
+            ),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        with pytest.raises(RuntimeError, match="database invariant failed"):
+            await service.rebuild_conversation(
+                "usr_1",
+                "cnv_1",
+                skip_final_compaction=True,
+            )
     finally:
         await connection.close()

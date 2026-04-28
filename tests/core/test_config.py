@@ -184,6 +184,54 @@ def test_operational_allowed_profiles_reject_blank_entries() -> None:
         )
 
 
+def test_artifact_blob_storage_settings_use_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("ATAGIA_ARTIFACT_BLOB_STORAGE_KIND", raising=False)
+    monkeypatch.delenv("ATAGIA_ARTIFACT_BLOB_STORAGE_PATH", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.artifact_blob_storage_kind == "sqlite_blob"
+    assert settings.artifact_blob_storage_path == "./data/artifact_blobs"
+
+
+def test_artifact_blob_storage_settings_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_ARTIFACT_BLOB_STORAGE_KIND", "local_file")
+    monkeypatch.setenv("ATAGIA_ARTIFACT_BLOB_STORAGE_PATH", "/tmp/atagia-artifacts")
+
+    settings = Settings.from_env()
+
+    assert settings.artifact_blob_storage_kind == "local_file"
+    assert settings.artifact_blob_storage_path == "/tmp/atagia-artifacts"
+
+
+def test_artifact_blob_storage_settings_reject_invalid_values() -> None:
+    with pytest.raises(ValueError):
+        Settings(
+            sqlite_path=":memory:",
+            migrations_path="./migrations",
+            manifests_path="./manifests",
+            storage_backend="inprocess",
+            redis_url="redis://localhost:6379/0",
+            llm_provider="openai",
+            llm_api_key=None,
+            openai_api_key="test-openai-key",
+            openrouter_api_key=None,
+            llm_base_url=None,
+            openrouter_site_url="http://localhost",
+            openrouter_app_name="Atagia",
+            llm_extraction_model="extract-test-model",
+            llm_scoring_model="score-test-model",
+            llm_classifier_model="classify-test-model",
+            llm_chat_model="reply-test-model",
+            service_mode=False,
+            service_api_key=None,
+            admin_api_key=None,
+            workers_enabled=False,
+            debug=False,
+            artifact_blob_storage_kind="remote",
+        )
+
+
 def test_ephemeral_scoring_hours_can_be_overridden(monkeypatch) -> None:
     monkeypatch.setenv("ATAGIA_EPHEMERAL_SCORING_HOURS", "12")
 
