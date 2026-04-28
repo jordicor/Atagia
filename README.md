@@ -269,8 +269,8 @@ Five tools are exposed: `atagia_get_context`, `atagia_add_memory`, `atagia_searc
 ### As a REST API
 
 ```bash
-git clone https://github.com/jordicor/atagia.git
-cd atagia
+git clone https://github.com/jordicor/Atagia.git
+cd Atagia
 pip install -e ".[dev]"
 cp .env.example .env   # configure LLM provider and keys
 uvicorn atagia.app:create_app --factory --reload
@@ -351,6 +351,7 @@ Memory is not a flat global profile. Each assistant mode defines its own retriev
 - **companion**: high emotional sensitivity, prefers interaction contracts
 - **brainstorm**: wide association, loose scope filtering
 - **biographical_interview**: maximizes evidence recall, strict privacy
+- **personal_assistant**: cross-chat continuity, contracts and state first
 - **general_qa**: balanced defaults
 
 Policies control which scopes are allowed, what memory types are preferred, privacy ceilings, context budgets, and retrieval parameters. Custom modes are defined as JSON manifests.
@@ -444,7 +445,7 @@ SQLite is the canonical data store. An LLM API is required for memory extraction
 | Language | Python 3.12+ |
 | API | FastAPI |
 | Primary storage | SQLite + FTS5 |
-| LLM providers | Anthropic, OpenAI, OpenRouter |
+| LLM providers | Anthropic, OpenAI, Google (Gemini), OpenRouter |
 | Optional cache/queues | Redis |
 | Optional semantic recall | sqlite-vec |
 
@@ -516,8 +517,8 @@ Benchmark status is still pre-alpha. Use the harness for regression tracking and
 | 1 | Core memory system: extraction, retrieval, scoring, contracts, lifecycle, API | Done |
 | 2 | Belief revision, consequence chains, compaction, evaluation, replay | Done |
 | 2.5 | Library mode, MCP server | Done |
-| 3 | Benchmark foundation, offline ingestion, LoCoMo harness, ablations, reporting | In progress |
-| 3.5 | Retrieval quality waves, adaptive context cache, text chunking, temporal grounding, memory hierarchy, natural memory capture, consent gating | Mostly done / stabilizing |
+| 3 | Benchmark foundation, offline ingestion, LoCoMo harness, ablations, reporting | Done |
+| 3.5 | Retrieval quality waves, adaptive context cache, text chunking, temporal grounding, memory hierarchy, natural memory capture, consent gating | Done |
 | 4 | Evidence and reliability: reproducible benchmark baselines, high-risk policy, retrieval hardening, compaction validation, relational memory slice | Next |
 | 5 | Graph or SaaS expansion | Deferred until benchmark evidence or user demand justifies it |
 
@@ -527,7 +528,6 @@ Atagia is backed by cross-domain research into memory systems spanning microbiol
 
 - [Beyond Similarity: Applicability-Governed Memory](docs/Beyond_Similarity_Applicability_Governed_Memory.md) -- thesis paper with testable hypotheses and evaluation strategy
 - [Beyond Human Memory](docs/BEYOND_HUMAN_MEMORY.md) -- cross-domain exploration from cellular autophagy to Aboriginal Dreamtime
-- [Technical Design](docs/Atagia_Technical_Design.md) -- full engineering specification
 
 ## License
 
@@ -536,4 +536,4 @@ Atagia is backed by cross-domain research into memory systems spanning microbiol
 ## Links
 
 - Website: [atagia.org](https://atagia.org)
-- Author: Jordi Cor ([Acerting Art Inc.](https://acertingart.com) / OjoCentauri)
+- Author: Jordi Cor ([Acerting Art Inc.](https://acerting.com) / OjoCentauri)
