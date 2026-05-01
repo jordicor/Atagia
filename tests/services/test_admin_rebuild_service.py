@@ -35,6 +35,7 @@ import atagia.services.admin_rebuild_service as admin_rebuild_module
 from atagia.services.admin_rebuild_service import AdminRebuildService
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.llm_client import (
+    LLMError,
     LLMClient,
     LLMCompletionRequest,
     LLMCompletionResponse,
@@ -271,16 +272,10 @@ def _settings() -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
         service_mode=False,
         service_api_key=None,
@@ -288,6 +283,7 @@ def _settings() -> Settings:
         workers_enabled=False,
         debug=False,
         allow_insecure_http=True,
+        topic_working_set_enabled=False,
     )
 
 
@@ -979,6 +975,7 @@ async def test_rebuild_conversation_skips_recoverable_contract_projection_error(
         )
 
         assert result.processed_messages == 1
+        assert result.status == "rebuilt_partial"
         assert result.extract_jobs_processed == 1
         assert result.contract_jobs_processed == 0
         assert result.recoverable_job_failures == 1
@@ -1036,8 +1033,63 @@ async def test_rebuild_conversation_skips_recoverable_output_limit_extract_error
         )
 
         assert result.processed_messages == 1
+        assert result.status == "rebuilt_partial"
         assert result.extract_jobs_processed == 0
         assert result.recoverable_job_failures >= 1
+        assert result.recoverable_extract_job_failures == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_conversation_skips_generic_llm_extract_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+
+    class FailingIngestWorker:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def process_job(self, payload):
+            raise LLMError("JSON error injected into SSE stream")
+
+    monkeypatch.setattr(admin_rebuild_module, "IngestWorker", FailingIngestWorker)
+
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=RebuildReplayProvider.name,
+                providers=[RebuildReplayProvider()],
+            ),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        result = await service.rebuild_conversation(
+            "usr_1",
+            "cnv_1",
+            skip_final_compaction=True,
+        )
+
+        assert result.processed_messages == 1
+        assert result.status == "rebuilt_partial"
+        assert result.extract_jobs_processed == 0
+        assert result.recoverable_job_failures == 1
         assert result.recoverable_extract_job_failures == 1
     finally:
         await connection.close()

@@ -1,4 +1,5 @@
 """CLI entry point for running the LoCoMo benchmark."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -42,6 +43,7 @@ from benchmarks.report_diff import (
     save_benchmark_diff,
 )
 from atagia.models.schemas_replay import AblationConfig
+from atagia.services.model_resolution import COMPONENTS_BY_ID
 
 _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -100,13 +102,67 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--provider", default=None, help="LLM provider name")
     parser.add_argument("--api-key", default=None, help="LLM API key")
-    parser.add_argument("--model", default=None, help="LLM model for answer generation")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Legacy alias for --answer-model; used only for benchmark answer generation.",
+    )
+    parser.add_argument(
+        "--answer-model",
+        default=None,
+        help="Model spec for benchmark answer generation, e.g. openrouter/google/gemini-3.1-flash-lite-preview,medium.",
+    )
+    parser.add_argument(
+        "--answer-prompt-variant",
+        choices=("default", "grounded_connect", "light_world_knowledge"),
+        default="default",
+        help=(
+            "Benchmark-only answer prompt variant. Use default for the normal "
+            "Atagia prompt; grounded_connect and light_world_knowledge add "
+            "experimental instructions for answer generation only."
+        ),
+    )
     parser.add_argument(
         "--judge-model",
         default=None,
         help=(
             "Optional LLM model for scoring; defaults to claude-opus-4-6 for "
             "Anthropic, otherwise the answer model"
+        ),
+    )
+    parser.add_argument(
+        "--forced-global-model",
+        default=None,
+        help=(
+            "Force one model for every Atagia internal LLM component. "
+            "This is useful for old one-model baselines; prefer phase/component "
+            "flags for tuning."
+        ),
+    )
+    parser.add_argument(
+        "--ingest-model",
+        default=None,
+        help="Model for Atagia ingest components unless overridden by --component-model.",
+    )
+    parser.add_argument(
+        "--retrieval-model",
+        default=None,
+        help="Model for Atagia retrieval components unless overridden by --component-model.",
+    )
+    parser.add_argument(
+        "--chat-model",
+        default=None,
+        help="Model for Atagia chat component fallback when --answer-model is omitted.",
+    )
+    parser.add_argument(
+        "--component-model",
+        action="append",
+        default=[],
+        metavar="COMPONENT=MODEL",
+        help=(
+            "Override one Atagia LLM component model. Repeatable. "
+            "Examples: extractor=openai/gpt-4o-mini, "
+            "need_detector=openrouter/google/gemini-3.1-flash-lite-preview,medium"
         ),
     )
     parser.add_argument(
@@ -296,6 +352,34 @@ def _resolve_judge_model(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _resolve_answer_model(args: argparse.Namespace) -> str | None:
+    return args.answer_model or args.model
+
+
+def _parse_component_model_overrides(raw_values: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for raw_value in raw_values or []:
+        if "=" not in raw_value:
+            raise ValueError(
+                "--component-model must use COMPONENT=MODEL, "
+                f"got {raw_value!r}"
+            )
+        component_id, model = (part.strip() for part in raw_value.split("=", 1))
+        if not component_id or not model:
+            raise ValueError(
+                "--component-model must include both COMPONENT and MODEL, "
+                f"got {raw_value!r}"
+            )
+        if component_id not in COMPONENTS_BY_ID:
+            valid = ", ".join(sorted(COMPONENTS_BY_ID))
+            raise ValueError(
+                f"Unknown component id for --component-model: {component_id}. "
+                f"Valid component ids: {valid}"
+            )
+        overrides[component_id] = model
+    return overrides
+
+
 def _default_diff_output_path(report_path: Path) -> Path:
     timestamp = report_path.stem.removeprefix("locomo-report-")
     return report_path.with_name(f"locomo-diff-{timestamp}.json")
@@ -323,7 +407,14 @@ async def _run_async(
         llm_provider=args.provider,
         llm_api_key=args.api_key,
         llm_model=args.model,
+        answer_model=args.answer_model,
         judge_model=_resolve_judge_model(args),
+        forced_global_model=args.forced_global_model,
+        ingest_model=args.ingest_model,
+        retrieval_model=args.retrieval_model,
+        chat_model_override=args.chat_model,
+        component_models=_parse_component_model_overrides(args.component_model),
+        answer_prompt_variant=args.answer_prompt_variant,
         manifests_dir=args.manifests_dir,
         embedding_backend=args.embedding_backend,
         embedding_model=args.embedding_model,
@@ -530,7 +621,7 @@ def _collect_benchmark_db_entries(db_dir: Path) -> list[dict[str, object]]:
                 "turn_count": metadata.get("turn_count"),
                 "selected_turns": progress.get("selected_turns"),
                 "ingested_turns": progress.get("ingested_turns"),
-                "model": str(metadata.get("llm_model") or ""),
+                "model": str(metadata.get("answer_model") or metadata.get("llm_model") or ""),
                 "status": str(progress.get("status") or "metadata_complete"),
                 "db_path": str(db_path),
                 "metadata_path": str(metadata_path),
@@ -1344,9 +1435,11 @@ def _format_report_summary(
             f"{report.model_info.get('provider', '')} / "
             f"{report.model_info.get('answer_model', '')}"
         ),
+        _format_phase_models(report.model_info),
         f"Trusted evaluation: {bool(report.model_info.get('trusted_evaluation', False))}",
         f"Parallel conversations: {int(report.model_info.get('parallel_conversations', 1))}",
         _format_warning_counts(report.model_info.get("warning_counts")),
+        _format_llm_call_summary(report.model_info.get("llm_call_summary")),
         format_retrieval_custody_summary(
             report.model_info.get("retrieval_custody_summary")
         ),
@@ -1422,6 +1515,51 @@ def _format_warning_counts(value: object) -> str:
     return "Warning counts: " + ", ".join(items)
 
 
+def _format_phase_models(model_info: dict[str, object]) -> str:
+    parts = []
+    for label, key in (
+        ("judge", "judge_model"),
+        ("forced", "forced_global_model"),
+        ("ingest", "ingest_model"),
+        ("retrieval", "retrieval_model"),
+        ("chat", "chat_model"),
+    ):
+        value = model_info.get(key)
+        if isinstance(value, str) and value:
+            parts.append(f"{label}={value}")
+    component_models = model_info.get("component_models")
+    if isinstance(component_models, dict) and component_models:
+        parts.append(f"components={len(component_models)}")
+    return "Phase models: " + (" ".join(parts) if parts else "default internal resolution")
+
+
+def _format_llm_call_summary(value: object) -> str:
+    if not isinstance(value, dict):
+        return "LLM calls: unavailable"
+    total_calls = value.get("total_calls")
+    token_totals = value.get("token_totals")
+    if not isinstance(token_totals, dict):
+        token_totals = {}
+    token_parts = [
+        f"{key}={int(amount)}"
+        for key, amount in token_totals.items()
+        if isinstance(amount, int | float) and amount
+    ]
+    cost_totals = value.get("cost_totals")
+    if not isinstance(cost_totals, dict):
+        cost_totals = {}
+    cost_parts = [
+        f"{key}={amount:.6f}"
+        for key, amount in cost_totals.items()
+        if isinstance(amount, int | float) and amount
+    ]
+    failed_calls = value.get("failed_calls")
+    failed_text = f" failed={failed_calls}" if failed_calls else ""
+    tokens_text = " tokens " + " ".join(token_parts) if token_parts else ""
+    cost_text = " cost " + " ".join(cost_parts) if cost_parts else ""
+    return f"LLM calls: {total_calls or 0}{failed_text}{tokens_text}{cost_text}"
+
+
 def main() -> None:
     """Parse CLI args, run the benchmark, and print the report path."""
     parser = _build_parser()
@@ -1453,8 +1591,22 @@ def main() -> None:
         parser.error("--data-path is required unless a list-benchmark-dbs option is used")
     if args.provider is None:
         parser.error("--provider is required unless a list-benchmark-dbs option is used")
-    if args.model is None:
-        parser.error("--model is required unless a list-benchmark-dbs option is used")
+    if args.model is not None and args.answer_model is not None:
+        parser.error("--model is a legacy alias; use either --model or --answer-model, not both")
+    if (
+        _resolve_answer_model(args) is None
+        and args.chat_model is None
+        and args.forced_global_model is None
+        and not args.ingest_only
+    ):
+        parser.error(
+            "--answer-model, --model, --chat-model, or --forced-global-model "
+            "is required unless --ingest-only is used"
+        )
+    try:
+        _parse_component_model_overrides(args.component_model)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.embedding_backend == "sqlite_vec" and not args.embedding_model:
         parser.error("--embedding-model is required when --embedding-backend is sqlite_vec")
     if args.ingest_only and (args.evaluate_only or args.reuse_db is not None):

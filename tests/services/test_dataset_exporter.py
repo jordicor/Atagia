@@ -21,7 +21,7 @@ from atagia.core.repositories import (
 )
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
+from atagia.models.schemas_memory import IntimacyBoundary, MemoryObjectType, MemoryScope, MemorySourceKind
 from atagia.models.schemas_replay import ConversationExportKind, ExportAnonymizationMode
 from atagia.services.dataset_exporter import (
     AnonymizedExportDisabledError,
@@ -111,16 +111,10 @@ def _settings(*, allow_admin_export_anonymization: bool) -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="chat-test-model",
         service_mode=False,
         service_api_key=None,
@@ -218,6 +212,81 @@ async def test_export_conversation_with_and_without_retrieval_traces() -> None:
         assert with_traces.retrieval_traces[0].retrieval_event_id == "ret_1"
         assert without_traces.retrieval_traces is None
         json.dumps(with_traces.model_dump(mode="json"))
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_export_conversation_requires_explicit_intimacy_context_opt_in() -> None:
+    connection, clock = await _build_runtime()
+    try:
+        memories = MemoryObjectRepository(connection, clock)
+        await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Private continuity memory",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=2,
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+            intimacy_boundary_confidence=0.9,
+            memory_id="mem_intimacy",
+        )
+        exporter = DatasetExporter(connection, clock)
+
+        with pytest.raises(
+            UnsafeConversationExportRequestError,
+            match="include_intimacy_context=true",
+        ):
+            await exporter.export_conversation("cnv_1", "usr_1")
+
+        exported = await exporter.export_conversation(
+            "cnv_1",
+            "usr_1",
+            include_intimacy_context=True,
+        )
+        assert exported.intimacy_boundary_counts == {"romantic_private": 1}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_export_conversation_counts_global_intimacy_memory_from_source_messages() -> None:
+    connection, clock = await _build_runtime()
+    try:
+        memories = MemoryObjectRepository(connection, clock)
+        await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id=None,
+            assistant_mode_id=None,
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="Promoted private continuity memory",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=2,
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+            intimacy_boundary_confidence=0.9,
+            payload={"source_message_ids": ["msg_1"]},
+            memory_id="mem_global_intimacy",
+        )
+        exporter = DatasetExporter(connection, clock)
+
+        with pytest.raises(
+            UnsafeConversationExportRequestError,
+            match="include_intimacy_context=true",
+        ):
+            await exporter.export_conversation("cnv_1", "usr_1")
+
+        exported = await exporter.export_conversation(
+            "cnv_1",
+            "usr_1",
+            include_intimacy_context=True,
+        )
+        assert exported.intimacy_boundary_counts == {"romantic_private": 1}
     finally:
         await connection.close()
 

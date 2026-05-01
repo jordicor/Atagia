@@ -25,6 +25,7 @@ TaxonomyBucket = Literal[
     "composition",
     "retrieval_or_ranking",
     "answer_or_grading",
+    "execution_failure",
     "unknown",
 ]
 
@@ -36,6 +37,9 @@ _DIAGNOSIS_BUCKETS: dict[str, TaxonomyBucket] = {
     "composition_selected_none": "composition",
     "retrieval_or_ranking_miss": "retrieval_or_ranking",
     "answer_policy_or_grading": "answer_or_grading",
+    "retrieval_failed": "execution_failure",
+    "answer_generation_failed": "execution_failure",
+    "judge_failed": "execution_failure",
 }
 
 _SUFFICIENCY_BUCKETS: dict[str, TaxonomyBucket] = {
@@ -45,6 +49,9 @@ _SUFFICIENCY_BUCKETS: dict[str, TaxonomyBucket] = {
     "missing_artifact_support": "candidate_generation",
     "retrieval_insufficient": "retrieval_or_ranking",
     "answer_or_judge_issue": "answer_or_grading",
+    "retrieval_failed": "execution_failure",
+    "answer_generation_failed": "execution_failure",
+    "judge_failed": "execution_failure",
 }
 
 _KNOWN_DIAGNOSIS = frozenset([*_DIAGNOSIS_BUCKETS, "passed"])

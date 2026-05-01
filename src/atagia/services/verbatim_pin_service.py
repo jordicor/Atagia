@@ -6,7 +6,19 @@ from typing import TYPE_CHECKING, Any
 
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
-from atagia.models.schemas_memory import MemoryScope, VerbatimPinStatus, VerbatimPinTargetKind
+from atagia.memory.intimacy_boundary_policy import (
+    constrained_scope_for_intimacy_boundary,
+    is_blocked_intimacy_boundary,
+    is_restricted_intimacy_boundary,
+    minimum_privacy_for_intimacy_boundary,
+    normalize_intimacy_boundary,
+)
+from atagia.models.schemas_memory import (
+    IntimacyBoundary,
+    MemoryScope,
+    VerbatimPinStatus,
+    VerbatimPinTargetKind,
+)
 
 if TYPE_CHECKING:
     from atagia.app import AppRuntime
@@ -41,6 +53,8 @@ class VerbatimPinService:
         target_span_start: int | None = None,
         target_span_end: int | None = None,
         privacy_level: int = 0,
+        intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+        intimacy_boundary_confidence: float = 0.0,
         reason: str | None = None,
         created_by: str | None = None,
         expires_at: str | None = None,
@@ -55,6 +69,27 @@ class VerbatimPinService:
             user_id=user_id,
             target_kind=target_kind,
             target_id=resolved_target_id,
+        )
+        resolved_intimacy_boundary = self._resolve_intimacy_boundary(
+            explicit_boundary=intimacy_boundary,
+            payload_json=payload_json,
+            source_row=source_row,
+        )
+        if is_blocked_intimacy_boundary(resolved_intimacy_boundary):
+            raise ValueError("safety_blocked verbatim pins cannot be created")
+        resolved_intimacy_boundary_confidence = self._resolve_intimacy_boundary_confidence(
+            explicit_confidence=intimacy_boundary_confidence,
+            resolved_boundary=resolved_intimacy_boundary,
+            payload_json=payload_json,
+            source_row=source_row,
+        )
+        scope = constrained_scope_for_intimacy_boundary(
+            resolved_intimacy_boundary,
+            scope=scope,
+        )
+        privacy_level = minimum_privacy_for_intimacy_boundary(
+            resolved_intimacy_boundary,
+            privacy_level=privacy_level,
         )
         scope_anchors = await self._resolve_scope_anchors(
             connection,
@@ -97,6 +132,13 @@ class VerbatimPinService:
         resolved_payload = dict(payload_json or {})
         resolved_payload.setdefault("source_target_kind", target_kind.value)
         resolved_payload.setdefault("source_target_id", resolved_target_id)
+        resolved_payload["intimacy_boundary"] = resolved_intimacy_boundary.value
+        resolved_payload["intimacy_boundary_confidence"] = resolved_intimacy_boundary_confidence
+        if is_restricted_intimacy_boundary(resolved_intimacy_boundary):
+            resolved_payload.setdefault(
+                "intimacy_boundary_policy",
+                {"requires_explicit_intimacy_context": True},
+            )
         if source_row is not None:
             resolved_payload.setdefault(
                 "source_snapshot",
@@ -129,6 +171,8 @@ class VerbatimPinService:
                 canonical_text=resolved_canonical_text,
                 index_text=resolved_index_text,
                 privacy_level=privacy_level,
+                intimacy_boundary=resolved_intimacy_boundary,
+                intimacy_boundary_confidence=resolved_intimacy_boundary_confidence,
                 created_by=resolved_created_by,
                 reason=reason,
                 target_span_start=span_start,
@@ -191,6 +235,8 @@ class VerbatimPinService:
         target_span_start: int | None = None,
         target_span_end: int | None = None,
         privacy_level: int | None = None,
+        intimacy_boundary: IntimacyBoundary | None = None,
+        intimacy_boundary_confidence: float | None = None,
         status: VerbatimPinStatus | None = None,
         reason: str | None = None,
         expires_at: str | None = None,
@@ -207,6 +253,8 @@ class VerbatimPinService:
                 target_span_start=target_span_start,
                 target_span_end=target_span_end,
                 privacy_level=privacy_level,
+                intimacy_boundary=intimacy_boundary,
+                intimacy_boundary_confidence=intimacy_boundary_confidence,
                 status=status,
                 reason=reason,
                 expires_at=expires_at,
@@ -248,6 +296,7 @@ class VerbatimPinService:
         workspace_id: str | None,
         conversation_id: str,
         limit: int,
+        allow_intimacy_context: bool = False,
         as_of: str | None = None,
     ) -> list[dict[str, Any]]:
         return await VerbatimPinRepository(connection, self.runtime.clock).search_active_verbatim_pins(
@@ -259,8 +308,45 @@ class VerbatimPinService:
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             limit=limit,
+            allow_intimacy_context=allow_intimacy_context,
             as_of=as_of,
         )
+
+    @staticmethod
+    def _resolve_intimacy_boundary(
+        *,
+        explicit_boundary: IntimacyBoundary,
+        payload_json: dict[str, Any] | None,
+        source_row: dict[str, Any] | None,
+    ) -> IntimacyBoundary:
+        if explicit_boundary is not IntimacyBoundary.ORDINARY:
+            return explicit_boundary
+        if source_row is not None and source_row.get("intimacy_boundary") is not None:
+            return normalize_intimacy_boundary(source_row.get("intimacy_boundary"))
+        payload = payload_json or {}
+        if payload.get("intimacy_boundary") is not None:
+            return normalize_intimacy_boundary(payload.get("intimacy_boundary"))
+        return IntimacyBoundary.ORDINARY
+
+    @staticmethod
+    def _resolve_intimacy_boundary_confidence(
+        *,
+        explicit_confidence: float,
+        resolved_boundary: IntimacyBoundary,
+        payload_json: dict[str, Any] | None,
+        source_row: dict[str, Any] | None,
+    ) -> float:
+        if explicit_confidence:
+            return float(explicit_confidence)
+        if (
+            source_row is not None
+            and normalize_intimacy_boundary(source_row.get("intimacy_boundary")) is resolved_boundary
+        ):
+            return float(source_row.get("intimacy_boundary_confidence", 0.0) or 0.0)
+        payload = payload_json or {}
+        if normalize_intimacy_boundary(payload.get("intimacy_boundary")) is resolved_boundary:
+            return float(payload.get("intimacy_boundary_confidence", 0.0) or 0.0)
+        return 0.0
 
     async def _load_source_row(
         self,

@@ -111,16 +111,10 @@ def _settings() -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
         service_mode=False,
         service_api_key=None,
@@ -128,6 +122,16 @@ def _settings() -> Settings:
         workers_enabled=False,
         debug=False,
         allow_insecure_http=True,
+    )
+
+
+def _split_by_scope_output(explanation: str) -> str:
+    return json.dumps(
+        {
+            "action": "SPLIT_BY_SCOPE",
+            "successor_canonical_text": "I prefer terse debugging answers in this conversation.",
+            "explanation": explanation,
+        }
     )
 
 
@@ -406,7 +410,7 @@ async def test_revision_worker_defers_contradictory_revision_below_tension_thres
 @pytest.mark.asyncio
 async def test_revision_worker_defers_same_value_scope_exception_after_preview() -> None:
     connection, _backend, memories, beliefs, worker = await _build_runtime(
-        [json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "This belief only holds in a narrower scope."})]
+        [_split_by_scope_output("This belief only holds in a narrower scope.")]
     )
     try:
         belief = await _seed_belief(
@@ -723,11 +727,11 @@ async def test_revision_worker_clears_stale_contradiction_buffer_when_tension_re
 async def test_revision_worker_reuses_threshold_preview_for_ambiguous_same_value_cases() -> None:
     connection, _backend, memories, beliefs, worker = await _build_runtime(
         [
-            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 1."}),
-            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 2."}),
-            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 3."}),
-            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Threshold trigger preview."}),
-            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Threshold apply preview."}),
+            _split_by_scope_output("Preview 1."),
+            _split_by_scope_output("Preview 2."),
+            _split_by_scope_output("Preview 3."),
+            _split_by_scope_output("Threshold trigger preview."),
+            _split_by_scope_output("Threshold apply preview."),
             json.dumps({"action": "REINFORCE", "explanation": "Should remain unused."}),
         ]
     )
@@ -823,10 +827,10 @@ async def test_revision_worker_preserves_contradiction_buffer_when_threshold_rev
 async def test_revision_worker_preserves_ambiguous_buffer_when_threshold_preview_fails() -> None:
     connection, _backend, memories, beliefs, worker = await _build_runtime(
         [
-            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 1."}),
-            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 2."}),
-            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Preview 3."}),
-            json.dumps({"action": "SPLIT_BY_SCOPE", "explanation": "Threshold trigger preview."}),
+            _split_by_scope_output("Preview 1."),
+            _split_by_scope_output("Preview 2."),
+            _split_by_scope_output("Preview 3."),
+            _split_by_scope_output("Threshold trigger preview."),
             "not-json",
         ]
     )

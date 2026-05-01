@@ -73,12 +73,21 @@ class DatasetExporter:
         user_id: str,
         include_retrieval_traces: bool = True,
         include_memory_snapshots: bool = False,
+        include_intimacy_context: bool = False,
         anonymization_mode: ExportAnonymizationMode = ExportAnonymizationMode.RAW,
     ) -> ConversationExport:
         del include_memory_snapshots
         conversation = await self._conversation_repository.get_conversation(conversation_id, user_id)
         if conversation is None:
             raise ConversationExportNotFoundError("Conversation not found for user")
+        intimacy_boundary_counts = await self._conversation_intimacy_boundary_counts(
+            conversation_id=conversation_id,
+            user_id=user_id,
+        )
+        if intimacy_boundary_counts and not include_intimacy_context:
+            raise UnsafeConversationExportRequestError(
+                "Conversation export contains intimacy-bound context; set include_intimacy_context=true explicitly"
+            )
         if anonymization_mode != ExportAnonymizationMode.RAW and include_retrieval_traces:
             raise UnsafeConversationExportRequestError(
                 "Retrieval traces are not available for anonymized projection exports"
@@ -103,6 +112,7 @@ class DatasetExporter:
                 workspace_id=self._coerce_workspace_id(conversation.get("workspace_id")),
                 assistant_mode_id=str(conversation["assistant_mode_id"]),
                 messages=exported_messages,
+                intimacy_boundary_counts=intimacy_boundary_counts,
                 anonymization_mode=anonymization_mode,
             )
 
@@ -152,6 +162,7 @@ class DatasetExporter:
             workspace_id=conversation.get("workspace_id"),
             messages=exported_messages,
             retrieval_traces=retrieval_traces,
+            intimacy_boundary_counts=intimacy_boundary_counts,
             exported_at=self._clock.now().isoformat(),
         )
 
@@ -163,6 +174,7 @@ class DatasetExporter:
         workspace_id: str | None,
         assistant_mode_id: str,
         messages: list[ExportedMessage],
+        intimacy_boundary_counts: dict[str, int],
         anonymization_mode: ExportAnonymizationMode,
     ) -> ConversationExport:
         if self._settings is None or not self._settings.allow_admin_export_anonymization:
@@ -191,9 +203,61 @@ class DatasetExporter:
             workspace_id=export_ids.workspace_id,
             messages=self._anonymized_messages(messages, export_ids, projection, anonymization_mode),
             retrieval_traces=None,
+            intimacy_boundary_counts=intimacy_boundary_counts,
             exported_at=None,
             anonymization=projection.summary,
         )
+
+    async def _conversation_intimacy_boundary_counts(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+    ) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        cursor = await self._connection.execute(
+            """
+            SELECT mo.intimacy_boundary, COUNT(DISTINCT mo.id) AS boundary_count
+            FROM memory_objects AS mo
+            WHERE mo.user_id = ?
+              AND mo.intimacy_boundary != 'ordinary'
+              AND (
+                mo.conversation_id = ?
+                OR EXISTS (
+                    SELECT 1
+                    FROM json_each(mo.payload_json, '$.source_message_ids') AS source_ids
+                    JOIN messages AS m ON m.id = source_ids.value
+                    WHERE m.conversation_id = ?
+                )
+              )
+            GROUP BY mo.intimacy_boundary
+            """,
+            (user_id, conversation_id, conversation_id),
+        )
+        for row in await cursor.fetchall():
+            boundary = str(row["intimacy_boundary"])
+            counts[boundary] = counts.get(boundary, 0) + int(row["boundary_count"])
+        for table in (
+            "summary_views",
+            "conversation_topics",
+            "artifacts",
+            "verbatim_pins",
+        ):
+            cursor = await self._connection.execute(
+                f"""
+                SELECT intimacy_boundary, COUNT(*) AS boundary_count
+                FROM {table}
+                WHERE user_id = ?
+                  AND conversation_id = ?
+                  AND intimacy_boundary != 'ordinary'
+                GROUP BY intimacy_boundary
+                """,
+                (user_id, conversation_id),
+            )
+            for row in await cursor.fetchall():
+                boundary = str(row["intimacy_boundary"])
+                counts[boundary] = counts.get(boundary, 0) + int(row["boundary_count"])
+        return dict(sorted(counts.items()))
 
     def _resolve_anonymization_model(self) -> str:
         if self._settings is None:

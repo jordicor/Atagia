@@ -485,9 +485,6 @@ async def connect_atagia(
     redis_url: str | None = None,
     manifests_dir: str | Path | None = None,
     operational_profiles_dir: str | Path | None = None,
-    llm_provider: str | None = None,
-    llm_api_key: str | None = None,
-    llm_model: str | None = None,
     llm_forced_global_model: str | None = None,
     anthropic_api_key: str | None = None,
     openai_api_key: str | None = None,
@@ -495,9 +492,10 @@ async def connect_atagia(
     openrouter_api_key: str | None = None,
     embedding_backend: str = "none",
     embedding_model: str | None = None,
-    embedding_provider_name: str | None = None,
     context_cache_enabled: bool | None = None,
     chunking_enabled: bool | None = None,
+    assistant_guidance_enabled: bool | None = None,
+    recent_transcript_budget_tokens: int | None = None,
     http_client: httpx.AsyncClient | None = None,
     timeout: float = 30.0,
 ) -> AtagiaClient:
@@ -535,9 +533,6 @@ async def connect_atagia(
             redis_url=redis_url,
             manifests_dir=manifests_dir,
             operational_profiles_dir=operational_profiles_dir,
-            llm_provider=llm_provider,
-            llm_api_key=llm_api_key,
-            llm_model=llm_model,
             llm_forced_global_model=llm_forced_global_model,
             anthropic_api_key=anthropic_api_key,
             openai_api_key=openai_api_key,
@@ -545,9 +540,10 @@ async def connect_atagia(
             openrouter_api_key=openrouter_api_key,
             embedding_backend=embedding_backend,
             embedding_model=embedding_model,
-            embedding_provider_name=embedding_provider_name,
             context_cache_enabled=context_cache_enabled,
             chunking_enabled=chunking_enabled,
+            assistant_guidance_enabled=assistant_guidance_enabled,
+            recent_transcript_budget_tokens=recent_transcript_budget_tokens,
         )
     )
     await client.setup()

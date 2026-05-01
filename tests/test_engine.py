@@ -186,7 +186,7 @@ def _normal_operational_profile_token(engine: Atagia) -> str:
 async def test_engine_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     await engine.setup()
     assert engine.runtime is not None
@@ -202,7 +202,7 @@ async def test_engine_setup_respects_env_context_cache_toggle(
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
     monkeypatch.setenv("ATAGIA_CONTEXT_CACHE_ENABLED", "false")
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     await engine.setup()
     try:
@@ -221,8 +221,8 @@ async def test_engine_setup_respects_chunking_override(
     monkeypatch.setenv("ATAGIA_CHUNKING_ENABLED", "true")
     engine = Atagia(
         db_path=":memory:",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
         chunking_enabled=False,
     )
 
@@ -238,7 +238,7 @@ async def test_engine_setup_respects_chunking_override(
 async def test_engine_create_entities(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     await engine.setup()
     try:
@@ -270,7 +270,7 @@ async def test_engine_create_entities(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_engine_get_context(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     await engine.setup()
     try:
@@ -290,6 +290,8 @@ async def test_engine_get_context(monkeypatch: pytest.MonkeyPatch) -> None:
 
         assert isinstance(context.system_prompt, str)
         assert context.system_prompt
+        assert context.recent_transcript == []
+        assert context.recent_transcript_trace is not None
         connection = await engine.runtime.open_connection()
         try:
             messages = MessageRepository(connection, engine.runtime.clock)
@@ -304,6 +306,126 @@ async def test_engine_get_context(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_engine_get_context_includes_recent_transcript_without_fts_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+        )
+        await engine.ingest_message(
+            "usr_1",
+            "cnv_1",
+            "user",
+            "Yesterday I went to the bank on Carrer Major.",
+        )
+
+        context = await engine.get_context(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message="What time does that usually close?",
+        )
+
+        transcript_texts = [entry.text for entry in context.recent_transcript]
+        assert transcript_texts == ["Yesterday I went to the bank on Carrer Major."]
+        assert "What time does that usually close?" not in transcript_texts
+        assert "<recent_transcript_json>" in context.system_prompt
+        assert "Carrer Major" in context.system_prompt
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_get_context_uses_recent_transcript_budget_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+        recent_transcript_budget_tokens=30000,
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+        )
+
+        context = await engine.get_context(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message="What did we decide?",
+        )
+
+        assert context.recent_transcript_trace is not None
+        assert context.recent_transcript_trace.budget_tokens == 30000
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_get_context_can_disable_recent_transcript_for_benchmarks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_BENCHMARK_DISABLE_RAW_RECENT_TRANSCRIPT", "true")
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+        )
+        await engine.ingest_message(
+            "usr_1",
+            "cnv_1",
+            "user",
+            "This prior sentence should not be injected as raw transcript.",
+        )
+
+        context = await engine.get_context(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message="What did I just say?",
+        )
+
+        assert context.recent_transcript == []
+        assert context.recent_transcript_omissions == []
+        assert context.recent_transcript_trace is None
+        assert context.assistant_guidance == []
+        assert "<recent_transcript_json>" not in context.system_prompt
+        assert "This prior sentence should not be injected" not in context.system_prompt
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_engine_add_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -312,8 +434,8 @@ async def test_engine_add_response(
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=tmp_path / "atagia-engine.db",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
     )
 
     await engine.setup()
@@ -359,7 +481,7 @@ async def test_engine_add_response(
 async def test_engine_context_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     async with engine:
         await engine.create_user("usr_1")
@@ -383,7 +505,7 @@ async def test_engine_context_manager(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_engine_chat(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     await engine.setup()
     try:
@@ -412,12 +534,59 @@ async def test_engine_chat(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_engine_chat_can_disable_raw_recent_transcript_for_benchmarks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_BENCHMARK_DISABLE_RAW_RECENT_TRANSCRIPT", "true")
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+        )
+        await engine.ingest_message(
+            "usr_1",
+            "cnv_1",
+            "user",
+            "This prior chat message must not reach the chat model as transcript.",
+        )
+
+        await engine.chat(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message="Answer from retrieved memory only.",
+        )
+
+        chat_request = next(
+            request
+            for request in provider.requests
+            if request.metadata.get("purpose") == "chat_reply"
+        )
+        chat_prompt = "\n".join(message.content for message in chat_request.messages)
+        assert "This prior chat message must not reach" not in chat_prompt
+        assert [message.role for message in chat_request.messages] == ["system", "user"]
+        assert chat_request.messages[-1].content == "Answer from retrieved memory only."
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_engine_get_context_cache_hit_exposes_observability_without_retrieval_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     await engine.setup()
     try:
@@ -443,6 +612,10 @@ async def test_engine_get_context_cache_hit_exposes_observability_without_retrie
         assert second.from_cache is True
         assert second.need_detection_skipped is True
         assert second.detected_needs == []
+        assert [entry.text for entry in second.recent_transcript] == [
+            "Please help me debug this retry loop."
+        ]
+        assert "continue" not in [entry.text for entry in second.recent_transcript]
         connection = await engine.runtime.open_connection()
         try:
             events = RetrievalEventRepository(connection, engine.runtime.clock)
@@ -459,7 +632,7 @@ async def test_engine_add_response_invalidates_stable_context_cache(
 ) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     await engine.setup()
     try:
@@ -501,7 +674,7 @@ async def test_engine_ingest_message_invalidates_stable_context_cache(
 ) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     await engine.setup()
     try:
@@ -547,8 +720,8 @@ async def test_engine_flush(
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=tmp_path / "atagia-engine-flush.db",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
     )
 
     await engine.setup()
@@ -578,8 +751,8 @@ async def test_engine_ablation_switches_forwarded(
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=":memory:",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
         skip_belief_revision=True,
         skip_compaction=True,
     )
@@ -602,8 +775,8 @@ async def test_engine_ingest_message(
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=tmp_path / "atagia-engine-ingest.db",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
     )
 
     await engine.setup()
@@ -665,7 +838,7 @@ async def test_engine_get_context_rolls_back_user_message_when_scoring_fails(
 ) -> None:
     provider = FailingEngineProvider("applicability_scoring")
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     await engine.setup()
     try:
@@ -719,7 +892,7 @@ async def test_engine_get_context_degrades_when_need_detector_fails(
 ) -> None:
     provider = FailingEngineProvider("need_detection")
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", llm_provider="openai", llm_api_key="test-openai-key")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
 
     await engine.setup()
     try:

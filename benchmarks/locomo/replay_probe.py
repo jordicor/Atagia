@@ -21,9 +21,11 @@ from atagia.memory.retrieval_planner import build_retrieval_fts_queries
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.chat_support import build_system_prompt, chat_model, resolve_policy
 from atagia.services.llm_client import LLMCompletionRequest, LLMMessage
+from atagia.services.model_resolution import COMPONENTS_BY_ID, provider_qualified_model
 from atagia.services.retrieval_service import RetrievalService
-from benchmarks.base import BenchmarkConversation, BenchmarkQuestion
+from benchmarks.base import BenchmarkConversation
 from benchmarks.json_artifacts import write_json_atomic
+from benchmarks.llm_config import provider_api_key_kwargs
 from benchmarks.locomo.adapter import LoCoMoAdapter
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -54,9 +56,28 @@ def _parse_args() -> argparse.Namespace:
         default=os.getenv("ATAGIA_EMBEDDING_MODEL"),
         help="Embedding model name",
     )
-    parser.add_argument("--llm-provider", default=os.getenv("ATAGIA_LLM_PROVIDER"), help="LLM provider override")
-    parser.add_argument("--llm-api-key", default=os.getenv("ATAGIA_LLM_API_KEY"), help="LLM API key override")
-    parser.add_argument("--llm-model", default=os.getenv("ATAGIA_LLM_CHAT_MODEL"), help="LLM model override")
+    parser.add_argument("--provider", default=None, help="LLM provider used to qualify bare model values")
+    parser.add_argument("--api-key", default=None, help="Provider-specific LLM API key override")
+    parser.add_argument(
+        "--llm-model",
+        default=os.getenv("ATAGIA_LLM_CHAT_MODEL"),
+        help="Legacy alias for --answer-model; used only for answer generation.",
+    )
+    parser.add_argument(
+        "--answer-model",
+        help="Model override for answer generation, e.g. openrouter/google/gemini-3.1-flash-lite-preview,medium",
+    )
+    parser.add_argument("--forced-global-model", help="Force one model for every Atagia internal LLM component")
+    parser.add_argument("--ingest-model", help="Model for Atagia ingest components")
+    parser.add_argument("--retrieval-model", help="Model for Atagia retrieval components")
+    parser.add_argument("--chat-model", help="Model for Atagia chat component fallback")
+    parser.add_argument(
+        "--component-model",
+        action="append",
+        default=[],
+        metavar="COMPONENT=MODEL",
+        help="Override one Atagia LLM component model. Repeatable.",
+    )
     parser.add_argument("--skip-need-detection", action="store_true", help="Disable LLM need detection")
     parser.add_argument("--skip-applicability-scoring", action="store_true", help="Disable LLM applicability scoring")
     parser.add_argument("--skip-answer", action="store_true", help="Skip final answer generation")
@@ -64,7 +85,55 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not any([args.question_index, args.question_id, args.question_text]):
         parser.error("one of --question-index, --question-id, or --question-text is required")
+    if args.llm_model and args.answer_model:
+        parser.error("--llm-model is a legacy alias; use either --llm-model or --answer-model, not both")
+    try:
+        _parse_component_model_overrides(args.component_model)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
+
+
+def _answer_model(args: argparse.Namespace) -> str | None:
+    return args.answer_model or args.llm_model
+
+
+def _parse_component_model_overrides(raw_values: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for raw_value in raw_values or []:
+        if "=" not in raw_value:
+            raise ValueError(
+                "--component-model must use COMPONENT=MODEL, "
+                f"got {raw_value!r}"
+            )
+        component_id, model = (part.strip() for part in raw_value.split("=", 1))
+        if not component_id or not model:
+            raise ValueError(
+                "--component-model must include both COMPONENT and MODEL, "
+                f"got {raw_value!r}"
+            )
+        if component_id not in COMPONENTS_BY_ID:
+            valid = ", ".join(sorted(COMPONENTS_BY_ID))
+            raise ValueError(
+                f"Unknown component id for --component-model: {component_id}. "
+                f"Valid component ids: {valid}"
+            )
+        overrides[component_id] = model
+    return overrides
+
+
+def _qualified_model(provider: str | None, model: str | None) -> str | None:
+    return provider_qualified_model(provider, model)
+
+
+def _qualified_component_models(
+    provider: str | None,
+    component_models: dict[str, str],
+) -> dict[str, str]:
+    return {
+        component_id: _qualified_model(provider, model) or model
+        for component_id, model in component_models.items()
+    }
 
 
 def _load_conversation(data_path: str | Path, conversation_id: str) -> BenchmarkConversation:
@@ -309,9 +378,15 @@ async def _run(args: argparse.Namespace) -> Path:
     async with Atagia(
         db_path=args.db_path,
         manifests_dir=args.manifests_dir,
-        llm_provider=args.llm_provider,
-        llm_api_key=args.llm_api_key,
-        llm_model=args.llm_model,
+        llm_forced_global_model=_qualified_model(args.provider, args.forced_global_model),
+        llm_ingest_model=_qualified_model(args.provider, args.ingest_model),
+        llm_retrieval_model=_qualified_model(args.provider, args.retrieval_model),
+        llm_chat_model=_qualified_model(args.provider, args.chat_model),
+        llm_component_models=_qualified_component_models(
+            args.provider,
+            _parse_component_model_overrides(args.component_model),
+        ),
+        **provider_api_key_kwargs(args.provider, args.api_key),
         embedding_backend=args.embedding_backend,
         embedding_model=args.embedding_model,
         context_cache_enabled=False,
@@ -356,7 +431,7 @@ async def _run(args: argparse.Namespace) -> Path:
                     assistant_mode_id=assistant_mode_id,
                     pipeline_result=pipeline_result,
                     question_text=question_text,
-                    model_override=args.llm_model,
+                    model_override=_qualified_model(args.provider, _answer_model(args)),
                 )
             except Exception as exc:  # pragma: no cover - best effort artifact enrichment
                 logger.exception("Replay probe answer generation failed")
@@ -373,8 +448,17 @@ async def _run(args: argparse.Namespace) -> Path:
         "user_id": args.user_id,
         "embedding_backend": args.embedding_backend,
         "embedding_model": args.embedding_model,
-        "llm_provider": args.llm_provider,
-        "llm_model": args.llm_model,
+        "provider": args.provider,
+        "llm_model": _answer_model(args),
+        "answer_model": _qualified_model(args.provider, _answer_model(args)),
+        "forced_global_model": _qualified_model(args.provider, args.forced_global_model),
+        "ingest_model": _qualified_model(args.provider, args.ingest_model),
+        "retrieval_model": _qualified_model(args.provider, args.retrieval_model),
+        "chat_model": _qualified_model(args.provider, args.chat_model),
+        "component_models": _qualified_component_models(
+            args.provider,
+            _parse_component_model_overrides(args.component_model),
+        ),
         "ablation": ablation.model_dump(mode="json"),
         "retrieval_plan": pipeline_result.retrieval_plan.model_dump(mode="json"),
         "stage_timings": dict(pipeline_result.stage_timings),

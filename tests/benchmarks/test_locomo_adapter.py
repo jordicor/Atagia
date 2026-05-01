@@ -57,6 +57,67 @@ def test_parse_minimal_dataset(tmp_path: Path) -> None:
     assert conversation.questions[0].evidence_turn_ids == ["D1:1"]
 
 
+def test_parse_image_caption_as_attachment(tmp_path: Path) -> None:
+    data_path = _write_dataset(
+        tmp_path,
+        [
+            {
+                "sample_id": "conv-image",
+                "conversation": {
+                    "speaker_a": "Alice",
+                    "speaker_b": "Bob",
+                    "session_1": [
+                        {
+                            "speaker": "Bob",
+                            "dia_id": "D1:1",
+                            "text": "The kids made this with clay.",
+                            "img_url": ["https://example.test/dog-cup.jpg"],
+                            "blip_caption": "a photo of a cup with a dog face on it",
+                            "query": "kids pottery finished pieces",
+                        },
+                    ],
+                    "session_1_date_time": "1:56 pm on 8 May, 2023",
+                },
+                "qa": [],
+            }
+        ],
+    )
+
+    turn = LoCoMoAdapter(data_path).load().conversations[0].turns[0]
+
+    assert turn.metadata["blip_caption"] == "a photo of a cup with a dog face on it"
+    assert turn.metadata["img_url"] == ["https://example.test/dog-cup.jpg"]
+    assert turn.attachments == [
+        {
+            "kind": "image",
+            "content_text": (
+                "Visual description of attached image: a photo of a cup with a dog face on it\n"
+                "Associated message speaker: Bob\n"
+                "Associated message text: The kids made this with clay.\n"
+                "Associated message timestamp: 2023-05-08T13:56:00"
+            ),
+            "url": "https://example.test/dog-cup.jpg",
+            "title": "LoCoMo image caption D1:1",
+            "metadata": {
+                "source": "locomo",
+                "caption_kind": "blip_caption",
+                "turn_id": "D1:1",
+                "image_index": 1,
+                "locomo_metadata": {
+                    "dia_id": "D1:1",
+                    "img_url": ["https://example.test/dog-cup.jpg"],
+                    "blip_caption": "a photo of a cup with a dog face on it",
+                    "query": "kids pottery finished pieces",
+                },
+            },
+            "privacy_level": 0,
+            "preserve_verbatim": True,
+            "skip_raw_by_default": False,
+            "requires_explicit_request": False,
+        }
+    ]
+
+
 def test_category_filtering(tmp_path: Path) -> None:
     data_path = _write_dataset(
         tmp_path,

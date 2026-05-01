@@ -10,7 +10,7 @@ import pytest
 
 from atagia.core.clock import FrozenClock
 from atagia.core.db_sqlite import initialize_database
-from atagia.core.repositories import ConversationRepository, UserRepository
+from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository
 from atagia.core.topic_repository import TopicRepository
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
@@ -154,18 +154,78 @@ async def test_update_topic_and_snapshot_keep_active_and_parked_work_sets_compac
                 "artifact_ids": [],
                 "source_counts": {},
                 "source_refs": [],
+                "source_message_start_seq": None,
+                "source_message_end_seq": None,
                 "last_touched_seq": 4,
                 "last_touched_at": "2026-04-26T02:25:00+00:00",
                 "confidence": 0.5,
                 "privacy_level": 0,
+                "intimacy_boundary": "ordinary",
+                "intimacy_boundary_confidence": 0.0,
             }
         ]
+        assert snapshot["freshness"]["status"] == "fresh"
+        assert snapshot["freshness"]["last_processed_seq"] == 4
         assert snapshot["parked_topics"][0]["id"] == "tpc_first"
         assert snapshot["parked_topics"][0]["open_questions"] == ["Which benchmark shard regressed?"]
 
         events = await repository.list_events(user_id="usr_a", conversation_id="cnv_a", topic_id="tpc_first")
         assert [event["event_type"] for event in events] == ["created", "parked"]
         assert events[-1]["payload_json"] == {"reason": "waiting_for_benchmark"}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_topic_snapshot_reports_freshness_lag_against_messages() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        await _seed_conversations(connection, clock)
+        messages = MessageRepository(connection, clock)
+        topics = TopicRepository(connection, clock)
+        for seq in range(1, 7):
+            await messages.create_message(
+                f"msg_{seq}",
+                "cnv_a",
+                "user" if seq % 2 else "assistant",
+                seq,
+                f"Message {seq}",
+                10,
+                {},
+            )
+        await topics.create_topic(
+            topic_id="tpc_active",
+            user_id="usr_a",
+            conversation_id="cnv_a",
+            title="Active topic",
+            last_touched_seq=2,
+            source_message_start_seq=1,
+            source_message_end_seq=2,
+        )
+
+        snapshot = await topics.get_topic_snapshot(
+            user_id="usr_a",
+            conversation_id="cnv_a",
+            refresh_message_threshold=2,
+            stale_message_threshold=4,
+            refresh_token_threshold=100,
+            stale_token_threshold=200,
+        )
+
+        assert snapshot["active_topics"][0]["source_message_start_seq"] == 1
+        assert snapshot["active_topics"][0]["source_message_end_seq"] == 2
+        assert snapshot["freshness"] == {
+            "status": "stale",
+            "last_processed_seq": 2,
+            "last_processed_message_id": "msg_2",
+            "latest_message_seq": 6,
+            "lag_message_count": 4,
+            "lag_token_count": 40,
+            "refresh_message_threshold": 2,
+            "stale_message_threshold": 4,
+            "refresh_token_threshold": 100,
+            "stale_token_threshold": 200,
+        }
     finally:
         await connection.close()
 

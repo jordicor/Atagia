@@ -19,7 +19,13 @@ from atagia.core.repositories import (
 )
 from atagia.memory.belief_reviser import BeliefReviser, RevisionContext, RevisionDecision
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
+from atagia.models.schemas_memory import (
+    IntimacyBoundary,
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    MemoryStatus,
+)
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.llm_client import (
     LLMClient,
@@ -143,6 +149,8 @@ async def _seed_belief(
     canonical_text: str = "User prefers terse debugging answers.",
     index_text: str | None = None,
     privacy_level: int = 1,
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+    intimacy_boundary_confidence: float = 0.0,
     preserve_verbatim: bool = False,
 ) -> dict[str, object]:
     created = await memories.create_memory_object(
@@ -160,6 +168,8 @@ async def _seed_belief(
         vitality=0.25,
         maya_score=1.0,
         privacy_level=privacy_level,
+        intimacy_boundary=intimacy_boundary,
+        intimacy_boundary_confidence=intimacy_boundary_confidence,
         preserve_verbatim=preserve_verbatim,
         status=MemoryStatus.ACTIVE,
         payload={
@@ -184,6 +194,9 @@ async def _seed_evidence(
     memory_id: str = "mem_evidence",
     conversation_id: str = "cnv_1",
     text: str = "The user asked for terse debugging answers again.",
+    privacy_level: int = 1,
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+    intimacy_boundary_confidence: float = 0.0,
 ) -> dict[str, object]:
     return await memories.create_memory_object(
         user_id="usr_1",
@@ -195,7 +208,9 @@ async def _seed_evidence(
         canonical_text=text,
         source_kind=MemorySourceKind.EXTRACTED,
         confidence=0.9,
-        privacy_level=1,
+        privacy_level=privacy_level,
+        intimacy_boundary=intimacy_boundary,
+        intimacy_boundary_confidence=intimacy_boundary_confidence,
         payload={},
         memory_id=memory_id,
     )
@@ -316,6 +331,49 @@ async def test_supersede_creates_new_belief_marks_old_superseded_and_links() -> 
         assert new_belief["status"] == MemoryStatus.ACTIVE.value
         assert new_belief["canonical_text"] == "supersede successor belief"
         assert {row["relation_type"] for row in links} == {"supersedes", "reinforces"}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_supersede_preserves_strongest_intimacy_boundary_on_successor() -> None:
+    connection, memories, beliefs, reviser = await _build_runtime("SUPERSEDE")
+    try:
+        belief = await _seed_belief(
+            memories,
+            beliefs,
+            privacy_level=1,
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+            intimacy_boundary_confidence=0.6,
+        )
+        evidence = await _seed_evidence(
+            memories,
+            text="The user now prefers a different private debugging style.",
+            privacy_level=2,
+            intimacy_boundary=IntimacyBoundary.INTIMACY_PREFERENCE_PRIVATE,
+            intimacy_boundary_confidence=0.9,
+        )
+
+        result = await reviser.revise(
+            belief_id=str(belief["id"]),
+            new_evidence=[evidence],
+            context=RevisionContext(
+                user_id="usr_1",
+                claim_key="response_style.debugging",
+                claim_value=json.dumps("private concise"),
+                source_message_id="msg_3",
+                assistant_mode_id="coding_debug",
+                workspace_id="wrk_1",
+                conversation_id="cnv_1",
+                scope=MemoryScope.CONVERSATION,
+            ),
+        )
+
+        new_belief = await memories.get_memory_object(result.new_belief_ids[0], "usr_1")
+        assert new_belief is not None
+        assert new_belief["intimacy_boundary"] == IntimacyBoundary.INTIMACY_PREFERENCE_PRIVATE.value
+        assert new_belief["intimacy_boundary_confidence"] == pytest.approx(0.9)
+        assert new_belief["privacy_level"] == 2
     finally:
         await connection.close()
 

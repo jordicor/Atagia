@@ -167,7 +167,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Run in controlled local benchmark mode: raise retrieval privacy "
-            "ceiling and allow sensitive facts from retrieved benchmark context"
+            "ceiling and activate pending memories for coverage audit while "
+            "preserving ordinary high-risk secret disclosure refusals"
         ),
     )
     return parser

@@ -27,6 +27,7 @@ from atagia.models.schemas_jobs import (
 )
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
 from atagia.services.llm_client import (
+    LLMError,
     LLMClient,
     OutputLimitExceededError,
     StructuredOutputError,
@@ -39,6 +40,8 @@ from atagia.workers.revision_worker import RevisionWorker
 
 logger = logging.getLogger(__name__)
 RECENT_CONTEXT_MESSAGES = 6
+REBUILD_STATUS_REBUILT = "rebuilt"
+REBUILD_STATUS_REBUILT_PARTIAL = "rebuilt_partial"
 
 
 class RebuildResult(BaseModel):
@@ -46,7 +49,7 @@ class RebuildResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    status: str = "rebuilt"
+    status: str = REBUILD_STATUS_REBUILT
     user_id: str
     conversation_ids: list[str] = Field(default_factory=list)
     workspace_ids: list[str] = Field(default_factory=list)
@@ -386,7 +389,7 @@ class AdminRebuildService:
     ) -> tuple[bool, dict[str, Any] | None]:
         try:
             return True, await handler(payload)
-        except (StructuredOutputError, TransientLLMError, OutputLimitExceededError) as exc:
+        except (LLMError, StructuredOutputError, TransientLLMError, OutputLimitExceededError) as exc:
             self._record_recoverable_job_failure(result, stage)
             logger.warning(
                 "Skipping recoverable %s rebuild job",
@@ -404,6 +407,7 @@ class AdminRebuildService:
 
     @staticmethod
     def _record_recoverable_job_failure(result: RebuildResult, stage: str) -> None:
+        result.status = REBUILD_STATUS_REBUILT_PARTIAL
         result.recoverable_job_failures += 1
         if stage == "extract":
             result.recoverable_extract_job_failures += 1

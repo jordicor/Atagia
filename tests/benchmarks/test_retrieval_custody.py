@@ -23,7 +23,7 @@ def test_build_retrieval_custody_records_candidate_route_and_decisions() -> None
             },
             {
                 "id": "raw_1",
-                "is_raw_message_window": True,
+                "is_verbatim_evidence_window": True,
                 "channel_ranks": {},
                 "rrf_score": 0.1,
             },
@@ -57,8 +57,8 @@ def test_build_retrieval_custody_records_candidate_route_and_decisions() -> None
     assert custody[0]["scorer"]["llm_applicability"] == 0.9
     assert custody[0]["composer_decision"] == "selected"
     assert custody[0]["user_id"] == "usr_benchmark"
-    assert custody[1]["candidate_kind"] == "raw_message_window"
-    assert custody[1]["channels"] == ["raw_message"]
+    assert custody[1]["candidate_kind"] == "verbatim_evidence_search_window"
+    assert custody[1]["channels"] == ["verbatim_evidence_search"]
     assert custody[1]["filter_reason"] == "not_scored_or_filtered"
     assert custody[1]["composer_decision"] == "not_selected"
 
@@ -107,8 +107,8 @@ def test_summarize_retrieval_custody_counts_channels_and_selected() -> None:
                     "selected": True,
                 },
                 {
-                    "candidate_kind": "raw_message_window",
-                    "channels": ["raw_message"],
+                    "candidate_kind": "verbatim_evidence_search_window",
+                    "channels": ["verbatim_evidence_search"],
                     "composer_decision": "not_selected",
                     "filter_reason": "not_scored_or_filtered",
                     "selected": False,
@@ -120,9 +120,9 @@ def test_summarize_retrieval_custody_counts_channels_and_selected() -> None:
     assert summary == {
         "candidate_count": 2,
         "selected_count": 1,
-        "channel_counts": {"embedding": 1, "fts": 1, "raw_message": 1},
+        "channel_counts": {"embedding": 1, "fts": 1, "verbatim_evidence_search": 1},
         "selected_channel_counts": {"embedding": 1, "fts": 1},
-        "candidate_kind_counts": {"evidence": 1, "raw_message_window": 1},
+        "candidate_kind_counts": {"evidence": 1, "verbatim_evidence_search_window": 1},
         "composer_decision_counts": {"not_selected": 1, "selected": 1},
         "filter_reason_counts": {"not_scored_or_filtered": 1},
     }

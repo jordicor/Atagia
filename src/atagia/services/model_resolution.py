@@ -58,6 +58,10 @@ class ComponentSpec:
     def env_var(self) -> str:
         return f"ATAGIA_LLM_MODEL__{self.component_id.upper()}"
 
+    @property
+    def intimacy_env_var(self) -> str:
+        return f"ATAGIA_LLM_INTIMACY_MODEL__{self.component_id.upper()}"
+
 
 @dataclass(frozen=True, slots=True)
 class ResolvedComponentModel:
@@ -76,7 +80,9 @@ class ResolutionSnapshot:
 
     forced_global_model: str | None
     category_models: dict[str, str | None]
+    intimacy_category_models: dict[str, str | None]
     components: dict[str, ResolvedComponentModel]
+    intimacy_components: dict[str, ResolvedComponentModel]
     embedding: ParsedModelSpec
 
 
@@ -84,6 +90,11 @@ CATEGORY_ENV_VARS = {
     "ingest": "ATAGIA_LLM_INGEST_MODEL",
     "retrieval": "ATAGIA_LLM_RETRIEVAL_MODEL",
     "chat": "ATAGIA_LLM_CHAT_MODEL",
+}
+
+INTIMACY_CATEGORY_ENV_VARS = {
+    "ingest": "ATAGIA_LLM_INTIMACY_INGEST_MODEL",
+    "retrieval": "ATAGIA_LLM_INTIMACY_RETRIEVAL_MODEL",
 }
 
 COMPONENT_SPECS: tuple[ComponentSpec, ...] = (
@@ -99,6 +110,7 @@ COMPONENT_SPECS: tuple[ComponentSpec, ...] = (
     ComponentSpec("topic_working_set", "ingest", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("consent_confirmation", "ingest", "anthropic/claude-sonnet-4-6"),
     ComponentSpec("intent_classifier", "ingest", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("extraction_watchdog", "ingest", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("export_anonymizer", "ingest", "anthropic/claude-sonnet-4-6"),
     ComponentSpec("need_detector", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("applicability_scorer", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
@@ -107,6 +119,32 @@ COMPONENT_SPECS: tuple[ComponentSpec, ...] = (
     ComponentSpec("chat", "chat", "anthropic/claude-sonnet-4-6"),
 )
 COMPONENTS_BY_ID = {spec.component_id: spec for spec in COMPONENT_SPECS}
+
+PURPOSE_TO_COMPONENT_ID = {
+    "applicability_scoring": "applicability_scorer",
+    "belief_revision": "belief_reviser",
+    "chat_reply": "chat",
+    "consequence_detection": "consequence_detector",
+    "consequence_tendency_inference": "consequence_builder",
+    "consent_confirmation_intent": "consent_confirmation",
+    "context_cache_signal_detection": "context_staleness",
+    "episode_synthesis": "compactor",
+    "evaluation_contract_compliance": "metrics_computer",
+    "export_anonymization_rewrite": "export_anonymizer",
+    "export_anonymization_verify": "export_anonymizer",
+    "extraction_watchdog": "extraction_watchdog",
+    "intent_classifier_claim_key_equivalence": "intent_classifier",
+    "intent_classifier_explicit": "intent_classifier",
+    "memory_extraction": "extractor",
+    "need_detection": "need_detector",
+    "summary_chunk_segmentation": "compactor",
+    "summary_privacy_gate_judge": "summary_privacy_judge",
+    "summary_privacy_gate_refine": "summary_privacy_refiner",
+    "text_chunking_level1": "text_chunker",
+    "thematic_profile_synthesis": "compactor",
+    "topic_working_set_update": "topic_working_set",
+    "workspace_rollup_synthesis": "compactor",
+}
 
 
 def normalized_model_value(value: str | None) -> str | None:
@@ -204,6 +242,16 @@ def component_env_models_from_env(env: dict[str, str]) -> dict[str, str]:
     return values
 
 
+def intimacy_component_env_models_from_env(env: dict[str, str]) -> dict[str, str]:
+    """Return intimacy fallback component models from an env mapping."""
+    values: dict[str, str] = {}
+    for spec in COMPONENT_SPECS:
+        value = normalized_model_value(env.get(spec.intimacy_env_var))
+        if value is not None:
+            values[spec.component_id] = value
+    return values
+
+
 def resolve_component(settings: Any, component_id: str) -> ResolvedComponentModel:
     """Resolve a component model from forced/component/category/default layers."""
     component = COMPONENTS_BY_ID.get(component_id)
@@ -233,6 +281,16 @@ def resolve_component(settings: Any, component_id: str) -> ResolvedComponentMode
             parsed=parsed,
         )
 
+    if component.component_id == "extraction_watchdog":
+        extractor = resolve_component(settings, "extractor")
+        return ResolvedComponentModel(
+            component_id=component.component_id,
+            category=component.category,
+            model_spec=extractor.model_spec,
+            provenance=f"extractor.{extractor.provenance}",
+            parsed=extractor.parsed,
+        )
+
     category_value = normalized_model_value(_category_model(settings, component.category))
     if category_value is not None:
         parsed = parse_model_spec(category_value, env_name=CATEGORY_ENV_VARS[component.category])
@@ -254,9 +312,60 @@ def resolve_component(settings: Any, component_id: str) -> ResolvedComponentMode
     )
 
 
+def resolve_intimacy_component(
+    settings: Any,
+    component_id: str,
+) -> ResolvedComponentModel | None:
+    """Resolve an optional intimacy-specific fallback model for a component."""
+    component = COMPONENTS_BY_ID.get(component_id)
+    if component is None:
+        raise ModelResolutionError(f"Unknown LLM component id: {component_id}")
+
+    component_overrides = getattr(settings, "llm_intimacy_component_models", {}) or {}
+    unknown_components = set(component_overrides).difference(COMPONENTS_BY_ID)
+    if unknown_components:
+        raise ModelResolutionError(
+            "Unknown intimacy LLM component id(s): "
+            f"{', '.join(sorted(unknown_components))}"
+        )
+
+    component_value = normalized_model_value(component_overrides.get(component.component_id))
+    if component_value is not None:
+        parsed = parse_model_spec(component_value, env_name=component.intimacy_env_var)
+        return ResolvedComponentModel(
+            component_id=component.component_id,
+            category=component.category,
+            model_spec=parsed.canonical_spec,
+            provenance="intimacy component override",
+            parsed=parsed,
+        )
+
+    category_value = normalized_model_value(
+        _intimacy_category_model(settings, component.category)
+    )
+    if category_value is not None:
+        env_var = INTIMACY_CATEGORY_ENV_VARS[component.category]
+        parsed = parse_model_spec(category_value, env_name=env_var)
+        return ResolvedComponentModel(
+            component_id=component.component_id,
+            category=component.category,
+            model_spec=parsed.canonical_spec,
+            provenance=f"intimacy category.{component.category}",
+            parsed=parsed,
+        )
+
+    return None
+
+
 def resolve_component_model(settings: Any, component_id: str) -> str:
     """Return the canonical model spec for one LLM-backed component."""
     return resolve_component(settings, component_id).model_spec
+
+
+def resolve_intimacy_component_model(settings: Any, component_id: str) -> str | None:
+    """Return the optional intimacy fallback model for one component."""
+    resolved = resolve_intimacy_component(settings, component_id)
+    return resolved.model_spec if resolved is not None else None
 
 
 def resolve_all_components(settings: Any) -> dict[str, ResolvedComponentModel]:
@@ -265,6 +374,31 @@ def resolve_all_components(settings: Any) -> dict[str, ResolvedComponentModel]:
         spec.component_id: resolve_component(settings, spec.component_id)
         for spec in COMPONENT_SPECS
     }
+
+
+def resolve_all_intimacy_components(settings: Any) -> dict[str, ResolvedComponentModel]:
+    """Resolve all configured intimacy fallback component models."""
+    resolved: dict[str, ResolvedComponentModel] = {}
+    for spec in COMPONENT_SPECS:
+        component = resolve_intimacy_component(settings, spec.component_id)
+        if component is not None:
+            resolved[spec.component_id] = component
+    return resolved
+
+
+def resolve_intimacy_fallback_models(settings: Any) -> dict[str, str]:
+    """Return component id to intimacy fallback model mappings."""
+    return {
+        component_id: resolved.model_spec
+        for component_id, resolved in resolve_all_intimacy_components(settings).items()
+    }
+
+
+def component_id_for_llm_purpose(purpose: str | None) -> str | None:
+    """Return the component id associated with a stable LLM request purpose."""
+    if purpose is None:
+        return None
+    return PURPOSE_TO_COMPONENT_ID.get(purpose)
 
 
 def build_resolution_snapshot(settings: Any) -> ResolutionSnapshot:
@@ -278,20 +412,41 @@ def build_resolution_snapshot(settings: Any) -> ResolutionSnapshot:
             "retrieval": normalized_model_value(getattr(settings, "llm_retrieval_model", None)),
             "chat": normalized_model_value(getattr(settings, "llm_chat_model", None)),
         },
+        intimacy_category_models={
+            "ingest": normalized_model_value(
+                getattr(settings, "llm_intimacy_ingest_model", None)
+            ),
+            "retrieval": normalized_model_value(
+                getattr(settings, "llm_intimacy_retrieval_model", None)
+            ),
+        },
         components=resolve_all_components(settings),
+        intimacy_components=resolve_all_intimacy_components(settings),
         embedding=parse_embedding_model_spec(getattr(settings, "embedding_model", None)),
     )
 
 
 def required_completion_provider_slugs(settings: Any) -> set[str]:
     """Return provider slugs required by resolved completion components."""
+    providers: set[str] = set()
     forced = normalized_model_value(getattr(settings, "llm_forced_global_model", None))
     if forced is not None:
-        return {parse_model_spec(forced, env_name="ATAGIA_LLM_FORCED_GLOBAL_MODEL").provider_slug}
-    return {
+        providers.add(
+            parse_model_spec(
+                forced,
+                env_name="ATAGIA_LLM_FORCED_GLOBAL_MODEL",
+            ).provider_slug
+        )
+    else:
+        providers.update(
+            resolved.parsed.provider_slug
+            for resolved in resolve_all_components(settings).values()
+        )
+    providers.update(
         resolved.parsed.provider_slug
-        for resolved in resolve_all_components(settings).values()
-    }
+        for resolved in resolve_all_intimacy_components(settings).values()
+    )
+    return providers
 
 
 def required_provider_slugs(settings: Any) -> set[str]:
@@ -342,6 +497,11 @@ def format_resolution_log(settings: Any) -> str:
         lines.append(
             f"  category.{category:<9} : {value:<45} (env: {CATEGORY_ENV_VARS[category]})"
         )
+    for category in ("ingest", "retrieval"):
+        value = snapshot.intimacy_category_models[category] or "<unset>"
+        lines.append(
+            f"  intimacy.{category:<8} : {value:<45} (env: {INTIMACY_CATEGORY_ENV_VARS[category]})"
+        )
     lines.append(
         f"  embedding              : {snapshot.embedding.canonical_model:<45} (env: ATAGIA_EMBEDDING_MODEL)"
     )
@@ -351,6 +511,17 @@ def format_resolution_log(settings: Any) -> str:
         lines.append(
             f"  {component_id:<23}: {resolved.model_spec:<45} [from: {resolved.provenance}]"
         )
+    if snapshot.intimacy_components:
+        lines.append("  ---- intimacy fallbacks")
+        for component_id in COMPONENTS_BY_ID:
+            resolved = snapshot.intimacy_components.get(component_id)
+            if resolved is None:
+                continue
+            lines.append(
+                f"  {component_id:<23}: {resolved.model_spec:<45} [from: {resolved.provenance}]"
+            )
+    else:
+        lines.append("  intimacy_fallbacks    : <none configured>")
     if snapshot.forced_global_model is not None:
         lines.append(f"*** FORCED GLOBAL MODEL ACTIVE: {snapshot.forced_global_model} ***")
         lines.append("*** All completion component resolutions above are overridden. ***")
@@ -395,3 +566,11 @@ def _category_model(settings: Any, category: str) -> str | None:
     if category == "chat":
         return getattr(settings, "llm_chat_model", None)
     raise ModelResolutionError(f"Unknown LLM category: {category}")
+
+
+def _intimacy_category_model(settings: Any, category: str) -> str | None:
+    if category == "ingest":
+        return getattr(settings, "llm_intimacy_ingest_model", None)
+    if category == "retrieval":
+        return getattr(settings, "llm_intimacy_retrieval_model", None)
+    return None

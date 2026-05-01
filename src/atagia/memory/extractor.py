@@ -24,6 +24,22 @@ from atagia.core.repositories import MemoryObjectRepository, MessageRepository
 from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
 from atagia.memory.chunking_config import PRIOR_CHUNK_CONTEXT_MAX_TOKENS
 from atagia.core.storage_backend import StorageBackend
+from atagia.memory.extraction_watchdog import (
+    ExtractionWatchdogConfig,
+    ExtractionWatchdogObserver,
+    ExtractionWatchdogRetry,
+    validate_watchdog_provider_policy,
+)
+from atagia.memory.high_risk_policy import (
+    CONFIRMATION_REQUIRED_MEMORY_CATEGORIES,
+    requires_confirmation,
+)
+from atagia.memory.intimacy_boundary_policy import (
+    constrained_scope_for_intimacy_boundary,
+    is_blocked_intimacy_boundary,
+    is_restricted_intimacy_boundary,
+    minimum_privacy_for_intimacy_boundary,
+)
 from atagia.memory.intent_classifier import are_claim_keys_equivalent, is_explicit_user_statement
 from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.memory.scope_utils import resolve_scope_identifiers
@@ -35,6 +51,7 @@ from atagia.models.schemas_memory import (
     ExtractedStateUpdate,
     ExtractionConversationContext,
     ExtractionResult,
+    IntimacyBoundary,
     MemoryCategory,
     MemoryObjectType,
     MemoryScope,
@@ -42,7 +59,14 @@ from atagia.models.schemas_memory import (
 )
 from atagia.services.embedding_payloads import build_embedding_upsert_payload
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage, StructuredOutputError
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMMessage,
+    OutputLimitExceededError,
+    StructuredOutputError,
+    known_intimacy_context_metadata,
+)
 from atagia.services.model_resolution import resolve_component_model
 from atagia.services.privacy_filter_client import (
     OpenAIPrivacyFilterClient,
@@ -58,12 +82,7 @@ DEFAULT_ACTIVE_THRESHOLD = 0.5
 DEDUPE_TTL_SECONDS = 24 * 60 * 60
 CONSENT_CONFIRM_THRESHOLD = 2
 CONSENT_DECLINE_SUPPRESSION_THRESHOLD = 2
-HIGH_RISK_MEMORY_CATEGORIES = {
-    MemoryCategory.PIN_OR_PASSWORD,
-    MemoryCategory.MEDICATION,
-    MemoryCategory.FINANCIAL,
-    MemoryCategory.DATE_OF_BIRTH,
-}
+HIGH_RISK_MEMORY_CATEGORIES = CONFIRMATION_REQUIRED_MEMORY_CATEGORIES
 TEMPORAL_CONFIDENCE_THRESHOLD = 0.6
 EXTRACTION_VALIDATION_MAX_CORRECTIVE_RETRIES = 2
 logger = logging.getLogger(__name__)
@@ -110,6 +129,15 @@ privacy_level meanings:
 - 2 = sensitive personal context
 - 3 = do-not-reuse-without-strong-need
 
+intimacy_boundary meanings:
+- ordinary = not private romantic/intimate relationship context
+- romantic_private = private romantic attachment, dating, relationship, or partner-context memory
+- intimacy_private = private adult intimate preference, experience, desire, or context
+- intimacy_preference_private = private adult specialized intimate preference, boundary, or context
+- intimacy_boundary = private intimate agreement, limit, safety, aftercare, or disclosure boundary
+- ambiguous_intimate = likely intimate but ambiguous; choose this when unsure
+- safety_blocked = do not reuse; appears to involve unsafe, illegal, exploitative, coercive, or minor-related intimate context
+
 The current mode's privacy_ceiling is {privacy_ceiling}.
 You may extract items at any privacy level. Assign privacy_level honestly based on content sensitivity, not based on the ceiling.
 
@@ -121,6 +149,8 @@ Rules:
 - Set nothing_durable=true when the message is purely transactional or has no durable memory value.
 - Keep canonical_text concise and grounded in the source message.
 - When useful, add index_text: 1-2 short sentences of retrieval-oriented context that preserves the original fact and adds discoverability context.
+- For every extracted item, set `intimacy_boundary` and `intimacy_boundary_confidence` using semantic judgment from the source message.
+- For non-ordinary intimacy_boundary values, set privacy_level to at least 2, avoid global_user and assistant_mode scopes, and prefer a safe index_text that generalizes the memory without sensitive wording.
 - For beliefs, use claim_key and claim_value only when the message supports a stable interpretation.
 - Normalize every claim_key to the schema `domain.subdomain.aspect`.
 - claim_key must be lowercase, in English, dot-separated, and stable across paraphrases.
@@ -148,11 +178,18 @@ Rules:
   - `event_triggered`: tied to a specific event occurrence rather than an ongoing state.
   - `ephemeral`: true at the time of mention, no explicit end time, expected to decay quickly (e.g., "I'm at the airport", "I have a headache").
   - `unknown`: the temporal nature cannot be determined from the message.
-  - `valid_from_iso` / `valid_to_iso` as ISO-8601 timestamps when the message implies a durable time window.
+  - `valid_from_iso` / `valid_to_iso` as ISO-8601 timestamps when the message implies a durable time window or a specific event occurrence.
   - If both `valid_from_iso` and `valid_to_iso` are present, `valid_from_iso` must be earlier than or equal to `valid_to_iso`.
   - If the end is uncertain, omit `valid_to_iso` instead of guessing.
   - `temporal_confidence` from 0.0 to 1.0.
-- Use <message_timestamp> as the anchor for resolving relative dates like "yesterday", "today", "tomorrow", "next week", and "last month".
+- Use <message_timestamp> as the anchor for resolving relative dates like "yesterday", "last night", "today", "tomorrow", "next week", and "last month".
+- For one-time events expressed with relative time (for example "last night",
+  "yesterday", "last Friday", or "two days ago"), set `temporal_type` to
+  `event_triggered` and fill `valid_from_iso` with the resolved event date/time
+  whenever the source timestamp provides enough information. If only the date is
+  known, use the start of that calendar date and set `valid_to_iso` to the end
+  of that same date. Do not use the message timestamp itself as the event date
+  when the text says the event happened earlier or later.
 - Each extracted memory must include a `language_codes` field listing the
   ISO 639-1 codes of the languages actually used in its `canonical_text`.
   At least one code is required. Use multiple codes only when the text
@@ -174,6 +211,18 @@ Every extracted item must include `canonical_text`.
 If both `valid_from_iso` and `valid_to_iso` are present, ensure `valid_from_iso`
 is earlier than or equal to `valid_to_iso`. If the end bound is uncertain, omit
 `valid_to_iso` instead of guessing or inverting the range.
+Return corrected JSON only.
+Do not include markdown fences, preambles, tags, or explanations.
+Anything outside the first JSON object will be ignored.
+Every extracted item you want Atagia to consider must be represented inside the JSON fields.
+"""
+EXTRACTION_BOUNDED_RETRY_TEMPLATE = """The previous extraction attempt produced too much output.
+
+Regenerate the full response from the original source message and schema.
+Extract at most {max_items} total items across evidences, beliefs, contract_signals, and state_updates.
+Keep only the most durable, future-useful, grounded memories.
+Keep canonical_text and index_text compact.
+Use nothing_durable=true if nothing survives that budget.
 Return corrected JSON only.
 Do not include markdown fences, preambles, tags, or explanations.
 Anything outside the first JSON object will be ignored.
@@ -226,6 +275,21 @@ class MemoryExtractor:
             )
         )
         self._extraction_model = resolve_component_model(resolved_settings, "extractor")
+        self._extraction_watchdog_model = resolve_component_model(
+            resolved_settings,
+            "extraction_watchdog",
+        )
+        self._extraction_watchdog_config = ExtractionWatchdogConfig.from_settings(
+            resolved_settings,
+        )
+        if self._extraction_watchdog_config.enabled:
+            validate_watchdog_provider_policy(
+                extractor_model=self._extraction_model,
+                watchdog_model=self._extraction_watchdog_model,
+                allow_different_provider=(
+                    self._extraction_watchdog_config.allow_different_provider
+                ),
+            )
         self._classifier_model = resolve_component_model(resolved_settings, "intent_classifier")
         self._chunking_enabled = resolved_settings.chunking_enabled
         self._chunking_threshold_tokens = resolved_settings.chunking_threshold_tokens
@@ -276,7 +340,10 @@ class MemoryExtractor:
         )
 
         cold_start = await self._is_cold_start(context, resolved_policy)
-        chunk_plan = await self._plan_extraction_chunks(message_text)
+        chunk_plan = await self._plan_extraction_chunks(
+            message_text,
+            resolved_policy=resolved_policy,
+        )
         chunk_extractions = await self._extract_chunk_results(
             chunk_plan=chunk_plan,
             role=role,
@@ -343,6 +410,7 @@ class MemoryExtractor:
                 canonical_text=pending["canonical_text"],
                 index_text=pending.get("index_text"),
                 privacy_level=pending["privacy_level"],
+                intimacy_boundary=pending.get("intimacy_boundary", IntimacyBoundary.ORDINARY.value),
                 preserve_verbatim=pending["preserve_verbatim"],
                 user_id=pending["user_id"],
                 object_type=pending["object_type"],
@@ -448,6 +516,7 @@ class MemoryExtractor:
                 ],
                 "need_triggers": [trigger.value for trigger in resolved_policy.need_triggers],
                 "privacy_ceiling": resolved_policy.privacy_ceiling,
+                "allow_intimacy_context": resolved_policy.allow_intimacy_context,
                 "context_budget_tokens": resolved_policy.context_budget_tokens,
             },
             indent=2,
@@ -472,10 +541,13 @@ class MemoryExtractor:
     @staticmethod
     def _natural_capture_prompt_block(role: str) -> str:
         category_values = ", ".join(category.value for category in MemoryCategory)
+        intimacy_boundary_values = ", ".join(boundary.value for boundary in IntimacyBoundary)
         if role == "user":
             return (
                 "The source role is `user`, so for every extracted item also set:\n"
                 f"- `memory_category`: one of [{category_values}]. Use `unknown` when the item is not a sensitive structured fact.\n"
+                f"- `intimacy_boundary`: one of [{intimacy_boundary_values}]. Use `ordinary` when the item is not private intimate context.\n"
+                "- `intimacy_boundary_confidence`: confidence in that boundary from 0.0 to 1.0.\n"
                 "- `preserve_verbatim`: true only when the exact structured value must be retained verbatim in canonical_text; otherwise false.\n"
                 "- `informational_mention`: optional bool. Use it only as a prompt/debugging hint when the user casually shares a structured fact worth remembering.\n"
                 "- When `preserve_verbatim=true`, keep `canonical_text` exact and put any retrieval-safe gloss in `index_text` without repeating the secret value."
@@ -483,11 +555,17 @@ class MemoryExtractor:
         return (
             "The source role is `assistant`. Keep the existing extraction behavior for assistant messages:\n"
             "- leave `memory_category` as `unknown`\n"
+            "- leave `intimacy_boundary` as `ordinary` unless the assistant is restating a user-provided intimate boundary from the active conversation\n"
             "- leave `preserve_verbatim` as false\n"
             "- do not use `informational_mention` unless it is needed for debugging a clearly structured extraction output"
         )
 
-    async def _plan_extraction_chunks(self, message_text: str) -> ChunkingPlan:
+    async def _plan_extraction_chunks(
+        self,
+        message_text: str,
+        *,
+        resolved_policy: ResolvedPolicy,
+    ) -> ChunkingPlan:
         if (
             not self._chunking_enabled
             or self._text_chunker.estimate_tokens(message_text) <= self._chunking_threshold_tokens
@@ -501,6 +579,13 @@ class MemoryExtractor:
         return await self._text_chunker.plan_chunks(
             message_text,
             threshold_tokens=self._chunking_threshold_tokens,
+            metadata=(
+                known_intimacy_context_metadata(
+                    reason="resolved_policy_allows_intimacy_context"
+                )
+                if resolved_policy.allow_intimacy_context
+                else {}
+            ),
         )
 
     async def _extract_chunk_results(
@@ -552,9 +637,20 @@ class MemoryExtractor:
                     "conversation_id": context.conversation_id,
                     "assistant_mode_id": context.assistant_mode_id,
                     "purpose": "memory_extraction",
+                    **(
+                        known_intimacy_context_metadata(
+                            reason="resolved_policy_allows_intimacy_context"
+                        )
+                        if resolved_policy.allow_intimacy_context
+                        else {}
+                    ),
                 },
             )
-            result = await self._complete_extraction_with_validation_retry(request)
+            result = await self._complete_extraction_with_validation_retry(
+                request,
+                source_input_tokens=self._text_chunker.estimate_tokens(chunk.text),
+                context=context,
+            )
             chunk_extractions.append(_ChunkExtraction(chunk=chunk, result=result))
             prior_chunk_context = self._extend_prior_chunk_context(prior_chunk_context, result)
             if chunk_plan.chunked:
@@ -573,12 +669,54 @@ class MemoryExtractor:
     async def _complete_extraction_with_validation_retry(
         self,
         request: LLMCompletionRequest,
+        *,
+        source_input_tokens: int,
+        context: ExtractionConversationContext,
+    ) -> ExtractionResult:
+        try:
+            return await self._complete_extraction_attempt_with_validation_retry(
+                request,
+                source_input_tokens=source_input_tokens,
+                context=context,
+                bounded_retry=False,
+            )
+        except (ExtractionWatchdogRetry, OutputLimitExceededError) as exc:
+            logger.warning(
+                "Retrying extraction with bounded output source_message_id=%s reason=%s",
+                context.source_message_id,
+                exc.__class__.__name__,
+            )
+            bounded_request = self._bounded_retry_request(request)
+            return await self._complete_extraction_attempt_with_validation_retry(
+                bounded_request,
+                source_input_tokens=source_input_tokens,
+                context=context,
+                bounded_retry=True,
+            )
+
+    async def _complete_extraction_attempt_with_validation_retry(
+        self,
+        request: LLMCompletionRequest,
+        *,
+        source_input_tokens: int,
+        context: ExtractionConversationContext,
+        bounded_retry: bool,
     ) -> ExtractionResult:
         current_request = request
-        max_attempts = EXTRACTION_VALIDATION_MAX_CORRECTIVE_RETRIES + 1
+        max_attempts = 2 if bounded_retry else EXTRACTION_VALIDATION_MAX_CORRECTIVE_RETRIES + 1
         for attempt_index in range(max_attempts):
             try:
-                return await self._llm_client.complete_structured(current_request, ExtractionResult)
+                result = await self._complete_extraction_request(
+                    current_request,
+                    source_input_tokens=source_input_tokens,
+                    context=context,
+                    use_watchdog=(
+                        self._extraction_watchdog_config.enabled and not bounded_retry
+                    ),
+                )
+                if bounded_retry:
+                    self._enforce_bounded_retry_item_cap(result)
+                return result
             except StructuredOutputError as exc:
                 if attempt_index == max_attempts - 1:
                     raise
@@ -593,6 +731,74 @@ class MemoryExtractor:
                         ],
                     }
                 )
+
+        raise StructuredOutputError("Provider returned invalid structured output")
+
+    async def _complete_extraction_request(
+        self,
+        request: LLMCompletionRequest,
+        *,
+        source_input_tokens: int,
+        context: ExtractionConversationContext,
+        use_watchdog: bool,
+    ) -> ExtractionResult:
+        if not use_watchdog:
+            return await self._llm_client.complete_structured(request, ExtractionResult)
+        observer = ExtractionWatchdogObserver(
+            llm_client=self._llm_client,
+            watchdog_model=self._extraction_watchdog_model,
+            extractor_model=self._extraction_model,
+            config=self._extraction_watchdog_config,
+            source_input_tokens=source_input_tokens,
+            user_id=context.user_id,
+            conversation_id=context.conversation_id,
+            source_message_id=context.source_message_id,
+        )
+        return await self._llm_client.complete_structured_streamed(
+            request,
+            ExtractionResult,
+            observer=observer,
+        )
+
+    def _bounded_retry_request(self, request: LLMCompletionRequest) -> LLMCompletionRequest:
+        metadata = dict(request.metadata)
+        metadata["extraction_retry_mode"] = "bounded_output"
+        return request.model_copy(
+            update={
+                "max_output_tokens": (
+                    self._extraction_watchdog_config.bounded_retry_max_output_tokens
+                ),
+                "metadata": metadata,
+                "messages": [
+                    *request.messages,
+                    LLMMessage(
+                        role="user",
+                        content=EXTRACTION_BOUNDED_RETRY_TEMPLATE.format(
+                            max_items=(
+                                self._extraction_watchdog_config.bounded_retry_max_items
+                            ),
+                        ),
+                    ),
+                ],
+            }
+        )
+
+    def _enforce_bounded_retry_item_cap(self, result: ExtractionResult) -> None:
+        item_count = (
+            len(result.evidences)
+            + len(result.beliefs)
+            + len(result.contract_signals)
+            + len(result.state_updates)
+        )
+        max_items = self._extraction_watchdog_config.bounded_retry_max_items
+        if item_count <= max_items:
+            return
+        raise StructuredOutputError(
+            "Provider returned too many bounded extraction items",
+            details=(
+                f"$: Bounded extraction returned {item_count} items; maximum is {max_items}.",
+            ),
+        )
 
     @staticmethod
     def _validation_retry_message(exc: StructuredOutputError) -> str:
@@ -669,6 +875,16 @@ class MemoryExtractor:
         consent_profiles: dict[MemoryCategory, dict[str, Any] | None] = {}
         try:
             for object_type, item in self._iter_items(result):
+                if is_blocked_intimacy_boundary(item.intimacy_boundary):
+                    continue
+                item.scope = constrained_scope_for_intimacy_boundary(
+                    item.intimacy_boundary,
+                    scope=item.scope,
+                )
+                item.privacy_level = minimum_privacy_for_intimacy_boundary(
+                    item.intimacy_boundary,
+                    privacy_level=item.privacy_level,
+                )
                 if item.scope not in resolved_policy.allowed_scopes:
                     continue
                 if not self._is_grounded(item.canonical_text, message_text):
@@ -741,6 +957,12 @@ class MemoryExtractor:
                     payload["privacy_filter_pre_signal"] = privacy_filter_audit
                 if item.informational_mention is not None:
                     payload["informational_mention"] = item.informational_mention
+                if is_restricted_intimacy_boundary(item.intimacy_boundary):
+                    payload["intimacy_boundary"] = item.intimacy_boundary.value
+                    payload["intimacy_boundary_policy"] = {
+                        "stored_scope": item.scope.value,
+                        "requires_explicit_intimacy_context": True,
+                    }
                 if chunked:
                     payload["chunk_index"] = chunk.chunk_index if chunk is not None else 1
                     payload["chunk_count"] = chunk.chunk_count if chunk is not None else 1
@@ -752,6 +974,9 @@ class MemoryExtractor:
                         payload["level1_attempts"] = chunk.level1_attempts
                 payload["extraction_hash"] = extraction_hash
                 payload["source_message_ids"] = [context.source_message_id]
+                if occurred_at is not None:
+                    payload["source_message_window_start_occurred_at"] = occurred_at
+                    payload["source_message_window_end_occurred_at"] = occurred_at
                 if isinstance(item, ExtractedBelief):
                     payload["claim_key"] = item.claim_key
                     payload["claim_value"] = item.claim_value
@@ -779,6 +1004,8 @@ class MemoryExtractor:
                     maya_score=self._default_maya_score(object_type),
                     privacy_level=item.privacy_level,
                     memory_category=item.memory_category,
+                    intimacy_boundary=item.intimacy_boundary,
+                    intimacy_boundary_confidence=item.intimacy_boundary_confidence,
                     preserve_verbatim=item.preserve_verbatim,
                     valid_from=valid_from,
                     valid_to=valid_to,
@@ -821,6 +1048,8 @@ class MemoryExtractor:
                             "canonical_text": item.canonical_text,
                             "index_text": item.index_text,
                             "privacy_level": item.privacy_level,
+                            "intimacy_boundary": item.intimacy_boundary.value,
+                            "intimacy_boundary_confidence": item.intimacy_boundary_confidence,
                             "preserve_verbatim": item.preserve_verbatim,
                             "user_id": context.user_id,
                             "object_type": object_type.value,
@@ -845,6 +1074,7 @@ class MemoryExtractor:
                     canonical_text=pending["canonical_text"],
                     index_text=pending.get("index_text"),
                     privacy_level=pending["privacy_level"],
+                    intimacy_boundary=pending.get("intimacy_boundary", IntimacyBoundary.ORDINARY.value),
                     preserve_verbatim=pending["preserve_verbatim"],
                     user_id=pending["user_id"],
                     object_type=pending["object_type"],
@@ -896,6 +1126,7 @@ class MemoryExtractor:
         canonical_text: str,
         index_text: str | None,
         privacy_level: int,
+        intimacy_boundary: IntimacyBoundary | str = IntimacyBoundary.ORDINARY,
         preserve_verbatim: bool,
         user_id: str,
         object_type: str,
@@ -911,6 +1142,7 @@ class MemoryExtractor:
                 canonical_text=canonical_text,
                 index_text=index_text,
                 privacy_level=privacy_level,
+                intimacy_boundary=str(intimacy_boundary),
                 preserve_verbatim=preserve_verbatim,
             )
             embedding_text = payload.text
@@ -1019,9 +1251,9 @@ class MemoryExtractor:
         # the ceiling-based REVIEW_REQUIRED path. Retrieval-time privacy
         # filtering remains the actual enforcement layer, so pending
         # confirmation is the correct initial status here.
-        if (
-            item.privacy_level >= 3
-            or item.memory_category in HIGH_RISK_MEMORY_CATEGORIES
+        if requires_confirmation(
+            memory_category=item.memory_category,
+            privacy_level=item.privacy_level,
         ) and confirmed_count < CONSENT_CONFIRM_THRESHOLD:
             return _PersistenceDecision(status=MemoryStatus.PENDING_USER_CONFIRMATION)
         return _PersistenceDecision(

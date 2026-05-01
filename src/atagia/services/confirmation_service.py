@@ -48,6 +48,7 @@ class _EmbeddingUpsert:
     canonical_text: str
     index_text: str | None
     privacy_level: int
+    intimacy_boundary: str
     preserve_verbatim: bool
     user_id: str
     object_type: str
@@ -274,6 +275,7 @@ class PendingConfirmationService:
                     canonical_text=str(updated["canonical_text"]),
                     index_text=updated.get("index_text"),
                     privacy_level=int(updated["privacy_level"]),
+                    intimacy_boundary=str(updated.get("intimacy_boundary") or "ordinary"),
                     preserve_verbatim=bool(int(updated["preserve_verbatim"])),
                     user_id=str(updated["user_id"]),
                     object_type=str(updated["object_type"]),
@@ -351,6 +353,7 @@ class PendingConfirmationService:
                     canonical_text=upsert.canonical_text,
                     index_text=upsert.index_text,
                     privacy_level=upsert.privacy_level,
+                    intimacy_boundary=upsert.intimacy_boundary,
                     preserve_verbatim=upsert.preserve_verbatim,
                 )
                 await self._embedding_index.upsert(

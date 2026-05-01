@@ -40,9 +40,10 @@ from atagia.models.schemas_memory import (
     ExtractionResult,
     MemoryObjectType,
 )
-from atagia.services.llm_client import LLMClient, StructuredOutputError, TransientLLMError
+from atagia.services.llm_client import LLMClient, LLMError, StructuredOutputError, TransientLLMError
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.model_resolution import resolve_component_model
+from atagia.services.topic_working_set_service import TopicWorkingSetRefreshService
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
@@ -70,6 +71,7 @@ class IngestWorker:
         self._manifest_loader = manifest_loader
         self._policy_resolver = PolicyResolver()
         self._llm_client = llm_client
+        self._clock = clock
         self._message_repository = MessageRepository(connection, clock)
         self._memory_repository = MemoryObjectRepository(connection, clock)
         self._belief_repository = BeliefRepository(connection, clock)
@@ -216,6 +218,10 @@ class IngestWorker:
             envelope=envelope,
             job_payload=job_payload,
         )
+        await self._maybe_refresh_topic_working_set(
+            envelope=envelope,
+            job_payload=job_payload,
+        )
 
     async def _emit_revision_jobs(
         self,
@@ -357,6 +363,45 @@ class IngestWorker:
             COMPACT_STREAM_NAME,
             compaction_job.model_dump(mode="json"),
         )
+
+    async def _maybe_refresh_topic_working_set(
+        self,
+        *,
+        envelope: JobEnvelope,
+        job_payload: MessageJobPayload,
+    ) -> None:
+        if envelope.conversation_id is None or not self._settings.topic_working_set_enabled:
+            return
+        try:
+            await TopicWorkingSetRefreshService(
+                connection=self._connection,
+                llm_client=self._llm_client,
+                clock=self._clock,
+                settings=self._settings,
+            ).maybe_refresh_after_message(
+                user_id=envelope.user_id,
+                conversation_id=envelope.conversation_id,
+                message_id=job_payload.message_id,
+            )
+        except LLMError as exc:
+            await self._rollback_topic_refresh_failure()
+            logger.warning(
+                "Skipping Topic Working Set refresh for message %s: %s",
+                job_payload.message_id,
+                exc,
+            )
+        except Exception:
+            await self._rollback_topic_refresh_failure()
+            logger.exception(
+                "Failed to refresh Topic Working Set for message %s",
+                job_payload.message_id,
+            )
+
+    async def _rollback_topic_refresh_failure(self) -> None:
+        try:
+            await self._connection.rollback()
+        except Exception:
+            logger.warning("Failed to rollback Topic Working Set refresh failure", exc_info=True)
 
     async def _process_consequence_detection(
         self,

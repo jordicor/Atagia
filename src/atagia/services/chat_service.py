@@ -10,9 +10,14 @@ from atagia.core.llm_output_limits import CHAT_REPLY_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
+from atagia.core.topic_repository import TopicRepository
 from atagia.memory.lifecycle_runner import piggyback_lifecycle
 from atagia.core.summary_repository import SummaryRepository
 from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
+from atagia.memory.intimacy_boundary_policy import (
+    INTIMACY_FILTER_REASON,
+    strongest_intimacy_boundary,
+)
 from atagia.models.schemas_api import ChatResult
 from atagia.services.artifact_service import ArtifactService
 from atagia.services.chat_support import (
@@ -27,6 +32,7 @@ from atagia.services.chat_support import (
     enqueue_message_jobs,
     missing_uncovered_tail_start_seq,
     render_transcript_window,
+    render_topic_working_set_block,
     resolve_assistant_mode_id,
     resolve_operational_profile,
     resolve_policy,
@@ -35,7 +41,12 @@ from atagia.services.chat_support import (
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.confirmation_service import PendingConfirmationService
 from atagia.services.errors import ConversationNotFoundError, LLMUnavailableError
-from atagia.services.llm_client import LLMCompletionRequest, LLMError, LLMMessage
+from atagia.services.llm_client import (
+    LLMCompletionRequest,
+    LLMError,
+    LLMMessage,
+    known_intimacy_context_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,18 +166,54 @@ class ChatService:
                     operational_profile=operational_profile,
                     operational_signals=operational_signals,
                 )
-                transcript_entries = build_transcript_window(
-                    prior_messages,
-                    conversation_chunks,
-                    resolution.resolved_policy.transcript_budget_tokens,
-                    raw_context_access_mode=str(
-                        resolution.source_retrieval_plan.get("raw_context_access_mode", "normal")
+                topic_snapshot = await TopicRepository(
+                    connection,
+                    self.runtime.clock,
+                ).get_topic_snapshot(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    refresh_message_threshold=(
+                        self.runtime.settings.topic_working_set_refresh_message_lag
+                    ),
+                    stale_message_threshold=(
+                        self.runtime.settings.topic_working_set_stale_message_lag
+                    ),
+                    refresh_token_threshold=(
+                        self.runtime.settings.topic_working_set_refresh_token_lag
+                    ),
+                    stale_token_threshold=(
+                        self.runtime.settings.topic_working_set_stale_token_lag
                     ),
                 )
-                transcript_trace = build_transcript_window_trace(
-                    transcript_entries,
-                    resolution.resolved_policy.transcript_budget_tokens,
+                topic_context_block = render_topic_working_set_block(
+                    topic_snapshot,
+                    allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
                 )
+                if self.runtime.settings.benchmark_disable_raw_recent_transcript:
+                    transcript_entries = []
+                    transcript_trace = build_transcript_window_trace([], 0)
+                else:
+                    transcript_budget_tokens = (
+                        self.runtime.settings.effective_recent_transcript_budget_tokens(
+                            resolution.resolved_policy.transcript_budget_tokens,
+                            hard_cap_tokens=(
+                                resolution.resolved_operational_profile.policy_override.transcript_budget_tokens
+                            ),
+                        )
+                    )
+                    transcript_entries = build_transcript_window(
+                        prior_messages,
+                        conversation_chunks,
+                        transcript_budget_tokens,
+                        raw_context_access_mode=str(
+                            resolution.source_retrieval_plan.get("raw_context_access_mode", "normal")
+                        ),
+                        allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
+                    )
+                    transcript_trace = build_transcript_window_trace(
+                        transcript_entries,
+                        transcript_budget_tokens,
+                    )
                 transcript = [
                     *render_transcript_window(transcript_entries),
                     {"role": "user", "text": prompt_message_text},
@@ -184,6 +231,7 @@ class ChatService:
                                     resolution.composed_context.workspace_block,
                                     resolution.composed_context.memory_block,
                                     resolution.composed_context.state_block,
+                                    topic_context_block=topic_context_block,
                                 ),
                             ),
                             *[
@@ -199,6 +247,12 @@ class ChatService:
                             "conversation_id": conversation_id,
                             "assistant_mode_id": resolved_mode_id,
                             "purpose": "chat_reply",
+                            **self._chat_intimacy_metadata(
+                                topic_snapshot,
+                                allow_intimacy_context=(
+                                    resolution.resolved_policy.allow_intimacy_context
+                                ),
+                            ),
                         },
                     )
                 )
@@ -280,6 +334,12 @@ class ChatService:
                                 "scored_candidates": resolution.scored_candidates,
                                 "retrieval_custody_v2": resolution.candidate_custody,
                                 "retrieval_custody_v2_status": resolution.retrieval_custody_v2_status,
+                                "intimacy_boundary_counts": _intimacy_boundary_counts(
+                                    resolution.candidate_custody
+                                ),
+                                "intimacy_policy_filtered_count": _intimacy_policy_filtered_count(
+                                    resolution.candidate_custody
+                                ),
                                 "sufficiency_diagnostics_v1": resolution.retrieval_sufficiency,
                                 "sufficiency_diagnostics_v1_status": (
                                     resolution.sufficiency_diagnostics_v1_status
@@ -437,6 +497,8 @@ class ChatService:
                         },
                         "enqueued_job_ids": enqueued_job_ids,
                         "post_commit_errors": post_commit_errors,
+                        "topic_working_set": topic_snapshot,
+                        "topic_working_set_block": topic_context_block,
                     }
                     if llm_response.thinking:
                         debug_payload["thinking"] = llm_response.thinking
@@ -456,3 +518,55 @@ class ChatService:
                 raise LLMUnavailableError("LLM service unavailable") from exc
             finally:
                 await connection.close()
+
+    @staticmethod
+    def _chat_intimacy_metadata(
+        topic_snapshot: dict[str, Any],
+        *,
+        allow_intimacy_context: bool,
+    ) -> dict[str, Any]:
+        topics = [
+            *(topic_snapshot.get("active_topics") or []),
+            *(topic_snapshot.get("parked_topics") or []),
+        ]
+        intimate_topics = [
+            topic
+            for topic in topics
+            if isinstance(topic, dict)
+            and str(topic.get("intimacy_boundary") or "ordinary") != "ordinary"
+        ]
+        if intimate_topics:
+            boundary = strongest_intimacy_boundary(intimate_topics)
+            confidence = max(
+                (
+                    float(topic.get("intimacy_boundary_confidence", 0.0) or 0.0)
+                    for topic in intimate_topics
+                ),
+                default=0.0,
+            )
+            return known_intimacy_context_metadata(
+                reason="topic_working_set_intimacy_boundary",
+                boundary=boundary.value,
+                confidence=confidence,
+            )
+        if allow_intimacy_context:
+            return known_intimacy_context_metadata(
+                reason="resolved_policy_allows_intimacy_context"
+            )
+        return {}
+
+
+def _intimacy_boundary_counts(candidate_custody: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in candidate_custody:
+        boundary = str(record.get("intimacy_boundary") or "ordinary")
+        counts[boundary] = counts.get(boundary, 0) + 1
+    return counts
+
+
+def _intimacy_policy_filtered_count(candidate_custody: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for record in candidate_custody
+        if record.get("filter_reason") == INTIMACY_FILTER_REASON
+    )

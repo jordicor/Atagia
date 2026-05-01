@@ -53,7 +53,7 @@ def _candidate(
     payload_json: dict[str, object] | None = None,
     retrieval_sources: list[str] | None = None,
     is_artifact_chunk: bool = False,
-    is_raw_message_window: bool = False,
+    is_verbatim_evidence_window: bool = False,
     tension_score: float = 0.0,
 ) -> dict[str, object]:
     return {
@@ -69,13 +69,13 @@ def _candidate(
         "channel_ranks": {
             "fts": 1,
             "embedding": None,
-            "raw_message": 1 if is_raw_message_window else None,
+            "verbatim_evidence_search": 1 if is_verbatim_evidence_window else None,
             "artifact_chunk": 1 if is_artifact_chunk else None,
             "consequence": None,
             "verbatim_pin": None,
         },
         "is_artifact_chunk": is_artifact_chunk,
-        "is_raw_message_window": is_raw_message_window,
+        "is_verbatim_evidence_window": is_verbatim_evidence_window,
         "tension_score": tension_score,
     }
 
@@ -146,7 +146,7 @@ def test_artifact_mode_without_artifact_candidates_requests_artifact_channel() -
     assert diagnostic.artifact_candidate_count == 0
 
 
-def test_exact_recall_without_direct_evidence_requests_raw_message_channel() -> None:
+def test_exact_recall_without_direct_evidence_requests_verbatim_evidence_search_enabled() -> None:
     summary = _candidate(
         "sum_episode",
         object_type=MemoryObjectType.SUMMARY_VIEW.value,
@@ -164,7 +164,7 @@ def test_exact_recall_without_direct_evidence_requests_raw_message_channel() -> 
     )
 
     assert diagnostic.state == "insufficient_need_more_raw_evidence"
-    assert diagnostic.would_expand_channels == ["raw_message"]
+    assert diagnostic.would_expand_channels == ["verbatim_evidence_search"]
     assert diagnostic.direct_evidence_candidate_count == 0
 
 

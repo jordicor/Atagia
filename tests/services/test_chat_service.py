@@ -132,16 +132,10 @@ def _settings(tmp_path: Path) -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
         llm_forced_global_model="openai/reply-test-model",
         service_mode=False,
@@ -655,7 +649,7 @@ async def test_chat_reply_uses_windowed_transcript_and_records_trace(
                 "usr_1",
             )
             assert event is not None
-            assert event["outcome_json"]["transcript_window"]["raw_message_seqs"] == [7, 8, 9, 10]
+            assert event["outcome_json"]["transcript_window"]["transcript_message_seqs"] == [7, 8, 9, 10]
             assert event["outcome_json"]["transcript_window"]["chunk_ids"] == ["sum_old"]
             assert event["outcome_json"]["transcript_window"]["budget_tokens"] == 8000
             assert event["outcome_json"]["transcript_window"]["budget_used_tokens"] > 0

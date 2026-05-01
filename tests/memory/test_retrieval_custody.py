@@ -97,6 +97,8 @@ def test_candidate_custody_uses_safe_fields_without_raw_text_values() -> None:
             "scope": "conversation",
             "status": "active",
             "privacy_level": 0,
+            "intimacy_boundary": "ordinary",
+            "intimacy_boundary_confidence": 0.0,
             "retrieval_level": 0,
             "source_kind": "extracted",
             "temporal_type": "unknown",

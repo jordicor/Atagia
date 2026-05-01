@@ -37,6 +37,7 @@ class FakeChatCompletions:
 class FakeStream:
     def __init__(self, chunks) -> None:
         self._chunks = chunks
+        self.closed = False
 
     def __aiter__(self):
         return self._iterator()
@@ -44,6 +45,9 @@ class FakeStream:
     async def _iterator(self):
         for chunk in self._chunks:
             yield chunk
+
+    async def aclose(self):
+        self.closed = True
 
 
 class FakeEmbeddings:
@@ -328,6 +332,34 @@ async def test_openai_stream_emits_done_then_raises_on_length_finish_reason() ->
     assert isinstance(raised, LLMError)
     assert not isinstance(raised, TransientLLMError)
     assert "max output tokens" in str(raised)
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_closes_underlying_stream_on_cancel() -> None:
+    stream = FakeStream(
+        [
+            SimpleNamespace(
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="partial", tool_calls=None),
+                        finish_reason=None,
+                    )
+                ],
+            )
+        ]
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(FakeChatCompletions(stream), FakeEmbeddings()),
+    )
+
+    iterator = provider.stream(_request()).__aiter__()
+    first = await anext(iterator)
+    await iterator.aclose()
+
+    assert first.type == "text"
+    assert stream.closed is True
 
 
 @pytest.mark.asyncio

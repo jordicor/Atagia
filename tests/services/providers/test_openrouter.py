@@ -183,18 +183,11 @@ def test_openrouter_default_headers_and_factory_wiring(monkeypatch: pytest.Monke
         manifests_path="./manifests",
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openrouter",
-        llm_api_key=None,
         openai_api_key=None,
         openrouter_api_key="router-key",
-        llm_base_url=None,
         openrouter_site_url="https://atagia.org",
         openrouter_app_name="Atagia",
-        llm_extraction_model=None,
-        llm_scoring_model=None,
-        llm_classifier_model=None,
         llm_chat_model=None,
-        embedding_provider_name=None,
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
@@ -250,19 +243,12 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
         manifests_path="./manifests",
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="anthropic",
-        llm_api_key=None,
         anthropic_api_key="anthropic-key",
         openai_api_key="openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="https://atagia.org",
         openrouter_app_name="Atagia",
-        llm_extraction_model=None,
-        llm_scoring_model=None,
-        llm_classifier_model=None,
         llm_chat_model=None,
-        embedding_provider_name=None,
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
@@ -279,7 +265,6 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
     )
 
     assert client.provider_name is None
-    assert client.embedding_provider_name is None
     assert embedding.provider == "openai"
 
 
@@ -320,19 +305,12 @@ def test_build_llm_client_requires_openai_for_anthropic_embeddings(
         manifests_path="./manifests",
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="anthropic",
-        llm_api_key=None,
         anthropic_api_key="anthropic-key",
         openai_api_key=None,
         openrouter_api_key="router-key",
-        llm_base_url=None,
         openrouter_site_url="https://atagia.org",
         openrouter_app_name="Atagia",
-        llm_extraction_model=None,
-        llm_scoring_model=None,
-        llm_classifier_model=None,
         llm_chat_model=None,
-        embedding_provider_name=None,
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
@@ -348,7 +326,7 @@ def test_build_llm_client_requires_openai_for_anthropic_embeddings(
 
 
 @pytest.mark.asyncio
-async def test_build_llm_client_respects_explicit_embedding_provider_override(
+async def test_build_llm_client_routes_embeddings_by_provider_qualified_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeAnthropicProvider(LLMProvider):
@@ -390,19 +368,12 @@ async def test_build_llm_client_respects_explicit_embedding_provider_override(
         manifests_path="./manifests",
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="anthropic",
-        llm_api_key=None,
         anthropic_api_key="anthropic-key",
         openai_api_key=None,
         openrouter_api_key="router-key",
-        llm_base_url=None,
         openrouter_site_url="https://atagia.org",
         openrouter_app_name="Atagia",
-        llm_extraction_model=None,
-        llm_scoring_model=None,
-        llm_classifier_model=None,
         llm_chat_model=None,
-        embedding_provider_name="openrouter",
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
@@ -422,5 +393,4 @@ async def test_build_llm_client_respects_explicit_embedding_provider_override(
     )
 
     assert client.provider_name is None
-    assert client.embedding_provider_name is None
     assert embedding.provider == "openrouter"

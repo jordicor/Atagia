@@ -205,8 +205,8 @@ async def test_mcp_get_context(
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=tmp_path / "atagia-mcp.db",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
     )
 
     await engine.setup()
@@ -255,8 +255,8 @@ async def test_mcp_search_memories(
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=tmp_path / "atagia-mcp.db",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
     )
 
     await engine.setup()
@@ -308,8 +308,8 @@ async def test_mcp_add_memory(
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=tmp_path / "atagia-mcp.db",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
     )
 
     await engine.setup()
@@ -373,8 +373,8 @@ async def test_mcp_add_memory_carries_operational_profile(
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=tmp_path / "atagia-mcp.db",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
     )
 
     await engine.setup()
@@ -417,8 +417,8 @@ async def test_mcp_delete_memory(
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=tmp_path / "atagia-mcp.db",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
     )
 
     await engine.setup()
@@ -484,8 +484,8 @@ async def test_mcp_list_memories(
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=tmp_path / "atagia-mcp.db",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
     )
 
     await engine.setup()

@@ -14,6 +14,7 @@ from atagia.core.ids import generate_prefixed_id, new_memory_id
 from atagia.core.storage_backend import StorageBackend
 from atagia.core.timestamps import normalize_optional_timestamp
 from atagia.models.schemas_memory import (
+    IntimacyBoundary,
     MemoryCategory,
     MemoryObjectType,
     MemoryScope,
@@ -21,6 +22,7 @@ from atagia.models.schemas_memory import (
     MemoryStatus,
     SummaryViewKind,
 )
+from atagia.memory.intimacy_boundary_policy import memory_object_intimacy_sql_clause
 
 RETRIEVAL_ELIGIBLE_MEMORY_STATUSES: tuple[MemoryStatus, ...] = (MemoryStatus.ACTIVE,)
 
@@ -1108,6 +1110,8 @@ class MemoryObjectRepository(BaseRepository):
         vitality: float = 0.15,
         maya_score: float = 1.5,
         privacy_level: int = 0,
+        intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+        intimacy_boundary_confidence: float = 0.0,
         status: MemoryStatus = MemoryStatus.ACTIVE,
         payload: dict[str, Any] | None = None,
         commit: bool = True,
@@ -1145,6 +1149,8 @@ class MemoryObjectRepository(BaseRepository):
                 maya_score=maya_score,
                 privacy_level=privacy_level,
                 memory_category=MemoryCategory.UNKNOWN,
+                intimacy_boundary=intimacy_boundary,
+                intimacy_boundary_confidence=intimacy_boundary_confidence,
                 preserve_verbatim=False,
                 status=status,
                 memory_id=mirror_id,
@@ -1168,6 +1174,8 @@ class MemoryObjectRepository(BaseRepository):
                 maya_score = ?,
                 privacy_level = ?,
                 memory_category = ?,
+                intimacy_boundary = ?,
+                intimacy_boundary_confidence = ?,
                 preserve_verbatim = ?,
                 status = ?,
                 updated_at = ?
@@ -1189,6 +1197,8 @@ class MemoryObjectRepository(BaseRepository):
                 maya_score,
                 privacy_level,
                 MemoryCategory.UNKNOWN.value,
+                intimacy_boundary.value,
+                float(intimacy_boundary_confidence),
                 0,
                 status.value,
                 self._timestamp(),
@@ -1224,6 +1234,8 @@ class MemoryObjectRepository(BaseRepository):
         maya_score: float = 0.0,
         status: MemoryStatus = MemoryStatus.ACTIVE,
         memory_category: MemoryCategory = MemoryCategory.UNKNOWN,
+        intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+        intimacy_boundary_confidence: float = 0.0,
         preserve_verbatim: bool = False,
         valid_from: str | None = None,
         valid_to: str | None = None,
@@ -1251,6 +1263,8 @@ class MemoryObjectRepository(BaseRepository):
             maya_score=maya_score,
             status=status,
             memory_category=memory_category,
+            intimacy_boundary=intimacy_boundary,
+            intimacy_boundary_confidence=intimacy_boundary_confidence,
             preserve_verbatim=preserve_verbatim,
             valid_from=valid_from,
             valid_to=valid_to,
@@ -1282,6 +1296,8 @@ class MemoryObjectRepository(BaseRepository):
         maya_score: float = 0.0,
         status: MemoryStatus = MemoryStatus.ACTIVE,
         memory_category: MemoryCategory = MemoryCategory.UNKNOWN,
+        intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+        intimacy_boundary_confidence: float = 0.0,
         preserve_verbatim: bool = False,
         valid_from: str | None = None,
         valid_to: str | None = None,
@@ -1309,6 +1325,8 @@ class MemoryObjectRepository(BaseRepository):
             maya_score=maya_score,
             status=status,
             memory_category=memory_category,
+            intimacy_boundary=intimacy_boundary,
+            intimacy_boundary_confidence=intimacy_boundary_confidence,
             preserve_verbatim=preserve_verbatim,
             valid_from=valid_from,
             valid_to=valid_to,
@@ -1339,6 +1357,8 @@ class MemoryObjectRepository(BaseRepository):
         maya_score: float = 0.0,
         status: MemoryStatus = MemoryStatus.ACTIVE,
         memory_category: MemoryCategory = MemoryCategory.UNKNOWN,
+        intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+        intimacy_boundary_confidence: float = 0.0,
         preserve_verbatim: bool = False,
         valid_from: str | None = None,
         valid_to: str | None = None,
@@ -1369,6 +1389,8 @@ class MemoryObjectRepository(BaseRepository):
             maya_score,
             privacy_level,
             memory_category.value,
+            intimacy_boundary.value,
+            float(intimacy_boundary_confidence),
             int(preserve_verbatim),
             valid_from,
             valid_to,
@@ -1400,6 +1422,8 @@ class MemoryObjectRepository(BaseRepository):
                     maya_score,
                     privacy_level,
                     memory_category,
+                    intimacy_boundary,
+                    intimacy_boundary_confidence,
                     preserve_verbatim,
                     valid_from,
                     valid_to,
@@ -1409,7 +1433,7 @@ class MemoryObjectRepository(BaseRepository):
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 parameters,
             )
@@ -1579,6 +1603,7 @@ class MemoryObjectRepository(BaseRepository):
         conversation_id: str | None,
         assistant_mode_id: str | None,
         privacy_ceiling: int,
+        allow_intimacy_context: bool = False,
     ) -> int:
         """Return the total canonical_text length for eligible active memories.
 
@@ -1605,9 +1630,14 @@ class MemoryObjectRepository(BaseRepository):
               )
               AND status IN ({status_placeholders})
               AND privacy_level <= ?
+              AND {intimacy_filter}
             """.format(
                 clauses=" OR ".join(clauses),
                 status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                intimacy_filter=memory_object_intimacy_sql_clause(
+                    "memory_objects",
+                    allow_intimacy_context=allow_intimacy_context,
+                ),
             ),
             tuple(
                 [
@@ -1630,6 +1660,7 @@ class MemoryObjectRepository(BaseRepository):
         conversation_id: str | None,
         assistant_mode_id: str | None,
         privacy_ceiling: int,
+        allow_intimacy_context: bool = False,
     ) -> list[dict[str, Any]]:
         """Return eligible active memory objects for small-corpus composition."""
         clauses, parameters = self._context_scope_clauses(
@@ -1651,10 +1682,15 @@ class MemoryObjectRepository(BaseRepository):
               )
               AND status IN ({status_placeholders})
               AND privacy_level <= ?
+              AND {intimacy_filter}
             ORDER BY updated_at DESC, id ASC
             """.format(
                 clauses=" OR ".join(clauses),
                 status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                intimacy_filter=memory_object_intimacy_sql_clause(
+                    "memory_objects",
+                    allow_intimacy_context=allow_intimacy_context,
+                ),
             ),
             tuple(
                 [
@@ -1718,6 +1754,7 @@ class MemoryObjectRepository(BaseRepository):
         assistant_mode_id: str | None,
         workspace_id: str | None,
         conversation_id: str | None,
+        allow_intimacy_context: bool = False,
     ) -> dict[str, Any]:
         clauses, parameters = self._state_context_clauses(
             assistant_mode_id=assistant_mode_id,
@@ -1735,8 +1772,15 @@ class MemoryObjectRepository(BaseRepository):
               AND object_type = ?
               AND status = ?
               AND ({clauses})
+              AND {intimacy_filter}
             ORDER BY updated_at DESC, id ASC
-            """.format(clauses=" OR ".join(clauses)),
+            """.format(
+                clauses=" OR ".join(clauses),
+                intimacy_filter=memory_object_intimacy_sql_clause(
+                    "memory_objects",
+                    allow_intimacy_context=allow_intimacy_context,
+                ),
+            ),
             (
                 user_id,
                 MemoryObjectType.STATE_SNAPSHOT.value,

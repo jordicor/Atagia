@@ -12,7 +12,12 @@ from atagia.core.clock import FrozenClock
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import UserRepository
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
-from atagia.models.schemas_memory import MemoryScope, VerbatimPinStatus, VerbatimPinTargetKind
+from atagia.models.schemas_memory import (
+    IntimacyBoundary,
+    MemoryScope,
+    VerbatimPinStatus,
+    VerbatimPinTargetKind,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
@@ -160,5 +165,67 @@ async def test_verbatim_pin_repository_search_excludes_expired_and_deleted_pins(
             limit=10,
             as_of="2026-03-30T12:00:00+00:00",
         ) == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_verbatim_pin_search_filters_intimacy_boundary_until_authorized() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        pins = VerbatimPinRepository(connection, clock)
+        await users.create_user("usr_a")
+
+        ordinary = await pins.create_verbatim_pin(
+            user_id="usr_a",
+            scope=MemoryScope.GLOBAL_USER,
+            target_kind=VerbatimPinTargetKind.MESSAGE,
+            target_id="msg_ordinary",
+            canonical_text="ordinary pottery note",
+            index_text="ordinary pottery note",
+            privacy_level=0,
+            created_by="usr_a",
+        )
+        restricted = await pins.create_verbatim_pin(
+            user_id="usr_a",
+            scope=MemoryScope.GLOBAL_USER,
+            target_kind=VerbatimPinTargetKind.MESSAGE,
+            target_id="msg_private",
+            canonical_text="private pottery note",
+            index_text="private pottery note",
+            privacy_level=0,
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+            intimacy_boundary_confidence=0.9,
+            created_by="usr_a",
+        )
+
+        ordinary_rows = await pins.search_active_verbatim_pins(
+            user_id="usr_a",
+            query="pottery",
+            privacy_ceiling=3,
+            scope_filter=[MemoryScope.GLOBAL_USER],
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_1",
+            limit=10,
+            as_of="2026-03-30T12:00:00+00:00",
+        )
+        authorized_rows = await pins.search_active_verbatim_pins(
+            user_id="usr_a",
+            query="pottery",
+            privacy_ceiling=3,
+            scope_filter=[MemoryScope.GLOBAL_USER],
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_1",
+            limit=10,
+            allow_intimacy_context=True,
+            as_of="2026-03-30T12:00:00+00:00",
+        )
+
+        assert [row["id"] for row in ordinary_rows] == [ordinary["id"]]
+        assert {row["id"] for row in authorized_rows} == {ordinary["id"], restricted["id"]}
+        assert restricted["privacy_level"] == 2
     finally:
         await connection.close()

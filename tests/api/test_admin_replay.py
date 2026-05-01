@@ -135,16 +135,10 @@ def _settings(tmp_path: Path, *, allow_admin_export_anonymization: bool = False)
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="chat-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="openai/reply-test-model",
         llm_ingest_model="openai/chat-test-model",
         llm_retrieval_model="openai/score-test-model",
@@ -343,7 +337,7 @@ def test_admin_replay_grounding_and_export_routes_work(tmp_path: Path) -> None:
                 {"user_id": "usr_1"},
                 {"user_id": "usr_1"},
                 {"user_id": "usr_1"},
-                {"user_id": "usr_1", "anonymization_mode": "raw"},
+                {"user_id": "usr_1", "anonymization_mode": "raw", "include_intimacy_context": False},
             ]
 
 

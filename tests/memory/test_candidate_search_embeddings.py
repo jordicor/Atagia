@@ -449,7 +449,7 @@ async def test_rrf_uses_best_fts_rank_once_across_query_rewrites() -> None:
             "fts": 1,
             "embedding": None,
             "consequence": None,
-            "raw_message": None,
+            "verbatim_evidence_search": None,
         }
         assert shared["matched_sub_queries"] == ["retry loop fastapi"]
         assert shared["subquery_ranks"]["retry loop fastapi"] >= 1

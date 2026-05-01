@@ -12,7 +12,13 @@ from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository, WorkspaceRepository
 from atagia.memory.candidate_search import CandidateSearch
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
+from atagia.models.schemas_memory import (
+    IntimacyBoundary,
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    MemoryStatus,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -47,6 +53,7 @@ async def _seed_memory(
     conversation_id: str | None = "cnv_1",
     status: MemoryStatus = MemoryStatus.ACTIVE,
     privacy_level: int = 0,
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
 ) -> None:
     await memories.create_memory_object(
         user_id="usr_1",
@@ -59,6 +66,8 @@ async def _seed_memory(
         source_kind=MemorySourceKind.EXTRACTED,
         confidence=0.8,
         privacy_level=privacy_level,
+        intimacy_boundary=intimacy_boundary,
+        intimacy_boundary_confidence=0.9 if intimacy_boundary is not IntimacyBoundary.ORDINARY else 0.0,
         status=status,
         language_codes=language_codes,
         memory_id=memory_id,
@@ -219,5 +228,48 @@ async def test_aggregate_retrievable_language_mix_returns_empty_on_cold_start() 
         )
 
         assert profile == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_retrievable_language_mix_can_include_authorized_intimacy_context() -> None:
+    connection, _clock, memories, search = await _build_runtime()
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_private_es",
+            canonical_text="private spanish continuity",
+            language_codes=["es"],
+            privacy_level=2,
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+        )
+
+        ordinary_profile = await search.aggregate_retrievable_language_mix(
+            user_id="usr_1",
+            scope_filter=[MemoryScope.CONVERSATION],
+            assistant_mode_id="coding_debug",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            privacy_ceiling=2,
+        )
+        authorized_profile = await search.aggregate_retrievable_language_mix(
+            user_id="usr_1",
+            scope_filter=[MemoryScope.CONVERSATION],
+            assistant_mode_id="coding_debug",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            privacy_ceiling=2,
+            allow_intimacy_context=True,
+        )
+
+        assert ordinary_profile == []
+        assert authorized_profile == [
+            {
+                "language_code": "es",
+                "memory_count": 1,
+                "last_seen_at": "2026-04-05T12:00:00+00:00",
+            }
+        ]
     finally:
         await connection.close()

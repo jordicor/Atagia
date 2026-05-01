@@ -14,6 +14,11 @@ from atagia.core.artifact_repository import ArtifactRepository
 from atagia.core.clock import Clock
 from atagia.core.ids import generate_prefixed_id
 from atagia.memory.context_composer import ContextComposer
+from atagia.memory.intimacy_boundary_policy import (
+    is_blocked_intimacy_boundary,
+    is_restricted_intimacy_boundary,
+    minimum_privacy_for_intimacy_boundary,
+)
 from atagia.models.schemas_api import AttachmentInput
 from atagia.services.artifact_blob_store import ArtifactBlobStore
 
@@ -148,6 +153,8 @@ class ArtifactService:
                 page_count=artifact.get("page_count"),
                 status=str(artifact.get("status", "ready")),
                 privacy_level=int(artifact.get("privacy_level", 0)),
+                intimacy_boundary=artifact.get("intimacy_boundary"),
+                intimacy_boundary_confidence=float(artifact.get("intimacy_boundary_confidence", 0.0) or 0.0),
                 preserve_verbatim=bool(artifact.get("preserve_verbatim", False)),
                 skip_raw_by_default=bool(artifact.get("skip_raw_by_default", True)),
                 requires_explicit_request=bool(artifact.get("requires_explicit_request", True)),
@@ -174,6 +181,14 @@ class ArtifactService:
                         "text": str(chunk["text"]),
                         "token_count": int(chunk["token_count"]),
                         "kind": str(chunk["kind"]),
+                        "intimacy_boundary": str(
+                            chunk.get("intimacy_boundary") or artifact.get("intimacy_boundary") or "ordinary"
+                        ),
+                        "intimacy_boundary_confidence": float(
+                            chunk.get("intimacy_boundary_confidence")
+                            or artifact.get("intimacy_boundary_confidence")
+                            or 0.0
+                        ),
                     }
                     for chunk in prepared.chunks
                 ]
@@ -198,6 +213,7 @@ class ArtifactService:
         user_id: str,
         artifact_id: str,
         include_raw: bool = False,
+        allow_intimacy_context: bool = False,
     ) -> ArtifactPayload | None:
         repository = ArtifactRepository(self._connection, self._clock)
         artifact = await repository.get_artifact(artifact_id, user_id)
@@ -208,7 +224,12 @@ class ArtifactService:
         raw_available = blob is not None and (
             blob.get("blob_bytes") is not None or blob.get("storage_uri") is not None
         )
-        raw_block_reason = self._raw_block_reason(artifact, include_raw, raw_available)
+        raw_block_reason = self._raw_block_reason(
+            artifact,
+            include_raw,
+            raw_available,
+            allow_intimacy_context=allow_intimacy_context,
+        )
         content_bytes = None
         storage_uri = None
         if raw_available and raw_block_reason is None:
@@ -252,6 +273,10 @@ class ArtifactService:
         )
         summary_text = self._build_summary_text(attachment, artifact_id, text_payload, byte_size)
         index_text = self._build_index_text(attachment, summary_text, text_payload)
+        privacy_level = minimum_privacy_for_intimacy_boundary(
+            attachment.intimacy_boundary,
+            privacy_level=attachment.privacy_level,
+        )
         chunks = self._build_chunks(
             artifact_id=artifact_id,
             user_id=user_id,
@@ -270,6 +295,10 @@ class ArtifactService:
         metadata = dict(attachment.metadata)
         metadata.setdefault("relevance_state", "active_work_material")
         metadata.setdefault("relevance_source", "attachment_ingest")
+        if attachment.intimacy_boundary.value != "ordinary":
+            metadata.setdefault("intimacy_boundary_policy", {
+                "requires_explicit_intimacy_context": True,
+            })
         return PreparedArtifact(
             artifact={
                 "id": artifact_id,
@@ -287,7 +316,9 @@ class ArtifactService:
                 "size_bytes": byte_size,
                 "page_count": attachment.page_count,
                 "status": "ready",
-                "privacy_level": attachment.privacy_level,
+                "privacy_level": privacy_level,
+                "intimacy_boundary": attachment.intimacy_boundary,
+                "intimacy_boundary_confidence": attachment.intimacy_boundary_confidence,
                 "preserve_verbatim": attachment.preserve_verbatim,
                 "skip_raw_by_default": attachment.skip_raw_by_default,
                 "requires_explicit_request": attachment.requires_explicit_request,
@@ -321,9 +352,15 @@ class ArtifactService:
         artifact: dict[str, Any],
         include_raw: bool,
         raw_available: bool,
+        *,
+        allow_intimacy_context: bool = False,
     ) -> str | None:
         if not raw_available:
             return None
+        if is_blocked_intimacy_boundary(artifact.get("intimacy_boundary")):
+            return "safety_blocked_intimacy_boundary"
+        if is_restricted_intimacy_boundary(artifact.get("intimacy_boundary")) and not allow_intimacy_context:
+            return "explicit_intimacy_context_required"
         if include_raw:
             return None
         if bool(artifact.get("requires_explicit_request")):
@@ -466,7 +503,7 @@ class ArtifactService:
             parts.append("verbatim")
         if attachment.privacy_level:
             parts.append(f"privacy={attachment.privacy_level}")
-        if text_payload:
+        if text_payload and not self._raw_text_is_prompt_gated(attachment):
             parts.append(f"preview={self._truncate_field(text_payload, _MAX_ATTACHMENT_PROMPT_PREVIEW_CHARS)}")
         elif attachment.source_ref:
             parts.append(f"ref={self._truncate_field(attachment.source_ref, 120)}")
@@ -483,7 +520,10 @@ class ArtifactService:
             if value:
                 parts.append(self._truncate_field(value, 120))
         if text_payload:
-            parts.append(self._truncate_field(text_payload, _MAX_ATTACHMENT_PROMPT_PREVIEW_CHARS))
+            if self._raw_text_is_prompt_gated(attachment):
+                parts.append("raw text gated by policy")
+            else:
+                parts.append(self._truncate_field(text_payload, _MAX_ATTACHMENT_PROMPT_PREVIEW_CHARS))
         return " ".join(part for part in parts if part).strip()
 
     def _build_prompt_placeholder(
@@ -514,7 +554,7 @@ class ArtifactService:
             parts.append(f"size={byte_size} bytes")
         if attachment.preserve_verbatim:
             parts.append("verbatim")
-        if text_payload:
+        if text_payload and not self._raw_text_is_prompt_gated(attachment):
             parts.append("summary available")
         elif attachment.url:
             parts.append("reference only")
@@ -540,6 +580,8 @@ class ArtifactService:
                 "text": summary_text,
                 "token_count": self._estimate_tokens(summary_text),
                 "kind": "summary",
+                "intimacy_boundary": attachment.intimacy_boundary.value,
+                "intimacy_boundary_confidence": attachment.intimacy_boundary_confidence,
             }
         ]
         if text_payload is None:
@@ -556,6 +598,8 @@ class ArtifactService:
                     "text": chunk_text,
                     "token_count": self._estimate_tokens(chunk_text),
                     "kind": "parsed" if attachment.content_text is not None else "extracted",
+                    "intimacy_boundary": attachment.intimacy_boundary.value,
+                    "intimacy_boundary_confidence": attachment.intimacy_boundary_confidence,
                 }
             )
         return chunks
@@ -643,6 +687,8 @@ class ArtifactService:
             "size_bytes": artifact.get("size_bytes"),
             "page_count": artifact.get("page_count"),
             "privacy_level": artifact.get("privacy_level", 0),
+            "intimacy_boundary": artifact.get("intimacy_boundary", "ordinary"),
+            "intimacy_boundary_confidence": artifact.get("intimacy_boundary_confidence", 0.0),
             "preserve_verbatim": artifact.get("preserve_verbatim", False),
             "skip_raw_by_default": artifact.get("skip_raw_by_default", True),
             "requires_explicit_request": artifact.get("requires_explicit_request", True),
@@ -652,3 +698,12 @@ class ArtifactService:
             "summary_text": artifact.get("summary_text"),
             "index_text": artifact.get("index_text"),
         }
+
+    @staticmethod
+    def _raw_text_is_prompt_gated(attachment: AttachmentInput) -> bool:
+        return bool(
+            attachment.skip_raw_by_default
+            or attachment.requires_explicit_request
+            or is_restricted_intimacy_boundary(attachment.intimacy_boundary)
+            or is_blocked_intimacy_boundary(attachment.intimacy_boundary)
+        )

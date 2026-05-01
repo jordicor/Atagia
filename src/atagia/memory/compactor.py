@@ -30,20 +30,26 @@ from atagia.core.repositories import (
 )
 from atagia.core.summary_repository import SummaryRepository
 from atagia.models.schemas_memory import (
+    IntimacyBoundary,
     MemoryObjectType,
     MemoryScope,
     MemoryStatus,
     SummaryViewKind,
 )
+from atagia.memory.intimacy_boundary_policy import (
+    strongest_intimacy_boundary,
+)
 from atagia.memory.summary_privacy_judge import (
     SummaryPrivacyJudge,
 )
+from atagia.services.embedding_payloads import build_embedding_upsert_payload
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
     LLMMessage,
     StructuredOutputError,
+    known_intimacy_context_metadata,
 )
 from atagia.services.model_resolution import resolve_component_model
 from atagia.services.privacy_filter_client import (
@@ -72,13 +78,20 @@ _DATA_ONLY_INSTRUCTION = (
 _ABSOLUTE_TIME_INSTRUCTION = (
     "Use absolute dates from source data in summary_text (ISO 8601 or plain calendar dates like "
     "'April 2026'). Do not use relative time references like 'last week', 'recently', or "
-    "'yesterday'. Use reference_time_utc only to reason about staleness of input material, "
-    "not to emit relative dates."
+    "'yesterday' or 'last night'. Use reference_time_utc only to reason about staleness of input material, "
+    "not to emit relative dates. Keep source dates separate from event dates: if a source "
+    "message was written on one date but says an event happened earlier or later, do not "
+    "write that the event happened on the source date. Resolve phrases like 'last night', "
+    "'yesterday', and 'last Friday' against the source message occurred_at when possible, "
+    "then say that the source message on that date reported the resolved event date or "
+    "previous/later period."
 )
 _PRIVACY_LEVEL_INSTRUCTION = (
     "When source items include privacy_level, treat higher values as more restricted. "
     "For privacy_level >= 2, do not include those details in summary_text and do not "
-    "include meta-notes about the restriction."
+    "include meta-notes about the restriction. When source items include a non-ordinary "
+    "intimacy_boundary, omit or generalize the intimate detail unless the summary is "
+    "conversation-local and required to preserve continuity."
 )
 
 
@@ -462,7 +475,9 @@ class Compactor:
                 summary_id = generate_prefixed_id("sum")
                 created_at = self._timestamp()
                 summary_text = episode.summary_text.strip()
-                source_privacy_max = self._max_privacy_level(source_rows)
+                source_intimacy_boundary = self._max_intimacy_boundary(source_rows)
+                source_intimacy_confidence = self._max_intimacy_confidence(source_rows)
+                source_privacy_max = self._privacy_with_intimacy_boundary(source_rows)
                 index_text = self._summary_index_text(
                     summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
                     summary_text=summary_text,
@@ -504,6 +519,8 @@ class Compactor:
                         "hierarchy_level": 0,
                         "summary_text": validated.summary_text,
                         "source_object_ids_json": source_object_ids,
+                        "intimacy_boundary": source_intimacy_boundary.value,
+                        "intimacy_boundary_confidence": source_intimacy_confidence,
                         "maya_score": SUMMARY_MAYA_SCORE,
                         "model": self._classifier_model,
                         "created_at": created_at,
@@ -529,6 +546,8 @@ class Compactor:
                     vitality=CONVERSATION_CHUNK_VITALITY,
                     maya_score=SUMMARY_MAYA_SCORE,
                     privacy_level=source_privacy_max,
+                    intimacy_boundary=source_intimacy_boundary,
+                    intimacy_boundary_confidence=source_intimacy_confidence,
                     payload=payload,
                     commit=False,
                 )
@@ -585,7 +604,9 @@ class Compactor:
                 summary_id = str(row["id"])
                 summary_text = str(row["summary_text"]).strip()
                 created_at = str(row["created_at"])
-                privacy_level = self._max_privacy_level(source_rows)
+                source_intimacy_boundary = self._max_intimacy_boundary(source_rows)
+                source_intimacy_confidence = self._max_intimacy_confidence(source_rows)
+                privacy_level = self._privacy_with_intimacy_boundary(source_rows)
                 source_messages = await self._message_rows_for_range(
                     user_id=user_id,
                     conversation_id=resolved_conversation_id,
@@ -603,6 +624,8 @@ class Compactor:
                     source_object_ids=source_object_ids,
                     source_message_ids=source_message_ids,
                     privacy_level=privacy_level,
+                    intimacy_boundary=source_intimacy_boundary,
+                    intimacy_boundary_confidence=source_intimacy_confidence,
                 ):
                     continue
                 await self._memory_repository.upsert_summary_mirror(
@@ -628,6 +651,8 @@ class Compactor:
                     vitality=CONVERSATION_CHUNK_VITALITY,
                     maya_score=float(row.get("maya_score", SUMMARY_MAYA_SCORE)),
                     privacy_level=privacy_level,
+                    intimacy_boundary=source_intimacy_boundary,
+                    intimacy_boundary_confidence=source_intimacy_confidence,
                     payload={
                         **self._summary_mirror_payload(
                             summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
@@ -669,7 +694,10 @@ class Compactor:
             chunk_rows=chunk_rows,
             chain_rows=chain_rows,
         )
-        source_privacy_max = self._max_privacy_level([*memory_rows, *chunk_rows])
+        source_rows_for_policy = [*memory_rows, *chunk_rows]
+        source_intimacy_boundary = self._max_intimacy_boundary(source_rows_for_policy)
+        source_intimacy_confidence = self._max_intimacy_confidence(source_rows_for_policy)
+        source_privacy_max = self._privacy_with_intimacy_boundary(source_rows_for_policy)
         gate_state = _PrivacyGateJobState()
         validated = await self._validate_summary_draft(
             user_id=user_id,
@@ -726,6 +754,8 @@ class Compactor:
                     "hierarchy_level": 0,
                     "summary_text": validated.summary_text,
                     "source_object_ids_json": cited_ids,
+                    "intimacy_boundary": source_intimacy_boundary.value,
+                    "intimacy_boundary_confidence": source_intimacy_confidence,
                     "maya_score": SUMMARY_MAYA_SCORE,
                     "model": self._scoring_model,
                     "created_at": created_at,
@@ -749,6 +779,8 @@ class Compactor:
                     workspace_id=workspace_id,
                     maya_score=SUMMARY_MAYA_SCORE,
                     privacy_level=source_privacy_max,
+                    intimacy_boundary=source_intimacy_boundary,
+                    intimacy_boundary_confidence=source_intimacy_confidence,
                     status=MemoryStatus.ARCHIVED,
                     payload={**validated.payload_updates, "audit_only_mirror": True},
                     commit=False,
@@ -798,7 +830,10 @@ class Compactor:
                 summary_id = generate_prefixed_id("sum")
                 created_at = self._timestamp()
                 normalized_summary_text = summary_text.strip()
-                source_privacy_max = self._max_privacy_level([*source_memory_rows, *source_chunks])
+                source_rows_for_policy = [*source_memory_rows, *source_chunks]
+                source_intimacy_boundary = self._max_intimacy_boundary(source_rows_for_policy)
+                source_intimacy_confidence = self._max_intimacy_confidence(source_rows_for_policy)
+                source_privacy_max = self._privacy_with_intimacy_boundary(source_rows_for_policy)
                 index_text = self._summary_index_text(
                     summary_kind=SummaryViewKind.EPISODE,
                     summary_text=normalized_summary_text,
@@ -838,6 +873,8 @@ class Compactor:
                         "hierarchy_level": 1,
                         "summary_text": validated.summary_text,
                         "source_object_ids_json": source_object_ids,
+                        "intimacy_boundary": source_intimacy_boundary.value,
+                        "intimacy_boundary_confidence": source_intimacy_confidence,
                         "maya_score": SUMMARY_MAYA_SCORE,
                         "model": self._scoring_model,
                         "created_at": created_at,
@@ -860,6 +897,8 @@ class Compactor:
                     vitality=0.15,
                     maya_score=SUMMARY_MAYA_SCORE,
                     privacy_level=source_privacy_max,
+                    intimacy_boundary=source_intimacy_boundary,
+                    intimacy_boundary_confidence=source_intimacy_confidence,
                     payload=payload,
                     commit=False,
                 )
@@ -914,7 +953,9 @@ class Compactor:
                 summary_id = generate_prefixed_id("sum")
                 created_at = self._timestamp()
                 summary_text = profile.summary_text.strip()
-                source_privacy_max = self._max_privacy_level(source_rows)
+                source_intimacy_boundary = self._max_intimacy_boundary(source_rows)
+                source_intimacy_confidence = self._max_intimacy_confidence(source_rows)
+                source_privacy_max = self._privacy_with_intimacy_boundary(source_rows)
                 index_text = self._summary_index_text(
                     summary_kind=SummaryViewKind.THEMATIC_PROFILE,
                     summary_text=summary_text,
@@ -950,6 +991,8 @@ class Compactor:
                         "hierarchy_level": 2,
                         "summary_text": validated.summary_text,
                         "source_object_ids_json": source_object_ids,
+                        "intimacy_boundary": source_intimacy_boundary.value,
+                        "intimacy_boundary_confidence": source_intimacy_confidence,
                         "maya_score": SUMMARY_MAYA_SCORE,
                         "model": self._scoring_model,
                         "created_at": created_at,
@@ -972,6 +1015,8 @@ class Compactor:
                     vitality=0.12,
                     maya_score=SUMMARY_MAYA_SCORE,
                     privacy_level=source_privacy_max,
+                    intimacy_boundary=source_intimacy_boundary,
+                    intimacy_boundary_confidence=source_intimacy_confidence,
                     payload=payload,
                     commit=False,
                 )
@@ -1069,6 +1114,10 @@ class Compactor:
                 "assistant_mode_id": None,
                 "purpose": "workspace_rollup_synthesis",
                 "workspace_id": workspace_id,
+                **self._intimacy_metadata_from_rows(
+                    [*memory_rows, *chunk_rows, *chain_rows],
+                    reason="summary_source_intimacy_boundary",
+                ),
             },
         )
         return await self._llm_client.complete_structured(request, _WorkspaceRollupResponse)
@@ -1108,6 +1157,10 @@ class Compactor:
                 "conversation_id": None,
                 "assistant_mode_id": None,
                 "purpose": "episode_synthesis",
+                **self._intimacy_metadata_from_rows(
+                    chunk_rows,
+                    reason="summary_source_intimacy_boundary",
+                ),
             },
         )
         response = await self._complete_structured_with_validation_retry(
@@ -1155,6 +1208,10 @@ class Compactor:
                 "conversation_id": None,
                 "assistant_mode_id": None,
                 "purpose": "thematic_profile_synthesis",
+                **self._intimacy_metadata_from_rows(
+                    [*belief_rows, *episode_rows],
+                    reason="summary_source_intimacy_boundary",
+                ),
             },
         )
         return await self._complete_structured_with_validation_retry(
@@ -1352,6 +1409,7 @@ class Compactor:
               AND workspace_id = ?
               AND status = ?
               AND privacy_level < 2
+              AND intimacy_boundary = ?
               AND object_type IN (?, ?, ?, ?, ?)
               AND scope IN ('workspace', 'conversation', 'ephemeral_session')
             ORDER BY updated_at DESC, id ASC
@@ -1361,6 +1419,7 @@ class Compactor:
                 user_id,
                 workspace_id,
                 MemoryStatus.ACTIVE.value,
+                IntimacyBoundary.ORDINARY.value,
                 MemoryObjectType.BELIEF.value,
                 MemoryObjectType.EVIDENCE.value,
                 MemoryObjectType.CONSEQUENCE_CHAIN.value,
@@ -1378,6 +1437,8 @@ class Compactor:
             WHERE user_id = ?
               AND object_type = ?
               AND status = ?
+              AND privacy_level < 2
+              AND intimacy_boundary = ?
             ORDER BY updated_at DESC, id ASC
             LIMIT ?
             """,
@@ -1385,6 +1446,7 @@ class Compactor:
                 user_id,
                 MemoryObjectType.BELIEF.value,
                 MemoryStatus.ACTIVE.value,
+                IntimacyBoundary.ORDINARY.value,
                 THEMATIC_PROFILE_BELIEF_LIMIT,
             ),
         )
@@ -1397,6 +1459,8 @@ class Compactor:
             WHERE user_id = ?
               AND object_type = ?
               AND status = ?
+              AND privacy_level < 2
+              AND intimacy_boundary = ?
               AND json_extract(payload_json, '$.summary_kind') = ?
               AND CAST(json_extract(payload_json, '$.hierarchy_level') AS INTEGER) = 1
             ORDER BY updated_at DESC, id ASC
@@ -1406,6 +1470,7 @@ class Compactor:
                 user_id,
                 MemoryObjectType.SUMMARY_VIEW.value,
                 MemoryStatus.ACTIVE.value,
+                IntimacyBoundary.ORDINARY.value,
                 SummaryViewKind.EPISODE.value,
                 THEMATIC_PROFILE_EPISODE_LIMIT,
             ),
@@ -1450,6 +1515,8 @@ class Compactor:
             row
             for row in enriched_rows
             if int(row.get("privacy_level") or 0) < 2
+            and str(row.get("intimacy_boundary") or IntimacyBoundary.ORDINARY.value)
+            == IntimacyBoundary.ORDINARY.value
         ]
 
     async def _conversation_chunks_with_temporal_payload(
@@ -1463,7 +1530,7 @@ class Compactor:
         placeholders = ", ".join("?" for _ in mirror_ids)
         mirror_rows = await self._memory_repository._fetch_all(  # noqa: SLF001
             """
-            SELECT id, privacy_level, payload_json
+            SELECT id, privacy_level, intimacy_boundary, intimacy_boundary_confidence, payload_json
             FROM memory_objects
             WHERE user_id = ?
               AND id IN ({placeholders})
@@ -1475,6 +1542,8 @@ class Compactor:
             payload_json = row.get("payload_json") or {}
             payload = dict(payload_json) if isinstance(payload_json, dict) else {}
             payload["privacy_level"] = row.get("privacy_level")
+            payload["intimacy_boundary"] = row.get("intimacy_boundary")
+            payload["intimacy_boundary_confidence"] = row.get("intimacy_boundary_confidence")
             payload_by_summary_id[str(row["id"]).removeprefix("sum_mem_")] = payload
         enriched_rows: list[dict[str, Any]] = []
         for chunk_row in chunk_rows:
@@ -1485,6 +1554,8 @@ class Compactor:
                 "source_message_window_end_occurred_at",
                 "source_message_ids",
                 "privacy_level",
+                "intimacy_boundary",
+                "intimacy_boundary_confidence",
             ):
                 if enriched_row.get(key) is None and payload.get(key) is not None:
                     enriched_row[key] = payload[key]
@@ -1506,6 +1577,11 @@ class Compactor:
             WHERE cc.user_id = ?
               AND cc.workspace_id = ?
               AND cc.status = 'active'
+              AND action.privacy_level < 2
+              AND action.intimacy_boundary = 'ordinary'
+              AND outcome.privacy_level < 2
+              AND outcome.intimacy_boundary = 'ordinary'
+              AND (tendency.id IS NULL OR (tendency.privacy_level < 2 AND tendency.intimacy_boundary = 'ordinary'))
             ORDER BY cc.confidence DESC, cc.updated_at DESC, cc.id ASC
             LIMIT ?
             """,
@@ -1826,6 +1902,44 @@ class Compactor:
         if not rows:
             return 0
         return max(int(row.get("privacy_level", 0)) for row in rows)
+
+    @staticmethod
+    def _max_intimacy_boundary(rows: list[dict[str, Any]]) -> IntimacyBoundary:
+        return strongest_intimacy_boundary(rows)
+
+    @staticmethod
+    def _max_intimacy_confidence(rows: list[dict[str, Any]]) -> float:
+        confidences: list[float] = []
+        for row in rows:
+            try:
+                confidences.append(float(row.get("intimacy_boundary_confidence", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                continue
+        return max(confidences, default=0.0)
+
+    @classmethod
+    def _privacy_with_intimacy_boundary(cls, rows: list[dict[str, Any]]) -> int:
+        privacy_level = cls._max_privacy_level(rows)
+        boundary = cls._max_intimacy_boundary(rows)
+        if boundary is not IntimacyBoundary.ORDINARY:
+            return max(privacy_level, 2)
+        return privacy_level
+
+    @classmethod
+    def _intimacy_metadata_from_rows(
+        cls,
+        rows: list[dict[str, Any]],
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        boundary = cls._max_intimacy_boundary(rows)
+        if boundary is IntimacyBoundary.ORDINARY:
+            return {}
+        return known_intimacy_context_metadata(
+            reason=reason,
+            boundary=boundary.value,
+            confidence=cls._max_intimacy_confidence(rows),
+        )
 
     async def _validate_summary_draft(
         self,
@@ -2155,6 +2269,7 @@ class Compactor:
             "hierarchy_level": hierarchy_level,
             "source_object_ids": cls._unique_strings(source_object_ids),
             "source_claim_signatures": claim_signatures,
+            "source_intimacy_boundary": strongest_intimacy_boundary(source_rows).value,
         }
         normalized_source_message_ids = cls._unique_strings(payload_source_message_ids)
         if normalized_source_message_ids:
@@ -2170,6 +2285,8 @@ class Compactor:
         source_object_ids: list[str],
         source_message_ids: list[str],
         privacy_level: int,
+        intimacy_boundary: IntimacyBoundary,
+        intimacy_boundary_confidence: float,
     ) -> bool:
         if existing_mirror is None:
             return False
@@ -2191,6 +2308,10 @@ class Compactor:
             )
             == cls._unique_strings(source_message_ids)
             and int(existing_mirror.get("privacy_level", 0)) == privacy_level
+            and str(existing_mirror.get("intimacy_boundary") or IntimacyBoundary.ORDINARY.value)
+            == intimacy_boundary.value
+            and float(existing_mirror.get("intimacy_boundary_confidence") or 0.0)
+            == float(intimacy_boundary_confidence)
         )
 
     @classmethod
@@ -2238,15 +2359,22 @@ class Compactor:
             if row is None:
                 continue
             try:
+                payload = build_embedding_upsert_payload(
+                    canonical_text=str(row["canonical_text"]),
+                    index_text=str(row["index_text"]) if row.get("index_text") is not None else None,
+                    privacy_level=int(row.get("privacy_level", 0)),
+                    intimacy_boundary=str(row.get("intimacy_boundary") or IntimacyBoundary.ORDINARY.value),
+                    preserve_verbatim=bool(int(row.get("preserve_verbatim", 0))),
+                )
                 await self._embedding_index.upsert(
                     memory_id=mirror_id,
-                    text=str(row["canonical_text"]),
+                    text=payload.text,
                     metadata={
                         "user_id": user_id,
                         "object_type": MemoryObjectType.SUMMARY_VIEW.value,
                         "scope": str(row["scope"]),
                         "created_at": str(row["created_at"]),
-                        "index_text": row.get("index_text"),
+                        "index_text": payload.index_text,
                     },
                 )
             except Exception:

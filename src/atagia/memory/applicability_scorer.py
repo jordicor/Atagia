@@ -13,6 +13,12 @@ from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.llm_output_limits import APPLICABILITY_SCORER_MAX_OUTPUT_TOKENS
 from atagia.memory.policy_manifest import ResolvedPolicy
+from atagia.memory.intimacy_boundary_policy import (
+    INTIMACY_FILTER_REASON,
+    candidate_allows_intimacy_boundary,
+    candidate_intimacy_boundary,
+    strongest_intimacy_boundary,
+)
 from atagia.models.schemas_memory import (
     DetectedNeed,
     ExtractionConversationContext,
@@ -27,6 +33,7 @@ from atagia.services.llm_client import (
     LLMCompletionRequest,
     LLMMessage,
     StructuredOutputError,
+    known_intimacy_context_metadata,
 )
 from atagia.services.model_resolution import resolve_component_model
 
@@ -287,6 +294,15 @@ class ApplicabilityScorer:
             return "policy_filtered_status"
         if int(candidate.get("privacy_level", 0)) > resolved_policy.privacy_ceiling:
             return "policy_filtered_privacy"
+        if not candidate_allows_intimacy_boundary(
+            candidate,
+            allow_intimacy_context=(
+                retrieval_plan.allow_intimacy_context
+                if retrieval_plan is not None
+                else resolved_policy.allow_intimacy_context
+            ),
+        ):
+            return INTIMACY_FILTER_REASON
         if (
             (retrieval_plan is None or retrieval_plan.temporal_query_range is None)
             and self._is_future_valid(candidate, self._clock.now())
@@ -373,6 +389,7 @@ class ApplicabilityScorer:
                 "conversation_id": conversation_context.conversation_id,
                 "assistant_mode_id": conversation_context.assistant_mode_id,
                 "purpose": "applicability_scoring",
+                **self._intimacy_metadata_for_candidates(candidates),
             },
         )
         try:
@@ -611,7 +628,7 @@ class ApplicabilityScorer:
         object_type = str(candidate.get("object_type"))
         if (
             object_type == MemoryObjectType.EVIDENCE.value
-            or bool(candidate.get("is_raw_message_window"))
+            or bool(candidate.get("is_verbatim_evidence_window"))
         ):
             return 0.15
         if object_type == MemoryObjectType.BELIEF.value:
@@ -753,4 +770,18 @@ class ApplicabilityScorer:
                 str(candidate.get("object_type")),
                 len(preferred_order),
             ),
+        )
+
+    @staticmethod
+    def _intimacy_metadata_for_candidates(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        boundaries = [
+            candidate_intimacy_boundary(candidate)
+            for candidate in candidates
+        ]
+        if not any(boundary.value != "ordinary" for boundary in boundaries):
+            return {}
+        strongest = strongest_intimacy_boundary(candidates)
+        return known_intimacy_context_metadata(
+            reason="candidate_intimacy_boundary",
+            boundary=strongest.value,
         )

@@ -61,9 +61,7 @@ def build_retrieval_fts_queries(
 
     content_tokens = _stable_token_union(content_tokens, normalized_must_keep_terms)
     if not content_tokens and not normalized_quoted_phrases:
-        raise ValueError(
-            f"Sub-query produced no searchable FTS tokens: {message_text!r}"
-        )
+        return []
 
     queries: list[str] = []
     seen_queries: set[str] = set()
@@ -107,9 +105,7 @@ def _build_default_fts_queries(
     original_text: str,
 ) -> list[str]:
     if not content_tokens:
-        raise ValueError(
-            f"Sub-query produced no searchable FTS tokens: {original_text!r}"
-        )
+        return []
 
     queries: list[str] = []
     if len(content_tokens) >= 4:
@@ -223,6 +219,7 @@ class RetrievalPlanner:
             query_intelligence.sub_queries,
             query_intelligence.sparse_query_hints,
         )
+        no_searchable_tokens = not sub_query_plans
         plan = RetrievalPlan(
             original_query=original_query,
             assistant_mode_id=conversation_context.assistant_mode_id,
@@ -239,12 +236,13 @@ class RetrievalPlanner:
             vector_limit=resolved_policy.retrieval_params.vector_limit,
             max_context_items=resolved_policy.retrieval_params.final_context_items,
             privacy_ceiling=resolved_policy.privacy_ceiling,
+            allow_intimacy_context=resolved_policy.allow_intimacy_context,
             retrieval_levels=list(query_intelligence.retrieval_levels),
             temporal_query_range=query_intelligence.temporal_range,
             consequence_search_enabled=False,
             require_evidence_regrounding=False,
             need_driven_boosts={},
-            skip_retrieval=cold_start,
+            skip_retrieval=cold_start or no_searchable_tokens,
             exact_recall_mode=bool(query_intelligence.exact_recall_needed),
             exact_facets=list(query_intelligence.exact_facets),
         )
@@ -293,6 +291,7 @@ class RetrievalPlanner:
                 plan.vector_limit = resolved_policy.retrieval_params.vector_limit
                 plan.max_context_items = resolved_policy.retrieval_params.final_context_items
                 plan.privacy_ceiling = resolved_policy.privacy_ceiling
+                plan.allow_intimacy_context = resolved_policy.allow_intimacy_context
                 plan.consequence_search_enabled = False
                 plan.require_evidence_regrounding = False
             elif need.need_type is NeedTrigger.FRUSTRATION:
@@ -335,7 +334,7 @@ class RetrievalPlanner:
                 must_keep_terms=must_keep_terms,
             )
             if not fts_queries:
-                raise ValueError(f"Sub-query did not produce any FTS rewrites: {sub_query!r}")
+                continue
             sub_query_plans.append(
                 PlannedSubQuery(
                     text=sub_query,

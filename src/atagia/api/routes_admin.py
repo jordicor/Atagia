@@ -704,6 +704,7 @@ async def export_conversation(
             conversation_id,
             payload.user_id,
             include_retrieval_traces=payload.include_retrieval_traces,
+            include_intimacy_context=payload.include_intimacy_context,
             anonymization_mode=payload.anonymization_mode,
         )
         await AdminAuditRepository(connection, clock).create_audit_entry(
@@ -714,6 +715,7 @@ async def export_conversation(
             metadata={
                 "user_id": payload.user_id,
                 "anonymization_mode": payload.anonymization_mode.value,
+                "include_intimacy_context": payload.include_intimacy_context,
             },
         )
         return result

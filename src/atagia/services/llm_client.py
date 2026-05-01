@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Generic, TypeVar
 
@@ -19,10 +20,12 @@ from atagia.services.model_profiles import MODEL_PROFILES
 from atagia.services.model_resolution import (
     ModelResolutionError,
     ParsedModelSpec,
+    component_id_for_llm_purpose,
     parse_model_spec,
 )
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 _STRICT_JSON_FALLBACK_INSTRUCTION = (
     "Return exactly one raw JSON object or array. Start with { or [. "
@@ -32,8 +35,30 @@ _STRICT_JSON_FALLBACK_INSTRUCTION = (
 )
 
 
+def known_intimacy_context_metadata(
+    *,
+    reason: str,
+    boundary: str | None = None,
+    confidence: float | None = None,
+) -> dict[str, Any]:
+    """Return sanitized metadata for already-known intimate analytical context."""
+    metadata: dict[str, Any] = {
+        "atagia_intimacy_context": True,
+        "atagia_intimacy_context_reason": reason,
+    }
+    if boundary is not None:
+        metadata["source_intimacy_boundary"] = boundary
+    if confidence is not None:
+        metadata["source_intimacy_boundary_confidence"] = float(confidence)
+    return metadata
+
+
 class LLMError(RuntimeError):
     """Base LLM client error."""
+
+
+class LLMPolicyBlockedError(LLMError):
+    """Raised when a provider refuses or blocks a request for policy reasons."""
 
 
 class ConfigurationError(LLMError):
@@ -180,6 +205,14 @@ class LLMProvider:
         yield LLMStreamEvent(type="done", payload={"usage": response.usage})
 
 
+class _PreOutputStreamError(RuntimeError):
+    """Internal wrapper for stream errors raised before any output was emitted."""
+
+    def __init__(self, original: LLMError) -> None:
+        super().__init__(str(original))
+        self.original = original
+
+
 class LLMClient(Generic[T]):
     """Registry-based LLM client with retry helpers."""
 
@@ -187,21 +220,19 @@ class LLMClient(Generic[T]):
         self,
         provider_name: str | None = None,
         providers: list[LLMProvider] | None = None,
-        embedding_provider_name: str | None = None,
         retry_policy: RetryPolicy | None = None,
         allow_unqualified_single_provider_models: bool = False,
+        intimacy_fallback_models: dict[str, str] | None = None,
+        intimacy_proactive_routing_enabled: bool = False,
     ) -> None:
         self._provider_name = provider_name.strip().lower() if provider_name is not None else None
-        self._embedding_provider_name = (
-            embedding_provider_name.strip().lower()
-            if embedding_provider_name is not None
-            else None
-        )
         self._providers = {
             provider.name.strip().lower(): provider for provider in (providers or [])
         }
         self._retry_policy = retry_policy or RetryPolicy()
         self._allow_unqualified_single_provider_models = allow_unqualified_single_provider_models
+        self._intimacy_fallback_models = dict(intimacy_fallback_models or {})
+        self._intimacy_proactive_routing_enabled = intimacy_proactive_routing_enabled
 
     def register_provider(self, provider: LLMProvider) -> None:
         self._providers[provider.name.strip().lower()] = provider
@@ -211,16 +242,8 @@ class LLMClient(Generic[T]):
         return self._provider_name
 
     @property
-    def embedding_provider_name(self) -> str | None:
-        return self._embedding_provider_name or self._provider_name
-
-    @property
     def provider(self) -> LLMProvider:
         return self._provider()
-
-    @property
-    def embedding_provider(self) -> LLMProvider:
-        return self._provider(self.embedding_provider_name)
 
     def _provider(self, provider_name: str | None = None) -> LLMProvider:
         resolved_name = provider_name or self._provider_name
@@ -237,7 +260,22 @@ class LLMClient(Generic[T]):
         normalized_request = request.model_copy(
             update={"max_output_tokens": apply_min_output_threshold(request.max_output_tokens)}
         )
-        provider, provider_request = self._completion_provider_request(normalized_request)
+        proactive_request = self._proactive_intimacy_request(normalized_request)
+        if proactive_request is not None:
+            return await self._complete_once(proactive_request)
+        try:
+            return await self._complete_once(normalized_request)
+        except LLMError as exc:
+            fallback_request = self._intimacy_fallback_request(normalized_request, exc)
+            if fallback_request is None:
+                raise
+            return await self._complete_once(fallback_request)
+
+    async def _complete_once(
+        self,
+        request: LLMCompletionRequest,
+    ) -> LLMCompletionResponse:
+        provider, provider_request = self._completion_provider_request(request)
         return await self._with_retries(lambda: provider.complete(provider_request))
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -247,7 +285,7 @@ class LLMClient(Generic[T]):
     def supports_embedding_dimensions(self, model_spec: str) -> bool:
         """Return whether the provider for an embedding model supports dimensions."""
         if self._provider_name is not None:
-            return self.embedding_provider.supports_embedding_dimensions
+            return self.provider.supports_embedding_dimensions
         parsed = self._parse_model_spec(model_spec, allow_thinking=False)
         return self._provider(parsed.provider_name).supports_embedding_dimensions
 
@@ -255,9 +293,29 @@ class LLMClient(Generic[T]):
         normalized_request = request.model_copy(
             update={"max_output_tokens": apply_min_output_threshold(request.max_output_tokens)}
         )
-        provider, provider_request = self._completion_provider_request(normalized_request)
+        proactive_request = self._proactive_intimacy_request(normalized_request)
+        if proactive_request is not None:
+            async for event in self._stream_once(proactive_request):
+                yield event
+            return
+        try:
+            async for event in self._stream_once(normalized_request):
+                yield event
+            return
+        except _PreOutputStreamError as exc:
+            fallback_request = self._intimacy_fallback_request(normalized_request, exc.original)
+            if fallback_request is None:
+                raise exc.original from exc
+            async for event in self._stream_once(fallback_request):
+                yield event
+
+    async def _stream_once(
+        self,
+        request: LLMCompletionRequest,
+    ) -> AsyncIterator[LLMStreamEvent]:
+        provider, provider_request = self._completion_provider_request(request)
         delay = self._retry_policy.base_delay_seconds
-        last_error: Exception | None = None
+        last_error: LLMError | None = None
         for attempt in range(1, self._retry_policy.attempts + 1):
             emitted_any = False
             try:
@@ -273,9 +331,278 @@ class LLMClient(Generic[T]):
                     break
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self._retry_policy.max_delay_seconds)
+            except LLMError as exc:
+                if emitted_any:
+                    raise
+                raise _PreOutputStreamError(exc) from exc
         if last_error is None:
             raise LLMError("LLM stream failed without a captured error")
-        raise last_error
+        raise _PreOutputStreamError(last_error)
+
+    async def complete_streamed(
+        self,
+        request: LLMCompletionRequest,
+        *,
+        observer: Any | None = None,
+    ) -> LLMCompletionResponse:
+        normalized_request = request.model_copy(
+            update={"max_output_tokens": apply_min_output_threshold(request.max_output_tokens)}
+        )
+        proactive_request = self._proactive_intimacy_request(normalized_request)
+        if proactive_request is not None:
+            return await self._complete_streamed_once(proactive_request, observer=observer)
+        try:
+            return await self._complete_streamed_once(normalized_request, observer=observer)
+        except _PreOutputStreamError as exc:
+            fallback_request = self._intimacy_fallback_request(normalized_request, exc.original)
+            if fallback_request is None:
+                raise exc.original from exc
+            return await self._complete_streamed_once(fallback_request, observer=observer)
+
+    async def _complete_streamed_once(
+        self,
+        request: LLMCompletionRequest,
+        *,
+        observer: Any | None = None,
+    ) -> LLMCompletionResponse:
+        provider, provider_request = self._completion_provider_request(request)
+        delay = self._retry_policy.base_delay_seconds
+        last_error: LLMError | None = None
+        for attempt in range(1, self._retry_policy.attempts + 1):
+            emitted_any = False
+            output_text = ""
+            thinking = ""
+            tool_calls: list[dict[str, Any]] = []
+            usage: dict[str, Any] = {}
+            stream_iterator = provider.stream(provider_request)
+            try:
+                async for event in stream_iterator:
+                    emitted_any = True
+                    if event.type == "text" and event.content:
+                        output_text += event.content
+                        if observer is not None:
+                            await observer.on_text(event.content, output_text, provider_request)
+                    elif event.type == "thinking" and event.content:
+                        thinking += event.content
+                    elif event.type == "tool_call":
+                        tool_calls.append(dict(event.payload))
+                    elif event.type == "done":
+                        event_usage = event.payload.get("usage")
+                        if isinstance(event_usage, dict):
+                            usage = event_usage
+                return LLMCompletionResponse(
+                    provider=provider.name,
+                    model=str(
+                        provider_request.metadata.get("atagia_model_spec")
+                        or provider_request.model
+                    ),
+                    output_text=output_text,
+                    thinking=thinking or None,
+                    tool_calls=tool_calls,
+                    usage=usage,
+                )
+            except TransientLLMError as exc:
+                await self._close_stream_iterator(stream_iterator)
+                if emitted_any:
+                    raise
+                last_error = exc
+                if attempt == self._retry_policy.attempts:
+                    break
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._retry_policy.max_delay_seconds)
+            except LLMError as exc:
+                await self._close_stream_iterator(stream_iterator)
+                if emitted_any:
+                    raise
+                raise _PreOutputStreamError(exc) from exc
+            except BaseException:
+                await self._close_stream_iterator(stream_iterator)
+                raise
+        if last_error is None:
+            raise LLMError("LLM streamed completion failed without a captured error")
+        raise _PreOutputStreamError(last_error)
+
+    def _intimacy_fallback_request(
+        self,
+        request: LLMCompletionRequest,
+        exc: LLMError,
+    ) -> LLMCompletionRequest | None:
+        if not self._is_policy_blocked_error(exc):
+            return None
+        if bool(request.metadata.get("atagia_intimacy_fallback_used")):
+            return None
+        if bool(request.metadata.get("atagia_intimacy_proactive_route")):
+            return None
+
+        fallback_model = self._resolve_intimacy_fallback_model(request)
+        if fallback_model is None:
+            return None
+        if fallback_model == request.model:
+            return None
+
+        component_id = self._component_id_for_request(request)
+        logger.warning(
+            "Retrying LLM request with intimacy fallback model "
+            "component_id=%s purpose=%s primary_model=%s fallback_model=%s error_class=%s",
+            component_id or "<unknown>",
+            request.metadata.get("purpose") or "<unset>",
+            request.model,
+            fallback_model,
+            exc.__class__.__name__,
+        )
+        metadata = copy.deepcopy(request.metadata)
+        metadata.update(
+            {
+                "atagia_intimacy_fallback_used": True,
+                "atagia_intimacy_primary_model": request.model,
+                "atagia_intimacy_primary_error_class": exc.__class__.__name__,
+                "atagia_intimacy_primary_error_reason": self._safe_error_label(exc),
+            }
+        )
+        if component_id is not None:
+            metadata.setdefault("atagia_component_id", component_id)
+        return request.model_copy(
+            update={
+                "model": fallback_model,
+                "metadata": metadata,
+            }
+        )
+
+    def _proactive_intimacy_request(
+        self,
+        request: LLMCompletionRequest,
+    ) -> LLMCompletionRequest | None:
+        if not self._intimacy_proactive_routing_enabled:
+            return None
+        if bool(request.metadata.get("atagia_intimacy_fallback_used")):
+            return None
+        if bool(request.metadata.get("atagia_intimacy_proactive_route")):
+            return None
+        if not self._metadata_indicates_known_intimacy(request.metadata):
+            return None
+
+        fallback_model = self._resolve_intimacy_fallback_model(request)
+        if fallback_model is None or fallback_model == request.model:
+            return None
+
+        component_id = self._component_id_for_request(request)
+        logger.info(
+            "Routing LLM request directly to intimacy model "
+            "component_id=%s purpose=%s primary_model=%s intimacy_model=%s",
+            component_id or "<unknown>",
+            request.metadata.get("purpose") or "<unset>",
+            request.model,
+            fallback_model,
+        )
+        metadata = copy.deepcopy(request.metadata)
+        metadata.update(
+            {
+                "atagia_intimacy_proactive_route": True,
+                "atagia_intimacy_primary_model": request.model,
+            }
+        )
+        if component_id is not None:
+            metadata.setdefault("atagia_component_id", component_id)
+        return request.model_copy(
+            update={
+                "model": fallback_model,
+                "metadata": metadata,
+            }
+        )
+
+    def _resolve_intimacy_fallback_model(
+        self,
+        request: LLMCompletionRequest,
+    ) -> str | None:
+        explicit = request.metadata.get("atagia_intimacy_fallback_model")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        component_id = self._component_id_for_request(request)
+        if component_id is None:
+            return None
+        return self._intimacy_fallback_models.get(component_id)
+
+    @staticmethod
+    def _component_id_for_request(request: LLMCompletionRequest) -> str | None:
+        component_id = request.metadata.get("atagia_component_id")
+        if isinstance(component_id, str) and component_id.strip():
+            return component_id.strip()
+        purpose = request.metadata.get("purpose")
+        return component_id_for_llm_purpose(purpose if isinstance(purpose, str) else None)
+
+    @classmethod
+    def _metadata_indicates_known_intimacy(cls, metadata: dict[str, Any]) -> bool:
+        for key in (
+            "atagia_intimacy_context",
+            "atagia_known_intimacy_context",
+        ):
+            if cls._truthy(metadata.get(key)):
+                return True
+        for key in (
+            "intimacy_boundary",
+            "source_intimacy_boundary",
+            "candidate_intimacy_boundary",
+        ):
+            if cls._nonordinary_intimacy_boundary(metadata.get(key)):
+                return True
+        boundaries = metadata.get("intimacy_boundaries")
+        if isinstance(boundaries, list):
+            return any(cls._nonordinary_intimacy_boundary(value) for value in boundaries)
+        return False
+
+    @staticmethod
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return False
+
+    @staticmethod
+    def _nonordinary_intimacy_boundary(value: Any) -> bool:
+        if value is None:
+            return False
+        raw_value = getattr(value, "value", value)
+        normalized = str(raw_value).strip().lower()
+        return normalized not in {"", "ordinary", "none", "null"}
+
+    @staticmethod
+    def _is_policy_blocked_error(exc: LLMError) -> bool:
+        if isinstance(exc, LLMPolicyBlockedError):
+            return True
+        if isinstance(exc, (OutputLimitExceededError, StructuredOutputError, TransientLLMError)):
+            return False
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "blocked the response",
+                "blocked the prompt",
+                "content_filter",
+                "finish_reason=safety",
+                "finish_reason=refusal",
+                "prompt:prohibited_content",
+                "response:safety",
+                "response:refusal",
+                "stop_reason=refusal",
+                "policy_refusal",
+                "safety block",
+            )
+        )
+
+    @staticmethod
+    def _safe_error_label(exc: LLMError) -> str:
+        message = str(exc).lower()
+        for marker in (
+            "content_filter",
+            "refusal",
+            "prohibited_content",
+            "safety",
+            "blocked",
+        ):
+            if marker in message:
+                return marker
+        return "policy_blocked"
 
     def _completion_provider_request(
         self,
@@ -430,27 +757,38 @@ class LLMClient(Generic[T]):
                     }
                 )
             )
-        try:
-            payload = self._decode_json_payload(response.output_text)
-        except StructuredJSONDecodeError as exc:
-            if used_schema_fallback:
-                raise StructuredOutputError(
-                    "Provider returned non-JSON structured output after schema fallback",
-                    details=exc.details,
-                ) from exc
-            raise StructuredOutputError(
-                "Provider returned non-JSON structured output",
-                details=exc.details,
-            ) from exc
+        return self._validate_structured_response(response, schema, used_schema_fallback)
 
-        adapter = TypeAdapter(schema)
+    async def complete_structured_streamed(
+        self,
+        request: LLMCompletionRequest,
+        schema: type[T],
+        *,
+        observer: Any | None = None,
+    ) -> T:
+        used_schema_fallback = False
         try:
-            return adapter.validate_python(payload)
-        except Exception as exc:
-            raise StructuredOutputError(
-                "Provider returned invalid structured output",
-                details=self._structured_error_details(exc),
-            ) from exc
+            response = await self.complete_streamed(request, observer=observer)
+        except LLMError as exc:
+            if not self._should_retry_without_schema(exc, request):
+                raise
+            used_schema_fallback = True
+            response = await self.complete_streamed(
+                request.model_copy(
+                    update={
+                        "response_schema": None,
+                        "messages": [
+                            *request.messages,
+                            LLMMessage(
+                                role="user",
+                                content=_STRICT_JSON_FALLBACK_INSTRUCTION,
+                            ),
+                        ],
+                    }
+                ),
+                observer=observer,
+            )
+        return self._validate_structured_response(response, schema, used_schema_fallback)
 
     async def _with_retries(self, operation: Any) -> Any:
         delay = self._retry_policy.base_delay_seconds
@@ -482,6 +820,43 @@ class LLMClient(Generic[T]):
     @staticmethod
     def _decode_json_payload(output_text: str) -> Any:
         return decode_structured_json_payload(output_text).data
+
+    @staticmethod
+    async def _close_stream_iterator(stream_iterator: Any) -> None:
+        aclose = getattr(stream_iterator, "aclose", None)
+        if not callable(aclose):
+            return
+        result = aclose()
+        if hasattr(result, "__await__"):
+            await result
+
+    def _validate_structured_response(
+        self,
+        response: LLMCompletionResponse,
+        schema: type[T],
+        used_schema_fallback: bool,
+    ) -> T:
+        try:
+            payload = self._decode_json_payload(response.output_text)
+        except StructuredJSONDecodeError as exc:
+            if used_schema_fallback:
+                raise StructuredOutputError(
+                    "Provider returned non-JSON structured output after schema fallback",
+                    details=exc.details,
+                ) from exc
+            raise StructuredOutputError(
+                "Provider returned non-JSON structured output",
+                details=exc.details,
+            ) from exc
+
+        adapter = TypeAdapter(schema)
+        try:
+            return adapter.validate_python(payload)
+        except Exception as exc:
+            raise StructuredOutputError(
+                "Provider returned invalid structured output",
+                details=self._structured_error_details(exc),
+            ) from exc
 
     @classmethod
     def _structured_error_details(cls, exc: Exception) -> tuple[str, ...]:

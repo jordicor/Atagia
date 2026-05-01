@@ -19,6 +19,7 @@ from atagia.core.retrieval_event_repository import AdminAuditRepository, Retriev
 from atagia.memory.inspector import MemoryInspector
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import (
+    IntimacyBoundary,
     MemoryObjectType,
     MemoryScope,
     MemorySourceKind,
@@ -57,7 +58,9 @@ async def _build_runtime():
         canonical_text="User prefers patch-style fixes.",
         source_kind=MemorySourceKind.INFERRED,
         confidence=0.9,
-        privacy_level=0,
+        privacy_level=2,
+        intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+        intimacy_boundary_confidence=0.86,
         status=MemoryStatus.ACTIVE,
         memory_id="mem_belief",
     )
@@ -180,6 +183,7 @@ async def test_inspect_memory_returns_full_object_and_logs_audit() -> None:
 
         assert memory is not None
         assert memory["canonical_text"] == "User prefers patch-style fixes."
+        assert memory["intimacy_boundary"] == "romantic_private"
         audit_rows = await audits.list_entries("adm_1")
         assert audit_rows[-1]["target_type"] == "memory_object"
         assert audit_rows[-1]["target_id"] == "mem_belief"
@@ -213,6 +217,7 @@ async def test_inspect_user_memories_filters_by_type_scope_and_status() -> None:
             object_type="belief",
             scope="conversation",
             status="active",
+            intimacy_boundary="romantic_private",
             limit=10,
         )
 
@@ -254,6 +259,7 @@ async def test_inspect_belief_history_returns_all_versions_and_logs_audit() -> N
         )
 
         assert [item["version"] for item in history] == [1, 2]
+        assert {item["parent_intimacy_boundary"] for item in history} == {"romantic_private"}
         audit_rows = await audits.list_entries("adm_1")
         assert audit_rows[-1]["target_type"] == "belief_history"
         assert audit_rows[-1]["target_id"] == "mem_belief"

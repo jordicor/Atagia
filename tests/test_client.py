@@ -154,16 +154,10 @@ def _settings(tmp_path: Path, *, workers_enabled: bool = False) -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="client-test-model",
-        llm_scoring_model="client-score-model",
-        llm_classifier_model="client-classifier-model",
         llm_chat_model="client-reply-model",
         llm_forced_global_model="openai/client-reply-model",
         service_mode=True,
@@ -185,8 +179,8 @@ async def test_connect_atagia_local_sidecar_round_trip(
     client = await connect_atagia(
         transport="local",
         db_path=":memory:",
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
     )
     try:
         assert isinstance(client, LocalAtagiaClient)

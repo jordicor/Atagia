@@ -1,7 +1,7 @@
 {
   "assistant_mode_id": "personal_assistant",
   "display_name": "Personal Assistant",
-  "prompt_hash": "07ec7f4d9f3429160ef0925ba667dcfa98de25a2bd5c4d1e46554fe092f5ce45",
+  "prompt_hash": "0bc620edc35152d4630b1eb48be125001b3e87ec584e270c3265921c6ff85a3f",
   "cross_chat_allowed": true,
   "allowed_scopes": [
     "assistant_mode",

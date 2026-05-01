@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+import inspect
 import json
 from typing import Any
 
@@ -24,6 +25,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMEmbeddingVector,
     LLMError,
+    LLMPolicyBlockedError,
     LLMProvider,
     LLMStreamEvent,
     OutputLimitExceededError,
@@ -121,7 +123,7 @@ def _finish_reason_error(
             f"(finish_reason={finish_reason})"
         )
     if finish_reason in _BLOCKED_FINISH_REASONS:
-        return LLMError(
+        return LLMPolicyBlockedError(
             f"{provider_name} blocked the response (finish_reason={finish_reason})"
         )
     if finish_reason in _TRANSIENT_FINISH_REASONS:
@@ -143,6 +145,17 @@ def _empty_content_error(
     return TransientLLMError(
         f"{provider_name} returned no output content (finish_reason={label})"
     )
+
+
+async def _close_provider_stream(stream: Any) -> None:
+    for attr in ("aclose", "close"):
+        close = getattr(stream, attr, None)
+        if not callable(close):
+            continue
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+        return
 
 
 def _openai_messages(request: LLMCompletionRequest) -> list[dict[str, Any]]:
@@ -477,6 +490,8 @@ class OpenAICompatibleProvider(LLMProvider):
             raise LLMError(str(exc)) from exc
         except APIError as exc:
             raise LLMError(str(exc)) from exc
+        finally:
+            await _close_provider_stream(stream)
 
         if pending_error is None:
             for index in sorted(tool_buffers):

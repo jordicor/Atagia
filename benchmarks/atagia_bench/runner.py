@@ -29,6 +29,7 @@ from benchmarks.atagia_bench.adapter import (
 from benchmarks.atagia_bench.graders import GradeResult, resolve_grader
 from benchmarks.custody_summary import summarize_retrieval_custody
 from benchmarks.json_artifacts import write_json_atomic
+from benchmarks.llm_config import provider_api_key_kwargs
 from benchmarks.migration_metadata import benchmark_migration_metadata
 from benchmarks.numeric_summary import summarize_numeric_values
 from benchmarks.retrieval_custody import build_retrieval_custody
@@ -217,9 +218,8 @@ class AtagiaBenchRunner:
             async with Atagia(
                 db_path=db_path,
                 manifests_dir=self._manifests_dir,
-                llm_provider=self._llm_provider,
-                llm_api_key=self._llm_api_key,
-                llm_model=self._llm_model,
+                llm_forced_global_model=self._llm_model,
+                **provider_api_key_kwargs(self._llm_provider, self._llm_api_key),
                 embedding_backend=self._embedding_backend,
                 embedding_model=self._embedding_model,
                 skip_belief_revision=ablation.skip_belief_revision if ablation else False,

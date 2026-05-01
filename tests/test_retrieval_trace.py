@@ -69,7 +69,7 @@ class TestCandidateSearchTrace:
         assert trace.fts_candidates_count == 0
         assert trace.embedding_candidates_count == 0
         assert trace.consequence_candidates_count == 0
-        assert trace.raw_message_candidates_count == 0
+        assert trace.verbatim_evidence_search_candidates_count == 0
         assert trace.entity_candidates_count == 0
         assert trace.total_before_fusion == 0
         assert trace.total_after_fusion == 0
@@ -80,7 +80,7 @@ class TestCandidateSearchTrace:
             fts_candidates_count=10,
             embedding_candidates_count=5,
             consequence_candidates_count=2,
-            raw_message_candidates_count=0,
+            verbatim_evidence_search_candidates_count=0,
             entity_candidates_count=0,
             total_before_fusion=17,
             total_after_fusion=12,
@@ -543,7 +543,7 @@ class TestTraceBuilders:
                     "fts": 1,
                     "embedding": None,
                     "consequence": None,
-                    "raw_message": None,
+                    "verbatim_evidence_search": None,
                 },
                 "matched_sub_queries": ["alpha query"],
             },
@@ -553,23 +553,23 @@ class TestTraceBuilders:
                     "fts": None,
                     "embedding": None,
                     "consequence": None,
-                    "raw_message": 1,
+                    "verbatim_evidence_search": 1,
                 },
                 "matched_sub_queries": ["alpha query"],
-                "is_raw_message_window": True,
+                "is_verbatim_evidence_window": True,
             },
             # Raw window that entered via the marker only — channel rank is None
-            # but is_raw_message_window is True. The fallback must still count it.
+            # but is_verbatim_evidence_window is True. The fallback must still count it.
             {
                 "id": "rmw_marker_only",
                 "channel_ranks": {
                     "fts": None,
                     "embedding": None,
                     "consequence": None,
-                    "raw_message": None,
+                    "verbatim_evidence_search": None,
                 },
                 "matched_sub_queries": ["alpha query"],
-                "is_raw_message_window": True,
+                "is_verbatim_evidence_window": True,
             },
         ]
 
@@ -578,11 +578,11 @@ class TestTraceBuilders:
         )
 
         assert trace.fts_candidates_count == 1
-        assert trace.raw_message_candidates_count == 2
+        assert trace.verbatim_evidence_search_candidates_count == 2
         assert trace.embedding_candidates_count == 0
         assert trace.consequence_candidates_count == 0
         assert trace.per_subquery_counts[0].fts == 1
-        assert trace.per_subquery_counts[0].raw_message == 2
+        assert trace.per_subquery_counts[0].verbatim_evidence_search == 2
         assert trace.per_subquery_counts[0].embedding == 0
 
     def test_build_candidate_search_trace_zero_channel_stays_zero(self) -> None:
@@ -609,7 +609,7 @@ class TestTraceBuilders:
                     "fts": 1,
                     "embedding": None,
                     "consequence": None,
-                    "raw_message": None,
+                    "verbatim_evidence_search": None,
                 },
                 "matched_sub_queries": ["alpha query"],
             },
@@ -619,7 +619,7 @@ class TestTraceBuilders:
                     "fts": None,
                     "embedding": None,
                     "consequence": 1,
-                    "raw_message": None,
+                    "verbatim_evidence_search": None,
                 },
                 "matched_sub_queries": [],
             },
@@ -630,9 +630,9 @@ class TestTraceBuilders:
         )
 
         assert trace.embedding_candidates_count == 0
-        assert trace.raw_message_candidates_count == 0
+        assert trace.verbatim_evidence_search_candidates_count == 0
         assert trace.per_subquery_counts[0].embedding == 0
-        assert trace.per_subquery_counts[0].raw_message == 0
+        assert trace.per_subquery_counts[0].verbatim_evidence_search == 0
 
     def test_build_scoring_trace_with_candidates(self) -> None:
         from atagia.services.retrieval_pipeline import RetrievalPipeline

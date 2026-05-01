@@ -12,7 +12,10 @@ from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.memory.need_detector import NeedDetector
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
-from atagia.models.schemas_memory import ExtractionContextMessage, ExtractionConversationContext
+from atagia.models.schemas_memory import (
+    ExtractionContextMessage,
+    ExtractionConversationContext,
+)
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -58,7 +61,9 @@ def _context() -> ExtractionConversationContext:
         workspace_id="wrk_1",
         assistant_mode_id="coding_debug",
         recent_messages=[
-            ExtractionContextMessage(role="assistant", content="I suggested checking websocket middleware."),
+            ExtractionContextMessage(
+                role="assistant", content="I suggested checking websocket middleware."
+            ),
             ExtractionContextMessage(role="user", content="That still did not fix it."),
         ],
     )
@@ -75,16 +80,10 @@ def _settings() -> Settings:
         manifests_path="./manifests",
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="anthropic",
-        llm_api_key=None,
         openai_api_key=None,
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-model",
-        llm_scoring_model="score-model",
-        llm_classifier_model="classify-model",
         llm_chat_model=None,
         service_mode=False,
         service_api_key=None,
@@ -136,7 +135,9 @@ async def test_need_detector_detects_allowed_need_and_uses_resolved_model() -> N
 
     assert [need.need_type.value for need in detected.needs] == ["ambiguity"]
     assert detected.sub_queries == ["fix websocket timeout"]
-    assert provider.requests[0].model == "openrouter/google/gemini-3.1-flash-lite-preview"
+    assert (
+        provider.requests[0].model == "openrouter/google/gemini-3.1-flash-lite-preview"
+    )
     assert "reference_time_iso" in provider.requests[0].messages[1].content
 
 
@@ -257,6 +258,10 @@ async def test_need_detector_prompt_contains_anti_injection_markers() -> None:
     assert "For `slot_fill`, preserve the concrete entity" in prompt
     assert "For `callback_bias=true`, preserve the explicit remembered anchor" in prompt
     assert "For `broad_list`, preserve distinct requested facets" in prompt
+    assert "expected answer may require aggregating multiple concrete" in prompt
+    assert "framed as a `where`, `how`, or `which` question" in prompt
+    assert "places, locations, methods, strategies" in prompt
+    assert "Prefer `broad_list` over `default`" in prompt
     assert "broad-list or multi-facet" in prompt
     assert "For takeaway, stance, symbolism, or theme questions" in prompt
 

@@ -28,6 +28,7 @@ from atagia.services.llm_client import (
     LLMCompletionRequest,
     LLMMessage,
     StructuredOutputError,
+    known_intimacy_context_metadata,
 )
 from atagia.services.model_resolution import resolve_component_model
 
@@ -176,6 +177,13 @@ class ContractProjector:
                 "conversation_id": context.conversation_id,
                 "assistant_mode_id": context.assistant_mode_id,
                 "purpose": "contract_projection",
+                **(
+                    known_intimacy_context_metadata(
+                        reason="resolved_policy_allows_intimacy_context"
+                    )
+                    if resolved_policy.allow_intimacy_context
+                    else {}
+                ),
             },
         )
         result = await self._complete_projection_with_validation_retry(request)

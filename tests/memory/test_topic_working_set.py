@@ -226,3 +226,138 @@ async def test_topic_updater_parks_existing_topic_from_model_plan() -> None:
         assert [event["event_type"] for event in events] == ["created", "parked", "source_linked"]
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_topic_updater_uses_placeholders_for_raw_policy_restricted_messages() -> None:
+    payload = {"actions": [], "nothing_to_update": True}
+    connection, _clock, messages, _topics, updater, provider = await _build_runtime([payload])
+    try:
+        message = await messages.create_message(
+            "msg_restricted",
+            "cnv_1",
+            "user",
+            1,
+            "SECRET RAW ATTACHMENT TEXT",
+            500,
+            {
+                "context_placeholder": "[Skipped attachment]",
+            },
+        )
+        message["include_raw"] = False
+        message["skip_by_default"] = True
+        message["context_placeholder"] = "[Skipped attachment]"
+        message["content_kind"] = "attachment"
+        message["policy_reason"] = "heavy_content"
+
+        await updater.update_from_messages(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            messages=[message],
+        )
+
+        prompt = provider.requests[0].messages[1].content
+        assert "SECRET RAW ATTACHMENT TEXT" not in prompt
+        assert "[Skipped attachment]" in prompt
+        assert '"raw_text_included": false' in prompt
+        assert '"policy_reason": "heavy_content"' in prompt
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_topic_updater_ignores_cross_conversation_topic_actions() -> None:
+    payload = {
+        "actions": [
+            {
+                "action": "update",
+                "topic_id": "tpc_other_conv",
+                "summary": "This should not be applied across conversations.",
+                "source_message_ids": ["msg_3"],
+            }
+        ],
+        "nothing_to_update": False,
+    }
+    connection, clock, messages, topics, updater, _provider = await _build_runtime([payload])
+    try:
+        conversations = ConversationRepository(connection, clock)
+        await conversations.create_conversation("cnv_other", "usr_1", None, "coding_debug", "Other")
+        await topics.create_topic(
+            topic_id="tpc_other_conv",
+            user_id="usr_1",
+            conversation_id="cnv_other",
+            title="Other conversation topic",
+            summary="Original summary.",
+        )
+        message = await messages.create_message(
+            "msg_3",
+            "cnv_1",
+            "user",
+            1,
+            "Please update the current topic only.",
+            8,
+            {},
+        )
+
+        changed = await updater.update_from_messages(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            messages=[message],
+        )
+        other_topic = await topics.get_topic("tpc_other_conv", "usr_1")
+        snapshot = await topics.get_topic_snapshot(user_id="usr_1", conversation_id="cnv_1")
+
+        assert changed == []
+        assert other_topic is not None
+        assert other_topic["summary"] == "Original summary."
+        assert snapshot["freshness"]["last_processed_seq"] == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_topic_updater_records_progress_when_batch_only_closes_topic() -> None:
+    payload = {
+        "actions": [
+            {
+                "action": "close",
+                "topic_id": "tpc_existing",
+                "summary": "Closed after the user finished the thread.",
+                "source_message_ids": ["msg_4"],
+            }
+        ],
+        "nothing_to_update": False,
+    }
+    connection, _clock, messages, topics, updater, _provider = await _build_runtime([payload])
+    try:
+        await topics.create_topic(
+            topic_id="tpc_existing",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            title="Current thread",
+            summary="Open work.",
+        )
+        message = await messages.create_message(
+            "msg_4",
+            "cnv_1",
+            "assistant",
+            1,
+            "Done, that thread is closed.",
+            8,
+            {},
+        )
+
+        changed = await updater.update_from_messages(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            messages=[message],
+        )
+        snapshot = await topics.get_topic_snapshot(user_id="usr_1", conversation_id="cnv_1")
+
+        assert changed[0]["status"] == "closed"
+        assert snapshot["active_topics"] == []
+        assert snapshot["parked_topics"] == []
+        assert snapshot["freshness"]["last_processed_seq"] == 1
+        assert snapshot["freshness"]["lag_message_count"] == 0
+    finally:
+        await connection.close()

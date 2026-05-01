@@ -40,16 +40,10 @@ def _settings(tmp_path: Path) -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="test-model",
-        llm_scoring_model="test-model",
-        llm_classifier_model="test-model",
         llm_chat_model="openai/test-model",
         llm_ingest_model="openai/test-model",
         llm_retrieval_model="openai/test-model",
@@ -110,6 +104,8 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
                 "canonical_text": "alpha beta gamma",
                 "index_text": "alpha beta gamma",
                 "privacy_level": 0,
+                "intimacy_boundary": "romantic_private",
+                "intimacy_boundary_confidence": 0.7,
                 "reason": "test pin",
                 "created_by": "usr_1",
             },
@@ -118,6 +114,8 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
         assert created.status_code == 200
         pin_id = created.json()["id"]
         assert created.json()["status"] == "active"
+        assert created.json()["privacy_level"] == 2
+        assert created.json()["intimacy_boundary"] == "romantic_private"
 
         forbidden = client.post(
             "/v1/verbatim-pins",

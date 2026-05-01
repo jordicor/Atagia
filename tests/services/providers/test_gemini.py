@@ -19,6 +19,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingVector,
     LLMError,
     LLMMessage,
+    LLMPolicyBlockedError,
     LLMProvider,
     LLMToolSpec,
     OutputLimitExceededError,
@@ -35,6 +36,7 @@ class FakeAsyncStream:
     def __init__(self, chunks, error: Exception | None = None) -> None:
         self._chunks = chunks
         self._error = error
+        self.closed = False
 
     def __aiter__(self):
         return self._iterator()
@@ -44,6 +46,9 @@ class FakeAsyncStream:
             yield chunk
         if self._error is not None:
             raise self._error
+
+    async def aclose(self):
+        self.closed = True
 
 
 class FakeGeminiModels:
@@ -637,18 +642,11 @@ async def test_build_llm_client_registers_gemini_and_uses_gemini_embeddings(
         manifests_path="./manifests",
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="gemini",
-        llm_api_key=None,
         openai_api_key=None,
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="https://atagia.org",
         openrouter_app_name="Atagia",
-        llm_extraction_model=None,
-        llm_scoring_model=None,
-        llm_classifier_model=None,
         llm_chat_model=None,
-        embedding_provider_name=None,
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,
@@ -667,7 +665,6 @@ async def test_build_llm_client_registers_gemini_and_uses_gemini_embeddings(
 
     assert captured["api_key"] == "google-key"
     assert client.provider_name is None
-    assert client.embedding_provider_name is None
     assert embedding.provider == "gemini"
 
 
@@ -743,6 +740,41 @@ async def test_gemini_stream_emits_done_before_propagating_error() -> None:
     assert "stream broke" in str(raised)
 
 
+@pytest.mark.asyncio
+async def test_gemini_stream_raises_policy_blocked_error_for_safety_block() -> None:
+    stream = FakeAsyncStream(
+        [
+            _response(
+                parts=[],
+                finish_reason="SAFETY",
+            )
+        ]
+    )
+    models = FakeGeminiModels(stream_response=stream)
+    provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
+
+    iterator = provider.stream(_request()).__aiter__()
+    done = await iterator.__anext__()
+
+    assert done.type == "done"
+    with pytest.raises(LLMPolicyBlockedError, match=r"response:SAFETY"):
+        await iterator.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_gemini_stream_closes_underlying_stream_on_cancel() -> None:
+    stream = FakeAsyncStream([_response(parts=[_part(text="partial")])])
+    models = FakeGeminiModels(stream_response=stream)
+    provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
+
+    iterator = provider.stream(_request()).__aiter__()
+    first = await anext(iterator)
+    await iterator.aclose()
+
+    assert first.type == "text"
+    assert stream.closed is True
+
+
 def test_build_llm_client_requires_gemini_credentials() -> None:
     settings = Settings(
         sqlite_path=":memory:",
@@ -750,18 +782,11 @@ def test_build_llm_client_requires_gemini_credentials() -> None:
         manifests_path="./manifests",
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="gemini",
-        llm_api_key=None,
         openai_api_key=None,
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="https://atagia.org",
         openrouter_app_name="Atagia",
-        llm_extraction_model=None,
-        llm_scoring_model=None,
-        llm_classifier_model=None,
         llm_chat_model=None,
-        embedding_provider_name=None,
         service_mode=False,
         service_api_key=None,
         admin_api_key=None,

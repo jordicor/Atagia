@@ -14,7 +14,12 @@ from atagia.core.llm_output_limits import CONTEXT_STALENESS_MAX_OUTPUT_TOKENS
 from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.models.schemas_cache import ContextCacheEntry
 from atagia.models.schemas_memory import AssistantModeId, OperationalProfileSnapshot
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMMessage,
+    known_intimacy_context_metadata,
+)
 from atagia.services.model_resolution import resolve_component_model
 
 MESSAGE_PENALTY_PER_MESSAGE = 0.1
@@ -156,6 +161,13 @@ class ContextStalenessSignalDetector:
                 "conversation_id": request.conversation_id,
                 "assistant_mode_id": resolved_policy.assistant_mode_id.value,
                 "purpose": "context_cache_signal_detection",
+                **(
+                    known_intimacy_context_metadata(
+                        reason="resolved_policy_allows_intimacy_context"
+                    )
+                    if resolved_policy.allow_intimacy_context
+                    else {}
+                ),
             },
         )
         return await self._llm_client.complete_structured(llm_request, _StalenessSignals)

@@ -20,6 +20,7 @@ from atagia.memory.candidate_search import CandidateSearch
 from atagia.memory.candidate_diversity import early_diversity_select
 from atagia.memory.context_composer import ContextComposer
 from atagia.memory.contract_projection import ContractProjector
+from atagia.memory.intimacy_boundary_policy import candidate_allows_intimacy_boundary
 from atagia.memory.need_detector import NeedDetector
 from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.memory.retrieval_diagnostics import build_retrieval_sufficiency_diagnostic
@@ -50,6 +51,12 @@ from atagia.services.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 PROFILE_TOP_N: Final[int] = 5
+SOURCE_MESSAGE_FETCH_LIMIT: Final[int] = 80
+COVERAGE_SOURCE_MESSAGE_LIMIT: Final[int] = 8
+COVERAGE_CANDIDATES_PER_SOURCE_MESSAGE: Final[int] = 3
+COVERAGE_CANDIDATE_LIMIT: Final[int] = 12
+COVERAGE_INHERITED_SCORE_CAP: Final[float] = 0.70
+COVERAGE_INHERITED_SCORE_FLOOR: Final[float] = 0.05
 
 
 def _default_query_intelligence(message_text: str) -> QueryIntelligenceResult:
@@ -201,6 +208,7 @@ class RetrievalPipeline:
                     workspace_id=base_plan.workspace_id,
                     conversation_id=base_plan.conversation_id,
                     privacy_ceiling=base_plan.privacy_ceiling,
+                    allow_intimacy_context=base_plan.allow_intimacy_context,
                     limit=PROFILE_TOP_N,
                 )
                 query_intelligence = await self._measure_stage(
@@ -287,6 +295,16 @@ class RetrievalPipeline:
 
         retrieval_plan = enriched_plan or base_plan
         raw_candidates = self._merge_candidates(base_candidates, enriched_candidates)
+        coverage_candidates = await self._measure_stage(
+            stage_timings,
+            "coverage_candidate_expansion",
+            self._source_message_coverage_candidates(
+                raw_candidates=raw_candidates,
+                conversation_context=conversation_context,
+                retrieval_plan=retrieval_plan,
+            ),
+        )
+        raw_candidates = self._merge_candidates(raw_candidates, coverage_candidates)
         # Regrounding is decided by the winning plan (enriched when available)
         # so the base search does not inject derived memories when high-stakes
         # needs require direct evidence.
@@ -308,7 +326,7 @@ class RetrievalPipeline:
         )
         candidate_total_ms = stage_timings.get("base_candidate_search", 0.0) + stage_timings.get(
             "enriched_candidate_search", 0.0
-        )
+        ) + stage_timings.get("coverage_candidate_expansion", 0.0)
         stage_timings["candidate_search"] = candidate_total_ms
         if trace is not None:
             trace.candidate_search = self._build_candidate_search_trace(
@@ -410,6 +428,7 @@ class RetrievalPipeline:
                 assistant_mode_id=conversation_context.assistant_mode_id,
                 workspace_id=conversation_context.workspace_id,
                 conversation_id=conversation_context.conversation_id,
+                allow_intimacy_context=effective_policy.allow_intimacy_context,
             ),
         )
 
@@ -435,6 +454,7 @@ class RetrievalPipeline:
             stage_timings,
             "context_composition",
             self._compose_context(
+                user_id=conversation_context.user_id,
                 message_text=message_text,
                 retrieval_plan=retrieval_plan,
                 scored_candidates=scored_candidates,
@@ -509,6 +529,7 @@ class RetrievalPipeline:
             conversation_id=conversation_context.conversation_id,
             assistant_mode_id=conversation_context.assistant_mode_id,
             privacy_ceiling=resolved_policy.privacy_ceiling,
+            allow_intimacy_context=resolved_policy.allow_intimacy_context,
         )
         message_chars = await self._message_repository.sum_text_length_for_context(
             conversation_context.user_id,
@@ -582,6 +603,7 @@ class RetrievalPipeline:
                     workspace_id=base_plan.workspace_id,
                     conversation_id=base_plan.conversation_id,
                     privacy_ceiling=base_plan.privacy_ceiling,
+                    allow_intimacy_context=base_plan.allow_intimacy_context,
                     limit=PROFILE_TOP_N,
                 )
                 query_intelligence = await self._measure_stage(
@@ -662,6 +684,7 @@ class RetrievalPipeline:
                 conversation_id=conversation_context.conversation_id,
                 assistant_mode_id=conversation_context.assistant_mode_id,
                 privacy_ceiling=resolved_policy.privacy_ceiling,
+                allow_intimacy_context=resolved_policy.allow_intimacy_context,
             ),
         )
         if retrieval_plan.exact_recall_mode or retrieval_plan.raw_context_access_mode in {"verbatim", "artifact"}:
@@ -780,6 +803,7 @@ class RetrievalPipeline:
                 assistant_mode_id=conversation_context.assistant_mode_id,
                 workspace_id=conversation_context.workspace_id,
                 conversation_id=conversation_context.conversation_id,
+                allow_intimacy_context=resolved_policy.allow_intimacy_context,
             ),
         )
 
@@ -799,6 +823,7 @@ class RetrievalPipeline:
             stage_timings,
             "context_composition",
             self._compose_context(
+                user_id=conversation_context.user_id,
                 message_text=message_text,
                 retrieval_plan=retrieval_plan,
                 scored_candidates=scored_candidates,
@@ -984,6 +1009,212 @@ class RetrievalPipeline:
             if candidate_score > existing_score:
                 merged[memory_id] = candidate
         return [merged[memory_id] for memory_id in order]
+
+    async def _source_message_coverage_candidates(
+        self,
+        *,
+        raw_candidates: list[dict[str, Any]],
+        conversation_context: ExtractionConversationContext,
+        retrieval_plan: RetrievalPlan,
+    ) -> list[dict[str, Any]]:
+        """Pull bounded sibling memories from source messages already retrieved."""
+        if not self._should_expand_source_message_coverage(retrieval_plan, raw_candidates):
+            return []
+
+        existing_ids = {str(candidate.get("id") or "") for candidate in raw_candidates}
+        source_messages = self._coverage_source_messages(raw_candidates)
+        if not source_messages:
+            return []
+
+        expanded: list[dict[str, Any]] = []
+        expanded_ids: set[str] = set()
+        for source_message_id, source_metadata in source_messages[:COVERAGE_SOURCE_MESSAGE_LIMIT]:
+            rows = await self._memory_repository.list_for_source_message(
+                user_id=conversation_context.user_id,
+                source_message_id=source_message_id,
+                statuses=tuple(retrieval_plan.status_filter),
+            )
+            per_message_count = 0
+            for row in rows:
+                memory_id = str(row.get("id") or "")
+                if memory_id in existing_ids or memory_id in expanded_ids:
+                    continue
+                if not self._candidate_matches_retrieval_plan(row, retrieval_plan):
+                    continue
+                expanded.append(
+                    self._annotate_source_message_coverage_candidate(
+                        row,
+                        source_message_id=source_message_id,
+                        source_metadata=source_metadata,
+                    )
+                )
+                expanded_ids.add(memory_id)
+                per_message_count += 1
+                if (
+                    per_message_count >= COVERAGE_CANDIDATES_PER_SOURCE_MESSAGE
+                    or len(expanded) >= COVERAGE_CANDIDATE_LIMIT
+                ):
+                    break
+            if len(expanded) >= COVERAGE_CANDIDATE_LIMIT:
+                break
+        return expanded
+
+    @staticmethod
+    def _should_expand_source_message_coverage(
+        retrieval_plan: RetrievalPlan,
+        raw_candidates: list[dict[str, Any]],
+    ) -> bool:
+        if not raw_candidates:
+            return False
+        return (
+            retrieval_plan.query_type == "broad_list"
+            or retrieval_plan.exact_recall_mode
+            or retrieval_plan.raw_context_access_mode == "artifact"
+        )
+
+    @classmethod
+    def _coverage_source_messages(
+        cls,
+        raw_candidates: list[dict[str, Any]],
+    ) -> list[tuple[str, dict[str, Any]]]:
+        by_message_id: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for candidate in raw_candidates:
+            message_ids = cls._raw_candidate_source_message_ids(candidate)
+            if not message_ids:
+                continue
+            candidate_score = cls._normalized_retrieval_score(candidate.get("rrf_score"))
+            matched_sub_queries = [
+                str(item)
+                for item in candidate.get("matched_sub_queries", [])
+                if str(item).strip()
+            ]
+            for message_id in message_ids:
+                metadata = by_message_id.get(message_id)
+                if metadata is None:
+                    metadata = {
+                        "rrf_score": candidate_score,
+                        "matched_sub_queries": list(matched_sub_queries),
+                    }
+                    by_message_id[message_id] = metadata
+                    order.append(message_id)
+                    continue
+                if candidate_score > float(metadata.get("rrf_score") or 0.0):
+                    metadata["rrf_score"] = candidate_score
+                existing_queries = set(metadata.get("matched_sub_queries") or [])
+                for sub_query in matched_sub_queries:
+                    if sub_query in existing_queries:
+                        continue
+                    metadata["matched_sub_queries"].append(sub_query)
+                    existing_queries.add(sub_query)
+        return [(message_id, by_message_id[message_id]) for message_id in order]
+
+    @staticmethod
+    def _raw_candidate_source_message_ids(candidate: dict[str, Any]) -> list[str]:
+        raw_ids = candidate.get("verbatim_evidence_window_message_ids")
+        if not raw_ids:
+            payload = candidate.get("payload_json") or {}
+            if isinstance(payload, dict):
+                raw_ids = payload.get("source_message_ids")
+        if not raw_ids and candidate.get("message_id"):
+            raw_ids = [candidate.get("message_id")]
+        if not isinstance(raw_ids, list):
+            return []
+        return [
+            str(message_id).strip()
+            for message_id in raw_ids
+            if str(message_id).strip()
+        ]
+
+    @classmethod
+    def _annotate_source_message_coverage_candidate(
+        cls,
+        candidate: dict[str, Any],
+        *,
+        source_message_id: str,
+        source_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        annotated = dict(candidate)
+        source_score = cls._normalized_retrieval_score(source_metadata.get("rrf_score"))
+        inherited_score = min(
+            COVERAGE_INHERITED_SCORE_CAP,
+            max(COVERAGE_INHERITED_SCORE_FLOOR, source_score * 0.8),
+        )
+        annotated["rrf_score"] = max(
+            cls._normalized_retrieval_score(annotated.get("rrf_score")),
+            inherited_score,
+        )
+        annotated.setdefault("channel_ranks", {})
+        annotated["coverage_source_message_id"] = source_message_id
+        annotated["matched_sub_queries"] = list(source_metadata.get("matched_sub_queries") or [])
+        retrieval_sources = list(annotated.get("retrieval_sources") or [])
+        if "source_neighbor" not in retrieval_sources:
+            retrieval_sources.append("source_neighbor")
+        annotated["retrieval_sources"] = retrieval_sources
+        annotated["retrieval_source"] = "+".join(retrieval_sources)
+        return annotated
+
+    @staticmethod
+    def _candidate_matches_retrieval_plan(candidate: dict[str, Any], plan: RetrievalPlan) -> bool:
+        if int(candidate.get("privacy_level", 0)) > plan.privacy_ceiling:
+            return False
+        if not candidate_allows_intimacy_boundary(
+            candidate,
+            allow_intimacy_context=plan.allow_intimacy_context,
+        ):
+            return False
+        if candidate.get("status") not in {status.value for status in plan.status_filter}:
+            return False
+        if not RetrievalPipeline._candidate_matches_retrieval_levels(candidate, plan):
+            return False
+        return RetrievalPipeline._candidate_matches_scope(candidate, plan)
+
+    @staticmethod
+    def _candidate_matches_retrieval_levels(candidate: dict[str, Any], plan: RetrievalPlan) -> bool:
+        if candidate.get("object_type") != MemoryObjectType.SUMMARY_VIEW.value:
+            return 0 in plan.retrieval_levels
+        payload_json = candidate.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            return False
+        hierarchy_level = int(payload_json.get("hierarchy_level", -1))
+        summary_kind = str(payload_json.get("summary_kind", "")).strip()
+        if hierarchy_level == 0:
+            return 0 in plan.retrieval_levels and summary_kind == SummaryViewKind.CONVERSATION_CHUNK.value
+        if hierarchy_level == 1:
+            return 1 in plan.retrieval_levels and summary_kind == SummaryViewKind.EPISODE.value
+        if hierarchy_level == 2:
+            return 2 in plan.retrieval_levels and summary_kind == SummaryViewKind.THEMATIC_PROFILE.value
+        return False
+
+    @staticmethod
+    def _candidate_matches_scope(candidate: dict[str, Any], plan: RetrievalPlan) -> bool:
+        scope = str(candidate.get("scope", ""))
+        if scope == MemoryScope.GLOBAL_USER.value:
+            return MemoryScope.GLOBAL_USER in plan.scope_filter
+        if scope == MemoryScope.ASSISTANT_MODE.value:
+            return (
+                MemoryScope.ASSISTANT_MODE in plan.scope_filter
+                and candidate.get("assistant_mode_id") == plan.assistant_mode_id
+            )
+        if scope == MemoryScope.WORKSPACE.value:
+            return (
+                MemoryScope.WORKSPACE in plan.scope_filter
+                and candidate.get("assistant_mode_id") == plan.assistant_mode_id
+                and candidate.get("workspace_id") == plan.workspace_id
+            )
+        if scope == MemoryScope.CONVERSATION.value:
+            return (
+                MemoryScope.CONVERSATION in plan.scope_filter
+                and candidate.get("assistant_mode_id") == plan.assistant_mode_id
+                and candidate.get("conversation_id") == plan.conversation_id
+            )
+        if scope == MemoryScope.EPHEMERAL_SESSION.value:
+            return (
+                MemoryScope.EPHEMERAL_SESSION in plan.scope_filter
+                and candidate.get("assistant_mode_id") == plan.assistant_mode_id
+                and candidate.get("conversation_id") == plan.conversation_id
+            )
+        return False
 
     async def _build_plan(
         self,
@@ -1299,7 +1530,7 @@ class RetrievalPipeline:
                 "fts": None,
                 "embedding": None,
                 "consequence": None,
-                "raw_message": None,
+                "verbatim_evidence_search": None,
             },
         )
         annotated.setdefault("matched_sub_queries", [])
@@ -1345,6 +1576,7 @@ class RetrievalPipeline:
     async def _compose_context(
         self,
         *,
+        user_id: str,
         message_text: str,
         retrieval_plan: RetrievalPlan,
         scored_candidates: list[ScoredCandidate],
@@ -1355,18 +1587,75 @@ class RetrievalPipeline:
         conversation_messages: list[dict[str, Any]],
         composer_strategy: str | None = None,
     ) -> ComposedContext:
+        source_messages = conversation_messages
+        if retrieval_plan.exact_recall_mode or retrieval_plan.query_type in {"temporal", "slot_fill", "broad_list"}:
+            source_messages = await self._source_messages_for_candidates(
+                user_id=user_id,
+                scored_candidates=scored_candidates,
+                existing_messages=conversation_messages,
+            )
         return self._context_composer.compose(
             scored_candidates=scored_candidates,
             current_contract=current_contract,
             workspace_rollup=workspace_rollup,
             user_state=user_state,
             resolved_policy=resolved_policy,
-            conversation_messages=conversation_messages,
+            conversation_messages=source_messages,
             query_text=message_text,
             query_type=retrieval_plan.query_type,
             exact_recall_mode=retrieval_plan.exact_recall_mode,
             composer_strategy=composer_strategy,
         )
+
+    async def _source_messages_for_candidates(
+        self,
+        *,
+        user_id: str,
+        scored_candidates: list[ScoredCandidate],
+        existing_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        messages_by_id = {
+            str(message.get("id")): message
+            for message in existing_messages
+            if str(message.get("id") or "").strip()
+        }
+        missing_ids: list[str] = []
+        seen = set(messages_by_id)
+        for candidate in scored_candidates:
+            for message_id in self._candidate_source_message_ids(candidate):
+                if message_id in seen:
+                    continue
+                seen.add(message_id)
+                missing_ids.append(message_id)
+                if len(missing_ids) >= SOURCE_MESSAGE_FETCH_LIMIT:
+                    break
+            if len(missing_ids) >= SOURCE_MESSAGE_FETCH_LIMIT:
+                break
+
+        fetched_messages: list[dict[str, Any]] = []
+        for message_id in missing_ids:
+            message = await self._message_repository.get_message(message_id, user_id)
+            if message is not None:
+                fetched_messages.append(message)
+        return [*existing_messages, *fetched_messages]
+
+    @staticmethod
+    def _candidate_source_message_ids(candidate: ScoredCandidate) -> list[str]:
+        payload_json = candidate.memory_object.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            return []
+        raw_ids = payload_json.get("source_message_ids") or []
+        if not isinstance(raw_ids, list):
+            return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_id in raw_ids:
+            message_id = str(raw_id).strip()
+            if not message_id or message_id in seen:
+                continue
+            seen.add(message_id)
+            normalized.append(message_id)
+        return normalized
 
     def _override_policy(
         self,
@@ -1418,7 +1707,7 @@ class RetrievalPipeline:
         artifact_chunk_count = 0
         embedding_count = 0
         consequence_count = 0
-        raw_message_count = 0
+        verbatim_evidence_search_count = 0
         for candidate in raw_candidates:
             channel_ranks = candidate.get("channel_ranks") or {}
             if channel_ranks.get("verbatim_pin") is not None or candidate.get("is_verbatim_pin"):
@@ -1432,12 +1721,12 @@ class RetrievalPipeline:
             if channel_ranks.get("consequence") is not None:
                 consequence_count += 1
             if (
-                channel_ranks.get("raw_message") is not None
-                or candidate.get("is_raw_message_window")
+                channel_ranks.get("verbatim_evidence_search") is not None
+                or candidate.get("is_verbatim_evidence_window")
             ):
-                raw_message_count += 1
+                verbatim_evidence_search_count += 1
         total_before_fusion = (
-            fts_count + artifact_chunk_count + embedding_count + consequence_count + raw_message_count
+            fts_count + artifact_chunk_count + embedding_count + consequence_count + verbatim_evidence_search_count
         )
         per_subquery_counts: list[SubQuerySearchCount] = []
         for sub_query in retrieval_plan.sub_query_plans:
@@ -1459,8 +1748,8 @@ class RetrievalPipeline:
                     if channel_ranks.get("embedding") is not None:
                         sub_emb += 1
                     if (
-                        channel_ranks.get("raw_message") is not None
-                        or candidate.get("is_raw_message_window")
+                        channel_ranks.get("verbatim_evidence_search") is not None
+                        or candidate.get("is_verbatim_evidence_window")
                     ):
                         sub_raw += 1
             per_subquery_counts.append(SubQuerySearchCount(
@@ -1469,7 +1758,7 @@ class RetrievalPipeline:
                 artifact_chunk=sub_artifact,
                 fts=sub_fts,
                 embedding=sub_emb,
-                raw_message=sub_raw,
+                verbatim_evidence_search=sub_raw,
             ))
         return CandidateSearchTrace(
             fts_candidates_count=fts_count,
@@ -1477,7 +1766,7 @@ class RetrievalPipeline:
             artifact_chunk_candidates_count=artifact_chunk_count,
             embedding_candidates_count=embedding_count,
             consequence_candidates_count=consequence_count,
-            raw_message_candidates_count=raw_message_count,
+            verbatim_evidence_search_candidates_count=verbatim_evidence_search_count,
             entity_candidates_count=0,
             total_before_fusion=total_before_fusion,
             total_after_fusion=len(raw_candidates),

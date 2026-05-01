@@ -96,8 +96,11 @@ def _candidate_channels(
         channels.append("verbatim_pin")
     if raw_candidate.get("is_artifact_chunk") and "artifact_chunk" not in channels:
         channels.append("artifact_chunk")
-    if raw_candidate.get("is_raw_message_window") and "raw_message" not in channels:
-        channels.append("raw_message")
+    if (
+        raw_candidate.get("is_verbatim_evidence_window")
+        and "verbatim_evidence_search" not in channels
+    ):
+        channels.append("verbatim_evidence_search")
     return channels
 
 
@@ -106,8 +109,8 @@ def _candidate_kind(candidate: dict[str, Any]) -> str:
         return "verbatim_pin"
     if candidate.get("is_artifact_chunk"):
         return "artifact_chunk"
-    if candidate.get("is_raw_message_window"):
-        return "raw_message_window"
+    if candidate.get("is_verbatim_evidence_window"):
+        return "verbatim_evidence_search_window"
     return str(candidate.get("object_type") or candidate.get("candidate_kind") or "memory_object")
 
 

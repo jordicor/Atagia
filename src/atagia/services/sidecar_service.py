@@ -13,6 +13,7 @@ from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
 )
+from atagia.core.topic_repository import TopicRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
 from atagia.memory.lifecycle_runner import piggyback_lifecycle
@@ -22,9 +23,14 @@ from atagia.services.artifact_service import ArtifactService
 from atagia.services.chat_support import (
     DEFAULT_ASSISTANT_MODE_ID,
     RECENT_FETCH_LIMIT,
+    build_recent_transcript_guidance,
+    build_recent_transcript_window,
     build_message_jobs,
     build_system_prompt,
     enqueue_message_jobs,
+    render_assistant_guidance_block,
+    render_recent_transcript_json_block,
+    render_topic_working_set_block,
     resolve_operational_profile,
     resolve_policy,
 )
@@ -102,6 +108,11 @@ class SidecarService:
                     operational_signals=operational_signals,
                     ablation=ablation,
                 )
+                topic_snapshot = await self._topic_snapshot(
+                    connection,
+                    user_id=user_id,
+                    conversation_id=str(conversation["id"]),
+                )
                 await connection.execute("BEGIN")
                 try:
                     resolved_user_occurred_at = (
@@ -162,6 +173,42 @@ class SidecarService:
                     name="atagia-lifecycle-piggyback",
                 )
 
+        recent_transcript_entries = []
+        recent_transcript_omissions = []
+        recent_transcript_trace = None
+        recent_transcript_block = ""
+        assistant_guidance = []
+        assistant_guidance_block = ""
+        if not self.runtime.settings.benchmark_disable_raw_recent_transcript:
+            recent_transcript_budget_tokens = (
+                self.runtime.settings.effective_recent_transcript_budget_tokens(
+                    resolution.resolved_policy.transcript_budget_tokens,
+                    hard_cap_tokens=(
+                        resolution.resolved_operational_profile.policy_override.transcript_budget_tokens
+                    ),
+                )
+            )
+            recent_transcript = build_recent_transcript_window(
+                prior_messages,
+                recent_transcript_budget_tokens,
+                overage_ratio=self.runtime.settings.recent_transcript_overage_ratio,
+                raw_context_access_mode=str(
+                    resolution.source_retrieval_plan.get("raw_context_access_mode", "normal")
+                ),
+            )
+            recent_transcript_entries = recent_transcript.entries
+            recent_transcript_omissions = recent_transcript.omissions
+            recent_transcript_trace = recent_transcript.trace
+            recent_transcript_block = render_recent_transcript_json_block(
+                recent_transcript_entries,
+            )
+            assistant_guidance = build_recent_transcript_guidance(
+                recent_transcript_omissions,
+                enabled=self.runtime.settings.assistant_guidance_enabled,
+            )
+            assistant_guidance_block = render_assistant_guidance_block(
+                assistant_guidance,
+            )
         return ContextResult(
             system_prompt=build_system_prompt(
                 str(conversation["assistant_mode_id"]),
@@ -170,7 +217,22 @@ class SidecarService:
                 resolution.composed_context.workspace_block,
                 resolution.composed_context.memory_block,
                 resolution.composed_context.state_block,
+                topic_context_block=render_topic_working_set_block(
+                    topic_snapshot,
+                    allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
+                ),
+                recent_transcript_block=recent_transcript_block,
+                assistant_guidance_block=assistant_guidance_block,
             ),
+            topic_working_set=topic_snapshot,
+            topic_working_set_block=render_topic_working_set_block(
+                topic_snapshot,
+                allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
+            ),
+            recent_transcript=recent_transcript_entries,
+            recent_transcript_omissions=recent_transcript_omissions,
+            recent_transcript_trace=recent_transcript_trace,
+            assistant_guidance=assistant_guidance,
             memories=resolution.memory_summaries,
             contract=resolution.current_contract,
             detected_needs=resolution.detected_needs,
@@ -444,4 +506,20 @@ class SidecarService:
         await enqueue_message_jobs(
             storage_backend=self.runtime.storage_backend,
             jobs=jobs,
+        )
+
+    async def _topic_snapshot(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        return await TopicRepository(connection, self.runtime.clock).get_topic_snapshot(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            refresh_message_threshold=self.runtime.settings.topic_working_set_refresh_message_lag,
+            stale_message_threshold=self.runtime.settings.topic_working_set_stale_message_lag,
+            refresh_token_threshold=self.runtime.settings.topic_working_set_refresh_token_lag,
+            stale_token_threshold=self.runtime.settings.topic_working_set_stale_token_lag,
         )

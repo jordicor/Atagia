@@ -5,12 +5,13 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Iterable
 
-import aiosqlite
-
-from atagia.core.clock import Clock
 from atagia.core.ids import generate_prefixed_id
 from atagia.core.repositories import BaseRepository, _decode_json_columns, _encode_json
-from atagia.models.schemas_memory import MemoryScope
+from atagia.memory.intimacy_boundary_policy import (
+    memory_object_intimacy_sql_clause,
+    normalize_intimacy_boundary,
+)
+from atagia.models.schemas_memory import IntimacyBoundary, MemoryScope
 
 
 class ArtifactRepository(BaseRepository):
@@ -35,6 +36,8 @@ class ArtifactRepository(BaseRepository):
         page_count: int | None = None,
         status: str = "ready",
         privacy_level: int = 0,
+        intimacy_boundary: IntimacyBoundary | str = IntimacyBoundary.ORDINARY,
+        intimacy_boundary_confidence: float = 0.0,
         preserve_verbatim: bool = False,
         skip_raw_by_default: bool = True,
         requires_explicit_request: bool = True,
@@ -49,6 +52,7 @@ class ArtifactRepository(BaseRepository):
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_artifact_id = artifact_id or generate_prefixed_id("art")
+        resolved_intimacy_boundary = normalize_intimacy_boundary(intimacy_boundary)
         timestamp = self._timestamp()
         await self._connection.execute(
             """
@@ -69,6 +73,8 @@ class ArtifactRepository(BaseRepository):
                 page_count,
                 status,
                 privacy_level,
+                intimacy_boundary,
+                intimacy_boundary_confidence,
                 preserve_verbatim,
                 skip_raw_by_default,
                 requires_explicit_request,
@@ -79,7 +85,7 @@ class ArtifactRepository(BaseRepository):
                 updated_at,
                 deleted_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """,
             (
                 resolved_artifact_id,
@@ -98,6 +104,8 @@ class ArtifactRepository(BaseRepository):
                 page_count,
                 status,
                 privacy_level,
+                resolved_intimacy_boundary.value,
+                float(intimacy_boundary_confidence),
                 int(preserve_verbatim),
                 int(skip_raw_by_default),
                 int(requires_explicit_request),
@@ -256,12 +264,15 @@ class ArtifactRepository(BaseRepository):
         text: str,
         token_count: int,
         kind: str,
+        intimacy_boundary: IntimacyBoundary | str = IntimacyBoundary.ORDINARY,
+        intimacy_boundary_confidence: float = 0.0,
         source_start_offset: int | None = None,
         source_end_offset: int | None = None,
         chunk_id: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_chunk_id = chunk_id or generate_prefixed_id("arc")
+        resolved_intimacy_boundary = normalize_intimacy_boundary(intimacy_boundary)
         timestamp = self._timestamp()
         await self._connection.execute(
             """
@@ -275,10 +286,12 @@ class ArtifactRepository(BaseRepository):
                 text,
                 token_count,
                 kind,
+                intimacy_boundary,
+                intimacy_boundary_confidence,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 resolved_chunk_id,
@@ -290,6 +303,8 @@ class ArtifactRepository(BaseRepository):
                 text,
                 token_count,
                 kind,
+                resolved_intimacy_boundary.value,
+                float(intimacy_boundary_confidence),
                 timestamp,
                 timestamp,
             ),
@@ -320,6 +335,10 @@ class ArtifactRepository(BaseRepository):
                     text=str(chunk["text"]),
                     token_count=int(chunk["token_count"]),
                     kind=str(chunk["kind"]),
+                    intimacy_boundary=str(chunk.get("intimacy_boundary") or IntimacyBoundary.ORDINARY.value),
+                    intimacy_boundary_confidence=float(
+                        chunk.get("intimacy_boundary_confidence", 0.0) or 0.0
+                    ),
                     source_start_offset=chunk.get("source_start_offset"),
                     source_end_offset=chunk.get("source_end_offset"),
                     chunk_id=str(chunk["id"]) if chunk.get("id") is not None else None,
@@ -341,6 +360,112 @@ class ArtifactRepository(BaseRepository):
             """,
             (artifact_id, user_id),
         )
+
+    async def list_artifact_chunks_for_messages(
+        self,
+        *,
+        user_id: str,
+        message_ids: list[str],
+        privacy_ceiling: int,
+        scope_filter: list[MemoryScope],
+        assistant_mode_id: str,
+        workspace_id: str | None,
+        conversation_id: str,
+        limit: int,
+        allow_intimacy_context: bool = False,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        normalized_message_ids = [
+            str(message_id).strip()
+            for message_id in message_ids
+            if str(message_id).strip()
+        ]
+        if not normalized_message_ids:
+            return []
+        deduped_message_ids = list(dict.fromkeys(normalized_message_ids))
+        scope_clauses, scope_parameters = self._scope_clauses(
+            scope_filter,
+            assistant_mode_id=assistant_mode_id,
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+        )
+        if not scope_clauses:
+            return []
+        requested_values = ", ".join("(?, ?)" for _ in deduped_message_ids)
+        query_text = """
+            WITH requested(message_id, message_order) AS (
+                VALUES {requested_values}
+            )
+            SELECT
+                ac.*,
+                a.workspace_id,
+                a.conversation_id,
+                a.message_id,
+                a.artifact_type,
+                a.source_kind,
+                a.source_ref,
+                a.mime_type,
+                a.filename,
+                a.title,
+                a.content_hash,
+                a.size_bytes,
+                a.page_count,
+                c.assistant_mode_id AS conversation_assistant_mode_id,
+                a.status,
+                a.privacy_level,
+                a.intimacy_boundary AS artifact_intimacy_boundary,
+                a.intimacy_boundary_confidence AS artifact_intimacy_boundary_confidence,
+                a.preserve_verbatim,
+                a.skip_raw_by_default,
+                a.requires_explicit_request,
+                a.metadata_json AS artifact_metadata_json,
+                a.summary_text AS artifact_summary_text,
+                a.index_text AS artifact_index_text,
+                a.created_at AS artifact_created_at,
+                a.updated_at AS artifact_updated_at,
+                CAST(requested.message_order AS REAL)
+                    + CASE WHEN ac.kind = 'summary' THEN 0.5 ELSE 0.0 END
+                    + (CAST(ac.chunk_index AS REAL) / 1000.0) AS rank
+            FROM artifact_chunks AS ac
+            JOIN artifacts AS a ON a.id = ac.artifact_id
+            JOIN requested ON requested.message_id = a.message_id
+            LEFT JOIN conversations AS c ON c.id = a.conversation_id
+            WHERE a.user_id = ?
+              AND a.status = 'ready'
+              AND a.deleted_at IS NULL
+              AND a.privacy_level <= ?
+              AND {intimacy_filter}
+              AND ({scope_clauses})
+            ORDER BY
+                requested.message_order ASC,
+                CASE WHEN ac.kind = 'summary' THEN 1 ELSE 0 END ASC,
+                ac.chunk_index ASC,
+                ac.id ASC
+            LIMIT ?
+        """.format(
+            requested_values=requested_values,
+            scope_clauses=" OR ".join(scope_clauses),
+            intimacy_filter=(
+                f"{memory_object_intimacy_sql_clause('ac', allow_intimacy_context=allow_intimacy_context)} "
+                f"AND {memory_object_intimacy_sql_clause('a', allow_intimacy_context=allow_intimacy_context)}"
+            ),
+        )
+        requested_parameters: list[Any] = []
+        for order, message_id in enumerate(deduped_message_ids):
+            requested_parameters.extend([message_id, order])
+        cursor = await self._connection.execute(
+            query_text,
+            (
+                *requested_parameters,
+                user_id,
+                privacy_ceiling,
+                *scope_parameters,
+                limit,
+            ),
+        )
+        rows = await cursor.fetchall()
+        return [row for row in (_decode_json_columns(row) for row in rows) if row is not None]
 
     async def create_artifact_link(
         self,
@@ -422,6 +547,7 @@ class ArtifactRepository(BaseRepository):
         workspace_id: str | None,
         conversation_id: str,
         limit: int,
+        allow_intimacy_context: bool = False,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -451,6 +577,8 @@ class ArtifactRepository(BaseRepository):
                 c.assistant_mode_id AS conversation_assistant_mode_id,
                 a.status,
                 a.privacy_level,
+                a.intimacy_boundary AS artifact_intimacy_boundary,
+                a.intimacy_boundary_confidence AS artifact_intimacy_boundary_confidence,
                 a.preserve_verbatim,
                 a.skip_raw_by_default,
                 a.requires_explicit_request,
@@ -468,11 +596,23 @@ class ArtifactRepository(BaseRepository):
               AND a.status = 'ready'
               AND a.deleted_at IS NULL
               AND a.privacy_level <= ?
+              AND {intimacy_filter}
               AND ({scope_clauses})
               AND artifact_chunks_fts MATCH ?
-            ORDER BY rank ASC, a.updated_at DESC, ac.chunk_index ASC, ac.id ASC
+            ORDER BY
+                CASE WHEN ac.kind = 'summary' THEN 1 ELSE 0 END ASC,
+                rank ASC,
+                a.updated_at DESC,
+                ac.chunk_index ASC,
+                ac.id ASC
             LIMIT ?
-        """.format(scope_clauses=" OR ".join(scope_clauses))
+        """.format(
+            scope_clauses=" OR ".join(scope_clauses),
+            intimacy_filter=(
+                f"{memory_object_intimacy_sql_clause('ac', allow_intimacy_context=allow_intimacy_context)} "
+                f"AND {memory_object_intimacy_sql_clause('a', allow_intimacy_context=allow_intimacy_context)}"
+            ),
+        )
         cursor = await self._connection.execute(
             query_text,
             (

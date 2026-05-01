@@ -136,6 +136,8 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "canonical_text",
             "index_text",
             "privacy_level",
+            "intimacy_boundary",
+            "intimacy_boundary_confidence",
             "status",
             "created_by",
             "created_at",
@@ -163,6 +165,8 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "page_count",
             "status",
             "privacy_level",
+            "intimacy_boundary",
+            "intimacy_boundary_confidence",
             "preserve_verbatim",
             "skip_raw_by_default",
             "requires_explicit_request",
@@ -184,6 +188,8 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "text",
             "token_count",
             "kind",
+            "intimacy_boundary",
+            "intimacy_boundary_confidence",
             "created_at",
             "updated_at",
         }.issubset(artifact_chunks_columns)
@@ -727,7 +733,7 @@ async def test_migration_0012_backfills_summary_view_user_ids_and_drops_orphans(
         )
         rows = await rows_cursor.fetchall()
 
-        assert [migration.version for migration in applied] == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+        assert [migration.version for migration in applied] == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
         assert [row["id"] for row in rows] == ["sum_conv", "sum_rollup"]
         assert all(row["user_id"] == "usr_1" for row in rows)
         assert all(row["hierarchy_level"] == 0 for row in rows)

@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from atagia.models.schemas_memory import (
     ComposedContext,
     DetectedNeed,
+    IntimacyBoundary,
     RetrievalPlan,
     RetrievalSufficiencyDiagnostic,
     RetrievalTrace,
@@ -132,6 +133,8 @@ class GroundingItem(BaseModel):
     source_kind: str
     maya_score: float
     grounding_level: GroundingLevel
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
+    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class GroundingReport(BaseModel):
@@ -206,6 +209,7 @@ class ConversationExport(BaseModel):
     workspace_id: str | None = None
     messages: list[ExportedMessage] = Field(default_factory=list)
     retrieval_traces: list[ExportedRetrievalTrace] | None = None
+    intimacy_boundary_counts: dict[str, int] = Field(default_factory=dict)
     exported_at: str | None = None
     anonymization: ExportAnonymizationSummary | None = None
 
@@ -244,4 +248,5 @@ class ConversationExportRequest(BaseModel):
 
     user_id: str
     include_retrieval_traces: bool = True
+    include_intimacy_context: bool = False
     anonymization_mode: ExportAnonymizationMode = ExportAnonymizationMode.RAW

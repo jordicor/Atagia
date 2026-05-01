@@ -23,6 +23,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingRequest,
     LLMEmbeddingResponse,
     LLMError,
+    LLMPolicyBlockedError,
     LLMProvider,
     LLMStreamEvent,
     OutputLimitExceededError,
@@ -77,7 +78,9 @@ def _stop_reason_error(stop_reason: str | None) -> LLMError | None:
             f"(stop_reason={stop_reason})"
         )
     if stop_reason in _BLOCKED_STOP_REASONS:
-        return LLMError(f"Anthropic blocked the response (stop_reason={stop_reason})")
+        return LLMPolicyBlockedError(
+            f"Anthropic blocked the response (stop_reason={stop_reason})"
+        )
     if stop_reason in _TRANSIENT_STOP_REASONS:
         return TransientLLMError(
             f"Anthropic returned retryable stop reason: {stop_reason}"

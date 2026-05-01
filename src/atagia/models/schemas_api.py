@@ -12,8 +12,10 @@ from atagia.core.timestamps import normalize_optional_timestamp
 from atagia.models.schemas_evaluation import MetricName
 from atagia.models.schemas_memory import (
     ComposedContext,
+    IntimacyBoundary,
     MemoryScope,
     OperationalSignals,
+    TopicWorkingSetTrace,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
@@ -108,6 +110,8 @@ class AttachmentInput(BaseModel):
     mime_type: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     privacy_level: int = Field(default=0, ge=0, le=3)
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
+    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     preserve_verbatim: bool = False
     skip_raw_by_default: bool = True
     requires_explicit_request: bool = True
@@ -257,6 +261,8 @@ class ArtifactRecord(BaseModel):
     page_count: int | None = None
     status: ArtifactStatus
     privacy_level: int = Field(ge=0, le=3)
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
+    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     preserve_verbatim: bool = False
     skip_raw_by_default: bool = True
     requires_explicit_request: bool = True
@@ -296,6 +302,8 @@ class ArtifactChunkRecord(BaseModel):
     text: str
     token_count: int = Field(ge=0)
     kind: ArtifactChunkKind
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
+    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     created_at: str
     updated_at: str
 
@@ -373,12 +381,60 @@ class MemorySummary(BaseModel):
     scope: str
 
 
+class RecentTranscriptEntry(BaseModel):
+    """One entry in the deterministic recent transcript returned to sidecar clients."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["message", "policy_placeholder", "omission"]
+    role: Literal["user", "assistant"]
+    text: str
+    seq: int
+    message_id: str
+    token_estimate: int = Field(ge=0)
+    content_kind: str = "text"
+    policy_reason: str = "normal"
+    omission_reason: Literal["token_budget", "policy"] | None = None
+
+
+class RecentTranscriptOmission(BaseModel):
+    """Structured metadata for a recent transcript message omitted from raw context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Literal["token_budget", "policy"]
+    seq: int
+    message_id: str
+    role: Literal["user", "assistant"]
+    token_estimate: int = Field(ge=0)
+    content_kind: str = "text"
+    policy_reason: str = "normal"
+
+
+class RecentTranscriptTrace(BaseModel):
+    """Trace metadata for sidecar recent transcript assembly."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    budget_tokens: int = Field(ge=0)
+    budget_used_tokens: int = Field(ge=0)
+    overage_ratio: float = Field(ge=0.0)
+    included_message_seqs: list[int] = Field(default_factory=list)
+    omitted_message_seqs: list[int] = Field(default_factory=list)
+
+
 class ContextResult(BaseModel):
     """Library-mode retrieval result ready for an external LLM call."""
 
     model_config = ConfigDict(extra="forbid")
 
     system_prompt: str
+    topic_working_set: TopicWorkingSetTrace = Field(default_factory=TopicWorkingSetTrace)
+    topic_working_set_block: str = ""
+    recent_transcript: list[RecentTranscriptEntry] = Field(default_factory=list)
+    recent_transcript_omissions: list[RecentTranscriptOmission] = Field(default_factory=list)
+    recent_transcript_trace: RecentTranscriptTrace | None = None
+    assistant_guidance: list[str] = Field(default_factory=list)
     memories: list[MemorySummary] = Field(default_factory=list)
     contract: dict[str, dict[str, Any]] = Field(default_factory=dict)
     detected_needs: list[str] = Field(default_factory=list)
@@ -550,6 +606,8 @@ class VerbatimPinCreateRequest(BaseModel):
     target_span_start: int | None = Field(default=None, ge=0)
     target_span_end: int | None = Field(default=None, ge=0)
     privacy_level: int = Field(default=0, ge=0, le=3)
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
+    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reason: str | None = None
     created_by: str | None = None
     expires_at: str | None = None
@@ -630,6 +688,8 @@ class VerbatimPinUpdateRequest(BaseModel):
     target_span_start: int | None = Field(default=None, ge=0)
     target_span_end: int | None = Field(default=None, ge=0)
     privacy_level: int | None = Field(default=None, ge=0, le=3)
+    intimacy_boundary: IntimacyBoundary | None = None
+    intimacy_boundary_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     status: VerbatimPinStatus | None = None
     reason: str | None = None
     expires_at: str | None = None
@@ -697,6 +757,8 @@ class VerbatimPinRecord(BaseModel):
     canonical_text: str
     index_text: str
     privacy_level: int = Field(ge=0, le=3)
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
+    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     status: VerbatimPinStatus
     reason: str | None = None
     created_by: str

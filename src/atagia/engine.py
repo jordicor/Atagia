@@ -18,13 +18,17 @@ from atagia.models.schemas_api import (
     WarmupRecommendedConversationsResponse,
 )
 from atagia.models.schemas_replay import AblationConfig
-from atagia.models.schemas_memory import MemoryScope, VerbatimPinStatus, VerbatimPinTargetKind
+from atagia.models.schemas_memory import (
+    IntimacyBoundary,
+    MemoryScope,
+    VerbatimPinStatus,
+    VerbatimPinTargetKind,
+)
 from atagia.services.chat_service import ChatService
 from atagia.services.conversation_activity_service import ConversationActivityService
 from atagia.services.sidecar_service import SidecarService
 from atagia.services.verbatim_pin_service import VerbatimPinService
 from atagia.services.errors import RuntimeNotInitializedError
-from atagia.services.model_resolution import provider_qualified_model
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_MIGRATIONS_DIR = _PROJECT_ROOT / "migrations"
@@ -41,21 +45,27 @@ class Atagia:
         redis_url: str | None = None,
         manifests_dir: str | Path | None = None,
         operational_profiles_dir: str | Path | None = None,
-        llm_provider: str | None = None,
-        llm_api_key: str | None = None,
-        llm_model: str | None = None,
         llm_forced_global_model: str | None = None,
+        llm_ingest_model: str | None = None,
+        llm_retrieval_model: str | None = None,
+        llm_chat_model: str | None = None,
+        llm_component_models: dict[str, str] | None = None,
+        llm_intimacy_ingest_model: str | None = None,
+        llm_intimacy_retrieval_model: str | None = None,
+        llm_intimacy_component_models: dict[str, str] | None = None,
+        llm_intimacy_proactive_routing_enabled: bool | None = None,
         anthropic_api_key: str | None = None,
         openai_api_key: str | None = None,
         google_api_key: str | None = None,
         openrouter_api_key: str | None = None,
         embedding_backend: str = "none",
         embedding_model: str | None = None,
-        embedding_provider_name: str | None = None,
         skip_belief_revision: bool = False,
         skip_compaction: bool = False,
         context_cache_enabled: bool | None = None,
         chunking_enabled: bool | None = None,
+        assistant_guidance_enabled: bool | None = None,
+        recent_transcript_budget_tokens: int | None = None,
     ) -> None:
         self._db_path = str(Path(db_path).expanduser()) if isinstance(db_path, Path) else str(db_path)
         self._redis_url = redis_url
@@ -69,21 +79,29 @@ class Atagia:
             if isinstance(operational_profiles_dir, Path)
             else operational_profiles_dir
         )
-        self._llm_provider = llm_provider
-        self._llm_api_key = llm_api_key
-        self._llm_model = llm_model
         self._llm_forced_global_model = llm_forced_global_model
+        self._llm_ingest_model = llm_ingest_model
+        self._llm_retrieval_model = llm_retrieval_model
+        self._llm_chat_model = llm_chat_model
+        self._llm_component_models = dict(llm_component_models or {})
+        self._llm_intimacy_ingest_model = llm_intimacy_ingest_model
+        self._llm_intimacy_retrieval_model = llm_intimacy_retrieval_model
+        self._llm_intimacy_component_models = dict(llm_intimacy_component_models or {})
+        self._llm_intimacy_proactive_routing_enabled = (
+            llm_intimacy_proactive_routing_enabled
+        )
         self._anthropic_api_key = anthropic_api_key
         self._openai_api_key = openai_api_key
         self._google_api_key = google_api_key
         self._openrouter_api_key = openrouter_api_key
         self._embedding_backend = embedding_backend
         self._embedding_model = embedding_model
-        self._embedding_provider_name = embedding_provider_name
         self._skip_belief_revision = skip_belief_revision
         self._skip_compaction = skip_compaction
         self._context_cache_enabled = context_cache_enabled
         self._chunking_enabled = chunking_enabled
+        self._assistant_guidance_enabled = assistant_guidance_enabled
+        self._recent_transcript_budget_tokens = recent_transcript_budget_tokens
         self._runtime: AppRuntime | None = None
         self._closed = False
 
@@ -292,6 +310,8 @@ class Atagia:
         target_span_start: int | None = None,
         target_span_end: int | None = None,
         privacy_level: int = 0,
+        intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+        intimacy_boundary_confidence: float = 0.0,
         reason: str | None = None,
         created_by: str | None = None,
         expires_at: str | None = None,
@@ -316,6 +336,8 @@ class Atagia:
                 target_span_start=target_span_start,
                 target_span_end=target_span_end,
                 privacy_level=privacy_level,
+                intimacy_boundary=intimacy_boundary,
+                intimacy_boundary_confidence=intimacy_boundary_confidence,
                 reason=reason,
                 created_by=created_by,
                 expires_at=expires_at,
@@ -388,6 +410,8 @@ class Atagia:
         target_span_start: int | None = None,
         target_span_end: int | None = None,
         privacy_level: int | None = None,
+        intimacy_boundary: IntimacyBoundary | None = None,
+        intimacy_boundary_confidence: float | None = None,
         status: VerbatimPinStatus | None = None,
         reason: str | None = None,
         expires_at: str | None = None,
@@ -406,6 +430,8 @@ class Atagia:
                 target_span_start=target_span_start,
                 target_span_end=target_span_end,
                 privacy_level=privacy_level,
+                intimacy_boundary=intimacy_boundary,
+                intimacy_boundary_confidence=intimacy_boundary_confidence,
                 status=status,
                 reason=reason,
                 expires_at=expires_at,
@@ -585,25 +611,18 @@ class Atagia:
         migrations_path = os.getenv("ATAGIA_MIGRATIONS_PATH") or str(_DEFAULT_MIGRATIONS_DIR)
         use_env_redis = self._redis_url is None and env_settings.storage_backend == "redis"
         storage_backend = "redis" if self._redis_url is not None or use_env_redis else "inprocess"
-        legacy_provider = (self._llm_provider or env_settings.llm_provider).strip().lower()
         anthropic_api_key = self._anthropic_api_key or env_settings.anthropic_api_key
         openai_api_key = self._openai_api_key or env_settings.openai_api_key
         google_api_key = self._google_api_key or env_settings.google_api_key
         openrouter_api_key = self._openrouter_api_key or env_settings.openrouter_api_key
-        if self._llm_api_key:
-            if legacy_provider == "anthropic":
-                anthropic_api_key = self._llm_api_key
-            elif legacy_provider == "openai":
-                openai_api_key = self._llm_api_key
-            elif legacy_provider in {"gemini", "google"}:
-                google_api_key = self._llm_api_key
-            elif legacy_provider == "openrouter":
-                openrouter_api_key = self._llm_api_key
         forced_global_model = (
             self._llm_forced_global_model
-            or provider_qualified_model(legacy_provider, self._llm_model)
             or env_settings.llm_forced_global_model
         )
+        component_models = dict(env_settings.llm_component_models)
+        component_models.update(self._llm_component_models)
+        intimacy_component_models = dict(env_settings.llm_intimacy_component_models)
+        intimacy_component_models.update(self._llm_intimacy_component_models)
         return Settings(
             sqlite_path=self._db_path,
             migrations_path=migrations_path,
@@ -611,28 +630,33 @@ class Atagia:
             operational_profiles_path=operational_profiles_path,
             storage_backend=storage_backend,
             redis_url=self._redis_url or env_settings.redis_url,
-            llm_provider=legacy_provider,
-            llm_api_key=self._llm_api_key or env_settings.llm_api_key,
             anthropic_api_key=anthropic_api_key,
             openai_api_key=openai_api_key,
             google_api_key=google_api_key,
             openrouter_api_key=openrouter_api_key,
-            llm_base_url=env_settings.llm_base_url,
             anthropic_base_url=env_settings.anthropic_base_url,
             openai_base_url=env_settings.openai_base_url,
             openrouter_base_url=env_settings.openrouter_base_url,
             openrouter_site_url=env_settings.openrouter_site_url,
             openrouter_app_name=env_settings.openrouter_app_name,
-            llm_extraction_model=env_settings.llm_extraction_model,
-            llm_scoring_model=env_settings.llm_scoring_model,
-            llm_classifier_model=env_settings.llm_classifier_model,
-            llm_chat_model=env_settings.llm_chat_model,
+            llm_chat_model=self._llm_chat_model or env_settings.llm_chat_model,
             llm_forced_global_model=forced_global_model,
-            llm_ingest_model=env_settings.llm_ingest_model,
-            llm_retrieval_model=env_settings.llm_retrieval_model,
-            llm_component_models=dict(env_settings.llm_component_models),
-            embedding_provider_name=(
-                self._embedding_provider_name or env_settings.embedding_provider_name
+            llm_ingest_model=self._llm_ingest_model or env_settings.llm_ingest_model,
+            llm_retrieval_model=self._llm_retrieval_model or env_settings.llm_retrieval_model,
+            llm_component_models=component_models,
+            llm_intimacy_ingest_model=(
+                self._llm_intimacy_ingest_model
+                or env_settings.llm_intimacy_ingest_model
+            ),
+            llm_intimacy_retrieval_model=(
+                self._llm_intimacy_retrieval_model
+                or env_settings.llm_intimacy_retrieval_model
+            ),
+            llm_intimacy_component_models=intimacy_component_models,
+            llm_intimacy_proactive_routing_enabled=(
+                env_settings.llm_intimacy_proactive_routing_enabled
+                if self._llm_intimacy_proactive_routing_enabled is None
+                else self._llm_intimacy_proactive_routing_enabled
             ),
             service_mode=False,
             service_api_key=None,
@@ -672,9 +696,49 @@ class Atagia:
                 else self._chunking_enabled
             ),
             chunking_threshold_tokens=env_settings.chunking_threshold_tokens,
+            extraction_watchdog_enabled=env_settings.extraction_watchdog_enabled,
+            extraction_watchdog_allow_different_provider=(
+                env_settings.extraction_watchdog_allow_different_provider
+            ),
+            extraction_watchdog_min_elapsed_seconds=(
+                env_settings.extraction_watchdog_min_elapsed_seconds
+            ),
+            extraction_watchdog_min_output_tokens=env_settings.extraction_watchdog_min_output_tokens,
+            extraction_watchdog_check_interval_tokens=(
+                env_settings.extraction_watchdog_check_interval_tokens
+            ),
+            extraction_watchdog_max_checks=env_settings.extraction_watchdog_max_checks,
+            extraction_watchdog_llm_timeout_seconds=(
+                env_settings.extraction_watchdog_llm_timeout_seconds
+            ),
+            extraction_watchdog_bounded_retry_max_items=(
+                env_settings.extraction_watchdog_bounded_retry_max_items
+            ),
+            extraction_watchdog_bounded_retry_max_output_tokens=(
+                env_settings.extraction_watchdog_bounded_retry_max_output_tokens
+            ),
             small_corpus_token_threshold_ratio=(
                 env_settings.small_corpus_token_threshold_ratio
             ),
+            assistant_guidance_enabled=(
+                env_settings.assistant_guidance_enabled
+                if self._assistant_guidance_enabled is None
+                else self._assistant_guidance_enabled
+            ),
+            recent_transcript_budget_tokens=(
+                env_settings.recent_transcript_budget_tokens
+                if self._recent_transcript_budget_tokens is None
+                else self._recent_transcript_budget_tokens
+            ),
+            benchmark_disable_raw_recent_transcript=(
+                env_settings.benchmark_disable_raw_recent_transcript
+            ),
+            recent_transcript_overage_ratio=env_settings.recent_transcript_overage_ratio,
+            verbatim_evidence_search_enabled=env_settings.verbatim_evidence_search_enabled,
+            verbatim_evidence_search_rrf_weight=env_settings.verbatim_evidence_search_rrf_weight,
+            verbatim_evidence_search_limit=env_settings.verbatim_evidence_search_limit,
+            verbatim_evidence_window_size=env_settings.verbatim_evidence_window_size,
+            verbatim_evidence_window_overlap=env_settings.verbatim_evidence_window_overlap,
         )
 
     async def _require_runtime(self) -> AppRuntime:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import logging
 import os
 from pathlib import Path
 
@@ -12,22 +11,11 @@ from dotenv import load_dotenv
 from atagia.services.model_resolution import (
     DEFAULT_EMBEDDING_MODEL,
     component_env_models_from_env,
+    intimacy_component_env_models_from_env,
 )
 
 
 _DOTENV_LOADED = False
-logger = logging.getLogger(__name__)
-_LEGACY_LLM_ENV_VARS = (
-    "ATAGIA_LLM_PROVIDER",
-    "ATAGIA_LLM_API_KEY",
-    "ATAGIA_LLM_BASE_URL",
-    "ATAGIA_LLM_EXTRACTION_MODEL",
-    "ATAGIA_LLM_SCORING_MODEL",
-    "ATAGIA_LLM_CLASSIFIER_MODEL",
-    "ATAGIA_EMBEDDING_PROVIDER",
-    "ATAGIA_PRIVACY_VALIDATION_GATE_JUDGE_MODEL",
-    "ATAGIA_PRIVACY_VALIDATION_GATE_REFINER_MODEL",
-)
 
 
 def _load_dotenv_once() -> None:
@@ -67,6 +55,16 @@ def _env_csv_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return normalized or default
 
 
+def _env_optional_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
+
+
+MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS = 2048
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Runtime settings for Atagia."""
@@ -76,16 +74,10 @@ class Settings:
     manifests_path: str
     storage_backend: str
     redis_url: str
-    llm_provider: str
-    llm_api_key: str | None
     openai_api_key: str | None
     openrouter_api_key: str | None
-    llm_base_url: str | None
     openrouter_site_url: str
     openrouter_app_name: str
-    llm_extraction_model: str | None
-    llm_scoring_model: str | None
-    llm_classifier_model: str | None
     llm_chat_model: str | None
     service_mode: bool
     service_api_key: str | None
@@ -101,12 +93,15 @@ class Settings:
     llm_ingest_model: str | None = None
     llm_retrieval_model: str | None = None
     llm_component_models: dict[str, str] = field(default_factory=dict)
+    llm_intimacy_ingest_model: str | None = None
+    llm_intimacy_retrieval_model: str | None = None
+    llm_intimacy_component_models: dict[str, str] = field(default_factory=dict)
+    llm_intimacy_proactive_routing_enabled: bool = False
     operational_profiles_path: str = "./operational_profiles"
     artifact_blob_storage_kind: str = "sqlite_blob"
     artifact_blob_storage_path: str = "./data/artifact_blobs"
     allow_admin_export_anonymization: bool = False
     allow_insecure_http: bool = False
-    embedding_provider_name: str | None = None
     embedding_backend: str = "none"
     embedding_model: str | None = None
     embedding_dimension: int = 1536
@@ -134,8 +129,6 @@ class Settings:
     privacy_validation_gate_timeout_seconds: float = 20.0
     privacy_validation_gate_max_source_chars: int = 6000
     privacy_validation_gate_max_summaries_gated_per_job: int = 50
-    privacy_validation_gate_judge_model: str | None = None
-    privacy_validation_gate_refiner_model: str | None = None
     operational_high_risk_enabled: bool = False
     operational_allowed_profiles: tuple[str, ...] = ("normal", "low_power", "offline")
     context_cache_enabled: bool = True
@@ -143,26 +136,45 @@ class Settings:
     context_cache_max_ttl_seconds: int = 3600
     chunking_enabled: bool = False
     chunking_threshold_tokens: int = 2000
+    extraction_watchdog_enabled: bool = True
+    extraction_watchdog_allow_different_provider: bool = False
+    extraction_watchdog_min_elapsed_seconds: float = 8.0
+    extraction_watchdog_min_output_tokens: int = 2048
+    extraction_watchdog_check_interval_tokens: int = 1024
+    extraction_watchdog_max_checks: int = 2
+    extraction_watchdog_llm_timeout_seconds: float = 8.0
+    extraction_watchdog_bounded_retry_max_items: int = 8
+    extraction_watchdog_bounded_retry_max_output_tokens: int = 4096
     lifecycle_lazy_enabled: bool = True
     lifecycle_min_interval_seconds: int = 3600
     lifecycle_worker_enabled: bool = False
     lifecycle_worker_interval_seconds: int = 3600
     small_corpus_token_threshold_ratio: float = 0.7
-    # Wave 1 batch 2 (1-C): raw evidence as first-class search channel.
-    raw_message_channel: bool = True
-    # Raw evidence RRF weight, slightly lower than memory_objects by
-    # default because memories are more focused and raw evidence is a
-    # recall safety net. Tuning is deferred to Wave 2.
-    raw_message_rrf_weight: float = 0.75
-    # Maximum conversation windows fetched per sub-query from the raw
-    # evidence channel before fusion. Raw evidence is a secondary lane
-    # so this ceiling is modest.
-    raw_message_channel_limit: int = 8
-    # Conversation window size (messages per window) used by the raw
-    # evidence channel. 2-4 per the Wave 1-C spec; default 3 with 1-turn
-    # overlap keeps neighbouring evidence accessible.
-    raw_message_window_size: int = 3
-    raw_message_window_overlap: int = 1
+    assistant_guidance_enabled: bool = True
+    recent_transcript_budget_tokens: int | None = None
+    benchmark_disable_raw_recent_transcript: bool = False
+    recent_transcript_overage_ratio: float = 0.025
+    topic_working_set_enabled: bool = True
+    topic_working_set_refresh_message_lag: int = 4
+    topic_working_set_stale_message_lag: int = 10
+    topic_working_set_refresh_token_lag: int = 2000
+    topic_working_set_stale_token_lag: int = 5000
+    topic_working_set_refresh_batch_messages: int = 8
+    # FTS-backed verbatim evidence as first-class search channel.
+    verbatim_evidence_search_enabled: bool = True
+    # Evidence-search RRF weight, slightly lower than memory_objects by
+    # default because memories are more focused and verbatim evidence is
+    # a recall safety net. Tuning is deferred to Wave 2.
+    verbatim_evidence_search_rrf_weight: float = 0.75
+    # Maximum conversation windows fetched per sub-query from the
+    # evidence-search channel before fusion. It is a secondary lane, so
+    # this ceiling is modest.
+    verbatim_evidence_search_limit: int = 8
+    # Conversation window size (messages per window) used by the
+    # evidence-search channel. Default 3 with 1-turn overlap keeps
+    # neighbouring evidence accessible.
+    verbatim_evidence_window_size: int = 3
+    verbatim_evidence_window_overlap: int = 1
 
     def __post_init__(self) -> None:
         if self.context_cache_min_ttl_seconds <= 0:
@@ -173,6 +185,20 @@ class Settings:
             raise ValueError("context_cache_max_ttl_seconds must be >= context_cache_min_ttl_seconds")
         if self.chunking_threshold_tokens <= 0:
             raise ValueError("chunking_threshold_tokens must be positive")
+        if self.extraction_watchdog_min_elapsed_seconds < 0:
+            raise ValueError("extraction_watchdog_min_elapsed_seconds must be non-negative")
+        if self.extraction_watchdog_min_output_tokens <= 0:
+            raise ValueError("extraction_watchdog_min_output_tokens must be positive")
+        if self.extraction_watchdog_check_interval_tokens <= 0:
+            raise ValueError("extraction_watchdog_check_interval_tokens must be positive")
+        if self.extraction_watchdog_max_checks < 0:
+            raise ValueError("extraction_watchdog_max_checks must be non-negative")
+        if self.extraction_watchdog_llm_timeout_seconds <= 0:
+            raise ValueError("extraction_watchdog_llm_timeout_seconds must be positive")
+        if self.extraction_watchdog_bounded_retry_max_items <= 0:
+            raise ValueError("extraction_watchdog_bounded_retry_max_items must be positive")
+        if self.extraction_watchdog_bounded_retry_max_output_tokens <= 512:
+            raise ValueError("extraction_watchdog_bounded_retry_max_output_tokens must be greater than 512")
         if self.rrf_k <= 0:
             raise ValueError("rrf_k must be positive")
         if self.lifecycle_min_interval_seconds <= 0:
@@ -207,30 +233,47 @@ class Settings:
             raise ValueError(
                 "small_corpus_token_threshold_ratio must be in the interval [0.0, 1.0]"
             )
-        if not 0.0 <= self.raw_message_rrf_weight <= 2.0:
-            raise ValueError("raw_message_rrf_weight must be in the interval [0.0, 2.0]")
-        if self.raw_message_channel_limit < 0:
-            raise ValueError("raw_message_channel_limit must be non-negative")
-        if self.raw_message_window_size < 2 or self.raw_message_window_size > 4:
-            raise ValueError("raw_message_window_size must be between 2 and 4")
-        if self.raw_message_window_overlap < 0:
-            raise ValueError("raw_message_window_overlap must be non-negative")
-        if self.raw_message_window_overlap >= self.raw_message_window_size:
+        if (
+            self.recent_transcript_budget_tokens is not None
+            and self.recent_transcript_budget_tokens <= 0
+        ):
+            raise ValueError("recent_transcript_budget_tokens must be positive")
+        if not 0.0 <= self.recent_transcript_overage_ratio <= 1.0:
             raise ValueError(
-                "raw_message_window_overlap must be strictly less than raw_message_window_size"
+                "recent_transcript_overage_ratio must be in the interval [0.0, 1.0]"
+            )
+        if self.topic_working_set_refresh_message_lag <= 0:
+            raise ValueError("topic_working_set_refresh_message_lag must be positive")
+        if self.topic_working_set_stale_message_lag < self.topic_working_set_refresh_message_lag:
+            raise ValueError(
+                "topic_working_set_stale_message_lag must be >= "
+                "topic_working_set_refresh_message_lag"
+            )
+        if self.topic_working_set_refresh_token_lag <= 0:
+            raise ValueError("topic_working_set_refresh_token_lag must be positive")
+        if self.topic_working_set_stale_token_lag < self.topic_working_set_refresh_token_lag:
+            raise ValueError(
+                "topic_working_set_stale_token_lag must be >= "
+                "topic_working_set_refresh_token_lag"
+            )
+        if self.topic_working_set_refresh_batch_messages <= 0:
+            raise ValueError("topic_working_set_refresh_batch_messages must be positive")
+        if not 0.0 <= self.verbatim_evidence_search_rrf_weight <= 2.0:
+            raise ValueError("verbatim_evidence_search_rrf_weight must be in the interval [0.0, 2.0]")
+        if self.verbatim_evidence_search_limit < 0:
+            raise ValueError("verbatim_evidence_search_limit must be non-negative")
+        if self.verbatim_evidence_window_size < 2 or self.verbatim_evidence_window_size > 4:
+            raise ValueError("verbatim_evidence_window_size must be between 2 and 4")
+        if self.verbatim_evidence_window_overlap < 0:
+            raise ValueError("verbatim_evidence_window_overlap must be non-negative")
+        if self.verbatim_evidence_window_overlap >= self.verbatim_evidence_window_size:
+            raise ValueError(
+                "verbatim_evidence_window_overlap must be strictly less than verbatim_evidence_window_size"
             )
 
     @classmethod
     def from_env(cls) -> "Settings":
         _load_dotenv_once()
-        for env_name in _LEGACY_LLM_ENV_VARS:
-            if (os.getenv(env_name) or "").strip():
-                logger.warning(
-                    "%s is a legacy LLM configuration variable and is ignored by "
-                    "model resolution. Use provider-qualified model variables and "
-                    "provider-specific API keys instead.",
-                    env_name,
-                )
         return cls(
             sqlite_path=os.getenv("ATAGIA_SQLITE_PATH", "./data/atagia.db"),
             migrations_path=os.getenv("ATAGIA_MIGRATIONS_PATH", "./migrations"),
@@ -249,30 +292,28 @@ class Settings:
             ),
             storage_backend=os.getenv("ATAGIA_STORAGE_BACKEND", "inprocess").strip().lower(),
             redis_url=os.getenv("ATAGIA_REDIS_URL", "redis://localhost:6379/0"),
-            llm_provider=os.getenv("ATAGIA_LLM_PROVIDER", "anthropic").strip().lower(),
-            llm_api_key=os.getenv("ATAGIA_LLM_API_KEY") or None,
             anthropic_api_key=os.getenv("ATAGIA_ANTHROPIC_API_KEY") or None,
             openai_api_key=os.getenv("ATAGIA_OPENAI_API_KEY") or None,
             openrouter_api_key=os.getenv("ATAGIA_OPENROUTER_API_KEY") or None,
-            llm_base_url=os.getenv("ATAGIA_LLM_BASE_URL") or None,
             anthropic_base_url=os.getenv("ATAGIA_ANTHROPIC_BASE_URL") or None,
             openai_base_url=os.getenv("ATAGIA_OPENAI_BASE_URL") or None,
             openrouter_base_url=os.getenv("ATAGIA_OPENROUTER_BASE_URL") or None,
             openrouter_site_url=os.getenv("ATAGIA_OPENROUTER_SITE_URL", "http://localhost"),
             openrouter_app_name=os.getenv("ATAGIA_OPENROUTER_APP_NAME", "Atagia"),
-            llm_extraction_model=os.getenv("ATAGIA_LLM_EXTRACTION_MODEL") or None,
-            llm_scoring_model=os.getenv("ATAGIA_LLM_SCORING_MODEL") or None,
-            llm_classifier_model=(
-                os.getenv("ATAGIA_LLM_CLASSIFIER_MODEL")
-                or os.getenv("ATAGIA_LLM_SCORING_MODEL")
-                or None
-            ),
             llm_chat_model=os.getenv("ATAGIA_LLM_CHAT_MODEL") or None,
             llm_forced_global_model=os.getenv("ATAGIA_LLM_FORCED_GLOBAL_MODEL") or None,
             llm_ingest_model=os.getenv("ATAGIA_LLM_INGEST_MODEL") or None,
             llm_retrieval_model=os.getenv("ATAGIA_LLM_RETRIEVAL_MODEL") or None,
             llm_component_models=component_env_models_from_env(os.environ),
-            embedding_provider_name=os.getenv("ATAGIA_EMBEDDING_PROVIDER") or None,
+            llm_intimacy_ingest_model=os.getenv("ATAGIA_LLM_INTIMACY_INGEST_MODEL") or None,
+            llm_intimacy_retrieval_model=(
+                os.getenv("ATAGIA_LLM_INTIMACY_RETRIEVAL_MODEL") or None
+            ),
+            llm_intimacy_component_models=intimacy_component_env_models_from_env(os.environ),
+            llm_intimacy_proactive_routing_enabled=_env_bool(
+                "ATAGIA_LLM_INTIMACY_PROACTIVE_ROUTING_ENABLED",
+                False,
+            ),
             service_mode=_env_bool("ATAGIA_SERVICE_MODE", False),
             service_api_key=os.getenv("ATAGIA_SERVICE_API_KEY") or None,
             admin_api_key=os.getenv("ATAGIA_ADMIN_API_KEY") or None,
@@ -327,12 +368,6 @@ class Settings:
             privacy_validation_gate_max_summaries_gated_per_job=int(
                 os.getenv("ATAGIA_PRIVACY_VALIDATION_GATE_MAX_SUMMARIES_GATED_PER_JOB", "50")
             ),
-            privacy_validation_gate_judge_model=(
-                os.getenv("ATAGIA_PRIVACY_VALIDATION_GATE_JUDGE_MODEL") or None
-            ),
-            privacy_validation_gate_refiner_model=(
-                os.getenv("ATAGIA_PRIVACY_VALIDATION_GATE_REFINER_MODEL") or None
-            ),
             operational_high_risk_enabled=_env_bool(
                 "ATAGIA_OPERATIONAL_HIGH_RISK_ENABLED",
                 False,
@@ -352,6 +387,32 @@ class Settings:
             chunking_threshold_tokens=int(
                 os.getenv("ATAGIA_CHUNKING_THRESHOLD_TOKENS", "2000")
             ),
+            extraction_watchdog_enabled=_env_bool("ATAGIA_EXTRACTION_WATCHDOG_ENABLED", True),
+            extraction_watchdog_allow_different_provider=_env_bool(
+                "ATAGIA_EXTRACTION_WATCHDOG_ALLOW_DIFFERENT_PROVIDER",
+                False,
+            ),
+            extraction_watchdog_min_elapsed_seconds=float(
+                os.getenv("ATAGIA_EXTRACTION_WATCHDOG_MIN_ELAPSED_SECONDS", "8.0")
+            ),
+            extraction_watchdog_min_output_tokens=int(
+                os.getenv("ATAGIA_EXTRACTION_WATCHDOG_MIN_OUTPUT_TOKENS", "2048")
+            ),
+            extraction_watchdog_check_interval_tokens=int(
+                os.getenv("ATAGIA_EXTRACTION_WATCHDOG_CHECK_INTERVAL_TOKENS", "1024")
+            ),
+            extraction_watchdog_max_checks=int(
+                os.getenv("ATAGIA_EXTRACTION_WATCHDOG_MAX_CHECKS", "2")
+            ),
+            extraction_watchdog_llm_timeout_seconds=float(
+                os.getenv("ATAGIA_EXTRACTION_WATCHDOG_LLM_TIMEOUT_SECONDS", "8.0")
+            ),
+            extraction_watchdog_bounded_retry_max_items=int(
+                os.getenv("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_ITEMS", "8")
+            ),
+            extraction_watchdog_bounded_retry_max_output_tokens=int(
+                os.getenv("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_OUTPUT_TOKENS", "4096")
+            ),
             lifecycle_lazy_enabled=_env_bool("ATAGIA_LIFECYCLE_LAZY_ENABLED", True),
             lifecycle_min_interval_seconds=int(
                 os.getenv("ATAGIA_LIFECYCLE_MIN_INTERVAL_SECONDS", "3600")
@@ -363,20 +424,70 @@ class Settings:
             small_corpus_token_threshold_ratio=float(
                 os.getenv("ATAGIA_SMALL_CORPUS_TOKEN_THRESHOLD_RATIO", "0.7")
             ),
-            raw_message_channel=_env_bool("ATAGIA_RAW_MESSAGE_CHANNEL", True),
-            raw_message_rrf_weight=float(
-                os.getenv("ATAGIA_RAW_MESSAGE_RRF_WEIGHT", "0.75")
+            assistant_guidance_enabled=_env_bool(
+                "ATAGIA_ASSISTANT_GUIDANCE_ENABLED",
+                True,
             ),
-            raw_message_channel_limit=int(
-                os.getenv("ATAGIA_RAW_MESSAGE_CHANNEL_LIMIT", "8")
+            recent_transcript_budget_tokens=_env_optional_int(
+                "ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS"
             ),
-            raw_message_window_size=int(
-                os.getenv("ATAGIA_RAW_MESSAGE_WINDOW_SIZE", "3")
+            benchmark_disable_raw_recent_transcript=_env_bool(
+                "ATAGIA_BENCHMARK_DISABLE_RAW_RECENT_TRANSCRIPT",
+                False,
             ),
-            raw_message_window_overlap=int(
-                os.getenv("ATAGIA_RAW_MESSAGE_WINDOW_OVERLAP", "1")
+            recent_transcript_overage_ratio=float(
+                os.getenv("ATAGIA_RECENT_TRANSCRIPT_OVERAGE_RATIO", "0.025")
+            ),
+            topic_working_set_enabled=_env_bool("ATAGIA_TOPIC_WORKING_SET_ENABLED", True),
+            topic_working_set_refresh_message_lag=int(
+                os.getenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_MESSAGE_LAG", "4")
+            ),
+            topic_working_set_stale_message_lag=int(
+                os.getenv("ATAGIA_TOPIC_WORKING_SET_STALE_MESSAGE_LAG", "10")
+            ),
+            topic_working_set_refresh_token_lag=int(
+                os.getenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_TOKEN_LAG", "2000")
+            ),
+            topic_working_set_stale_token_lag=int(
+                os.getenv("ATAGIA_TOPIC_WORKING_SET_STALE_TOKEN_LAG", "5000")
+            ),
+            topic_working_set_refresh_batch_messages=int(
+                os.getenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_BATCH_MESSAGES", "8")
+            ),
+            verbatim_evidence_search_enabled=_env_bool(
+                "ATAGIA_VERBATIM_EVIDENCE_SEARCH_ENABLED",
+                True,
+            ),
+            verbatim_evidence_search_rrf_weight=float(
+                os.getenv("ATAGIA_VERBATIM_EVIDENCE_SEARCH_RRF_WEIGHT", "0.75")
+            ),
+            verbatim_evidence_search_limit=int(
+                os.getenv("ATAGIA_VERBATIM_EVIDENCE_SEARCH_LIMIT", "8")
+            ),
+            verbatim_evidence_window_size=int(
+                os.getenv("ATAGIA_VERBATIM_EVIDENCE_WINDOW_SIZE", "3")
+            ),
+            verbatim_evidence_window_overlap=int(
+                os.getenv("ATAGIA_VERBATIM_EVIDENCE_WINDOW_OVERLAP", "1")
             ),
         )
+
+    def effective_recent_transcript_budget_tokens(
+        self,
+        policy_budget_tokens: int,
+        *,
+        hard_cap_tokens: int | None = None,
+    ) -> int:
+        """Return the transcript budget used for immediate working memory."""
+        configured_budget = (
+            self.recent_transcript_budget_tokens
+            if self.recent_transcript_budget_tokens is not None
+            else policy_budget_tokens
+        )
+        effective_budget = max(MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS, int(configured_budget))
+        if hard_cap_tokens is not None:
+            effective_budget = min(effective_budget, int(hard_cap_tokens))
+        return effective_budget
 
     def migrations_dir(self, root: Path | None = None) -> Path:
         base = root or Path.cwd()

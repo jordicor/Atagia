@@ -11,6 +11,7 @@ from atagia.services.model_resolution import (
     PROVIDER_SLUG_TO_NAME,
     parse_embedding_model_spec,
     required_provider_slugs,
+    resolve_intimacy_fallback_models,
     validate_required_provider_keys,
 )
 from atagia.services.providers.anthropic import AnthropicProvider
@@ -57,7 +58,14 @@ def build_llm_client(
     if settings.google_api_key:
         providers.append(GeminiProvider(api_key=settings.google_api_key))
 
-    client = LLMClient(providers=providers, retry_policy=retry_policy)
+    client = LLMClient(
+        providers=providers,
+        retry_policy=retry_policy,
+        intimacy_fallback_models=resolve_intimacy_fallback_models(settings),
+        intimacy_proactive_routing_enabled=(
+            settings.llm_intimacy_proactive_routing_enabled
+        ),
+    )
 
     for provider_slug in sorted(required_provider_slugs(settings)):
         provider_name = PROVIDER_SLUG_TO_NAME[provider_slug]

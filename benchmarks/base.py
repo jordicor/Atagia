@@ -23,6 +23,8 @@ class BenchmarkTurn(BaseModel):
     session_id: str
     timestamp: str
     turn_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class BenchmarkQuestion(BaseModel):

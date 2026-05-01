@@ -57,6 +57,7 @@ class LoCoMoAdapter(BenchmarkAdapter):
                 if not isinstance(turn, dict):
                     continue
                 speaker = str(turn.get("speaker", ""))
+                metadata = self._turn_metadata(turn)
                 turns.append(
                     BenchmarkTurn(
                         role=speaker_roles.get(speaker, "user"),
@@ -68,6 +69,12 @@ class LoCoMoAdapter(BenchmarkAdapter):
                             str(turn.get("dia_id"))
                             if turn.get("dia_id") is not None
                             else None
+                        ),
+                        metadata=metadata,
+                        attachments=self._turn_attachments(
+                            turn,
+                            metadata,
+                            session_timestamp=session_timestamp,
                         ),
                     )
                 )
@@ -161,6 +168,86 @@ class LoCoMoAdapter(BenchmarkAdapter):
             except ValueError:
                 continue
         return raw_value
+
+    @staticmethod
+    def _turn_metadata(turn: dict[str, Any]) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        for key in ("dia_id", "img_url", "blip_caption", "query", "re-download"):
+            if key in turn:
+                metadata[key] = turn[key]
+        return metadata
+
+    @staticmethod
+    def _turn_attachments(
+        turn: dict[str, Any],
+        metadata: dict[str, Any],
+        *,
+        session_timestamp: str,
+    ) -> list[dict[str, Any]]:
+        raw_urls = turn.get("img_url")
+        urls: list[str] = []
+        if isinstance(raw_urls, list):
+            urls = [str(url).strip() for url in raw_urls if str(url).strip()]
+        elif isinstance(raw_urls, str) and raw_urls.strip():
+            urls = [raw_urls.strip()]
+        caption = str(turn.get("blip_caption") or "").strip()
+        if not urls and not caption:
+            return []
+        turn_id = str(turn.get("dia_id") or "").strip()
+        source_text = str(turn.get("text") or "").strip()
+        speaker = str(turn.get("speaker") or "").strip()
+        caption_text = LoCoMoAdapter._attachment_caption_text(
+            caption=caption,
+            speaker=speaker,
+            source_text=source_text,
+            session_timestamp=session_timestamp,
+        )
+        attachments: list[dict[str, Any]] = []
+        for index, url in enumerate(urls or [""], start=1):
+            attachment_metadata = {
+                "source": "locomo",
+                "caption_kind": "blip_caption",
+                "turn_id": turn_id or None,
+                "image_index": index,
+                "locomo_metadata": metadata,
+            }
+            attachments.append(
+                {
+                    "kind": "image",
+                    "content_text": caption_text,
+                    "url": url or None,
+                    "title": (
+                        f"LoCoMo image caption {turn_id}"
+                        if turn_id
+                        else "LoCoMo image caption"
+                    ),
+                    "metadata": attachment_metadata,
+                    "privacy_level": 0,
+                    "preserve_verbatim": bool(caption),
+                    "skip_raw_by_default": False,
+                    "requires_explicit_request": False,
+                }
+            )
+        return attachments
+
+    @staticmethod
+    def _attachment_caption_text(
+        *,
+        caption: str,
+        speaker: str,
+        source_text: str,
+        session_timestamp: str,
+    ) -> str | None:
+        if not caption:
+            return None
+        lines = [f"Visual description of attached image: {caption}"]
+        if speaker:
+            lines.append(f"Associated message speaker: {speaker}")
+        if source_text:
+            lines.append(f"Associated message text: {source_text}")
+        if session_timestamp:
+            lines.append(f"Associated message timestamp: {session_timestamp}")
+        return "\n".join(lines)
 
     @staticmethod
     def _stringify_value(value: Any) -> str:

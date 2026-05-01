@@ -199,16 +199,10 @@ def _settings(tmp_path: Path) -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="openai/reply-test-model",
         llm_ingest_model="openai/extract-test-model",
         llm_retrieval_model="openai/score-test-model",
@@ -221,6 +215,7 @@ def _settings(tmp_path: Path) -> Settings:
         debug=False,
         allow_insecure_http=True,
         small_corpus_token_threshold_ratio=0.0,
+        topic_working_set_enabled=False,
     )
 
 

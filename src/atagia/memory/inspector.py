@@ -41,6 +41,7 @@ class _InspectionRepository(BaseRepository):
         object_type: str | None,
         scope: str | None,
         status: str | None,
+        intimacy_boundary: str | None,
         limit: int,
     ) -> list[dict[str, Any]]:
         clauses = ["user_id = ?"]
@@ -54,6 +55,9 @@ class _InspectionRepository(BaseRepository):
         if status is not None:
             clauses.append("status = ?")
             parameters.append(status)
+        if intimacy_boundary is not None:
+            clauses.append("intimacy_boundary = ?")
+            parameters.append(intimacy_boundary)
         parameters.append(limit)
         return await self._fetch_all(
             """
@@ -69,7 +73,10 @@ class _InspectionRepository(BaseRepository):
     async def list_belief_history(self, belief_id: str, user_id: str) -> list[dict[str, Any]]:
         return await self._fetch_all(
             """
-            SELECT bv.*
+            SELECT
+                bv.*,
+                mo.intimacy_boundary AS parent_intimacy_boundary,
+                mo.intimacy_boundary_confidence AS parent_intimacy_boundary_confidence
             FROM belief_versions AS bv
             JOIN memory_objects AS mo ON mo.id = bv.belief_id
             WHERE bv.belief_id = ?
@@ -96,8 +103,14 @@ class _InspectionRepository(BaseRepository):
             SELECT
                 cc.*,
                 action.canonical_text AS action_canonical_text,
+                action.intimacy_boundary AS action_intimacy_boundary,
+                action.intimacy_boundary_confidence AS action_intimacy_boundary_confidence,
                 outcome.canonical_text AS outcome_canonical_text,
-                tendency.canonical_text AS tendency_canonical_text
+                outcome.intimacy_boundary AS outcome_intimacy_boundary,
+                outcome.intimacy_boundary_confidence AS outcome_intimacy_boundary_confidence,
+                tendency.canonical_text AS tendency_canonical_text,
+                tendency.intimacy_boundary AS tendency_intimacy_boundary,
+                tendency.intimacy_boundary_confidence AS tendency_intimacy_boundary_confidence
             FROM consequence_chains AS cc
             JOIN memory_objects AS action ON action.id = cc.action_memory_id
             JOIN memory_objects AS outcome ON outcome.id = cc.outcome_memory_id
@@ -181,6 +194,7 @@ class MemoryInspector:
         object_type: str | None = None,
         scope: str | None = None,
         status: str | None = None,
+        intimacy_boundary: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         memories = await self._inspection_repository.list_memories(
@@ -188,6 +202,7 @@ class MemoryInspector:
             object_type=object_type,
             scope=scope,
             status=status,
+            intimacy_boundary=intimacy_boundary,
             limit=limit,
         )
         await self._audit_repository.create_audit_entry(
@@ -200,6 +215,7 @@ class MemoryInspector:
                 "object_type": object_type,
                 "scope": scope,
                 "status": status,
+                "intimacy_boundary": intimacy_boundary,
                 "limit": limit,
                 "result_count": len(memories),
             },

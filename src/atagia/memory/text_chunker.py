@@ -137,6 +137,7 @@ class TextChunker:
         text: str,
         *,
         threshold_tokens: int = CHUNKING_THRESHOLD_TOKENS,
+        metadata: dict[str, Any] | None = None,
     ) -> ChunkingPlan:
         normalized = self._normalize_text(text)
         if not normalized:
@@ -164,7 +165,7 @@ class TextChunker:
                 )
                 continue
             try:
-                for chunk_text in await self.chunk_with_ai_level1(segment):
+                for chunk_text in await self.chunk_with_ai_level1(segment, metadata=metadata):
                     chunks.append(TextChunk(text=chunk_text, chunking_strategy="level1"))
             except Level1ChunkingError as exc:
                 fallback_count += 1
@@ -199,7 +200,12 @@ class TextChunker:
             fallback_count=fallback_count,
         )
 
-    async def chunk_with_ai_level1(self, text: str) -> list[str]:
+    async def chunk_with_ai_level1(
+        self,
+        text: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[str]:
         markers = self._build_markers(text)
         if not markers:
             raise Level1ChunkingError("insufficient_markers")
@@ -208,7 +214,13 @@ class TextChunker:
         window_chars = LEVEL1_WINDOW_TOKENS * 4
         overlap_chars = max(1, LEVEL1_OVERLAP_MARKERS * LEVEL1_MARKER_INTERVAL * 4)
         for window_text in self._window_marked_text(marked_text, window_chars, overlap_chars):
-            cut_marker_ids.update(await self._request_level1_cuts(window_text, attempts=1))
+            cut_marker_ids.update(
+                await self._request_level1_cuts(
+                    window_text,
+                    attempts=1,
+                    metadata=metadata,
+                )
+            )
         return self._validate_and_create_chunks(text, markers, cut_marker_ids)
 
     @staticmethod
@@ -362,6 +374,7 @@ class TextChunker:
         marked_text: str,
         *,
         attempts: int,
+        metadata: dict[str, Any] | None = None,
     ) -> list[str]:
         request = LLMCompletionRequest(
             model=self._model,
@@ -382,7 +395,7 @@ class TextChunker:
             ],
             temperature=0.0,
             max_output_tokens=TEXT_CHUNKER_MAX_OUTPUT_TOKENS,
-            metadata={"purpose": "text_chunking_level1"},
+            metadata={"purpose": "text_chunking_level1", **(metadata or {})},
         )
         response = await self._llm_client.complete(request)
         raw_response = response.output_text

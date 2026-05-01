@@ -20,6 +20,7 @@ from atagia.memory.context_composer import ContextComposer
 from atagia.models.schemas_memory import (
     DetectedNeed,
     ExtractionConversationContext,
+    IntimacyBoundary,
     MemoryObjectType,
     MemoryScope,
     MemorySourceKind,
@@ -239,16 +240,10 @@ def _settings(*, small_corpus_token_threshold_ratio: float = 0.0) -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
         service_mode=False,
         service_api_key=None,
@@ -404,7 +399,7 @@ def _candidate_record(
             "fts": 1 if rrf_score > 0.0 else None,
             "embedding": None,
             "consequence": None,
-            "raw_message": None,
+            "verbatim_evidence_search": None,
         },
         "matched_sub_queries": ["What was the root cause of the outage?"],
         "retrieval_sources": retrieval_sources or ["fts"],
@@ -489,6 +484,152 @@ async def test_pipeline_executes_full_flow() -> None:
             "context_composition",
         }.issubset(result.stage_timings)
         assert all(value >= 0.0 for value in result.stage_timings.values())
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_expands_broad_list_candidates_from_retrieved_source_message() -> None:
+    message_text = "Which details were part of the campaign?"
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["launch promotion"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "launch promotion",
+                    "fts_phrase": "launch promotion",
+                }
+            ],
+            "query_type": "broad_list",
+            "retrieval_levels": [0],
+        },
+        score_map={
+            "mem_matched": 0.72,
+            "mem_source_sibling": 0.91,
+        },
+    )
+    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
+        provider=provider
+    )
+    try:
+        source_payload = {"source_message_ids": ["msg_campaign"]}
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="The launch promotion included a store-opening announcement.",
+            payload=source_payload,
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            memory_id="mem_matched",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Red hoodie video frame.",
+            payload=source_payload,
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            memory_id="mem_source_sibling",
+        )
+
+        result = await pipeline.execute(
+            message_text=message_text,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": message_text}],
+        )
+
+        raw_ids = [candidate["id"] for candidate in result.raw_candidates]
+        assert raw_ids == ["mem_matched", "mem_source_sibling"]
+        sibling = next(
+            candidate for candidate in result.raw_candidates if candidate["id"] == "mem_source_sibling"
+        )
+        assert sibling["retrieval_sources"] == ["source_neighbor"]
+        assert sibling["coverage_source_message_id"] == "msg_campaign"
+        assert "mem_source_sibling" in _score_request_memory_ids(provider)
+        assert result.stage_timings["coverage_candidate_expansion"] >= 0.0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_filters_intimacy_boundary_during_source_message_expansion() -> None:
+    message_text = "Which details were part of the campaign?"
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["launch promotion"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "launch promotion",
+                    "fts_phrase": "launch promotion",
+                }
+            ],
+            "query_type": "broad_list",
+            "retrieval_levels": [0],
+        },
+        score_map={"mem_matched": 0.72, "mem_private_sibling": 0.99},
+    )
+    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
+        provider=provider
+    )
+    try:
+        source_payload = {"source_message_ids": ["msg_campaign"]}
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="The launch promotion included a store-opening announcement.",
+            payload=source_payload,
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            memory_id="mem_matched",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Private source-neighbor continuity.",
+            payload=source_payload,
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+            intimacy_boundary_confidence=0.9,
+            memory_id="mem_private_sibling",
+        )
+
+        result = await pipeline.execute(
+            message_text=message_text,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": message_text}],
+        )
+
+        assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_matched"]
+        assert "mem_private_sibling" not in _score_request_memory_ids(provider)
     finally:
         await connection.close()
 
@@ -1126,7 +1267,7 @@ async def test_pipeline_small_corpus_shortcut_sets_trace_flag() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_small_corpus_exact_recall_includes_raw_message_windows() -> None:
+async def test_pipeline_small_corpus_exact_recall_includes_verbatim_evidence_search_windows() -> None:
     from atagia.core.repositories import MessageRepository
 
     provider = PipelineProvider(
@@ -1183,11 +1324,85 @@ async def test_pipeline_small_corpus_exact_recall_includes_raw_message_windows()
 
         assert result.small_corpus_mode is True
         assert trace.candidate_search is not None
-        assert trace.candidate_search.raw_message_candidates_count >= 1
+        assert trace.candidate_search.verbatim_evidence_search_candidates_count >= 1
         assert any(
-            candidate.get("is_raw_message_window")
+            candidate.get("is_verbatim_evidence_window")
             for candidate in result.raw_candidates
         )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_backfills_source_quote_for_selected_memory_source_message() -> None:
+    from atagia.core.repositories import MessageRepository
+
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["Jon banker job"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "Jon banker job",
+                    "fts_phrase": "Jon banker job",
+                }
+            ],
+            "query_type": "temporal",
+            "retrieval_levels": [0],
+            "exact_recall_needed": True,
+            "exact_facets": ["date"],
+        },
+        score_map={"mem_job_loss": 0.95},
+    )
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        mode_id="general_qa",
+        provider=provider,
+    )
+    try:
+        messages = MessageRepository(
+            connection,
+            FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)),
+        )
+        await messages.create_message(
+            message_id="msg_source",
+            conversation_id="cnv_1",
+            role="user",
+            seq=None,
+            text="Jon: Lost my job as a banker yesterday, so I'm gonna take a shot at starting my own business.",
+            occurred_at="2023-01-20T16:04:00+00:00",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="general_qa",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Jon is no longer in a secure banker job and is starting a business.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            payload={
+                "source_message_ids": ["msg_source"],
+                "source_message_window_start_occurred_at": "2023-01-20T16:04:00+00:00",
+                "source_message_window_end_occurred_at": "2023-01-20T16:04:00+00:00",
+            },
+            memory_id="mem_job_loss",
+        )
+
+        result = await pipeline.execute(
+            message_text="When did Jon lose his job as a banker?",
+            conversation_context=context.model_copy(update={"assistant_mode_id": "general_qa"}),
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "When did Jon lose his job as a banker?"},
+            ],
+        )
+
+        assert "mem_job_loss" in result.composed_context.selected_memory_ids
+        assert "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 1: Jon: Lost my job as a banker yesterday" in result.composed_context.memory_block
     finally:
         await connection.close()
 
@@ -1762,11 +1977,11 @@ def test_ambiguity_recovery_expands_scoring_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_raw_message_channel_contributes_to_exact_recall_trace() -> None:
+async def test_pipeline_verbatim_evidence_search_enabled_contributes_to_exact_recall_trace() -> None:
     """End-to-end Wave 1 batch 2 (1-C + 1-D): raw evidence reaches the trace.
 
     The need detector surfaces exact recall, the planner propagates it,
-    the candidate search attaches the raw_message channel, and the
+    the candidate search attaches the verbatim_evidence_search channel, and the
     trace records how many candidates came from raw evidence.
     """
     from atagia.core.repositories import MessageRepository
@@ -1835,13 +2050,13 @@ async def test_pipeline_raw_message_channel_contributes_to_exact_recall_trace() 
         assert trace.need_detection.exact_recall_needed is True
         assert "quantity" in trace.need_detection.exact_facets
         assert trace.candidate_search is not None
-        assert trace.candidate_search.raw_message_candidates_count >= 1
-        raw_windows = [
+        assert trace.candidate_search.verbatim_evidence_search_candidates_count >= 1
+        evidence_windows = [
             candidate
             for candidate in result.raw_candidates
-            if candidate.get("is_raw_message_window")
+            if candidate.get("is_verbatim_evidence_window")
         ]
-        assert raw_windows, "raw message window should reach the raw_candidates list"
+        assert evidence_windows, "verbatim evidence search window should reach the raw_candidates list"
     finally:
         await connection.close()
 

@@ -92,4 +92,7 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         default_thinking_level="none",
         extra_body={"reasoning": {}},
     ),
+    "openrouter/z-ai/glm-4.6": ModelProfile(),
+    "openrouter/x-ai/grok-4.1-fast": ModelProfile(),
+    "openrouter/x-ai/grok-4-fast": ModelProfile(),
 }

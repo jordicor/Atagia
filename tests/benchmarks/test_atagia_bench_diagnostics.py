@@ -5,7 +5,7 @@ from __future__ import annotations
 from benchmarks.atagia_bench.adapter import AtagiaBenchQuestion
 from benchmarks.atagia_bench.graders import GradeResult
 from benchmarks.atagia_bench.runner import AtagiaBenchRunner, AtagiaQuestionResult
-from benchmarks.trusted_eval import trusted_evaluation_ablation
+from benchmarks.trusted_eval import TRUSTED_EVALUATION_PROMPT_NOTE, trusted_evaluation_ablation
 from atagia.models.schemas_memory import RetrievalTrace
 from atagia.models.schemas_replay import AblationConfig
 
@@ -163,6 +163,13 @@ def test_trusted_evaluation_ablation_preserves_existing_overrides() -> None:
         "max_candidates": 10,
         "privacy_ceiling": 3,
     }
+
+
+def test_trusted_evaluation_prompt_preserves_secret_refusal_policy() -> None:
+    assert "does not override the ordinary high-risk chat disclosure policy" in (
+        TRUSTED_EVALUATION_PROMPT_NOTE
+    )
+    assert "continue withholding raw secret literals" in TRUSTED_EVALUATION_PROMPT_NOTE
 
 
 def test_filter_questions_accepts_category_and_question_id() -> None:

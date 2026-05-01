@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 from pydantic import BaseModel
 
-from atagia.models.schemas_memory import ExtractionResult
+from atagia.models.schemas_memory import ExtractionResult, IntimacyBoundary
 from atagia.services.llm_client import (
     ConfigurationError,
     LLMClient,
@@ -18,6 +16,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMEmbeddingVector,
     LLMMessage,
+    LLMPolicyBlockedError,
     LLMProvider,
     LLMStreamEvent,
     OutputLimitExceededError,
@@ -175,6 +174,59 @@ class MidStreamFailureProvider(LLMProvider):
         raise TransientLLMError("stream interrupted")
 
 
+class PostDoneLimitProvider(LLMProvider):
+    name = "post-done-limit"
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        return LLMCompletionResponse(provider=self.name, model=request.model)
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        return LLMEmbeddingResponse(
+            provider=self.name,
+            model=request.model,
+            vectors=[LLMEmbeddingVector(index=0, values=[0.1])],
+        )
+
+    async def stream(self, request: LLMCompletionRequest):
+        yield LLMStreamEvent(type="text", content="partial")
+        yield LLMStreamEvent(type="done", payload={"usage": {"completion_tokens": 2}})
+        raise OutputLimitExceededError("hit max output tokens")
+
+
+class ClosingStreamProvider(LLMProvider):
+    name = "closing-stream"
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        return LLMCompletionResponse(provider=self.name, model=request.model)
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        return LLMEmbeddingResponse(
+            provider=self.name,
+            model=request.model,
+            vectors=[LLMEmbeddingVector(index=0, values=[0.1])],
+        )
+
+    async def stream(self, request: LLMCompletionRequest):
+        try:
+            yield LLMStreamEvent(type="text", content="partial")
+            yield LLMStreamEvent(type="text", content="unreachable")
+        finally:
+            self.closed = True
+
+
+class AbortObserver:
+    async def on_text(
+        self,
+        _chunk: str,
+        _accumulated_text: str,
+        _request: LLMCompletionRequest,
+    ) -> None:
+        raise RuntimeError("observer abort")
+
+
 class RecordingProvider(LLMProvider):
     def __init__(self, name: str) -> None:
         self.name = name
@@ -190,6 +242,12 @@ class RecordingProvider(LLMProvider):
             model=request.model,
             vectors=[LLMEmbeddingVector(index=0, values=[0.1])],
         )
+
+
+class PolicyBlockingProvider(RecordingProvider):
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.requests.append(request)
+        raise LLMPolicyBlockedError("provider blocked the response (finish_reason=content_filter)")
 
 
 def _request() -> LLMCompletionRequest:
@@ -212,6 +270,191 @@ async def test_complete_retries_transient_errors() -> None:
 
     assert response.output_text == "final answer"
     assert provider.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_complete_uses_intimacy_fallback_for_policy_block() -> None:
+    primary = PolicyBlockingProvider("openai")
+    fallback = RecordingProvider("openrouter")
+    client = LLMClient(
+        providers=[primary, fallback],
+        intimacy_fallback_models={"extractor": "openrouter/z-ai/glm-4.6"},
+    )
+
+    response = await client.complete(
+        LLMCompletionRequest(
+            model="openai/gpt-5-mini",
+            messages=[LLMMessage(role="user", content="hello")],
+            metadata={"purpose": "memory_extraction"},
+        )
+    )
+
+    assert response.output_text == "ok"
+    assert primary.requests[0].model == "gpt-5-mini"
+    assert fallback.requests[0].model == "z-ai/glm-4.6"
+    assert fallback.requests[0].metadata["atagia_intimacy_fallback_used"] is True
+    assert fallback.requests[0].metadata["atagia_intimacy_primary_model"] == "openai/gpt-5-mini"
+    assert fallback.requests[0].metadata["atagia_component_id"] == "extractor"
+
+
+@pytest.mark.asyncio
+async def test_complete_proactively_uses_intimacy_model_for_known_context() -> None:
+    primary = RecordingProvider("openai")
+    fallback = RecordingProvider("openrouter")
+    client = LLMClient(
+        providers=[primary, fallback],
+        intimacy_fallback_models={"extractor": "openrouter/z-ai/glm-4.6"},
+        intimacy_proactive_routing_enabled=True,
+    )
+
+    response = await client.complete(
+        LLMCompletionRequest(
+            model="openai/gpt-5-mini",
+            messages=[LLMMessage(role="user", content="hello")],
+            metadata={
+                "purpose": "memory_extraction",
+                "source_intimacy_boundary": "romantic_private",
+            },
+        )
+    )
+
+    assert response.output_text == "ok"
+    assert primary.requests == []
+    assert fallback.requests[0].model == "z-ai/glm-4.6"
+    assert fallback.requests[0].metadata["atagia_intimacy_proactive_route"] is True
+    assert fallback.requests[0].metadata["atagia_intimacy_primary_model"] == "openai/gpt-5-mini"
+
+
+@pytest.mark.asyncio
+async def test_complete_does_not_proactively_route_without_setting() -> None:
+    primary = RecordingProvider("openai")
+    fallback = RecordingProvider("openrouter")
+    client = LLMClient(
+        providers=[primary, fallback],
+        intimacy_fallback_models={"extractor": "openrouter/z-ai/glm-4.6"},
+    )
+
+    await client.complete(
+        LLMCompletionRequest(
+            model="openai/gpt-5-mini",
+            messages=[LLMMessage(role="user", content="hello")],
+            metadata={
+                "purpose": "memory_extraction",
+                "source_intimacy_boundary": "romantic_private",
+            },
+        )
+    )
+
+    assert primary.requests[0].model == "gpt-5-mini"
+    assert fallback.requests == []
+
+
+@pytest.mark.asyncio
+async def test_complete_does_not_use_intimacy_fallback_for_non_policy_error() -> None:
+    class FailingProvider(RecordingProvider):
+        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+            self.requests.append(request)
+            raise LLMError("ordinary provider failure")
+
+    primary = FailingProvider("openai")
+    fallback = RecordingProvider("openrouter")
+    client = LLMClient(
+        providers=[primary, fallback],
+        intimacy_fallback_models={"extractor": "openrouter/z-ai/glm-4.6"},
+    )
+
+    with pytest.raises(LLMError, match="ordinary provider failure"):
+        await client.complete(
+            LLMCompletionRequest(
+                model="openai/gpt-5-mini",
+                messages=[LLMMessage(role="user", content="hello")],
+                metadata={"purpose": "memory_extraction"},
+            )
+        )
+
+    assert len(primary.requests) == 1
+    assert fallback.requests == []
+
+
+@pytest.mark.asyncio
+async def test_complete_does_not_use_intimacy_fallback_for_generic_refusal_word() -> None:
+    class FailingProvider(RecordingProvider):
+        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+            self.requests.append(request)
+            raise LLMError("ordinary refusal counter update failed")
+
+    primary = FailingProvider("openai")
+    fallback = RecordingProvider("openrouter")
+    client = LLMClient(
+        providers=[primary, fallback],
+        intimacy_fallback_models={"extractor": "openrouter/z-ai/glm-4.6"},
+    )
+
+    with pytest.raises(LLMError, match="ordinary refusal counter"):
+        await client.complete(
+            LLMCompletionRequest(
+                model="openai/gpt-5-mini",
+                messages=[LLMMessage(role="user", content="hello")],
+                metadata={"purpose": "memory_extraction"},
+            )
+        )
+
+    assert len(primary.requests) == 1
+    assert fallback.requests == []
+
+
+@pytest.mark.asyncio
+async def test_stream_uses_intimacy_fallback_for_pre_output_policy_block() -> None:
+    primary = PolicyBlockingProvider("openai")
+    fallback = RecordingProvider("openrouter")
+    client = LLMClient(
+        providers=[primary, fallback],
+        intimacy_fallback_models={"extractor": "openrouter/z-ai/glm-4.6"},
+    )
+
+    events = [
+        event
+        async for event in client.stream(
+            LLMCompletionRequest(
+                model="openai/gpt-5-mini",
+                messages=[LLMMessage(role="user", content="hello")],
+                metadata={"purpose": "memory_extraction"},
+            )
+        )
+    ]
+
+    assert [event.type for event in events] == ["text", "done"]
+    assert events[0].content == "ok"
+    assert primary.requests[0].model == "gpt-5-mini"
+    assert fallback.requests[0].model == "z-ai/glm-4.6"
+    assert fallback.requests[0].metadata["atagia_intimacy_fallback_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_complete_streamed_proactively_routes_known_intimacy_enum_boundary() -> None:
+    primary = RecordingProvider("openai")
+    fallback = RecordingProvider("openrouter")
+    client = LLMClient(
+        providers=[primary, fallback],
+        intimacy_fallback_models={"extractor": "openrouter/z-ai/glm-4.6"},
+        intimacy_proactive_routing_enabled=True,
+    )
+
+    response = await client.complete_streamed(
+        LLMCompletionRequest(
+            model="openai/gpt-5-mini",
+            messages=[LLMMessage(role="user", content="hello")],
+            metadata={
+                "purpose": "memory_extraction",
+                "source_intimacy_boundary": IntimacyBoundary.ROMANTIC_PRIVATE,
+            },
+        )
+    )
+
+    assert response.output_text == "ok"
+    assert primary.requests == []
+    assert fallback.requests[0].model == "z-ai/glm-4.6"
+    assert fallback.requests[0].metadata["atagia_intimacy_proactive_route"] is True
 
 
 @pytest.mark.asyncio
@@ -509,6 +752,52 @@ async def test_stream_does_not_retry_after_partial_output() -> None:
     with pytest.raises(TransientLLMError):
         await anext(stream)
     assert provider.stream_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_streamed_propagates_error_after_done_event() -> None:
+    provider = PostDoneLimitProvider()
+    client = LLMClient(provider_name=provider.name, providers=[provider])
+
+    with pytest.raises(OutputLimitExceededError, match="max output tokens"):
+        await client.complete_streamed(_request())
+
+
+@pytest.mark.asyncio
+async def test_complete_streamed_closes_stream_on_observer_abort() -> None:
+    provider = ClosingStreamProvider()
+    client = LLMClient(provider_name=provider.name, providers=[provider])
+
+    with pytest.raises(RuntimeError, match="observer abort"):
+        await client.complete_streamed(_request(), observer=AbortObserver())
+
+    assert provider.closed is True
+
+
+@pytest.mark.asyncio
+async def test_complete_structured_streamed_parses_json_payload() -> None:
+    provider = JsonProvider('{"label":"ok","score":9}')
+    client = LLMClient(provider_name="json", providers=[provider])
+
+    payload = await client.complete_structured_streamed(_request(), StructuredPayload)
+
+    assert payload.label == "ok"
+    assert payload.score == 9
+
+
+@pytest.mark.asyncio
+async def test_complete_structured_streamed_preserves_schema_fallback() -> None:
+    provider = GrammarFallbackProvider()
+    client = LLMClient(provider_name=provider.name, providers=[provider])
+
+    payload = await client.complete_structured_streamed(
+        _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()}),
+        StructuredPayload,
+    )
+
+    assert payload.label == "ok"
+    assert payload.score == 9
+    assert provider.seen_response_schema == [True, False]
 
 
 def test_output_limit_exceeded_error_is_subclass_of_llm_error() -> None:

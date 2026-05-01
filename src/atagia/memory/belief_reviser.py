@@ -18,8 +18,13 @@ from atagia.core.config import Settings
 from atagia.core.llm_output_limits import BELIEF_REVISER_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import MemoryObjectRepository
 from atagia.memory.intent_classifier import are_claim_keys_equivalent
+from atagia.memory.intimacy_boundary_policy import (
+    minimum_privacy_for_intimacy_boundary,
+    strongest_intimacy_boundary,
+)
 from atagia.memory.scope_utils import resolve_scope_identifiers
 from atagia.models.schemas_memory import (
+    IntimacyBoundary,
     MemoryObjectType,
     MemoryScope,
     MemorySourceKind,
@@ -27,7 +32,12 @@ from atagia.models.schemas_memory import (
 )
 from atagia.services.embedding_payloads import build_embedding_upsert_payload
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMMessage,
+    known_intimacy_context_metadata,
+)
 from atagia.services.model_resolution import resolve_component_model
 
 STABILITY_DELTA_PER_EVIDENCE = 0.03
@@ -148,6 +158,7 @@ class _PendingEmbeddingUpsert:
     canonical_text: str
     index_text: str | None
     privacy_level: int
+    intimacy_boundary: str
     preserve_verbatim: bool
     user_id: str
     object_type: str
@@ -307,6 +318,7 @@ class BeliefReviser:
                 result = await self._apply_split_by_mode(
                     belief_row=belief_row,
                     current_version=current_version,
+                    new_evidence=new_evidence,
                     context=revision_context,
                     decision=decision,
                     explanation=decision.explanation,
@@ -317,6 +329,7 @@ class BeliefReviser:
                 result = await self._apply_split_by_scope(
                     belief_row=belief_row,
                     current_version=current_version,
+                    new_evidence=new_evidence,
                     context=revision_context,
                     decision=decision,
                     explanation=decision.explanation,
@@ -390,6 +403,10 @@ class BeliefReviser:
                 "conversation_id": context.conversation_id,
                 "assistant_mode_id": context.assistant_mode_id,
                 "purpose": "belief_revision",
+                **self._intimacy_metadata_from_rows(
+                    [belief_row, *new_evidence],
+                    reason="belief_revision_source_intimacy_boundary",
+                ),
             },
         )
         return await self._llm_client.complete_structured(request, RevisionDecision)
@@ -571,6 +588,7 @@ class BeliefReviser:
             support_count=int(current_version["support_count"]) + max(1, len(new_evidence)),
             contradict_count=int(current_version["contradict_count"]),
             condition={},
+            source_rows=[belief_row, *new_evidence],
         )
         await self._connection.execute(
             """
@@ -608,6 +626,7 @@ class BeliefReviser:
         *,
         belief_row: dict[str, Any],
         current_version: dict[str, Any],
+        new_evidence: list[dict[str, Any]],
         context: RevisionContext,
         decision: RevisionDecision,
         explanation: str,
@@ -627,6 +646,7 @@ class BeliefReviser:
             support_count=max(1, int(current_version["support_count"])),
             contradict_count=int(current_version["contradict_count"]),
             condition={"mode": context.assistant_mode_id},
+            source_rows=[belief_row, *new_evidence],
         )
         await self._archive_belief(str(belief_row["id"]), context.user_id)
         await self._belief_repository.create_memory_link(
@@ -651,6 +671,7 @@ class BeliefReviser:
         *,
         belief_row: dict[str, Any],
         current_version: dict[str, Any],
+        new_evidence: list[dict[str, Any]],
         context: RevisionContext,
         decision: RevisionDecision,
         explanation: str,
@@ -670,6 +691,7 @@ class BeliefReviser:
             support_count=max(1, int(current_version["support_count"])),
             contradict_count=int(current_version["contradict_count"]),
             condition={"scope": context.scope.value},
+            source_rows=[belief_row, *new_evidence],
         )
         await self._archive_belief(str(belief_row["id"]), context.user_id)
         await self._belief_repository.create_memory_link(
@@ -724,6 +746,7 @@ class BeliefReviser:
             contradict_count=0,
             condition={},
             valid_from=now,
+            source_rows=[belief_row, *new_evidence],
         )
         await self._belief_repository.create_memory_link(
             source_id=str(successor["id"]),
@@ -765,6 +788,7 @@ class BeliefReviser:
             support_count=1,
             contradict_count=0,
             condition=self._exception_condition(context),
+            source_rows=[belief_row, *new_evidence],
         )
         await self._belief_repository.create_memory_link(
             source_id=str(exception["id"]),
@@ -814,11 +838,21 @@ class BeliefReviser:
         contradict_count: int,
         condition: dict[str, Any],
         valid_from: str | None = None,
+        source_rows: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         payload = dict(base_belief.get("payload_json") or {})
         payload["claim_key"] = claim_key
         payload["claim_value"] = claim_value
         payload["source_message_ids"] = [source_message_id]
+        policy_rows = source_rows if source_rows is not None else [base_belief]
+        intimacy_boundary = strongest_intimacy_boundary(policy_rows)
+        intimacy_boundary_confidence = max(
+            (
+                float(row.get("intimacy_boundary_confidence", 0.0) or 0.0)
+                for row in policy_rows
+            ),
+            default=0.0,
+        )
         scope_identifiers = resolve_scope_identifiers(
             scope,
             assistant_mode_id=assistant_mode_id,
@@ -847,7 +881,12 @@ class BeliefReviser:
             stability=float(base_belief["stability"]),
             vitality=float(base_belief["vitality"]),
             maya_score=float(base_belief["maya_score"]),
-            privacy_level=int(base_belief["privacy_level"]),
+            privacy_level=minimum_privacy_for_intimacy_boundary(
+                intimacy_boundary,
+                privacy_level=int(base_belief["privacy_level"]),
+            ),
+            intimacy_boundary=intimacy_boundary,
+            intimacy_boundary_confidence=intimacy_boundary_confidence,
             preserve_verbatim=bool(int(base_belief.get("preserve_verbatim", 0))),
             status=MemoryStatus.ACTIVE,
             valid_from=valid_from,
@@ -907,6 +946,7 @@ class BeliefReviser:
                     else None
                 ),
                 privacy_level=int(belief_row.get("privacy_level", 0)),
+                intimacy_boundary=str(belief_row.get("intimacy_boundary") or "ordinary"),
                 preserve_verbatim=bool(int(belief_row.get("preserve_verbatim", 0))),
                 user_id=str(belief_row["user_id"]),
                 object_type=str(belief_row["object_type"]),
@@ -929,6 +969,7 @@ class BeliefReviser:
                     canonical_text=pending.canonical_text,
                     index_text=pending.index_text,
                     privacy_level=pending.privacy_level,
+                    intimacy_boundary=pending.intimacy_boundary,
                     preserve_verbatim=pending.preserve_verbatim,
                 )
                 await self._embedding_index.upsert(
@@ -989,6 +1030,28 @@ class BeliefReviser:
     @staticmethod
     def _json_text(value: Any) -> str:
         return json_utils.dumps(value, sort_keys=True)
+
+    @staticmethod
+    def _intimacy_metadata_from_rows(
+        rows: list[dict[str, Any]],
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        boundary = strongest_intimacy_boundary(rows)
+        if boundary is IntimacyBoundary.ORDINARY:
+            return {}
+        confidence = max(
+            (
+                float(row.get("intimacy_boundary_confidence", 0.0) or 0.0)
+                for row in rows
+            ),
+            default=0.0,
+        )
+        return known_intimacy_context_metadata(
+            reason=reason,
+            boundary=boundary.value,
+            confidence=confidence,
+        )
 
     def _timestamp(self) -> str:
         return self._clock.now().isoformat()

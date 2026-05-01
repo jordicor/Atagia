@@ -115,16 +115,10 @@ def _settings(*, small_corpus_token_threshold_ratio: float = 0.0) -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
         service_mode=False,
         service_api_key=None,
@@ -133,7 +127,7 @@ def _settings(*, small_corpus_token_threshold_ratio: float = 0.0) -> Settings:
         debug=False,
         allow_insecure_http=True,
         small_corpus_token_threshold_ratio=small_corpus_token_threshold_ratio,
-        raw_message_channel=False,
+        verbatim_evidence_search_enabled=False,
     )
 
 
@@ -488,7 +482,7 @@ async def test_summary_support_promotion_filters_ineligible_fetched_support_rows
             },
         )
         summary["rrf_score"] = 1.0
-        summary["channel_ranks"] = {"fts": 1, "embedding": None, "consequence": None, "raw_message": None}
+        summary["channel_ranks"] = {"fts": 1, "embedding": None, "consequence": None, "verbatim_evidence_search": None}
         summary["matched_sub_queries"] = [_QUERY]
         summary["retrieval_sources"] = ["fts"]
 

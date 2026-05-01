@@ -44,6 +44,8 @@ from atagia.services.llm_client import (
     LLMEmbeddingRequest,
     LLMEmbeddingResponse,
     LLMProvider,
+    LLMStreamEvent,
+    OutputLimitExceededError,
     StructuredOutputError,
 )
 from atagia.services.privacy_filter_client import PrivacyFilterDetection, PrivacyFilterSpan
@@ -131,16 +133,10 @@ def _settings(**overrides: object) -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
         service_mode=False,
         service_api_key=None,
@@ -273,6 +269,86 @@ class SequencedExtractionProvider(LLMProvider):
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError("Embeddings are not used by the extractor tests")
+
+
+class OutputLimitThenBoundedProvider(LLMProvider):
+    name = "output-limit-then-bounded"
+
+    def __init__(
+        self,
+        bounded_payload: dict[str, object],
+    ) -> None:
+        self.bounded_payload = _with_default_language_codes(bounded_payload)
+        self.requests: list[LLMCompletionRequest] = []
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.requests.append(request)
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text=json.dumps(self.bounded_payload),
+        )
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        raise AssertionError("Embeddings are not used by the extractor tests")
+
+    async def stream(self, request: LLMCompletionRequest):
+        self.requests.append(request)
+        yield LLMStreamEvent(type="text", content='{"evidences": [')
+        yield LLMStreamEvent(type="done", payload={"usage": {"completion_tokens": 4}})
+        raise OutputLimitExceededError("hit max output tokens")
+
+
+class WatchdogAbortProvider(LLMProvider):
+    name = "watchdog-abort"
+
+    def __init__(self, bounded_payload: dict[str, object]) -> None:
+        self.bounded_payload = _with_default_language_codes(bounded_payload)
+        self.requests: list[LLMCompletionRequest] = []
+        self.stream_closed = False
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.requests.append(request)
+        if request.metadata.get("purpose") == "extraction_watchdog":
+            payload = {
+                "decision": "abort_and_retry_bounded",
+                "confidence": 0.95,
+                "reason": "Repeated extraction output.",
+            }
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(payload),
+            )
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text=json.dumps(self.bounded_payload),
+        )
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        raise AssertionError("Embeddings are not used by the extractor tests")
+
+    async def stream(self, request: LLMCompletionRequest):
+        self.requests.append(request)
+        try:
+            repeated = "alpha beta gamma delta epsilon zeta eta theta " * 8
+            yield LLMStreamEvent(
+                type="text",
+                content=json.dumps(
+                    {
+                        "evidences": [
+                            {
+                                "canonical_text": repeated,
+                                "index_text": repeated,
+                            }
+                        ]
+                    }
+                ),
+            )
+            yield LLMStreamEvent(type="text", content="unreachable")
+        finally:
+            self.stream_closed = True
 
 
 class FakePrivacyFilterClient:
@@ -415,6 +491,170 @@ async def test_normal_extraction_persists_grounded_items() -> None:
         assert by_type["state_snapshot"]["scope"] == "conversation"
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_extractor_retries_bounded_after_output_limit() -> None:
+    bounded_payload = {
+        "evidences": [
+            {
+                "canonical_text": "I prefer concise debugging advice.",
+                "scope": "assistant_mode",
+                "confidence": 0.9,
+                "source_kind": "extracted",
+                "privacy_level": 0,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    provider = OutputLimitThenBoundedProvider(bounded_payload)
+    connection, _clock, messages, memories, extractor, provider, resolved_policy = (
+        await _build_runtime_with_provider(provider)
+    )
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="I prefer concise debugging advice.",
+            occurred_at="2023-05-08T13:56:00+00:00",
+        )
+
+        result = await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1")
+        assert result.nothing_durable is False
+        assert len(persisted) == 1
+        assert provider.requests[0].metadata["purpose"] == "memory_extraction"
+        assert provider.requests[1].metadata["extraction_retry_mode"] == "bounded_output"
+        assert provider.requests[1].max_output_tokens == 4096
+        assert "Extract at most 8 total items" in provider.requests[1].messages[-1].content
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_extractor_watchdog_abort_retries_bounded_and_closes_stream() -> None:
+    bounded_payload = {
+        "evidences": [
+            {
+                "canonical_text": "I prefer compact memory extraction.",
+                "scope": "assistant_mode",
+                "confidence": 0.9,
+                "source_kind": "extracted",
+                "privacy_level": 0,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    settings = _settings(
+        extraction_watchdog_min_elapsed_seconds=0.0,
+        extraction_watchdog_min_output_tokens=1,
+        extraction_watchdog_check_interval_tokens=1,
+    )
+    provider = WatchdogAbortProvider(bounded_payload)
+    connection, _clock, messages, memories, extractor, provider, resolved_policy = (
+        await _build_runtime_with_provider(provider, settings=settings)
+    )
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="I prefer compact memory extraction.",
+            occurred_at="2023-05-08T13:56:00+00:00",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
+
+        purposes = [request.metadata.get("purpose") for request in provider.requests]
+        assert purposes == ["memory_extraction", "extraction_watchdog", "memory_extraction"]
+        assert provider.requests[-1].metadata["extraction_retry_mode"] == "bounded_output"
+        assert provider.stream_closed is True
+        assert len(await memories.list_for_user("usr_1")) == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_retry_item_cap_prevents_persisting_excess_items() -> None:
+    too_many_evidences = [
+        {
+            "canonical_text": f"Grounded preference {index}.",
+            "scope": "assistant_mode",
+            "confidence": 0.9,
+            "source_kind": "extracted",
+            "privacy_level": 0,
+            "payload": {},
+        }
+        for index in range(3)
+    ]
+    bounded_payload = {
+        "evidences": too_many_evidences,
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    settings = _settings(extraction_watchdog_bounded_retry_max_items=1)
+    provider = OutputLimitThenBoundedProvider(bounded_payload)
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = (
+        await _build_runtime_with_provider(provider, settings=settings)
+    )
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="I prefer concise debugging advice.",
+            occurred_at="2023-05-08T13:56:00+00:00",
+        )
+
+        with pytest.raises(StructuredOutputError, match="too many bounded extraction items"):
+            await extractor.extract(
+                message_text=source_message["text"],
+                role="user",
+                conversation_context=_context(source_message["id"]),
+                resolved_policy=resolved_policy,
+            )
+
+        assert await memories.list_for_user("usr_1") == []
+        assert len(provider.requests) == 3
+        assert provider.requests[1].metadata["extraction_retry_mode"] == "bounded_output"
+        assert provider.requests[2].metadata["extraction_retry_mode"] == "bounded_output"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_disabled_extraction_watchdog_allows_different_provider_override() -> None:
+    payload = {"evidences": [], "beliefs": [], "contract_signals": [], "state_updates": []}
+    provider = CannedExtractionProvider(payload)
+    settings = _settings(
+        extraction_watchdog_enabled=False,
+        llm_component_models={
+            "extractor": "openai/gpt-5-mini",
+            "extraction_watchdog": "openrouter/google/gemini-3.1-flash-lite-preview",
+        },
+    )
+
+    connection, *_rest = await _build_runtime_with_provider(provider, settings=settings)
+    await connection.close()
 
 
 @pytest.mark.asyncio
@@ -572,6 +812,49 @@ async def test_temporal_fields_are_persisted_when_temporal_confidence_is_high() 
         assert evidence["valid_from"] == "2023-05-15T00:00:00+00:00"
         assert evidence["valid_to"] == "2023-05-21T23:59:59.999999+00:00"
         assert evidence["payload_json"]["temporal_confidence"] == pytest.approx(0.82)
+        assert (
+            evidence["payload_json"]["source_message_window_start_occurred_at"]
+            == "2023-05-08T13:56:00+00:00"
+        )
+        assert (
+            evidence["payload_json"]["source_message_window_end_occurred_at"]
+            == "2023-05-08T13:56:00+00:00"
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_extraction_prompt_requires_event_dates_for_relative_one_time_events() -> None:
+    payload = {
+        "evidences": [],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": True,
+    }
+    connection, _clock, messages, _memories, extractor, provider, resolved_policy = await _build_runtime(payload)
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="Last night was amazing! We celebrated my daughter's birthday with a concert.",
+            occurred_at="2023-08-14T14:24:00+00:00",
+        )
+
+        await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
+
+        prompt = provider.requests[0].messages[-1].content
+        assert '"last night"' in prompt
+        assert "set `temporal_type` to" in prompt
+        assert "`event_triggered`" in prompt
+        assert "fill `valid_from_iso`" in prompt
+        assert "Do not use the message timestamp itself as the event date" in prompt
     finally:
         await connection.close()
 
@@ -1310,7 +1593,7 @@ async def test_nothing_durable_skips_persistence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_nothing_durable_with_items_fails_structured_validation() -> None:
+async def test_nothing_durable_with_items_persists_non_empty_extraction() -> None:
     payload = {
         "evidences": [
             {
@@ -1332,15 +1615,18 @@ async def test_nothing_durable_with_items_fails_structured_validation() -> None:
     try:
         source_message = await _create_source_message(messages, text="I prefer concise debugging advice.")
 
-        with pytest.raises(StructuredOutputError):
-            await extractor.extract(
-                message_text=source_message["text"],
-                role="user",
-                conversation_context=_context(source_message["id"]),
-                resolved_policy=resolved_policy,
-            )
+        result = await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
 
-        assert await memories.list_for_user("usr_1") == []
+        rows = await memories.list_for_user("usr_1")
+        assert result.nothing_durable is False
+        assert len(result.evidences) == 1
+        assert len(rows) == 1
+        assert rows[0]["canonical_text"] == "I prefer concise debugging advice"
     finally:
         await connection.close()
 

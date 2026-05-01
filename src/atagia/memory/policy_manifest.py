@@ -62,6 +62,7 @@ class PolicyOverride(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     cross_chat_allowed: bool | None = None
+    allow_intimacy_context: bool | None = None
     allowed_scopes: list[MemoryScope] | None = None
     preferred_memory_types: list[MemoryObjectType] | None = None
     need_triggers: list[NeedTrigger] | None = None
@@ -114,6 +115,7 @@ class ResolvedPolicy(BaseModel):
     display_name: str
     prompt_hash: str
     cross_chat_allowed: bool
+    allow_intimacy_context: bool
     allowed_scopes: list[MemoryScope]
     preferred_memory_types: list[MemoryObjectType]
     need_triggers: list[NeedTrigger]
@@ -188,6 +190,11 @@ class PolicyResolver:
                 workspace.cross_chat_allowed,
                 conversation.cross_chat_allowed,
             ),
+            allow_intimacy_context=self._resolve_allow_intimacy_context(
+                manifest.allow_intimacy_context,
+                workspace.allow_intimacy_context,
+                conversation.allow_intimacy_context,
+            ),
             allowed_scopes=self._resolve_allowed_scopes(
                 manifest.allowed_scopes,
                 workspace.allowed_scopes,
@@ -244,6 +251,14 @@ class PolicyResolver:
 
     @staticmethod
     def _resolve_cross_chat_allowed(
+        manifest_value: bool,
+        workspace_value: bool | None,
+        conversation_value: bool | None,
+    ) -> bool:
+        return manifest_value and (workspace_value is not False) and (conversation_value is not False)
+
+    @staticmethod
+    def _resolve_allow_intimacy_context(
         manifest_value: bool,
         workspace_value: bool | None,
         conversation_value: bool | None,

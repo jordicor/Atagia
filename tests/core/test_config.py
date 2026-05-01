@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from atagia.core.config import Settings
+from atagia.core.config import MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS, Settings
 
 
 def test_workers_are_disabled_by_default(monkeypatch) -> None:
@@ -21,6 +21,28 @@ def test_workers_can_be_enabled_explicitly(monkeypatch) -> None:
     settings = Settings.from_env()
 
     assert settings.workers_enabled is True
+
+
+def test_intimacy_model_settings_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_LLM_INTIMACY_INGEST_MODEL", "openrouter/z-ai/glm-4.6")
+    monkeypatch.setenv(
+        "ATAGIA_LLM_INTIMACY_RETRIEVAL_MODEL",
+        "openrouter/x-ai/grok-4.1-fast",
+    )
+    monkeypatch.setenv(
+        "ATAGIA_LLM_INTIMACY_MODEL__EXTRACTOR",
+        "google/gemini-3.1-flash-lite-preview",
+    )
+    monkeypatch.setenv("ATAGIA_LLM_INTIMACY_PROACTIVE_ROUTING_ENABLED", "true")
+
+    settings = Settings.from_env()
+
+    assert settings.llm_intimacy_ingest_model == "openrouter/z-ai/glm-4.6"
+    assert settings.llm_intimacy_retrieval_model == "openrouter/x-ai/grok-4.1-fast"
+    assert settings.llm_intimacy_component_models == {
+        "extractor": "google/gemini-3.1-flash-lite-preview"
+    }
+    assert settings.llm_intimacy_proactive_routing_enabled is True
 
 
 def test_context_cache_settings_use_defaults(monkeypatch) -> None:
@@ -82,6 +104,143 @@ def test_chunking_threshold_must_be_positive(monkeypatch) -> None:
         Settings.from_env()
 
 
+def test_recent_transcript_budget_defaults_to_policy_with_floor(monkeypatch) -> None:
+    monkeypatch.delenv("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.recent_transcript_budget_tokens is None
+    assert settings.effective_recent_transcript_budget_tokens(4000) == 4000
+    assert (
+        settings.effective_recent_transcript_budget_tokens(512)
+        == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
+    )
+
+
+def test_recent_transcript_budget_can_be_overridden_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS", "30000")
+
+    settings = Settings.from_env()
+
+    assert settings.recent_transcript_budget_tokens == 30000
+    assert settings.effective_recent_transcript_budget_tokens(4000) == 30000
+
+
+def test_recent_transcript_budget_override_is_floored(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS", "512")
+
+    settings = Settings.from_env()
+
+    assert (
+        settings.effective_recent_transcript_budget_tokens(4000)
+        == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
+    )
+
+
+def test_recent_transcript_budget_respects_hard_cap(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS", "30000")
+
+    settings = Settings.from_env()
+
+    assert settings.effective_recent_transcript_budget_tokens(
+        4000,
+        hard_cap_tokens=2000,
+    ) == 2000
+
+
+def test_recent_transcript_budget_rejects_non_positive_override(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS", "0")
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+def test_benchmark_disable_raw_recent_transcript_defaults_off(monkeypatch) -> None:
+    monkeypatch.delenv("ATAGIA_BENCHMARK_DISABLE_RAW_RECENT_TRANSCRIPT", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.benchmark_disable_raw_recent_transcript is False
+
+
+def test_benchmark_disable_raw_recent_transcript_can_be_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_BENCHMARK_DISABLE_RAW_RECENT_TRANSCRIPT", "true")
+
+    settings = Settings.from_env()
+
+    assert settings.benchmark_disable_raw_recent_transcript is True
+
+
+def test_extraction_watchdog_settings_use_defaults(monkeypatch) -> None:
+    for name in (
+        "ATAGIA_EXTRACTION_WATCHDOG_ENABLED",
+        "ATAGIA_EXTRACTION_WATCHDOG_ALLOW_DIFFERENT_PROVIDER",
+        "ATAGIA_EXTRACTION_WATCHDOG_MIN_ELAPSED_SECONDS",
+        "ATAGIA_EXTRACTION_WATCHDOG_MIN_OUTPUT_TOKENS",
+        "ATAGIA_EXTRACTION_WATCHDOG_CHECK_INTERVAL_TOKENS",
+        "ATAGIA_EXTRACTION_WATCHDOG_MAX_CHECKS",
+        "ATAGIA_EXTRACTION_WATCHDOG_LLM_TIMEOUT_SECONDS",
+        "ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_ITEMS",
+        "ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_OUTPUT_TOKENS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.extraction_watchdog_enabled is True
+    assert settings.extraction_watchdog_allow_different_provider is False
+    assert settings.extraction_watchdog_min_elapsed_seconds == pytest.approx(8.0)
+    assert settings.extraction_watchdog_min_output_tokens == 2048
+    assert settings.extraction_watchdog_check_interval_tokens == 1024
+    assert settings.extraction_watchdog_max_checks == 2
+    assert settings.extraction_watchdog_llm_timeout_seconds == pytest.approx(8.0)
+    assert settings.extraction_watchdog_bounded_retry_max_items == 8
+    assert settings.extraction_watchdog_bounded_retry_max_output_tokens == 4096
+
+
+def test_extraction_watchdog_settings_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_ENABLED", "false")
+    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_ALLOW_DIFFERENT_PROVIDER", "true")
+    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_MIN_ELAPSED_SECONDS", "1.5")
+    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_MIN_OUTPUT_TOKENS", "77")
+    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_CHECK_INTERVAL_TOKENS", "33")
+    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_MAX_CHECKS", "4")
+    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_LLM_TIMEOUT_SECONDS", "2.5")
+    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_ITEMS", "3")
+    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_OUTPUT_TOKENS", "2048")
+
+    settings = Settings.from_env()
+
+    assert settings.extraction_watchdog_enabled is False
+    assert settings.extraction_watchdog_allow_different_provider is True
+    assert settings.extraction_watchdog_min_elapsed_seconds == pytest.approx(1.5)
+    assert settings.extraction_watchdog_min_output_tokens == 77
+    assert settings.extraction_watchdog_check_interval_tokens == 33
+    assert settings.extraction_watchdog_max_checks == 4
+    assert settings.extraction_watchdog_llm_timeout_seconds == pytest.approx(2.5)
+    assert settings.extraction_watchdog_bounded_retry_max_items == 3
+    assert settings.extraction_watchdog_bounded_retry_max_output_tokens == 2048
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("ATAGIA_EXTRACTION_WATCHDOG_MIN_ELAPSED_SECONDS", "-1"),
+        ("ATAGIA_EXTRACTION_WATCHDOG_MIN_OUTPUT_TOKENS", "0"),
+        ("ATAGIA_EXTRACTION_WATCHDOG_CHECK_INTERVAL_TOKENS", "0"),
+        ("ATAGIA_EXTRACTION_WATCHDOG_MAX_CHECKS", "-1"),
+        ("ATAGIA_EXTRACTION_WATCHDOG_LLM_TIMEOUT_SECONDS", "0"),
+        ("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_ITEMS", "0"),
+        ("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_OUTPUT_TOKENS", "512"),
+    ],
+)
+def test_extraction_watchdog_settings_reject_invalid_values(monkeypatch, env_name, value) -> None:
+    monkeypatch.setenv(env_name, value)
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
 def test_privacy_gate_settings_use_defaults(monkeypatch) -> None:
     monkeypatch.delenv("ATAGIA_OPF_PRIVACY_FILTER_ENABLED", raising=False)
     monkeypatch.delenv("ATAGIA_OPF_PRIMARY_URL", raising=False)
@@ -105,8 +264,6 @@ def test_privacy_gate_settings_can_be_overridden(monkeypatch) -> None:
     monkeypatch.setenv("ATAGIA_PRIVACY_VALIDATION_GATE_TIMEOUT_SECONDS", "3.5")
     monkeypatch.setenv("ATAGIA_PRIVACY_VALIDATION_GATE_MAX_SOURCE_CHARS", "1234")
     monkeypatch.setenv("ATAGIA_PRIVACY_VALIDATION_GATE_MAX_SUMMARIES_GATED_PER_JOB", "7")
-    monkeypatch.setenv("ATAGIA_PRIVACY_VALIDATION_GATE_JUDGE_MODEL", "judge-model")
-    monkeypatch.setenv("ATAGIA_PRIVACY_VALIDATION_GATE_REFINER_MODEL", "refiner-model")
 
     settings = Settings.from_env()
 
@@ -118,8 +275,6 @@ def test_privacy_gate_settings_can_be_overridden(monkeypatch) -> None:
     assert settings.privacy_validation_gate_timeout_seconds == pytest.approx(3.5)
     assert settings.privacy_validation_gate_max_source_chars == 1234
     assert settings.privacy_validation_gate_max_summaries_gated_per_job == 7
-    assert settings.privacy_validation_gate_judge_model == "judge-model"
-    assert settings.privacy_validation_gate_refiner_model == "refiner-model"
 
 
 def test_privacy_gate_settings_reject_invalid_timeouts(monkeypatch) -> None:
@@ -164,16 +319,10 @@ def test_operational_allowed_profiles_reject_blank_entries() -> None:
             manifests_path="./manifests",
             storage_backend="inprocess",
             redis_url="redis://localhost:6379/0",
-            llm_provider="openai",
-            llm_api_key=None,
             openai_api_key="test-openai-key",
             openrouter_api_key=None,
-            llm_base_url=None,
             openrouter_site_url="http://localhost",
             openrouter_app_name="Atagia",
-            llm_extraction_model="extract-test-model",
-            llm_scoring_model="score-test-model",
-            llm_classifier_model="classify-test-model",
             llm_chat_model="reply-test-model",
             service_mode=False,
             service_api_key=None,
@@ -212,16 +361,10 @@ def test_artifact_blob_storage_settings_reject_invalid_values() -> None:
             manifests_path="./manifests",
             storage_backend="inprocess",
             redis_url="redis://localhost:6379/0",
-            llm_provider="openai",
-            llm_api_key=None,
             openai_api_key="test-openai-key",
             openrouter_api_key=None,
-            llm_base_url=None,
             openrouter_site_url="http://localhost",
             openrouter_app_name="Atagia",
-            llm_extraction_model="extract-test-model",
-            llm_scoring_model="score-test-model",
-            llm_classifier_model="classify-test-model",
             llm_chat_model="reply-test-model",
             service_mode=False,
             service_api_key=None,

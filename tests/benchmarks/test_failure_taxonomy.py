@@ -82,6 +82,55 @@ def test_failure_taxonomy_maps_locomo_diagnostics_without_raw_text(tmp_path) -> 
     assert "RAW JUDGE REASON" not in serialized
 
 
+def test_failure_taxonomy_maps_technical_execution_failures(tmp_path) -> None:
+    report = BenchmarkReport(
+        benchmark_name="LoCoMo",
+        overall_accuracy=0.0,
+        category_breakdown={1: 0.0},
+        conversations=[
+            ConversationReport(
+                conversation_id="conv_1",
+                results=[
+                    QuestionResult(
+                        question=BenchmarkQuestion(
+                            question_text="RAW QUESTION TEXT",
+                            ground_truth="RAW GROUND TRUTH",
+                            category=1,
+                            question_id="q1",
+                        ),
+                        prediction="",
+                        score_result=ScoreResult(
+                            score=0,
+                            reasoning="RAW ERROR",
+                            judge_model="judge",
+                        ),
+                        memories_used=0,
+                        retrieval_time_ms=0.0,
+                        trace={
+                            "diagnosis_bucket": "retrieval_failed",
+                            "sufficiency_diagnostic": "retrieval_failed",
+                        },
+                    )
+                ],
+                accuracy=0.0,
+                category_breakdown={1: 0.0},
+            )
+        ],
+        total_questions=1,
+        total_correct=0,
+        timestamp="2026-04-26T00:00:00+00:00",
+        duration_seconds=1.0,
+    )
+    source = tmp_path / "report.json"
+    source.write_text("{}", encoding="utf-8")
+
+    taxonomy = build_failure_taxonomy_report(report, source_report=str(source))
+
+    assert taxonomy.taxonomy_counts == {"execution_failure": 1}
+    assert taxonomy.items[0].diagnosis_bucket == "retrieval_failed"
+    assert taxonomy.items[0].taxonomy_bucket == "execution_failure"
+
+
 def test_failure_taxonomy_uses_exact_mappings_and_sanitizes_free_form_diagnostics(tmp_path) -> None:
     report = AtagiaBenchReport(
         timestamp="2026-04-26T00:00:00+00:00",

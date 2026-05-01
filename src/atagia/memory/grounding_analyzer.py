@@ -66,6 +66,10 @@ class GroundingAnalyzer:
                     source_kind=str(row.get("source_kind", "")),
                     maya_score=float(row.get("maya_score", 0.0)),
                     grounding_level=grounding_level,
+                    intimacy_boundary=str(row.get("intimacy_boundary") or "ordinary"),
+                    intimacy_boundary_confidence=float(
+                        row.get("intimacy_boundary_confidence", 0.0) or 0.0
+                    ),
                 )
             )
 

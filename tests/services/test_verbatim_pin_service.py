@@ -12,6 +12,7 @@ from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
 from atagia.models.schemas_memory import (
+    IntimacyBoundary,
     MemoryObjectType,
     MemoryScope,
     MemorySourceKind,
@@ -49,16 +50,10 @@ def _settings(tmp_path: Path) -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="test-model",
-        llm_scoring_model="test-model",
-        llm_classifier_model="test-model",
         llm_chat_model="openai/test-model",
         llm_ingest_model="openai/test-model",
         llm_retrieval_model="openai/test-model",
@@ -124,6 +119,8 @@ async def test_verbatim_pin_service_resolves_message_memory_object_and_text_span
                 source_kind=MemorySourceKind.EXTRACTED,
                 confidence=0.8,
                 privacy_level=0,
+                intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+                intimacy_boundary_confidence=0.91,
                 memory_id="mem_1",
             )
 
@@ -159,6 +156,9 @@ async def test_verbatim_pin_service_resolves_message_memory_object_and_text_span
 
             assert message_pin["canonical_text"] == "alpha beta gamma"
             assert memory_pin["canonical_text"] == "memory object snapshot"
+            assert memory_pin["intimacy_boundary"] == "romantic_private"
+            assert memory_pin["intimacy_boundary_confidence"] == 0.91
+            assert memory_pin["privacy_level"] == 2
             assert span_pin["canonical_text"] == "beta"
             assert message_pin["index_text"] == "alpha beta gamma"
             assert span_pin["index_text"] == "beta"

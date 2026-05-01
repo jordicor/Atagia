@@ -9,7 +9,13 @@ import aiosqlite
 from atagia.core.ids import generate_prefixed_id
 from atagia.core.repositories import BaseRepository, _decode_json_columns, _encode_json
 from atagia.core.timestamps import normalize_optional_timestamp
-from atagia.models.schemas_memory import MemoryScope, VerbatimPinStatus, VerbatimPinTargetKind
+from atagia.memory.intimacy_boundary_policy import (
+    is_blocked_intimacy_boundary,
+    memory_object_intimacy_sql_clause,
+    minimum_privacy_for_intimacy_boundary,
+    normalize_intimacy_boundary,
+)
+from atagia.models.schemas_memory import IntimacyBoundary, MemoryScope, VerbatimPinStatus, VerbatimPinTargetKind
 
 
 def _normalize_optional_text(value: Any) -> str | None:
@@ -50,6 +56,8 @@ class VerbatimPinRepository(BaseRepository):
         canonical_text: str,
         index_text: str,
         privacy_level: int,
+        intimacy_boundary: IntimacyBoundary | str = IntimacyBoundary.ORDINARY,
+        intimacy_boundary_confidence: float = 0.0,
         created_by: str,
         reason: str | None = None,
         target_span_start: int | None = None,
@@ -61,6 +69,13 @@ class VerbatimPinRepository(BaseRepository):
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_pin_id = pin_id or generate_prefixed_id("vbp")
+        resolved_intimacy_boundary = normalize_intimacy_boundary(intimacy_boundary)
+        if is_blocked_intimacy_boundary(resolved_intimacy_boundary):
+            raise ValueError("safety_blocked verbatim pins cannot be created")
+        resolved_privacy_level = minimum_privacy_for_intimacy_boundary(
+            resolved_intimacy_boundary,
+            privacy_level=privacy_level,
+        )
         timestamp = self._timestamp()
         normalized_expires_at = normalize_optional_timestamp(expires_at)
         parameters = (
@@ -76,7 +91,9 @@ class VerbatimPinRepository(BaseRepository):
             target_span_end,
             _normalize_required_text(canonical_text),
             _normalize_required_text(index_text),
-            int(privacy_level),
+            int(resolved_privacy_level),
+            resolved_intimacy_boundary.value,
+            float(intimacy_boundary_confidence),
             status.value,
             _normalize_optional_text(reason),
             _normalize_required_text(created_by),
@@ -102,6 +119,8 @@ class VerbatimPinRepository(BaseRepository):
                 canonical_text,
                 index_text,
                 privacy_level,
+                intimacy_boundary,
+                intimacy_boundary_confidence,
                 status,
                 reason,
                 created_by,
@@ -111,7 +130,7 @@ class VerbatimPinRepository(BaseRepository):
                 deleted_at,
                 payload_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             parameters,
         )
@@ -213,6 +232,7 @@ class VerbatimPinRepository(BaseRepository):
         workspace_id: str | None,
         conversation_id: str,
         limit: int,
+        allow_intimacy_context: bool = False,
         as_of: str | None = None,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
@@ -240,11 +260,18 @@ class VerbatimPinRepository(BaseRepository):
               AND ({scope_clauses})
               AND vp.status = ?
               AND vp.privacy_level <= ?
+              AND {intimacy_filter}
               AND (vp.expires_at IS NULL OR datetime(vp.expires_at) > datetime(?))
               AND verbatim_pins_fts MATCH ?
             ORDER BY rank ASC, vp.updated_at DESC, vp.created_at DESC, vp.id ASC
             LIMIT ?
-            """.format(scope_clauses=" OR ".join(scope_clauses)),
+            """.format(
+                scope_clauses=" OR ".join(scope_clauses),
+                intimacy_filter=memory_object_intimacy_sql_clause(
+                    "vp",
+                    allow_intimacy_context=allow_intimacy_context,
+                ),
+            ),
             (
                 user_id,
                 *scope_parameters,
@@ -272,6 +299,8 @@ class VerbatimPinRepository(BaseRepository):
         target_span_start: int | None = None,
         target_span_end: int | None = None,
         privacy_level: int | None = None,
+        intimacy_boundary: IntimacyBoundary | str | None = None,
+        intimacy_boundary_confidence: float | None = None,
         status: VerbatimPinStatus | None = None,
         reason: str | None = None,
         expires_at: str | None = None,
@@ -308,6 +337,23 @@ class VerbatimPinRepository(BaseRepository):
         if privacy_level is not None:
             updates.append("privacy_level = ?")
             parameters.append(int(privacy_level))
+        if intimacy_boundary is not None:
+            resolved_intimacy_boundary = normalize_intimacy_boundary(intimacy_boundary)
+            if is_blocked_intimacy_boundary(resolved_intimacy_boundary):
+                raise ValueError("safety_blocked verbatim pins cannot be activated")
+            updates.append("intimacy_boundary = ?")
+            parameters.append(resolved_intimacy_boundary.value)
+            if privacy_level is None:
+                updates.append("privacy_level = ?")
+                parameters.append(
+                    minimum_privacy_for_intimacy_boundary(
+                        resolved_intimacy_boundary,
+                        privacy_level=int(existing.get("privacy_level", 0) or 0),
+                    )
+                )
+        if intimacy_boundary_confidence is not None:
+            updates.append("intimacy_boundary_confidence = ?")
+            parameters.append(float(intimacy_boundary_confidence))
         if status is not None:
             updates.append("status = ?")
             parameters.append(status.value)

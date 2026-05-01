@@ -21,6 +21,7 @@ Atagia scores each candidate memory across multiple dimensions (task fit, mode f
 - **Consent-gated memory** -- sensitive information is stored only after user confirmation, with per-user category tracking
 - **Temporal grounding** -- resolves relative dates ("last Saturday", "three weeks ago") against source timestamps into actual calendar dates
 - **Adaptive context caching** -- deterministic staleness scoring serves cached results on follow-up turns when context has not significantly changed
+- **Topic Working Set orientation** -- keeps a compact view of active and parked conversation topics ahead of raw recent transcript context
 - **Operational profiles (experimental)** -- per-request runtime condition presets (`normal`, `low_power`, `offline`, `emergency`, `disaster`) are normalized, authorized, and carried through cache/events/jobs
 - **Two-level text chunking** -- rule-based + AI-assisted splitting handles voice transcriptions and long pastes before extraction
 - **All storage in SQLite** -- no external vector DB required; sqlite-vec available for optional embedding recall
@@ -35,6 +36,8 @@ What works today:
 - Consent-gated memory storage with per-user category thresholds
 - Hybrid retrieval: FTS5 with reciprocal rank fusion and progressive multi-query expansion
 - Three-level memory hierarchy (L0 verbatim, L1 belief, L2 summary) with mirror retrieval
+- Immediate working memory: recent same-conversation transcript is added by token budget before retrieved long-term memory
+- Topic Working Set: compact active/parked topic context is refreshed asynchronously and placed before recent transcript text in prompts
 - Temporal grounding for relative dates against source message timestamps
 - Belief revision with 8 strategies and full version history
 - Consequence chain learning and interaction contract observation
@@ -46,7 +49,7 @@ What works today:
 - LoCoMo benchmark harness with ablation support and replay probes
 
 What is in progress or planned:
-- **Vector embeddings**: candidate search now supports optional sqlite-vec semantic recall on top of FTS5 for local/pre-alpha recall experiments. Service mode rejects sqlite-vec until vector ranking is user-partitioned before ranking.
+- **Vector embeddings**: candidate search supports optional sqlite-vec semantic recall on top of FTS5 for local/pre-alpha recall experiments. Vector search is user-partitioned before nearest-neighbor ranking and can run in service mode when configured.
 - **Benchmark coverage**: see the [Evaluation status](#evaluation-status) section below for current signals and methodology.
 - **Neo4j graph layer**: planned for relationship traversal where flat retrieval is insufficient. Will ship only if benchmark evidence justifies the complexity.
 
@@ -65,6 +68,8 @@ async with Atagia(
     db_path="memory.db",
     anthropic_api_key="sk-ant-...",
     llm_forced_global_model="anthropic/claude-sonnet-4-6",
+    # Optional immediate transcript override; effective minimum is 2048 tokens.
+    recent_transcript_budget_tokens=6000,
 ) as engine:
     # Create resources
     await engine.create_user("user_1")
@@ -78,7 +83,10 @@ async with Atagia(
         mode="coding_debug",
     )
     # context.system_prompt       -> inject into your LLM
+    # context.topic_working_set_block -> compact active-topic orientation before transcript
+    # context.recent_transcript   -> immediate prior turns included verbatim by budget
     # context.memories            -> scored memories that were selected
+    # context.assistant_guidance  -> optional suggestions for natural follow-up when context is omitted
     # context.contract            -> how this user prefers to collaborate
     # context.detected_needs      -> signals detected in the query
     # context.from_cache          -> whether this was served from cache
@@ -194,7 +202,9 @@ Messages accept an optional `occurred_at` ISO timestamp for historical data wher
 | `operational_profiles_dir` | Built-in | Directory with canonical operational profile JSON presets |
 | `anthropic_api_key` / `openai_api_key` / `google_api_key` / `openrouter_api_key` | From env | Provider-specific LLM API keys |
 | `llm_forced_global_model` | From env | Optional `provider/model[,thinking_level]` override for all LLM-backed components |
-| `llm_model` | `None` | Legacy constructor shortcut, converted with `llm_provider` to `llm_forced_global_model` |
+| `llm_intimacy_ingest_model` / `llm_intimacy_retrieval_model` | From env | Optional fallback model for policy-blocked intimacy-sensitive ingest/retrieval calls |
+| `llm_intimacy_component_models` | From env | Optional per-component intimacy fallback models |
+| `llm_intimacy_proactive_routing_enabled` | `False` | Route already-known intimate contexts directly to configured intimacy models |
 | `embedding_backend` | `"none"` | `"none"` or `"sqlite_vec"` |
 | `embedding_model` | `openai/text-embedding-3-small` | Provider-qualified embedding model |
 | `context_cache_enabled` | `True` | Enable adaptive context caching |
@@ -213,6 +223,21 @@ ingest and retrieval intelligence, while privacy, consent, PII, and chat
 components stay on Anthropic Claude Sonnet. The default runtime therefore
 requires both `ATAGIA_OPENROUTER_API_KEY` and `ATAGIA_ANTHROPIC_API_KEY`. To run
 every component on one provider, set `ATAGIA_LLM_FORCED_GLOBAL_MODEL`.
+
+Intimacy fallback models are optional and inactive by default. They are not used
+to proactively route ordinary traffic. If configured, Atagia retries an
+LLM-backed component on the fallback model only when the primary provider
+returns a policy-block/refusal signal; retry metadata records component id,
+purpose, primary model, fallback model, and sanitized error class/reason without
+raw conversation text. Category-level fallbacks use:
+`ATAGIA_LLM_INTIMACY_INGEST_MODEL` and
+`ATAGIA_LLM_INTIMACY_RETRIEVAL_MODEL`. Component overrides use
+`ATAGIA_LLM_INTIMACY_MODEL__<COMPONENT_ID>`, for example
+`ATAGIA_LLM_INTIMACY_MODEL__EXTRACTOR=openrouter/z-ai/glm-4.6`.
+Set `ATAGIA_LLM_INTIMACY_PROACTIVE_ROUTING_ENABLED=true` to skip the primary
+model when the request already carries structured intimacy context, such as an
+active intimacy policy, a non-ordinary `intimacy_boundary` on source memories or
+topics, or explicit host-provided request metadata.
 
 Example mixed-provider env:
 
@@ -469,11 +494,11 @@ Atagia is evaluated with both LoCoMo and an internal regression suite, Atagia-be
 
 LoCoMo is useful as a community benchmark, but full runs are slow and some ground-truth issues in the dataset are still being audited ([details](https://github.com/snap-research/locomo/issues/35)). Atagia-bench is faster and focuses on the behaviors Atagia is designed to get right: consent gating, privacy and mode boundaries, abstention, belief revision, supersession, exact recall, cross-conversation aggregation, preferences, and multilingual smoke cases.
 
-Current internal signal: 60/64 pass rate (93.8%), with remaining failures concentrated around high-risk secret/code recall policy. These numbers are development signals, not public competitive claims; reproducible public baselines and holdout evaluation are still being hardened.
+Current internal policy-aligned signal: 63/64 pass rate (98.4%), average score 0.975, with 0 critical errors in the 2026-05-01 all-persona Atagia-bench run. High-risk and privacy-check questions pass at 5/5 under the ordinary-chat policy that withholds raw reusable secret literals. The remaining failure is `rosa-q02`, an answer-policy/grading issue where the current building code evidence is retrieved but the answer model still withholds it as a protected secret. Current numbers remain development signals only until public baselines are frozen.
 
 ## Benchmarking
 
-Atagia includes a LoCoMo benchmark harness with a dataset downloader, LLM judge scorer, correction overlays, ablation presets, diff reporting, failed-question custody reports, run manifests, and CLI summary output.
+Atagia includes a LoCoMo benchmark harness with a dataset downloader, LLM judge scorer, correction overlays, ablation presets, retained-DB replay, diff reporting, failed-question custody reports, run manifests, and CLI summary output.
 
 ```bash
 python -m benchmarks.locomo.download

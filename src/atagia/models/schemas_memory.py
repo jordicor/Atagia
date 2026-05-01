@@ -49,6 +49,16 @@ class MemoryCategory(str, Enum):
     UNKNOWN = "unknown"
 
 
+class IntimacyBoundary(str, Enum):
+    ORDINARY = "ordinary"
+    ROMANTIC_PRIVATE = "romantic_private"
+    INTIMACY_PRIVATE = "intimacy_private"
+    INTIMACY_PREFERENCE_PRIVATE = "intimacy_preference_private"
+    INTIMACY_BOUNDARY = "intimacy_boundary"
+    AMBIGUOUS_INTIMATE = "ambiguous_intimate"
+    SAFETY_BLOCKED = "safety_blocked"
+
+
 class MemoryStatus(str, Enum):
     ACTIVE = "active"
     SUPERSEDED = "superseded"
@@ -124,6 +134,7 @@ class AssistantModeId(str, Enum):
     BRAINSTORM = "brainstorm"
     BIOGRAPHICAL_INTERVIEW = "biographical_interview"
     GENERAL_QA = "general_qa"
+    INTIMACY = "intimacy"
     PERSONAL_ASSISTANT = "personal_assistant"
 
 
@@ -397,6 +408,7 @@ class AssistantModeManifest(BaseModel):
     assistant_mode_id: AssistantModeId
     display_name: str = Field(min_length=1)
     cross_chat_allowed: bool
+    allow_intimacy_context: bool = False
     allowed_scopes: list[MemoryScope] = Field(min_length=1)
     preferred_memory_types: list[MemoryObjectType] = Field(min_length=1)
     need_triggers: list[NeedTrigger] = Field(default_factory=list)
@@ -468,6 +480,8 @@ class ExtractedMemoryBase(BaseModel):
     source_kind: MemorySourceKind
     privacy_level: int = Field(ge=0, le=3)
     memory_category: MemoryCategory = MemoryCategory.UNKNOWN
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
+    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     preserve_verbatim: bool = False
     informational_mention: bool | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -495,6 +509,8 @@ class ExtractedMemoryBase(BaseModel):
         normalized.setdefault("scope", MemoryScope.CONVERSATION.value)
         normalized.setdefault("source_kind", MemorySourceKind.EXTRACTED.value)
         normalized.setdefault("privacy_level", 0)
+        normalized.setdefault("intimacy_boundary", IntimacyBoundary.ORDINARY.value)
+        normalized.setdefault("intimacy_boundary_confidence", 0.0)
         normalized.setdefault("payload", {})
         normalized.setdefault("temporal_type", "unknown")
         if "temporal_confidence" not in normalized:
@@ -1074,7 +1090,7 @@ class RetrievalPlan(BaseModel):
     workspace_id: str | None = None
     conversation_id: str
     fts_queries: list[str] = Field(default_factory=list)
-    sub_query_plans: list[PlannedSubQuery] = Field(min_length=1)
+    sub_query_plans: list[PlannedSubQuery] = Field(default_factory=list)
     callback_bias: bool = False
     raw_context_access_mode: RawContextAccessMode = "normal"
     query_type: QueryType = "default"
@@ -1084,6 +1100,7 @@ class RetrievalPlan(BaseModel):
     max_candidates: int = Field(ge=0)
     max_context_items: int = Field(gt=0)
     privacy_ceiling: int = Field(ge=0, le=3)
+    allow_intimacy_context: bool = False
     retrieval_levels: list[int] = Field(default_factory=lambda: [0])
     temporal_query_range: TemporalQueryRange | None = None
     consequence_search_enabled: bool = False
@@ -1114,7 +1131,7 @@ class RetrievalPlan(BaseModel):
     @classmethod
     def validate_sub_query_plans(cls, values: list[PlannedSubQuery]) -> list[PlannedSubQuery]:
         if not values:
-            raise ValueError("sub_query_plans must not be empty")
+            return values
         texts = [value.text for value in values]
         _ensure_unique_values(texts)
         return values
@@ -1200,6 +1217,8 @@ class MemoryObject(BaseModel):
     maya_score: float = 0.0
     privacy_level: int = 0
     memory_category: MemoryCategory = MemoryCategory.UNKNOWN
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
+    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     preserve_verbatim: bool = False
     temporal_type: str = "unknown"
     tension_score: float = 0.0
@@ -1294,7 +1313,7 @@ class SubQuerySearchCount(BaseModel):
     artifact_chunk: int = Field(ge=0, default=0)
     fts: int = Field(ge=0, default=0)
     embedding: int = Field(ge=0, default=0)
-    raw_message: int = Field(ge=0, default=0)
+    verbatim_evidence_search: int = Field(ge=0, default=0)
 
 
 class CandidateSearchTrace(BaseModel):
@@ -1307,7 +1326,7 @@ class CandidateSearchTrace(BaseModel):
     artifact_chunk_candidates_count: int = Field(ge=0, default=0)
     embedding_candidates_count: int = Field(ge=0, default=0)
     consequence_candidates_count: int = Field(ge=0, default=0)
-    raw_message_candidates_count: int = Field(ge=0, default=0)
+    verbatim_evidence_search_candidates_count: int = Field(ge=0, default=0)
     # Stubbed until the entity channel lands (Wave 2 / Phase 4). Reads
     # as 0 in every trace today; do not interpret it as "entity channel
     # ran and found nothing".
@@ -1364,7 +1383,7 @@ RetrievalSufficiencyState = Literal[
 RetrievalExpansionChannel = Literal[
     "fts",
     "embedding",
-    "raw_message",
+    "verbatim_evidence_search",
     "artifact_chunk",
     "consequence",
     "verbatim_pin",
@@ -1400,7 +1419,7 @@ class RetrievalSufficiencyDiagnostic(BaseModel):
     top_score: float = Field(ge=0.0, default=0.0)
     direct_evidence_candidate_count: int = Field(ge=0, default=0)
     summary_candidate_count: int = Field(ge=0, default=0)
-    raw_message_candidate_count: int = Field(ge=0, default=0)
+    verbatim_evidence_search_candidate_count: int = Field(ge=0, default=0)
     artifact_candidate_count: int = Field(ge=0, default=0)
     unsupported_summary_candidate_count: int = Field(ge=0, default=0)
     contradictory_candidate_count: int = Field(ge=0, default=0)
@@ -1421,10 +1440,31 @@ class TopicTraceItem(BaseModel):
     artifact_ids: list[str] = Field(default_factory=list)
     source_counts: dict[str, int] = Field(default_factory=dict)
     source_refs: list[dict[str, str]] = Field(default_factory=list)
+    source_message_start_seq: int | None = None
+    source_message_end_seq: int | None = None
     last_touched_seq: int | None = None
     last_touched_at: str | None = None
     confidence: float | None = None
     privacy_level: int | None = None
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
+    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class TopicWorkingSetFreshness(BaseModel):
+    """Freshness metadata for the conversation topic orientation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: str = "fresh"
+    last_processed_seq: int | None = None
+    last_processed_message_id: str | None = None
+    latest_message_seq: int = Field(ge=0, default=0)
+    lag_message_count: int = Field(ge=0, default=0)
+    lag_token_count: int = Field(ge=0, default=0)
+    refresh_message_threshold: int = Field(ge=1, default=4)
+    stale_message_threshold: int = Field(ge=1, default=10)
+    refresh_token_threshold: int = Field(ge=1, default=2000)
+    stale_token_threshold: int = Field(ge=1, default=5000)
 
 
 class TopicWorkingSetTrace(BaseModel):
@@ -1434,6 +1474,7 @@ class TopicWorkingSetTrace(BaseModel):
 
     active_topics: list[TopicTraceItem] = Field(default_factory=list)
     parked_topics: list[TopicTraceItem] = Field(default_factory=list)
+    freshness: TopicWorkingSetFreshness = Field(default_factory=TopicWorkingSetFreshness)
 
 
 class RetrievalTrace(BaseModel):

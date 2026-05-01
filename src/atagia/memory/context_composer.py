@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from atagia.core import json_utils
 from atagia.core.clock import Clock
+from atagia.memory.intimacy_boundary_policy import candidate_allows_intimacy_boundary
 from atagia.memory.policy_manifest import ResolvedPolicy
 from atagia.models.schemas_memory import ComposedContext, QueryType, ScoredCandidate
 
@@ -20,6 +21,8 @@ ComposerStrategy = Literal["score_first", "budgeted_marginal"]
 class _SelectionProfile:
     diversity_weight: float
     richness_weight: float
+    source_grounding_weight: float
+    coverage_gain_weight: float
     pool_extra: int
 
 
@@ -37,6 +40,15 @@ class _SelectionAction:
 class _MemorySelection:
     selected: list[ScoredCandidate]
     memory_lines: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceQuoteOptions:
+    enabled: bool
+    max_messages: int = 3
+    max_chars: int = 520
+    max_message_chars: int = 180
+    max_entries: int | None = None
 
 
 class ContextComposer:
@@ -68,6 +80,10 @@ class ContextComposer:
                 for candidate in scored_candidates
             )
             if str(candidate.memory_object.get("canonical_text", "")).strip()
+            and candidate_allows_intimacy_boundary(
+                candidate.memory_object,
+                allow_intimacy_context=resolved_policy.allow_intimacy_context,
+            )
         ]
         # Wave 1 batch 2 (1-D): when exact recall is flagged, push L0
         # evidence ahead of L1/L2 summaries before any diversity pass.
@@ -85,10 +101,7 @@ class ContextComposer:
             query_text=query_text,
             query_type=query_type,
         )
-        candidate_by_id = {
-            candidate.memory_id: candidate
-            for candidate in candidates
-        }
+        candidate_by_id = {candidate.memory_id: candidate for candidate in candidates}
         budget_tokens = resolved_policy.context_budget_tokens
         remaining_budget = budget_tokens
         contract_block, remaining_budget = self._budget_block(
@@ -123,6 +136,11 @@ class ContextComposer:
             else:
                 remaining_budget = 0
 
+        source_messages_by_id = self._source_messages_by_id(conversation_messages)
+        source_quote_options = self._source_quote_options(
+            query_type=query_type,
+            exact_recall_mode=exact_recall_mode,
+        )
         max_items = resolved_policy.retrieval_params.final_context_items
         strategy = composer_strategy or "score_first"
         if strategy == "score_first":
@@ -131,6 +149,8 @@ class ContextComposer:
                 candidate_by_id=candidate_by_id,
                 remaining_budget=remaining_budget,
                 max_items=max_items,
+                source_messages_by_id=source_messages_by_id,
+                source_quote_options=source_quote_options,
             )
         elif strategy == "budgeted_marginal":
             selection = self._select_budgeted_marginal(
@@ -141,6 +161,8 @@ class ContextComposer:
                 query_text=query_text,
                 query_type=query_type,
                 exact_recall_mode=exact_recall_mode,
+                source_messages_by_id=source_messages_by_id,
+                source_quote_options=source_quote_options,
             )
         else:
             raise ValueError(f"Unsupported composer strategy: {strategy}")
@@ -181,6 +203,8 @@ class ContextComposer:
         candidate_by_id: dict[str, ScoredCandidate],
         remaining_budget: int,
         max_items: int,
+        source_messages_by_id: dict[str, dict[str, Any]],
+        source_quote_options: _SourceQuoteOptions,
     ) -> _MemorySelection:
         selected: list[ScoredCandidate] = []
         selected_ids: set[str] = set()
@@ -205,6 +229,8 @@ class ContextComposer:
                         memory_lines=memory_lines,
                         remaining_budget=remaining_budget,
                         max_items=max_items,
+                        source_messages_by_id=source_messages_by_id,
+                        source_quote_options=source_quote_options,
                     )
                     continue
 
@@ -217,11 +243,15 @@ class ContextComposer:
                     continue
                 if supporting_l0.memory_id not in selected_ids:
                     required_items = 2
-                    required_tokens = (
-                        cls.estimate_tokens(cls._format_memory_entry(len(selected) + 1, supporting_l0))
-                        + cls.estimate_tokens(cls._format_memory_entry(len(selected) + 2, candidate))
+                    required_tokens = cls.estimate_tokens(
+                        cls._format_memory_entry(len(selected) + 1, supporting_l0)
+                    ) + cls.estimate_tokens(
+                        cls._format_memory_entry(len(selected) + 2, candidate)
                     )
-                    if len(selected) + required_items > max_items or required_tokens > remaining_budget:
+                    if (
+                        len(selected) + required_items > max_items
+                        or required_tokens > remaining_budget
+                    ):
                         continue
                     remaining_budget = cls._append_candidate_if_possible(
                         supporting_l0,
@@ -230,6 +260,8 @@ class ContextComposer:
                         memory_lines=memory_lines,
                         remaining_budget=remaining_budget,
                         max_items=max_items,
+                        source_messages_by_id=source_messages_by_id,
+                        source_quote_options=source_quote_options,
                     )
                 remaining_budget = cls._append_candidate_if_possible(
                     candidate,
@@ -238,6 +270,8 @@ class ContextComposer:
                     memory_lines=memory_lines,
                     remaining_budget=remaining_budget,
                     max_items=max_items,
+                    source_messages_by_id=source_messages_by_id,
+                    source_quote_options=source_quote_options,
                 )
                 continue
 
@@ -248,6 +282,8 @@ class ContextComposer:
                 memory_lines=memory_lines,
                 remaining_budget=remaining_budget,
                 max_items=max_items,
+                source_messages_by_id=source_messages_by_id,
+                source_quote_options=source_quote_options,
             )
         return _MemorySelection(
             selected=selected,
@@ -265,14 +301,15 @@ class ContextComposer:
         query_text: str | None,
         query_type: QueryType,
         exact_recall_mode: bool,
+        source_messages_by_id: dict[str, dict[str, Any]],
+        source_quote_options: _SourceQuoteOptions,
     ) -> _MemorySelection:
         selected: list[ScoredCandidate] = []
         selected_ids: set[str] = set()
         blocked_ids: set[str] = set()
         memory_lines: list[str] = []
         order_by_id = {
-            candidate.memory_id: index
-            for index, candidate in enumerate(candidates)
+            candidate.memory_id: index for index, candidate in enumerate(candidates)
         }
         query_tokens = cls._content_tokens(query_text or "")
         repeated_pool_tokens = cls._repeated_pool_tokens(candidates)
@@ -282,7 +319,10 @@ class ContextComposer:
             best_action: _SelectionAction | None = None
             best_key: tuple[float, float, float, float, float, str] | None = None
             for candidate in candidates:
-                if candidate.memory_id in selected_ids or candidate.memory_id in blocked_ids:
+                if (
+                    candidate.memory_id in selected_ids
+                    or candidate.memory_id in blocked_ids
+                ):
                     continue
                 action = cls._budgeted_action_for_candidate(
                     candidate,
@@ -325,6 +365,8 @@ class ContextComposer:
                     memory_lines=memory_lines,
                     remaining_budget=remaining_budget,
                     max_items=max_items,
+                    source_messages_by_id=source_messages_by_id,
+                    source_quote_options=source_quote_options,
                 )
             blocked_ids.update(best_action.blocked_ids)
 
@@ -349,6 +391,8 @@ class ContextComposer:
         if (
             profile.diversity_weight <= 0.0
             and profile.richness_weight <= 0.0
+            and profile.source_grounding_weight <= 0.0
+            and profile.coverage_gain_weight <= 0.0
         ):
             return candidates
 
@@ -361,27 +405,45 @@ class ContextComposer:
         query_tokens = cls._content_tokens(query_text)
         repeated_pool_tokens = cls._repeated_pool_tokens(pool)
         selected: list[ScoredCandidate] = []
+        covered_tokens: set[str] = set()
 
         while pool:
             best_index = 0
             best_score = float("-inf")
             for index, candidate in enumerate(pool):
-                redundancy = max(
-                    cls._candidate_similarity(
-                        candidate,
-                        chosen,
-                        ignored_tokens=repeated_pool_tokens,
+                redundancy = (
+                    max(
+                        cls._candidate_similarity(
+                            candidate,
+                            chosen,
+                            ignored_tokens=repeated_pool_tokens,
+                        )
+                        for chosen in selected
                     )
-                    for chosen in selected
-                ) if selected else 0.0
+                    if selected
+                    else 0.0
+                )
                 richness = cls._candidate_richness(
                     candidate,
                     query_tokens=query_tokens,
                     repeated_pool_tokens=repeated_pool_tokens,
                 )
+                source_grounding = cls._candidate_source_grounding(candidate)
+                coverage_gain = (
+                    cls._candidate_coverage_gain(
+                        candidate,
+                        covered_tokens=covered_tokens,
+                        query_tokens=query_tokens,
+                        repeated_pool_tokens=repeated_pool_tokens,
+                    )
+                    if selected
+                    else 0.0
+                )
                 selection_score = (
                     float(candidate.final_score)
                     + (profile.richness_weight * richness)
+                    + (profile.source_grounding_weight * source_grounding)
+                    + (profile.coverage_gain_weight * coverage_gain)
                     - (profile.diversity_weight * redundancy)
                 )
                 if selection_score > best_score:
@@ -399,7 +461,15 @@ class ContextComposer:
                     ):
                         best_index = index
                         best_score = selection_score
-            selected.append(pool.pop(best_index))
+            selected_candidate = pool.pop(best_index)
+            selected.append(selected_candidate)
+            covered_tokens.update(
+                cls._candidate_coverage_tokens(
+                    selected_candidate,
+                    query_tokens=query_tokens,
+                    repeated_pool_tokens=repeated_pool_tokens,
+                )
+            )
 
         return [*selected, *remainder]
 
@@ -409,23 +479,31 @@ class ContextComposer:
             return _SelectionProfile(
                 diversity_weight=0.32,
                 richness_weight=0.12,
+                source_grounding_weight=0.04,
+                coverage_gain_weight=0.10,
                 pool_extra=24,
             )
         if query_type == "temporal":
             return _SelectionProfile(
                 diversity_weight=0.03,
                 richness_weight=0.01,
+                source_grounding_weight=0.04,
+                coverage_gain_weight=0.0,
                 pool_extra=10,
             )
         if query_type == "slot_fill":
             return _SelectionProfile(
                 diversity_weight=0.18,
                 richness_weight=0.07,
+                source_grounding_weight=0.04,
+                coverage_gain_weight=0.0,
                 pool_extra=16,
             )
         return _SelectionProfile(
             diversity_weight=0.08,
             richness_weight=0.03,
+            source_grounding_weight=0.0,
+            coverage_gain_weight=0.0,
             pool_extra=12,
         )
 
@@ -470,7 +548,10 @@ class ContextComposer:
                 if supporting_l0 is None:
                     blocked_ids.add(candidate.memory_id)
                     return None
-                if supporting_l0.memory_id not in selected_ids and supporting_l0.memory_id in blocked_ids:
+                if (
+                    supporting_l0.memory_id not in selected_ids
+                    and supporting_l0.memory_id in blocked_ids
+                ):
                     return None
                 action_items = (
                     (candidate,)
@@ -509,8 +590,7 @@ class ContextComposer:
             for item in new_items
         )
         first_order = min(
-            order_by_id.get(item.memory_id, len(order_by_id))
-            for item in new_items
+            order_by_id.get(item.memory_id, len(order_by_id)) for item in new_items
         )
         return _SelectionAction(
             items=new_items,
@@ -543,23 +623,44 @@ class ContextComposer:
         repeated_pool_tokens: set[str],
         profile: _SelectionProfile,
     ) -> float:
-        redundancy = max(
-            cls._candidate_similarity(
-                candidate,
-                chosen,
-                ignored_tokens=repeated_pool_tokens,
+        redundancy = (
+            max(
+                cls._candidate_similarity(
+                    candidate,
+                    chosen,
+                    ignored_tokens=repeated_pool_tokens,
+                )
+                for chosen in selected
             )
-            for chosen in selected
-        ) if selected else 0.0
+            if selected
+            else 0.0
+        )
         richness = cls._candidate_richness(
             candidate,
             query_tokens=query_tokens,
             repeated_pool_tokens=repeated_pool_tokens,
         )
+        source_grounding = cls._candidate_source_grounding(candidate)
+        coverage_gain = (
+            cls._candidate_coverage_gain(
+                candidate,
+                covered_tokens=cls._selected_coverage_tokens(
+                    selected,
+                    query_tokens=query_tokens,
+                    repeated_pool_tokens=repeated_pool_tokens,
+                ),
+                query_tokens=query_tokens,
+                repeated_pool_tokens=repeated_pool_tokens,
+            )
+            if selected
+            else 0.0
+        )
         return max(
             0.0,
             float(candidate.final_score)
             + (profile.richness_weight * richness)
+            + (profile.source_grounding_weight * source_grounding)
+            + (profile.coverage_gain_weight * coverage_gain)
             - (profile.diversity_weight * redundancy),
         )
 
@@ -579,14 +680,50 @@ class ContextComposer:
             str(other.memory_object.get("canonical_text", "")),
             ignored_tokens=ignored_tokens,
         )
+        source_similarity = cls._candidate_source_similarity(candidate, other)
         if not candidate_tokens or not other_tokens:
-            return 0.0
+            return source_similarity
         overlap = candidate_tokens & other_tokens
         union = candidate_tokens | other_tokens
         similarity = len(overlap) / len(union)
-        if cls._candidate_source_window(candidate) == cls._candidate_source_window(other):
-            similarity += 0.15
+        similarity = max(similarity, source_similarity)
+        candidate_window = cls._candidate_source_window(candidate)
+        if (
+            candidate_window is not None
+            and candidate_window == cls._candidate_source_window(other)
+        ):
+            similarity = max(similarity, 0.55)
         return min(1.0, similarity)
+
+    @classmethod
+    def _candidate_source_similarity(
+        cls,
+        candidate: ScoredCandidate,
+        other: ScoredCandidate,
+    ) -> float:
+        candidate_ids = set(cls._candidate_source_message_ids(candidate))
+        other_ids = set(cls._candidate_source_message_ids(other))
+        if not candidate_ids or not other_ids:
+            return 0.0
+        overlap = candidate_ids & other_ids
+        if not overlap:
+            return 0.0
+        return len(overlap) / max(1, min(len(candidate_ids), len(other_ids)))
+
+    @classmethod
+    def _candidate_source_grounding(cls, candidate: ScoredCandidate) -> float:
+        payload_json = candidate.memory_object.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            return 0.0
+        if payload_json.get("source_kind_variant") == "conversation_window":
+            return 1.0
+        if cls._candidate_source_message_ids(candidate):
+            return 0.85
+        if payload_json.get("source_excerpt_messages"):
+            return 0.75
+        if cls._candidate_source_window(candidate) is not None:
+            return 0.45
+        return 0.0
 
     @classmethod
     def _candidate_richness(
@@ -604,9 +741,68 @@ class ContextComposer:
         if not candidate_tokens:
             return 0.0
         richness = min(1.0, sum(len(token) for token in candidate_tokens) / 40.0)
-        if str(candidate.memory_object.get("object_type")) in {"belief", "interaction_contract", "state_snapshot"}:
+        if str(candidate.memory_object.get("object_type")) in {
+            "belief",
+            "interaction_contract",
+            "state_snapshot",
+        }:
             return richness * 0.7
         return richness
+
+    @classmethod
+    def _candidate_coverage_gain(
+        cls,
+        candidate: ScoredCandidate,
+        *,
+        covered_tokens: set[str],
+        query_tokens: set[str],
+        repeated_pool_tokens: set[str],
+    ) -> float:
+        if cls._candidate_source_grounding(candidate) <= 0.0:
+            return 0.0
+        candidate_tokens = cls._candidate_coverage_tokens(
+            candidate,
+            query_tokens=query_tokens,
+            repeated_pool_tokens=repeated_pool_tokens,
+        )
+        if not candidate_tokens:
+            return 0.0
+        new_tokens = candidate_tokens - covered_tokens
+        if not new_tokens:
+            return 0.0
+        return min(1.0, sum(len(token) for token in new_tokens) / 40.0)
+
+    @classmethod
+    def _selected_coverage_tokens(
+        cls,
+        selected: list[ScoredCandidate],
+        *,
+        query_tokens: set[str],
+        repeated_pool_tokens: set[str],
+    ) -> set[str]:
+        covered_tokens: set[str] = set()
+        for candidate in selected:
+            covered_tokens.update(
+                cls._candidate_coverage_tokens(
+                    candidate,
+                    query_tokens=query_tokens,
+                    repeated_pool_tokens=repeated_pool_tokens,
+                )
+            )
+        return covered_tokens
+
+    @classmethod
+    def _candidate_coverage_tokens(
+        cls,
+        candidate: ScoredCandidate,
+        *,
+        query_tokens: set[str],
+        repeated_pool_tokens: set[str],
+    ) -> set[str]:
+        return cls._content_tokens(
+            str(candidate.memory_object.get("canonical_text", "")),
+            ignored_tokens={*query_tokens, *repeated_pool_tokens},
+        )
 
     @staticmethod
     def _candidate_source_window(candidate: ScoredCandidate) -> tuple[str, str] | None:
@@ -671,13 +867,11 @@ class ContextComposer:
     def _repeated_pool_tokens(cls, candidates: list[ScoredCandidate]) -> set[str]:
         token_counts: dict[str, int] = {}
         for candidate in candidates:
-            for token in cls._content_tokens(str(candidate.memory_object.get("canonical_text", ""))):
+            for token in cls._content_tokens(
+                str(candidate.memory_object.get("canonical_text", ""))
+            ):
                 token_counts[token] = token_counts.get(token, 0) + 1
-        return {
-            token
-            for token, count in token_counts.items()
-            if count >= 2
-        }
+        return {token for token, count in token_counts.items() if count >= 2}
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
@@ -686,7 +880,9 @@ class ContextComposer:
         return max(1, math.ceil(len(text) / 4))
 
     @staticmethod
-    def _coerce_scored_candidate(candidate: ScoredCandidate | dict[str, Any]) -> ScoredCandidate:
+    def _coerce_scored_candidate(
+        candidate: ScoredCandidate | dict[str, Any],
+    ) -> ScoredCandidate:
         if isinstance(candidate, ScoredCandidate):
             return candidate
         return ScoredCandidate.model_validate(candidate)
@@ -698,7 +894,7 @@ class ContextComposer:
     ) -> int:
         """Return the exact-recall hierarchy bucket for a candidate.
 
-        Lower is better. Concrete L0 evidence (including raw message
+        Lower is better. Concrete L0 evidence (including verbatim evidence search
         windows) sits in bucket 0, while episode/thematic summaries
         drop to bucket 1. Outside exact-recall mode all candidates are
         treated equally so ordering stays score-driven.
@@ -745,7 +941,11 @@ class ContextComposer:
             return "unspecified"
         label = value.get("label")
         if label is None:
-            extras = {key: item for key, item in value.items() if key not in {"score", "confidence"}}
+            extras = {
+                key: item
+                for key, item in value.items()
+                if key not in {"score", "confidence"}
+            }
             label = json_utils.dumps(extras or value, sort_keys=True)
         rendered = str(label)
         confidence = value.get("confidence", value.get("score"))
@@ -776,7 +976,13 @@ class ContextComposer:
         )
 
     @staticmethod
-    def _format_memory_entry(index: int, candidate: ScoredCandidate) -> str:
+    def _format_memory_entry(
+        index: int,
+        candidate: ScoredCandidate,
+        *,
+        source_messages_by_id: dict[str, dict[str, Any]] | None = None,
+        source_quote_options: _SourceQuoteOptions | None = None,
+    ) -> str:
         memory_object = candidate.memory_object
         confidence = float(memory_object.get("confidence", 0.0))
         payload_json = memory_object.get("payload_json") or {}
@@ -790,23 +996,49 @@ class ContextComposer:
             f"confidence: {confidence:.2f}",
             f"scope: {memory_object.get('scope')}",
         ]
+        privacy_level = memory_object.get("privacy_level")
+        if privacy_level is not None:
+            metadata_parts.append(f"privacy_level: {privacy_level}")
+        memory_category = str(memory_object.get("memory_category") or "").strip()
+        if memory_category:
+            metadata_parts.append(f"memory_category: {memory_category}")
+        intimacy_boundary = str(memory_object.get("intimacy_boundary") or "").strip()
+        if intimacy_boundary and intimacy_boundary != "ordinary":
+            metadata_parts.append(f"intimacy_boundary: {intimacy_boundary}")
+        if bool(memory_object.get("preserve_verbatim")):
+            metadata_parts.append("preserve_verbatim: true")
+        temporal_type = str(memory_object.get("temporal_type") or "unknown")
+        valid_from = memory_object.get("valid_from")
+        valid_to = memory_object.get("valid_to")
+        if valid_from or valid_to:
+            if temporal_type == "event_triggered":
+                metadata_parts.append(
+                    f"event_time: {valid_from or '?'} to {valid_to or '?'}"
+                )
+            else:
+                metadata_parts.append(
+                    f"valid_window: {valid_from or '?'} to {valid_to or '?'}"
+                )
         source_window = ContextComposer._candidate_source_window(candidate)
         if source_window is not None:
             source_window_start, source_window_end = source_window
             metadata_parts.append(
                 f"source_window: {source_window_start or '?'} to {source_window_end or '?'}"
             )
-        valid_from = memory_object.get("valid_from")
-        valid_to = memory_object.get("valid_to")
-        if valid_from or valid_to:
-            metadata_parts.append(f"valid: {valid_from or '?'} to {valid_to or '?'}")
         if candidate.resolved_date:
             metadata_parts.append(f"resolved_date: {candidate.resolved_date}")
         lines = [
             f"{index}. ({', '.join(metadata_parts)})\n"
             f"   {memory_object.get('canonical_text', '')}"
         ]
-        if is_conversation_chunk:
+        source_quote = ContextComposer._source_quote_for_candidate(
+            candidate,
+            source_messages_by_id=source_messages_by_id or {},
+            options=source_quote_options or _SourceQuoteOptions(enabled=False),
+        )
+        if source_quote:
+            lines.append(f"   source_quote: {source_quote}")
+        elif is_conversation_chunk:
             excerpt = ContextComposer._conversation_chunk_excerpt(payload_json)
             if excerpt:
                 lines.append(f"   source_excerpt: {excerpt}")
@@ -866,7 +1098,7 @@ class ContextComposer:
             return header[:max_chars].rstrip()
 
         suffix = "..."
-        content = text[len(header):].strip()
+        content = text[len(header) :].strip()
         available_chars = max(0, max_chars - len(header) - len(suffix))
         if available_chars == 0:
             return header.rstrip()
@@ -883,13 +1115,48 @@ class ContextComposer:
         memory_lines: list[str],
         remaining_budget: int,
         max_items: int,
+        source_messages_by_id: dict[str, dict[str, Any]],
+        source_quote_options: _SourceQuoteOptions,
     ) -> int:
-        if candidate.memory_id in selected_ids or remaining_budget <= 0 or len(selected) >= max_items:
+        if (
+            candidate.memory_id in selected_ids
+            or remaining_budget <= 0
+            or len(selected) >= max_items
+        ):
             return remaining_budget
         candidate_block = cls._format_memory_entry(len(selected) + 1, candidate)
         candidate_tokens = cls.estimate_tokens(candidate_block)
         if candidate_tokens > remaining_budget:
             return remaining_budget
+        ranked_source_quote_options = cls._ranked_source_quote_options(
+            source_quote_options,
+            rank=len(selected) + 1,
+        )
+        candidate_block_with_source = cls._format_memory_entry(
+            len(selected) + 1,
+            candidate,
+            source_messages_by_id=source_messages_by_id,
+            source_quote_options=ranked_source_quote_options,
+        )
+        candidate_tokens_with_source = cls.estimate_tokens(candidate_block_with_source)
+        if candidate_tokens_with_source <= remaining_budget:
+            candidate_block = candidate_block_with_source
+            candidate_tokens = candidate_tokens_with_source
+        else:
+            compact_source_options = cls._compact_source_quote_options(
+                ranked_source_quote_options
+            )
+            if compact_source_options != ranked_source_quote_options:
+                compact_candidate_block = cls._format_memory_entry(
+                    len(selected) + 1,
+                    candidate,
+                    source_messages_by_id=source_messages_by_id,
+                    source_quote_options=compact_source_options,
+                )
+                compact_candidate_tokens = cls.estimate_tokens(compact_candidate_block)
+                if compact_candidate_tokens <= remaining_budget:
+                    candidate_block = compact_candidate_block
+                    candidate_tokens = compact_candidate_tokens
         memory_lines.append(candidate_block)
         selected.append(candidate)
         selected_ids.add(candidate.memory_id)
@@ -898,7 +1165,9 @@ class ContextComposer:
     @staticmethod
     def _is_hierarchical_summary_candidate(candidate: ScoredCandidate) -> bool:
         payload_json = candidate.memory_object.get("payload_json") or {}
-        if candidate.memory_object.get("object_type") != "summary_view" or not isinstance(payload_json, dict):
+        if candidate.memory_object.get(
+            "object_type"
+        ) != "summary_view" or not isinstance(payload_json, dict):
             return False
         return int(payload_json.get("hierarchy_level", -1)) in {1, 2}
 
@@ -995,7 +1264,9 @@ class ContextComposer:
         claim_signatures = payload_json.get("source_claim_signatures", [])
         if not isinstance(claim_signatures, list) or not claim_signatures:
             return None
-        summary_updated_at = cls._parse_candidate_datetime(candidate.memory_object.get("updated_at"))
+        summary_updated_at = cls._parse_candidate_datetime(
+            candidate.memory_object.get("updated_at")
+        )
         source_object_ids = {
             str(item).strip()
             for item in payload_json.get("source_object_ids", [])
@@ -1026,16 +1297,26 @@ class ContextComposer:
             claim_key = str(other_payload.get("claim_key") or "").strip()
             if claim_key not in expected_values_by_key:
                 continue
-            claim_value = json_utils.dumps(other_payload.get("claim_value"), sort_keys=True)
+            claim_value = json_utils.dumps(
+                other_payload.get("claim_value"), sort_keys=True
+            )
             if claim_value in expected_values_by_key[claim_key]:
                 continue
-            other_updated_at = cls._parse_candidate_datetime(other.memory_object.get("updated_at"))
-            if summary_updated_at is not None and other_updated_at is not None and other_updated_at <= summary_updated_at:
+            other_updated_at = cls._parse_candidate_datetime(
+                other.memory_object.get("updated_at")
+            )
+            if (
+                summary_updated_at is not None
+                and other_updated_at is not None
+                and other_updated_at <= summary_updated_at
+            ):
                 continue
             conflicting.append(other)
         if not conflicting:
             return None
-        return sorted(conflicting, key=lambda item: (-item.final_score, item.memory_id))[0]
+        return sorted(
+            conflicting, key=lambda item: (-item.final_score, item.memory_id)
+        )[0]
 
     @staticmethod
     def _parse_candidate_datetime(value: Any) -> datetime | None:
@@ -1065,3 +1346,160 @@ class ContextComposer:
                 prefix += f" @ {occurred_at}"
             rendered.append(f"{prefix}: {text}")
         return " | ".join(rendered)
+
+    @staticmethod
+    def _source_quote_options(
+        *,
+        query_type: QueryType,
+        exact_recall_mode: bool,
+    ) -> _SourceQuoteOptions:
+        enabled = exact_recall_mode or query_type in {
+            "temporal",
+            "slot_fill",
+            "broad_list",
+        }
+        if not enabled:
+            return _SourceQuoteOptions(enabled=False)
+        if query_type == "temporal":
+            max_entries = 4
+        elif query_type in {"slot_fill", "broad_list"}:
+            max_entries = 6
+        else:
+            max_entries = 5
+        return _SourceQuoteOptions(
+            enabled=True,
+            max_entries=max_entries,
+        )
+
+    @staticmethod
+    def _ranked_source_quote_options(
+        options: _SourceQuoteOptions,
+        *,
+        rank: int,
+    ) -> _SourceQuoteOptions:
+        if (
+            not options.enabled
+            or options.max_entries is None
+            or rank <= options.max_entries
+        ):
+            return options
+        return _SourceQuoteOptions(enabled=False)
+
+    @staticmethod
+    def _compact_source_quote_options(
+        options: _SourceQuoteOptions,
+    ) -> _SourceQuoteOptions:
+        if not options.enabled:
+            return options
+        return _SourceQuoteOptions(
+            enabled=True,
+            max_messages=min(options.max_messages, 1),
+            max_chars=min(options.max_chars, 220),
+            max_message_chars=min(options.max_message_chars, 180),
+            max_entries=options.max_entries,
+        )
+
+    @staticmethod
+    def _source_messages_by_id(
+        conversation_messages: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        messages_by_id: dict[str, dict[str, Any]] = {}
+        for message in conversation_messages:
+            message_id = str(message.get("id") or "").strip()
+            if not message_id or message_id in messages_by_id:
+                continue
+            messages_by_id[message_id] = message
+        return messages_by_id
+
+    @classmethod
+    def _source_quote_for_candidate(
+        cls,
+        candidate: ScoredCandidate,
+        *,
+        source_messages_by_id: dict[str, dict[str, Any]],
+        options: _SourceQuoteOptions,
+    ) -> str:
+        if not options.enabled:
+            return ""
+        memory_object = candidate.memory_object
+        payload_json = memory_object.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            return ""
+        if payload_json.get("source_kind_variant") == "conversation_window":
+            return ""
+        if not source_messages_by_id:
+            return ""
+        source_message_ids = cls._candidate_source_message_ids(candidate)
+        if not source_message_ids:
+            return ""
+
+        rendered: list[str] = []
+        total_chars = 0
+        for source_message_id in source_message_ids:
+            if len(rendered) >= options.max_messages:
+                break
+            message = source_messages_by_id.get(source_message_id)
+            if message is None or not cls._message_allows_source_quote(message):
+                continue
+            text = str(message.get("text", "")).strip()
+            if not text:
+                continue
+            text = cls._truncate_inline(text, options.max_message_chars)
+            prefix_parts = [str(message.get("role") or "unknown").strip() or "unknown"]
+            occurred_at = str(message.get("occurred_at") or "").strip()
+            if occurred_at:
+                prefix_parts.append(f"@ {occurred_at}")
+            seq = message.get("seq")
+            if seq is not None:
+                prefix_parts.append(f"seq {seq}")
+            segment = f"{' '.join(prefix_parts)}: {text}"
+            segment = cls._truncate_inline(
+                segment, max(1, options.max_chars - total_chars)
+            )
+            if not segment:
+                continue
+            rendered.append(segment)
+            total_chars += len(segment)
+            if total_chars >= options.max_chars:
+                break
+        return " | ".join(rendered)
+
+    @staticmethod
+    def _candidate_source_message_ids(candidate: ScoredCandidate) -> list[str]:
+        payload_json = candidate.memory_object.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            return []
+        source_ids = payload_json.get("source_message_ids") or []
+        if not isinstance(source_ids, list):
+            return []
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for source_id in source_ids:
+            value = str(source_id).strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
+    @staticmethod
+    def _message_allows_source_quote(message: dict[str, Any]) -> bool:
+        include_raw = message.get("include_raw")
+        if include_raw is None:
+            return True
+        if isinstance(include_raw, str):
+            return include_raw.strip().lower() not in {"0", "false", "no"}
+        if int(include_raw) == 0:
+            return False
+        return True
+
+    @staticmethod
+    def _truncate_inline(text: str, max_chars: int) -> str:
+        if max_chars <= 0:
+            return ""
+        normalized = " ".join(text.split())
+        if len(normalized) <= max_chars:
+            return normalized
+        if max_chars <= 3:
+            return normalized[:max_chars]
+        return f"{normalized[: max_chars - 3].rstrip()}..."

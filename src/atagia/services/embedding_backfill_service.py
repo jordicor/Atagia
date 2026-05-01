@@ -100,6 +100,7 @@ class EmbeddingBackfillService:
                 mo.canonical_text,
                 mo.index_text,
                 mo.privacy_level,
+                mo.intimacy_boundary,
                 mo.preserve_verbatim,
                 mo.status,
                 mo.created_at
@@ -126,6 +127,7 @@ class EmbeddingBackfillService:
                 canonical_text=str(row["canonical_text"]),
                 index_text=str(row["index_text"]) if row["index_text"] is not None else None,
                 privacy_level=int(row["privacy_level"]),
+                intimacy_boundary=str(row["intimacy_boundary"]),
                 preserve_verbatim=bool(int(row["preserve_verbatim"])),
             )
             await self._embedding_index.upsert(

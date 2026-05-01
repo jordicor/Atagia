@@ -14,8 +14,6 @@ from tempfile import TemporaryDirectory
 from time import perf_counter
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 from benchmarks.artifact_hash import (
     sha256_directory,
     sha256_file,
@@ -35,6 +33,12 @@ from benchmarks.locomo.adapter import LoCoMoAdapter
 from benchmarks.retrieval_custody import build_retrieval_custody
 from benchmarks.custody_summary import summarize_retrieval_custody
 from benchmarks.json_artifacts import write_json_atomic
+from benchmarks.llm_config import provider_api_key_kwargs
+from benchmarks.llm_metrics import (
+    LLMCallRecorder,
+    install_llm_call_recorder,
+    merge_llm_call_summaries,
+)
 from benchmarks.migration_metadata import benchmark_migration_metadata
 from benchmarks.scorer import LLMJudgeScorer
 from benchmarks.trusted_eval import (
@@ -49,6 +53,7 @@ from atagia.core.timestamps import normalize_optional_timestamp
 from atagia.models.schemas_memory import RetrievalTrace
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.admin_rebuild_service import AdminRebuildService, RebuildResult
+from atagia.services.artifact_service import ArtifactService
 from atagia.services.chat_support import build_system_prompt, chat_model, resolve_policy
 from atagia.services.llm_client import (
     LLMCompletionRequest,
@@ -56,8 +61,10 @@ from atagia.services.llm_client import (
     LLMMessage,
     StructuredOutputError,
 )
-from atagia.services.model_resolution import provider_qualified_model
+from atagia.services.model_resolution import COMPONENTS_BY_ID, provider_qualified_model
 from atagia.services.retrieval_service import RetrievalService
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
@@ -68,6 +75,53 @@ _BENCHMARK_INGESTION_PROGRESS_FILENAME = "ingestion_progress.json"
 _INGEST_MODE_ONLINE = "online"
 _INGEST_MODE_BULK = "bulk"
 _VALID_INGEST_MODES = {_INGEST_MODE_ONLINE, _INGEST_MODE_BULK}
+_ANSWER_PROMPT_VARIANT_DEFAULT = "default"
+_ANSWER_PROMPT_VARIANTS = frozenset(
+    {
+        _ANSWER_PROMPT_VARIANT_DEFAULT,
+        "grounded_connect",
+        "light_world_knowledge",
+    }
+)
+_ANSWER_PROMPT_VARIANT_NOTES = {
+    "grounded_connect": (
+        "Benchmark answer variant: if the retrieved context contains partial, "
+        "adjacent, or implicit evidence that is sufficient to answer, connect "
+        "those facts and give the best grounded answer directly. Resolve "
+        "relative dates against the relevant memory or source-window date. If "
+        "a memory uses a vague reference such as 'the movie', 'that concert', "
+        "or 'it', and other retrieved context names an unambiguous nearby "
+        "referent, use that referent explicitly. Do not use outside knowledge "
+        "or invent private facts; say you do not know only when the retrieved "
+        "context does not support the answer."
+    ),
+    "light_world_knowledge": (
+        "Benchmark answer variant: answer from retrieved context first. You may "
+        "use general world knowledge only to interpret public entities, titles, "
+        "aliases, or obvious references when the retrieved context already "
+        "contains strong clues. Do not use world knowledge to invent private "
+        "events, dates, performers, relationships, locations, or personal "
+        "details not supported by retrieved context. When evidence is partial "
+        "but sufficient, connect the facts and answer directly; when it is not "
+        "sufficient, say you do not know."
+    ),
+}
+
+_TECHNICAL_FAILURE_DIAGNOSIS_BY_STAGE = {
+    "retrieval": "retrieval_failed",
+    "answer_generation": "answer_generation_failed",
+    "judge": "judge_failed",
+}
+_TECHNICAL_FAILURE_TRACE_KEY_BY_STAGE = {
+    "retrieval": "retrieval_failure",
+    "answer_generation": "answer_generation_failure",
+    "judge": "judge_failure",
+}
+_TECHNICAL_FAILURE_REASON_PREFIX_BY_STAGE = {
+    "retrieval": "Retrieval failed",
+    "answer_generation": "Answer generation failed",
+    "judge": "Judge call failed",
+}
 
 
 def _apply_corrections(
@@ -97,7 +151,14 @@ class LoCoMoBenchmark(BenchmarkRunner):
         llm_provider: str,
         llm_api_key: str | None,
         llm_model: str | None,
+        answer_model: str | None = None,
         judge_model: str | None = None,
+        forced_global_model: str | None = None,
+        ingest_model: str | None = None,
+        retrieval_model: str | None = None,
+        chat_model_override: str | None = None,
+        component_models: dict[str, str] | None = None,
+        answer_prompt_variant: str = _ANSWER_PROMPT_VARIANT_DEFAULT,
         manifests_dir: str | Path | None = None,
         embedding_backend: str = "none",
         embedding_model: str | None = None,
@@ -107,12 +168,40 @@ class LoCoMoBenchmark(BenchmarkRunner):
         self._data_path = Path(data_path).expanduser()
         self._llm_provider = llm_provider
         self._llm_api_key = llm_api_key
-        self._llm_model = provider_qualified_model(llm_provider, llm_model)
+        self._answer_model = provider_qualified_model(
+            llm_provider,
+            answer_model or llm_model,
+        )
         self._judge_model = (
             provider_qualified_model(llm_provider, judge_model)
             if judge_model is not None
-            else self._llm_model
+            else self._answer_model
         )
+        self._forced_global_model = provider_qualified_model(
+            llm_provider,
+            forced_global_model,
+        )
+        self._ingest_model = provider_qualified_model(llm_provider, ingest_model)
+        self._retrieval_model = provider_qualified_model(llm_provider, retrieval_model)
+        self._chat_model = provider_qualified_model(llm_provider, chat_model_override)
+        unknown_components = sorted(set(component_models or {}).difference(COMPONENTS_BY_ID))
+        if unknown_components:
+            valid = ", ".join(sorted(COMPONENTS_BY_ID))
+            raise ValueError(
+                "Unknown LoCoMo component model override(s): "
+                f"{', '.join(unknown_components)}. Valid component ids: {valid}"
+            )
+        self._component_models = {
+            component_id: provider_qualified_model(llm_provider, model) or model
+            for component_id, model in (component_models or {}).items()
+        }
+        if answer_prompt_variant not in _ANSWER_PROMPT_VARIANTS:
+            valid = ", ".join(sorted(_ANSWER_PROMPT_VARIANTS))
+            raise ValueError(
+                f"Unknown LoCoMo answer prompt variant: {answer_prompt_variant!r}. "
+                f"Valid variants: {valid}"
+            )
+        self._answer_prompt_variant = answer_prompt_variant
         self._manifests_dir = (
             Path(manifests_dir).expanduser()
             if manifests_dir is not None
@@ -566,14 +655,22 @@ class LoCoMoBenchmark(BenchmarkRunner):
         async with Atagia(
             db_path=db_path,
             manifests_dir=self._manifests_dir,
-            llm_provider=self._llm_provider,
-            llm_api_key=self._llm_api_key,
-            llm_model=self._llm_model,
+            llm_forced_global_model=self._forced_global_model,
+            llm_ingest_model=self._ingest_model,
+            llm_retrieval_model=self._retrieval_model,
+            llm_chat_model=self._chat_model,
+            llm_component_models=self._component_models,
+            **provider_api_key_kwargs(self._llm_provider, self._llm_api_key),
             embedding_backend=self._embedding_backend,
             embedding_model=self._embedding_model,
             skip_belief_revision=ablation.skip_belief_revision if ablation else False,
             skip_compaction=ablation.skip_compaction if ablation else False,
         ) as engine:
+            runtime = engine.runtime
+            if runtime is None:
+                raise RuntimeError("Atagia runtime was unexpectedly unavailable")
+            llm_recorder = LLMCallRecorder()
+            install_llm_call_recorder(runtime.llm_client, llm_recorder)
             user_id = "benchmark-user"
             rebuild_result: RebuildResult | None = None
             if evaluate_only:
@@ -683,6 +780,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                         ingest_only=ingest_only,
                         ingest_mode=db_ingest_mode,
                         rebuild_result=rebuild_result,
+                        llm_call_summary=llm_recorder.summary(),
                     ),
                 )
             trusted_activation_count = (
@@ -717,6 +815,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 parallel_questions=parallel_questions,
                 ingest_mode=ingest_mode,
                 db_ingest_mode=db_ingest_mode,
+                llm_recorder=llm_recorder,
             )
 
         return self._build_conversation_report(
@@ -729,6 +828,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 ingest_only=ingest_only,
                 ingest_mode=db_ingest_mode,
                 rebuild_result=rebuild_result,
+                llm_call_summary=llm_recorder.summary(),
             ),
         )
 
@@ -765,6 +865,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 role=turn.role,
                 text=f"{turn.speaker}: {turn.text}",
                 occurred_at=turn.timestamp or None,
+                attachments=turn.attachments or None,
             )
             if runtime.settings.workers_enabled:
                 drained = await engine.flush(timeout_seconds=1800.0)
@@ -844,6 +945,20 @@ class LoCoMoBenchmark(BenchmarkRunner):
         connection = await runtime.open_connection()
         try:
             messages_repo = MessageRepository(connection, runtime.clock)
+            conversations_repo = ConversationRepository(connection, runtime.clock)
+            artifacts = ArtifactService(
+                connection,
+                runtime.clock,
+                blob_store=runtime.artifact_blob_store,
+            )
+            conversation_row = await conversations_repo.get_conversation(
+                conversation.conversation_id,
+                user_id,
+            )
+            if conversation_row is None:
+                raise RuntimeError(
+                    f"Benchmark conversation {conversation.conversation_id} was not initialized"
+                )
             try:
                 await connection.execute("BEGIN")
                 for turn in turns:
@@ -851,17 +966,31 @@ class LoCoMoBenchmark(BenchmarkRunner):
                         normalize_optional_timestamp(turn.timestamp)
                         or runtime.clock.now().isoformat()
                     )
-                    await messages_repo.create_message(
+                    message_text = f"{turn.speaker}: {turn.text}"
+                    attachment_bundle = artifacts.prepare_attachments(
+                        message_text=message_text,
+                        attachments=turn.attachments or None,
+                        user_id=user_id,
+                        conversation=conversation_row,
+                    )
+                    metadata = self._message_metadata_for_attachments(attachment_bundle)
+                    created_message = await messages_repo.create_message(
                         message_id=None,
                         conversation_id=conversation.conversation_id,
                         role=turn.role,
                         seq=None,
-                        text=f"{turn.speaker}: {turn.text}",
+                        text=attachment_bundle.prompt_text,
                         token_count=None,
-                        metadata={},
+                        metadata=metadata,
                         occurred_at=resolved_occurred_at,
                         commit=False,
                     )
+                    if attachment_bundle.artifacts:
+                        await artifacts.persist_prepared_attachments(
+                            bundle=attachment_bundle,
+                            message_id=str(created_message["id"]),
+                            commit=False,
+                        )
                 await connection.commit()
             except Exception:
                 await connection.rollback()
@@ -936,6 +1065,24 @@ class LoCoMoBenchmark(BenchmarkRunner):
             rebuild_result,
         )
 
+    @staticmethod
+    def _message_metadata_for_attachments(attachment_bundle: Any) -> dict[str, Any]:
+        if not attachment_bundle.artifacts:
+            return {}
+        return {
+            "attachments": attachment_bundle.attachments,
+            "attachment_count": len(attachment_bundle.artifacts),
+            "attachment_artifact_ids": [
+                str(prepared.artifact["id"]) for prepared in attachment_bundle.artifacts
+            ],
+            "artifact_backed": True,
+            "skip_by_default": True,
+            "include_raw": False,
+            "requires_explicit_request": True,
+            "content_kind": "artifact",
+            "context_placeholder": attachment_bundle.context_placeholder,
+        }
+
     async def _load_turn_message_ids(
         self,
         engine: Atagia,
@@ -991,6 +1138,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
         parallel_questions: int,
         ingest_mode: str,
         db_ingest_mode: str,
+        llm_recorder: LLMCallRecorder,
     ) -> list[QuestionResult]:
         runtime = engine.runtime
         if runtime is None:
@@ -1017,6 +1165,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 trusted_evaluation=trusted_evaluation,
                 trusted_activation_count=trusted_activation_count,
                 turn_message_ids=turn_message_ids,
+                llm_recorder=llm_recorder,
             )
             async with checkpoint_lock:
                 results_by_index[question_index] = result
@@ -1103,6 +1252,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
         trusted_evaluation: bool,
         trusted_activation_count: int,
         turn_message_ids: dict[str, str],
+        llm_recorder: LLMCallRecorder,
     ) -> QuestionResult:
         runtime = engine.runtime
         if runtime is None:
@@ -1113,10 +1263,12 @@ class LoCoMoBenchmark(BenchmarkRunner):
             f"{question_index}/{question_count}",
             flush=True,
         )
-        # LLM errors during answer generation or judging must not cancel sibling
-        # questions in the same parallel batch (asyncio.gather would propagate
-        # and cancel every in-flight task across all conversations otherwise).
-        try:
+        with llm_recorder.context(
+            conversation_id=conversation.conversation_id,
+            question_id=question.question_id,
+            question_index=question_index,
+            category=question.category,
+        ):
             retrieval_trace = RetrievalTrace(
                 query_text=question.question_text,
                 user_id=user_id,
@@ -1124,75 +1276,190 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 timestamp_iso=runtime.clock.now().isoformat(),
             )
             retrieval_started_at = perf_counter()
-            pipeline_result, assistant_mode_id = await self._retrieve_question_context(
-                engine,
-                user_id=user_id,
-                conversation_id=conversation.conversation_id,
-                question_text=question.question_text,
-                ablation=(
-                    trusted_evaluation_ablation(ablation)
-                    if trusted_evaluation
-                    else ablation
-                ),
-                trace=retrieval_trace,
-            )
-            retrieval_time_ms = (perf_counter() - retrieval_started_at) * 1000.0
-            prediction = await self._generate_answer(
-                runtime=runtime,
-                assistant_mode_id=assistant_mode_id,
-                pipeline_result=pipeline_result,
-                question_text=question.question_text,
-                trusted_evaluation=trusted_evaluation,
-            )
-            score_result = await judge.score(
-                question=question.question_text,
-                prediction=prediction,
-                ground_truth=question.ground_truth,
-            )
-            trace_payload = await self._build_question_trace(
-                engine,
-                user_id=user_id,
-                question=question,
-                pipeline_result=pipeline_result,
-                retrieval_trace=retrieval_trace,
-                assistant_mode_id=assistant_mode_id,
-                conversation_id=conversation.conversation_id,
-                turn_message_ids=turn_message_ids,
-                passed=bool(score_result.score),
-                trusted_evaluation=trusted_evaluation,
-                trusted_activation_count=trusted_activation_count,
-            )
-            return QuestionResult(
-                question=question,
-                prediction=prediction,
-                score_result=score_result,
-                memories_used=len(pipeline_result.composed_context.selected_memory_ids),
-                retrieval_time_ms=retrieval_time_ms,
-                trace=trace_payload,
-            )
-        except (LLMError, StructuredOutputError) as exc:
-            exc_class = type(exc).__name__
-            message = str(exc)
-            truncated = message if len(message) <= 500 else f"{message[:500]}..."
-            logger.warning(
-                "LoCoMo question scoring failed for conversation_id=%s question_index=%s: %s: %s",
-                conversation.conversation_id,
-                question_index,
-                exc_class,
-                truncated,
-            )
-            return QuestionResult(
-                question=question,
-                prediction="",
-                score_result=ScoreResult(
-                    score=0,
-                    reasoning=f"Judge call failed: {exc_class}: {truncated}",
+            try:
+                pipeline_result, assistant_mode_id = await self._retrieve_question_context(
+                    engine,
+                    user_id=user_id,
+                    conversation_id=conversation.conversation_id,
+                    question_text=question.question_text,
+                    ablation=(
+                        trusted_evaluation_ablation(ablation)
+                        if trusted_evaluation
+                        else ablation
+                    ),
+                    trace=retrieval_trace,
+                )
+            except (LLMError, StructuredOutputError) as exc:
+                return self._technical_failure_result(
+                    question=question,
+                    stage="retrieval",
+                    exc=exc,
                     judge_model=judge.judge_model,
-                ),
-                memories_used=0,
-                retrieval_time_ms=0.0,
-                trace={"judge_failure": {"exception_class": exc_class, "message": truncated}},
-            )
+                    conversation=conversation,
+                    question_index=question_index,
+                    trace={
+                        "retrieval_trace": retrieval_trace.model_dump(mode="json"),
+                        "llm_calls": llm_recorder.records_for_context(
+                            conversation_id=conversation.conversation_id,
+                            question_id=question.question_id,
+                        ),
+                    },
+                )
+            retrieval_time_ms = (perf_counter() - retrieval_started_at) * 1000.0
+            try:
+                prediction = await self._generate_answer(
+                    runtime=runtime,
+                    assistant_mode_id=assistant_mode_id,
+                    pipeline_result=pipeline_result,
+                    question_text=question.question_text,
+                    trusted_evaluation=trusted_evaluation,
+                )
+            except (LLMError, StructuredOutputError) as exc:
+                trace_payload = await self._build_question_trace(
+                    engine,
+                    user_id=user_id,
+                    question=question,
+                    pipeline_result=pipeline_result,
+                    retrieval_trace=retrieval_trace,
+                    assistant_mode_id=assistant_mode_id,
+                    conversation_id=conversation.conversation_id,
+                    turn_message_ids=turn_message_ids,
+                    passed=False,
+                    trusted_evaluation=trusted_evaluation,
+                    trusted_activation_count=trusted_activation_count,
+                )
+                trace_payload["llm_calls"] = llm_recorder.records_for_context(
+                    conversation_id=conversation.conversation_id,
+                    question_id=question.question_id,
+                )
+                return self._technical_failure_result(
+                    question=question,
+                    stage="answer_generation",
+                    exc=exc,
+                    judge_model=judge.judge_model,
+                    conversation=conversation,
+                    question_index=question_index,
+                    prediction="",
+                    memories_used=len(pipeline_result.composed_context.selected_memory_ids),
+                    retrieval_time_ms=retrieval_time_ms,
+                    trace=trace_payload,
+                )
+            try:
+                score_result = await judge.score(
+                    question=question.question_text,
+                    prediction=prediction,
+                    ground_truth=question.ground_truth,
+                )
+            except (LLMError, StructuredOutputError) as exc:
+                trace_payload = await self._build_question_trace(
+                    engine,
+                    user_id=user_id,
+                    question=question,
+                    pipeline_result=pipeline_result,
+                    retrieval_trace=retrieval_trace,
+                    assistant_mode_id=assistant_mode_id,
+                    conversation_id=conversation.conversation_id,
+                    turn_message_ids=turn_message_ids,
+                    passed=False,
+                    trusted_evaluation=trusted_evaluation,
+                    trusted_activation_count=trusted_activation_count,
+                )
+                trace_payload["llm_calls"] = llm_recorder.records_for_context(
+                    conversation_id=conversation.conversation_id,
+                    question_id=question.question_id,
+                )
+                return self._technical_failure_result(
+                    question=question,
+                    stage="judge",
+                    exc=exc,
+                    judge_model=judge.judge_model,
+                    conversation=conversation,
+                    question_index=question_index,
+                    prediction=prediction,
+                    memories_used=len(pipeline_result.composed_context.selected_memory_ids),
+                    retrieval_time_ms=retrieval_time_ms,
+                    trace=trace_payload,
+                )
+        trace_payload = await self._build_question_trace(
+            engine,
+            user_id=user_id,
+            question=question,
+            pipeline_result=pipeline_result,
+            retrieval_trace=retrieval_trace,
+            assistant_mode_id=assistant_mode_id,
+            conversation_id=conversation.conversation_id,
+            turn_message_ids=turn_message_ids,
+            passed=bool(score_result.score),
+            trusted_evaluation=trusted_evaluation,
+            trusted_activation_count=trusted_activation_count,
+        )
+        trace_payload["llm_calls"] = llm_recorder.records_for_context(
+            conversation_id=conversation.conversation_id,
+            question_id=question.question_id,
+        )
+        return QuestionResult(
+            question=question,
+            prediction=prediction,
+            score_result=score_result,
+            memories_used=len(pipeline_result.composed_context.selected_memory_ids),
+            retrieval_time_ms=retrieval_time_ms,
+            trace=trace_payload,
+        )
+
+    @staticmethod
+    def _technical_failure_result(
+        *,
+        question: BenchmarkQuestion,
+        stage: str,
+        exc: Exception,
+        judge_model: str,
+        conversation: BenchmarkConversation,
+        question_index: int,
+        prediction: str = "",
+        memories_used: int = 0,
+        retrieval_time_ms: float = 0.0,
+        trace: dict[str, Any] | None = None,
+    ) -> QuestionResult:
+        exc_class = type(exc).__name__
+        message = str(exc)
+        truncated = message if len(message) <= 500 else f"{message[:500]}..."
+        diagnosis_bucket = _TECHNICAL_FAILURE_DIAGNOSIS_BY_STAGE.get(
+            stage,
+            "technical_failure",
+        )
+        trace_key = _TECHNICAL_FAILURE_TRACE_KEY_BY_STAGE.get(stage, "technical_failure")
+        reason_prefix = _TECHNICAL_FAILURE_REASON_PREFIX_BY_STAGE.get(
+            stage,
+            "Question execution failed",
+        )
+        logger.warning(
+            "LoCoMo question %s failed for conversation_id=%s question_index=%s: %s: %s",
+            stage,
+            conversation.conversation_id,
+            question_index,
+            exc_class,
+            truncated,
+        )
+        trace_payload = dict(trace or {})
+        trace_payload["failure_stage"] = stage
+        trace_payload["diagnosis_bucket"] = diagnosis_bucket
+        trace_payload["sufficiency_diagnostic"] = diagnosis_bucket
+        trace_payload[trace_key] = {
+            "exception_class": exc_class,
+            "message": truncated,
+        }
+        return QuestionResult(
+            question=question,
+            prediction=prediction,
+            score_result=ScoreResult(
+                score=0,
+                reasoning=f"{reason_prefix}: {exc_class}: {truncated}",
+                judge_model=judge_model,
+            ),
+            memories_used=memories_used,
+            retrieval_time_ms=retrieval_time_ms,
+            trace=trace_payload,
+        )
 
     async def _retrieve_question_context(
         self,
@@ -1371,9 +1638,12 @@ class LoCoMoBenchmark(BenchmarkRunner):
         )
         if trusted_evaluation:
             system_prompt = f"{system_prompt}\n\n{TRUSTED_EVALUATION_PROMPT_NOTE}"
+        variant_note = _ANSWER_PROMPT_VARIANT_NOTES.get(self._answer_prompt_variant)
+        if variant_note:
+            system_prompt = f"{system_prompt}\n\n{variant_note}"
         response = await runtime.llm_client.complete(
             LLMCompletionRequest(
-                model=self._llm_model or chat_model(runtime.settings),
+                model=self._answer_model or chat_model(runtime.settings),
                 messages=[
                     LLMMessage(role="system", content=system_prompt),
                     LLMMessage(role="user", content=question_text),
@@ -1509,10 +1779,22 @@ class LoCoMoBenchmark(BenchmarkRunner):
         return summaries
 
     def _base_model_info(self) -> dict[str, Any]:
+        effective_answer_model = (
+            self._answer_model
+            or self._chat_model
+            or self._forced_global_model
+            or ""
+        )
         return {
             "provider": self._llm_provider,
-            "answer_model": self._llm_model or "",
-            "judge_model": self._judge_model or self._llm_model or "",
+            "answer_model": effective_answer_model,
+            "judge_model": self._judge_model or effective_answer_model,
+            "forced_global_model": self._forced_global_model,
+            "ingest_model": self._ingest_model,
+            "retrieval_model": self._retrieval_model,
+            "chat_model": self._chat_model,
+            "component_models": dict(sorted(self._component_models.items())),
+            "answer_prompt_variant": self._answer_prompt_variant,
             "assistant_mode_id": _DEFAULT_ASSISTANT_MODE_ID,
         }
 
@@ -1540,6 +1822,10 @@ class LoCoMoBenchmark(BenchmarkRunner):
         model_info.setdefault(
             "retrieval_custody_summary",
             self._aggregate_retrieval_custody_summary(conversation_reports),
+        )
+        model_info.setdefault(
+            "llm_call_summary",
+            self._aggregate_llm_call_summary(conversation_reports),
         )
         return BenchmarkReport(
             benchmark_name="LoCoMo",
@@ -1587,6 +1873,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
         ingest_only: bool,
         ingest_mode: str | None = None,
         rebuild_result: RebuildResult | None = None,
+        llm_call_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         metadata: dict[str, Any] = {
             "benchmark_db_path": str(db_path),
@@ -1597,6 +1884,8 @@ class LoCoMoBenchmark(BenchmarkRunner):
             metadata["ingest_mode"] = ingest_mode
         if rebuild_result is not None:
             metadata["rebuild_result"] = rebuild_result.model_dump(mode="json")
+        if llm_call_summary is not None:
+            metadata["llm_call_summary"] = llm_call_summary
         if metadata_dir is not None:
             metadata["benchmark_metadata_dir"] = str(metadata_dir)
             metadata["benchmark_run_metadata_path"] = str(
@@ -1619,6 +1908,9 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 "memory_not_active": 0,
                 "retrieval_or_ranking_miss": 0,
                 "answer_policy_or_grading": 0,
+                "retrieval_failed": 0,
+                "answer_generation_failed": 0,
+                "judge_failed": 0,
                 "structured_output_retries": 0,
                 "synthesis_preservation": 0,
                 "applicability_fallback": 0,
@@ -1655,6 +1947,17 @@ class LoCoMoBenchmark(BenchmarkRunner):
             for report in conversation_reports
             for result in report.results
         )
+
+    @staticmethod
+    def _aggregate_llm_call_summary(
+        conversation_reports: Sequence[ConversationReport],
+    ) -> dict[str, Any]:
+        summaries = [
+            report.metadata.get("llm_call_summary")
+            for report in conversation_reports
+            if isinstance(report.metadata.get("llm_call_summary"), dict)
+        ]
+        return merge_llm_call_summaries(summaries)
 
     @staticmethod
     def _write_report(report: BenchmarkReport, report_path: str | Path) -> Path:
@@ -1887,8 +2190,18 @@ class LoCoMoBenchmark(BenchmarkRunner):
             "max_turns": max_turns,
             "assistant_mode_id": _DEFAULT_ASSISTANT_MODE_ID,
             "provider": self._llm_provider,
-            "llm_model": self._llm_model,
-            "judge_model": self._judge_model,
+            "llm_model": self._answer_model or self._chat_model or self._forced_global_model,
+            "answer_model": self._answer_model or self._chat_model or self._forced_global_model,
+            "judge_model": self._judge_model
+            or self._answer_model
+            or self._chat_model
+            or self._forced_global_model,
+            "forced_global_model": self._forced_global_model,
+            "ingest_model": self._ingest_model,
+            "retrieval_model": self._retrieval_model,
+            "chat_model": self._chat_model,
+            "component_models": dict(sorted(self._component_models.items())),
+            "answer_prompt_variant": self._answer_prompt_variant,
             "embedding_backend": self._embedding_backend,
             "embedding_model": self._embedding_model,
             "ablation_config": (

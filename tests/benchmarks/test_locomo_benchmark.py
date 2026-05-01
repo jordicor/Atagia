@@ -12,6 +12,7 @@ import pytest
 
 from benchmarks.base import BenchmarkQuestion, BenchmarkReport, ConversationReport, QuestionResult, ScoreResult
 from benchmarks.locomo.__main__ import (
+    _build_parser,
     _format_benchmark_db_list,
     _format_benchmark_db_list_json,
     _format_benchmark_db_snapshot_diff,
@@ -208,10 +209,17 @@ class BenchmarkProvider(LLMProvider):
 
     @staticmethod
     def _response(request: LLMCompletionRequest, output_text: str) -> LLMCompletionResponse:
+        prompt_tokens = sum(len(message.content.split()) for message in request.messages)
+        completion_tokens = max(1, len(output_text.split()))
         return LLMCompletionResponse(
             provider=BenchmarkProvider.name,
             model=request.model,
             output_text=output_text,
+            usage={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
         )
 
     @staticmethod
@@ -258,6 +266,24 @@ class JudgeFailingForOneQuestionProvider(BenchmarkProvider):
             raise LLMError(
                 "Anthropic stopped because it reached max output tokens"
             )
+        return await super().complete(request)
+
+
+class AnswerFailingForOneQuestionProvider(BenchmarkProvider):
+    """Provider whose benchmark answer call raises LLMError for one question."""
+
+    def __init__(self, failing_question_text: str) -> None:
+        super().__init__()
+        self._failing_question_text = failing_question_text
+        self.answer_failures = 0
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        if (
+            request.metadata.get("purpose") == "benchmark_answer_generation"
+            and request.metadata.get("question") == self._failing_question_text
+        ):
+            self.answer_failures += 1
+            raise LLMError("Answer provider overloaded")
         return await super().complete(request)
 
 
@@ -349,6 +375,44 @@ def _write_dataset(tmp_path: Path) -> Path:
     return data_path
 
 
+def _write_dataset_with_image_caption(tmp_path: Path) -> Path:
+    data_path = tmp_path / "locomo-image.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "sample_id": "conv-image",
+                    "conversation": {
+                        "speaker_a": "Alice",
+                        "speaker_b": "Bob",
+                        "session_1": [
+                            {
+                                "speaker": "Bob",
+                                "dia_id": "D1:1",
+                                "text": "The kids loved making something with clay. They made this!",
+                                "img_url": ["https://example.test/dog-cup.jpg"],
+                                "blip_caption": "a photo of a cup with a dog face on it",
+                                "query": "kids pottery finished pieces",
+                            },
+                        ],
+                        "session_1_date_time": "1:56 pm on 8 May, 2023",
+                    },
+                    "qa": [
+                        {
+                            "question": "What kind of pot did Bob and the kids make with clay?",
+                            "answer": "a cup with a dog face on it",
+                            "evidence": ["D1:1"],
+                            "category": 4,
+                        },
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return data_path
+
+
 def _write_two_conversation_dataset(tmp_path: Path) -> Path:
     data_path = _write_dataset(tmp_path)
     samples = json.loads(data_path.read_text(encoding="utf-8"))
@@ -365,6 +429,57 @@ def _write_dataset_with_missing_timestamp(tmp_path: Path) -> Path:
     samples[0]["conversation"].pop("session_1_date_time")
     data_path.write_text(json.dumps(samples), encoding="utf-8")
     return data_path
+
+
+def test_atagia_constructor_accepts_phase_model_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_LLM_FORCED_GLOBAL_MODEL", "")
+    monkeypatch.setenv("ATAGIA_LLM_INGEST_MODEL", "")
+    monkeypatch.setenv("ATAGIA_LLM_RETRIEVAL_MODEL", "")
+    monkeypatch.setenv("ATAGIA_LLM_CHAT_MODEL", "")
+    engine = Atagia(
+        llm_ingest_model="openai/ingest-model,minimal",
+        llm_retrieval_model="openai/retrieval-model,medium",
+        llm_chat_model="openai/chat-model,high",
+        llm_component_models={"extractor": "openai/extractor-model,none"},
+    )
+
+    settings = engine._build_settings()
+
+    assert settings.llm_forced_global_model is None
+    assert settings.llm_ingest_model == "openai/ingest-model,minimal"
+    assert settings.llm_retrieval_model == "openai/retrieval-model,medium"
+    assert settings.llm_chat_model == "openai/chat-model,high"
+    assert settings.llm_component_models["extractor"] == "openai/extractor-model,none"
+
+
+def test_locomo_cli_accepts_answer_model_and_component_overrides() -> None:
+    args = _build_parser().parse_args(
+        [
+            "--data-path",
+            "benchmarks/data/locomo10.json",
+            "--provider",
+            "openrouter",
+            "--answer-model",
+            "openrouter/google/gemini-3.1-flash-lite-preview,medium",
+            "--ingest-model",
+            "openrouter/google/gemini-3.1-flash-lite-preview,none",
+            "--retrieval-model",
+            "openrouter/google/gemini-3.1-flash-lite-preview,minimal",
+            "--component-model",
+            "extractor=openai/gpt-4o-mini",
+            "--answer-prompt-variant",
+            "grounded_connect",
+        ]
+    )
+
+    assert args.model is None
+    assert args.answer_model == "openrouter/google/gemini-3.1-flash-lite-preview,medium"
+    assert args.ingest_model == "openrouter/google/gemini-3.1-flash-lite-preview,none"
+    assert args.retrieval_model == "openrouter/google/gemini-3.1-flash-lite-preview,minimal"
+    assert args.component_model == ["extractor=openai/gpt-4o-mini"]
+    assert args.answer_prompt_variant == "grounded_connect"
 
 
 @pytest.mark.asyncio
@@ -421,6 +536,70 @@ async def test_benchmark_single_conversation(
         for request in provider.requests
         if request.metadata.get("purpose") == "memory_extraction"
     ) == 6
+    assert report.model_info["llm_call_summary"]["total_calls"] > 0
+    assert report.conversations[0].results[0].trace["llm_calls"]
+
+
+@pytest.mark.asyncio
+async def test_benchmark_routes_models_by_phase_and_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model=None,
+        answer_model="answer-model,high",
+        judge_model="judge-model,medium",
+        ingest_model="ingest-model,minimal",
+        retrieval_model="retrieval-model,none",
+        chat_model_override="chat-model",
+        component_models={"extractor": "extractor-model,minimal"},
+        answer_prompt_variant="grounded_connect",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await benchmark.run(categories=[1], max_questions=1)
+
+    models_by_purpose: dict[str, set[str]] = {}
+    for request in provider.requests:
+        purpose = str(request.metadata.get("purpose"))
+        models_by_purpose.setdefault(purpose, set()).add(request.model)
+
+    assert models_by_purpose["memory_extraction"] == {"openai/extractor-model,minimal"}
+    assert models_by_purpose["contract_projection"] == {"openai/ingest-model,minimal"}
+    assert models_by_purpose["need_detection"] == {"openai/retrieval-model,none"}
+    assert models_by_purpose["applicability_scoring"] == {"openai/retrieval-model,none"}
+    assert models_by_purpose["benchmark_answer_generation"] == {"openai/answer-model,high"}
+    assert models_by_purpose["benchmark_judge"] == {"openai/judge-model,medium"}
+
+    assert report.model_info["answer_model"] == "openai/answer-model,high"
+    assert report.model_info["judge_model"] == "openai/judge-model,medium"
+    assert report.model_info["forced_global_model"] is None
+    assert report.model_info["ingest_model"] == "openai/ingest-model,minimal"
+    assert report.model_info["retrieval_model"] == "openai/retrieval-model,none"
+    assert report.model_info["chat_model"] == "openai/chat-model"
+    assert report.model_info["component_models"] == {
+        "extractor": "openai/extractor-model,minimal"
+    }
+    assert report.model_info["answer_prompt_variant"] == "grounded_connect"
+    answer_request = next(
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "benchmark_answer_generation"
+    )
+    assert "Benchmark answer variant" in answer_request.messages[0].content
+    llm_calls = report.conversations[0].results[0].trace["llm_calls"]
+    assert {call["purpose"] for call in llm_calls} >= {
+        "need_detection",
+        "applicability_scoring",
+        "benchmark_answer_generation",
+        "benchmark_judge",
+    }
+    assert report.model_info["llm_call_summary"]["by_purpose"]["memory_extraction"]["calls"] == 6
 
 
 @pytest.mark.asyncio
@@ -581,6 +760,106 @@ async def test_benchmark_writes_partial_checkpoint_before_interruption(
 
 
 @pytest.mark.asyncio
+async def test_score_question_labels_retrieval_error_without_cancelling_siblings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failing_question_text = "What color notebooks does Alice keep?"
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    original_retrieve = RetrievalService.retrieve
+
+    async def _fail_one_retrieval(
+        self: RetrievalService,
+        user_id: str,
+        conversation_id: str,
+        message_text: str,
+        mode: str | None = None,
+        ablation: AblationConfig | None = None,
+        trace: object | None = None,
+    ):
+        if message_text == failing_question_text:
+            raise LLMError("Retrieval provider overloaded")
+        return await original_retrieve(
+            self,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_text=message_text,
+            mode=mode,
+            ablation=ablation,
+            trace=trace,
+        )
+
+    monkeypatch.setattr(RetrievalService, "retrieve", _fail_one_retrieval)
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await benchmark.run(parallel_questions=2)
+
+    assert report.total_questions == 3
+    failed = next(
+        result
+        for result in report.conversations[0].results
+        if result.question.question_text == failing_question_text
+    )
+    assert failed.score_result.score == 0
+    assert "Retrieval failed" in failed.score_result.reasoning
+    assert failed.trace["failure_stage"] == "retrieval"
+    assert failed.trace["diagnosis_bucket"] == "retrieval_failed"
+    assert failed.trace["sufficiency_diagnostic"] == "retrieval_failed"
+    assert failed.trace["retrieval_failure"]["exception_class"] == "LLMError"
+    assert report.model_info["warning_counts"]["retrieval_failed"] == 1
+    surviving_results = [
+        result
+        for result in report.conversations[0].results
+        if result.question.question_text != failing_question_text
+    ]
+    assert len(surviving_results) == 2
+    assert all("failure_stage" not in result.trace for result in surviving_results)
+
+
+@pytest.mark.asyncio
+async def test_score_question_labels_answer_generation_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failing_question_text = "What color notebooks does Alice keep?"
+    provider = AnswerFailingForOneQuestionProvider(failing_question_text)
+    _install_stub_client(monkeypatch, provider)
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await benchmark.run(parallel_questions=2)
+
+    assert provider.answer_failures == 1
+    failed = next(
+        result
+        for result in report.conversations[0].results
+        if result.question.question_text == failing_question_text
+    )
+    assert failed.score_result.score == 0
+    assert "Answer generation failed" in failed.score_result.reasoning
+    assert failed.trace["failure_stage"] == "answer_generation"
+    assert failed.trace["diagnosis_bucket"] == "answer_generation_failed"
+    assert failed.trace["sufficiency_diagnostic"] == "answer_generation_failed"
+    assert failed.trace["answer_generation_failure"]["exception_class"] == "LLMError"
+    assert "retrieval_trace" in failed.trace
+    assert report.model_info["warning_counts"]["answer_generation_failed"] == 1
+
+
+@pytest.mark.asyncio
 async def test_score_question_tolerates_judge_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -617,7 +896,11 @@ async def test_score_question_tolerates_judge_error(
     assert "Judge call failed" in failed.score_result.reasoning
     assert "LLMError" in failed.score_result.reasoning
     assert failed.score_result.judge_model == "openai/judge-model"
+    assert failed.trace["failure_stage"] == "judge"
+    assert failed.trace["diagnosis_bucket"] == "judge_failed"
+    assert failed.trace["sufficiency_diagnostic"] == "judge_failed"
     assert failed.trace.get("judge_failure", {}).get("exception_class") == "LLMError"
+    assert report.model_info["warning_counts"]["judge_failed"] == 1
     surviving_results = [
         result
         for result in results
@@ -737,6 +1020,10 @@ async def test_benchmark_max_turns_limits_ingestion(
         mode: str | None = None,
         workspace_id: str | None = None,
         occurred_at: str | None = None,
+        attachments: list[dict[str, object]] | None = None,
+        *,
+        operational_profile: str | None = None,
+        operational_signals: dict[str, object] | None = None,
     ) -> None:
         ingested_messages.append((role, text, occurred_at))
         await original_ingest_message(
@@ -748,6 +1035,9 @@ async def test_benchmark_max_turns_limits_ingestion(
             mode=mode,
             workspace_id=workspace_id,
             occurred_at=occurred_at,
+            attachments=attachments,
+            operational_profile=operational_profile,
+            operational_signals=operational_signals,
         )
 
     monkeypatch.setattr(Atagia, "ingest_message", _capture_ingest_message)
@@ -875,9 +1165,8 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
     async with Atagia(
         db_path=retained_db,
         manifests_dir=MANIFESTS_DIR,
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
-        llm_model="answer-model",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/answer-model",
     ) as engine:
         runtime = engine.runtime
         assert runtime is not None
@@ -892,6 +1181,67 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
 
     assert len(messages) == 6
     assert all("What color notebooks" not in str(message["text"]) for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_benchmark_bulk_ingest_persists_locomo_image_captions_as_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    data_path = _write_dataset_with_image_caption(tmp_path)
+    db_dir = tmp_path / "benchmark-dbs"
+    benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    await benchmark.run(
+        conversation_ids=["conv-image"],
+        ingest_only=True,
+        max_turns=1,
+        benchmark_db_dir=db_dir,
+        keep_db=True,
+        ingest_mode="bulk",
+    )
+
+    retained_db = next(db_dir.glob("*/benchmark.db"))
+    with sqlite3.connect(retained_db) as connection:
+        connection.row_factory = sqlite3.Row
+        message = connection.execute(
+            "SELECT text, metadata_json FROM messages ORDER BY seq LIMIT 1"
+        ).fetchone()
+        artifact = connection.execute(
+            "SELECT artifact_type, source_kind, source_ref, metadata_json FROM artifacts"
+        ).fetchone()
+        chunks = connection.execute(
+            "SELECT text, kind FROM artifact_chunks ORDER BY chunk_index"
+        ).fetchall()
+
+    assert message is not None
+    assert "a photo of a cup with a dog face on it" in message["text"]
+    message_metadata = json.loads(message["metadata_json"])
+    assert message_metadata["attachment_count"] == 1
+    assert artifact is not None
+    assert artifact["artifact_type"] == "image"
+    assert artifact["source_kind"] == "url"
+    assert artifact["source_ref"] == "https://example.test/dog-cup.jpg"
+    artifact_metadata = json.loads(artifact["metadata_json"])
+    assert artifact_metadata["source"] == "locomo"
+    assert artifact_metadata["caption_kind"] == "blip_caption"
+    assert artifact_metadata["turn_id"] == "D1:1"
+    assert any("a photo of a cup with a dog face on it" in row["text"] for row in chunks)
+    assert any(row["kind"] == "parsed" for row in chunks)
+    assert any(
+        "a photo of a cup with a dog face on it" in request.messages[-1].content
+        for request in provider.requests
+        if request.metadata.get("purpose") == "memory_extraction"
+    )
 
 
 @pytest.mark.asyncio
@@ -924,9 +1274,8 @@ async def test_benchmark_bulk_ingest_falls_back_for_missing_turn_timestamp(
     async with Atagia(
         db_path=retained_db,
         manifests_dir=MANIFESTS_DIR,
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
-        llm_model="answer-model",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/answer-model",
     ) as engine:
         runtime = engine.runtime
         assert runtime is not None
@@ -1075,9 +1424,8 @@ async def test_benchmark_can_reuse_retained_ingestion_db_without_persisting_ques
     async with Atagia(
         db_path=retained_db,
         manifests_dir=MANIFESTS_DIR,
-        llm_provider="openai",
-        llm_api_key="test-openai-key",
-        llm_model="answer-model",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/answer-model",
     ) as engine:
         runtime = engine.runtime
         assert runtime is not None

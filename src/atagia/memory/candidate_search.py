@@ -13,6 +13,13 @@ from atagia.core.config import Settings
 from atagia.core.artifact_repository import ArtifactRepository
 from atagia.core.repositories import MessageRepository, _decode_json_columns
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
+from atagia.memory.intimacy_boundary_policy import (
+    candidate_allows_intimacy_boundary,
+    coalesced_intimacy_sql_clause,
+    memory_object_intimacy_sql_clause,
+    strongest_intimacy_boundary,
+)
+from atagia.memory.retrieval_planner import build_retrieval_fts_queries
 from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
@@ -30,15 +37,22 @@ _ALLOWED_CONSEQUENCE_MATCH_COLUMNS = frozenset(
         "tendency_belief_id",
     }
 )
-# Channels participating in rank fusion. ``raw_message`` carries raw
-# conversation evidence (Wave 1 batch 2, task 1-C) and is weighted
-# slightly lower than curated memory channels by default.
-_CHANNEL_ORDER = ("verbatim_pin", "artifact_chunk", "fts", "embedding", "consequence", "raw_message")
-_RAW_MESSAGE_ID_PREFIX = "rmw_"
-# Widest-to-narrowest order used to assign a synthetic scope to a raw
-# conversation window. The widest scope compatible with both the plan
-# and the window's owning conversation wins.
-_RAW_SCOPE_BREADTH_ORDER = (
+# Channels participating in rank fusion. ``verbatim_evidence_search``
+# carries FTS-backed conversation evidence and is weighted slightly
+# lower than curated memory channels by default.
+_CHANNEL_ORDER = (
+    "verbatim_pin",
+    "artifact_chunk",
+    "fts",
+    "embedding",
+    "consequence",
+    "verbatim_evidence_search",
+)
+_VERBATIM_EVIDENCE_WINDOW_ID_PREFIX = "vew_"
+# Widest-to-narrowest order used to assign a synthetic scope to a
+# verbatim evidence window. The widest scope compatible with both the
+# plan and the window's owning conversation wins.
+_EVIDENCE_SCOPE_BREADTH_ORDER = (
     MemoryScope.GLOBAL_USER,
     MemoryScope.ASSISTANT_MODE,
     MemoryScope.WORKSPACE,
@@ -76,12 +90,13 @@ class CandidateSearch:
         self._message_repository = MessageRepository(connection, clock)
         self._artifact_repository = ArtifactRepository(connection, clock)
         self._verbatim_pin_repository = VerbatimPinRepository(connection, clock)
-        # Wave 1 batch 2 (1-C): raw-message channel wiring.
-        self._raw_message_channel_enabled = self._settings.raw_message_channel
-        self._raw_message_channel_weight = float(self._settings.raw_message_rrf_weight)
-        self._raw_message_channel_limit = int(self._settings.raw_message_channel_limit)
-        self._raw_message_window_size = int(self._settings.raw_message_window_size)
-        self._raw_message_window_overlap = int(self._settings.raw_message_window_overlap)
+        self._verbatim_evidence_search_enabled = self._settings.verbatim_evidence_search_enabled
+        self._verbatim_evidence_search_weight = float(
+            self._settings.verbatim_evidence_search_rrf_weight
+        )
+        self._verbatim_evidence_search_limit = int(self._settings.verbatim_evidence_search_limit)
+        self._verbatim_evidence_window_size = int(self._settings.verbatim_evidence_window_size)
+        self._verbatim_evidence_window_overlap = int(self._settings.verbatim_evidence_window_overlap)
 
     async def search(
         self,
@@ -115,6 +130,7 @@ class CandidateSearch:
               AND ({scope_clauses})
               AND mo.status IN ({status_placeholders})
               AND mo.privacy_level <= ?
+              AND {intimacy_filter}
               AND ({retrieval_level_clauses})
               AND memory_objects_fts MATCH ?
             ORDER BY {temporal_order_case}{scope_order_case}, rank ASC, mo.updated_at DESC
@@ -125,6 +141,10 @@ class CandidateSearch:
             retrieval_level_clauses=" OR ".join(retrieval_level_clauses),
             temporal_order_case=temporal_order_case,
             scope_order_case=scope_order_case,
+            intimacy_filter=memory_object_intimacy_sql_clause(
+                "mo",
+                allow_intimacy_context=plan.allow_intimacy_context,
+            ),
         )
 
         aggregated: dict[str, dict[str, Any]] = {}
@@ -169,6 +189,8 @@ class CandidateSearch:
                 plan=plan,
                 user_id=user_id,
                 sub_query=sub_query,
+                linked_candidates=sub_query_aggregated.values(),
+                include_lexical=True,
             )
             self._merge_channel_candidates(
                 sub_query_aggregated,
@@ -197,25 +219,40 @@ class CandidateSearch:
                 embedding_candidates,
                 channel="embedding",
             )
-            # Wave 1 batch 2 (1-C): raw evidence lane. Each sub-query
-            # contributes conversation windows from the messages table
-            # alongside the memory-object channels. Privacy filtering
-            # runs at the SQL layer, so results that reach here are
-            # already scoped to the current ceiling.
-            raw_message_candidates = await self._search_raw_messages(
+            # FTS-backed evidence lane. Each sub-query contributes
+            # conversation windows from the messages table alongside
+            # the memory-object channels. Privacy filtering runs at the
+            # SQL layer, so results that reach here are already scoped
+            # to the current ceiling.
+            verbatim_evidence_search_candidates = await self._search_verbatim_evidence(
                 plan=plan,
                 user_id=user_id,
                 sub_query=sub_query,
             )
             self._merge_channel_candidates(
                 sub_query_aggregated,
-                raw_message_candidates,
-                channel="raw_message",
+                verbatim_evidence_search_candidates,
+                channel="verbatim_evidence_search",
             )
-            # Collapse raw windows that overlap memory-object candidates
-            # already retrieved for this sub-query. Memories are more
-            # focused, raw evidence is the recall safety net.
-            self._dedupe_raw_messages_against_memories(sub_query_aggregated, plan=plan)
+            linked_artifact_chunk_candidates = await self._search_artifact_chunks(
+                plan=plan,
+                user_id=user_id,
+                sub_query=sub_query,
+                linked_candidates=sub_query_aggregated.values(),
+                include_lexical=False,
+            )
+            self._merge_channel_candidates(
+                sub_query_aggregated,
+                linked_artifact_chunk_candidates,
+                channel="artifact_chunk",
+            )
+            # Collapse evidence windows that overlap memory-object
+            # candidates already retrieved for this sub-query. Memories
+            # are more focused; verbatim evidence is the recall safety net.
+            self._dedupe_verbatim_evidence_windows_against_memories(
+                sub_query_aggregated,
+                plan=plan,
+            )
             if plan.callback_bias and sub_query_aggregated:
                 await self._populate_callback_source_flags(
                     list(sub_query_aggregated.values()),
@@ -232,12 +269,15 @@ class CandidateSearch:
                 total_sub_queries=len(plan.sub_query_plans),
             )
 
-        # Cross-sub-query dedup pass: a raw window fetched under one
-        # sub-query may overlap a memory object fetched under a different
-        # sub-query. The per-sub-query dedup call above only sees one
-        # sub-query at a time, so we repeat the pass against the fully
-        # merged aggregated set before final ranking.
-        self._dedupe_raw_messages_against_memories(aggregated, plan=plan)
+        # Cross-sub-query dedup pass: a verbatim evidence window fetched
+        # under one sub-query may overlap a memory object fetched under a
+        # different sub-query. The per-sub-query dedup call above only
+        # sees one sub-query at a time, so repeat it against the fully
+        # merged set before final ranking.
+        self._dedupe_verbatim_evidence_windows_against_memories(
+            aggregated,
+            plan=plan,
+        )
         if plan.callback_bias and aggregated:
             await self._populate_callback_source_flags(
                 list(aggregated.values()),
@@ -254,6 +294,7 @@ class CandidateSearch:
         workspace_id: str | None,
         conversation_id: str,
         privacy_ceiling: int,
+        allow_intimacy_context: bool = False,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
@@ -277,12 +318,17 @@ class CandidateSearch:
               AND ({scope_clauses})
               AND mo.status = ?
               AND mo.privacy_level <= ?
+              AND {intimacy_filter}
               AND mo.language_codes_json IS NOT NULL
             GROUP BY lc.value
             ORDER BY memory_count DESC, last_seen_at DESC, language_code ASC
             LIMIT ?
         """.format(
             scope_clauses=" OR ".join(scope_clauses),
+            intimacy_filter=memory_object_intimacy_sql_clause(
+                "mo",
+                allow_intimacy_context=allow_intimacy_context,
+            ),
         )
         cursor = await self._connection.execute(
             query,
@@ -363,6 +409,7 @@ class CandidateSearch:
                 workspace_id=plan.workspace_id,
                 conversation_id=plan.conversation_id,
                 limit=self._fts_channel_limit(plan),
+                allow_intimacy_context=plan.allow_intimacy_context,
                 as_of=self._clock.now().isoformat(),
             )
             for row in rows:
@@ -395,16 +442,37 @@ class CandidateSearch:
         plan: RetrievalPlan,
         user_id: str,
         sub_query: Any,
+        linked_candidates: Any,
+        include_lexical: bool,
     ) -> list[dict[str, Any]]:
         if not (plan.exact_recall_mode or plan.raw_context_access_mode == "artifact"):
             return []
-        if not sub_query.fts_queries:
+        if include_lexical and not sub_query.fts_queries:
             return []
 
         aggregated: dict[str, dict[str, Any]] = {}
-        queries_to_try = list(sub_query.fts_queries)
-        if plan.exact_recall_mode:
-            queries_to_try = queries_to_try[:1]
+        for row in await self._artifact_repository.list_artifact_chunks_for_messages(
+            user_id=user_id,
+            message_ids=self._source_message_ids_from_candidates(linked_candidates),
+            privacy_ceiling=plan.privacy_ceiling,
+            scope_filter=plan.scope_filter,
+            assistant_mode_id=plan.assistant_mode_id,
+            workspace_id=plan.workspace_id,
+            conversation_id=plan.conversation_id,
+            limit=self._fts_channel_limit(plan),
+            allow_intimacy_context=plan.allow_intimacy_context,
+        ):
+            artifact_candidate = self._build_artifact_chunk_candidate(
+                row,
+                plan=plan,
+                sub_query_text=sub_query.text,
+            )
+            artifact_candidate["artifact_linked_source_message"] = True
+            if artifact_candidate.get("scope") is None:
+                continue
+            aggregated[str(artifact_candidate["id"])] = artifact_candidate
+
+        queries_to_try = self._artifact_fts_queries(plan, sub_query) if include_lexical else []
 
         for fts_query in queries_to_try:
             rows = await self._artifact_repository.search_artifact_chunks(
@@ -416,6 +484,7 @@ class CandidateSearch:
                 workspace_id=plan.workspace_id,
                 conversation_id=plan.conversation_id,
                 limit=self._fts_channel_limit(plan),
+                allow_intimacy_context=plan.allow_intimacy_context,
             )
             for row in rows:
                 artifact_candidate = self._build_artifact_chunk_candidate(
@@ -431,8 +500,6 @@ class CandidateSearch:
                     existing.get("rank", 0.0)
                 ):
                     aggregated[memory_id] = artifact_candidate
-            if plan.exact_recall_mode and aggregated:
-                break
 
         ordered = sorted(
             aggregated.values(),
@@ -443,6 +510,58 @@ class CandidateSearch:
             ),
         )
         return self._assign_position_ranks(ordered[: self._fts_channel_limit(plan)])
+
+    @staticmethod
+    def _artifact_fts_queries(plan: RetrievalPlan, sub_query: Any) -> list[str]:
+        queries: list[str] = []
+        seen: set[str] = set()
+        for fts_query in sub_query.fts_queries:
+            if fts_query in seen:
+                continue
+            seen.add(fts_query)
+            queries.append(fts_query)
+        if plan.original_query:
+            try:
+                original_query_rewrites = build_retrieval_fts_queries(plan.original_query)
+            except ValueError:
+                original_query_rewrites = []
+            for fts_query in original_query_rewrites:
+                if fts_query in seen:
+                    continue
+                seen.add(fts_query)
+                queries.append(fts_query)
+        return queries
+
+    @classmethod
+    def _source_message_ids_from_candidates(cls, candidates: Any) -> list[str]:
+        message_ids: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            for message_id in cls._candidate_source_message_ids(candidate):
+                if message_id in seen:
+                    continue
+                seen.add(message_id)
+                message_ids.append(message_id)
+        return message_ids
+
+    @staticmethod
+    def _candidate_source_message_ids(candidate: Any) -> list[str]:
+        if not isinstance(candidate, dict):
+            return []
+        raw_ids = candidate.get("verbatim_evidence_window_message_ids")
+        if not raw_ids:
+            payload = candidate.get("payload_json") or {}
+            if isinstance(payload, dict):
+                raw_ids = payload.get("source_message_ids")
+        if not raw_ids and candidate.get("message_id"):
+            raw_ids = [candidate.get("message_id")]
+        if not isinstance(raw_ids, list):
+            return []
+        return [
+            str(message_id).strip()
+            for message_id in raw_ids
+            if str(message_id).strip()
+        ]
 
     async def _search_consequence_chains(
         self,
@@ -552,6 +671,10 @@ class CandidateSearch:
               AND COALESCE(tendency.user_id, outcome.user_id) = ?
               AND COALESCE(tendency.status, outcome.status) IN ({status_placeholders})
               AND COALESCE(tendency.privacy_level, outcome.privacy_level) <= ?
+              AND {candidate_intimacy_filter}
+              AND {action_intimacy_filter}
+              AND {outcome_intimacy_filter}
+              AND (tendency.id IS NULL OR {tendency_intimacy_filter})
               AND ({candidate_scope_clauses})
               AND ({chain_relevance_clauses})
               AND memory_objects_fts MATCH ?
@@ -564,6 +687,23 @@ class CandidateSearch:
         """.format(
             match_column=match_column,
             status_placeholders=status_placeholders,
+            candidate_intimacy_filter=coalesced_intimacy_sql_clause(
+                "tendency",
+                "outcome",
+                allow_intimacy_context=plan.allow_intimacy_context,
+            ),
+            action_intimacy_filter=memory_object_intimacy_sql_clause(
+                "action",
+                allow_intimacy_context=plan.allow_intimacy_context,
+            ),
+            outcome_intimacy_filter=memory_object_intimacy_sql_clause(
+                "outcome",
+                allow_intimacy_context=plan.allow_intimacy_context,
+            ),
+            tendency_intimacy_filter=memory_object_intimacy_sql_clause(
+                "tendency",
+                allow_intimacy_context=plan.allow_intimacy_context,
+            ),
             candidate_scope_clauses=" OR ".join(candidate_scope_clauses),
             chain_relevance_clauses=" OR ".join(chain_relevance_clauses),
             temporal_order_case=temporal_order_case,
@@ -614,6 +754,8 @@ class CandidateSearch:
             "canonical_text": str(pin_row["canonical_text"]),
             "index_text": str(pin_row["index_text"]),
             "privacy_level": int(pin_row.get("privacy_level", 0)),
+            "intimacy_boundary": str(pin_row.get("intimacy_boundary") or "ordinary"),
+            "intimacy_boundary_confidence": float(pin_row.get("intimacy_boundary_confidence") or 0.0),
             "status": str(pin_row["status"]),
             "reason": pin_row.get("reason"),
             "created_by": str(pin_row["created_by"]),
@@ -626,6 +768,8 @@ class CandidateSearch:
                 "verbatim_pin_id": str(pin_row["id"]),
                 "verbatim_pin_target_kind": str(pin_row["target_kind"]),
                 "verbatim_pin_target_id": str(pin_row["target_id"]),
+                "intimacy_boundary": str(pin_row.get("intimacy_boundary") or "ordinary"),
+                "intimacy_boundary_confidence": float(pin_row.get("intimacy_boundary_confidence") or 0.0),
             },
             "source_kind": MemorySourceKind.VERBATIM.value,
             "object_type": MemoryObjectType.EVIDENCE.value,
@@ -639,7 +783,7 @@ class CandidateSearch:
             "rank": rank,
             "fts_rank": rank,
             "retrieval_sources": ["verbatim_pin"],
-            "channel_ranks": {"verbatim_pin": None, "fts": None, "embedding": None, "consequence": None, "raw_message": None},
+            "channel_ranks": {"verbatim_pin": None, "fts": None, "embedding": None, "consequence": None, "verbatim_evidence_search": None},
             "matched_sub_queries": [sub_query_text],
             "is_verbatim_pin": True,
             "retrieval_level": 0,
@@ -820,10 +964,10 @@ class CandidateSearch:
         return _decode_json_columns(row)
 
     # ------------------------------------------------------------------
-    # Wave 1 batch 2 (1-C): raw evidence channel
+    # FTS-backed verbatim evidence channel
     # ------------------------------------------------------------------
 
-    async def _search_raw_messages(
+    async def _search_verbatim_evidence(
         self,
         *,
         plan: RetrievalPlan,
@@ -834,29 +978,28 @@ class CandidateSearch:
 
         Steps:
         1. Run a privacy-filtered FTS query on messages.
-        2. Materialize a ``raw_message_window_size`` conversation window
+        2. Materialize a ``verbatim_evidence_window_size`` conversation window
            around each match. Overlap across neighbouring matches is
            collapsed by keeping the best-ranked seed per window slot.
         3. Shape the window as a pseudo-candidate compatible with the
            downstream fusion / filtering pipeline.
         """
-        if not self._raw_message_channel_enabled:
+        if not self._verbatim_evidence_search_enabled:
             return []
-        if self._raw_message_channel_limit <= 0:
+        if self._verbatim_evidence_search_limit <= 0:
             return []
 
-        channel_scope = self._pick_raw_message_scope(plan.scope_filter)
+        channel_scope = self._pick_verbatim_evidence_scope(plan.scope_filter)
         if channel_scope is None:
             return []
 
-        # Raw evidence is strongest on the precise FTS variant. Planner
-        # order already goes from most precise to broader rewrites.
-        #
-        # For exact-recall questions we still prefer that strongest
-        # query first, but a multilingual bridge can make the precise
-        # rewrite too strict for verbatim transcript search. In that
-        # case we fall back to broader rewrites only if the stricter
-        # query found no windows.
+        # Verbatim evidence is strongest on the precise FTS variant.
+        # Planner order already goes from most precise to broader
+        # rewrites. Exact recall still prefers that strongest query
+        # first, but a multilingual bridge can make the precise rewrite
+        # too strict for transcript evidence search. In that case, fall
+        # back to broader rewrites only if the stricter query found no
+        # usable windows.
         fts_queries = list(sub_query.fts_queries or [])
         if not fts_queries:
             return []
@@ -879,11 +1022,11 @@ class CandidateSearch:
                 user_id=user_id,
                 query=fts_query,
                 privacy_ceiling=plan.privacy_ceiling,
-                limit=self._raw_message_channel_limit,
+                limit=self._verbatim_evidence_search_limit,
                 allow_conversation_id=plan.conversation_id,
             )
             for row in rows:
-                window_candidate = await self._build_raw_message_window_candidate(
+                window_candidate = await self._build_verbatim_evidence_search_window_candidate(
                     seed_row=row,
                     plan=plan,
                     user_id=user_id,
@@ -907,9 +1050,9 @@ class CandidateSearch:
                 str(candidate["id"]),
             ),
         )
-        return self._assign_position_ranks(ordered[: self._raw_message_channel_limit])
+        return self._assign_position_ranks(ordered[: self._verbatim_evidence_search_limit])
 
-    async def _build_raw_message_window_candidate(
+    async def _build_verbatim_evidence_search_window_candidate(
         self,
         *,
         seed_row: dict[str, Any],
@@ -924,15 +1067,19 @@ class CandidateSearch:
             conversation_id=conversation_id,
             user_id=user_id,
             center_seq=seed_seq,
-            window_size=self._raw_message_window_size,
+            window_size=self._verbatim_evidence_window_size,
         )
         if not window_messages:
             return None
+        window_messages = await self._gate_pending_confirmation_window_messages(
+            user_id=user_id,
+            messages=window_messages,
+        )
         conversation_mode_id = str(seed_row.get("conversation_assistant_mode_id") or "")
         # Scope mapping guards cross-mode and cross-conversation leakage
         # for the downstream scope filter. The SQL layer already checked
         # the mode privacy ceiling.
-        resolved_scope = self._resolve_raw_window_scope(
+        resolved_scope = self._resolve_verbatim_evidence_window_scope(
             channel_scope=channel_scope,
             plan=plan,
             conversation_mode_id=conversation_mode_id,
@@ -943,14 +1090,27 @@ class CandidateSearch:
 
         start_seq = int(window_messages[0]["seq"])
         end_seq = int(window_messages[-1]["seq"])
-        window_id = f"{_RAW_MESSAGE_ID_PREFIX}{conversation_id}_{start_seq}_{end_seq}"
-        canonical_text = self._format_raw_window_text(window_messages)
+        window_id = (
+            f"{_VERBATIM_EVIDENCE_WINDOW_ID_PREFIX}"
+            f"{conversation_id}_{start_seq}_{end_seq}"
+        )
+        canonical_text = self._format_verbatim_evidence_window_text(
+            window_messages,
+        )
         occurred_at = (
             window_messages[-1].get("occurred_at")
             or window_messages[-1].get("created_at")
         )
-        source_message_ids = [str(message["id"]) for message in window_messages]
+        source_message_ids = [
+            str(message["id"])
+            for message in window_messages
+            if not self._message_is_pending_confirmation(message)
+        ]
         privacy_level = await self._max_privacy_level_for_source_messages(
+            user_id=user_id,
+            source_message_ids=source_message_ids,
+        )
+        intimacy_boundary, intimacy_boundary_confidence = await self._strongest_intimacy_boundary_for_source_messages(
             user_id=user_id,
             source_message_ids=source_message_ids,
         )
@@ -991,6 +1151,8 @@ class CandidateSearch:
             "vitality": 0.0,
             "maya_score": 0.0,
             "privacy_level": privacy_level,
+            "intimacy_boundary": intimacy_boundary,
+            "intimacy_boundary_confidence": intimacy_boundary_confidence,
             "temporal_type": "unknown",
             "valid_from": None,
             "valid_to": None,
@@ -1000,11 +1162,79 @@ class CandidateSearch:
             "rank": fts_rank,
             "fts_rank": fts_rank,
             "retrieval_level": 0,
-            "is_raw_message_window": True,
-            "raw_window_conversation_id": conversation_id,
-            "raw_window_start_seq": start_seq,
-            "raw_window_end_seq": end_seq,
-            "raw_window_message_ids": source_message_ids,
+            "is_verbatim_evidence_window": True,
+            "verbatim_evidence_window_conversation_id": conversation_id,
+            "verbatim_evidence_window_start_seq": start_seq,
+            "verbatim_evidence_window_end_seq": end_seq,
+            "verbatim_evidence_window_message_ids": source_message_ids,
+        }
+
+    async def _gate_pending_confirmation_window_messages(
+        self,
+        *,
+        user_id: str,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        pending_ids = await self._pending_confirmation_source_message_ids(
+            user_id=user_id,
+            message_ids=[str(message["id"]) for message in messages],
+        )
+        if not pending_ids:
+            return messages
+        gated_messages: list[dict[str, Any]] = []
+        for message in messages:
+            message_id = str(message.get("id") or "")
+            if message_id not in pending_ids:
+                gated_messages.append(message)
+                continue
+            gated = dict(message)
+            gated.update(
+                {
+                    "include_raw": False,
+                    "skip_by_default": True,
+                    "pending_user_confirmation": True,
+                    "policy_reason": "pending_user_confirmation",
+                }
+            )
+            gated_messages.append(gated)
+        return gated_messages
+
+    async def _pending_confirmation_source_message_ids(
+        self,
+        *,
+        user_id: str,
+        message_ids: list[str],
+    ) -> set[str]:
+        normalized_message_ids = [
+            str(message_id).strip()
+            for message_id in message_ids
+            if str(message_id).strip()
+        ]
+        if not normalized_message_ids:
+            return set()
+        placeholders = ", ".join("?" for _ in normalized_message_ids)
+        cursor = await self._connection.execute(
+            """
+            SELECT DISTINCT CAST(pending_src.value AS TEXT) AS message_id
+            FROM memory_objects AS pending
+            JOIN json_each(
+                json_extract(pending.payload_json, '$.source_message_ids')
+            ) AS pending_src ON 1 = 1
+            WHERE pending.user_id = ?
+              AND pending.status = ?
+              AND CAST(pending_src.value AS TEXT) IN ({placeholders})
+            """.format(placeholders=placeholders),
+            (
+                user_id,
+                MemoryStatus.PENDING_USER_CONFIRMATION.value,
+                *normalized_message_ids,
+            ),
+        )
+        rows = await cursor.fetchall()
+        return {
+            str(row["message_id"])
+            for row in rows
+            if str(row["message_id"]).strip()
         }
 
     async def _max_privacy_level_for_source_messages(
@@ -1036,6 +1266,39 @@ class CandidateSearch:
             return 0
         return int(row["max_privacy_level"])
 
+    async def _strongest_intimacy_boundary_for_source_messages(
+        self,
+        *,
+        user_id: str,
+        source_message_ids: list[str],
+    ) -> tuple[str, float]:
+        normalized_message_ids = [
+            str(message_id).strip()
+            for message_id in source_message_ids
+            if str(message_id).strip()
+        ]
+        if not normalized_message_ids:
+            return "ordinary", 0.0
+        placeholders = ", ".join("?" for _ in normalized_message_ids)
+        cursor = await self._connection.execute(
+            """
+            SELECT mo.intimacy_boundary, mo.intimacy_boundary_confidence
+            FROM memory_objects AS mo
+            JOIN json_each(mo.payload_json, '$.source_message_ids') AS source_ids ON 1 = 1
+            WHERE mo.user_id = ?
+              AND CAST(source_ids.value AS TEXT) IN ({placeholders})
+            """.format(placeholders=placeholders),
+            (user_id, *normalized_message_ids),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        boundary = strongest_intimacy_boundary(rows)
+        confidences = [
+            float(row.get("intimacy_boundary_confidence", 0.0) or 0.0)
+            for row in rows
+            if str(row.get("intimacy_boundary") or "ordinary") == boundary.value
+        ]
+        return boundary.value, max(confidences, default=0.0)
+
     @staticmethod
     def _build_artifact_chunk_candidate(
         row: dict[str, Any],
@@ -1055,6 +1318,26 @@ class CandidateSearch:
         preserve_verbatim = bool(row.get("preserve_verbatim"))
         source_window_start = artifact_metadata.get("source_window_start")
         source_window_end = artifact_metadata.get("source_window_end")
+        boundary_rows = [
+            {
+                "intimacy_boundary": row.get("artifact_intimacy_boundary"),
+                "intimacy_boundary_confidence": row.get("artifact_intimacy_boundary_confidence"),
+            },
+            {
+                "intimacy_boundary": row.get("intimacy_boundary"),
+                "intimacy_boundary_confidence": row.get("intimacy_boundary_confidence"),
+            },
+        ]
+        boundary = strongest_intimacy_boundary(boundary_rows)
+        intimacy_boundary = boundary.value
+        intimacy_boundary_confidence = max(
+            (
+                float(item.get("intimacy_boundary_confidence", 0.0) or 0.0)
+                for item in boundary_rows
+                if str(item.get("intimacy_boundary") or "ordinary") == boundary.value
+            ),
+            default=0.0,
+        )
         candidate: dict[str, Any] = {
             "_rowid": None,
             "id": chunk_id,
@@ -1077,6 +1360,8 @@ class CandidateSearch:
             "object_type": MemoryObjectType.EVIDENCE.value,
             "scope": CandidateSearch._scope_for_artifact_row(row, plan),
             "canonical_text": canonical_text,
+            "intimacy_boundary": intimacy_boundary,
+            "intimacy_boundary_confidence": intimacy_boundary_confidence,
             "payload_json": {
                 "artifact_id": artifact_id,
                 "artifact_chunk_id": chunk_id,
@@ -1094,6 +1379,8 @@ class CandidateSearch:
                 "sub_query_text": sub_query_text,
                 "source_window_start_occurred_at": source_window_start,
                 "source_window_end_occurred_at": source_window_end,
+                "intimacy_boundary": intimacy_boundary,
+                "intimacy_boundary_confidence": intimacy_boundary_confidence,
             },
             "source_kind": MemorySourceKind.VERBATIM.value
             if preserve_verbatim
@@ -1123,23 +1410,82 @@ class CandidateSearch:
             "fts": None,
             "embedding": None,
             "consequence": None,
-            "raw_message": None,
+            "verbatim_evidence_search": None,
         }
         candidate["retrieval_source"] = "artifact_chunk"
         candidate["matched_sub_queries"] = [sub_query_text]
         return candidate
 
     @staticmethod
-    def _format_raw_window_text(messages: list[dict[str, Any]]) -> str:
+    def _format_verbatim_evidence_window_text(
+        messages: list[dict[str, Any]],
+    ) -> str:
         """Format a conversation window as a compact transcript block."""
         lines: list[str] = []
         for message in messages:
             role = str(message.get("role") or "user")
-            text = str(message.get("text") or "").strip()
+            if (
+                CandidateSearch._message_is_pending_confirmation(message)
+                or CandidateSearch._message_should_use_placeholder(message)
+            ):
+                text = CandidateSearch._message_placeholder_text(message)
+            else:
+                text = str(message.get("text") or "").strip()
             if not text:
                 continue
             lines.append(f"[{role}] {text}")
         return "\n".join(lines)
+
+    @classmethod
+    def _message_should_use_placeholder(cls, message: dict[str, Any]) -> bool:
+        return cls._truthy(message.get("skip_by_default")) and not cls._truthy(
+            message.get("include_raw"),
+            default=True,
+        )
+
+    @classmethod
+    def _message_is_pending_confirmation(cls, message: dict[str, Any]) -> bool:
+        return cls._truthy(message.get("pending_user_confirmation"))
+
+    @classmethod
+    def _message_placeholder_text(cls, message: dict[str, Any]) -> str:
+        if cls._message_is_pending_confirmation(message):
+            seq = str(message.get("seq") if message.get("seq") is not None else "?")
+            role = str(message.get("role") or "user")
+            content_kind = str(message.get("content_kind") or "text")
+            return (
+                f"[Skipped message | seq={seq} role={role} "
+                f"kind={content_kind} policy=pending_user_confirmation]"
+            )
+        existing = " ".join(str(message.get("context_placeholder") or "").split())[
+            :300
+        ].strip()
+        if existing:
+            return existing
+        message_id = str(message.get("id") or f"msg_{message.get('seq', '?')}")
+        seq = str(message.get("seq") if message.get("seq") is not None else "?")
+        role = str(message.get("role") or "user")
+        content_kind = str(message.get("content_kind") or "text")
+        policy_reason = str(message.get("policy_reason") or "skip_by_default")
+        return (
+            f"[Skipped message | id={message_id} seq={seq} role={role} "
+            f"kind={content_kind} policy={policy_reason} ref={message_id}]"
+        )
+
+    @staticmethod
+    def _truthy(value: Any, *, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if not normalized:
+                return default
+            return normalized in {"1", "true", "yes", "on"}
+        return bool(value)
 
     @staticmethod
     def _scope_for_artifact_row(row: dict[str, Any], plan: RetrievalPlan) -> str | None:
@@ -1178,23 +1524,23 @@ class CandidateSearch:
         return None
 
     @staticmethod
-    def _pick_raw_message_scope(scope_filter: list[MemoryScope]) -> MemoryScope | None:
-        """Pick the widest plan-allowed scope for raw evidence windows."""
+    def _pick_verbatim_evidence_scope(scope_filter: list[MemoryScope]) -> MemoryScope | None:
+        """Pick the widest plan-allowed scope for verbatim evidence windows."""
         allowed = set(scope_filter)
-        for scope in _RAW_SCOPE_BREADTH_ORDER:
+        for scope in _EVIDENCE_SCOPE_BREADTH_ORDER:
             if scope in allowed:
                 return scope
         return None
 
     @staticmethod
-    def _resolve_raw_window_scope(
+    def _resolve_verbatim_evidence_window_scope(
         *,
         channel_scope: MemoryScope,
         plan: RetrievalPlan,
         conversation_mode_id: str,
         conversation_id: str,
     ) -> MemoryScope | None:
-        """Map a raw window to a scope consistent with plan filtering.
+        """Map an evidence window to a scope consistent with plan filtering.
 
         The returned scope must satisfy ``_candidate_matches_scope`` so
         that windows survive the post-fusion filter. Narrower scopes
@@ -1211,8 +1557,8 @@ class CandidateSearch:
         if channel_scope is MemoryScope.WORKSPACE:
             if conversation_mode_id != plan.assistant_mode_id:
                 return None
-            # Workspace scope requires a workspace; raw windows do not
-            # carry one without extra joins, so only accept when the
+            # Workspace scope requires a workspace; evidence windows do
+            # not carry one without extra joins, so only accept when the
             # window's conversation is the active one.
             if conversation_id == plan.conversation_id:
                 return MemoryScope.WORKSPACE
@@ -1234,23 +1580,23 @@ class CandidateSearch:
         return None
 
     @staticmethod
-    def _dedupe_raw_messages_against_memories(
+    def _dedupe_verbatim_evidence_windows_against_memories(
         aggregated: dict[str, dict[str, Any]],
         *,
         plan: RetrievalPlan,
     ) -> None:
-        """Drop raw-window candidates already covered by a memory object.
+        """Drop evidence-window candidates already covered by a memory object.
 
-        A raw window is considered covered when any of its source
+        An evidence window is considered covered when any of its source
         message ids appears in ``payload_json.source_message_ids`` of a
-        non-raw candidate that also scored for the same sub-query.
+        non-window candidate that also scored for the same sub-query.
         """
         if plan.exact_recall_mode or plan.raw_context_access_mode == "verbatim":
             return
 
         covered_message_ids: set[str] = set()
         for candidate in aggregated.values():
-            if candidate.get("is_raw_message_window"):
+            if candidate.get("is_verbatim_evidence_window"):
                 continue
             payload = candidate.get("payload_json")
             if not isinstance(payload, dict):
@@ -1263,11 +1609,11 @@ class CandidateSearch:
 
         to_drop: list[str] = []
         for window_id, candidate in aggregated.items():
-            if not candidate.get("is_raw_message_window"):
+            if not candidate.get("is_verbatim_evidence_window"):
                 continue
             window_message_ids = {
                 str(message_id)
-                for message_id in candidate.get("raw_window_message_ids") or []
+                for message_id in candidate.get("verbatim_evidence_window_message_ids") or []
             }
             if window_message_ids & covered_message_ids:
                 to_drop.append(window_id)
@@ -1277,6 +1623,11 @@ class CandidateSearch:
     @classmethod
     def _matches_plan_filters(cls, candidate: dict[str, Any], plan: RetrievalPlan) -> bool:
         if int(candidate.get("privacy_level", 0)) > plan.privacy_ceiling:
+            return False
+        if not candidate_allows_intimacy_boundary(
+            candidate,
+            allow_intimacy_context=plan.allow_intimacy_context,
+        ):
             return False
         if candidate.get("status") not in {status.value for status in plan.status_filter}:
             return False
@@ -1575,8 +1926,8 @@ class CandidateSearch:
         )
 
     def _channel_weight(self, channel: str) -> float:
-        if channel == "raw_message":
-            return self._raw_message_channel_weight
+        if channel == "verbatim_evidence_search":
+            return self._verbatim_evidence_search_weight
         return 1.0
 
     def _compute_rank_fusion_scores(
@@ -1595,7 +1946,7 @@ class CandidateSearch:
         # per-channel weights, but final fusion collapses sub-query ranks
         # without channel info. Honor channel weights end-to-end by
         # down-weighting candidates that only ever matched through
-        # below-unit channels (e.g. the raw_message safety-net channel).
+        # below-unit channels (e.g. the verbatim_evidence_search safety-net channel).
         # A candidate that also matched a unit-weight channel keeps the
         # full score.
         candidate_channel_weight = self._candidate_channel_weight(channel_ranks)
@@ -1621,8 +1972,8 @@ class CandidateSearch:
         The weight is the max weight among channels that actually
         contributed a rank for this candidate. A candidate seen via a
         full-weight channel (e.g. ``fts``) keeps weight 1.0 even if it
-        also matched via the lighter raw_message channel; a candidate
-        that ONLY matched via raw_message is down-weighted by that
+        also matched via the lighter verbatim_evidence_search channel; a candidate
+        that ONLY matched via verbatim_evidence_search is down-weighted by that
         channel's weight.
         """
         if not channel_ranks:

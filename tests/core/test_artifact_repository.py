@@ -13,7 +13,7 @@ from atagia.core.clock import FrozenClock
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository
 from atagia.models.schemas_api import AttachmentInput
-from atagia.models.schemas_memory import MemoryScope
+from atagia.models.schemas_memory import IntimacyBoundary, MemoryScope
 from atagia.services.artifact_blob_store import ArtifactBlobStore
 from atagia.services.artifact_service import ArtifactService
 
@@ -66,6 +66,9 @@ async def test_artifact_service_creates_chunks_and_links_and_respects_user_isola
             },
         )
         assert "[Attachments omitted]" in bundle.prompt_text
+        assert "Alpha beta gamma" not in bundle.prompt_text
+        assert bundle.context_placeholder is not None
+        assert "Alpha beta gamma" not in bundle.context_placeholder
         assert bundle.attachments[0]["artifact_id"]
         assert bundle.attachments[0]["relevance_state"] == "active_work_material"
         assert bundle.attachments[0]["relevance_source"] == "attachment_ingest"
@@ -143,6 +146,8 @@ async def test_artifact_service_creates_chunks_and_links_and_respects_user_isola
         assert len(chunks) >= 2
         assert chunks[0]["kind"] == "summary"
         assert chunks[0]["text"].startswith("pasted_text attachment")
+        assert "Alpha beta gamma" not in chunks[0]["text"]
+        assert any("Alpha beta gamma" in chunk["text"] for chunk in chunks[1:])
 
         search_rows = await repository.search_artifact_chunks(
             user_id="usr_a",
@@ -204,6 +209,9 @@ async def test_artifact_delete_and_purge_exclude_results() -> None:
                 "assistant_mode_id": "coding_debug",
             },
         )
+        assert "Alpha beta gamma" not in bundle.prompt_text
+        assert bundle.context_placeholder is not None
+        assert "Alpha beta gamma" not in bundle.context_placeholder
         await connection.execute("BEGIN")
         try:
             user_message = await messages.create_message(
@@ -256,6 +264,99 @@ async def test_artifact_delete_and_purge_exclude_results() -> None:
         purged = await repository.delete_artifact(artifact_id, "usr_a", purge=True, commit=True)
         assert purged is not None
         assert purged["status"] == "purged"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_artifact_chunk_search_filters_intimacy_boundary_until_authorized() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc))
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        repository = ArtifactRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await connection.execute(
+            """
+            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+            VALUES ('coding_debug', 'Coding Debug', 'hash_1', '{}', '2026-03-30T12:00:00+00:00', '2026-03-30T12:00:00+00:00')
+            """
+        )
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Artifact Chat")
+
+        ordinary = await repository.create_artifact(
+            artifact_id="art_ordinary",
+            user_id="usr_a",
+            workspace_id=None,
+            conversation_id="cnv_a",
+            message_id=None,
+            artifact_type="pasted_text",
+            source_kind="pasted_text",
+            status="ready",
+            privacy_level=0,
+            summary_text="ordinary pottery note",
+            index_text="ordinary pottery note",
+        )
+        restricted = await repository.create_artifact(
+            artifact_id="art_private",
+            user_id="usr_a",
+            workspace_id=None,
+            conversation_id="cnv_a",
+            message_id=None,
+            artifact_type="pasted_text",
+            source_kind="pasted_text",
+            status="ready",
+            privacy_level=2,
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+            intimacy_boundary_confidence=0.9,
+            summary_text="private pottery note",
+            index_text="private pottery note",
+        )
+        await repository.create_artifact_chunk(
+            artifact_id=str(ordinary["id"]),
+            user_id="usr_a",
+            chunk_index=0,
+            text="ordinary pottery checklist",
+            token_count=3,
+            kind="summary",
+        )
+        await repository.create_artifact_chunk(
+            artifact_id=str(restricted["id"]),
+            user_id="usr_a",
+            chunk_index=0,
+            text="private pottery continuity note",
+            token_count=4,
+            kind="summary",
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+            intimacy_boundary_confidence=0.9,
+        )
+
+        ordinary_rows = await repository.search_artifact_chunks(
+            user_id="usr_a",
+            query="pottery",
+            privacy_ceiling=3,
+            scope_filter=[MemoryScope.CONVERSATION],
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_a",
+            limit=10,
+        )
+        authorized_rows = await repository.search_artifact_chunks(
+            user_id="usr_a",
+            query="pottery",
+            privacy_ceiling=3,
+            scope_filter=[MemoryScope.CONVERSATION],
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_a",
+            limit=10,
+            allow_intimacy_context=True,
+        )
+
+        assert {row["artifact_id"] for row in ordinary_rows} == {"art_ordinary"}
+        assert {row["artifact_id"] for row in authorized_rows} == {"art_ordinary", "art_private"}
     finally:
         await connection.close()
 

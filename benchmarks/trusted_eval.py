@@ -10,10 +10,12 @@ from atagia.models.schemas_replay import AblationConfig
 
 TRUSTED_EVALUATION_PROMPT_NOTE = (
     "Trusted benchmark evaluation mode is active. The requester is the authenticated "
-    "benchmark owner in a controlled local evaluation. If retrieved context contains "
-    "sensitive facts for this benchmark user, answer from them directly; do not refuse "
-    "solely because the fact is private or sensitive. Do not invent facts that are not "
-    "present in retrieved context."
+    "benchmark owner in a controlled local evaluation. This mode may surface "
+    "sensitive retrieved context so coverage can be audited, but it does not override "
+    "the ordinary high-risk chat disclosure policy. Answer from retrieved context when "
+    "the fact is permitted for ordinary authenticated use, and continue withholding raw "
+    "secret literals such as credentials, PINs, passwords, and payment-card secrets. "
+    "Do not invent facts that are not present in retrieved context."
 )
 
 

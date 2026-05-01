@@ -1,0 +1,45 @@
+{
+  "assistant_mode_id": "intimacy",
+  "display_name": "Intimacy",
+  "cross_chat_allowed": false,
+  "allow_intimacy_context": true,
+  "allowed_scopes": [
+    "ephemeral_session",
+    "conversation",
+    "workspace"
+  ],
+  "preferred_memory_types": [
+    "interaction_contract",
+    "state_snapshot",
+    "belief",
+    "evidence",
+    "summary_view"
+  ],
+  "need_triggers": [
+    "sensitive_context",
+    "ambiguity",
+    "follow_up_failure"
+  ],
+  "contract_dimensions_priority": [
+    "boundaries",
+    "consent",
+    "tone",
+    "pace"
+  ],
+  "privacy_ceiling": 3,
+  "context_budget_tokens": 3600,
+  "transcript_budget_tokens": 5200,
+  "retrieval_params": {
+    "fts_limit": 20,
+    "vector_limit": 8,
+    "graph_hops": 0,
+    "rerank_top_k": 12,
+    "final_context_items": 7
+  },
+  "context_cache_policy": {
+    "base_ttl_seconds": 900,
+    "sync_threshold": 0.95,
+    "max_messages_without_refresh": 8,
+    "max_minutes_without_refresh": 20
+  }
+}

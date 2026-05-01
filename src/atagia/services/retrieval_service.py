@@ -36,6 +36,7 @@ class RetrievalService:
         mode: str | None = None,
         operational_profile: ResolvedOperationalProfile | None = None,
         ablation: AblationConfig | None = None,
+        stored_messages: list[dict[str, Any]] | None = None,
         trace: RetrievalTrace | None = None,
     ) -> PipelineResult:
         """Execute the retrieval pipeline for the active conversation state."""
@@ -49,6 +50,7 @@ class RetrievalService:
                 mode=mode,
                 operational_profile=operational_profile,
                 ablation=ablation,
+                stored_messages=stored_messages,
                 trace=trace,
             )
         finally:
@@ -173,9 +175,21 @@ class RetrievalService:
     ) -> None:
         if trace is None:
             return
+        settings = getattr(self.runtime, "settings", None)
+        freshness_kwargs = (
+            {
+                "refresh_message_threshold": settings.topic_working_set_refresh_message_lag,
+                "stale_message_threshold": settings.topic_working_set_stale_message_lag,
+                "refresh_token_threshold": settings.topic_working_set_refresh_token_lag,
+                "stale_token_threshold": settings.topic_working_set_stale_token_lag,
+            }
+            if settings is not None
+            else {}
+        )
         snapshot = await TopicRepository(connection, self.runtime.clock).get_topic_snapshot(
             user_id=user_id,
             conversation_id=conversation_id,
+            **freshness_kwargs,
         )
         trace.topic_snapshot = TopicWorkingSetTrace.model_validate(snapshot)
 

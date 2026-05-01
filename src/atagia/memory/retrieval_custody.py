@@ -69,6 +69,12 @@ def build_candidate_custody(
             "scope": _safe_optional_str(candidate.get("scope")),
             "status": _safe_optional_str(candidate.get("status")),
             "privacy_level": _safe_int(candidate.get("privacy_level")),
+            "intimacy_boundary": _safe_optional_str(
+                candidate.get("intimacy_boundary") or "ordinary"
+            ),
+            "intimacy_boundary_confidence": _safe_float(
+                candidate.get("intimacy_boundary_confidence", 0.0) or 0.0
+            ),
             "retrieval_level": _safe_int(candidate.get("retrieval_level")),
             "source_kind": _safe_optional_str(candidate.get("source_kind")),
             "temporal_type": _safe_optional_str(candidate.get("temporal_type")),
@@ -149,8 +155,8 @@ def _candidate_kind(candidate: dict[str, Any]) -> str:
         return "verbatim_pin"
     if candidate.get("is_artifact_chunk"):
         return "artifact_chunk"
-    if candidate.get("is_raw_message_window"):
-        return "raw_message_window"
+    if candidate.get("is_verbatim_evidence_window"):
+        return "verbatim_evidence_search_window"
     return str(candidate.get("object_type") or candidate.get("candidate_kind") or "memory_object")
 
 
@@ -167,8 +173,8 @@ def _candidate_channels(candidate: dict[str, Any]) -> list[str]:
         channels.add("verbatim_pin")
     if candidate.get("is_artifact_chunk"):
         channels.add("artifact_chunk")
-    if candidate.get("is_raw_message_window"):
-        channels.add("raw_message")
+    if candidate.get("is_verbatim_evidence_window"):
+        channels.add("verbatim_evidence_search")
     return sorted(channels)
 
 

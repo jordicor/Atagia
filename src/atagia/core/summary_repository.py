@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from atagia.core.repositories import BaseRepository, _encode_json, summary_mirror_id
-from atagia.models.schemas_memory import SummaryViewKind
+from atagia.models.schemas_memory import IntimacyBoundary, SummaryViewKind
 
 _SUMMARY_KIND_LEVELS = {
     SummaryViewKind.CONVERSATION_CHUNK: 0,
@@ -30,6 +30,8 @@ class _SummaryCreate(BaseModel):
     hierarchy_level: int = Field(default=0, ge=0)
     summary_text: str = Field(min_length=1)
     source_object_ids_json: list[str] = Field(default_factory=list)
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
+    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     maya_score: float
     model: str
     created_at: str
@@ -80,12 +82,14 @@ class SummaryRepository(BaseRepository):
                 summary_kind,
                 summary_text,
                 source_object_ids_json,
+                intimacy_boundary,
+                intimacy_boundary_confidence,
                 maya_score,
                 model,
                 hierarchy_level,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.id,
@@ -97,6 +101,8 @@ class SummaryRepository(BaseRepository):
                 payload.summary_kind.value,
                 payload.summary_text,
                 _encode_json(payload.source_object_ids_json),
+                payload.intimacy_boundary.value,
+                payload.intimacy_boundary_confidence,
                 payload.maya_score,
                 payload.model,
                 payload.hierarchy_level,

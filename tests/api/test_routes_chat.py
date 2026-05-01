@@ -84,16 +84,10 @@ def _settings(
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="chat-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="openai/reply-test-model",
         llm_ingest_model="openai/chat-test-model",
         llm_retrieval_model="openai/score-test-model",
@@ -432,6 +426,8 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
                         "title": "Notes",
                         "source_ref": "upload-1",
                         "privacy_level": 1,
+                        "intimacy_boundary": "romantic_private",
+                        "intimacy_boundary_confidence": 0.8,
                         "preserve_verbatim": True,
                         "skip_raw_by_default": True,
                         "requires_explicit_request": True,
@@ -456,7 +452,7 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
         with _connection(client) as connection:
             cursor = client.portal.call(
                 lambda: connection.execute(
-                    "SELECT id, artifact_type, source_kind, status, message_id, preserve_verbatim, skip_raw_by_default, requires_explicit_request, metadata_json FROM artifacts WHERE user_id = ?",
+                    "SELECT id, artifact_type, source_kind, status, message_id, privacy_level, intimacy_boundary, intimacy_boundary_confidence, preserve_verbatim, skip_raw_by_default, requires_explicit_request, metadata_json FROM artifacts WHERE user_id = ?",
                     ("usr_1",),
                 )
             )
@@ -467,6 +463,9 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
             assert artifact_row["source_kind"] == "base64"
             assert artifact_row["status"] == "ready"
             assert artifact_row["message_id"] is not None
+            assert artifact_row["privacy_level"] == 2
+            assert artifact_row["intimacy_boundary"] == "romantic_private"
+            assert artifact_row["intimacy_boundary_confidence"] == 0.8
             assert artifact_row["preserve_verbatim"] == 1
             assert artifact_row["skip_raw_by_default"] == 1
             assert artifact_row["requires_explicit_request"] == 1
@@ -486,13 +485,14 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
 
             chunk_cursor = client.portal.call(
                 lambda: connection.execute(
-                    "SELECT text FROM artifact_chunks WHERE artifact_id = ? ORDER BY chunk_index ASC",
+                    "SELECT text, intimacy_boundary FROM artifact_chunks WHERE artifact_id = ? ORDER BY chunk_index ASC",
                     (artifact_row["id"],),
                 )
             )
             chunk_rows = client.portal.call(chunk_cursor.fetchall)
             assert chunk_rows
             assert all("SGVsbG8sIHdvcmxkIQ==" not in row["text"] for row in chunk_rows)
+            assert {row["intimacy_boundary"] for row in chunk_rows} == {"romantic_private"}
 
             message_cursor = client.portal.call(
                 lambda: connection.execute(
@@ -507,6 +507,7 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
             assert metadata_json["attachment_artifact_ids"] == [artifact_row["id"]]
             assert metadata_json["attachments"][0]["relevance_state"] == "active_work_material"
             assert metadata_json["attachments"][0]["relevance_source"] == "attachment_ingest"
+            assert metadata_json["attachments"][0]["intimacy_boundary"] == "romantic_private"
     return None
 
 
@@ -710,16 +711,10 @@ def test_create_app_rejects_equal_service_and_admin_keys(tmp_path: Path) -> None
         manifests_path=settings.manifests_path,
         storage_backend=settings.storage_backend,
         redis_url=settings.redis_url,
-        llm_provider=settings.llm_provider,
-        llm_api_key=settings.llm_api_key,
         openai_api_key=settings.openai_api_key,
         openrouter_api_key=settings.openrouter_api_key,
-        llm_base_url=settings.llm_base_url,
         openrouter_site_url=settings.openrouter_site_url,
         openrouter_app_name=settings.openrouter_app_name,
-        llm_extraction_model=settings.llm_extraction_model,
-        llm_scoring_model=settings.llm_scoring_model,
-        llm_classifier_model=settings.llm_classifier_model,
         llm_chat_model=settings.llm_chat_model,
         llm_ingest_model=settings.llm_ingest_model,
         llm_retrieval_model=settings.llm_retrieval_model,

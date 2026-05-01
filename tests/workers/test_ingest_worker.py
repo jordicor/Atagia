@@ -33,11 +33,13 @@ from atagia.models.schemas_jobs import (
     EXTRACT_STREAM_NAME,
     JobEnvelope,
     JobType,
+    MessageJobPayload,
     REVISE_STREAM_NAME,
     WORKER_GROUP_NAME,
 )
 from atagia.models.schemas_memory import MemoryObjectType
 from atagia.services.llm_client import (
+    LLMError,
     LLMClient,
     LLMCompletionRequest,
     LLMCompletionResponse,
@@ -148,16 +150,10 @@ def _settings(**overrides: object) -> Settings:
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
         llm_forced_global_model="openai/reply-test-model",
         service_mode=False,
@@ -166,6 +162,7 @@ def _settings(**overrides: object) -> Settings:
         workers_enabled=False,
         debug=False,
         allow_insecure_http=True,
+        topic_working_set_enabled=False,
     )
     return Settings(**{**asdict(settings), **overrides})
 
@@ -586,6 +583,76 @@ async def test_ingest_worker_enqueues_compaction_job_without_workspace_after_thr
 
 
 @pytest.mark.asyncio
+async def test_ingest_worker_rolls_back_failed_topic_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = json.dumps(
+        {
+            "evidences": [],
+            "beliefs": [],
+            "contract_signals": [],
+            "state_updates": [],
+            "mode_guess": None,
+            "nothing_durable": True,
+        }
+    )
+    connection, _clock, _backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+        [payload],
+        settings=_settings(topic_working_set_enabled=True),
+    )
+
+    class FailingTopicRefreshService:
+        def __init__(self, **kwargs) -> None:
+            self.connection = kwargs["connection"]
+
+        async def maybe_refresh_after_message(self, **_kwargs):
+            await self.connection.execute("BEGIN")
+            await self.connection.execute(
+                """
+                INSERT INTO conversation_topic_events(
+                    id,
+                    user_id,
+                    conversation_id,
+                    event_type,
+                    payload_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "tpe_uncommitted",
+                    "usr_1",
+                    "cnv_1",
+                    "updated",
+                    "{}",
+                    "2026-03-31T04:00:00+00:00",
+                ),
+            )
+            raise LLMError("topic refresh failed")
+
+    monkeypatch.setattr(
+        "atagia.workers.ingest_worker.TopicWorkingSetRefreshService",
+        FailingTopicRefreshService,
+    )
+
+    try:
+        job = _extract_job(str(message["id"]))
+        await ingest_worker._maybe_refresh_topic_working_set(
+            envelope=job,
+            job_payload=MessageJobPayload.model_validate(job.payload),
+        )
+        cursor = await connection.execute(
+            "SELECT COUNT(*) AS count FROM conversation_topic_events WHERE id = ?",
+            ("tpe_uncommitted",),
+        )
+        row = await cursor.fetchone()
+
+        assert int(row["count"]) == 0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_ingest_skips_revision_when_disabled() -> None:
     persisted = [
         {
@@ -985,7 +1052,7 @@ async def test_contract_worker_reclaims_failed_pending_job_and_retries_successfu
         }
     )
     connection, _clock, backend, provider, memories, _ingest_worker, contract_worker, message = await _build_runtime(
-        ["not-json", payload]
+        ["not-json", "still-not-json", payload]
     )
     try:
         await backend.stream_add(CONTRACT_STREAM_NAME, _contract_job(str(message["id"])).model_dump(mode="json"))
@@ -1002,7 +1069,7 @@ async def test_contract_worker_reclaims_failed_pending_job_and_retries_successfu
         assert first.failed == 1
         assert second.acked == 1
         assert len(contract_memories) == 1
-        assert len(provider.requests) == 2
+        assert len(provider.requests) == 3
         compact_records = [
             record
             for record in caplog.records
@@ -1021,16 +1088,10 @@ def test_chat_reply_enqueues_stream_jobs_and_worker_processes_extraction(tmp_pat
         manifests_path=str(MANIFESTS_DIR),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
-        llm_provider="openai",
-        llm_api_key=None,
         openai_api_key="test-openai-key",
         openrouter_api_key=None,
-        llm_base_url=None,
         openrouter_site_url="http://localhost",
         openrouter_app_name="Atagia",
-        llm_extraction_model="extract-test-model",
-        llm_scoring_model="score-test-model",
-        llm_classifier_model="classify-test-model",
         llm_chat_model="reply-test-model",
         llm_forced_global_model="openai/reply-test-model",
         service_mode=False,

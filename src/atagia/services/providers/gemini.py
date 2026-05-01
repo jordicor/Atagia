@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 import copy
+import inspect
 import json
 from typing import Any
 from uuid import uuid4
@@ -28,6 +29,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMEmbeddingVector,
     LLMError,
+    LLMPolicyBlockedError,
     LLMProvider,
     LLMStreamEvent,
     OutputLimitExceededError,
@@ -431,6 +433,17 @@ def _empty_content_error(finish_reason: str | None) -> TransientLLMError:
     )
 
 
+async def _close_provider_stream(stream: Any) -> None:
+    for attr in ("aclose", "close"):
+        close = getattr(stream, attr, None)
+        if not callable(close):
+            continue
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+        return
+
+
 def _blocked_reason(response: Any) -> str | None:
     """Return a normalized block reason if Gemini refused the prompt or response."""
     prompt_feedback = _getattr_or_key(response, "prompt_feedback")
@@ -519,7 +532,9 @@ class GeminiProvider(LLMProvider):
 
         block_reason = _blocked_reason(response)
         if block_reason is not None:
-            raise LLMError(f"Gemini blocked the response ({block_reason})")
+            raise LLMPolicyBlockedError(
+                f"Gemini blocked the response ({block_reason})"
+            )
 
         output_text, thinking, tool_calls = _collect_response_content(response)
         finish_reason = _candidate_finish_reason(response)
@@ -581,6 +596,7 @@ class GeminiProvider(LLMProvider):
         usage: dict[str, int | float] = {}
         pending_error: Exception | None = None
         last_finish_reason: str | None = None
+        stream: Any | None = None
         try:
             stream = await self._client.aio.models.generate_content_stream(
                 **_completion_kwargs(request)
@@ -603,7 +619,7 @@ class GeminiProvider(LLMProvider):
                     yield LLMStreamEvent(type="tool_call", payload=tool_call)
                 block_reason = _blocked_reason(chunk)
                 if block_reason is not None:
-                    pending_error = LLMError(
+                    pending_error = LLMPolicyBlockedError(
                         f"Gemini blocked the response ({block_reason})"
                     )
                     break
@@ -618,6 +634,9 @@ class GeminiProvider(LLMProvider):
             if not emitted_any:
                 raise _map_exception(exc) from exc
             pending_error = exc
+        finally:
+            if stream is not None:
+                await _close_provider_stream(stream)
 
         if pending_error is None and not emitted_output_or_tool:
             pending_error = _empty_content_error(last_finish_reason)

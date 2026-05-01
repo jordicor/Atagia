@@ -34,6 +34,7 @@ from atagia.services.llm_client import (
     LLMCompletionRequest,
     LLMMessage,
     StructuredOutputError,
+    known_intimacy_context_metadata,
 )
 from atagia.services.model_resolution import resolve_component_model
 
@@ -428,6 +429,7 @@ class ConsequenceChainBuilder:
             outcome_text=str(outcome_memory["canonical_text"]),
             sentiment=signal.outcome_sentiment,
             conversation_context=conversation_context,
+            resolved_policy=resolved_policy,
         )
         if not tendency_text:
             return None
@@ -477,6 +479,7 @@ class ConsequenceChainBuilder:
         outcome_text: str,
         sentiment: ConsequenceSentiment,
         conversation_context: ExtractionConversationContext,
+        resolved_policy: ResolvedPolicy,
     ) -> str:
         request = LLMCompletionRequest(
             model=self._tendency_model,
@@ -506,6 +509,13 @@ class ConsequenceChainBuilder:
                 "conversation_id": conversation_context.conversation_id,
                 "assistant_mode_id": conversation_context.assistant_mode_id,
                 "purpose": "consequence_tendency_inference",
+                **(
+                    known_intimacy_context_metadata(
+                        reason="resolved_policy_allows_intimacy_context"
+                    )
+                    if resolved_policy.allow_intimacy_context
+                    else {}
+                ),
             },
         )
         try:

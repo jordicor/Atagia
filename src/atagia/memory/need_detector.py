@@ -17,7 +17,12 @@ from atagia.models.schemas_memory import (
     NeedTrigger,
     QueryIntelligenceResult,
 )
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMMessage,
+    known_intimacy_context_metadata,
+)
 from atagia.services.model_resolution import resolve_component_model
 
 _NEED_DESCRIPTIONS: dict[NeedTrigger, str] = {
@@ -57,7 +62,7 @@ IMPORTANT:
 - Do not let `fts_phrase` drift into a broad theme, takeaway, opinion label, or symbolic abstraction when the question is about a concrete person, object, place, work, event, or prior utterance.
 - For `slot_fill`, preserve the concrete entity, the requested attribute, and any explicit disambiguating event, timeframe, relationship, or object.
 - For `callback_bias=true`, preserve the explicit remembered anchor of what the assistant said, recommended, named, or explained.
-- For `broad_list`, preserve distinct requested facets across sub-queries instead of repeating the same anchor phrase.
+- For `broad_list`, preserve distinct requested facets across sub-queries instead of repeating the same anchor phrase. Use `broad_list` when the expected answer may require aggregating multiple concrete places, locations, methods, strategies, steps, actions, ways, examples, activities, or other list members, even when the wording is framed as a `where`, `how`, or `which` question. Prefer `broad_list` over `default` when a complete answer should collect several distinct remembered items rather than summarize one fact.
 - For takeaway, stance, symbolism, or theme questions, keep the concrete object under discussion in the sparse hint rather than only the abstract theme.
 - Anchor-language bridging: If the concrete anchors in the user
   query appear to be in a language that is NOT among the top
@@ -142,7 +147,7 @@ This can also apply when the user asks for multiple concrete named items,
 as long as the answer still depends on exact names or exact values.
 
 Query type meanings:
-- broad_list: asks for multiple items, categories, activities, examples, or facets
+- broad_list: asks for or implies multiple items, categories, places, locations, methods, strategies, steps, actions, activities, examples, or facets
 - temporal: primarily asks when, what date, what time, or duration anchored in time
 - slot_fill: primarily asks for one missing attribute such as who, where, which, or origin
 - default: anything else
@@ -185,7 +190,9 @@ class NeedDetector:
         self._llm_client = llm_client
         self._clock = clock
         resolved_settings = settings or Settings.from_env()
-        self._scoring_model = resolve_component_model(resolved_settings, "need_detector")
+        self._scoring_model = resolve_component_model(
+            resolved_settings, "need_detector"
+        )
 
     async def detect(
         self,
@@ -196,7 +203,9 @@ class NeedDetector:
         user_language_profile: list[dict[str, Any]],
     ) -> QueryIntelligenceResult:
         if user_language_profile is None:
-            raise ValueError("user_language_profile must be provided; pass an empty list when unknown")
+            raise ValueError(
+                "user_language_profile must be provided; pass an empty list when unknown"
+            )
         context = ExtractionConversationContext.model_validate(conversation_context)
         prompt = self._build_prompt(
             message_text,
@@ -208,7 +217,10 @@ class NeedDetector:
         request = LLMCompletionRequest(
             model=self._scoring_model,
             messages=[
-                LLMMessage(role="system", content="Produce grounded query intelligence as JSON only."),
+                LLMMessage(
+                    role="system",
+                    content="Produce grounded query intelligence as JSON only.",
+                ),
                 LLMMessage(role="user", content=prompt),
             ],
             temperature=0.0,
@@ -219,9 +231,18 @@ class NeedDetector:
                 "conversation_id": context.conversation_id,
                 "assistant_mode_id": context.assistant_mode_id,
                 "purpose": "need_detection",
+                **(
+                    known_intimacy_context_metadata(
+                        reason="resolved_policy_allows_intimacy_context"
+                    )
+                    if resolved_policy.allow_intimacy_context
+                    else {}
+                ),
             },
         )
-        query_intelligence = await self._llm_client.complete_structured(request, QueryIntelligenceResult)
+        query_intelligence = await self._llm_client.complete_structured(
+            request, QueryIntelligenceResult
+        )
         self._require_sparse_hints(query_intelligence)
         allowed_need_types = set(resolved_policy.need_triggers)
         deduped: dict[NeedTrigger, DetectedNeed] = {}
@@ -243,8 +264,7 @@ class NeedDetector:
     @staticmethod
     def _require_sparse_hints(query_intelligence: QueryIntelligenceResult) -> None:
         hint_targets = {
-            hint.sub_query_text
-            for hint in query_intelligence.sparse_query_hints
+            hint.sub_query_text for hint in query_intelligence.sparse_query_hints
         }
         missing_sub_queries = [
             sub_query
@@ -267,14 +287,17 @@ class NeedDetector:
     ) -> str:
         escaped_message_text = html.escape(message_text)
         escaped_role = html.escape(role)
-        escaped_recent_context = "\n".join(
-            (
-                f'<message role="{html.escape(message.role)}">'
-                f"{html.escape(message.content)}"
-                "</message>"
+        escaped_recent_context = (
+            "\n".join(
+                (
+                    f'<message role="{html.escape(message.role)}">'
+                    f"{html.escape(message.content)}"
+                    "</message>"
+                )
+                for message in context.recent_messages
             )
-            for message in context.recent_messages
-        ) or '<message role="none">(none)</message>'
+            or '<message role="none">(none)</message>'
+        )
         if resolved_policy.need_triggers:
             descriptions = "\n".join(
                 f"- {need_type.value}: {_NEED_DESCRIPTIONS[need_type]}"
@@ -284,7 +307,9 @@ class NeedDetector:
                 need_type.value for need_type in resolved_policy.need_triggers
             )
         else:
-            descriptions = "- none: no need types are enabled for this mode; return needs=[]"
+            descriptions = (
+                "- none: no need types are enabled for this mode; return needs=[]"
+            )
             allowed_need_types = "(none enabled; return needs=[])"
         user_language_profile_summary = self._summarize_user_language_profile(
             user_language_profile
@@ -307,11 +332,19 @@ class NeedDetector:
             return "(none)"
         lines: list[str] = []
         for row in user_language_profile:
-            language_code = str(row.get("language_code", "")).strip().lower() or "unknown"
+            language_code = (
+                str(row.get("language_code", "")).strip().lower() or "unknown"
+            )
             memory_count = int(row.get("memory_count", 0))
             raw_last_seen_at = str(row.get("last_seen_at", "")).strip()
-            last_seen_date = raw_last_seen_at[:10] if len(raw_last_seen_at) >= 10 else raw_last_seen_at or "unknown"
-            line = f"{language_code}: {memory_count} memories (last seen {last_seen_date})"
+            last_seen_date = (
+                raw_last_seen_at[:10]
+                if len(raw_last_seen_at) >= 10
+                else raw_last_seen_at or "unknown"
+            )
+            line = (
+                f"{language_code}: {memory_count} memories (last seen {last_seen_date})"
+            )
             if any(character in raw_last_seen_at for character in "<>&"):
                 line = f"{line} raw={raw_last_seen_at}"
             lines.append(html.escape(line))

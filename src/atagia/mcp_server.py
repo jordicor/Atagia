@@ -143,6 +143,19 @@ async def _get_context_impl(
         {
             "conversation_id": resolved_conversation_id,
             "system_prompt": context.system_prompt,
+            "recent_transcript": [
+                entry.model_dump(mode="json") for entry in context.recent_transcript
+            ],
+            "recent_transcript_omissions": [
+                omission.model_dump(mode="json")
+                for omission in context.recent_transcript_omissions
+            ],
+            "recent_transcript_trace": (
+                None
+                if context.recent_transcript_trace is None
+                else context.recent_transcript_trace.model_dump(mode="json")
+            ),
+            "assistant_guidance": context.assistant_guidance,
             "memories": [memory.model_dump(mode="json") for memory in context.memories],
             "contract": context.contract,
             "detected_needs": context.detected_needs,
