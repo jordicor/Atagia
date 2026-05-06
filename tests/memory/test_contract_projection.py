@@ -19,7 +19,15 @@ from atagia.core.repositories import (
 )
 from atagia.memory.contract_projection import ContractProjector
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
-from atagia.models.schemas_memory import ContractProjectionResult, ExtractionConversationContext, MemoryStatus
+from atagia.models.schemas_memory import (
+    ContractProjectionResult,
+    ExtractionConversationContext,
+    MemoryObjectType,
+    MemoryScope,
+    MemorySensitivity,
+    MemorySourceKind,
+    MemoryStatus,
+)
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -519,7 +527,7 @@ async def test_lower_confidence_signal_does_not_overwrite_existing_projection() 
 
 
 @pytest.mark.asyncio
-async def test_scope_isolation_keeps_mode_specific_contracts_separate() -> None:
+async def test_retrieval_profile_does_not_partition_contract_scope() -> None:
     first = {
         "signals": [
             {
@@ -603,7 +611,7 @@ async def test_scope_isolation_keeps_mode_specific_contracts_separate() -> None:
         debug_contract = await projector.get_current_contract("usr_1", "coding_debug", None, "cnv_debug")
         research_contract = await projector.get_current_contract("usr_1", "research_deep_dive", None, "cnv_research")
 
-        assert debug_contract["pace"] == {"label": "fast"}
+        assert debug_contract["pace"] == {"label": "methodical"}
         assert research_contract["pace"] == {"label": "methodical"}
     finally:
         await connection.close()
@@ -758,6 +766,216 @@ async def test_get_current_contract_returns_projection_and_manifest_defaults() -
 
         assert current_contract["implementation_first"] == {"label": "high"}
         assert current_contract["depth"] == {"label": "default", "source": "manifest_default"}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_get_current_contract_applies_phase7_row_and_source_gates() -> None:
+    (
+        connection,
+        _clock,
+        conversations,
+        _messages,
+        memories,
+        contracts,
+        projector,
+        _provider,
+        _loader,
+    ) = await _build_runtime([])
+    try:
+        await _create_conversation(conversations, "coding_debug")
+
+        visible_source = await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.INTERACTION_CONTRACT,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="I prefer concise answers.",
+            payload={"dimension_name": "phase7_visible", "value_json": {"label": "concise"}},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            status=MemoryStatus.ACTIVE,
+            memory_id="mem_contract_visible",
+            user_persona_id="persona_a",
+            platform_id="default",
+            sensitivity=MemorySensitivity.PUBLIC,
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        private_source = await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.INTERACTION_CONTRACT,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="I prefer private handling.",
+            payload={"dimension_name": "phase7_private", "value_json": {"label": "private"}},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=2,
+            status=MemoryStatus.ACTIVE,
+            memory_id="mem_contract_private",
+            user_persona_id="persona_a",
+            platform_id="default",
+            sensitivity=MemorySensitivity.PRIVATE,
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        wrong_persona_source = await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.INTERACTION_CONTRACT,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="I prefer another persona style.",
+            payload={"dimension_name": "phase7_wrong_persona", "value_json": {"label": "other"}},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            status=MemoryStatus.ACTIVE,
+            memory_id="mem_contract_wrong_persona",
+            user_persona_id="persona_b",
+            platform_id="default",
+            sensitivity=MemorySensitivity.PUBLIC,
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        for dimension, value, source in (
+            ("phase7_visible", {"label": "concise"}, visible_source),
+            ("phase7_private", {"label": "private"}, private_source),
+            ("phase7_wrong_persona", {"label": "other"}, wrong_persona_source),
+        ):
+            await contracts.upsert_projection(
+                user_id="usr_1",
+                assistant_mode_id="coding_debug",
+                workspace_id=None,
+                conversation_id="cnv_1",
+                scope=MemoryScope.CONVERSATION,
+                dimension_name=dimension,
+                value_json=value,
+                confidence=0.9,
+                source_memory_id=str(source["id"]),
+            )
+
+        rows = await contracts.list_for_context(
+            "usr_1",
+            "coding_debug",
+            None,
+            "cnv_1",
+            user_persona_id="persona_a",
+            platform_id="default",
+            character_id=None,
+        )
+        current_contract = await projector.get_current_contract(
+            "usr_1",
+            "coding_debug",
+            None,
+            "cnv_1",
+            user_persona_id="persona_a",
+            platform_id="default",
+            character_id=None,
+        )
+
+        assert [row["dimension_name"] for row in rows] == ["phase7_visible"]
+        assert current_contract["phase7_visible"] == {"label": "concise"}
+        assert "phase7_private" not in current_contract
+        assert "phase7_wrong_persona" not in current_contract
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_contract_projection_key_separates_user_personas() -> None:
+    (
+        connection,
+        _clock,
+        conversations,
+        _messages,
+        memories,
+        contracts,
+        projector,
+        _provider,
+        _loader,
+    ) = await _build_runtime([])
+    try:
+        await _create_conversation(conversations, "coding_debug")
+        source_a = await memories.create_memory_object(
+            user_id="usr_1",
+            object_type=MemoryObjectType.INTERACTION_CONTRACT,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="I prefer concise answers.",
+            payload={"dimension_name": "depth", "value_json": {"label": "concise"}},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            status=MemoryStatus.ACTIVE,
+            memory_id="mem_contract_persona_a",
+            user_persona_id="persona_a",
+            platform_id="default",
+            sensitivity=MemorySensitivity.PUBLIC,
+            scope_canonical=MemoryScope.USER.value,
+        )
+        source_b = await memories.create_memory_object(
+            user_id="usr_1",
+            object_type=MemoryObjectType.INTERACTION_CONTRACT,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="I prefer expansive answers.",
+            payload={"dimension_name": "depth", "value_json": {"label": "expansive"}},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            status=MemoryStatus.ACTIVE,
+            memory_id="mem_contract_persona_b",
+            user_persona_id="persona_b",
+            platform_id="default",
+            sensitivity=MemorySensitivity.PUBLIC,
+            scope_canonical=MemoryScope.USER.value,
+        )
+        await contracts.upsert_projection(
+            user_id="usr_1",
+            assistant_mode_id=None,
+            workspace_id=None,
+            conversation_id=None,
+            scope=MemoryScope.GLOBAL_USER,
+            dimension_name="depth",
+            value_json={"label": "concise"},
+            confidence=0.8,
+            source_memory_id=str(source_a["id"]),
+        )
+        await contracts.upsert_projection(
+            user_id="usr_1",
+            assistant_mode_id=None,
+            workspace_id=None,
+            conversation_id=None,
+            scope=MemoryScope.GLOBAL_USER,
+            dimension_name="depth",
+            value_json={"label": "expansive"},
+            confidence=0.9,
+            source_memory_id=str(source_b["id"]),
+        )
+
+        count_cursor = await connection.execute("SELECT COUNT(*) AS count FROM contract_dimensions_current")
+        count_row = await count_cursor.fetchone()
+        persona_a_contract = await projector.get_current_contract(
+            "usr_1",
+            "coding_debug",
+            None,
+            "cnv_1",
+            user_persona_id="persona_a",
+            platform_id="default",
+        )
+        persona_b_contract = await projector.get_current_contract(
+            "usr_1",
+            "coding_debug",
+            None,
+            "cnv_1",
+            user_persona_id="persona_b",
+            platform_id="default",
+        )
+
+        assert count_row["count"] == 2
+        assert persona_a_contract["depth"] == {"label": "concise"}
+        assert persona_b_contract["depth"] == {"label": "expansive"}
     finally:
         await connection.close()
 

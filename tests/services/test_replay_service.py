@@ -31,7 +31,9 @@ from atagia.services.retrieval_pipeline import RetrievalPipeline
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
-_MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
+_CANDIDATE_SCORE_KEY_PATTERN = re.compile(
+    r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
+)
 
 
 class ReplayProvider(LLMProvider):
@@ -65,11 +67,11 @@ class ReplayProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_scoring":
-            memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
             payload = {
                 "scores": [
-                    {"memory_id": memory_id, "llm_applicability": self.score_map.get(memory_id, 0.5)}
-                    for memory_id in memory_ids
+                    {"score_key": score_key, "llm_applicability": self.score_map.get(memory_id, 0.5)}
+                    for memory_id, score_key in candidate_keys
                 ],
             }
             return LLMCompletionResponse(provider=self.name, model=request.model, output_text=json.dumps(payload))

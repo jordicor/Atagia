@@ -44,6 +44,9 @@ async def _seed_memory(
     conversation_id: str | None = "cnv_1",
     object_type: MemoryObjectType = MemoryObjectType.EVIDENCE,
     scope: MemoryScope = MemoryScope.CONVERSATION,
+    user_persona_id: str | None = None,
+    character_id: str | None = "wrk_1",
+    scope_canonical: str | None = MemoryScope.CHAT.value,
     canonical_text: str,
 ) -> dict[str, object]:
     return await memories.create_memory_object(
@@ -60,6 +63,10 @@ async def _seed_memory(
         status=MemoryStatus.ACTIVE,
         payload={"source_message_ids": ["msg_1"]},
         memory_id=memory_id,
+        user_persona_id=user_persona_id,
+        platform_id="default",
+        character_id=character_id,
+        scope_canonical=scope_canonical,
     )
 
 
@@ -122,6 +129,44 @@ async def test_create_chain_validates_memory_objects_belong_to_user() -> None:
                     "outcome_memory_id": str(outcome["id"]),
                     "tendency_belief_id": None,
                     "confidence": 0.6,
+                    "status": "active",
+                    "created_at": "2026-04-02T12:00:00+00:00",
+                    "updated_at": "2026-04-02T12:00:00+00:00",
+                }
+            )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_create_chain_rejects_cross_persona_sources() -> None:
+    connection, memories, chains = await _build_runtime()
+    try:
+        action = await _seed_memory(
+            memories,
+            memory_id="mem_action",
+            canonical_text="Suggested a refactor.",
+            user_persona_id="persona_a",
+        )
+        outcome = await _seed_memory(
+            memories,
+            memory_id="mem_outcome",
+            canonical_text="Regressions followed.",
+            user_persona_id="persona_b",
+        )
+
+        with pytest.raises(ValueError, match="disagree on user persona"):
+            await chains.create_chain(
+                {
+                    "id": "chn_cross_persona",
+                    "user_id": "usr_1",
+                    "workspace_id": "wrk_1",
+                    "conversation_id": "cnv_1",
+                    "assistant_mode_id": "coding_debug",
+                    "action_memory_id": str(action["id"]),
+                    "outcome_memory_id": str(outcome["id"]),
+                    "tendency_belief_id": None,
+                    "confidence": 0.7,
                     "status": "active",
                     "created_at": "2026-04-02T12:00:00+00:00",
                     "updated_at": "2026-04-02T12:00:00+00:00",

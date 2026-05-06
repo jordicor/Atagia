@@ -11,9 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from atagia.core.clock import Clock, SystemClock
 from atagia.core.config import Settings
 from atagia.core.llm_output_limits import CONTEXT_STALENESS_MAX_OUTPUT_TOKENS
-from atagia.memory.policy_manifest import ResolvedPolicy
+from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.models.schemas_cache import ContextCacheEntry
-from atagia.models.schemas_memory import AssistantModeId, OperationalProfileSnapshot
+from atagia.models.schemas_memory import RetrievalProfileId, OperationalProfileSnapshot
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -68,7 +68,7 @@ class _StalenessSignals(BaseModel):
     contradiction_detected: bool
     high_stakes_topic: bool
     sensitive_content: bool
-    mode_shift_target: AssistantModeId | None
+    mode_shift_target: RetrievalProfileId | None
     short_followup: bool
     ambiguous_wording: bool
 
@@ -137,7 +137,7 @@ class ContextStalenessSignalDetector:
         *,
         cache_entry: ContextCacheEntry,
         request: ContextStalenessRequest,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
     ) -> _StalenessSignals:
         prompt = self._build_prompt(
             cache_entry=cache_entry,
@@ -159,7 +159,7 @@ class ContextStalenessSignalDetector:
             metadata={
                 "user_id": request.user_id,
                 "conversation_id": request.conversation_id,
-                "assistant_mode_id": resolved_policy.assistant_mode_id.value,
+                "assistant_mode_id": resolved_policy.profile_id.value,
                 "purpose": "context_cache_signal_detection",
                 **(
                     known_intimacy_context_metadata(
@@ -177,10 +177,10 @@ class ContextStalenessSignalDetector:
         *,
         cache_entry: ContextCacheEntry,
         request: ContextStalenessRequest,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
     ) -> str:
         return STALENESS_PROMPT_TEMPLATE.format(
-            current_mode_id=html.escape(resolved_policy.assistant_mode_id.value),
+            current_mode_id=html.escape(resolved_policy.profile_id.value),
             previous_user_message=html.escape(cache_entry.last_user_message_text),
             new_user_message=html.escape(request.message_text),
         )
@@ -205,7 +205,7 @@ class ContextStalenessScorer:
         self,
         entry: ContextCacheEntry | dict[str, Any],
         request: ContextStalenessRequest | dict[str, Any],
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
     ) -> ContextStalenessScore:
         request_model = ContextStalenessRequest.model_validate(request)
         try:
@@ -424,7 +424,7 @@ class ContextStalenessScorer:
         *,
         cache_entry: ContextCacheEntry,
         request: ContextStalenessRequest,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
     ) -> str | None:
         if not request.cache_enabled:
             return "cache_disabled"
@@ -440,7 +440,7 @@ class ContextStalenessScorer:
             return "user_id_mismatch"
         if cache_entry.conversation_id != request.conversation_id:
             return "conversation_id_mismatch"
-        if cache_entry.assistant_mode_id != resolved_policy.assistant_mode_id.value:
+        if cache_entry.assistant_mode_id != resolved_policy.profile_id.value:
             return "assistant_mode_id_mismatch"
         if cache_entry.workspace_id != request.workspace_id:
             return "workspace_id_mismatch"
@@ -457,7 +457,7 @@ class ContextStalenessScorer:
     def _hard_sync_score(
         self,
         *,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
         matched_signals: list[str],
         pace_label: str = "default",
         pace_multiplier: float = 1.0,

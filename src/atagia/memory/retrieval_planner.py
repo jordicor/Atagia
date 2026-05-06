@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from atagia.memory.policy_manifest import ResolvedPolicy
+from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.models.schemas_memory import (
     ExtractionConversationContext,
     MemoryScope,
@@ -25,7 +25,6 @@ _DEFAULT_SCOPE_ORDER = (
     MemoryScope.EPHEMERAL_SESSION,
     MemoryScope.CONVERSATION,
     MemoryScope.WORKSPACE,
-    MemoryScope.ASSISTANT_MODE,
     MemoryScope.GLOBAL_USER,
 )
 _BROAD_SCOPE_ORDER = tuple(reversed(_DEFAULT_SCOPE_ORDER))
@@ -208,7 +207,7 @@ class RetrievalPlanner:
         original_query: str,
         query_intelligence: QueryIntelligenceResult,
         conversation_context: ExtractionConversationContext,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
         cold_start: bool,
     ) -> RetrievalPlan:
         base_scope_filter = self._ordered_scopes(
@@ -225,6 +224,16 @@ class RetrievalPlanner:
             assistant_mode_id=conversation_context.assistant_mode_id,
             workspace_id=conversation_context.workspace_id,
             conversation_id=conversation_context.conversation_id,
+            user_persona_id=conversation_context.user_persona_id,
+            platform_id=conversation_context.platform_id or "default",
+            character_id=(
+                conversation_context.character_id
+                if conversation_context.character_id is not None
+                else conversation_context.workspace_id
+            ),
+            incognito=conversation_context.incognito or conversation_context.isolated_mode,
+            remember_across_chats=conversation_context.remember_across_chats,
+            remember_across_devices=conversation_context.remember_across_devices,
             fts_queries=self._flatten_fts_queries(sub_query_plans),
             sub_query_plans=sub_query_plans,
             callback_bias=query_intelligence.callback_bias,

@@ -20,6 +20,7 @@ from atagia.models.schemas_memory import (
     MemoryCategory,
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
 )
@@ -133,6 +134,10 @@ async def test_confirming_pending_memory_upserts_embedding_with_safe_payload() -
             memory_id=str(pending["id"]),
             category=MemoryCategory.PIN_OR_PASSWORD,
             created_at=str(pending["created_at"]),
+            intended_scope=MemoryScope.USER,
+            intended_sensitivity=MemorySensitivity.SECRET,
+            policy_snapshot={"source": "test"},
+            policy_proven=True,
             commit=False,
         )
         await confirmations.mark_markers_asked(
@@ -173,12 +178,170 @@ async def test_confirming_pending_memory_upserts_embedding_with_safe_payload() -
                 "metadata": {
                     "user_id": "usr_1",
                     "object_type": "evidence",
-                    "scope": "global_user",
+                        "scope": "user",
                     "created_at": str(pending["created_at"]),
                     "index_text": None,
                 },
             }
         ]
         assert provider.requests[0].metadata["purpose"] == "consent_confirmation_intent"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_unproven_pending_policy_confirmation_moves_to_review_not_active() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 6, 12, 0, tzinfo=timezone.utc))
+    provider = ConfirmationProvider("confirm")
+    try:
+        await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+        confirmations = PendingMemoryConfirmationRepository(connection, clock)
+        await users.create_user("usr_1")
+        await conversations.create_conversation(
+            "cnv_1",
+            "usr_1",
+            None,
+            "personal_assistant",
+            "Chat",
+        )
+        pending = await memories.create_memory_object(
+            memory_id="mem_unproven",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="personal_assistant",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="Sensitive migrated value",
+            index_text="sensitive value",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.97,
+            privacy_level=3,
+            memory_category=MemoryCategory.PIN_OR_PASSWORD,
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+            commit=False,
+        )
+        await confirmations.create_marker(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            memory_id=str(pending["id"]),
+            category=MemoryCategory.PIN_OR_PASSWORD,
+            created_at=str(pending["created_at"]),
+            commit=False,
+        )
+        await confirmations.mark_markers_asked(
+            "usr_1",
+            [str(pending["id"])],
+            asked_at=clock.now().isoformat(),
+            commit=False,
+        )
+        await connection.commit()
+
+        service = PendingConfirmationService(
+            connection,
+            clock,
+            llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+            settings=_settings(),
+        )
+        plan = await service.plan_turn(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="yes",
+        )
+        await service.apply_turn_plan(user_id="usr_1", plan=plan, commit=True)
+
+        updated = await memories.get_memory_object("mem_unproven", "usr_1")
+        marker = await confirmations.get_marker_for_memory("usr_1", "mem_unproven")
+
+        assert updated is not None
+        assert updated["status"] == MemoryStatus.REVIEW_REQUIRED.value
+        assert marker is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_confirmation_rechecks_current_preferences_before_activation() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 6, 12, 0, tzinfo=timezone.utc))
+    provider = ConfirmationProvider("confirm")
+    try:
+        await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+        confirmations = PendingMemoryConfirmationRepository(connection, clock)
+        profiles = MemoryConsentProfileRepository(connection, clock)
+        await users.create_user("usr_1")
+        await conversations.create_conversation(
+            "cnv_1",
+            "usr_1",
+            None,
+            "personal_assistant",
+            "Chat",
+        )
+        pending = await memories.create_memory_object(
+            memory_id="mem_current_narrowed",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="personal_assistant",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.GLOBAL_USER,
+            scope_canonical=MemoryScope.USER.value,
+            canonical_text="Banking card PIN: 4512",
+            index_text="bank card PIN",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.97,
+            privacy_level=3,
+            memory_category=MemoryCategory.PIN_OR_PASSWORD,
+            preserve_verbatim=True,
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+            commit=False,
+        )
+        await confirmations.create_marker(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            memory_id=str(pending["id"]),
+            category=MemoryCategory.PIN_OR_PASSWORD,
+            created_at=str(pending["created_at"]),
+            intended_scope=MemoryScope.USER,
+            intended_sensitivity=MemorySensitivity.SECRET,
+            policy_snapshot={"source": "test"},
+            policy_proven=True,
+            commit=False,
+        )
+        await confirmations.mark_markers_asked(
+            "usr_1",
+            [str(pending["id"])],
+            asked_at=clock.now().isoformat(),
+            commit=False,
+        )
+        await connection.commit()
+        await users.update_memory_preferences("usr_1", remember_across_chats=False)
+
+        service = PendingConfirmationService(
+            connection,
+            clock,
+            llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+            settings=_settings(),
+        )
+        plan = await service.plan_turn(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="yes",
+        )
+        await service.apply_turn_plan(user_id="usr_1", plan=plan, commit=True)
+
+        updated = await memories.get_memory_object("mem_current_narrowed", "usr_1")
+        profile = await profiles.get_profile("usr_1", MemoryCategory.PIN_OR_PASSWORD)
+        marker = await confirmations.get_marker_for_memory("usr_1", "mem_current_narrowed")
+
+        assert updated is not None
+        assert updated["status"] == MemoryStatus.REVIEW_REQUIRED.value
+        assert profile is None
+        assert marker is None
     finally:
         await connection.close()

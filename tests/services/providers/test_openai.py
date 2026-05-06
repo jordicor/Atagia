@@ -151,6 +151,61 @@ async def test_openai_complete_maps_response_and_uses_structured_output() -> Non
 
 
 @pytest.mark.asyncio
+async def test_openai_complete_preserves_native_tool_call_history() -> None:
+    response = SimpleNamespace(
+        model="gpt-5-mini",
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+        usage=None,
+        model_dump=lambda: {},
+    )
+    completions = FakeChatCompletions(create_result=response)
+    provider = OpenAIProvider(api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()))
+    request = _request().model_copy(
+        update={
+            "messages": [
+                LLMMessage(role="user", content="Use the lookup tool."),
+                LLMMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call_lookup",
+                            "type": "tool_use",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "{\"query\":\"atagia\"}",
+                            },
+                        }
+                    ],
+                ),
+                LLMMessage(
+                    role="tool",
+                    content="{\"result\":\"ok\"}",
+                    name="call_lookup",
+                ),
+            ],
+            "response_schema": None,
+        }
+    )
+
+    await provider.complete(request)
+
+    messages = completions.calls[0]["messages"]
+    assert messages[1]["content"] is None
+    assert messages[1]["tool_calls"] == [
+        {
+            "id": "call_lookup",
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "arguments": "{\"query\":\"atagia\"}",
+            },
+        }
+    ]
+    assert messages[2]["tool_call_id"] == "call_lookup"
+
+
+@pytest.mark.asyncio
 async def test_openai_complete_forwards_provider_extra_body_from_metadata() -> None:
     """Metadata['provider_extra_body'] is forwarded as `extra_body` to the SDK,
     so OpenRouter callers can set the rich `reasoning` object and other

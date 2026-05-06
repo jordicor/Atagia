@@ -20,10 +20,13 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
+from atagia.transport_ids import decode_path_id, encode_path_id
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[1] / "manifests"
-_MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
+_CANDIDATE_SCORE_KEY_PATTERN = re.compile(
+    r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
+)
 
 
 class ClientProvider(LLMProvider):
@@ -58,15 +61,15 @@ class ClientProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_scoring":
-            memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
                     {
                         "scores": [
-                            {"memory_id": memory_id, "llm_applicability": 0.5}
-                            for memory_id in memory_ids
+                            {"score_key": score_key, "llm_applicability": 0.5}
+                            for _memory_id, score_key in candidate_keys
                         ],
                     }
                 ),
@@ -164,6 +167,7 @@ def _settings(tmp_path: Path, *, workers_enabled: bool = False) -> Settings:
         service_api_key="service-key",
         admin_api_key="admin-key",
         workers_enabled=workers_enabled,
+        lifecycle_lazy_enabled=False,
         debug=False,
         allow_insecure_http=False,
         small_corpus_token_threshold_ratio=0.0,
@@ -198,11 +202,13 @@ async def test_connect_atagia_local_sidecar_round_trip(
             conversation_id=conversation_id,
             message="Please remember the retry guard.",
             mode="coding_debug",
+            workspace_id="wrk_1",
         )
         await client.add_response(
             user_id="usr_1",
             conversation_id=conversation_id,
             text="I will keep the retry guard in mind.",
+            character_id="wrk_1",
         )
         await client.ingest_message(
             user_id="usr_1",
@@ -210,17 +216,22 @@ async def test_connect_atagia_local_sidecar_round_trip(
             role="user",
             text="Historical note: retry loops need a guard.",
             mode="coding_debug",
+            workspace_id="wrk_1",
         )
         chat_result = await client.chat(
             user_id="usr_1",
             conversation_id=conversation_id,
             message="Why is the retry loop failing?",
             mode="coding_debug",
+            workspace_id="wrk_1",
         )
 
         assert context.system_prompt
         assert chat_result.response_text == "Check the retry guard first."
         assert await client.flush(timeout_seconds=0.1) is True
+        status = await client.get_processing_status("usr_1", conversation_id)
+        assert status.workers_enabled is True
+        assert status.processing is False
     finally:
         await client.close()
 
@@ -254,17 +265,22 @@ async def test_connect_atagia_http_sidecar_round_trip(tmp_path: Path) -> None:
                 "cnv_1",
                 workspace_id="wrk_1",
                 assistant_mode_id="coding_debug",
+                platform_id="client_http",
             )
             context = await client.get_context(
                 user_id="usr_1",
                 conversation_id=conversation_id,
                 message="Please remember the retry guard.",
                 mode="coding_debug",
+                workspace_id="wrk_1",
+                platform_id="client_http",
             )
             await client.add_response(
                 user_id="usr_1",
                 conversation_id=conversation_id,
                 text="I will keep the retry guard in mind.",
+                platform_id="client_http",
+                character_id="wrk_1",
             )
             await client.ingest_message(
                 user_id="usr_1",
@@ -272,16 +288,165 @@ async def test_connect_atagia_http_sidecar_round_trip(tmp_path: Path) -> None:
                 role="user",
                 text="Historical note: retry loops need a guard.",
                 mode="coding_debug",
+                workspace_id="wrk_1",
+                platform_id="client_http",
             )
             chat_result = await client.chat(
                 user_id="usr_1",
                 conversation_id=conversation_id,
                 message="Why is the retry loop failing?",
+                workspace_id="wrk_1",
+                platform_id="client_http",
             )
 
             assert context.system_prompt
             assert chat_result.response_text == "Check the retry guard first."
             assert await client.flush(timeout_seconds=0.1) is False
+            status = await client.get_processing_status("usr_1", conversation_id)
+            assert status.workers_enabled is False
+            assert status.status == "blocked"
+            assert status.pending_jobs > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_conversation_id", ["chat/with spaces?#", ".", ".."])
+async def test_http_client_encodes_unsafe_conversation_ids_for_asgi_routes(
+    tmp_path: Path,
+    raw_conversation_id: str,
+) -> None:
+    app = create_app(_settings(tmp_path))
+    provider = ClientProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as http_client:
+            client = HttpAtagiaClient(
+                base_url="http://testserver",
+                api_key="service-key",
+                http_client=http_client,
+            )
+            await client.create_user("usr_1")
+            await client.create_workspace("usr_1", "wrk_1", "Workspace")
+            created_id = await client.create_conversation(
+                "usr_1",
+                raw_conversation_id,
+                workspace_id="wrk_1",
+                assistant_mode_id="coding_debug",
+                platform_id="client_http",
+            )
+            context = await client.get_context(
+                user_id="usr_1",
+                conversation_id=raw_conversation_id,
+                message="Please remember the retry guard.",
+                mode="coding_debug",
+                workspace_id="wrk_1",
+                platform_id="client_http",
+            )
+            await client.add_response(
+                user_id="usr_1",
+                conversation_id=raw_conversation_id,
+                text="I will keep the retry guard in mind.",
+                platform_id="client_http",
+                character_id="wrk_1",
+            )
+            await client.ingest_message(
+                user_id="usr_1",
+                conversation_id=raw_conversation_id,
+                role="user",
+                text="Historical note: retry loops need a guard.",
+                mode="coding_debug",
+                workspace_id="wrk_1",
+                platform_id="client_http",
+            )
+            chat_result = await client.chat(
+                user_id="usr_1",
+                conversation_id=raw_conversation_id,
+                message="Why is the retry loop failing?",
+                workspace_id="wrk_1",
+                platform_id="client_http",
+            )
+            status = await client.get_processing_status("usr_1", raw_conversation_id)
+        connection = await app.state.runtime.open_connection()
+        try:
+            cursor = await connection.execute(
+                "SELECT id FROM conversations WHERE user_id = ?",
+                ("usr_1",),
+            )
+            stored_ids = {str(row[0]) for row in await cursor.fetchall()}
+        finally:
+            await connection.close()
+
+    assert created_id == raw_conversation_id
+    assert context.system_prompt
+    assert chat_result.conversation_id == raw_conversation_id
+    assert chat_result.response_text == "Check the retry guard first."
+    assert status.status == "blocked"
+    assert raw_conversation_id in stored_ids
+    assert encode_path_id(raw_conversation_id) not in stored_ids
+
+
+def test_transport_path_ids_are_reversible_and_dot_safe() -> None:
+    for raw_id in ("chat/with spaces?#", ".", "..", "__atagia_b64_existing"):
+        encoded = encode_path_id(raw_id)
+        assert "/" not in encoded
+        assert encoded not in {".", ".."}
+        assert decode_path_id(encoded) == raw_id
+
+
+@pytest.mark.asyncio
+async def test_http_client_encodes_unsafe_user_id_for_user_status_route(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path))
+    raw_user_id = "usr/with spaces?#"
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as http_client:
+            client = HttpAtagiaClient(
+                base_url="http://testserver",
+                api_key="service-key",
+                http_client=http_client,
+            )
+            await client.create_user(raw_user_id)
+            status = await client.get_processing_status(raw_user_id)
+
+    assert status.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_http_client_worker_control_uses_admin_key(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as http_client:
+            client = HttpAtagiaClient(
+                base_url="http://testserver",
+                api_key="service-key",
+                admin_api_key="admin-key",
+                http_client=http_client,
+            )
+
+            default_state = await client.get_worker_control()
+            paused_state = await client.set_worker_control(
+                "hard_pause",
+                reason="restore",
+            )
+
+    assert default_state.mode == "active"
+    assert paused_state.mode == "hard_pause"
+    assert paused_state.worker_claims_allowed is False
 
 
 @pytest.mark.asyncio

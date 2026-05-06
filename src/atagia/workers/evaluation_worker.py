@@ -22,7 +22,9 @@ from atagia.models.schemas_jobs import (
     WORKER_GROUP_NAME,
     WorkerIterationResult,
 )
+from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.llm_client import LLMClient, StructuredOutputError, TransientLLMError
+from atagia.services.worker_control_service import WorkerControlService, wait_if_worker_claims_paused
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
@@ -43,7 +45,15 @@ class EvaluationWorker:
     ) -> None:
         self._storage_backend = storage_backend
         self._llm_client = llm_client
-        self._metrics_computer = MetricsComputer(connection, clock, settings=settings)
+        self._worker_control = WorkerControlService(connection, clock)
+        resolved_settings = settings or Settings.from_env()
+        self._job_tracking = JobTrackingService(
+            connection,
+            clock,
+            workers_enabled=resolved_settings.workers_enabled,
+            settings=resolved_settings,
+        )
+        self._metrics_computer = MetricsComputer(connection, clock, settings=resolved_settings)
         self._metrics_repository = MetricsRepository(connection, clock)
         self._clock = clock
 
@@ -64,6 +74,8 @@ class EvaluationWorker:
         consumer_name: str = "evaluate-1",
         block_ms: int | None = 0,
     ) -> WorkerIterationResult:
+        if await wait_if_worker_claims_paused(self._worker_control, block_ms=block_ms):
+            return WorkerIterationResult()
         messages = await self._next_messages(consumer_name=consumer_name, block_ms=block_ms)
         if not messages:
             return WorkerIterationResult()
@@ -73,7 +85,9 @@ class EvaluationWorker:
         dead_lettered = 0
         for message in messages:
             try:
+                await self._job_tracking.mark_running(message)
                 await self.process_job(message.payload)
+                await self._job_tracking.mark_succeeded(message)
                 await self._storage_backend.stream_ack(
                     EVALUATION_STREAM_NAME,
                     WORKER_GROUP_NAME,
@@ -85,6 +99,8 @@ class EvaluationWorker:
                 self._log_job_failure(message, exc)
                 if await self._dead_letter_if_exhausted(message, exc):
                     dead_lettered += 1
+                else:
+                    await self._job_tracking.mark_retrying(message, exc)
         return WorkerIterationResult(
             received=len(messages),
             acked=acked,
@@ -196,4 +212,5 @@ class EvaluationWorker:
             WORKER_GROUP_NAME,
             message.message_id,
         )
+        await self._job_tracking.mark_dead_lettered(message, exc)
         return True

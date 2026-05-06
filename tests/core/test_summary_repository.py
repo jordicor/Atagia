@@ -69,7 +69,7 @@ async def test_create_summary_creates_row_with_correct_fields() -> None:
 async def test_create_summary_rejects_missing_parent_references() -> None:
     connection, summaries = await _build_runtime()
     try:
-        with pytest.raises(ValueError, match="conversation_id or workspace_id"):
+        with pytest.raises(ValueError, match="conversation_id, workspace_id, or character_id"):
             await summaries.create_summary(
                 "usr_1",
                 {

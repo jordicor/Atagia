@@ -12,6 +12,8 @@ from atagia.core.canonical import canonical_json_hash
 from atagia.core import json_utils
 from atagia.core.storage_backend import (
     StorageBackend,
+    _job_matches_conversation,
+    _job_matches_user,
     extract_context_view_conversation_id,
     extract_context_view_user_id,
 )
@@ -91,6 +93,19 @@ class RedisBackend(StorageBackend):
             f"recent_window:{key}",
             json_utils.dumps(messages, sort_keys=True),
         )
+
+    async def delete_recent_windows_for_user(self, user_id: str) -> int:
+        keys = [f"recent_window:{user_id}"]
+        async for key in self._client.scan_iter(match=f"recent_window:{user_id}:*"):
+            keys.append(str(key))
+        return int(await self._client.delete(*keys)) if keys else 0
+
+    async def delete_recent_window_for_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> int:
+        return int(await self._client.delete(f"recent_window:{user_id}:{conversation_id}") or 0)
 
     async def get_context_view(self, key: str) -> dict[str, Any] | None:
         raw = await self._client.get(self._context_view_key(key))
@@ -236,6 +251,17 @@ class RedisBackend(StorageBackend):
             await self._client.srem(index_key, str(cache_key))
         await self._client.delete(index_key)
         return deleted
+
+    async def purge_user_jobs(self, user_id: str) -> int:
+        return await self._purge_jobs(lambda payload: _job_matches_user(payload, user_id))
+
+    async def purge_conversation_jobs(self, user_id: str, conversation_id: str) -> int:
+        return await self._purge_jobs(
+            lambda payload: (
+                _job_matches_user(payload, user_id)
+                and _job_matches_conversation(payload, conversation_id)
+            )
+        )
 
     async def enqueue_job(self, queue_name: str, payload: dict[str, Any]) -> None:
         await self._client.rpush(
@@ -414,6 +440,77 @@ class RedisBackend(StorageBackend):
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    async def _purge_jobs(self, should_drop: Any) -> int:
+        purged = 0
+        async for key in self._client.scan_iter(match="queue:*"):
+            queue_key = str(key)
+            raw_items = await self._client.lrange(queue_key, 0, -1)
+            retained: list[str] = []
+            for raw in raw_items:
+                try:
+                    payload = json_utils.loads(raw)
+                except Exception:
+                    retained.append(raw)
+                    continue
+                if should_drop(payload.get("payload") if isinstance(payload, dict) and "payload" in payload else payload):
+                    purged += 1
+                    continue
+                retained.append(raw)
+            await self._client.delete(queue_key)
+            if retained:
+                await self._client.rpush(queue_key, *retained)
+
+        for stream_name, group_name in list(self._stream_groups):
+            purged += await self._purge_stream_entries(stream_name, group_name, should_drop)
+        async for key in self._client.scan_iter(match="atagia:*"):
+            stream_name = str(key)
+            if stream_name.startswith("queue:"):
+                continue
+            try:
+                key_type = await self._client.type(stream_name)
+            except Exception:
+                continue
+            if key_type != "stream":
+                continue
+            purged += await self._purge_stream_entries(stream_name, None, should_drop)
+        return purged
+
+    async def _purge_stream_entries(
+        self,
+        stream_name: str,
+        group_name: str | None,
+        should_drop: Any,
+    ) -> int:
+        purged = 0
+        group_names = (
+            [group_name]
+            if group_name is not None
+            else await self._stream_group_names(stream_name)
+        )
+        for message_id, fields in await self._client.xrange(stream_name, "-", "+"):
+            normalized_fields = self._normalize_stream_fields(fields)
+            try:
+                payload = json_utils.loads(normalized_fields.get("payload", "{}"))
+            except Exception:
+                continue
+            if should_drop(payload):
+                for ack_group_name in group_names:
+                    await self._client.xack(stream_name, ack_group_name, message_id)
+                await self._client.xdel(stream_name, message_id)
+                purged += 1
+        return purged
+
+    async def _stream_group_names(self, stream_name: str) -> list[str]:
+        try:
+            groups = await self._client.xinfo_groups(stream_name)
+        except ResponseError:
+            return []
+        names: list[str] = []
+        for group in groups:
+            if isinstance(group, dict) and group.get("name") is not None:
+                names.append(str(group["name"]))
+        return names
 
     async def _sync_context_view_owner(
         self,

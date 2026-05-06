@@ -166,6 +166,63 @@ async def test_compaction_worker_processes_conversation_chunk_job() -> None:
 
 
 @pytest.mark.asyncio
+async def test_compaction_worker_skips_temporary_conversation_chunk_job() -> None:
+    connection, backend, messages, summaries, _memories, worker = await _build_runtime({})
+    try:
+        await connection.execute("UPDATE conversations SET temporary = 1 WHERE id = ?", ("cnv_1",))
+        await connection.commit()
+        await _seed_messages(messages)
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(job_kind=CompactionJobKind.CONVERSATION_CHUNK.value).model_dump(mode="json"),
+        )
+
+        result = await worker.run_once()
+        rows = await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10)
+
+        assert result.acked == 1
+        assert result.failed == 0
+        assert rows == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_worker_runs_for_isolated_conversation_chunk_job() -> None:
+    connection, backend, messages, summaries, _memories, worker = await _build_runtime(
+        {
+            "summary_chunk_segmentation": [
+                json.dumps(
+                    {
+                        "episodes": [
+                            {"start_seq": 1, "end_seq": 2, "summary_text": "Isolated conversation summary."}
+                        ]
+                    }
+                )
+            ]
+        }
+    )
+    try:
+        await connection.execute("UPDATE conversations SET isolated_mode = 1 WHERE id = ?", ("cnv_1",))
+        await connection.commit()
+        await _seed_messages(messages)
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(job_kind=CompactionJobKind.CONVERSATION_CHUNK.value).model_dump(mode="json"),
+        )
+
+        result = await worker.run_once()
+        rows = await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10)
+
+        assert result.acked == 1
+        assert result.failed == 0
+        assert len(rows) == 1
+        assert rows[0]["summary_text"] == "Isolated conversation summary."
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_compaction_worker_processes_workspace_rollup_job() -> None:
     connection, backend, _messages, summaries, _memories, worker = await _build_runtime(
         {
@@ -199,13 +256,53 @@ async def test_compaction_worker_processes_workspace_rollup_job() -> None:
         await backend.stream_add(COMPACT_STREAM_NAME, _compaction_job(job_kind="workspace_rollup").model_dump(mode="json"))
 
         result = await worker.run_once()
-        rows = await summaries.list_workspace_rollups("usr_1", "wrk_1", limit=10)
+        rows = await summaries.list_character_rollups("usr_1", "wrk_1", limit=10)
 
         assert result.acked == 1
         assert len(rows) == 1
         assert rows[0]["source_message_start_seq"] is None
         assert rows[0]["source_message_end_seq"] is None
         assert rows[0]["summary_text"] == "Workspace prefers narrow debugging patches."
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_worker_rechecks_current_preferences_before_broad_rollup() -> None:
+    connection, backend, _messages, summaries, _memories, worker = await _build_runtime({})
+    try:
+        clock = FrozenClock(datetime(2026, 4, 3, 14, 0, tzinfo=timezone.utc))
+        await UserRepository(connection, clock).update_memory_preferences(
+            "usr_1",
+            remember_across_chats=False,
+        )
+        await summaries.create_summary(
+            "usr_1",
+            {
+                "id": "sum_chunk_1",
+                "conversation_id": "cnv_1",
+                "workspace_id": "wrk_1",
+                "source_message_start_seq": 1,
+                "source_message_end_seq": 2,
+                "summary_kind": "conversation_chunk",
+                "summary_text": "Chunk summary.",
+                "source_object_ids_json": [],
+                "maya_score": 1.5,
+                "model": "classify-test-model",
+                "created_at": "2026-04-03T14:00:00+00:00",
+            },
+        )
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(job_kind=CompactionJobKind.WORKSPACE_ROLLUP.value).model_dump(mode="json"),
+        )
+
+        result = await worker.run_once()
+        rows = await summaries.list_character_rollups("usr_1", "wrk_1", limit=10)
+
+        assert result.acked == 1
+        assert result.failed == 0
+        assert rows == []
     finally:
         await connection.close()
 

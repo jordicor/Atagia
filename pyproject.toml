@@ -45,6 +45,7 @@ embeddings = [
 ]
 
 [project.scripts]
+atagia-api = "atagia.cli:main"
 atagia-mcp = "atagia.mcp_server:main"
 atagia-embeddings-backfill = "atagia.embedding_backfill_cli:main"
 
@@ -56,6 +57,13 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "atagia._vendor" = ["AI_JSON_CLEANROOM_LICENSE.txt"]
+"atagia.resources" = [
+  "migrations/*.sql",
+  "manifests/*.json",
+  "manifests/.gitkeep",
+  "operational_profiles/*.json",
+  "operational_profiles/README.md",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

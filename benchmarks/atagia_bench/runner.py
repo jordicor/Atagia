@@ -602,7 +602,8 @@ class AtagiaBenchRunner:
             ),
             "trusted_evaluation": trusted_evaluation,
             "trusted_activation_count": trusted_activation_count,
-            "assistant_mode_id": assistant_mode_id,
+            "mode": assistant_mode_id,
+            "retrieval_profile_id": assistant_mode_id,
             "retrieval_conversation_id": conversation_id,
             "evidence_turn_ids": list(question.evidence_turn_ids),
             "evidence_message_ids": evidence_message_ids,
@@ -861,7 +862,7 @@ class AtagiaBenchRunner:
         target_mode: str,
         persona_data: AtagiaBenchPersonaData,
     ) -> str:
-        """Find a conversation with the given assistant mode.
+        """Find a conversation with the given retrieval profile.
 
         Used for privacy boundary tests where the question must be asked
         from a specific mode context (e.g., asking from coding_debug to
@@ -878,7 +879,7 @@ class AtagiaBenchRunner:
         conversation_id: str,
         persona_data: AtagiaBenchPersonaData,
     ) -> str:
-        """Get the assistant_mode_id for a conversation."""
+        """Get the retrieval profile for a conversation."""
         for conv in persona_data.conversations:
             if conv.conversation_id == conversation_id:
                 return conv.assistant_mode_id

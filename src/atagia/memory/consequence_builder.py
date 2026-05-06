@@ -17,7 +17,7 @@ from atagia.core.consequence_repository import ConsequenceRepository
 from atagia.core.ids import generate_prefixed_id
 from atagia.core.llm_output_limits import CONSEQUENCE_BUILDER_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import MemoryObjectRepository
-from atagia.memory.policy_manifest import ResolvedPolicy
+from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.memory.retrieval_planner import build_safe_fts_queries
 from atagia.models.schemas_memory import (
     ConsequenceChainResult,
@@ -26,6 +26,7 @@ from atagia.models.schemas_memory import (
     ExtractionConversationContext,
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
 )
@@ -113,7 +114,7 @@ class ConsequenceChainBuilder:
         signal: ConsequenceSignal,
         user_id: str,
         conversation_context: ExtractionConversationContext,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
     ) -> ConsequenceChainResult | None:
         if not signal.is_consequence:
             return None
@@ -124,10 +125,29 @@ class ConsequenceChainBuilder:
                 signal=signal,
                 user_id=user_id,
                 conversation_context=conversation_context,
+                create_missing=False,
             )
             resolving_action = False
+            action_text = (
+                str(action_memory["canonical_text"])
+                if action_memory is not None
+                else signal.action_description
+            )
+            tendency_text = await self._infer_tendency_text(
+                action_text=action_text,
+                outcome_text=signal.outcome_description,
+                sentiment=signal.outcome_sentiment,
+                conversation_context=conversation_context,
+                resolved_policy=resolved_policy,
+            )
             if action_memory is None:
-                return None
+                resolving_action = True
+                action_memory = await self._create_inferred_action_memory(
+                    signal=signal,
+                    user_id=user_id,
+                    conversation_context=conversation_context,
+                )
+                resolving_action = False
             outcome_memory = await self._create_outcome_memory(
                 signal=signal,
                 user_id=user_id,
@@ -140,6 +160,7 @@ class ConsequenceChainBuilder:
                 user_id=user_id,
                 action_memory=action_memory,
                 outcome_memory=outcome_memory,
+                tendency_text=tendency_text,
                 conversation_context=conversation_context,
                 resolved_policy=resolved_policy,
             )
@@ -149,7 +170,9 @@ class ConsequenceChainBuilder:
                 {
                     "id": chain_id,
                     "user_id": user_id,
-                    "workspace_id": conversation_context.workspace_id,
+                    "workspace_id": None
+                    if conversation_context.temporary or conversation_context.isolated_mode
+                    else conversation_context.workspace_id,
                     "conversation_id": conversation_context.conversation_id,
                     "assistant_mode_id": conversation_context.assistant_mode_id,
                     "action_memory_id": str(action_memory["id"]),
@@ -210,6 +233,7 @@ class ConsequenceChainBuilder:
         signal: ConsequenceSignal,
         user_id: str,
         conversation_context: ExtractionConversationContext,
+        create_missing: bool = True,
     ) -> dict[str, Any] | None:
         if signal.likely_action_message_id:
             action_memory = await self._find_action_memory_by_message_id(
@@ -228,6 +252,9 @@ class ConsequenceChainBuilder:
         if action_memory is not None:
             return action_memory
 
+        if not create_missing:
+            return None
+
         return await self._create_inferred_action_memory(
             signal=signal,
             user_id=user_id,
@@ -241,6 +268,11 @@ class ConsequenceChainBuilder:
         message_id: str,
         conversation_context: ExtractionConversationContext,
     ) -> dict[str, Any] | None:
+        visibility_clauses, visibility_parameters = self._context_visibility_clauses(
+            conversation_context
+        )
+        if not visibility_clauses:
+            return None
         cursor = await self._connection.execute(
             """
             SELECT mo.*
@@ -248,6 +280,7 @@ class ConsequenceChainBuilder:
             WHERE mo.user_id = ?
               AND mo.status = ?
               AND mo.object_type IN (?, ?)
+              AND {visibility_clauses}
               AND EXISTS (
                   SELECT 1
                   FROM json_each(mo.payload_json, '$.source_message_ids')
@@ -262,12 +295,13 @@ class ConsequenceChainBuilder:
                 mo.updated_at DESC,
                 mo.id ASC
             LIMIT 1
-            """,
+            """.format(visibility_clauses=" AND ".join(visibility_clauses)),
             (
                 user_id,
                 MemoryStatus.ACTIVE.value,
                 MemoryObjectType.EVIDENCE.value,
                 MemoryObjectType.BELIEF.value,
+                *visibility_parameters,
                 message_id,
                 conversation_context.conversation_id,
                 conversation_context.workspace_id,
@@ -288,11 +322,9 @@ class ConsequenceChainBuilder:
         safe_queries = build_safe_fts_queries(action_description)
         if not safe_queries:
             return None
-        clauses = ["mo.conversation_id = ?"]
-        parameters: list[Any] = [conversation_context.conversation_id]
-        if conversation_context.workspace_id is not None:
-            clauses.append("mo.workspace_id = ?")
-            parameters.append(conversation_context.workspace_id)
+        clauses, parameters = self._context_visibility_clauses(conversation_context)
+        if not clauses:
+            return None
         for query in self._lookup_queries(safe_queries[0]):
             cursor = await self._connection.execute(
                 """
@@ -304,11 +336,11 @@ class ConsequenceChainBuilder:
                 WHERE mo.user_id = ?
                   AND mo.status = ?
                   AND mo.object_type IN (?, ?)
-                  AND ({scope_clauses})
+                  AND {scope_clauses}
                   AND memory_objects_fts MATCH ?
                 ORDER BY rank ASC, mo.updated_at DESC, mo.id ASC
                 LIMIT 1
-                """.format(scope_clauses=" OR ".join(clauses)),
+                """.format(scope_clauses=" AND ".join(clauses)),
                 (
                     user_id,
                     MemoryStatus.ACTIVE.value,
@@ -341,27 +373,21 @@ class ConsequenceChainBuilder:
         user_id: str,
         conversation_context: ExtractionConversationContext,
     ) -> dict[str, Any]:
-        scope = (
-            MemoryScope.WORKSPACE
-            if conversation_context.workspace_id is not None
-            else MemoryScope.CONVERSATION
-        )
+        scope = MemoryScope.CHAT
+        storage_scope = self._storage_scope(scope)
+        scope_ids = self._legacy_scope_ids(scope, conversation_context)
         source_message_ids = (
             [signal.likely_action_message_id]
             if signal.likely_action_message_id is not None
-            else []
+            else [conversation_context.source_message_id]
         )
         return await self._memory_repository.create_memory_object(
             user_id=user_id,
-            workspace_id=conversation_context.workspace_id if scope is MemoryScope.WORKSPACE else None,
-            conversation_id=(
-                conversation_context.conversation_id
-                if scope is MemoryScope.CONVERSATION
-                else None
-            ),
-            assistant_mode_id=conversation_context.assistant_mode_id,
+            workspace_id=scope_ids["workspace_id"],
+            conversation_id=scope_ids["conversation_id"],
+            assistant_mode_id=scope_ids["assistant_mode_id"],
             object_type=MemoryObjectType.EVIDENCE,
-            scope=scope,
+            scope=storage_scope,
             canonical_text=signal.action_description,
             source_kind=MemorySourceKind.INFERRED,
             confidence=max(0.0, min(1.0, signal.confidence)),
@@ -369,6 +395,10 @@ class ConsequenceChainBuilder:
             payload={
                 "source_message_ids": source_message_ids,
                 "inferred_from_consequence": True,
+                "source_turn_policy": self._source_turn_policy_snapshot(
+                    conversation_context,
+                    scope=scope,
+                ),
             },
             extraction_hash=self._compute_consequence_hash(
                 signal.action_description,
@@ -376,6 +406,14 @@ class ConsequenceChainBuilder:
                 MemoryObjectType.EVIDENCE.value,
                 signal.likely_action_message_id or conversation_context.conversation_id,
             ),
+            user_persona_id=conversation_context.user_persona_id,
+            platform_id=conversation_context.platform_id,
+            character_id=self._context_character_id(conversation_context),
+            sensitivity=MemorySensitivity.PUBLIC,
+            auto_expires=conversation_context.temporary or conversation_context.purge_on_close,
+            platform_locked=self._platform_locked(conversation_context),
+            platform_id_lock=self._platform_id_lock(conversation_context),
+            scope_canonical=scope.value,
             commit=False,
         )
 
@@ -386,16 +424,18 @@ class ConsequenceChainBuilder:
         user_id: str,
         action_memory: dict[str, Any],
         conversation_context: ExtractionConversationContext,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
     ) -> dict[str, Any]:
-        action_scope = MemoryScope(str(action_memory["scope"]))
+        action_scope = MemoryScope.CHAT
+        storage_scope = self._storage_scope(action_scope)
+        scope_ids = self._legacy_scope_ids(action_scope, conversation_context)
         return await self._memory_repository.create_memory_object(
             user_id=user_id,
-            workspace_id=action_memory.get("workspace_id"),
-            conversation_id=action_memory.get("conversation_id"),
+            workspace_id=scope_ids["workspace_id"],
+            conversation_id=scope_ids["conversation_id"],
             assistant_mode_id=action_memory.get("assistant_mode_id") or conversation_context.assistant_mode_id,
             object_type=MemoryObjectType.EVIDENCE,
-            scope=action_scope,
+            scope=storage_scope,
             canonical_text=signal.outcome_description,
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=signal.confidence,
@@ -404,6 +444,10 @@ class ConsequenceChainBuilder:
                 "source_message_ids": [conversation_context.source_message_id],
                 "consequence_action_memory_id": str(action_memory["id"]),
                 "outcome_sentiment": signal.outcome_sentiment.value,
+                "source_turn_policy": self._source_turn_policy_snapshot(
+                    conversation_context,
+                    scope=action_scope,
+                ),
             },
             extraction_hash=self._compute_consequence_hash(
                 signal.outcome_description,
@@ -411,6 +455,13 @@ class ConsequenceChainBuilder:
                 MemoryObjectType.EVIDENCE.value,
                 f"{conversation_context.source_message_id}:{action_memory['id']}",
             ),
+            user_persona_id=conversation_context.user_persona_id,
+            platform_id=conversation_context.platform_id,
+            character_id=self._context_character_id(conversation_context),
+            auto_expires=conversation_context.temporary or conversation_context.purge_on_close,
+            platform_locked=self._platform_locked(conversation_context),
+            platform_id_lock=self._platform_id_lock(conversation_context),
+            scope_canonical=action_scope.value,
             commit=False,
         )
 
@@ -421,37 +472,25 @@ class ConsequenceChainBuilder:
         user_id: str,
         action_memory: dict[str, Any],
         outcome_memory: dict[str, Any],
+        tendency_text: str,
         conversation_context: ExtractionConversationContext,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
     ) -> dict[str, Any] | None:
-        tendency_text = await self._infer_tendency_text(
-            action_text=str(action_memory["canonical_text"]),
-            outcome_text=str(outcome_memory["canonical_text"]),
-            sentiment=signal.outcome_sentiment,
-            conversation_context=conversation_context,
-            resolved_policy=resolved_policy,
-        )
         if not tendency_text:
             return None
-        tendency_scope = (
-            MemoryScope.WORKSPACE
-            if conversation_context.workspace_id is not None
-            else MemoryScope.CONVERSATION
-        )
+        tendency_scope = self._tendency_scope(conversation_context)
+        storage_scope = self._storage_scope(tendency_scope)
+        scope_ids = self._legacy_scope_ids(tendency_scope, conversation_context)
         source_message_ids = [conversation_context.source_message_id]
         if signal.likely_action_message_id is not None:
             source_message_ids.append(signal.likely_action_message_id)
         return await self._memory_repository.create_memory_object(
             user_id=user_id,
-            workspace_id=conversation_context.workspace_id if tendency_scope is MemoryScope.WORKSPACE else None,
-            conversation_id=(
-                conversation_context.conversation_id
-                if tendency_scope is MemoryScope.CONVERSATION
-                else None
-            ),
-            assistant_mode_id=conversation_context.assistant_mode_id,
+            workspace_id=scope_ids["workspace_id"],
+            conversation_id=scope_ids["conversation_id"],
+            assistant_mode_id=scope_ids["assistant_mode_id"],
             object_type=MemoryObjectType.CONSEQUENCE_CHAIN,
-            scope=tendency_scope,
+            scope=storage_scope,
             canonical_text=tendency_text,
             source_kind=MemorySourceKind.INFERRED,
             confidence=max(0.0, min(1.0, signal.confidence * 0.8)),
@@ -462,6 +501,10 @@ class ConsequenceChainBuilder:
                 "action_memory_id": str(action_memory["id"]),
                 "outcome_memory_id": str(outcome_memory["id"]),
                 "outcome_sentiment": signal.outcome_sentiment.value,
+                "source_turn_policy": self._source_turn_policy_snapshot(
+                    conversation_context,
+                    scope=tendency_scope,
+                ),
             },
             extraction_hash=self._compute_consequence_hash(
                 tendency_text,
@@ -469,6 +512,13 @@ class ConsequenceChainBuilder:
                 MemoryObjectType.CONSEQUENCE_CHAIN.value,
                 f"{conversation_context.source_message_id}:{action_memory['id']}:{outcome_memory['id']}",
             ),
+            user_persona_id=conversation_context.user_persona_id,
+            platform_id=conversation_context.platform_id,
+            character_id=self._context_character_id(conversation_context) if tendency_scope is not MemoryScope.USER else None,
+            auto_expires=conversation_context.temporary or conversation_context.purge_on_close,
+            platform_locked=self._platform_locked(conversation_context),
+            platform_id_lock=self._platform_id_lock(conversation_context),
+            scope_canonical=tendency_scope.value,
             commit=False,
         )
 
@@ -479,7 +529,7 @@ class ConsequenceChainBuilder:
         outcome_text: str,
         sentiment: ConsequenceSentiment,
         conversation_context: ExtractionConversationContext,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
     ) -> str:
         request = LLMCompletionRequest(
             model=self._tendency_model,
@@ -534,6 +584,111 @@ class ConsequenceChainBuilder:
 
     def _timestamp(self) -> str:
         return self._clock.now().isoformat()
+
+    @staticmethod
+    def _context_visibility_clauses(
+        conversation_context: ExtractionConversationContext,
+    ) -> tuple[list[str], list[Any]]:
+        return MemoryObjectRepository.namespace_visibility_clauses(
+            [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+            user_persona_id=conversation_context.user_persona_id,
+            platform_id=conversation_context.platform_id,
+            character_id=ConsequenceChainBuilder._context_character_id(conversation_context),
+            conversation_id=conversation_context.conversation_id,
+            remember_across_chats=conversation_context.remember_across_chats,
+            remember_across_devices=conversation_context.remember_across_devices,
+            incognito=conversation_context.incognito or conversation_context.isolated_mode,
+            table_alias="mo",
+        )
+
+    @staticmethod
+    def _tendency_scope(conversation_context: ExtractionConversationContext) -> MemoryScope:
+        if (
+            conversation_context.incognito
+            or conversation_context.isolated_mode
+            or not conversation_context.remember_across_chats
+            or conversation_context.temporary
+            or conversation_context.purge_on_close
+        ):
+            return MemoryScope.CHAT
+        if ConsequenceChainBuilder._context_character_id(conversation_context) is not None:
+            return MemoryScope.CHARACTER
+        return MemoryScope.USER
+
+    @staticmethod
+    def _storage_scope(scope: MemoryScope) -> MemoryScope:
+        if scope is MemoryScope.CHARACTER:
+            return MemoryScope.CHARACTER
+        if scope is MemoryScope.USER:
+            return MemoryScope.USER
+        return MemoryScope.CHAT
+
+    @staticmethod
+    def _legacy_scope_ids(
+        scope: MemoryScope,
+        conversation_context: ExtractionConversationContext,
+    ) -> dict[str, str | None]:
+        if scope is MemoryScope.CHAT:
+            return {
+                "assistant_mode_id": conversation_context.assistant_mode_id,
+                "workspace_id": conversation_context.workspace_id,
+                "conversation_id": conversation_context.conversation_id,
+            }
+        if scope is MemoryScope.CHARACTER:
+            return {
+                "assistant_mode_id": conversation_context.assistant_mode_id,
+                "workspace_id": conversation_context.workspace_id,
+                "conversation_id": None,
+            }
+        return {
+            "assistant_mode_id": None,
+            "workspace_id": None,
+            "conversation_id": None,
+        }
+
+    @staticmethod
+    def _context_character_id(conversation_context: ExtractionConversationContext) -> str | None:
+        return (
+            conversation_context.character_id
+            if conversation_context.character_id is not None
+            else conversation_context.workspace_id
+        )
+
+    @staticmethod
+    def _platform_locked(conversation_context: ExtractionConversationContext) -> bool:
+        return not conversation_context.remember_across_devices
+
+    @staticmethod
+    def _platform_id_lock(conversation_context: ExtractionConversationContext) -> str | None:
+        return (
+            conversation_context.platform_id
+            if not conversation_context.remember_across_devices
+            else None
+        )
+
+    @staticmethod
+    def _source_turn_policy_snapshot(
+        conversation_context: ExtractionConversationContext,
+        *,
+        scope: MemoryScope,
+    ) -> dict[str, Any]:
+        platform_locked = ConsequenceChainBuilder._platform_locked(conversation_context)
+        return {
+            "user_persona_id": conversation_context.user_persona_id,
+            "platform_id": conversation_context.platform_id,
+            "character_id": ConsequenceChainBuilder._context_character_id(conversation_context),
+            "conversation_id": conversation_context.conversation_id,
+            "mode": conversation_context.mode or conversation_context.assistant_mode_id,
+            "incognito": conversation_context.incognito or conversation_context.isolated_mode,
+            "remember_across_chats": conversation_context.remember_across_chats,
+            "remember_across_devices": conversation_context.remember_across_devices,
+            "temporary": conversation_context.temporary,
+            "purge_on_close": conversation_context.purge_on_close,
+            "intended_scope": scope.value,
+            "auto_expires": conversation_context.temporary or conversation_context.purge_on_close,
+            "platform_locked": platform_locked,
+            "platform_id_lock": conversation_context.platform_id if platform_locked else None,
+        }
 
     @staticmethod
     def _compute_consequence_hash(

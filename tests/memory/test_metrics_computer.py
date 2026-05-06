@@ -451,7 +451,7 @@ async def test_compute_ipr_counts_irrelevant_and_intrusive_feedback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compute_slr_combines_explicit_and_automatic_scope_issues() -> None:
+async def test_compute_slr_uses_explicit_scope_feedback_after_mode_softening() -> None:
     connection, clock, messages, memories, events, feedback, _beliefs, computer = await _build_runtime()
     try:
         await _create_memory_at(
@@ -508,7 +508,7 @@ async def test_compute_slr_combines_explicit_and_automatic_scope_issues() -> Non
 
         result = await computer.compute_slr("usr_1", "general_qa", "2026-03-31")
 
-        assert result.value == pytest.approx(2 / 3)
+        assert result.value == pytest.approx(1.0)
         assert result.sample_count == 3
     finally:
         await connection.close()

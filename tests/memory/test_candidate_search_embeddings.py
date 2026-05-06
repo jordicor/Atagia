@@ -12,7 +12,14 @@ from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository, WorkspaceRepository
 from atagia.memory.candidate_search import CandidateSearch
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus, RetrievalPlan
+from atagia.models.schemas_memory import (
+    MemoryObjectType,
+    MemoryScope,
+    MemorySensitivity,
+    MemorySourceKind,
+    MemoryStatus,
+    RetrievalPlan,
+)
 from atagia.services.embeddings import EmbeddingMatch
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
@@ -53,6 +60,7 @@ async def _build_runtime(matches: list[EmbeddingMatch]):
     await workspaces.create_workspace("wrk_3", "usr_1", "Secondary Workspace")
     await workspaces.create_workspace("wrk_2", "usr_2", "Other Workspace")
     await conversations.create_conversation("cnv_1", "usr_1", "wrk_1", "coding_debug", "User One")
+    await conversations.create_conversation("cnv_other", "usr_1", "wrk_1", "coding_debug", "User One Other")
     await conversations.create_conversation("cnv_2", "usr_2", "wrk_2", "coding_debug", "User Two")
     return connection, memories, search, embedding_index
 
@@ -70,6 +78,13 @@ async def _seed_memory(
     temporal_type: str = "unknown",
     valid_from: str | None = None,
     valid_to: str | None = None,
+    user_persona_id: str | None = None,
+    platform_id: str | None = None,
+    character_id: str | None = None,
+    sensitivity: MemorySensitivity | None = None,
+    platform_locked: bool = False,
+    platform_id_lock: str | None = None,
+    scope_canonical: str | None = None,
 ) -> None:
     await memories.create_memory_object(
         user_id=user_id,
@@ -87,6 +102,13 @@ async def _seed_memory(
         valid_from=valid_from,
         valid_to=valid_to,
         memory_id=memory_id,
+        user_persona_id=user_persona_id,
+        platform_id=platform_id,
+        character_id=character_id,
+        sensitivity=sensitivity,
+        platform_locked=platform_locked,
+        platform_id_lock=platform_id_lock,
+        scope_canonical=scope_canonical,
     )
 
 
@@ -101,6 +123,9 @@ def _plan(
         assistant_mode_id="coding_debug",
         workspace_id="wrk_1",
         conversation_id="cnv_1",
+        user_persona_id=None,
+        platform_id="default",
+        character_id="wrk_1",
         fts_queries=resolved_fts_queries,
         sub_query_plans=[
             {
@@ -149,6 +174,223 @@ async def test_search_by_embedding_returns_candidates_with_similarity_scores() -
         assert candidates[0]["id"] == "mem_1"
         assert candidates[0]["similarity_score"] == pytest.approx(0.88)
         assert candidates[0]["position_rank"] == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_search_by_embedding_applies_phase7_namespace_platform_and_sensitivity_filters() -> None:
+    matches = [
+        EmbeddingMatch(memory_id="mem_chat", score=0.99, position_rank=1),
+        EmbeddingMatch(memory_id="mem_character", score=0.98, position_rank=2),
+        EmbeddingMatch(memory_id="mem_user", score=0.97, position_rank=3),
+        EmbeddingMatch(memory_id="mem_other_chat", score=0.96, position_rank=4),
+        EmbeddingMatch(memory_id="mem_other_character", score=0.95, position_rank=5),
+        EmbeddingMatch(memory_id="mem_private", score=0.94, position_rank=6),
+        EmbeddingMatch(memory_id="mem_locked_other_platform", score=0.93, position_rank=7),
+    ]
+    connection, memories, search, embedding_index = await _build_runtime(matches)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_chat",
+            user_id="usr_1",
+            canonical_text="chat namespace memory",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_character",
+            user_id="usr_1",
+            canonical_text="character namespace memory",
+            scope=MemoryScope.WORKSPACE,
+            workspace_id="wrk_1",
+            conversation_id=None,
+            character_id="wrk_1",
+            scope_canonical=MemoryScope.CHARACTER.value,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_user",
+            user_id="usr_1",
+            canonical_text="user namespace memory",
+            scope=MemoryScope.GLOBAL_USER,
+            workspace_id=None,
+            conversation_id=None,
+            scope_canonical=MemoryScope.USER.value,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_other_chat",
+            user_id="usr_1",
+            canonical_text="wrong chat memory",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_other",
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_other_character",
+            user_id="usr_1",
+            canonical_text="wrong character memory",
+            scope=MemoryScope.WORKSPACE,
+            workspace_id="wrk_3",
+            conversation_id=None,
+            character_id="wrk_3",
+            scope_canonical=MemoryScope.CHARACTER.value,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_private",
+            user_id="usr_1",
+            canonical_text="private memory",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            sensitivity=MemorySensitivity.PRIVATE,
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_locked_other_platform",
+            user_id="usr_1",
+            canonical_text="locked other platform memory",
+            scope=MemoryScope.GLOBAL_USER,
+            workspace_id=None,
+            conversation_id=None,
+            platform_id="ios",
+            platform_locked=True,
+            platform_id_lock="ios",
+            scope_canonical=MemoryScope.USER.value,
+        )
+
+        candidates = await search.search_by_embedding(
+            query_text="namespace",
+            user_id="usr_1",
+            plan=_plan(vector_limit=10, max_candidates=10),
+            embedding_index=embedding_index,
+        )
+
+        assert [candidate["id"] for candidate in candidates] == [
+            "mem_chat",
+            "mem_character",
+            "mem_user",
+        ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_search_by_embedding_incognito_only_allows_active_chat() -> None:
+    connection, memories, search, embedding_index = await _build_runtime(
+        [
+            EmbeddingMatch(memory_id="mem_chat", score=0.99),
+            EmbeddingMatch(memory_id="mem_character", score=0.98),
+            EmbeddingMatch(memory_id="mem_user", score=0.97),
+        ]
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_chat",
+            user_id="usr_1",
+            canonical_text="chat memory",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_character",
+            user_id="usr_1",
+            canonical_text="character memory",
+            scope=MemoryScope.WORKSPACE,
+            workspace_id="wrk_1",
+            conversation_id=None,
+            character_id="wrk_1",
+            scope_canonical=MemoryScope.CHARACTER.value,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_user",
+            user_id="usr_1",
+            canonical_text="user memory",
+            scope=MemoryScope.GLOBAL_USER,
+            workspace_id=None,
+            conversation_id=None,
+            scope_canonical=MemoryScope.USER.value,
+        )
+        plan = _plan(vector_limit=10).model_copy(update={"incognito": True})
+
+        candidates = await search.search_by_embedding(
+            query_text="memory",
+            user_id="usr_1",
+            plan=plan,
+            embedding_index=embedding_index,
+        )
+
+        assert [candidate["id"] for candidate in candidates] == ["mem_chat"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fts_search_applies_phase7_namespace_filters_before_selection() -> None:
+    connection, memories, search, _embedding_index = await _build_runtime([])
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_chat",
+            user_id="usr_1",
+            canonical_text="namespace fts visible chat",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_character",
+            user_id="usr_1",
+            canonical_text="namespace fts visible character",
+            scope=MemoryScope.WORKSPACE,
+            workspace_id="wrk_1",
+            conversation_id=None,
+            character_id="wrk_1",
+            scope_canonical=MemoryScope.CHARACTER.value,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_legacy_workspace",
+            user_id="usr_1",
+            canonical_text="namespace fts legacy workspace",
+            scope=MemoryScope.WORKSPACE,
+            workspace_id="wrk_1",
+            conversation_id=None,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_private",
+            user_id="usr_1",
+            canonical_text="namespace fts private chat",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            sensitivity=MemorySensitivity.PRIVATE,
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+
+        candidates = await search.search(
+            _plan(vector_limit=0, fts_queries=["namespace fts"]),
+            "usr_1",
+        )
+
+        assert {candidate["id"] for candidate in candidates} == {"mem_chat", "mem_character"}
     finally:
         await connection.close()
 
@@ -337,7 +579,7 @@ async def test_search_by_embedding_overfetches_and_demotes_stale_ephemeral_hits(
         )
 
         assert [candidate["id"] for candidate in candidates] == ["mem_current"]
-        assert embedding_index.calls == [("retry loop", "usr_1", 2)]
+        assert embedding_index.calls == [("retry loop", "usr_1", 4)]
     finally:
         await connection.close()
 

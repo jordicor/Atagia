@@ -15,7 +15,7 @@ from atagia.memory.policy_manifest import (
     PolicyResolver,
     compute_effective_policy_hash,
 )
-from atagia.models.schemas_memory import AssistantModeId
+from atagia.models.schemas_memory import RetrievalProfileId
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -180,7 +180,7 @@ async def test_low_staleness_same_topic_continuation_stays_cacheable() -> None:
     assert provider.requests[0].metadata["purpose"] == "context_cache_signal_detection"
     assert html.escape("Let's fix the failing login test") in provider.requests[0].messages[1].content
     assert html.escape("Continue with the login test") in provider.requests[0].messages[1].content
-    assert AssistantModeId.CODING_DEBUG.value in provider.requests[0].messages[1].content
+    assert RetrievalProfileId.CODING_DEBUG.value in provider.requests[0].messages[1].content
 
 
 @pytest.mark.asyncio

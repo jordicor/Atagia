@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from atagia.core.ids import generate_prefixed_id
-from atagia.core.repositories import BaseRepository, _encode_json
-from atagia.models.schemas_memory import IntimacyBoundary
+from atagia.core.repositories import BaseRepository, _derive_sensitivity_from_privacy, _encode_json
+from atagia.models.schemas_memory import IntimacyBoundary, MemoryCategory, MemorySensitivity
 
 _TOPIC_SOURCE_REF_LIMIT = 8
 _DEFAULT_REFRESH_MESSAGE_THRESHOLD = 4
@@ -40,11 +40,23 @@ class TopicRepository(BaseRepository):
         privacy_level: int = 0,
         intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
         intimacy_boundary_confidence: float = 0.0,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        sensitivity: MemorySensitivity | None = None,
+        themes: list[str] | None = None,
+        platform_locked: bool = False,
+        platform_id_lock: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_topic_id = topic_id or generate_prefixed_id("tpc")
         timestamp = self._timestamp()
         touched_at = last_touched_at or timestamp
+        resolved_sensitivity = sensitivity or _derive_sensitivity_from_privacy(
+            privacy_level,
+            intimacy_boundary,
+            MemoryCategory.UNKNOWN,
+        )
         await self._connection.execute(
             """
             INSERT INTO conversation_topics(
@@ -67,10 +79,17 @@ class TopicRepository(BaseRepository):
                 privacy_level,
                 intimacy_boundary,
                 intimacy_boundary_confidence,
+                user_persona_id,
+                platform_id,
+                character_id,
+                sensitivity,
+                themes_json,
+                platform_locked,
+                platform_id_lock,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 resolved_topic_id,
@@ -92,6 +111,13 @@ class TopicRepository(BaseRepository):
                 privacy_level,
                 intimacy_boundary.value,
                 float(intimacy_boundary_confidence),
+                user_persona_id,
+                platform_id,
+                character_id,
+                resolved_sensitivity.value,
+                _encode_json(list(themes or [])),
+                int(platform_locked),
+                platform_id_lock,
                 timestamp,
                 timestamp,
             ),
@@ -636,6 +662,10 @@ def _compact_topic(topic: dict[str, Any]) -> dict[str, Any]:
         "last_touched_at": topic.get("last_touched_at"),
         "confidence": topic.get("confidence"),
         "privacy_level": topic.get("privacy_level"),
+        "sensitivity": topic.get("sensitivity") or MemorySensitivity.UNKNOWN.value,
+        "themes": topic.get("themes_json") or [],
+        "platform_locked": int(topic.get("platform_locked") or 0),
+        "platform_id_lock": topic.get("platform_id_lock"),
         "intimacy_boundary": topic.get("intimacy_boundary") or IntimacyBoundary.ORDINARY.value,
         "intimacy_boundary_confidence": topic.get("intimacy_boundary_confidence") or 0.0,
     }

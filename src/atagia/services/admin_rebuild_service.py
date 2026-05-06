@@ -11,19 +11,26 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
-from atagia.core.repositories import ConversationRepository, MessageRepository, summary_mirror_id
+from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository, summary_mirror_id
 from atagia.core.storage_backend import InProcessBackend, StorageBackend
 from atagia.core.timestamps import resolve_message_occurred_at
 from atagia.memory.policy_manifest import ManifestLoader
+from atagia.services.chat_support import recent_context
 from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
     CompactionJobKind,
     CompactionJobPayload,
+    GRAPH_STREAM_NAME,
     JobEnvelope,
     JobType,
     MessageJobPayload,
     REVISE_STREAM_NAME,
     WORKER_GROUP_NAME,
+)
+from atagia.models.schemas_memory import (
+    ConfirmationStrategy,
+    IngestOrigin,
+    SummaryViewKind,
 )
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
 from atagia.services.llm_client import (
@@ -35,11 +42,13 @@ from atagia.services.llm_client import (
 )
 from atagia.workers.compaction_worker import CompactionWorker
 from atagia.workers.contract_worker import ContractWorker
+from atagia.workers.graph_sync_worker import GraphSyncWorker
 from atagia.workers.ingest_worker import IngestWorker
 from atagia.workers.revision_worker import RevisionWorker
 
 logger = logging.getLogger(__name__)
 RECENT_CONTEXT_MESSAGES = 6
+REBUILD_MESSAGE_PAGE_SIZE = 5000
 REBUILD_STATUS_REBUILT = "rebuilt"
 REBUILD_STATUS_REBUILT_PARTIAL = "rebuilt_partial"
 
@@ -58,12 +67,14 @@ class RebuildResult(BaseModel):
     contract_jobs_processed: int = 0
     revision_jobs_processed: int = 0
     conversation_compaction_jobs_processed: int = 0
+    graph_jobs_processed: int = 0
     episode_compaction_jobs_processed: int = 0
     thematic_profile_jobs_processed: int = 0
     workspace_rollup_jobs_processed: int = 0
     recoverable_job_failures: int = 0
     recoverable_extract_job_failures: int = 0
     recoverable_contract_job_failures: int = 0
+    recoverable_graph_job_failures: int = 0
     recoverable_revision_job_failures: int = 0
     recoverable_compaction_job_failures: int = 0
 
@@ -170,6 +181,18 @@ class AdminRebuildService:
                 manifest_loader=self._manifest_loader,
                 settings=self._settings,
             )
+            graph_worker = (
+                GraphSyncWorker(
+                    storage_backend=rebuild_backend,
+                    connection=self._connection,
+                    llm_client=self._llm_client,
+                    clock=self._clock,
+                    manifest_loader=self._manifest_loader,
+                    settings=self._settings,
+                )
+                if self._settings.graph_projection_enabled
+                else None
+            )
             revision_worker = RevisionWorker(
                 storage_backend=rebuild_backend,
                 connection=self._connection,
@@ -191,66 +214,96 @@ class AdminRebuildService:
                 )
             )
             conversations_with_messages: list[dict[str, Any]] = []
+            users = UserRepository(self._connection, self._clock)
 
             for conversation in conversations:
-                messages = await self._message_repository.get_messages(
-                    str(conversation["id"]),
-                    str(conversation["user_id"]),
-                    limit=5000,
-                    offset=0,
-                )
-                if messages:
-                    conversations_with_messages.append(conversation)
-                for index, message in enumerate(messages):
-                    message_role = str(message["role"])
-                    recent_messages = [
-                        {
-                            "role": str(item["role"]),
-                            "content": str(item["text"]),
-                        }
-                        for item in messages[max(0, index - RECENT_CONTEXT_MESSAGES) : index]
-                    ]
-                    payload = MessageJobPayload(
-                        message_id=str(message["id"]),
-                        message_text=str(message["text"]),
-                        message_occurred_at=resolve_message_occurred_at(message),
-                        role=message_role,
-                        assistant_mode_id=str(conversation["assistant_mode_id"]),
-                        workspace_id=(
-                            str(conversation["workspace_id"])
-                            if conversation.get("workspace_id") is not None
-                            else None
-                        ),
-                        recent_messages=recent_messages,
+                memory_preferences = await users.get_memory_preferences(str(conversation["user_id"]))
+                conversation_had_messages = False
+                recent_message_window: list[dict[str, Any]] = []
+                offset = 0
+                while True:
+                    messages = await self._message_repository.get_messages(
+                        str(conversation["id"]),
+                        str(conversation["user_id"]),
+                        limit=REBUILD_MESSAGE_PAGE_SIZE,
+                        offset=offset,
                     )
-                    extract_processed, _ = await self._process_rebuild_job(
-                        result=result,
-                        stage="extract",
-                        handler=ingest_worker.process_job,
-                        payload=self._message_job(
-                            user_id=str(conversation["user_id"]),
-                            conversation_id=str(conversation["id"]),
-                            payload=payload,
-                            job_type=JobType.EXTRACT_MEMORY_CANDIDATES,
-                        ),
-                    )
-                    result.processed_messages += 1
-                    if extract_processed:
-                        result.extract_jobs_processed += 1
-                    if message_role == "user":
-                        contract_processed, _ = await self._process_rebuild_job(
+                    if not messages:
+                        break
+                    if not conversation_had_messages:
+                        conversations_with_messages.append(conversation)
+                        conversation_had_messages = True
+                    for message in messages:
+                        message_role = str(message["role"])
+                        payload = MessageJobPayload(
+                            message_id=str(message["id"]),
+                            message_text=str(message["text"]),
+                            message_occurred_at=resolve_message_occurred_at(message),
+                            role=message_role,
+                            assistant_mode_id=str(conversation["assistant_mode_id"]),
+                            workspace_id=(
+                                str(conversation["workspace_id"])
+                                if conversation.get("workspace_id") is not None
+                                else None
+                            ),
+                            user_persona_id=conversation.get("user_persona_id"),
+                            platform_id=str(conversation.get("platform_id") or "default"),
+                            character_id=(
+                                str(conversation["character_id"])
+                                if conversation.get("character_id") is not None
+                                else (
+                                    str(conversation["workspace_id"])
+                                    if conversation.get("workspace_id") is not None
+                                    else None
+                                )
+                            ),
+                            mode=str(conversation.get("mode") or conversation["assistant_mode_id"]),
+                            incognito=bool(conversation.get("incognito")) or bool(conversation.get("isolated_mode")),
+                            remember_across_chats=bool(memory_preferences["remember_across_chats"]),
+                            remember_across_devices=bool(memory_preferences["remember_across_devices"]),
+                            memory_privacy_mode=memory_preferences["memory_privacy_mode"],
+                            recent_messages=[
+                                item.model_dump(mode="json")
+                                for item in recent_context(recent_message_window)
+                            ],
+                            temporary=bool(conversation.get("temporary")),
+                            temporary_ttl_seconds=conversation.get("temporary_ttl_seconds"),
+                            purge_on_close=bool(conversation.get("purge_on_close")),
+                            isolated_mode=bool(conversation.get("isolated_mode")),
+                            ingest_origin=IngestOrigin.ADMIN_IMPORT,
+                            confirmation_strategy=ConfirmationStrategy.ADMIN_REVIEW_ONLY,
+                        )
+                        extract_processed, _ = await self._process_rebuild_job(
                             result=result,
-                            stage="contract",
-                            handler=contract_worker.process_job,
+                            stage="extract",
+                            handler=ingest_worker.process_job,
                             payload=self._message_job(
                                 user_id=str(conversation["user_id"]),
                                 conversation_id=str(conversation["id"]),
                                 payload=payload,
-                                job_type=JobType.PROJECT_CONTRACT,
+                                job_type=JobType.EXTRACT_MEMORY_CANDIDATES,
                             ),
                         )
-                        if contract_processed:
-                            result.contract_jobs_processed += 1
+                        result.processed_messages += 1
+                        if extract_processed:
+                            result.extract_jobs_processed += 1
+                        if message_role == "user":
+                            contract_processed, _ = await self._process_rebuild_job(
+                                result=result,
+                                stage="contract",
+                                handler=contract_worker.process_job,
+                                payload=self._message_job(
+                                    user_id=str(conversation["user_id"]),
+                                    conversation_id=str(conversation["id"]),
+                                    payload=payload,
+                                    job_type=JobType.PROJECT_CONTRACT,
+                                ),
+                            )
+                            if contract_processed:
+                                result.contract_jobs_processed += 1
+                        recent_message_window.append(message)
+                        recent_message_window = recent_message_window[-RECENT_CONTEXT_MESSAGES:]
+                    offset += len(messages)
 
             revision_results = await self._drain_stream(
                 rebuild_backend,
@@ -261,6 +314,16 @@ class AdminRebuildService:
             )
             result.revision_jobs_processed += len(revision_results)
 
+            if graph_worker is not None:
+                graph_results = await self._drain_stream(
+                    rebuild_backend,
+                    GRAPH_STREAM_NAME,
+                    graph_worker.process_job,
+                    result=result,
+                    stage="graph",
+                )
+                result.graph_jobs_processed += len(graph_results)
+
             if compaction_worker is not None:
                 for conversation in conversations_with_messages:
                     compaction_processed, compaction_result = await self._process_rebuild_job(
@@ -268,13 +331,8 @@ class AdminRebuildService:
                         stage="compaction",
                         handler=compaction_worker.process_job,
                         payload=self._conversation_chunk_job(
-                            user_id=str(conversation["user_id"]),
-                            conversation_id=str(conversation["id"]),
-                            workspace_id=(
-                                str(conversation["workspace_id"])
-                                if conversation.get("workspace_id") is not None
-                                else None
-                            ),
+                            conversation=conversation,
+                            memory_preferences=memory_preferences,
                         ),
                     )
                     if compaction_processed:
@@ -290,14 +348,15 @@ class AdminRebuildService:
                 for item in compaction_results:
                     self._record_compaction_result(result, item)
 
-                for workspace_id in result.workspace_ids:
+                for target in self._character_rollup_targets(conversations, result.workspace_ids):
                     rollup_processed, _ = await self._process_rebuild_job(
                         result=result,
                         stage="compaction",
                         handler=compaction_worker.process_job,
-                        payload=self._workspace_rollup_job(
+                        payload=self._character_rollup_job(
                             user_id=result.user_id,
-                            workspace_id=workspace_id,
+                            character_id=target["character_id"],
+                            workspace_id=target["workspace_id"],
                         ),
                     )
                     if rollup_processed:
@@ -330,35 +389,99 @@ class AdminRebuildService:
 
     @staticmethod
     def _workspace_rollup_job(*, user_id: str, workspace_id: str) -> dict[str, Any]:
+        return AdminRebuildService._character_rollup_job(
+            user_id=user_id,
+            character_id=workspace_id,
+            workspace_id=workspace_id,
+        )
+
+    @staticmethod
+    def _character_rollup_job(
+        *,
+        user_id: str,
+        character_id: str,
+        workspace_id: str | None = None,
+    ) -> dict[str, Any]:
+        suffix = f"{workspace_id}_{character_id}" if workspace_id is not None else character_id
         return JobEnvelope(
-            job_id=f"job_rebuild_workspace_{workspace_id}",
+            job_id=f"job_rebuild_character_{suffix}",
             job_type=JobType.COMPACT_SUMMARIES,
             user_id=user_id,
             payload=CompactionJobPayload(
                 user_id=user_id,
                 workspace_id=workspace_id,
                 conversation_id=None,
+                character_id=character_id,
                 job_kind=CompactionJobKind.WORKSPACE_ROLLUP,
             ).model_dump(mode="json"),
             created_at=None,
         ).model_dump(mode="json")
 
     @staticmethod
+    def _character_rollup_targets(
+        conversations: list[dict[str, Any]],
+        workspace_ids: list[str],
+    ) -> list[dict[str, str | None]]:
+        targets: dict[tuple[str, str | None], dict[str, str | None]] = {}
+        for workspace_id in workspace_ids:
+            targets[(workspace_id, workspace_id)] = {
+                "character_id": workspace_id,
+                "workspace_id": workspace_id,
+            }
+        for conversation in conversations:
+            workspace_id = (
+                str(conversation["workspace_id"])
+                if conversation.get("workspace_id") is not None
+                else None
+            )
+            character_id = (
+                str(conversation["character_id"])
+                if conversation.get("character_id") is not None
+                else workspace_id
+            )
+            if character_id is None:
+                continue
+            targets[(character_id, workspace_id)] = {
+                "character_id": character_id,
+                "workspace_id": workspace_id,
+            }
+        return list(targets.values())
+
+    @staticmethod
     def _conversation_chunk_job(
         *,
-        user_id: str,
-        conversation_id: str,
-        workspace_id: str | None,
+        conversation: dict[str, Any],
+        memory_preferences: dict[str, Any],
     ) -> dict[str, Any]:
+        workspace_id = (
+            str(conversation["workspace_id"])
+            if conversation.get("workspace_id") is not None
+            else None
+        )
+        character_id = (
+            str(conversation["character_id"])
+            if conversation.get("character_id") is not None
+            else workspace_id
+        )
         return JobEnvelope(
-            job_id=f"job_rebuild_chunk_{conversation_id}",
+            job_id=f"job_rebuild_chunk_{conversation['id']}",
             job_type=JobType.COMPACT_SUMMARIES,
-            user_id=user_id,
-            conversation_id=conversation_id,
+            user_id=str(conversation["user_id"]),
+            conversation_id=str(conversation["id"]),
             payload=CompactionJobPayload(
-                user_id=user_id,
+                user_id=str(conversation["user_id"]),
                 workspace_id=workspace_id,
-                conversation_id=conversation_id,
+                conversation_id=str(conversation["id"]),
+                user_persona_id=conversation.get("user_persona_id"),
+                platform_id=str(conversation.get("platform_id") or "default"),
+                character_id=character_id,
+                mode=str(conversation.get("mode") or conversation["assistant_mode_id"]),
+                incognito=bool(conversation.get("incognito")) or bool(conversation.get("isolated_mode")),
+                remember_across_chats=bool(memory_preferences["remember_across_chats"]),
+                remember_across_devices=bool(memory_preferences["remember_across_devices"]),
+                temporary=bool(conversation.get("temporary")),
+                temporary_ttl_seconds=conversation.get("temporary_ttl_seconds"),
+                purge_on_close=bool(conversation.get("purge_on_close")),
                 job_kind=CompactionJobKind.CONVERSATION_CHUNK,
             ).model_dump(mode="json"),
             created_at=None,
@@ -413,6 +536,8 @@ class AdminRebuildService:
             result.recoverable_extract_job_failures += 1
         elif stage == "contract":
             result.recoverable_contract_job_failures += 1
+        elif stage == "graph":
+            result.recoverable_graph_job_failures += 1
         elif stage == "revision":
             result.recoverable_revision_job_failures += 1
         elif stage == "compaction":
@@ -468,6 +593,31 @@ class AdminRebuildService:
                 """,
                 (user_id, conversation_id),
             )
+            await self._connection.execute(
+                """
+                DELETE FROM graph_relationship_sources
+                WHERE user_id = ?
+                  AND conversation_id = ?
+                """,
+                (user_id, conversation_id),
+            )
+            await self._connection.execute(
+                """
+                DELETE FROM graph_entity_mentions
+                WHERE user_id = ?
+                  AND conversation_id = ?
+                """,
+                (user_id, conversation_id),
+            )
+            await self._connection.execute(
+                """
+                DELETE FROM graph_projection_runs
+                WHERE user_id = ?
+                  AND conversation_id = ?
+                """,
+                (user_id, conversation_id),
+            )
+            await self._delete_orphan_graph_rows(user_id)
             if summary_ids:
                 placeholders = ", ".join("?" for _ in summary_ids)
                 await self._connection.execute(
@@ -496,6 +646,15 @@ class AdminRebuildService:
                 """,
                 (user_id,),
             )
+            for statement in (
+                "DELETE FROM graph_relationship_sources WHERE user_id = ?",
+                "DELETE FROM graph_relationships WHERE user_id = ?",
+                "DELETE FROM graph_entity_aliases WHERE user_id = ?",
+                "DELETE FROM graph_entity_mentions WHERE user_id = ?",
+                "DELETE FROM graph_projection_runs WHERE user_id = ?",
+                "DELETE FROM graph_entities WHERE user_id = ?",
+            ):
+                await self._connection.execute(statement, (user_id,))
             await self._connection.execute(
                 """
                 DELETE FROM summary_views
@@ -531,6 +690,43 @@ class AdminRebuildService:
                 await self._embedding_index.delete(memory_id)
             except Exception:
                 logger.warning("Embedding cleanup failed for memory_id=%s", memory_id, exc_info=True)
+
+    async def _delete_orphan_graph_rows(self, user_id: str) -> None:
+        await self._connection.execute(
+            """
+            DELETE FROM graph_relationships
+            WHERE user_id = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM graph_relationship_sources AS grs
+                  WHERE grs.user_id = graph_relationships.user_id
+                    AND grs.relationship_id = graph_relationships.id
+              )
+            """,
+            (user_id,),
+        )
+        await self._connection.execute(
+            """
+            DELETE FROM graph_entities
+            WHERE user_id = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM graph_entity_mentions AS gem
+                  WHERE gem.user_id = graph_entities.user_id
+                    AND gem.entity_id = graph_entities.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM graph_relationships AS gr
+                  WHERE gr.user_id = graph_entities.user_id
+                    AND (
+                        gr.source_entity_id = graph_entities.id
+                        OR gr.target_entity_id = graph_entities.id
+                    )
+              )
+            """,
+            (user_id,),
+        )
 
     async def _memory_ids_for_conversation(self, user_id: str, conversation_id: str) -> list[str]:
         cursor = await self._connection.execute(
@@ -569,11 +765,19 @@ class AdminRebuildService:
             """
             SELECT sv.id
             FROM summary_views AS sv
-            LEFT JOIN conversations AS c ON c.id = ?
+            JOIN conversations AS c
+              ON c.id = ?
+             AND c.user_id = ?
             WHERE sv.user_id = ?
               AND (
                   sv.conversation_id = ?
                   OR (c.workspace_id IS NOT NULL AND sv.workspace_id = c.workspace_id AND sv.summary_kind = ?)
+                  OR (
+                      COALESCE(c.character_id, c.workspace_id) IS NOT NULL
+                      AND sv.character_id = COALESCE(c.character_id, c.workspace_id)
+                      AND sv.user_persona_id IS c.user_persona_id
+                      AND sv.summary_kind = ?
+                  )
                   OR sv.summary_kind IN (?, ?)
               )
             ORDER BY sv.id ASC
@@ -581,10 +785,12 @@ class AdminRebuildService:
             (
                 conversation_id,
                 user_id,
+                user_id,
                 conversation_id,
-                CompactionJobKind.WORKSPACE_ROLLUP.value,
-                CompactionJobKind.EPISODE.value,
-                CompactionJobKind.THEMATIC_PROFILE.value,
+                SummaryViewKind.WORKSPACE_ROLLUP.value,
+                SummaryViewKind.CHARACTER_ROLLUP.value,
+                SummaryViewKind.EPISODE.value,
+                SummaryViewKind.THEMATIC_PROFILE.value,
             ),
         )
         rows = await cursor.fetchall()

@@ -294,6 +294,8 @@ async def _summary_surface_hits(
                     "hierarchy_level": int(payload.get("hierarchy_level", 0)),
                     "conversation_id": payload.get("conversation_id"),
                     "workspace_id": payload.get("workspace_id"),
+                    "character_id": payload.get("character_id"),
+                    "scope_canonical": payload.get("scope_canonical"),
                     "created_at": str(payload.get("created_at", "")),
                     "summary_text": str(payload.get("summary_text", "")),
                     "source_object_ids": json.loads(payload.get("source_object_ids_json", "[]")),
@@ -403,7 +405,13 @@ async def _run(args: argparse.Namespace) -> Path:
                 raise ValueError(
                     f"Conversation {args.conversation_id} was not found for user {args.user_id}"
                 )
-            assistant_mode_id = str(conversation_row["assistant_mode_id"])
+            retrieval_profile_id = str(
+                conversation_row["mode"]
+                or conversation_row["assistant_mode_id"]
+            )
+            platform_id = conversation_row["platform_id"]
+            user_persona_id = conversation_row["user_persona_id"]
+            character_id = conversation_row["character_id"]
             summary_hits = await _summary_surface_hits(
                 connection,
                 user_id=args.user_id,
@@ -418,7 +426,7 @@ async def _run(args: argparse.Namespace) -> Path:
             user_id=args.user_id,
             conversation_id=args.conversation_id,
             message_text=question_text,
-            mode=assistant_mode_id,
+            mode=retrieval_profile_id,
             ablation=ablation,
         )
 
@@ -428,7 +436,7 @@ async def _run(args: argparse.Namespace) -> Path:
             try:
                 answer = await _generate_answer(
                     runtime=runtime,
-                    assistant_mode_id=assistant_mode_id,
+                    assistant_mode_id=retrieval_profile_id,
                     pipeline_result=pipeline_result,
                     question_text=question_text,
                     model_override=_qualified_model(args.provider, _answer_model(args)),
@@ -446,6 +454,11 @@ async def _run(args: argparse.Namespace) -> Path:
         "evidence_turn_ids": evidence_turn_ids,
         "db_path": str(Path(args.db_path).expanduser()),
         "user_id": args.user_id,
+        "platform_id": platform_id,
+        "user_persona_id": user_persona_id,
+        "character_id": character_id,
+        "mode": retrieval_profile_id,
+        "retrieval_profile_id": retrieval_profile_id,
         "embedding_backend": args.embedding_backend,
         "embedding_model": args.embedding_model,
         "provider": args.provider,

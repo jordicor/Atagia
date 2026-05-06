@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
+from atagia.core.repositories import ConversationRepository, MemoryObjectRepository
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
 from atagia.memory.intimacy_boundary_policy import (
     constrained_scope_for_intimacy_boundary,
@@ -16,6 +16,7 @@ from atagia.memory.intimacy_boundary_policy import (
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
     MemoryScope,
+    MemorySensitivity,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
@@ -48,6 +49,12 @@ class VerbatimPinService:
         workspace_id: str | None = None,
         conversation_id: str | None = None,
         assistant_mode_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool | None = None,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
         canonical_text: str | None = None,
         index_text: str | None = None,
         target_span_start: int | None = None,
@@ -64,15 +71,31 @@ class VerbatimPinService:
         if resolved_target_id is None:
             raise ValueError("target_id must be provided")
 
+        namespace_payload = self._payload_with_namespace(
+            payload_json,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+        )
         source_row = await self._load_source_row(
             connection,
             user_id=user_id,
             target_kind=target_kind,
             target_id=resolved_target_id,
+            conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
         )
         resolved_intimacy_boundary = self._resolve_intimacy_boundary(
             explicit_boundary=intimacy_boundary,
-            payload_json=payload_json,
+            payload_json=namespace_payload,
             source_row=source_row,
         )
         if is_blocked_intimacy_boundary(resolved_intimacy_boundary):
@@ -80,7 +103,7 @@ class VerbatimPinService:
         resolved_intimacy_boundary_confidence = self._resolve_intimacy_boundary_confidence(
             explicit_confidence=intimacy_boundary_confidence,
             resolved_boundary=resolved_intimacy_boundary,
-            payload_json=payload_json,
+            payload_json=namespace_payload,
             source_row=source_row,
         )
         scope = constrained_scope_for_intimacy_boundary(
@@ -96,10 +119,16 @@ class VerbatimPinService:
             user_id=user_id,
             scope=scope,
             source_row=source_row,
-            payload_json=payload_json,
+            payload_json=namespace_payload,
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             assistant_mode_id=assistant_mode_id,
+        )
+        source_namespace = self._source_namespace_snapshot(
+            source_row=source_row,
+            payload_json=namespace_payload,
+            scope_anchors=scope_anchors,
+            scope=scope,
         )
         source_text = self._source_text_for_kind(source_row, target_kind)
 
@@ -129,7 +158,7 @@ class VerbatimPinService:
             span_end = target_span_end
 
         resolved_created_by = _normalize_text(created_by) or user_id
-        resolved_payload = dict(payload_json or {})
+        resolved_payload = dict(namespace_payload)
         resolved_payload.setdefault("source_target_kind", target_kind.value)
         resolved_payload.setdefault("source_target_id", resolved_target_id)
         resolved_payload["intimacy_boundary"] = resolved_intimacy_boundary.value
@@ -179,6 +208,22 @@ class VerbatimPinService:
                 target_span_end=span_end,
                 expires_at=expires_at,
                 payload_json=resolved_payload,
+                user_persona_id=source_namespace["user_persona_id"],
+                platform_id=source_namespace["platform_id"],
+                character_id=source_namespace["character_id"],
+                sensitivity=source_namespace["sensitivity"],
+                themes=source_namespace["themes"],
+                platform_locked=bool(source_namespace["platform_locked"]),
+                platform_id_lock=source_namespace["platform_id_lock"],
+                scope_canonical=source_namespace["scope_canonical"],
+                incognito_snapshot=bool(source_namespace["incognito_snapshot"]),
+                remember_across_chats_snapshot=bool(
+                    source_namespace["remember_across_chats_snapshot"]
+                ),
+                remember_across_devices_snapshot=bool(
+                    source_namespace["remember_across_devices_snapshot"]
+                ),
+                policy_snapshot=source_namespace["policy_snapshot"],
                 commit=False,
             )
             await connection.commit()
@@ -193,8 +238,25 @@ class VerbatimPinService:
         *,
         user_id: str,
         pin_id: str,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> dict[str, Any] | None:
-        return await VerbatimPinRepository(connection, self.runtime.clock).get_verbatim_pin(pin_id, user_id)
+        return await VerbatimPinRepository(connection, self.runtime.clock).get_verbatim_pin(
+            pin_id,
+            user_id,
+            conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+        )
 
     async def list_verbatim_pins(
         self,
@@ -210,6 +272,13 @@ class VerbatimPinService:
         include_deleted: bool = False,
         active_only: bool = False,
         as_of: str | None = None,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> list[dict[str, Any]]:
         return await VerbatimPinRepository(connection, self.runtime.clock).list_verbatim_pins(
             user_id,
@@ -222,6 +291,13 @@ class VerbatimPinService:
             include_deleted=include_deleted,
             active_only=active_only,
             as_of=as_of,
+            conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
         )
 
     async def update_verbatim_pin(
@@ -241,6 +317,13 @@ class VerbatimPinService:
         reason: str | None = None,
         expires_at: str | None = None,
         payload_json: dict[str, Any] | None = None,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> dict[str, Any] | None:
         repository = VerbatimPinRepository(connection, self.runtime.clock)
         await connection.execute("BEGIN")
@@ -259,6 +342,13 @@ class VerbatimPinService:
                 reason=reason,
                 expires_at=expires_at,
                 payload_json=payload_json,
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
                 commit=False,
             )
             await connection.commit()
@@ -273,11 +363,29 @@ class VerbatimPinService:
         *,
         user_id: str,
         pin_id: str,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> dict[str, Any] | None:
         repository = VerbatimPinRepository(connection, self.runtime.clock)
         await connection.execute("BEGIN")
         try:
-            deleted = await repository.delete_verbatim_pin(pin_id, user_id, commit=False)
+            deleted = await repository.delete_verbatim_pin(
+                pin_id,
+                user_id,
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                commit=False,
+            )
             await connection.commit()
         except Exception:
             await connection.rollback()
@@ -298,6 +406,12 @@ class VerbatimPinService:
         limit: int,
         allow_intimacy_context: bool = False,
         as_of: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> list[dict[str, Any]]:
         return await VerbatimPinRepository(connection, self.runtime.clock).search_active_verbatim_pins(
             user_id=user_id,
@@ -310,6 +424,12 @@ class VerbatimPinService:
             limit=limit,
             allow_intimacy_context=allow_intimacy_context,
             as_of=as_of,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
         )
 
     @staticmethod
@@ -355,18 +475,148 @@ class VerbatimPinService:
         user_id: str,
         target_kind: VerbatimPinTargetKind,
         target_id: str,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool | None = None,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> dict[str, Any] | None:
-        messages = MessageRepository(connection, self.runtime.clock)
         memories = MemoryObjectRepository(connection, self.runtime.clock)
 
         if target_kind is VerbatimPinTargetKind.MESSAGE:
-            return await messages.get_message(target_id, user_id)
+            return await self._load_message_source_row(
+                connection,
+                user_id=user_id,
+                message_id=target_id,
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
+            )
         if target_kind is VerbatimPinTargetKind.MEMORY_OBJECT:
+            if platform_id is not None and conversation_id is not None:
+                return await memories.get_visible_memory_object(
+                    target_id,
+                    user_id,
+                    conversation_id=conversation_id,
+                    user_persona_id=user_persona_id,
+                    platform_id=platform_id,
+                    character_id=character_id,
+                    incognito=bool(incognito),
+                    remember_across_chats=remember_across_chats,
+                    remember_across_devices=remember_across_devices,
+                    sensitivity_gates_enabled=True,
+                )
             return await memories.get_memory_object(target_id, user_id)
-        message = await messages.get_message(target_id, user_id)
+        message = await self._load_message_source_row(
+            connection,
+            user_id=user_id,
+            message_id=target_id,
+            conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+        )
         if message is not None:
             return message
+        if platform_id is not None and conversation_id is not None:
+            return await memories.get_visible_memory_object(
+                target_id,
+                user_id,
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=bool(incognito),
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                sensitivity_gates_enabled=True,
+            )
         return await memories.get_memory_object(target_id, user_id)
+
+    async def _load_message_source_row(
+        self,
+        connection: Any,
+        *,
+        user_id: str,
+        message_id: str,
+        conversation_id: str | None,
+        user_persona_id: str | None,
+        platform_id: str | None,
+        character_id: str | None,
+        incognito: bool | None,
+    ) -> dict[str, Any] | None:
+        clauses = ["m.id = ?", "c.user_id = ?"]
+        parameters: list[Any] = [message_id, user_id]
+        if platform_id is not None and conversation_id is not None:
+            clauses.extend(
+                [
+                    "c.id = ?",
+                    "c.platform_id = ?",
+                    "c.user_persona_id IS ?",
+                    "c.character_id IS ?",
+                ]
+            )
+            parameters.extend([conversation_id, platform_id, user_persona_id, character_id])
+            if incognito is not None:
+                clauses.append("c.incognito = ?")
+                parameters.append(1 if incognito else 0)
+        cursor = await connection.execute(
+            """
+            SELECT
+                m.*,
+                c.workspace_id AS workspace_id,
+                c.assistant_mode_id AS assistant_mode_id,
+                c.user_persona_id AS user_persona_id,
+                c.platform_id AS platform_id,
+                c.character_id AS character_id,
+                c.mode AS mode,
+                c.incognito AS incognito_snapshot
+            FROM messages AS m
+            JOIN conversations AS c ON c.id = m.conversation_id
+            WHERE {where_clause}
+            """.format(where_clause=" AND ".join(clauses)),
+            tuple(parameters),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def _payload_with_namespace(
+        payload_json: dict[str, Any] | None,
+        *,
+        user_persona_id: str | None,
+        platform_id: str | None,
+        character_id: str | None,
+        incognito: bool | None,
+        remember_across_chats: bool,
+        remember_across_devices: bool,
+    ) -> dict[str, Any]:
+        payload = dict(payload_json or {})
+        if user_persona_id is not None:
+            payload["user_persona_id"] = user_persona_id
+        if platform_id is not None:
+            payload["platform_id"] = platform_id
+        if character_id is not None:
+            payload["character_id"] = character_id
+        if (
+            incognito is not None
+            or user_persona_id is not None
+            or platform_id is not None
+            or character_id is not None
+        ):
+            raw_policy = payload.get("source_turn_policy") or payload.get("policy_snapshot_json")
+            policy = dict(raw_policy) if isinstance(raw_policy, dict) else {}
+            if incognito is not None:
+                policy["incognito"] = bool(incognito)
+            policy["remember_across_chats"] = bool(remember_across_chats)
+            policy["remember_across_devices"] = bool(remember_across_devices)
+            payload["source_turn_policy"] = policy
+        return payload
 
     async def _resolve_scope_anchors(
         self,
@@ -433,6 +683,118 @@ class VerbatimPinService:
             "conversation_id": resolved_conversation_id,
             "assistant_mode_id": resolved_assistant_mode_id,
         }
+
+    @staticmethod
+    def _source_namespace_snapshot(
+        *,
+        source_row: dict[str, Any] | None,
+        payload_json: dict[str, Any] | None,
+        scope_anchors: dict[str, str | None],
+        scope: MemoryScope,
+    ) -> dict[str, Any]:
+        payload = payload_json or {}
+        source_policy = VerbatimPinService._source_policy_snapshot(source_row, payload)
+        user_persona_id = VerbatimPinService._source_value(
+            source_row,
+            payload,
+            "user_persona_id",
+            "user_persona_id_snapshot",
+        )
+        platform_id = (
+            VerbatimPinService._source_value(source_row, payload, "platform_id", "platform_id_snapshot")
+            or "default"
+        )
+        character_id = (
+            VerbatimPinService._source_value(source_row, payload, "character_id", "character_id_snapshot")
+            or scope_anchors.get("workspace_id")
+        )
+        sensitivity = VerbatimPinService._source_sensitivity(source_row, payload)
+        raw_themes = VerbatimPinService._source_value(source_row, payload, "themes_json", "themes_json")
+        themes = raw_themes if isinstance(raw_themes, list) else []
+        platform_locked = bool(
+            VerbatimPinService._source_value(
+                source_row,
+                payload,
+                "platform_locked",
+                "platform_locked",
+            )
+            or source_policy.get("platform_locked")
+        )
+        platform_id_lock = (
+            VerbatimPinService._source_value(
+                source_row,
+                payload,
+                "platform_id_lock",
+                "platform_id_lock",
+            )
+            or source_policy.get("platform_id_lock")
+        )
+        return {
+            "user_persona_id": user_persona_id,
+            "platform_id": platform_id,
+            "character_id": character_id,
+            "sensitivity": sensitivity,
+            "themes": themes,
+            "platform_locked": platform_locked,
+            "platform_id_lock": platform_id_lock,
+            "scope_canonical": VerbatimPinService._canonical_pin_scope(scope),
+            "incognito_snapshot": bool(source_policy.get("incognito")),
+            "remember_across_chats_snapshot": source_policy.get("remember_across_chats", True) is not False,
+            "remember_across_devices_snapshot": source_policy.get("remember_across_devices", True) is not False,
+            "policy_snapshot": source_policy,
+        }
+
+    @staticmethod
+    def _source_value(
+        source_row: dict[str, Any] | None,
+        payload: dict[str, Any],
+        key: str,
+        snapshot_key: str,
+    ) -> Any:
+        if source_row is not None:
+            if source_row.get(key) is not None:
+                return source_row.get(key)
+            if source_row.get(snapshot_key) is not None:
+                return source_row.get(snapshot_key)
+        if payload.get(key) is not None:
+            return payload.get(key)
+        return payload.get(snapshot_key)
+
+    @staticmethod
+    def _source_sensitivity(
+        source_row: dict[str, Any] | None,
+        payload: dict[str, Any],
+    ) -> MemorySensitivity | None:
+        raw_value = VerbatimPinService._source_value(source_row, payload, "sensitivity", "sensitivity")
+        if raw_value is None:
+            return None
+        try:
+            return MemorySensitivity(str(raw_value))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _source_policy_snapshot(
+        source_row: dict[str, Any] | None,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_policy = None
+        if source_row is not None:
+            raw_policy = source_row.get("policy_snapshot_json")
+            row_payload = source_row.get("payload_json")
+            if raw_policy is None and isinstance(row_payload, dict):
+                raw_policy = row_payload.get("source_turn_policy")
+        if raw_policy is None:
+            raw_policy = payload.get("policy_snapshot_json") or payload.get("source_turn_policy")
+        return dict(raw_policy) if isinstance(raw_policy, dict) else {}
+
+    @staticmethod
+    def _canonical_pin_scope(scope: MemoryScope) -> str:
+        if scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION, MemoryScope.CHAT}:
+            return MemoryScope.CHAT.value
+        if scope in {MemoryScope.WORKSPACE, MemoryScope.CHARACTER}:
+            return MemoryScope.CHARACTER.value
+        return MemoryScope.USER.value
 
     @staticmethod
     def _source_text_for_kind(

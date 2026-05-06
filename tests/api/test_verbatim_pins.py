@@ -83,12 +83,14 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
             conversations = ConversationRepository(connection, runtime.clock)
             client.portal.call(users.create_user, "usr_1")
             client.portal.call(
-                conversations.create_conversation,
-                "cnv_1",
-                "usr_1",
-                None,
-                "coding_debug",
-                "Pinned chat",
+                lambda: conversations.create_conversation(
+                    "cnv_1",
+                    "usr_1",
+                    None,
+                    "coding_debug",
+                    "Pinned chat",
+                    platform_id="web",
+                )
             )
         finally:
             client.portal.call(connection.close)
@@ -101,10 +103,11 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
                 "target_kind": "message",
                 "target_id": "msg_1",
                 "conversation_id": "cnv_1",
+                "platform_id": "web",
                 "canonical_text": "alpha beta gamma",
                 "index_text": "alpha beta gamma",
                 "privacy_level": 0,
-                "intimacy_boundary": "romantic_private",
+                "intimacy_boundary": "ordinary",
                 "intimacy_boundary_confidence": 0.7,
                 "reason": "test pin",
                 "created_by": "usr_1",
@@ -114,8 +117,8 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
         assert created.status_code == 200
         pin_id = created.json()["id"]
         assert created.json()["status"] == "active"
-        assert created.json()["privacy_level"] == 2
-        assert created.json()["intimacy_boundary"] == "romantic_private"
+        assert created.json()["privacy_level"] == 0
+        assert created.json()["intimacy_boundary"] == "ordinary"
 
         forbidden = client.post(
             "/v1/verbatim-pins",
@@ -124,6 +127,8 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
                 "scope": "conversation",
                 "target_kind": "message",
                 "target_id": "msg_2",
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
                 "canonical_text": "other text",
                 "index_text": "other text",
                 "privacy_level": 0,
@@ -133,9 +138,31 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
         )
         assert forbidden.status_code == 403
 
+        private_created = client.post(
+            "/v1/verbatim-pins",
+            json={
+                "user_id": "usr_1",
+                "scope": "conversation",
+                "target_kind": "message",
+                "target_id": "msg_private",
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+                "canonical_text": "private exact text",
+                "index_text": "private exact text",
+                "privacy_level": 0,
+                "intimacy_boundary": "romantic_private",
+                "intimacy_boundary_confidence": 0.7,
+                "reason": "private pin",
+                "created_by": "usr_1",
+            },
+            headers=headers,
+        )
+        assert private_created.status_code == 200
+        private_pin_id = private_created.json()["id"]
+
         listing = client.get(
             "/v1/verbatim-pins",
-            params={"user_id": "usr_1"},
+            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
             headers=headers,
         )
         assert listing.status_code == 200
@@ -143,14 +170,28 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
 
         wrong_user_listing = client.get(
             "/v1/verbatim-pins",
-            params={"user_id": "usr_1"},
+            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
             headers=wrong_headers,
         )
         assert wrong_user_listing.status_code == 403
 
+        wrong_namespace_listing = client.get(
+            "/v1/verbatim-pins",
+            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "mobile"},
+            headers=headers,
+        )
+        assert wrong_namespace_listing.status_code == 404
+
+        private_fetched = client.get(
+            f"/v1/verbatim-pins/{private_pin_id}",
+            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
+            headers=headers,
+        )
+        assert private_fetched.status_code == 404
+
         fetched = client.get(
             f"/v1/verbatim-pins/{pin_id}",
-            params={"user_id": "usr_1"},
+            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
             headers=headers,
         )
         assert fetched.status_code == 200
@@ -158,7 +199,7 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
 
         updated = client.patch(
             f"/v1/verbatim-pins/{pin_id}",
-            params={"user_id": "usr_1"},
+            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
             json={"status": "archived", "reason": "done"},
             headers=headers,
         )
@@ -168,7 +209,7 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
 
         deleted = client.delete(
             f"/v1/verbatim-pins/{pin_id}",
-            params={"user_id": "usr_1"},
+            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
             headers=headers,
         )
         assert deleted.status_code == 200
@@ -176,7 +217,12 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
 
         reloaded = client.get(
             "/v1/verbatim-pins",
-            params={"user_id": "usr_1", "status": "deleted"},
+            params={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+                "status": "deleted",
+            },
             headers=headers,
         )
         assert reloaded.status_code == 200

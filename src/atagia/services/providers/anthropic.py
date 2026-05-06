@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+import json
 from typing import Any
 
 from anthropic import (
@@ -125,6 +126,22 @@ def _split_messages(
             )
             continue
 
+        if message.role == "assistant" and message.tool_calls:
+            content: list[dict[str, Any]] = []
+            if message.content:
+                content.append({"type": "text", "text": message.content})
+            for tool_call in message.tool_calls:
+                content.append(
+                    {
+                        "type": "tool_use",
+                        "id": str(tool_call.get("id") or "tool"),
+                        "name": str(tool_call.get("name") or "tool"),
+                        "input": _tool_call_input(tool_call),
+                    }
+                )
+            conversation_messages.append({"role": "assistant", "content": content})
+            continue
+
         conversation_messages.append(
             {
                 "role": message.role,
@@ -133,6 +150,42 @@ def _split_messages(
         )
 
     return system_blocks, conversation_messages
+
+
+def _tool_call_input(tool_call: dict[str, Any]) -> dict[str, Any]:
+    raw_arguments = tool_call.get("input", tool_call.get("arguments", {}))
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+    if isinstance(raw_arguments, str) and raw_arguments.strip():
+        try:
+            parsed = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            return {"arguments": raw_arguments}
+        return parsed if isinstance(parsed, dict) else {"arguments": parsed}
+    return {}
+
+
+def _stream_tool_payload(
+    content_block: Any,
+    buffer: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if getattr(content_block, "type", None) == "tool_use":
+        return {
+            "id": getattr(content_block, "id", None),
+            "type": "tool_use",
+            "name": getattr(content_block, "name", None),
+            "input": getattr(content_block, "input", {}),
+        }
+    if buffer is None:
+        return None
+    partial_json = str(buffer.pop("_partial_json", "") or "")
+    if partial_json:
+        try:
+            parsed = json.loads(partial_json)
+        except json.JSONDecodeError:
+            parsed = {"arguments": partial_json}
+        buffer["input"] = parsed if isinstance(parsed, dict) else {"arguments": parsed}
+    return buffer
 
 
 def _thinking_config(request: LLMCompletionRequest, max_tokens: int) -> dict[str, Any] | None:
@@ -323,6 +376,7 @@ class AnthropicProvider(LLMProvider):
 
         emitted_output_or_tool = False
         pending_error: Exception | None = None
+        tool_buffers: dict[int, dict[str, Any]] = {}
         try:
             async with self._client.messages.stream(**kwargs) as stream:
                 async for event in stream:
@@ -331,18 +385,34 @@ class AnthropicProvider(LLMProvider):
                         yield LLMStreamEvent(type="text", content=event.text)
                     elif event.type == "thinking":
                         yield LLMStreamEvent(type="thinking", content=event.thinking)
-                    elif event.type == "content_block_stop":
+                    elif event.type == "content_block_start":
                         content_block = getattr(event, "content_block", None)
                         if getattr(content_block, "type", None) == "tool_use":
+                            tool_buffers[int(getattr(event, "index", 0) or 0)] = {
+                                "id": getattr(content_block, "id", None),
+                                "type": "tool_use",
+                                "name": getattr(content_block, "name", None),
+                                "input": getattr(content_block, "input", {}) or {},
+                                "_partial_json": "",
+                            }
+                    elif event.type == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        buffer = tool_buffers.get(int(getattr(event, "index", 0) or 0))
+                        if buffer is not None and getattr(delta, "type", None) == "input_json_delta":
+                            buffer["_partial_json"] += str(
+                                getattr(delta, "partial_json", "") or ""
+                            )
+                    elif event.type == "content_block_stop":
+                        index = int(getattr(event, "index", 0) or 0)
+                        payload = _stream_tool_payload(
+                            getattr(event, "content_block", None),
+                            tool_buffers.pop(index, None),
+                        )
+                        if payload is not None:
                             emitted_output_or_tool = True
                             yield LLMStreamEvent(
                                 type="tool_call",
-                                payload={
-                                    "id": getattr(content_block, "id", None),
-                                    "type": "tool_use",
-                                    "name": getattr(content_block, "name", None),
-                                    "input": getattr(content_block, "input", {}),
-                                },
+                                payload=payload,
                             )
                 final_message = await stream.get_final_message()
                 stop_reason = _stop_reason_label(

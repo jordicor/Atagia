@@ -362,6 +362,100 @@ async def test_artifact_chunk_search_filters_intimacy_boundary_until_authorized(
 
 
 @pytest.mark.asyncio
+async def test_artifact_chunk_search_keeps_incognito_artifacts_chat_local() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc))
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        repository = ArtifactRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await connection.execute(
+            """
+            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+            VALUES ('coding_debug', 'Coding Debug', 'hash_1', '{}', '2026-03-30T12:00:00+00:00', '2026-03-30T12:00:00+00:00')
+            """
+        )
+        await conversations.create_conversation(
+            "cnv_incognito",
+            "usr_a",
+            None,
+            "coding_debug",
+            "Incognito",
+            user_persona_id="persona_a",
+            platform_id="default",
+            incognito=True,
+        )
+        await conversations.create_conversation(
+            "cnv_visible",
+            "usr_a",
+            None,
+            "coding_debug",
+            "Visible",
+            user_persona_id="persona_a",
+            platform_id="default",
+        )
+
+        artifact = await repository.create_artifact(
+            artifact_id="art_incognito",
+            user_id="usr_a",
+            workspace_id=None,
+            conversation_id="cnv_incognito",
+            message_id=None,
+            artifact_type="pasted_text",
+            source_kind="pasted_text",
+            status="ready",
+            privacy_level=0,
+            summary_text="incognito artifact",
+            index_text="incognito artifact",
+            user_persona_id="persona_a",
+            platform_id="default",
+            scope_canonical=MemoryScope.CHAT.value,
+            incognito_snapshot=True,
+        )
+        await repository.create_artifact_chunk(
+            artifact_id=str(artifact["id"]),
+            user_id="usr_a",
+            chunk_index=0,
+            text="incognito artifact local note",
+            token_count=4,
+            kind="summary",
+        )
+
+        broad_rows = await repository.search_artifact_chunks(
+            user_id="usr_a",
+            query="incognito",
+            privacy_ceiling=1,
+            scope_filter=[MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_visible",
+            limit=10,
+            user_persona_id="persona_a",
+            platform_id="default",
+        )
+        local_rows = await repository.search_artifact_chunks(
+            user_id="usr_a",
+            query="incognito",
+            privacy_ceiling=1,
+            scope_filter=[MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_incognito",
+            limit=10,
+            user_persona_id="persona_a",
+            platform_id="default",
+            incognito=True,
+        )
+
+        assert broad_rows == []
+        assert [row["artifact_id"] for row in local_rows] == ["art_incognito"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_artifact_service_can_store_and_fetch_local_file_payloads(tmp_path: Path) -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc))

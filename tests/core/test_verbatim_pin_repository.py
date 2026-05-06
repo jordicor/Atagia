@@ -15,6 +15,7 @@ from atagia.core.verbatim_pin_repository import VerbatimPinRepository
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
     MemoryScope,
+    MemorySensitivity,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
@@ -35,6 +36,19 @@ async def test_verbatim_pin_repository_crud_and_user_isolation() -> None:
         users = UserRepository(connection, clock)
         pins = VerbatimPinRepository(connection, clock)
         await users.create_user("usr_a")
+        await connection.execute(
+            """
+            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+            VALUES ('coding_debug', 'Coding Debug', 'hash_1', '{}', '2026-03-30T12:00:00+00:00', '2026-03-30T12:00:00+00:00')
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO conversations(id, user_id, assistant_mode_id, title, status, created_at, updated_at)
+            VALUES ('cnv_a', 'usr_a', 'coding_debug', 'Pins', 'active', '2026-03-30T12:00:00+00:00', '2026-03-30T12:00:00+00:00')
+            """
+        )
+        await connection.commit()
         await users.create_user("usr_b")
 
         created = await pins.create_verbatim_pin(
@@ -165,6 +179,79 @@ async def test_verbatim_pin_repository_search_excludes_expired_and_deleted_pins(
             limit=10,
             as_of="2026-03-30T12:00:00+00:00",
         ) == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_verbatim_pin_direct_crud_accepts_namespace_gates() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        pins = VerbatimPinRepository(connection, clock)
+        await users.create_user("usr_a")
+        await connection.execute(
+            """
+            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+            VALUES ('coding_debug', 'Coding Debug', 'hash_1', '{}', '2026-03-30T12:00:00+00:00', '2026-03-30T12:00:00+00:00')
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO conversations(id, user_id, assistant_mode_id, title, status, created_at, updated_at)
+            VALUES ('cnv_a', 'usr_a', 'coding_debug', 'Pins', 'active', '2026-03-30T12:00:00+00:00', '2026-03-30T12:00:00+00:00')
+            """
+        )
+        await connection.commit()
+
+        visible = await pins.create_verbatim_pin(
+            user_id="usr_a",
+            scope=MemoryScope.CONVERSATION,
+            target_kind=VerbatimPinTargetKind.MESSAGE,
+            target_id="msg_visible",
+            conversation_id="cnv_a",
+            canonical_text="visible exact note",
+            index_text="visible exact note",
+            privacy_level=0,
+            created_by="usr_a",
+            user_persona_id="persona_a",
+            platform_id="default",
+            sensitivity=MemorySensitivity.PUBLIC,
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        hidden = await pins.create_verbatim_pin(
+            user_id="usr_a",
+            scope=MemoryScope.CONVERSATION,
+            target_kind=VerbatimPinTargetKind.MESSAGE,
+            target_id="msg_hidden",
+            conversation_id="cnv_a",
+            canonical_text="hidden exact note",
+            index_text="hidden exact note",
+            privacy_level=0,
+            created_by="usr_a",
+            user_persona_id="persona_b",
+            platform_id="default",
+            sensitivity=MemorySensitivity.PUBLIC,
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+
+        visible_rows = await pins.list_verbatim_pins(
+            "usr_a",
+            conversation_id="cnv_a",
+            user_persona_id="persona_a",
+            platform_id="default",
+        )
+        hidden_update = await pins.update_verbatim_pin(
+            str(hidden["id"]),
+            "usr_a",
+            status=VerbatimPinStatus.ARCHIVED,
+            conversation_id="cnv_a",
+            user_persona_id="persona_a",
+            platform_id="default",
+        )
+
+        assert [row["id"] for row in visible_rows] == [visible["id"]]
+        assert hidden_update is None
     finally:
         await connection.close()
 

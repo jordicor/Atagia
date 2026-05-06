@@ -15,6 +15,7 @@ import aiosqlite
 
 _MIGRATION_PATTERN = re.compile(r"^(?P<version>\d+)_(?P<name>[a-z0-9_]+)\.sql$")
 _FOREIGN_KEYS_OFF_MARKER = "-- atagia:foreign_keys_off"
+SQLITE_BUSY_TIMEOUT_MS = 60_000
 _T = TypeVar("_T")
 
 
@@ -48,7 +49,7 @@ async def apply_startup_pragmas(
         await connection.execute("PRAGMA journal_mode = WAL;")
     await connection.execute("PRAGMA synchronous = NORMAL;")
     await connection.execute("PRAGMA foreign_keys = ON;")
-    await connection.execute("PRAGMA busy_timeout = 5000;")
+    await connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS};")
     await connection.execute("PRAGMA temp_store = MEMORY;")
 
 

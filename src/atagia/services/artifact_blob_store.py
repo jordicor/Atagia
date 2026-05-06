@@ -50,14 +50,21 @@ class ArtifactBlobStore:
         blob_path = self._resolve_storage_uri(storage_uri)
         return blob_path.read_bytes()
 
+    def delete_storage_uri(self, storage_uri: str) -> bool:
+        blob_path = self._resolve_storage_uri(storage_uri, strict=False)
+        if not blob_path.exists():
+            return False
+        blob_path.unlink()
+        return True
+
     def _path_for(self, *, user_id: str, sha256: str) -> Path:
         safe_user_id = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
         return self._base_dir / safe_user_id / sha256[:2] / sha256
 
-    def _resolve_storage_uri(self, storage_uri: str) -> Path:
+    def _resolve_storage_uri(self, storage_uri: str, *, strict: bool = True) -> Path:
         raw_path = Path(storage_uri).expanduser()
         candidate = raw_path if raw_path.is_absolute() else self._base_dir / raw_path
-        resolved = candidate.resolve(strict=True)
+        resolved = candidate.resolve(strict=strict)
         try:
             resolved.relative_to(self._base_dir)
         except ValueError:

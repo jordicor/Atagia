@@ -34,6 +34,7 @@ from atagia.models.schemas_memory import (
     MemoryCategory,
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
 )
@@ -178,7 +179,7 @@ async def _build_runtime(
         message_repository=messages,
         memory_repository=memories,
         storage_backend=InProcessBackend(),
-        settings=settings,
+        settings=settings or _settings(),
         privacy_filter_client=privacy_filter_client,
     )
     manifest = ManifestLoader(MANIFESTS_DIR).load_all()[mode_id]
@@ -213,7 +214,7 @@ async def _build_runtime_with_provider(
         message_repository=messages,
         memory_repository=memories,
         storage_backend=InProcessBackend(),
-        settings=settings,
+        settings=settings or _settings(),
     )
     manifest = ManifestLoader(MANIFESTS_DIR).load_all()[mode_id]
     resolved_policy = PolicyResolver().resolve(manifest, None, None)
@@ -389,6 +390,16 @@ def _context(
     mode_id: str = "coding_debug",
     conversation_id: str = "cnv_1",
     workspace_id: str | None = None,
+    isolated_mode: bool = False,
+    user_persona_id: str | None = None,
+    platform_id: str = "platform_1",
+    character_id: str | None = None,
+    incognito: bool = False,
+    remember_across_chats: bool = True,
+    remember_across_devices: bool = True,
+    temporary: bool = False,
+    temporary_ttl_seconds: int | None = None,
+    purge_on_close: bool = False,
 ) -> ExtractionConversationContext:
     return ExtractionConversationContext(
         user_id="usr_1",
@@ -396,7 +407,17 @@ def _context(
         source_message_id=message_id,
         workspace_id=workspace_id,
         assistant_mode_id=mode_id,
+        user_persona_id=user_persona_id,
+        platform_id=platform_id,
+        character_id=character_id,
         recent_messages=[],
+        temporary=temporary,
+        temporary_ttl_seconds=temporary_ttl_seconds,
+        purge_on_close=purge_on_close,
+        isolated_mode=isolated_mode,
+        incognito=incognito,
+        remember_across_chats=remember_across_chats,
+        remember_across_devices=remember_across_devices,
     )
 
 
@@ -488,7 +509,8 @@ async def test_normal_extraction_persists_grounded_items() -> None:
         assert by_type["belief"]["payload_json"]["claim_value"] == "concise_actionable"
         assert by_type["belief"]["payload_json"]["source_message_ids"] == ["msg_1"]
         assert "extraction_hash" in by_type["belief"]["payload_json"]
-        assert by_type["state_snapshot"]["scope"] == "conversation"
+        assert by_type["state_snapshot"]["scope"] == "chat"
+        assert by_type["state_snapshot"]["scope_canonical"] == "chat"
     finally:
         await connection.close()
 
@@ -916,6 +938,212 @@ async def test_temporal_type_accepts_ephemeral() -> None:
 
 
 @pytest.mark.asyncio
+async def test_isolated_extraction_forces_cross_chat_items_to_conversation_scope() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "I prefer concise debugging advice",
+                "scope": "global_user",
+                "confidence": 0.91,
+                "source_kind": "extracted",
+                "privacy_level": 1,
+                "payload": {"kind": "preference"},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+        payload,
+        workspace_id="wrk_1",
+    )
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="I prefer concise debugging advice.",
+        )
+
+        _result, persisted = await extractor.extract_with_persistence_details(
+            message_text=str(source_message["text"]),
+            role="user",
+            conversation_context=_context(
+                str(source_message["id"]),
+                workspace_id="wrk_1",
+                isolated_mode=True,
+            ),
+            resolved_policy=resolved_policy,
+        )
+
+        rows = [await memories.get_memory_object(str(persisted[0]["id"]), "usr_1")]
+        assert len(persisted) == 1
+        assert rows[0] is not None
+        assert rows[0]["scope"] == MemoryScope.CHAT.value
+        assert rows[0]["scope_canonical"] == MemoryScope.CHAT.value
+        assert rows[0]["conversation_id"] == "cnv_1"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase6_write_policy_stores_canonical_identity_and_gates() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "I prefer private character notes",
+                "scope": "character",
+                "confidence": 0.91,
+                "source_kind": "extracted",
+                "privacy_level": 2,
+                "sensitivity": "private",
+                "themes": ["preferences", "preferences"],
+                "platform_locked": True,
+                "platform_lock_reason": "Only useful on this client.",
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="I prefer private character notes.",
+        )
+
+        await extractor.extract(
+            message_text=str(source_message["text"]),
+            role="user",
+            conversation_context=_context(
+                str(source_message["id"]),
+                platform_id="sillytavern_desktop",
+                character_id="char_1",
+                user_persona_id="persona_1",
+            ),
+            resolved_policy=resolved_policy,
+        )
+
+        rows = await memories.list_for_user("usr_1", statuses=None)
+        assert len(rows) == 1
+        assert rows[0]["scope"] == MemoryScope.CHARACTER.value
+        assert rows[0]["scope_canonical"] == MemoryScope.CHARACTER.value
+        assert rows[0]["user_persona_id"] == "persona_1"
+        assert rows[0]["platform_id"] == "sillytavern_desktop"
+        assert rows[0]["character_id"] == "char_1"
+        assert rows[0]["sensitivity"] == MemorySensitivity.PRIVATE.value
+        assert rows[0]["themes_json"] == ["preferences"]
+        assert rows[0]["platform_locked"] == 1
+        assert rows[0]["platform_id_lock"] == "sillytavern_desktop"
+        assert rows[0]["payload_json"]["platform_lock_reason"] == "Only useful on this client."
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase6_incognito_preferences_and_temporary_force_chat_lock_and_expiry() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "I prefer client local temporary memory",
+                "scope": "user",
+                "confidence": 0.91,
+                "source_kind": "extracted",
+                "privacy_level": 1,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="I prefer client local temporary memory.",
+            occurred_at="2026-03-30T18:00:00+00:00",
+        )
+
+        await extractor.extract(
+            message_text=str(source_message["text"]),
+            role="user",
+            conversation_context=_context(
+                str(source_message["id"]),
+                platform_id="openwebui",
+                incognito=True,
+                remember_across_chats=False,
+                remember_across_devices=False,
+                temporary=True,
+                temporary_ttl_seconds=90,
+            ),
+            resolved_policy=resolved_policy,
+        )
+
+        rows = await memories.list_for_user("usr_1", statuses=None)
+        assert len(rows) == 1
+        assert rows[0]["scope"] == MemoryScope.CHAT.value
+        assert rows[0]["scope_canonical"] == MemoryScope.CHAT.value
+        assert rows[0]["conversation_id"] == "cnv_1"
+        assert rows[0]["auto_expires"] == 1
+        assert rows[0]["valid_to"] == "2026-03-30T18:01:30+00:00"
+        assert rows[0]["platform_locked"] == 1
+        assert rows[0]["platform_id_lock"] == "openwebui"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase6_character_scope_without_character_id_never_becomes_user() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "I prefer character scoped notes",
+                "scope": "character",
+                "confidence": 0.91,
+                "source_kind": "extracted",
+                "privacy_level": 1,
+                "payload": {},
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="I prefer character scoped notes.",
+        )
+
+        await extractor.extract(
+            message_text=str(source_message["text"]),
+            role="user",
+            conversation_context=_context(str(source_message["id"]), character_id=None),
+            resolved_policy=resolved_policy,
+        )
+
+        rows = await memories.list_for_user("usr_1", statuses=None)
+        assert len(rows) == 1
+        assert rows[0]["scope"] == MemoryScope.CHAT.value
+        assert rows[0]["scope_canonical"] == MemoryScope.CHAT.value
+        assert rows[0]["status"] == MemoryStatus.REVIEW_REQUIRED.value
+        assert "character_scope_missing_character_id_forced_chat" in rows[0]["payload_json"]["write_policy_reasons"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_temporal_type_rejects_unexpected_string() -> None:
     payload = {
         "evidences": [
@@ -1310,6 +1538,7 @@ def test_extraction_prompt_template_preserves_structured_fact_granularity() -> N
     assert "Do not classify factual details as contract signals" in EXTRACTION_PROMPT_TEMPLATE
     assert "multiple independent durable facts" in EXTRACTION_PROMPT_TEMPLATE
     assert "keep that condition attached to the extracted item" in EXTRACTION_PROMPT_TEMPLATE
+    assert "Do not rewrite it as the person's true" in EXTRACTION_PROMPT_TEMPLATE
 
 
 @pytest.mark.asyncio
@@ -1555,12 +1784,99 @@ async def test_workspace_scope_dedupe_merges_source_ids_and_clears_conversation_
 
         persisted = await memories.list_for_user("usr_1")
         assert len(persisted) == 1
-        assert persisted[0]["scope"] == MemoryScope.WORKSPACE.value
+        assert persisted[0]["scope"] == MemoryScope.CHARACTER.value
+        assert persisted[0]["scope_canonical"] == MemoryScope.CHARACTER.value
         assert persisted[0]["workspace_id"] == "wrk_1"
         assert persisted[0]["assistant_mode_id"] == "coding_debug"
         assert persisted[0]["conversation_id"] is None
+        assert persisted[0]["character_id"] == "wrk_1"
         assert persisted[0]["payload_json"]["source_message_ids"] == ["msg_1", "msg_2"]
         assert persisted[0]["payload_json"]["confirmation_count"] == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase6_dedupe_tightens_public_unlocked_memory_to_secret_platform_locked() -> None:
+    provider = SequencedExtractionProvider(
+        [
+            {
+                "evidences": [
+                    {
+                        "canonical_text": "I keep the launch code in the client vault",
+                        "scope": "user",
+                        "confidence": 0.9,
+                        "source_kind": "extracted",
+                        "privacy_level": 0,
+                        "sensitivity": "public",
+                        "payload": {},
+                    }
+                ],
+                "beliefs": [],
+                "contract_signals": [],
+                "state_updates": [],
+                "mode_guess": None,
+                "nothing_durable": False,
+            },
+            {
+                "evidences": [
+                    {
+                        "canonical_text": "I keep the launch code in the client vault",
+                        "scope": "user",
+                        "confidence": 0.9,
+                        "source_kind": "extracted",
+                        "privacy_level": 3,
+                        "sensitivity": "secret",
+                        "themes": ["security"],
+                        "platform_locked": True,
+                        "payload": {},
+                    }
+                ],
+                "beliefs": [],
+                "contract_signals": [],
+                "state_updates": [],
+                "mode_guess": None,
+                "nothing_durable": False,
+            },
+        ]
+    )
+    connection, _clock, messages, memories, extractor, _provider, resolved_policy = (
+        await _build_runtime_with_provider(provider)
+    )
+    try:
+        source_one = await _create_source_message(
+            messages,
+            message_id="msg_1",
+            text="I keep the launch code in the client vault.",
+        )
+        source_two = await _create_source_message(
+            messages,
+            message_id="msg_2",
+            text="I keep the launch code in the client vault.",
+            seq=2,
+        )
+
+        await extractor.extract(
+            message_text=str(source_one["text"]),
+            role="user",
+            conversation_context=_context(str(source_one["id"]), platform_id="client_a"),
+            resolved_policy=resolved_policy,
+        )
+        await extractor.extract(
+            message_text=str(source_two["text"]),
+            role="user",
+            conversation_context=_context(str(source_two["id"]), platform_id="client_a"),
+            resolved_policy=resolved_policy,
+        )
+
+        persisted = await memories.list_for_user("usr_1")
+        assert len(persisted) == 1
+        assert persisted[0]["sensitivity"] == MemorySensitivity.SECRET.value
+        assert persisted[0]["privacy_level"] == 3
+        assert persisted[0]["themes_json"] == ["security"]
+        assert persisted[0]["platform_locked"] == 1
+        assert persisted[0]["platform_id_lock"] == "client_a"
+        assert persisted[0]["payload_json"]["source_message_ids"] == ["msg_1", "msg_2"]
     finally:
         await connection.close()
 
@@ -1944,7 +2260,7 @@ async def test_cold_start_raises_belief_threshold_until_memory_exists() -> None:
 
 
 @pytest.mark.asyncio
-async def test_disallowed_scope_is_not_persisted() -> None:
+async def test_profile_scope_list_does_not_block_user_memory() -> None:
     payload = {
         "evidences": [
             {
@@ -1979,7 +2295,8 @@ async def test_disallowed_scope_is_not_persisted() -> None:
             resolved_policy=resolved_policy,
         )
 
-        assert await memories.list_for_user("usr_1") == []
+        rows = await memories.list_for_user("usr_1")
+        assert [row["scope"] for row in rows] == ["user"]
     finally:
         await connection.close()
 
@@ -2496,8 +2813,7 @@ async def test_anti_hallucination_rejects_ungrounded_items() -> None:
 @pytest.mark.asyncio
 async def test_chunked_extraction_merges_chunk_results_and_persists_chunk_metadata() -> None:
     settings = _settings(
-        chunking_enabled=True,
-        chunking_threshold_tokens=20,
+        chunking_extraction_threshold_tokens=20,
     )
     provider = SequencedExtractionProvider(
         [
@@ -2565,10 +2881,79 @@ async def test_chunked_extraction_merges_chunk_results_and_persists_chunk_metada
 
 
 @pytest.mark.asyncio
+async def test_chunked_cold_start_explicit_statement_classifies_belief_chunk_only() -> None:
+    settings = _settings(
+        chunking_extraction_threshold_tokens=20,
+    )
+    provider = SequencedExtractionProvider(
+        [
+            {
+                "evidences": [],
+                "beliefs": [
+                    {
+                        "claim_key": "debugging_advice_style",
+                        "claim_value": "prefers concise debugging advice",
+                        "canonical_text": "I prefer concise debugging advice",
+                        "scope": "assistant_mode",
+                        "confidence": 0.78,
+                        "source_kind": "extracted",
+                        "privacy_level": 1,
+                    }
+                ],
+                "contract_signals": [],
+                "state_updates": [],
+                "mode_guess": None,
+                "nothing_durable": False,
+            },
+            {
+                "evidences": [],
+                "beliefs": [],
+                "contract_signals": [],
+                "state_updates": [],
+                "mode_guess": None,
+                "nothing_durable": True,
+            },
+        ],
+        explicit_result=True,
+    )
+    connection, _clock, messages, memories, extractor, sequenced_provider, resolved_policy = (
+        await _build_runtime_with_provider(provider, settings=settings)
+    )
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text=(
+                ("I prefer concise debugging advice. " * 30)
+                + "\n\n"
+                + ("This unrelated long tail should not enter the explicit statement classifier. " * 18)
+            ),
+        )
+
+        await extractor.extract_with_persistence_details(
+            message_text=str(source_message["text"]),
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
+
+        classifier_requests = [
+            request
+            for request in sequenced_provider.requests
+            if request.metadata.get("purpose") == "intent_classifier_explicit"
+        ]
+        rows = await memories.list_for_user("usr_1")
+        assert len(classifier_requests) == 1
+        assert "I prefer concise debugging advice" in classifier_requests[0].messages[1].content
+        assert "unrelated long tail" not in classifier_requests[0].messages[1].content
+        assert rows[0]["status"] == MemoryStatus.ACTIVE.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_chunked_extraction_grounds_against_each_local_chunk() -> None:
     settings = _settings(
-        chunking_enabled=True,
-        chunking_threshold_tokens=20,
+        chunking_extraction_threshold_tokens=20,
     )
     provider = SequencedExtractionProvider(
         [
@@ -2641,8 +3026,7 @@ async def test_chunked_extraction_grounds_against_each_local_chunk() -> None:
 @pytest.mark.asyncio
 async def test_chunked_extraction_dedupes_semantically_equivalent_beliefs_across_chunks() -> None:
     settings = _settings(
-        chunking_enabled=True,
-        chunking_threshold_tokens=20,
+        chunking_extraction_threshold_tokens=20,
     )
     provider = SequencedExtractionProvider(
         [
@@ -2723,12 +3107,89 @@ async def test_chunked_extraction_dedupes_semantically_equivalent_beliefs_across
 
 
 @pytest.mark.asyncio
-async def test_chunked_persistence_rolls_back_on_later_chunk_write_failure(
+async def test_chunked_persistence_starts_each_chunk_without_open_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings(
-        chunking_enabled=True,
-        chunking_threshold_tokens=20,
+        chunking_extraction_threshold_tokens=20,
+    )
+    provider = SequencedExtractionProvider(
+        [
+            {
+                "evidences": [
+                    {
+                        "canonical_text": "segment one evidence",
+                        "scope": "assistant_mode",
+                        "confidence": 0.9,
+                        "source_kind": "extracted",
+                        "privacy_level": 0,
+                        "payload": {},
+                    }
+                ],
+                "beliefs": [],
+                "contract_signals": [],
+                "state_updates": [],
+                "mode_guess": None,
+                "nothing_durable": False,
+            },
+            {
+                "evidences": [
+                    {
+                        "canonical_text": "segment two evidence",
+                        "scope": "assistant_mode",
+                        "confidence": 0.9,
+                        "source_kind": "extracted",
+                        "privacy_level": 0,
+                        "payload": {},
+                    }
+                ],
+                "beliefs": [],
+                "contract_signals": [],
+                "state_updates": [],
+                "mode_guess": None,
+                "nothing_durable": False,
+            },
+        ]
+    )
+    connection, _clock, messages, _memories, extractor, _provider, resolved_policy = (
+        await _build_runtime_with_provider(provider, settings=settings)
+    )
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text=(
+                ("Speaker: segment one evidence. " * 20)
+                + "\n\n"
+                + ("Responder: segment two evidence. " * 20)
+            ),
+        )
+        original_persist_result = extractor._persist_result
+        open_transaction_at_chunk_start: list[bool] = []
+
+        async def _recording_persist_result(*args, **kwargs):
+            open_transaction_at_chunk_start.append(connection.in_transaction)
+            return await original_persist_result(*args, **kwargs)
+
+        monkeypatch.setattr(extractor, "_persist_result", _recording_persist_result)
+
+        await extractor.extract_with_persistence_details(
+            message_text=str(source_message["text"]),
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
+
+        assert open_transaction_at_chunk_start == [False, False]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_chunked_persistence_keeps_completed_chunks_on_later_chunk_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(
+        chunking_extraction_threshold_tokens=20,
     )
     provider = SequencedExtractionProvider(
         [
@@ -2801,6 +3262,8 @@ async def test_chunked_persistence_rolls_back_on_later_chunk_write_failure(
                 resolved_policy=resolved_policy,
             )
 
-        assert await memories.list_for_user("usr_1") == []
+        rows = await memories.list_for_user("usr_1")
+
+        assert [row["canonical_text"] for row in rows] == ["segment one evidence"]
     finally:
         await connection.close()

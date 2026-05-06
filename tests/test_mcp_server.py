@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 from datetime import datetime, timezone
 import json
 import re
@@ -13,16 +15,18 @@ mcp_available = pytest.importorskip("mcp", reason="mcp package not installed")
 
 from atagia import Atagia
 from atagia.core.clock import FrozenClock
-from atagia.core.repositories import MemoryObjectRepository, MessageRepository
+from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
 from atagia.models.schemas_jobs import EXTRACT_STREAM_NAME, JobEnvelope, WORKER_GROUP_NAME
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
 from atagia.mcp_server import (
     _add_memory_impl,
+    _delete_conversation_impl,
     _delete_memory_impl,
     _get_context_impl,
     _list_memories_impl,
     _search_memories_impl,
 )
+from atagia.services.errors import DeletionConfirmationError
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.chat_support import default_operational_profile_snapshot
@@ -35,7 +39,9 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 
-_MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
+_CANDIDATE_SCORE_KEY_PATTERN = re.compile(
+    r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
+)
 
 
 class MCPProvider(LLMProvider):
@@ -68,15 +74,15 @@ class MCPProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_scoring":
-            memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
                     {
                         "scores": [
-                            {"memory_id": memory_id, "llm_applicability": 0.5}
-                            for memory_id in memory_ids
+                            {"score_key": score_key, "llm_applicability": 0.5}
+                            for _memory_id, score_key in candidate_keys
                         ],
                     }
                 ),
@@ -172,6 +178,7 @@ async def _seed_memory(
     text: str,
     object_type: MemoryObjectType = MemoryObjectType.EVIDENCE,
     status: MemoryStatus = MemoryStatus.ACTIVE,
+    privacy_level: int = 0,
 ) -> None:
     runtime = engine.runtime
     if runtime is None:
@@ -188,9 +195,10 @@ async def _seed_memory(
             canonical_text=text,
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.9,
-            privacy_level=0,
+            privacy_level=privacy_level,
             status=status,
             memory_id=memory_id,
+            platform_id="web",
         )
     finally:
         await connection.close()
@@ -215,18 +223,24 @@ async def test_mcp_get_context(
             await _get_context_impl(
                 engine,
                 "usr_1",
+                "mcp",
                 "Please help me debug this retry loop.",
                 conversation_id="cnv_1",
                 mode="coding_debug",
+                user_persona_id="persona_mcp",
+                character_id="char_mcp",
             )
         )
         second = json.loads(
             await _get_context_impl(
                 engine,
                 "usr_1",
+                "mcp",
                 "continue",
                 conversation_id="cnv_1",
                 mode="coding_debug",
+                user_persona_id="persona_mcp",
+                character_id="char_mcp",
             )
         )
 
@@ -242,6 +256,20 @@ async def test_mcp_get_context(
             operational_profile_token=_normal_operational_profile_token(engine),
         )
         assert await engine.runtime.storage_backend.get_context_view(cache_key) is None
+        runtime = engine.runtime
+        if runtime is None:
+            raise AssertionError("Engine runtime should remain initialized")
+        connection = await runtime.open_connection()
+        try:
+            conversation = await ConversationRepository(connection, runtime.clock).get_conversation(
+                "cnv_1",
+                "usr_1",
+            )
+            assert conversation is not None
+            assert conversation["user_persona_id"] == "persona_mcp"
+            assert conversation["character_id"] == "char_mcp"
+        finally:
+            await connection.close()
     finally:
         await engine.close()
 
@@ -262,7 +290,12 @@ async def test_mcp_search_memories(
     await engine.setup()
     try:
         await engine.create_user("usr_1")
-        await engine.create_conversation("usr_1", "cnv_1", assistant_mode_id="coding_debug")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+            platform_id="web",
+        )
         await _seed_memory(
             engine,
             memory_id="mem_1",
@@ -281,19 +314,41 @@ async def test_mcp_search_memories(
         )
         await _seed_memory(
             engine,
+            memory_id="mem_private",
+            text="private retry credential",
+            privacy_level=2,
+        )
+        await _seed_memory(
+            engine,
             memory_id="mem_declined",
             text="declined retry credential",
             status=MemoryStatus.DECLINED,
         )
-        await _delete_memory_impl(engine, "usr_1", "mem_archived")
+        await _delete_memory_impl(
+            engine,
+            "usr_1",
+            "mem_archived",
+            conversation_id="cnv_1",
+            platform_id="web",
+        )
 
-        results = json.loads(await _search_memories_impl(engine, "usr_1", "retry", limit=10))
+        results = json.loads(
+            await _search_memories_impl(
+                engine,
+                "usr_1",
+                "retry",
+                limit=10,
+                conversation_id="cnv_1",
+                platform_id="web",
+            )
+        )
 
         assert results
         assert results[0]["id"] == "mem_1"
         assert "retry loop websocket backoff" in results[0]["text"]
         assert all(result["id"] != "mem_archived" for result in results)
         assert all(result["id"] != "mem_pending" for result in results)
+        assert all(result["id"] != "mem_private" for result in results)
         assert all(result["id"] != "mem_declined" for result in results)
     finally:
         await engine.close()
@@ -316,7 +371,12 @@ async def test_mcp_add_memory(
     try:
         engine.runtime.clock = FrozenClock(datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc))
         await engine.create_user("usr_1")
-        await engine.create_conversation("usr_1", "cnv_1", assistant_mode_id="coding_debug")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+            platform_id="mcp",
+        )
         cache_key = ContextCacheService.build_cache_key(
             user_id="usr_1",
             assistant_mode_id="coding_debug",
@@ -338,6 +398,7 @@ async def test_mcp_add_memory(
         confirmation = await _add_memory_impl(
             engine,
             "usr_1",
+            "mcp",
             "Please remember that the retry loop needs a backoff.",
             conversation_id="cnv_1",
         )
@@ -380,11 +441,17 @@ async def test_mcp_add_memory_carries_operational_profile(
     await engine.setup()
     try:
         await engine.create_user("usr_1")
-        await engine.create_conversation("usr_1", "cnv_1", assistant_mode_id="coding_debug")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+            platform_id="mcp",
+        )
 
         await _add_memory_impl(
             engine,
             "usr_1",
+            "mcp",
             "Please remember that offline mode should keep answers short.",
             conversation_id="cnv_1",
             operational_profile="offline",
@@ -400,10 +467,30 @@ async def test_mcp_add_memory_carries_operational_profile(
             count=1,
             block_ms=0,
         )
-        assert messages
-        envelope = JobEnvelope.model_validate(messages[0].payload)
-        assert envelope.operational_profile is not None
-        assert envelope.operational_profile.profile_id == "offline"
+        if messages:
+            envelope = JobEnvelope.model_validate(messages[0].payload)
+            assert envelope.operational_profile is not None
+            assert envelope.operational_profile.profile_id == "offline"
+        else:
+            connection = await runtime.open_connection()
+            try:
+                cursor = await connection.execute(
+                    """
+                    SELECT metadata_json
+                    FROM worker_job_runs
+                    WHERE user_id = ?
+                      AND conversation_id = ?
+                      AND job_type = ?
+                    """,
+                    ("usr_1", "cnv_1", "extract_memory_candidates"),
+                )
+                rows = await cursor.fetchall()
+            finally:
+                await connection.close()
+            assert any(
+                json.loads(row["metadata_json"]).get("operational_profile") == "offline"
+                for row in rows
+            )
     finally:
         await engine.close()
 
@@ -428,7 +515,12 @@ async def test_mcp_delete_memory(
             raise AssertionError("Engine runtime should be initialized")
         engine.runtime.embedding_index = tracking_embeddings
         await engine.create_user("usr_1")
-        await engine.create_conversation("usr_1", "cnv_1", assistant_mode_id="coding_debug")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+            platform_id="web",
+        )
         await _seed_memory(
             engine,
             memory_id="mem_1",
@@ -450,7 +542,13 @@ async def test_mcp_delete_memory(
             ttl_seconds=60,
         )
 
-        confirmation = await _delete_memory_impl(engine, "usr_1", "mem_1")
+        confirmation = await _delete_memory_impl(
+            engine,
+            "usr_1",
+            "mem_1",
+            conversation_id="cnv_1",
+            platform_id="web",
+        )
 
         assert confirmation == "Archived memory mem_1."
         runtime = engine.runtime
@@ -476,6 +574,65 @@ async def test_mcp_delete_memory(
 
 
 @pytest.mark.asyncio
+async def test_mcp_destructive_deletes_require_explicit_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = MCPProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-mcp.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+            platform_id="web",
+        )
+        await _seed_memory(
+            engine,
+            memory_id="mem_1",
+            text="destructive delete confirmation",
+        )
+
+        with pytest.raises(DeletionConfirmationError):
+            await _delete_memory_impl(
+                engine,
+                "usr_1",
+                "mem_1",
+                hard=True,
+                conversation_id="cnv_1",
+                platform_id="web",
+            )
+        with pytest.raises(DeletionConfirmationError):
+            await _delete_conversation_impl(
+                engine,
+                "usr_1",
+                "cnv_1",
+                platform_id="web",
+            )
+
+        confirmation = await _delete_memory_impl(
+            engine,
+            "usr_1",
+            "mem_1",
+            hard=True,
+            confirmation="HARD_DELETE_MEMORY",
+            conversation_id="cnv_1",
+            platform_id="web",
+        )
+        assert confirmation == "Hard-deleted memory mem_1."
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_mcp_list_memories(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -491,7 +648,12 @@ async def test_mcp_list_memories(
     await engine.setup()
     try:
         await engine.create_user("usr_1")
-        await engine.create_conversation("usr_1", "cnv_1", assistant_mode_id="coding_debug")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+            platform_id="web",
+        )
         await _seed_memory(
             engine,
             memory_id="mem_evidence",
@@ -519,19 +681,41 @@ async def test_mcp_list_memories(
         )
         await _seed_memory(
             engine,
+            memory_id="mem_private",
+            text="Private memory",
+            object_type=MemoryObjectType.EVIDENCE,
+            privacy_level=2,
+        )
+        await _seed_memory(
+            engine,
             memory_id="mem_declined",
             text="Declined memory",
             object_type=MemoryObjectType.EVIDENCE,
             status=MemoryStatus.DECLINED,
         )
-        await _delete_memory_impl(engine, "usr_1", "mem_archived")
+        await _delete_memory_impl(
+            engine,
+            "usr_1",
+            "mem_archived",
+            conversation_id="cnv_1",
+            platform_id="web",
+        )
 
-        all_memories = json.loads(await _list_memories_impl(engine, "usr_1"))
+        all_memories = json.loads(
+            await _list_memories_impl(
+                engine,
+                "usr_1",
+                conversation_id="cnv_1",
+                platform_id="web",
+            )
+        )
         belief_memories = json.loads(
             await _list_memories_impl(
                 engine,
                 "usr_1",
                 memory_type=MemoryObjectType.BELIEF.value,
+                conversation_id="cnv_1",
+                platform_id="web",
             )
         )
 
@@ -545,6 +729,7 @@ async def test_mcp_list_memories(
             MemoryStatus.ARCHIVED.value
         )
         assert all(memory["id"] != "mem_pending" for memory in all_memories)
+        assert all(memory["id"] != "mem_private" for memory in all_memories)
         assert all(memory["id"] != "mem_declined" for memory in all_memories)
         assert len(belief_memories) == 1
         assert belief_memories[0]["id"] == "mem_belief"

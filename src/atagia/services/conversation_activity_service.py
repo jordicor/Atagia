@@ -67,6 +67,11 @@ class ConversationActivityService:
         *,
         workspace_id: str | None = None,
         assistant_mode_id: str | None = None,
+        namespace_filter: bool = False,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
         as_of: str | None = None,
     ) -> list[dict[str, Any]]:
         conversations = ConversationRepository(connection, self.runtime.clock)
@@ -75,6 +80,11 @@ class ConversationActivityService:
             user_id,
             workspace_id=workspace_id,
             assistant_mode_id=assistant_mode_id,
+            namespace_filter=namespace_filter,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
         )
         stats_rows = [
             await self._compute_conversation_stats(
@@ -124,6 +134,11 @@ class ConversationActivityService:
         conversation_id: str | None = None,
         workspace_id: str | None = None,
         assistant_mode_id: str | None = None,
+        namespace_filter: bool = False,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
         as_of: str | None = None,
         refresh: bool = True,
     ) -> dict[str, Any]:
@@ -147,6 +162,11 @@ class ConversationActivityService:
                     user_id,
                     workspace_id=workspace_id,
                     assistant_mode_id=assistant_mode_id,
+                    namespace_filter=namespace_filter,
+                    user_persona_id=user_persona_id,
+                    platform_id=platform_id,
+                    character_id=character_id,
+                    incognito=incognito,
                     as_of=as_of,
                 )
             conversations = await ConversationActivityRepository(
@@ -156,6 +176,11 @@ class ConversationActivityService:
                 user_id=user_id,
                 workspace_id=workspace_id,
                 assistant_mode_id=assistant_mode_id,
+                namespace_filter=namespace_filter,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
                 as_of=as_of,
                 active_only=False,
             )
@@ -166,6 +191,10 @@ class ConversationActivityService:
                 "conversation_id": conversation_id,
                 "workspace_id": workspace_id,
                 "assistant_mode_id": assistant_mode_id,
+                "user_persona_id": user_persona_id,
+                "platform_id": platform_id,
+                "character_id": character_id,
+                "incognito": incognito,
             },
             "conversations": conversations,
             "conversation_count": len(conversations),
@@ -179,6 +208,10 @@ class ConversationActivityService:
         limit: int = 5,
         workspace_id: str | None = None,
         assistant_mode_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
         as_of: str | None = None,
         refresh: bool = True,
     ) -> list[dict[str, Any]]:
@@ -194,12 +227,22 @@ class ConversationActivityService:
                 user_id,
                 workspace_id=workspace_id,
                 assistant_mode_id=assistant_mode_id,
+                namespace_filter=platform_id is not None,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
                 as_of=as_of,
             )
         return await ConversationActivityRepository(connection, self.runtime.clock).list_activity_stats(
             user_id=user_id,
             workspace_id=workspace_id,
             assistant_mode_id=assistant_mode_id,
+            namespace_filter=platform_id is not None,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
             limit=effective_limit,
             as_of=as_of,
             active_only=True,
@@ -214,6 +257,10 @@ class ConversationActivityService:
         max_messages: int = _RECENT_MESSAGE_BUDGET_DEFAULT,
         as_of: str | None = None,
         refresh_stats: bool = True,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
     ) -> dict[str, Any]:
         effective_max_messages = self._bounded_int(
             max_messages,
@@ -223,7 +270,13 @@ class ConversationActivityService:
         )
         conversations = ConversationRepository(connection, self.runtime.clock)
         conversation = await conversations.get_conversation(conversation_id, user_id)
-        if conversation is None:
+        if conversation is None or not self._conversation_matches_namespace(
+            conversation,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+        ):
             return {
                 "user_id": user_id,
                 "conversation_id": conversation_id,
@@ -269,6 +322,10 @@ class ConversationActivityService:
         limit: int = 3,
         workspace_id: str | None = None,
         assistant_mode_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
         as_of: str | None = None,
         lead_time_minutes: int | None = None,
         total_message_budget: int = 24,
@@ -299,6 +356,10 @@ class ConversationActivityService:
             limit=effective_limit,
             workspace_id=workspace_id,
             assistant_mode_id=assistant_mode_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
             as_of=resolved_as_of.isoformat(),
             refresh=True,
         )
@@ -316,6 +377,10 @@ class ConversationActivityService:
                 max_messages=min(effective_per_conversation_budget, remaining_budget),
                 as_of=resolved_as_of.isoformat(),
                 refresh_stats=False,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
             )
             warmed.append(warmup)
             remaining_budget -= int(warmup["recent_message_count"])
@@ -328,6 +393,10 @@ class ConversationActivityService:
             "per_conversation_message_budget": effective_per_conversation_budget,
             "workspace_id": workspace_id,
             "assistant_mode_id": assistant_mode_id,
+            "user_persona_id": user_persona_id,
+            "platform_id": platform_id,
+            "character_id": character_id,
+            "incognito": incognito,
             "hot_conversations": hot_conversations,
             "warmed_conversations": warmed,
             "warmed_conversation_count": len(warmed),
@@ -387,6 +456,24 @@ class ConversationActivityService:
             warmup_errors=[],
         )
         return payload
+
+    @staticmethod
+    def _conversation_matches_namespace(
+        conversation: dict[str, Any],
+        *,
+        user_persona_id: str | None,
+        platform_id: str | None,
+        character_id: str | None,
+        incognito: bool,
+    ) -> bool:
+        if platform_id is None:
+            return True
+        return (
+            conversation.get("platform_id") == platform_id
+            and conversation.get("user_persona_id") == user_persona_id
+            and conversation.get("character_id") == character_id
+            and bool(conversation.get("incognito")) is bool(incognito)
+        )
 
     async def _finalize_warmup_payload(
         self,
@@ -553,7 +640,14 @@ class ConversationActivityService:
             "user_id": user_id,
             "conversation_id": str(conversation["id"]),
             "workspace_id": conversation.get("workspace_id"),
-            "assistant_mode_id": str(conversation["assistant_mode_id"]),
+            "assistant_mode_id": conversation.get("assistant_mode_id"),
+            "user_persona_id": conversation.get("user_persona_id"),
+            "platform_id": conversation.get("platform_id"),
+            "character_id": conversation.get("character_id") or conversation.get("workspace_id"),
+            "incognito": bool(conversation.get("incognito") or conversation.get("isolated_mode")),
+            "remember_across_chats": conversation.get("remember_across_chats", True),
+            "remember_across_devices": conversation.get("remember_across_devices", True),
+            "effective_policy_hash": conversation.get("effective_policy_hash"),
             "timezone": timezone_name,
             "first_message_at": first_message_at.isoformat() if first_message_at is not None else None,
             "last_message_at": last_message_at.isoformat() if last_message_at is not None else None,

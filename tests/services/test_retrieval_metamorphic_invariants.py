@@ -22,7 +22,7 @@ from atagia.core.repositories import (
 from atagia.memory.policy_manifest import (
     ManifestLoader,
     PolicyResolver,
-    ResolvedPolicy,
+    ResolvedRetrievalPolicy,
     sync_assistant_modes,
 )
 from atagia.models.schemas_memory import (
@@ -49,6 +49,9 @@ from atagia.services.retrieval_pipeline import RetrievalPipeline
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 _MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
+_CANDIDATE_SCORE_KEY_PATTERN = re.compile(
+    r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
+)
 _QUERY = "shared invariant token"
 
 
@@ -87,14 +90,11 @@ class InvariantProvider(LLMProvider):
                 output_text=json.dumps(self.need_response),
             )
         if purpose == "applicability_scoring":
-            memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
             payload = {
                 "scores": [
-                    {
-                        "memory_id": memory_id,
-                        "llm_applicability": self.score_map.get(memory_id, 0.7),
-                    }
-                    for memory_id in memory_ids
+                    {"score_key": score_key, "llm_applicability": self.score_map.get(memory_id, 0.7)}
+                    for memory_id, score_key in candidate_keys
                 ],
             }
             return LLMCompletionResponse(
@@ -141,7 +141,7 @@ async def _build_runtime(
     MemoryObjectRepository,
     RetrievalPipeline,
     InvariantProvider,
-    ResolvedPolicy,
+    ResolvedRetrievalPolicy,
     ExtractionConversationContext,
 ]:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
@@ -206,6 +206,12 @@ async def _seed_memory(
         MemoryScope.CONVERSATION,
         MemoryScope.EPHEMERAL_SESSION,
     }
+    scope_canonical = {
+        MemoryScope.CONVERSATION: MemoryScope.CHAT.value,
+        MemoryScope.EPHEMERAL_SESSION: MemoryScope.CHAT.value,
+        MemoryScope.WORKSPACE: MemoryScope.CHARACTER.value,
+        MemoryScope.GLOBAL_USER: MemoryScope.USER.value,
+    }.get(scope)
     resolved_workspace_id = workspace_id if scope in scoped_workspace_scopes else None
     resolved_conversation_id = conversation_id if scope in scoped_conversation_scopes else None
     return await memories.create_memory_object(
@@ -223,6 +229,9 @@ async def _seed_memory(
         payload=payload,
         status=status,
         memory_id=memory_id,
+        platform_id="default",
+        character_id=workspace_id if scope is MemoryScope.WORKSPACE else None,
+        scope_canonical=scope_canonical,
     )
 
 
@@ -230,7 +239,7 @@ async def _run_pipeline(
     pipeline: RetrievalPipeline,
     *,
     context: ExtractionConversationContext,
-    policy: ResolvedPolicy,
+    policy: ResolvedRetrievalPolicy,
     ablation: AblationConfig | None = None,
 ) -> PipelineResult:
     return await pipeline.execute(
@@ -332,7 +341,7 @@ async def test_hostile_cross_user_distractors_never_enter_retrieval_outputs() ->
     [MemoryScope.WORKSPACE, MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION],
 )
 @pytest.mark.parametrize("small_corpus_ratio", [0.0, 0.99])
-async def test_assistant_mode_boundary_matches_normal_and_small_corpus_paths(
+async def test_retrieval_profile_is_not_a_namespace_boundary(
     scope: MemoryScope,
     small_corpus_ratio: float,
 ) -> None:
@@ -345,7 +354,7 @@ async def test_assistant_mode_boundary_matches_normal_and_small_corpus_paths(
         await _seed_memory(
             memories,
             memory_id="mem_allowed",
-            canonical_text=f"{_QUERY} visible within the current assistant mode.",
+            canonical_text=f"{_QUERY} visible within the current retrieval profile.",
             scope=scope,
         )
         await _seed_memory(
@@ -360,11 +369,11 @@ async def test_assistant_mode_boundary_matches_normal_and_small_corpus_paths(
 
         assert result.small_corpus_mode is (small_corpus_ratio > 0.0)
         assert "mem_allowed" in _candidate_ids(result.raw_candidates)
-        assert "mem_other_mode" not in _candidate_ids(result.raw_candidates)
-        assert "mem_other_mode" not in _scored_ids(result)
-        assert "mem_other_mode" not in result.composed_context.selected_memory_ids
-        assert "mem_other_mode" not in _custody_ids(result)
-        assert "mem_other_mode" not in _score_request_memory_ids(provider)
+        assert "mem_other_mode" in _candidate_ids(result.raw_candidates)
+        assert "mem_other_mode" in _scored_ids(result)
+        assert "mem_other_mode" in result.composed_context.selected_memory_ids
+        assert "mem_other_mode" in _custody_ids(result)
+        assert "mem_other_mode" in _score_request_memory_ids(provider)
     finally:
         await connection.close()
 

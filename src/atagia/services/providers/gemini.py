@@ -236,16 +236,34 @@ def _split_messages(
 ) -> tuple[str | None, list[genai_types.Content]]:
     system_messages: list[str] = []
     contents: list[genai_types.Content] = []
+    tool_names_by_call_id: dict[str, str] = {}
 
     for message in request.messages:
         if message.role == "system":
             system_messages.append(message.content)
             continue
         if message.role == "assistant":
+            parts = []
+            if message.content:
+                parts.append(genai_types.Part.from_text(text=message.content))
+            for tool_call in message.tool_calls:
+                call_id = _getattr_or_key(tool_call, "id")
+                name = str(tool_call.get("name") or "tool")
+                if isinstance(call_id, str) and call_id:
+                    tool_names_by_call_id[call_id] = name
+                parts.append(
+                    genai_types.Part(
+                        function_call=genai_types.FunctionCall(
+                            id=call_id if isinstance(call_id, str) else None,
+                            name=name,
+                            args=_tool_call_args(tool_call),
+                        )
+                    )
+                )
             contents.append(
                 genai_types.Content(
                     role="model",
-                    parts=[genai_types.Part.from_text(text=message.content)],
+                    parts=parts or [genai_types.Part.from_text(text="")],
                 )
             )
             continue
@@ -254,9 +272,15 @@ def _split_messages(
                 genai_types.Content(
                     role="user",
                     parts=[
-                        genai_types.Part.from_function_response(
-                            name=message.name or "tool",
-                            response={"content": message.content},
+                        genai_types.Part(
+                            function_response=genai_types.FunctionResponse(
+                                id=message.name,
+                                name=_gemini_tool_response_name(
+                                    message.name,
+                                    tool_names_by_call_id,
+                                ),
+                                response={"content": message.content},
+                            )
                         )
                     ],
                 )
@@ -270,6 +294,28 @@ def _split_messages(
         )
 
     return "\n\n".join(system_messages) or None, contents
+
+
+def _gemini_tool_response_name(
+    tool_call_id: str | None,
+    tool_names_by_call_id: dict[str, str],
+) -> str:
+    if tool_call_id is not None and tool_call_id in tool_names_by_call_id:
+        return tool_names_by_call_id[tool_call_id]
+    return tool_call_id or "tool"
+
+
+def _tool_call_args(tool_call: dict[str, Any]) -> dict[str, Any]:
+    raw_arguments = tool_call.get("input", tool_call.get("arguments", {}))
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+    if isinstance(raw_arguments, str) and raw_arguments.strip():
+        try:
+            parsed = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            return {"arguments": raw_arguments}
+        return parsed if isinstance(parsed, dict) else {"arguments": parsed}
+    return {}
 
 
 def _tools_for_gemini(tools: list[Any]) -> list[genai_types.Tool]:

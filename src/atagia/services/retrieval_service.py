@@ -7,15 +7,16 @@ from typing import Any
 
 import aiosqlite
 
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
+from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
 from atagia.core.topic_repository import TopicRepository
 from atagia.models.schemas_memory import ExtractionConversationContext, RetrievalTrace
 from atagia.models.schemas_memory import ResolvedOperationalProfile, TopicWorkingSetTrace
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
+    apply_conversation_policy_overlay,
     recent_context,
-    resolve_assistant_mode_id,
+    resolve_retrieval_profile_id,
     resolve_policy,
 )
 from atagia.services.errors import ConversationNotFoundError
@@ -98,22 +99,31 @@ class RetrievalService:
         trace: RetrievalTrace | None = None,
     ) -> PipelineResult:
         conversations = ConversationRepository(connection, self.runtime.clock)
+        users = UserRepository(connection, self.runtime.clock)
         messages = MessageRepository(connection, self.runtime.clock)
         memories = MemoryObjectRepository(connection, self.runtime.clock)
 
         active_conversation = conversation or await conversations.get_conversation(conversation_id, user_id)
         if active_conversation is None:
             raise ConversationNotFoundError("Conversation not found for user")
+        memory_preferences = await users.get_memory_preferences(user_id)
 
-        assistant_mode_id = resolve_assistant_mode_id(
+        assistant_mode_id = resolve_retrieval_profile_id(
             str(active_conversation["assistant_mode_id"]),
             mode,
         )
+        if trace is not None:
+            trace.requested_mode = mode
+            trace.effective_mode = assistant_mode_id
         resolved_policy = resolve_policy(
             self.runtime.manifests,
             assistant_mode_id,
             self.runtime.policy_resolver,
             operational_profile,
+        )
+        resolved_policy = apply_conversation_policy_overlay(
+            resolved_policy,
+            active_conversation,
         )
         active_messages = stored_messages or await messages.get_recent_messages(
             conversation_id,
@@ -131,7 +141,23 @@ class RetrievalService:
             source_message_id=source_message_id,
             workspace_id=active_conversation["workspace_id"],
             assistant_mode_id=assistant_mode_id,
+            user_persona_id=active_conversation.get("user_persona_id"),
+            platform_id=str(active_conversation.get("platform_id") or "default"),
+            character_id=(
+                active_conversation.get("character_id")
+                if active_conversation.get("character_id") is not None
+                else active_conversation.get("workspace_id")
+            ),
+            mode=str(active_conversation.get("mode") or assistant_mode_id),
             recent_messages=recent_context(prior_messages),
+            temporary=bool(active_conversation.get("temporary")),
+            temporary_ttl_seconds=active_conversation.get("temporary_ttl_seconds"),
+            purge_on_close=bool(active_conversation.get("purge_on_close")),
+            isolated_mode=bool(active_conversation.get("isolated_mode")),
+            incognito=bool(active_conversation.get("incognito")) or bool(active_conversation.get("isolated_mode")),
+            remember_across_chats=bool(memory_preferences["remember_across_chats"]),
+            remember_across_devices=bool(memory_preferences["remember_across_devices"]),
+            memory_privacy_mode=memory_preferences["memory_privacy_mode"],
         )
         cold_start = (
             await memories.count_for_context(
@@ -140,6 +166,12 @@ class RetrievalService:
                 workspace_id=active_conversation["workspace_id"],
                 conversation_id=conversation_id,
                 assistant_mode_id=assistant_mode_id,
+                user_persona_id=conversation_context.user_persona_id,
+                platform_id=conversation_context.platform_id,
+                character_id=conversation_context.character_id,
+                incognito=conversation_context.incognito,
+                remember_across_chats=conversation_context.remember_across_chats,
+                remember_across_devices=conversation_context.remember_across_devices,
             )
             == 0
         )

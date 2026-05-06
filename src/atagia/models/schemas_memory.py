@@ -22,11 +22,47 @@ class MemoryObjectType(str, Enum):
 
 
 class MemoryScope(str, Enum):
+    # Legacy scopes kept during the additive phase of the namespace redesign.
+    # Phase 11 will remove them from the CHECK constraint and enum entries.
     GLOBAL_USER = "global_user"
     ASSISTANT_MODE = "assistant_mode"
     WORKSPACE = "workspace"
     CONVERSATION = "conversation"
     EPHEMERAL_SESSION = "ephemeral_session"
+    # Canonical post-redesign scopes (chat / character / user).
+    CHAT = "chat"
+    CHARACTER = "character"
+    USER = "user"
+
+
+class MemorySensitivity(str, Enum):
+    """Per-fact sensitivity gate introduced by the namespace redesign.
+
+    Storage and admin/review paths may carry `unknown`; ordinary retrieval
+    treats it as fail-closed (hidden) until a writer assigns a concrete value.
+    """
+
+    UNKNOWN = "unknown"
+    PUBLIC = "public"
+    PRIVATE = "private"
+    SECRET = "secret"
+
+
+# Canonical post-redesign scopes (retrieval/extraction work after the cutover).
+CANONICAL_SCOPES: frozenset[MemoryScope] = frozenset(
+    {MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER}
+)
+
+# Legacy scopes that survive only in storage during the additive phase.
+LEGACY_SCOPES: frozenset[MemoryScope] = frozenset(
+    {
+        MemoryScope.GLOBAL_USER,
+        MemoryScope.ASSISTANT_MODE,
+        MemoryScope.WORKSPACE,
+        MemoryScope.CONVERSATION,
+        MemoryScope.EPHEMERAL_SESSION,
+    }
+)
 
 
 class MemorySourceKind(str, Enum):
@@ -69,9 +105,73 @@ class MemoryStatus(str, Enum):
     DECLINED = "declined"
 
 
+class IngestOrigin(str, Enum):
+    """Canonical source kind for sidecar message ingestion."""
+
+    LIVE_TURN = "live_turn"
+    BACKFILL = "backfill"
+    ADMIN_IMPORT = "admin_import"
+
+
+class ConfirmationStrategy(str, Enum):
+    """How extraction may handle memories that require explicit consent."""
+
+    LIVE_PROMPT_ALLOWED = "live_prompt_allowed"
+    NEVER_PROMPT_USER = "never_prompt_user"
+    ADMIN_REVIEW_ONLY = "admin_review_only"
+
+
+class MemoryPrivacyMode(str, Enum):
+    """User-selected memory trust profile for storage decisions."""
+
+    BALANCED = "balanced"
+    TRUSTED_PRIVATE = "trusted_private"
+
+
+def default_confirmation_strategy_for_origin(
+    ingest_origin: IngestOrigin | str | None,
+) -> ConfirmationStrategy:
+    """Resolve the safe default confirmation strategy for an ingest origin."""
+
+    origin = IngestOrigin(ingest_origin or IngestOrigin.LIVE_TURN.value)
+    if origin is IngestOrigin.LIVE_TURN:
+        return ConfirmationStrategy.LIVE_PROMPT_ALLOWED
+    return ConfirmationStrategy.ADMIN_REVIEW_ONLY
+
+
+def resolve_confirmation_strategy(
+    *,
+    ingest_origin: IngestOrigin | str | None,
+    confirmation_strategy: ConfirmationStrategy | str | None,
+) -> ConfirmationStrategy:
+    """Return an explicit confirmation strategy or the origin-derived default."""
+
+    if confirmation_strategy is None:
+        return default_confirmation_strategy_for_origin(ingest_origin)
+    return ConfirmationStrategy(confirmation_strategy)
+
+
+def resolve_memory_privacy_mode(
+    memory_privacy_mode: MemoryPrivacyMode | str | None,
+) -> MemoryPrivacyMode:
+    """Return the resolved user memory privacy mode."""
+
+    if memory_privacy_mode is None:
+        return MemoryPrivacyMode.BALANCED
+    return MemoryPrivacyMode(memory_privacy_mode)
+
+
+class ConversationStatus(str, Enum):
+    ACTIVE = "active"
+    CLOSED = "closed"
+    ARCHIVED = "archived"
+    PENDING_DELETION = "pending_deletion"
+
+
 class SummaryViewKind(str, Enum):
     CONVERSATION_CHUNK = "conversation_chunk"
     WORKSPACE_ROLLUP = "workspace_rollup"
+    CHARACTER_ROLLUP = "character_rollup"
     CONTEXT_VIEW = "context_view"
     EPISODE = "episode"
     THEMATIC_PROFILE = "thematic_profile"
@@ -127,7 +227,7 @@ class ConsequenceSentiment(str, Enum):
     NEUTRAL = "neutral"
 
 
-class AssistantModeId(str, Enum):
+class RetrievalProfileId(str, Enum):
     CODING_DEBUG = "coding_debug"
     RESEARCH_DEEP_DIVE = "research_deep_dive"
     COMPANION = "companion"
@@ -390,7 +490,7 @@ class ResolvedOperationalProfile(BaseModel):
 
 
 class ContextCachePolicy(BaseModel):
-    """Adaptive context-cache settings attached to an assistant mode."""
+    """Adaptive context-cache settings attached to a retrieval profile."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -400,16 +500,14 @@ class ContextCachePolicy(BaseModel):
     max_minutes_without_refresh: int = Field(ge=1)
 
 
-class AssistantModeManifest(BaseModel):
-    """Validated assistant mode manifest loaded from JSON files."""
+class RetrievalProfileManifest(BaseModel):
+    """Validated retrieval profile loaded from JSON files."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    assistant_mode_id: AssistantModeId
+    profile_id: RetrievalProfileId
     display_name: str = Field(min_length=1)
-    cross_chat_allowed: bool
     allow_intimacy_context: bool = False
-    allowed_scopes: list[MemoryScope] = Field(min_length=1)
     preferred_memory_types: list[MemoryObjectType] = Field(min_length=1)
     need_triggers: list[NeedTrigger] = Field(default_factory=list)
     contract_dimensions_priority: list[str] = Field(min_length=1)
@@ -419,11 +517,6 @@ class AssistantModeManifest(BaseModel):
     retrieval_params: RetrievalParams
     context_cache_policy: ContextCachePolicy
     prompt_hash: str | None = Field(default=None, exclude=True)
-
-    @field_validator("allowed_scopes")
-    @classmethod
-    def validate_allowed_scopes(cls, values: list[MemoryScope]) -> list[MemoryScope]:
-        return _ensure_unique_values(values)
 
     @field_validator("preferred_memory_types")
     @classmethod
@@ -465,7 +558,34 @@ class ExtractionConversationContext(BaseModel):
     source_message_id: str
     workspace_id: str | None = None
     assistant_mode_id: str
+    user_persona_id: str | None = None
+    platform_id: str = "default"
+    character_id: str | None = None
+    mode: str | None = None
     recent_messages: list[ExtractionContextMessage] = Field(default_factory=list)
+    temporary: bool = False
+    temporary_ttl_seconds: int | None = None
+    purge_on_close: bool = False
+    isolated_mode: bool = False
+    incognito: bool = False
+    remember_across_chats: bool = True
+    remember_across_devices: bool = True
+    ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
+    confirmation_strategy: ConfirmationStrategy | None = None
+    memory_privacy_mode: MemoryPrivacyMode = MemoryPrivacyMode.BALANCED
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_confirmation_strategy_default(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        if normalized.get("confirmation_strategy") is None:
+            normalized["confirmation_strategy"] = resolve_confirmation_strategy(
+                ingest_origin=normalized.get("ingest_origin"),
+                confirmation_strategy=None,
+            )
+        return normalized
 
 
 class ExtractedMemoryBase(BaseModel):
@@ -479,6 +599,11 @@ class ExtractedMemoryBase(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     source_kind: MemorySourceKind
     privacy_level: int = Field(ge=0, le=3)
+    sensitivity: MemorySensitivity = MemorySensitivity.UNKNOWN
+    themes: list[str] = Field(default_factory=list)
+    auto_expires: bool = False
+    platform_locked: bool = False
+    platform_lock_reason: str | None = None
     memory_category: MemoryCategory = MemoryCategory.UNKNOWN
     intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
     intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -498,7 +623,13 @@ class ExtractedMemoryBase(BaseModel):
             return data
         normalized = dict(data)
         if "canonical_text" not in normalized:
-            for field_name in ("text", "memory_text", "summary_text", "description", "content"):
+            for field_name in (
+                "text",
+                "memory_text",
+                "summary_text",
+                "description",
+                "content",
+            ):
                 value = normalized.get(field_name)
                 if isinstance(value, str) and value.strip():
                     normalized["canonical_text"] = value
@@ -509,6 +640,10 @@ class ExtractedMemoryBase(BaseModel):
         normalized.setdefault("scope", MemoryScope.CONVERSATION.value)
         normalized.setdefault("source_kind", MemorySourceKind.EXTRACTED.value)
         normalized.setdefault("privacy_level", 0)
+        normalized.setdefault("sensitivity", MemorySensitivity.UNKNOWN.value)
+        normalized.setdefault("themes", [])
+        normalized.setdefault("auto_expires", False)
+        normalized.setdefault("platform_locked", False)
         normalized.setdefault("intimacy_boundary", IntimacyBoundary.ORDINARY.value)
         normalized.setdefault("intimacy_boundary_confidence", 0.0)
         normalized.setdefault("payload", {})
@@ -526,6 +661,30 @@ class ExtractedMemoryBase(BaseModel):
     @field_validator("index_text")
     @classmethod
     def validate_index_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("themes")
+    @classmethod
+    def validate_themes(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            theme = str(item).strip()
+            if not theme:
+                continue
+            key = theme.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(theme)
+        return normalized
+
+    @field_validator("platform_lock_reason")
+    @classmethod
+    def validate_platform_lock_reason(cls, value: str | None) -> str | None:
         if value is None:
             return None
         normalized = value.strip()
@@ -553,8 +712,7 @@ class ExtractedMemoryBase(BaseModel):
     def validate_language_codes(self) -> "ExtractedMemoryBase":
         if not self.language_codes:
             raise ValueError(
-                "language_codes must contain at least one ISO 639-1 code "
-                "for the language of canonical_text"
+                "language_codes must contain at least one ISO 639-1 code for the language of canonical_text"
             )
         seen: set[str] = set()
         for code in self.language_codes:
@@ -615,9 +773,7 @@ class ExtractionResult(BaseModel):
         evidences = list(normalized.get("evidences", []))
         beliefs: list[Any] = []
         for item in normalized.get("beliefs", []):
-            if isinstance(item, dict) and (
-                item.get("claim_key") is None or item.get("claim_value") is None
-            ):
+            if isinstance(item, dict) and (item.get("claim_key") is None or item.get("claim_value") is None):
                 evidences.append(dict(item))
                 continue
             beliefs.append(item)
@@ -641,21 +797,22 @@ class ExtractionResult(BaseModel):
                 if not isinstance(item, dict):
                     continue
                 normalized_item = dict(item)
-                item_type = str(
-                    normalized_item.get("memory_type")
-                    or normalized_item.get("item_type")
-                    or normalized_item.get("object_type")
-                    or normalized_item.get("type")
-                    or normalized_item.get("kind")
-                    or ""
-                ).strip().lower()
-                if (
-                    ("claim_key" in normalized_item and "claim_value" in normalized_item)
-                    or (
-                        item_type == MemoryObjectType.BELIEF.value
-                        and normalized_item.get("claim_key") is not None
-                        and normalized_item.get("claim_value") is not None
+                item_type = (
+                    str(
+                        normalized_item.get("memory_type")
+                        or normalized_item.get("item_type")
+                        or normalized_item.get("object_type")
+                        or normalized_item.get("type")
+                        or normalized_item.get("kind")
+                        or ""
                     )
+                    .strip()
+                    .lower()
+                )
+                if ("claim_key" in normalized_item and "claim_value" in normalized_item) or (
+                    item_type == MemoryObjectType.BELIEF.value
+                    and normalized_item.get("claim_key") is not None
+                    and normalized_item.get("claim_value") is not None
                 ):
                     claim_key = str(normalized_item.get("claim_key") or "").strip()
                     claim_value_raw = normalized_item.get("claim_value")
@@ -690,7 +847,12 @@ class ExtractionResult(BaseModel):
         normalized["contract_signals"] = contract_signals
         normalized["state_updates"] = state_updates
         if used_legacy_container:
-            for field_name in ("evidences", "beliefs", "contract_signals", "state_updates"):
+            for field_name in (
+                "evidences",
+                "beliefs",
+                "contract_signals",
+                "state_updates",
+            ):
                 normalized[field_name] = [
                     (
                         {
@@ -714,9 +876,7 @@ class ExtractionResult(BaseModel):
 
     @model_validator(mode="after")
     def validate_nothing_durable_consistency(self) -> "ExtractionResult":
-        if self.nothing_durable and (
-            self.evidences or self.beliefs or self.contract_signals or self.state_updates
-        ):
+        if self.nothing_durable and (self.evidences or self.beliefs or self.contract_signals or self.state_updates):
             raise ValueError("nothing_durable=true but extraction lists are non-empty")
         return self
 
@@ -760,11 +920,7 @@ class ContractProjectionResult(BaseModel):
                 continue
             if not isinstance(signal, dict):
                 continue
-            if (
-                not signal.get("canonical_text")
-                or not signal.get("dimension_name")
-                or not signal.get("scope")
-            ):
+            if not signal.get("canonical_text") or not signal.get("dimension_name") or not signal.get("scope"):
                 continue
             normalized_signal = dict(signal)
             if not isinstance(normalized_signal.get("value_json"), dict):
@@ -927,9 +1083,7 @@ class SparseQueryHint(BaseModel):
     @model_validator(mode="after")
     def validate_not_empty(self) -> "SparseQueryHint":
         if self.fts_phrase is None and not self.quoted_phrases and not self.must_keep_terms:
-            raise ValueError(
-                "SparseQueryHint requires at least one of fts_phrase, quoted_phrases, or must_keep_terms"
-            )
+            raise ValueError("SparseQueryHint requires at least one of fts_phrase, quoted_phrases, or must_keep_terms")
         return self
 
 
@@ -994,13 +1148,9 @@ class QueryIntelligenceResult(BaseModel):
         normalized_hints: list[SparseQueryHint] = []
         for hint in self.sparse_query_hints:
             if hint.sub_query_text not in sub_queries:
-                raise ValueError(
-                    "SparseQueryHint.sub_query_text must reference an item from sub_queries"
-                )
+                raise ValueError("SparseQueryHint.sub_query_text must reference an item from sub_queries")
             if hint.sub_query_text in seen_hint_targets:
-                raise ValueError(
-                    "SparseQueryHint.sub_query_text values must be unique"
-                )
+                raise ValueError("SparseQueryHint.sub_query_text values must be unique")
             seen_hint_targets.add(hint.sub_query_text)
             normalized_hints.append(
                 _normalize_sparse_hint_precision_fields(
@@ -1015,31 +1165,27 @@ class QueryIntelligenceResult(BaseModel):
                 if hint.quoted_phrases or hint.must_keep_terms:
                     continue
                 raise ValueError(
-                    "callback sparse_query_hints must preserve an explicit anchor "
-                    "via quoted_phrases or must_keep_terms"
+                    "callback sparse_query_hints must preserve an explicit anchor via quoted_phrases or must_keep_terms"
                 )
         if self.query_type == "slot_fill":
             for hint in self.sparse_query_hints:
                 if hint.quoted_phrases or hint.must_keep_terms:
                     continue
                 raise ValueError(
-                    "slot_fill sparse_query_hints must preserve concrete anchors "
-                    "via quoted_phrases or must_keep_terms"
+                    "slot_fill sparse_query_hints must preserve concrete anchors via quoted_phrases or must_keep_terms"
                 )
         if self.query_type == "broad_list":
             for hint in self.sparse_query_hints:
                 if hint.quoted_phrases or hint.must_keep_terms:
                     continue
                 raise ValueError(
-                    "broad_list sparse_query_hints must preserve explicit facet anchors "
-                    "via quoted_phrases or must_keep_terms"
+                    "broad_list sparse_query_hints must preserve explicit facet anchors via quoted_phrases or must_keep_terms"
                 )
         if self.query_type == "broad_list" and len(self.sparse_query_hints) > 1:
             signatures = [_sparse_hint_signature(hint) for hint in self.sparse_query_hints]
             if len(signatures) != len(set(signatures)):
                 raise ValueError(
-                    "broad_list sparse_query_hints must preserve distinct facet anchors "
-                    "across sub_queries"
+                    "broad_list sparse_query_hints must preserve distinct facet anchors across sub_queries"
                 )
         return self
 
@@ -1089,6 +1235,12 @@ class RetrievalPlan(BaseModel):
     assistant_mode_id: str
     workspace_id: str | None = None
     conversation_id: str
+    user_persona_id: str | None = None
+    platform_id: str = "default"
+    character_id: str | None = None
+    incognito: bool = False
+    remember_across_chats: bool = True
+    remember_across_devices: bool = True
     fts_queries: list[str] = Field(default_factory=list)
     sub_query_plans: list[PlannedSubQuery] = Field(default_factory=list)
     callback_bias: bool = False
@@ -1205,6 +1357,13 @@ class MemoryObject(BaseModel):
     workspace_id: str | None = None
     conversation_id: str | None = None
     assistant_mode_id: str | None = None
+    # Namespace redesign identity axes. `user_persona_id`, `platform_id` and
+    # `character_id` are explicit caller inputs (never inferred from prompt
+    # text). `platform_id` is required at write time after the public cut;
+    # storage keeps it nullable for legacy rows during the additive phase.
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
     object_type: MemoryObjectType
     scope: MemoryScope
     canonical_text: str
@@ -1216,6 +1375,11 @@ class MemoryObject(BaseModel):
     vitality: float = 0.0
     maya_score: float = 0.0
     privacy_level: int = 0
+    sensitivity: MemorySensitivity = MemorySensitivity.UNKNOWN
+    themes: list[str] = Field(default_factory=list)
+    auto_expires: bool = False
+    platform_locked: bool = False
+    platform_id_lock: str | None = None
     memory_category: MemoryCategory = MemoryCategory.UNKNOWN
     intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
     intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -1240,20 +1404,33 @@ class ContractDimensionCurrent(BaseModel):
     workspace_id: str | None = None
     conversation_id: str | None = None
     assistant_mode_id: str | None = None
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
     scope: MemoryScope
     dimension_name: str
     value_json: dict[str, Any] = Field(default_factory=dict)
     confidence: float
     source_memory_id: str
     updated_at: datetime
+    sensitivity: MemorySensitivity = MemorySensitivity.UNKNOWN
+    themes: list[str] = Field(default_factory=list)
+    platform_locked: bool = False
+    platform_id_lock: str | None = None
 
 
 class MemoryConsentProfile(BaseModel):
-    """Per-user consent counts for sensitive memory categories."""
+    """Per-user consent counts for sensitive memory categories.
+
+    The plan re-keys consent to `(user_id, user_persona_key, category)` so
+    sensitive interactions in one persona never affect another. The base
+    identity is represented by `user_persona_id=None`.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     user_id: str
+    user_persona_id: str | None = None
     category: MemoryCategory
     confirmed_count: int = Field(ge=0)
     declined_count: int = Field(ge=0)
@@ -1446,6 +1623,10 @@ class TopicTraceItem(BaseModel):
     last_touched_at: str | None = None
     confidence: float | None = None
     privacy_level: int | None = None
+    sensitivity: MemorySensitivity = MemorySensitivity.PUBLIC
+    themes: list[str] = Field(default_factory=list)
+    platform_locked: bool = False
+    platform_id_lock: str | None = None
     intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
     intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
@@ -1477,6 +1658,35 @@ class TopicWorkingSetTrace(BaseModel):
     freshness: TopicWorkingSetFreshness = Field(default_factory=TopicWorkingSetFreshness)
 
 
+StructuredOutputDiagnosticEvent = Literal[
+    "invalid_structured_output",
+    "malformed_domain_output",
+    "missing_after_retry",
+    "output_limit_drop",
+    "output_limit_split",
+]
+
+
+class LLMStructuredOutputDiagnostic(BaseModel):
+    """Structured-output issue observed during retrieval-time LLM calls."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    event: StructuredOutputDiagnosticEvent
+    purpose: str
+    model: str | None = None
+    candidate_count: int = Field(ge=0, default=0)
+    returned_count: int = Field(ge=0, default=0)
+    accepted_count: int = Field(ge=0, default=0)
+    malformed_count: int = Field(ge=0, default=0)
+    unknown_count: int = Field(ge=0, default=0)
+    duplicate_count: int = Field(ge=0, default=0)
+    missing_count: int = Field(ge=0, default=0)
+    retry_count: int = Field(ge=0, default=0)
+    details: dict[str, Any] = Field(default_factory=dict)
+    debug_artifact_path: str | None = None
+
+
 class RetrievalTrace(BaseModel):
     """Complete trace of a retrieval operation."""
 
@@ -1485,6 +1695,8 @@ class RetrievalTrace(BaseModel):
     query_text: str
     user_id: str
     conversation_id: str
+    requested_mode: str | None = None
+    effective_mode: str | None = None
     timestamp_iso: str
     small_corpus_mode: bool = False
     degraded_mode: bool = False
@@ -1495,4 +1707,5 @@ class RetrievalTrace(BaseModel):
     scoring: ScoringTrace | None = None
     composition: CompositionTrace | None = None
     retrieval_sufficiency: RetrievalSufficiencyDiagnostic | None = None
+    structured_output_diagnostics: list[LLMStructuredOutputDiagnostic] = Field(default_factory=list)
     total_duration_ms: float = Field(ge=0.0, default=0.0)

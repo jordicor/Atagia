@@ -2,9 +2,76 @@
 
 from __future__ import annotations
 
+from importlib import resources
+from pathlib import Path
+
 import pytest
 
-from atagia.core.config import MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS, Settings
+from atagia.core.config import (
+    MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS,
+    Settings,
+    default_resource_path,
+)
+
+
+def test_default_resource_paths_exist(monkeypatch) -> None:
+    monkeypatch.delenv("ATAGIA_MIGRATIONS_PATH", raising=False)
+    monkeypatch.delenv("ATAGIA_MANIFESTS_PATH", raising=False)
+    monkeypatch.delenv("ATAGIA_OPERATIONAL_PROFILES_PATH", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.migrations_dir().exists()
+    assert settings.manifests_dir().exists()
+    assert settings.operational_profiles_dir().exists()
+    assert default_resource_path("migrations")
+
+
+def test_relative_resource_env_paths_work_from_external_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ATAGIA_MIGRATIONS_PATH", "./migrations")
+    monkeypatch.setenv("ATAGIA_MANIFESTS_PATH", "./manifests")
+    monkeypatch.setenv("ATAGIA_OPERATIONAL_PROFILES_PATH", "./operational_profiles")
+
+    settings = Settings.from_env()
+
+    assert settings.migrations_dir().exists()
+    assert settings.manifests_dir().exists()
+    assert settings.operational_profiles_dir().exists()
+    assert settings.migrations_dir() != tmp_path / "migrations"
+
+
+def test_packaged_resources_are_present() -> None:
+    packaged = resources.files("atagia.resources")
+
+    assert packaged.joinpath("migrations", "0001_initial_schema.sql").is_file()
+    assert packaged.joinpath("manifests", "personal_assistant.json").is_file()
+    assert packaged.joinpath("operational_profiles", "normal.json").is_file()
+
+
+def test_openai_proxy_and_cors_settings_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_PROXY_MODEL_ID", "atagia-st")
+    monkeypatch.setenv("ATAGIA_PROXY_UPSTREAM_MODEL", "openai/gpt-4.1-mini")
+    monkeypatch.setenv("ATAGIA_PROXY_DEFAULT_MODE", "companion")
+    monkeypatch.setenv(
+        "ATAGIA_CORS_ALLOWED_ORIGINS",
+        "http://127.0.0.1:8000, http://localhost:3000",
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.openai_proxy_model_id == "atagia-st"
+    assert settings.openai_proxy_upstream_model == "openai/gpt-4.1-mini"
+    assert settings.openai_proxy_default_mode == "companion"
+    assert settings.cors_allowed_origins == (
+        "http://127.0.0.1:8000",
+        "http://localhost:3000",
+    )
 
 
 def test_workers_are_disabled_by_default(monkeypatch) -> None:
@@ -23,6 +90,41 @@ def test_workers_can_be_enabled_explicitly(monkeypatch) -> None:
     assert settings.workers_enabled is True
 
 
+def test_worker_circuit_breaker_settings_use_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("ATAGIA_WORKER_CIRCUIT_BREAKER_ENABLED", raising=False)
+    monkeypatch.delenv("ATAGIA_WORKER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", raising=False)
+    monkeypatch.delenv("ATAGIA_WORKER_CIRCUIT_BREAKER_WINDOW_SECONDS", raising=False)
+    monkeypatch.delenv("ATAGIA_WORKER_CIRCUIT_BREAKER_MIN_FAILURE_RATIO", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.worker_circuit_breaker_enabled is True
+    assert settings.worker_circuit_breaker_failure_threshold == 20
+    assert settings.worker_circuit_breaker_window_seconds == 180
+    assert settings.worker_circuit_breaker_min_failure_ratio == 0.8
+
+
+def test_worker_circuit_breaker_settings_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_WORKER_CIRCUIT_BREAKER_ENABLED", "false")
+    monkeypatch.setenv("ATAGIA_WORKER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "7")
+    monkeypatch.setenv("ATAGIA_WORKER_CIRCUIT_BREAKER_WINDOW_SECONDS", "45")
+    monkeypatch.setenv("ATAGIA_WORKER_CIRCUIT_BREAKER_MIN_FAILURE_RATIO", "0.6")
+
+    settings = Settings.from_env()
+
+    assert settings.worker_circuit_breaker_enabled is False
+    assert settings.worker_circuit_breaker_failure_threshold == 7
+    assert settings.worker_circuit_breaker_window_seconds == 45
+    assert settings.worker_circuit_breaker_min_failure_ratio == 0.6
+
+
+def test_worker_circuit_breaker_rejects_invalid_settings(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_WORKER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "0")
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
 def test_intimacy_model_settings_can_be_overridden(monkeypatch) -> None:
     monkeypatch.setenv("ATAGIA_LLM_INTIMACY_INGEST_MODEL", "openrouter/z-ai/glm-4.6")
     monkeypatch.setenv(
@@ -39,9 +141,7 @@ def test_intimacy_model_settings_can_be_overridden(monkeypatch) -> None:
 
     assert settings.llm_intimacy_ingest_model == "openrouter/z-ai/glm-4.6"
     assert settings.llm_intimacy_retrieval_model == "openrouter/x-ai/grok-4.1-fast"
-    assert settings.llm_intimacy_component_models == {
-        "extractor": "google/gemini-3.1-flash-lite-preview"
-    }
+    assert settings.llm_intimacy_component_models == {"extractor": "google/gemini-3.1-flash-lite-preview"}
     assert settings.llm_intimacy_proactive_routing_enabled is True
 
 
@@ -78,27 +178,27 @@ def test_context_cache_settings_reject_inverted_ttl_bounds(monkeypatch) -> None:
 
 
 def test_chunking_settings_use_defaults(monkeypatch) -> None:
-    monkeypatch.delenv("ATAGIA_CHUNKING_ENABLED", raising=False)
-    monkeypatch.delenv("ATAGIA_CHUNKING_THRESHOLD_TOKENS", raising=False)
+    monkeypatch.delenv("ATAGIA_DISABLE_CHUNKING_EXTRACTION", raising=False)
+    monkeypatch.delenv("ATAGIA_CHUNKING_EXTRACTION_THRESHOLD_TOKENS", raising=False)
 
     settings = Settings.from_env()
 
-    assert settings.chunking_enabled is False
-    assert settings.chunking_threshold_tokens == 2000
+    assert settings.disable_chunking_extraction is False
+    assert settings.chunking_extraction_threshold_tokens == 2048
 
 
 def test_chunking_settings_can_be_overridden(monkeypatch) -> None:
-    monkeypatch.setenv("ATAGIA_CHUNKING_ENABLED", "false")
-    monkeypatch.setenv("ATAGIA_CHUNKING_THRESHOLD_TOKENS", "321")
+    monkeypatch.setenv("ATAGIA_DISABLE_CHUNKING_EXTRACTION", "true")
+    monkeypatch.setenv("ATAGIA_CHUNKING_EXTRACTION_THRESHOLD_TOKENS", "321")
 
     settings = Settings.from_env()
 
-    assert settings.chunking_enabled is False
-    assert settings.chunking_threshold_tokens == 321
+    assert settings.disable_chunking_extraction is True
+    assert settings.chunking_extraction_threshold_tokens == 321
 
 
 def test_chunking_threshold_must_be_positive(monkeypatch) -> None:
-    monkeypatch.setenv("ATAGIA_CHUNKING_THRESHOLD_TOKENS", "0")
+    monkeypatch.setenv("ATAGIA_CHUNKING_EXTRACTION_THRESHOLD_TOKENS", "0")
 
     with pytest.raises(ValueError):
         Settings.from_env()
@@ -111,10 +211,7 @@ def test_recent_transcript_budget_defaults_to_policy_with_floor(monkeypatch) -> 
 
     assert settings.recent_transcript_budget_tokens is None
     assert settings.effective_recent_transcript_budget_tokens(4000) == 4000
-    assert (
-        settings.effective_recent_transcript_budget_tokens(512)
-        == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
-    )
+    assert settings.effective_recent_transcript_budget_tokens(512) == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
 
 
 def test_recent_transcript_budget_can_be_overridden_from_env(monkeypatch) -> None:
@@ -131,10 +228,7 @@ def test_recent_transcript_budget_override_is_floored(monkeypatch) -> None:
 
     settings = Settings.from_env()
 
-    assert (
-        settings.effective_recent_transcript_budget_tokens(4000)
-        == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
-    )
+    assert settings.effective_recent_transcript_budget_tokens(4000) == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
 
 
 def test_recent_transcript_budget_respects_hard_cap(monkeypatch) -> None:
@@ -142,10 +236,13 @@ def test_recent_transcript_budget_respects_hard_cap(monkeypatch) -> None:
 
     settings = Settings.from_env()
 
-    assert settings.effective_recent_transcript_budget_tokens(
-        4000,
-        hard_cap_tokens=2000,
-    ) == 2000
+    assert (
+        settings.effective_recent_transcript_budget_tokens(
+            4000,
+            hard_cap_tokens=2000,
+        )
+        == 2000
+    )
 
 
 def test_recent_transcript_budget_rejects_non_positive_override(monkeypatch) -> None:
@@ -291,7 +388,7 @@ def test_operational_profile_settings_use_defaults(monkeypatch) -> None:
 
     settings = Settings.from_env()
 
-    assert settings.operational_profiles_path == "./operational_profiles"
+    assert settings.operational_profiles_dir().exists()
     assert settings.operational_high_risk_enabled is False
     assert settings.operational_allowed_profiles == ("normal", "low_power", "offline")
 
@@ -351,6 +448,22 @@ def test_artifact_blob_storage_settings_can_be_overridden(monkeypatch) -> None:
 
     assert settings.artifact_blob_storage_kind == "local_file"
     assert settings.artifact_blob_storage_path == "/tmp/atagia-artifacts"
+
+
+def test_llm_debug_io_settings_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO", "true")
+    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_DIR", "/tmp/atagia-llm-debug")
+    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_PURPOSES", "applicability_scoring,need_detection")
+    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_RAW", "yes")
+    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_MAX_CHARS", "1234")
+
+    settings = Settings.from_env()
+
+    assert settings.llm_debug_io_enabled is True
+    assert settings.llm_debug_io_dir == "/tmp/atagia-llm-debug"
+    assert settings.llm_debug_io_purposes == ("applicability_scoring", "need_detection")
+    assert settings.llm_debug_io_raw is True
+    assert settings.llm_debug_io_max_chars == 1234
 
 
 def test_artifact_blob_storage_settings_reject_invalid_values() -> None:

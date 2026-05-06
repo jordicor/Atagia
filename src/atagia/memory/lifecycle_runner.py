@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import hashlib
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
@@ -26,6 +27,19 @@ LOCK_TTL_SECONDS = 300  # 5 min safety net for one cycle
 
 class LifecycleLockError(Exception):
     """Raised when a lifecycle cycle cannot acquire the execution lock."""
+
+
+@dataclass(slots=True)
+class _LifecycleRuntimeView:
+    """Small runtime facade for lifecycle services used by detached workers."""
+
+    database_path: str
+    clock: Clock
+    settings: Settings
+    embedding_index: EmbeddingIndex
+    storage_backend: StorageBackend
+    artifact_blob_store: Any | None = None
+    llm_client: Any | None = None
 
 
 async def _open_tracked_connection(
@@ -67,6 +81,9 @@ async def try_run_lifecycle(
     settings: Settings,
     embedding_index: EmbeddingIndex,
     storage_backend: StorageBackend,
+    artifact_blob_store: Any | None = None,
+    llm_client: Any | None = None,
+    lifecycle_runtime: AppRuntime | None = None,
 ) -> bool:
     """Attempt a lifecycle cycle if the cooldown allows and no cycle is running.
 
@@ -96,6 +113,42 @@ async def try_run_lifecycle(
             embedding_index=embedding_index,
         )
         result = await manager.run_cycle(dry_run=False)
+        result.expired_temporary_conversations_count = await _expire_idle_temporary_conversations(
+            connection,
+            database_path=database_path,
+            clock=clock,
+            settings=settings,
+            embedding_index=embedding_index,
+            storage_backend=storage_backend,
+            artifact_blob_store=artifact_blob_store,
+            llm_client=llm_client,
+            lifecycle_runtime=lifecycle_runtime,
+            dry_run=False,
+        )
+        result.purged_pending_conversations_count = await _purge_pending_deleted_conversations(
+            connection,
+            database_path=database_path,
+            clock=clock,
+            settings=settings,
+            embedding_index=embedding_index,
+            storage_backend=storage_backend,
+            artifact_blob_store=artifact_blob_store,
+            llm_client=llm_client,
+            lifecycle_runtime=lifecycle_runtime,
+            dry_run=False,
+        )
+        result.processed_pending_file_deletions_count = await _process_pending_file_deletions(
+            connection,
+            database_path=database_path,
+            clock=clock,
+            settings=settings,
+            embedding_index=embedding_index,
+            storage_backend=storage_backend,
+            artifact_blob_store=artifact_blob_store,
+            llm_client=llm_client,
+            lifecycle_runtime=lifecycle_runtime,
+            dry_run=False,
+        )
         for user_id in manager.affected_user_ids:
             await storage_backend.delete_context_views_for_user(user_id)
             await storage_backend.increment_cache_generation(
@@ -121,6 +174,9 @@ async def run_lifecycle_direct(
     settings: Settings,
     embedding_index: EmbeddingIndex,
     storage_backend: StorageBackend,
+    artifact_blob_store: Any | None = None,
+    llm_client: Any | None = None,
+    lifecycle_runtime: AppRuntime | None = None,
     dry_run: bool = False,
 ) -> LifecycleCycleResult:
     """Run lifecycle directly for admin use. Acquires the same mutex lock.
@@ -147,6 +203,42 @@ async def run_lifecycle_direct(
             embedding_index=embedding_index,
         )
         result = await manager.run_cycle(dry_run=dry_run)
+        result.expired_temporary_conversations_count = await _expire_idle_temporary_conversations(
+            connection,
+            database_path=database_path,
+            clock=clock,
+            settings=settings,
+            embedding_index=embedding_index,
+            storage_backend=storage_backend,
+            artifact_blob_store=artifact_blob_store,
+            llm_client=llm_client,
+            lifecycle_runtime=lifecycle_runtime,
+            dry_run=dry_run,
+        )
+        result.purged_pending_conversations_count = await _purge_pending_deleted_conversations(
+            connection,
+            database_path=database_path,
+            clock=clock,
+            settings=settings,
+            embedding_index=embedding_index,
+            storage_backend=storage_backend,
+            artifact_blob_store=artifact_blob_store,
+            llm_client=llm_client,
+            lifecycle_runtime=lifecycle_runtime,
+            dry_run=dry_run,
+        )
+        result.processed_pending_file_deletions_count = await _process_pending_file_deletions(
+            connection,
+            database_path=database_path,
+            clock=clock,
+            settings=settings,
+            embedding_index=embedding_index,
+            storage_backend=storage_backend,
+            artifact_blob_store=artifact_blob_store,
+            llm_client=llm_client,
+            lifecycle_runtime=lifecycle_runtime,
+            dry_run=dry_run,
+        )
         if not dry_run:
             await storage_backend.force_dedupe(
                 cooldown_key, settings.lifecycle_min_interval_seconds,
@@ -163,6 +255,96 @@ async def run_lifecycle_direct(
         await storage_backend.release_lock(lock_key, token)
 
 
+async def _expire_idle_temporary_conversations(
+    connection: aiosqlite.Connection,
+    *,
+    database_path: str,
+    clock: Clock,
+    settings: Settings,
+    embedding_index: EmbeddingIndex,
+    storage_backend: StorageBackend,
+    artifact_blob_store: Any | None,
+    llm_client: Any | None,
+    lifecycle_runtime: AppRuntime | None,
+    dry_run: bool,
+) -> int:
+    from atagia.services.lifecycle_service import ConversationLifecycleService
+
+    runtime = lifecycle_runtime or _LifecycleRuntimeView(
+        database_path=database_path,
+        clock=clock,
+        settings=settings,
+        embedding_index=embedding_index,
+        storage_backend=storage_backend,
+        artifact_blob_store=artifact_blob_store,
+        llm_client=llm_client,
+    )
+    return await ConversationLifecycleService(runtime).expire_idle_temporary_conversations(
+        connection,
+        dry_run=dry_run,
+    )
+
+
+async def _process_pending_file_deletions(
+    connection: aiosqlite.Connection,
+    *,
+    database_path: str,
+    clock: Clock,
+    settings: Settings,
+    embedding_index: EmbeddingIndex,
+    storage_backend: StorageBackend,
+    artifact_blob_store: Any | None,
+    llm_client: Any | None,
+    lifecycle_runtime: AppRuntime | None,
+    dry_run: bool,
+) -> int:
+    from atagia.services.lifecycle_service import ConversationLifecycleService
+
+    runtime = lifecycle_runtime or _LifecycleRuntimeView(
+        database_path=database_path,
+        clock=clock,
+        settings=settings,
+        embedding_index=embedding_index,
+        storage_backend=storage_backend,
+        artifact_blob_store=artifact_blob_store,
+        llm_client=llm_client,
+    )
+    return await ConversationLifecycleService(runtime).process_pending_file_deletions(
+        connection,
+        dry_run=dry_run,
+    )
+
+
+async def _purge_pending_deleted_conversations(
+    connection: aiosqlite.Connection,
+    *,
+    database_path: str,
+    clock: Clock,
+    settings: Settings,
+    embedding_index: EmbeddingIndex,
+    storage_backend: StorageBackend,
+    artifact_blob_store: Any | None,
+    llm_client: Any | None,
+    lifecycle_runtime: AppRuntime | None,
+    dry_run: bool,
+) -> int:
+    from atagia.services.lifecycle_service import ConversationLifecycleService
+
+    runtime = lifecycle_runtime or _LifecycleRuntimeView(
+        database_path=database_path,
+        clock=clock,
+        settings=settings,
+        embedding_index=embedding_index,
+        storage_backend=storage_backend,
+        artifact_blob_store=artifact_blob_store,
+        llm_client=llm_client,
+    )
+    return await ConversationLifecycleService(runtime).purge_pending_deleted_conversations(
+        connection,
+        dry_run=dry_run,
+    )
+
+
 async def piggyback_lifecycle(runtime: AppRuntime) -> None:
     """Fire-and-forget lifecycle attempt after retrieval."""
     try:
@@ -172,6 +354,9 @@ async def piggyback_lifecycle(runtime: AppRuntime) -> None:
             settings=runtime.settings,
             embedding_index=runtime.embedding_index,
             storage_backend=runtime.storage_backend,
+            artifact_blob_store=runtime.artifact_blob_store,
+            llm_client=runtime.llm_client,
+            lifecycle_runtime=runtime,
         )
     except Exception:
         logger.exception("Piggyback lifecycle failed")

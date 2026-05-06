@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from atagia.api.dependencies import AuthContext, ensure_user_access, get_auth_context, get_runtime
+from atagia.api.namespace_context import require_route_namespace_context
 from atagia.models.schemas_api import (
     ActivitySnapshotResponse,
     ConversationActivityStats,
@@ -26,11 +27,24 @@ def _coerce_stats(row: dict[str, Any] | None) -> ConversationActivityStats | Non
     return ConversationActivityStats.model_validate(row)
 
 
+def _scrub_warmup_result(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **row,
+        "recent_messages": [],
+        "stats": _coerce_stats(row.get("stats")),
+    }
+
+
 @router.get("/users/{user_id}/activity/conversations", response_model=ActivitySnapshotResponse)
 async def list_hot_conversations(
     user_id: str,
     request: Request,
     auth_context: AuthContext = Depends(get_auth_context),
+    conversation_id: str = Query(...),
+    platform_id: str = Query(...),
+    user_persona_id: str | None = None,
+    character_id: str | None = None,
+    incognito: bool = False,
     workspace_id: str | None = None,
     assistant_mode_id: str | None = None,
     limit: int = Query(default=5, ge=1, le=100),
@@ -41,13 +55,45 @@ async def list_hot_conversations(
     runtime = get_runtime(request)
     connection = await runtime.open_connection()
     try:
+        namespace = await require_route_namespace_context(
+            connection,
+            runtime.clock,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            platform_id=platform_id,
+            user_persona_id=user_persona_id,
+            character_id=character_id,
+            incognito=incognito,
+        )
         service = ConversationActivityService(runtime)
+        if namespace.incognito or not namespace.remember_across_chats:
+            return ActivitySnapshotResponse(
+                user_id=user_id,
+                as_of=service._resolve_as_of(as_of).isoformat(),
+                filters={
+                    "conversation_id": namespace.conversation_id,
+                    "workspace_id": workspace_id,
+                    "assistant_mode_id": assistant_mode_id,
+                    "user_persona_id": namespace.user_persona_id,
+                    "platform_id": namespace.platform_id,
+                    "character_id": namespace.character_id,
+                    "incognito": namespace.incognito,
+                    "limit": limit,
+                    "refresh": refresh,
+                },
+                conversations=[],
+                conversation_count=0,
+            )
         conversations = await service.list_hot_conversations(
             connection,
             user_id,
             limit=limit,
             workspace_id=workspace_id,
             assistant_mode_id=assistant_mode_id,
+            user_persona_id=namespace.user_persona_id,
+            platform_id=namespace.platform_id,
+            character_id=namespace.character_id,
+            incognito=namespace.incognito,
             as_of=as_of,
             refresh=refresh,
         )
@@ -55,8 +101,13 @@ async def list_hot_conversations(
             user_id=user_id,
             as_of=service._resolve_as_of(as_of).isoformat(),
             filters={
+                "conversation_id": namespace.conversation_id,
                 "workspace_id": workspace_id,
                 "assistant_mode_id": assistant_mode_id,
+                "user_persona_id": namespace.user_persona_id,
+                "platform_id": namespace.platform_id,
+                "character_id": namespace.character_id,
+                "incognito": namespace.incognito,
                 "limit": limit,
                 "refresh": refresh,
             },
@@ -85,6 +136,16 @@ async def warmup_conversation(
     runtime = get_runtime(request)
     connection = await runtime.open_connection()
     try:
+        namespace = await require_route_namespace_context(
+            connection,
+            runtime.clock,
+            user_id=resolved_user_id,
+            conversation_id=conversation_id,
+            platform_id=payload.platform_id,
+            user_persona_id=payload.user_persona_id,
+            character_id=payload.character_id,
+            incognito=payload.incognito,
+        )
         service = ConversationActivityService(runtime)
         result = await service.warmup_conversation(
             connection,
@@ -93,18 +154,17 @@ async def warmup_conversation(
             max_messages=payload.max_messages,
             as_of=payload.as_of,
             refresh_stats=True,
+            user_persona_id=namespace.user_persona_id,
+            platform_id=namespace.platform_id,
+            character_id=namespace.character_id,
+            incognito=namespace.incognito,
         )
         if "conversation_not_found" in result.get("warmup_errors", []):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Conversation not found for user",
             )
-        return WarmupConversationResponse.model_validate(
-            {
-                **result,
-                "stats": _coerce_stats(result.get("stats")),
-            }
-        )
+        return WarmupConversationResponse.model_validate(_scrub_warmup_result(result))
     finally:
         await connection.close()
 
@@ -120,13 +180,51 @@ async def warmup_recommended_conversations(
     runtime = get_runtime(request)
     connection = await runtime.open_connection()
     try:
+        namespace = await require_route_namespace_context(
+            connection,
+            runtime.clock,
+            user_id=user_id,
+            conversation_id=payload.conversation_id,
+            platform_id=payload.platform_id,
+            user_persona_id=payload.user_persona_id,
+            character_id=payload.character_id,
+            incognito=payload.incognito,
+        )
         service = ConversationActivityService(runtime)
+        if namespace.incognito or not namespace.remember_across_chats:
+            resolved_as_of = service._resolve_as_of(
+                payload.as_of,
+                lead_time_minutes=payload.lead_time_minutes,
+            ).isoformat()
+            return WarmupRecommendedConversationsResponse.model_validate(
+                {
+                    "user_id": user_id,
+                    "as_of": resolved_as_of,
+                    "requested_limit": payload.limit,
+                    "total_message_budget": payload.total_message_budget,
+                    "per_conversation_message_budget": payload.per_conversation_message_budget,
+                    "workspace_id": payload.workspace_id,
+                    "assistant_mode_id": payload.assistant_mode_id,
+                    "user_persona_id": namespace.user_persona_id,
+                    "platform_id": namespace.platform_id,
+                    "character_id": namespace.character_id,
+                    "incognito": namespace.incognito,
+                    "hot_conversations": [],
+                    "warmed_conversations": [],
+                    "warmed_conversation_count": 0,
+                    "warmed_message_count": 0,
+                }
+            )
         result = await service.warmup_recommended_conversations(
             connection,
             user_id,
             limit=payload.limit,
             workspace_id=payload.workspace_id,
             assistant_mode_id=payload.assistant_mode_id,
+            user_persona_id=namespace.user_persona_id,
+            platform_id=namespace.platform_id,
+            character_id=namespace.character_id,
+            incognito=namespace.incognito,
             as_of=payload.as_of,
             lead_time_minutes=payload.lead_time_minutes,
             total_message_budget=payload.total_message_budget,
@@ -140,10 +238,7 @@ async def warmup_recommended_conversations(
                     for row in result.get("hot_conversations", [])
                 ],
                 "warmed_conversations": [
-                    {
-                        **warmup,
-                        "stats": _coerce_stats(warmup.get("stats")),
-                    }
+                    _scrub_warmup_result(warmup)
                     for warmup in result.get("warmed_conversations", [])
                 ],
             }

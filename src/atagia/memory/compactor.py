@@ -26,13 +26,16 @@ from atagia.core.repositories import (
     MemoryObjectRepository,
     MessageRepository,
     WorkspaceRepository,
+    conversation_visibility_clause,
     summary_mirror_id,
 )
 from atagia.core.summary_repository import SummaryRepository
 from atagia.models.schemas_memory import (
+    ConversationStatus,
     IntimacyBoundary,
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemoryStatus,
     SummaryViewKind,
 )
@@ -51,6 +54,7 @@ from atagia.services.llm_client import (
     StructuredOutputError,
     known_intimacy_context_metadata,
 )
+from atagia.services.chat_support import message_text_for_context
 from atagia.services.model_resolution import resolve_component_model
 from atagia.services.privacy_filter_client import (
     OpenAIPrivacyFilterClient,
@@ -428,6 +432,10 @@ class Compactor:
         conversation = await self._conversation_repository.get_conversation(conversation_id, user_id)
         if conversation is None:
             raise ValueError(f"Unknown conversation_id: {conversation_id}")
+        if bool(conversation.get("temporary")):
+            return []
+        if str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
+            return []
         messages = await self._message_repository.get_messages(conversation_id, user_id, limit=5000, offset=0)
         if not messages:
             return []
@@ -446,73 +454,84 @@ class Compactor:
             messages=chunk_source,
         )
         self._validate_segmentation_response(segmentation, chunk_source)
-        created_ids: list[str] = []
+        drafts: list[dict[str, Any]] = []
         gate_state = _PrivacyGateJobState()
-        try:
-            episodes = sorted(
-                segmentation.episodes,
-                key=lambda episode: (episode.start_seq, episode.end_seq),
+        episodes = sorted(
+            segmentation.episodes,
+            key=lambda episode: (episode.start_seq, episode.end_seq),
+        )
+        previous_range: tuple[int, int] | None = None
+        for episode in episodes:
+            episode_range = (episode.start_seq, episode.end_seq)
+            if previous_range == episode_range:
+                raise ValueError("Conversation segmentation returned duplicate message ranges")
+            previous_range = episode_range
+            source_object_ids = await self._source_object_ids_for_message_range(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                start_seq=episode.start_seq,
+                end_seq=episode.end_seq,
             )
-            previous_range: tuple[int, int] | None = None
-            for episode in episodes:
-                episode_range = (episode.start_seq, episode.end_seq)
-                if previous_range == episode_range:
-                    raise ValueError("Conversation segmentation returned duplicate message ranges")
-                previous_range = episode_range
-                source_object_ids = await self._source_object_ids_for_message_range(
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    start_seq=episode.start_seq,
-                    end_seq=episode.end_seq,
-                )
-                source_rows = await self._memory_rows_by_ids(user_id, source_object_ids)
-                source_messages = await self._message_rows_for_range(
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    start_seq=episode.start_seq,
-                    end_seq=episode.end_seq,
-                )
-                summary_id = generate_prefixed_id("sum")
-                created_at = self._timestamp()
-                summary_text = episode.summary_text.strip()
-                source_intimacy_boundary = self._max_intimacy_boundary(source_rows)
-                source_intimacy_confidence = self._max_intimacy_confidence(source_rows)
-                source_privacy_max = self._privacy_with_intimacy_boundary(source_rows)
-                index_text = self._summary_index_text(
+            source_rows = await self._memory_rows_by_ids(user_id, source_object_ids)
+            source_messages = await self._message_rows_for_range(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                start_seq=episode.start_seq,
+                end_seq=episode.end_seq,
+            )
+            summary_id = generate_prefixed_id("sum")
+            created_at = self._timestamp()
+            summary_text = episode.summary_text.strip()
+            source_intimacy_boundary = self._max_intimacy_boundary(source_rows)
+            source_intimacy_confidence = self._max_intimacy_confidence(source_rows)
+            source_privacy_max = self._privacy_with_intimacy_boundary(source_rows)
+            source_sensitivity = (
+                self._summary_sensitivity(source_rows)
+                if source_rows
+                else MemorySensitivity.PUBLIC
+            )
+            source_themes = self._summary_themes(source_rows)
+            source_platform_locked = self._summary_platform_locked(source_rows)
+            source_platform_id_lock = self._summary_platform_id_lock(source_rows)
+            character_id = conversation.get("character_id") or conversation.get("workspace_id")
+            index_text = self._summary_index_text(
+                summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
+                summary_text=summary_text,
+                source_rows=source_rows,
+            )
+            payload = {
+                **self._summary_mirror_payload(
                     summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
-                    summary_text=summary_text,
+                    hierarchy_level=0,
+                    source_object_ids=source_object_ids,
                     source_rows=source_rows,
-                )
-                payload = {
-                    **self._summary_mirror_payload(
-                        summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
-                        hierarchy_level=0,
-                        source_object_ids=source_object_ids,
-                        source_rows=source_rows,
-                    ),
-                    **self._conversation_chunk_support_payload(source_messages),
-                }
-                validated = await self._validate_summary_draft(
-                    user_id=user_id,
-                    summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
-                    summary_text=summary_text,
-                    retrieval_constraints=[],
-                    source_privacy_max=source_privacy_max,
-                    source_texts=self._source_texts(
-                        [*source_rows, *source_messages],
-                        text_fields=("canonical_text", "text"),
-                    ),
-                    index_text=index_text,
-                    payload=payload,
-                    gate_state=gate_state,
-                )
-                payload.update(validated.payload_updates)
-                await self._summary_repository.create_summary(
-                    user_id,
-                    {
+                ),
+                **self._conversation_chunk_support_payload(source_messages),
+            }
+            validated = await self._validate_summary_draft(
+                user_id=user_id,
+                summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
+                summary_text=summary_text,
+                retrieval_constraints=[],
+                source_privacy_max=source_privacy_max,
+                source_texts=self._source_texts(
+                    [*source_rows, *source_messages],
+                    text_fields=("canonical_text", "text"),
+                ),
+                index_text=index_text,
+                payload=payload,
+                gate_state=gate_state,
+            )
+            payload.update(validated.payload_updates)
+            drafts.append(
+                {
+                    "summary": {
                         "id": summary_id,
                         "conversation_id": conversation_id,
                         "workspace_id": conversation.get("workspace_id"),
+                        "user_persona_id": conversation.get("user_persona_id"),
+                        "platform_id": str(conversation.get("platform_id") or "default"),
+                        "character_id": character_id,
                         "source_message_start_seq": episode.start_seq,
                         "source_message_end_seq": episode.end_seq,
                         "summary_kind": SummaryViewKind.CONVERSATION_CHUNK.value,
@@ -521,37 +540,62 @@ class Compactor:
                         "source_object_ids_json": source_object_ids,
                         "intimacy_boundary": source_intimacy_boundary.value,
                         "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "sensitivity": source_sensitivity.value,
+                        "themes_json": source_themes,
+                        "platform_locked": source_platform_locked,
+                        "platform_id_lock": source_platform_id_lock,
+                        "scope_canonical": MemoryScope.CHAT.value,
                         "maya_score": SUMMARY_MAYA_SCORE,
                         "model": self._classifier_model,
                         "created_at": created_at,
                     },
+                    "mirror": {
+                        "summary_view_id": summary_id,
+                        "summary_kind": SummaryViewKind.CONVERSATION_CHUNK,
+                        "hierarchy_level": 0,
+                        "summary_text": validated.summary_text,
+                        "source_object_ids": source_object_ids,
+                        "created_at": created_at,
+                        "updated_at": created_at,
+                        "index_text": validated.index_text,
+                        "scope": MemoryScope.CONVERSATION,
+                        "workspace_id": conversation.get("workspace_id"),
+                        "conversation_id": conversation_id,
+                        "assistant_mode_id": str(conversation["assistant_mode_id"]),
+                        "user_persona_id": conversation.get("user_persona_id"),
+                        "platform_id": str(conversation.get("platform_id") or "default"),
+                        "character_id": character_id,
+                        "sensitivity": source_sensitivity,
+                        "themes": source_themes,
+                        "platform_locked": source_platform_locked,
+                        "platform_id_lock": source_platform_id_lock,
+                        "scope_canonical": MemoryScope.CHAT.value,
+                        "confidence": CONVERSATION_CHUNK_CONFIDENCE,
+                        "stability": CONVERSATION_CHUNK_STABILITY,
+                        "vitality": CONVERSATION_CHUNK_VITALITY,
+                        "maya_score": SUMMARY_MAYA_SCORE,
+                        "privacy_level": source_privacy_max,
+                        "intimacy_boundary": source_intimacy_boundary,
+                        "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "payload": payload,
+                    },
+                }
+            )
+
+        created_ids: list[str] = []
+        try:
+            for draft in drafts:
+                await self._summary_repository.create_summary(
+                    user_id,
+                    draft["summary"],
                     commit=False,
                 )
                 await self._memory_repository.upsert_summary_mirror(
                     user_id=user_id,
-                    summary_view_id=summary_id,
-                    summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
-                    hierarchy_level=0,
-                    summary_text=validated.summary_text,
-                    source_object_ids=source_object_ids,
-                    created_at=created_at,
-                    updated_at=created_at,
-                    index_text=validated.index_text,
-                    scope=MemoryScope.CONVERSATION,
-                    workspace_id=conversation.get("workspace_id"),
-                    conversation_id=conversation_id,
-                    assistant_mode_id=str(conversation["assistant_mode_id"]),
-                    confidence=CONVERSATION_CHUNK_CONFIDENCE,
-                    stability=CONVERSATION_CHUNK_STABILITY,
-                    vitality=CONVERSATION_CHUNK_VITALITY,
-                    maya_score=SUMMARY_MAYA_SCORE,
-                    privacy_level=source_privacy_max,
-                    intimacy_boundary=source_intimacy_boundary,
-                    intimacy_boundary_confidence=source_intimacy_confidence,
-                    payload=payload,
+                    **draft["mirror"],
                     commit=False,
                 )
-                created_ids.append(summary_id)
+                created_ids.append(str(draft["summary"]["id"]))
             await self._summary_repository.commit()
         except Exception:
             await self._summary_repository.rollback()
@@ -592,6 +636,15 @@ class Compactor:
                         )
                     assistant_mode_id = str(conversation["assistant_mode_id"])
                     assistant_mode_by_conversation[resolved_conversation_id] = assistant_mode_id
+                else:
+                    conversation = await self._conversation_repository.get_conversation(
+                        resolved_conversation_id,
+                        user_id,
+                    )
+                    if conversation is None:
+                        raise ValueError(
+                            f"Unknown conversation_id for conversation chunk summary: {resolved_conversation_id}"
+                        )
 
                 source_object_ids = self._unique_strings(
                     [
@@ -607,6 +660,14 @@ class Compactor:
                 source_intimacy_boundary = self._max_intimacy_boundary(source_rows)
                 source_intimacy_confidence = self._max_intimacy_confidence(source_rows)
                 privacy_level = self._privacy_with_intimacy_boundary(source_rows)
+                source_sensitivity = (
+                    self._summary_sensitivity(source_rows)
+                    if source_rows
+                    else MemorySensitivity.PUBLIC
+                )
+                source_themes = self._summary_themes(source_rows)
+                source_platform_locked = self._summary_platform_locked(source_rows)
+                source_platform_id_lock = self._summary_platform_id_lock(source_rows)
                 source_messages = await self._message_rows_for_range(
                     user_id=user_id,
                     conversation_id=resolved_conversation_id,
@@ -646,6 +707,14 @@ class Compactor:
                     workspace_id=str(row["workspace_id"]) if row.get("workspace_id") else None,
                     conversation_id=resolved_conversation_id,
                     assistant_mode_id=assistant_mode_id,
+                    user_persona_id=conversation.get("user_persona_id"),
+                    platform_id=str(conversation.get("platform_id") or "default"),
+                    character_id=conversation.get("character_id") or conversation.get("workspace_id"),
+                    sensitivity=source_sensitivity,
+                    themes=source_themes,
+                    platform_locked=source_platform_locked,
+                    platform_id_lock=source_platform_id_lock,
+                    scope_canonical=MemoryScope.CHAT.value,
                     confidence=CONVERSATION_CHUNK_CONFIDENCE,
                     stability=CONVERSATION_CHUNK_STABILITY,
                     vitality=CONVERSATION_CHUNK_VITALITY,
@@ -677,125 +746,204 @@ class Compactor:
         user_id: str,
         workspace_id: str,
     ) -> str | None:
-        workspace = await self._workspace_repository.get_workspace(workspace_id, user_id)
-        if workspace is None:
-            raise ValueError(f"Unknown workspace_id: {workspace_id}")
+        return await self.generate_character_rollup(
+            user_id=user_id,
+            character_id=workspace_id,
+            workspace_id=workspace_id,
+        )
 
-        memory_rows = await self._workspace_material_memories(user_id, workspace_id)
-        chunk_rows = await self._workspace_conversation_chunks(user_id, workspace_id)
-        chain_rows = await self._workspace_consequence_chain_rows(user_id, workspace_id)
+    async def generate_character_rollup(
+        self,
+        *,
+        user_id: str,
+        character_id: str,
+        workspace_id: str | None = None,
+    ) -> str | None:
+        rollup_context_id = workspace_id or character_id
+        if workspace_id is not None:
+            workspace = await self._workspace_repository.get_workspace(workspace_id, user_id)
+            if workspace is None:
+                raise ValueError(f"Unknown workspace_id: {workspace_id}")
+
+        memory_rows = await self._character_material_memories(
+            user_id,
+            character_id,
+            workspace_id=workspace_id,
+        )
+        chunk_rows = await self._character_conversation_chunks(
+            user_id,
+            character_id,
+            workspace_id=workspace_id,
+        )
+        chain_rows = await self._character_consequence_chain_rows(
+            user_id,
+            character_id,
+            workspace_id=workspace_id,
+        )
         if not memory_rows and not chunk_rows and not chain_rows:
             return None
 
-        response = await self._synthesize_workspace_rollup(
-            user_id=user_id,
-            workspace_id=workspace_id,
+        rollup_groups = self._partition_character_rollup_inputs_by_user_persona(
             memory_rows=memory_rows,
             chunk_rows=chunk_rows,
             chain_rows=chain_rows,
         )
-        source_rows_for_policy = [*memory_rows, *chunk_rows]
-        source_intimacy_boundary = self._max_intimacy_boundary(source_rows_for_policy)
-        source_intimacy_confidence = self._max_intimacy_confidence(source_rows_for_policy)
-        source_privacy_max = self._privacy_with_intimacy_boundary(source_rows_for_policy)
-        gate_state = _PrivacyGateJobState()
-        validated = await self._validate_summary_draft(
-            user_id=user_id,
-            summary_kind=SummaryViewKind.WORKSPACE_ROLLUP,
-            summary_text=response.summary_text.strip(),
-            retrieval_constraints=[],
-            source_privacy_max=source_privacy_max,
-            source_texts=self._source_texts(
-                [*memory_rows, *chunk_rows, *chain_rows],
-                text_fields=(
-                    "canonical_text",
-                    "summary_text",
-                    "action_canonical_text",
-                    "outcome_canonical_text",
-                    "tendency_canonical_text",
-                ),
-            ),
-            index_text=None,
-            payload={},
-            gate_state=gate_state,
-        )
-        available_source_ids: list[str] = []
-        for row in memory_rows:
-            available_source_ids.append(str(row["id"]))
-        for row in chunk_rows:
-            source_ids = row.get("source_object_ids_json") or []
-            if isinstance(source_ids, list):
-                available_source_ids.extend(str(item) for item in source_ids)
-        for row in chain_rows:
-            for key in ("action_memory_id", "outcome_memory_id", "tendency_belief_id"):
-                value = row.get(key)
-                if value is not None:
-                    available_source_ids.append(str(value))
-        available_source_id_set = set(available_source_ids)
-        cited_ids = [
-            cited_id
-            for cited_id in self._unique_strings(response.cited_memory_ids)
-            if cited_id in available_source_id_set
-        ]
-        cited_ids = self._unique_strings([*cited_ids, *available_source_ids])
+        if not rollup_groups:
+            return None
 
-        summary_id = generate_prefixed_id("sum")
-        created_at = await self._next_workspace_rollup_timestamp(user_id, workspace_id)
-        try:
-            await self._summary_repository.create_summary(
-                user_id,
-                {
-                    "id": summary_id,
-                    "conversation_id": None,
-                    "workspace_id": workspace_id,
-                    "source_message_start_seq": None,
-                    "source_message_end_seq": None,
-                    "summary_kind": SummaryViewKind.WORKSPACE_ROLLUP.value,
-                    "hierarchy_level": 0,
-                    "summary_text": validated.summary_text,
-                    "source_object_ids_json": cited_ids,
-                    "intimacy_boundary": source_intimacy_boundary.value,
-                    "intimacy_boundary_confidence": source_intimacy_confidence,
-                    "maya_score": SUMMARY_MAYA_SCORE,
-                    "model": self._scoring_model,
-                    "created_at": created_at,
-                },
-                commit=False,
+        gate_state = _PrivacyGateJobState()
+        drafts: list[dict[str, Any]] = []
+        for source_user_persona_id, group_memory_rows, group_chunk_rows, group_chain_rows in rollup_groups:
+            response = await self._synthesize_workspace_rollup(
+                user_id=user_id,
+                workspace_id=rollup_context_id,
+                memory_rows=group_memory_rows,
+                chunk_rows=group_chunk_rows,
+                chain_rows=group_chain_rows,
             )
-            if PRIVACY_GATE_AUDIT_KEY in validated.payload_updates:
-                # Audit-only rollup mirrors exist only for PVG reporting.
-                # status=ARCHIVED + audit_only_mirror=true keeps them out of active retrieval.
-                await self._memory_repository.upsert_summary_mirror(
-                    user_id=user_id,
-                    summary_view_id=summary_id,
-                    summary_kind=SummaryViewKind.WORKSPACE_ROLLUP,
-                    hierarchy_level=0,
-                    summary_text=validated.summary_text,
-                    source_object_ids=cited_ids,
-                    created_at=created_at,
-                    updated_at=created_at,
-                    index_text=validated.index_text,
-                    scope=MemoryScope.WORKSPACE,
-                    workspace_id=workspace_id,
-                    maya_score=SUMMARY_MAYA_SCORE,
-                    privacy_level=source_privacy_max,
-                    intimacy_boundary=source_intimacy_boundary,
-                    intimacy_boundary_confidence=source_intimacy_confidence,
-                    status=MemoryStatus.ARCHIVED,
-                    payload={**validated.payload_updates, "audit_only_mirror": True},
+            source_rows_for_policy = [*group_memory_rows, *group_chunk_rows]
+            source_intimacy_boundary = self._max_intimacy_boundary(source_rows_for_policy)
+            source_intimacy_confidence = self._max_intimacy_confidence(source_rows_for_policy)
+            source_privacy_max = self._privacy_with_intimacy_boundary(source_rows_for_policy)
+            source_rows_for_namespace = [*group_memory_rows, *group_chunk_rows, *group_chain_rows]
+            source_sensitivity = self._summary_sensitivity(source_rows_for_namespace)
+            source_themes = self._summary_themes(source_rows_for_namespace)
+            source_platform_locked = self._summary_platform_locked(source_rows_for_namespace)
+            source_platform_id_lock = self._summary_platform_id_lock(source_rows_for_namespace)
+            source_platform_id = self._single_optional_text(source_rows_for_namespace, "platform_id") or "default"
+            validated = await self._validate_summary_draft(
+                user_id=user_id,
+                summary_kind=SummaryViewKind.CHARACTER_ROLLUP,
+                summary_text=response.summary_text.strip(),
+                retrieval_constraints=[],
+                source_privacy_max=source_privacy_max,
+                source_texts=self._source_texts(
+                    source_rows_for_namespace,
+                    text_fields=(
+                        "canonical_text",
+                        "summary_text",
+                        "action_canonical_text",
+                        "outcome_canonical_text",
+                        "tendency_canonical_text",
+                    ),
+                ),
+                index_text=None,
+                payload={},
+                gate_state=gate_state,
+            )
+            available_source_ids = await self._character_rollup_available_source_ids(
+                user_id=user_id,
+                memory_rows=group_memory_rows,
+                chunk_rows=group_chunk_rows,
+                chain_rows=group_chain_rows,
+                user_persona_id=source_user_persona_id,
+            )
+            available_source_id_set = set(available_source_ids)
+            cited_ids = [
+                cited_id
+                for cited_id in self._unique_strings(response.cited_memory_ids)
+                if cited_id in available_source_id_set
+            ]
+            cited_ids = self._unique_strings([*cited_ids, *available_source_ids])
+
+            summary_id = generate_prefixed_id("sum")
+            created_at = await self._next_character_rollup_timestamp(
+                user_id,
+                character_id,
+                source_user_persona_id,
+            )
+            drafts.append(
+                {
+                    "summary": {
+                        "id": summary_id,
+                        "conversation_id": None,
+                        "workspace_id": workspace_id,
+                        "user_persona_id": source_user_persona_id,
+                        "platform_id": source_platform_id,
+                        "character_id": character_id,
+                        "source_message_start_seq": None,
+                        "source_message_end_seq": None,
+                        "summary_kind": SummaryViewKind.CHARACTER_ROLLUP.value,
+                        "hierarchy_level": 0,
+                        "summary_text": validated.summary_text,
+                        "source_object_ids_json": cited_ids,
+                        "intimacy_boundary": source_intimacy_boundary.value,
+                        "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "sensitivity": source_sensitivity.value,
+                        "themes_json": source_themes,
+                        "platform_locked": source_platform_locked,
+                        "platform_id_lock": source_platform_id_lock,
+                        "scope_canonical": MemoryScope.CHARACTER.value,
+                        "maya_score": SUMMARY_MAYA_SCORE,
+                        "model": self._scoring_model,
+                        "created_at": created_at,
+                    },
+                    "audit_mirror": {
+                        "summary_view_id": summary_id,
+                        "summary_kind": SummaryViewKind.CHARACTER_ROLLUP,
+                        "hierarchy_level": 0,
+                        "summary_text": validated.summary_text,
+                        "source_object_ids": cited_ids,
+                        "created_at": created_at,
+                        "updated_at": created_at,
+                        "index_text": validated.index_text,
+                        "scope": MemoryScope.WORKSPACE,
+                        "workspace_id": workspace_id,
+                        "user_persona_id": source_user_persona_id,
+                        "platform_id": source_platform_id,
+                        "character_id": character_id,
+                        "sensitivity": source_sensitivity,
+                        "themes": source_themes,
+                        "platform_locked": source_platform_locked,
+                        "platform_id_lock": source_platform_id_lock,
+                        "scope_canonical": MemoryScope.CHARACTER.value,
+                        "maya_score": SUMMARY_MAYA_SCORE,
+                        "privacy_level": source_privacy_max,
+                        "intimacy_boundary": source_intimacy_boundary,
+                        "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "status": MemoryStatus.ARCHIVED,
+                        "payload": {**validated.payload_updates, "audit_only_mirror": True},
+                    }
+                    if PRIVACY_GATE_AUDIT_KEY in validated.payload_updates
+                    else None,
+                    "user_persona_id": source_user_persona_id,
+                }
+            )
+
+        created_summary_ids: list[str] = []
+        try:
+            for draft in drafts:
+                await self._summary_repository.create_summary(
+                    user_id,
+                    draft["summary"],
                     commit=False,
                 )
+                if draft["audit_mirror"] is not None:
+                    # Audit-only rollup mirrors exist only for PVG reporting.
+                    # status=ARCHIVED + audit_only_mirror=true keeps them out of active retrieval.
+                    await self._memory_repository.upsert_summary_mirror(
+                        user_id=user_id,
+                        **draft["audit_mirror"],
+                        commit=False,
+                    )
+                created_summary_ids.append(str(draft["summary"]["id"]))
             await self._summary_repository.commit()
         except Exception:
             await self._summary_repository.rollback()
             raise
-        await self._summary_repository.delete_old_rollups(user_id, workspace_id, keep_count=3)
-        return summary_id
+        for draft in drafts:
+            await self._summary_repository.delete_old_character_rollups_for_persona(
+                user_id,
+                character_id,
+                draft["user_persona_id"],
+                keep_count=3,
+            )
+        return created_summary_ids[-1] if created_summary_ids else None
 
     async def generate_episodes(self, user_id: str) -> list[str]:
         chunk_rows = await self._conversation_chunks_with_temporal_payload(
             user_id,
-            await self._summary_repository.list_all_user_conversation_chunks(user_id),
+            await self._summary_repository.list_cross_chat_user_conversation_chunks(user_id),
         )
         existing_rows = await self._summary_repository.list_summaries_by_kind(
             user_id,
@@ -809,7 +957,14 @@ class Compactor:
             return []
 
         try:
-            episode_groups = await self._synthesize_episodes(user_id=user_id, chunk_rows=chunk_rows)
+            episode_groups: list[tuple[str, list[dict[str, Any]]]] = []
+            for grouped_chunk_rows in self._partition_rows_by_user_persona(chunk_rows):
+                episode_groups.extend(
+                    await self._synthesize_episodes(
+                        user_id=user_id,
+                        chunk_rows=grouped_chunk_rows,
+                    )
+                )
         except (StructuredOutputError, ValueError) as exc:
             logger.warning(
                 "episode_synthesis_failed_preserving_existing_summaries user_id=%s error=%s",
@@ -819,54 +974,69 @@ class Compactor:
             )
             return deleted_summary_ids
 
-        created_summary_ids: list[str] = []
+        drafts: list[dict[str, Any]] = []
         gate_state = _PrivacyGateJobState()
-        try:
-            await self._summary_repository.delete_summaries(user_id, deleted_summary_ids, commit=False)
-            for summary_text, source_chunks in episode_groups:
-                source_object_ids = self._merge_summary_source_ids(source_chunks)
-                source_message_ids = self._merge_summary_source_message_ids(source_chunks)
-                source_memory_rows = await self._memory_rows_by_ids(user_id, source_object_ids)
-                summary_id = generate_prefixed_id("sum")
-                created_at = self._timestamp()
-                normalized_summary_text = summary_text.strip()
-                source_rows_for_policy = [*source_memory_rows, *source_chunks]
-                source_intimacy_boundary = self._max_intimacy_boundary(source_rows_for_policy)
-                source_intimacy_confidence = self._max_intimacy_confidence(source_rows_for_policy)
-                source_privacy_max = self._privacy_with_intimacy_boundary(source_rows_for_policy)
-                index_text = self._summary_index_text(
-                    summary_kind=SummaryViewKind.EPISODE,
-                    summary_text=normalized_summary_text,
-                    source_rows=source_memory_rows,
-                )
-                payload = self._summary_mirror_payload(
-                    summary_kind=SummaryViewKind.EPISODE,
-                    hierarchy_level=1,
-                    source_object_ids=source_object_ids,
-                    source_rows=source_memory_rows,
-                    source_message_ids=source_message_ids,
-                )
-                validated = await self._validate_summary_draft(
-                    user_id=user_id,
-                    summary_kind=SummaryViewKind.EPISODE,
-                    summary_text=normalized_summary_text,
-                    retrieval_constraints=[],
-                    source_privacy_max=source_privacy_max,
-                    source_texts=self._source_texts(
-                        [*source_chunks, *source_memory_rows],
-                        text_fields=("summary_text", "canonical_text"),
-                    ),
-                    index_text=index_text,
-                    payload=payload,
-                    gate_state=gate_state,
-                )
-                payload.update(validated.payload_updates)
-                await self._summary_repository.create_summary(
-                    user_id,
-                    {
+        for summary_text, source_chunks in episode_groups:
+            source_object_ids = self._merge_summary_source_ids(source_chunks)
+            source_message_ids = self._merge_summary_source_message_ids(source_chunks)
+            source_user_persona_id = self._single_namespace_text(source_chunks, "user_persona_id")
+            source_memory_rows = await self._memory_rows_by_ids(user_id, source_object_ids)
+            source_object_ids, source_memory_rows = self._filter_source_rows_by_user_persona(
+                source_object_ids,
+                source_memory_rows,
+                source_user_persona_id,
+            )
+            summary_id = generate_prefixed_id("sum")
+            created_at = self._timestamp()
+            normalized_summary_text = summary_text.strip()
+            source_rows_for_policy = [*source_memory_rows, *source_chunks]
+            source_intimacy_boundary = self._max_intimacy_boundary(source_rows_for_policy)
+            source_intimacy_confidence = self._max_intimacy_confidence(source_rows_for_policy)
+            source_privacy_max = self._privacy_with_intimacy_boundary(source_rows_for_policy)
+            source_sensitivity = self._summary_sensitivity(source_rows_for_policy)
+            source_themes = self._summary_themes(source_rows_for_policy)
+            source_platform_locked = self._summary_platform_locked(source_rows_for_policy)
+            source_platform_id_lock = self._summary_platform_id_lock(source_rows_for_policy)
+            source_workspace_id = self._single_workspace_id(source_chunks)
+            source_character_id = (
+                self._single_optional_text(source_rows_for_policy, "character_id")
+                or source_workspace_id
+            )
+            index_text = self._summary_index_text(
+                summary_kind=SummaryViewKind.EPISODE,
+                summary_text=normalized_summary_text,
+                source_rows=source_memory_rows,
+            )
+            payload = self._summary_mirror_payload(
+                summary_kind=SummaryViewKind.EPISODE,
+                hierarchy_level=1,
+                source_object_ids=source_object_ids,
+                source_rows=source_memory_rows,
+                source_message_ids=source_message_ids,
+            )
+            validated = await self._validate_summary_draft(
+                user_id=user_id,
+                summary_kind=SummaryViewKind.EPISODE,
+                summary_text=normalized_summary_text,
+                retrieval_constraints=[],
+                source_privacy_max=source_privacy_max,
+                source_texts=self._source_texts(
+                    [*source_chunks, *source_memory_rows],
+                    text_fields=("summary_text", "canonical_text"),
+                ),
+                index_text=index_text,
+                payload=payload,
+                gate_state=gate_state,
+            )
+            payload.update(validated.payload_updates)
+            drafts.append(
+                {
+                    "summary": {
                         "id": summary_id,
                         "conversation_id": None,
-                        "workspace_id": self._single_workspace_id(source_chunks),
+                        "workspace_id": source_workspace_id,
+                        "user_persona_id": source_user_persona_id,
+                        "character_id": source_character_id,
                         "source_message_start_seq": None,
                         "source_message_end_seq": None,
                         "summary_kind": SummaryViewKind.EPISODE.value,
@@ -875,34 +1045,60 @@ class Compactor:
                         "source_object_ids_json": source_object_ids,
                         "intimacy_boundary": source_intimacy_boundary.value,
                         "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "sensitivity": source_sensitivity.value,
+                        "themes_json": source_themes,
+                        "platform_locked": source_platform_locked,
+                        "platform_id_lock": source_platform_id_lock,
+                        "scope_canonical": MemoryScope.USER.value,
                         "maya_score": SUMMARY_MAYA_SCORE,
                         "model": self._scoring_model,
                         "created_at": created_at,
                     },
+                    "mirror": {
+                        "summary_view_id": summary_id,
+                        "summary_kind": SummaryViewKind.EPISODE,
+                        "hierarchy_level": 1,
+                        "summary_text": validated.summary_text,
+                        "source_object_ids": source_object_ids,
+                        "created_at": created_at,
+                        "updated_at": created_at,
+                        "index_text": validated.index_text,
+                        "scope": MemoryScope.GLOBAL_USER,
+                        "workspace_id": source_workspace_id,
+                        "user_persona_id": source_user_persona_id,
+                        "character_id": source_character_id,
+                        "sensitivity": source_sensitivity,
+                        "themes": source_themes,
+                        "platform_locked": source_platform_locked,
+                        "platform_id_lock": source_platform_id_lock,
+                        "scope_canonical": MemoryScope.USER.value,
+                        "confidence": 0.72,
+                        "stability": 0.82,
+                        "vitality": 0.15,
+                        "maya_score": SUMMARY_MAYA_SCORE,
+                        "privacy_level": source_privacy_max,
+                        "intimacy_boundary": source_intimacy_boundary,
+                        "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "payload": payload,
+                    },
+                }
+            )
+
+        created_summary_ids: list[str] = []
+        try:
+            await self._summary_repository.delete_summaries(user_id, deleted_summary_ids, commit=False)
+            for draft in drafts:
+                await self._summary_repository.create_summary(
+                    user_id,
+                    draft["summary"],
                     commit=False,
                 )
                 await self._memory_repository.upsert_summary_mirror(
                     user_id=user_id,
-                    summary_view_id=summary_id,
-                    summary_kind=SummaryViewKind.EPISODE,
-                    hierarchy_level=1,
-                    summary_text=validated.summary_text,
-                    source_object_ids=source_object_ids,
-                    created_at=created_at,
-                    updated_at=created_at,
-                    index_text=validated.index_text,
-                    scope=MemoryScope.GLOBAL_USER,
-                    confidence=0.72,
-                    stability=0.82,
-                    vitality=0.15,
-                    maya_score=SUMMARY_MAYA_SCORE,
-                    privacy_level=source_privacy_max,
-                    intimacy_boundary=source_intimacy_boundary,
-                    intimacy_boundary_confidence=source_intimacy_confidence,
-                    payload=payload,
+                    **draft["mirror"],
                     commit=False,
                 )
-                created_summary_ids.append(summary_id)
+                created_summary_ids.append(str(draft["summary"]["id"]))
             await self._summary_repository.commit()
         except Exception:
             await self._summary_repository.rollback()
@@ -926,11 +1122,32 @@ class Compactor:
             return []
 
         try:
-            response = await self._synthesize_thematic_profiles(
-                user_id=user_id,
-                belief_rows=belief_rows,
-                episode_rows=episode_rows,
-            )
+            profile_sources: list[tuple[_ThematicProfileSummary, list[str], dict[str, dict[str, Any]]]] = []
+            for grouped_rows in self._partition_rows_by_user_persona([*belief_rows, *episode_rows]):
+                grouped_belief_rows = [
+                    row
+                    for row in grouped_rows
+                    if str(row.get("object_type")) == MemoryObjectType.BELIEF.value
+                ]
+                grouped_episode_rows = [
+                    row
+                    for row in grouped_rows
+                    if str(row.get("object_type")) == MemoryObjectType.SUMMARY_VIEW.value
+                ]
+                response = await self._synthesize_thematic_profiles(
+                    user_id=user_id,
+                    belief_rows=grouped_belief_rows,
+                    episode_rows=grouped_episode_rows,
+                )
+                input_rows_by_id = {str(row["id"]): row for row in grouped_rows}
+                normalized_source_ids = self._validated_thematic_profile_source_ids(
+                    response,
+                    input_rows_by_id,
+                )
+                profile_sources.extend(
+                    (profile, source_ids, input_rows_by_id)
+                    for profile, source_ids in zip(response.profiles, normalized_source_ids, strict=True)
+                )
         except (StructuredOutputError, ValueError) as exc:
             logger.warning(
                 "thematic_profile_synthesis_failed_preserving_existing_summaries user_id=%s error=%s",
@@ -939,52 +1156,51 @@ class Compactor:
                 extra={"user_id": user_id, "error": str(exc)},
             )
             return deleted_summary_ids
-        input_rows_by_id = {str(row["id"]): row for row in [*belief_rows, *episode_rows]}
-        normalized_source_ids = self._validated_thematic_profile_source_ids(
-            response,
-            input_rows_by_id,
-        )
-        created_summary_ids: list[str] = []
+        drafts: list[dict[str, Any]] = []
         gate_state = _PrivacyGateJobState()
-        try:
-            await self._summary_repository.delete_summaries(user_id, deleted_summary_ids, commit=False)
-            for profile, source_object_ids in zip(response.profiles, normalized_source_ids, strict=True):
-                source_rows = [input_rows_by_id[memory_id] for memory_id in source_object_ids]
-                summary_id = generate_prefixed_id("sum")
-                created_at = self._timestamp()
-                summary_text = profile.summary_text.strip()
-                source_intimacy_boundary = self._max_intimacy_boundary(source_rows)
-                source_intimacy_confidence = self._max_intimacy_confidence(source_rows)
-                source_privacy_max = self._privacy_with_intimacy_boundary(source_rows)
-                index_text = self._summary_index_text(
-                    summary_kind=SummaryViewKind.THEMATIC_PROFILE,
-                    summary_text=summary_text,
-                    source_rows=source_rows,
-                )
-                payload = self._summary_mirror_payload(
-                    summary_kind=SummaryViewKind.THEMATIC_PROFILE,
-                    hierarchy_level=2,
-                    source_object_ids=source_object_ids,
-                    source_rows=source_rows,
-                )
-                validated = await self._validate_summary_draft(
-                    user_id=user_id,
-                    summary_kind=SummaryViewKind.THEMATIC_PROFILE,
-                    summary_text=summary_text,
-                    retrieval_constraints=[],
-                    source_privacy_max=source_privacy_max,
-                    source_texts=self._source_texts(source_rows, text_fields=("canonical_text",)),
-                    index_text=index_text,
-                    payload=payload,
-                    gate_state=gate_state,
-                )
-                payload.update(validated.payload_updates)
-                await self._summary_repository.create_summary(
-                    user_id,
-                    {
+        for profile, source_object_ids, input_rows_by_id in profile_sources:
+            source_rows = [input_rows_by_id[memory_id] for memory_id in source_object_ids]
+            summary_id = generate_prefixed_id("sum")
+            created_at = self._timestamp()
+            summary_text = profile.summary_text.strip()
+            source_intimacy_boundary = self._max_intimacy_boundary(source_rows)
+            source_intimacy_confidence = self._max_intimacy_confidence(source_rows)
+            source_privacy_max = self._privacy_with_intimacy_boundary(source_rows)
+            source_sensitivity = self._summary_sensitivity(source_rows)
+            source_themes = self._summary_themes(source_rows)
+            source_platform_locked = self._summary_platform_locked(source_rows)
+            source_platform_id_lock = self._summary_platform_id_lock(source_rows)
+            source_user_persona_id = self._single_optional_text(source_rows, "user_persona_id")
+            index_text = self._summary_index_text(
+                summary_kind=SummaryViewKind.THEMATIC_PROFILE,
+                summary_text=summary_text,
+                source_rows=source_rows,
+            )
+            payload = self._summary_mirror_payload(
+                summary_kind=SummaryViewKind.THEMATIC_PROFILE,
+                hierarchy_level=2,
+                source_object_ids=source_object_ids,
+                source_rows=source_rows,
+            )
+            validated = await self._validate_summary_draft(
+                user_id=user_id,
+                summary_kind=SummaryViewKind.THEMATIC_PROFILE,
+                summary_text=summary_text,
+                retrieval_constraints=[],
+                source_privacy_max=source_privacy_max,
+                source_texts=self._source_texts(source_rows, text_fields=("canonical_text",)),
+                index_text=index_text,
+                payload=payload,
+                gate_state=gate_state,
+            )
+            payload.update(validated.payload_updates)
+            drafts.append(
+                {
+                    "summary": {
                         "id": summary_id,
                         "conversation_id": None,
                         "workspace_id": None,
+                        "user_persona_id": source_user_persona_id,
                         "source_message_start_seq": None,
                         "source_message_end_seq": None,
                         "summary_kind": SummaryViewKind.THEMATIC_PROFILE.value,
@@ -993,34 +1209,58 @@ class Compactor:
                         "source_object_ids_json": source_object_ids,
                         "intimacy_boundary": source_intimacy_boundary.value,
                         "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "sensitivity": source_sensitivity.value,
+                        "themes_json": source_themes,
+                        "platform_locked": source_platform_locked,
+                        "platform_id_lock": source_platform_id_lock,
+                        "scope_canonical": MemoryScope.USER.value,
                         "maya_score": SUMMARY_MAYA_SCORE,
                         "model": self._scoring_model,
                         "created_at": created_at,
                     },
+                    "mirror": {
+                        "summary_view_id": summary_id,
+                        "summary_kind": SummaryViewKind.THEMATIC_PROFILE,
+                        "hierarchy_level": 2,
+                        "summary_text": validated.summary_text,
+                        "source_object_ids": source_object_ids,
+                        "created_at": created_at,
+                        "updated_at": created_at,
+                        "index_text": validated.index_text,
+                        "scope": MemoryScope.GLOBAL_USER,
+                        "user_persona_id": source_user_persona_id,
+                        "sensitivity": source_sensitivity,
+                        "themes": source_themes,
+                        "platform_locked": source_platform_locked,
+                        "platform_id_lock": source_platform_id_lock,
+                        "scope_canonical": MemoryScope.USER.value,
+                        "confidence": 0.74,
+                        "stability": 0.88,
+                        "vitality": 0.12,
+                        "maya_score": SUMMARY_MAYA_SCORE,
+                        "privacy_level": source_privacy_max,
+                        "intimacy_boundary": source_intimacy_boundary,
+                        "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "payload": payload,
+                    },
+                }
+            )
+
+        created_summary_ids: list[str] = []
+        try:
+            await self._summary_repository.delete_summaries(user_id, deleted_summary_ids, commit=False)
+            for draft in drafts:
+                await self._summary_repository.create_summary(
+                    user_id,
+                    draft["summary"],
                     commit=False,
                 )
                 await self._memory_repository.upsert_summary_mirror(
                     user_id=user_id,
-                    summary_view_id=summary_id,
-                    summary_kind=SummaryViewKind.THEMATIC_PROFILE,
-                    hierarchy_level=2,
-                    summary_text=validated.summary_text,
-                    source_object_ids=source_object_ids,
-                    created_at=created_at,
-                    updated_at=created_at,
-                    index_text=validated.index_text,
-                    scope=MemoryScope.GLOBAL_USER,
-                    confidence=0.74,
-                    stability=0.88,
-                    vitality=0.12,
-                    maya_score=SUMMARY_MAYA_SCORE,
-                    privacy_level=source_privacy_max,
-                    intimacy_boundary=source_intimacy_boundary,
-                    intimacy_boundary_confidence=source_intimacy_confidence,
-                    payload=payload,
+                    **draft["mirror"],
                     commit=False,
                 )
-                created_summary_ids.append(summary_id)
+                created_summary_ids.append(str(draft["summary"]["id"]))
             await self._summary_repository.commit()
         except Exception:
             await self._summary_repository.rollback()
@@ -1401,23 +1641,54 @@ class Compactor:
         return ", ".join(str(seq) for seq in seqs)
 
     async def _workspace_material_memories(self, user_id: str, workspace_id: str) -> list[dict[str, Any]]:
+        return await self._character_material_memories(
+            user_id,
+            workspace_id,
+            workspace_id=workspace_id,
+        )
+
+    async def _character_material_memories(
+        self,
+        user_id: str,
+        character_id: str,
+        *,
+        workspace_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        target_clause, target_parameters = self._character_target_clause(
+            table_alias="memory_objects",
+            character_id=character_id,
+            workspace_id=workspace_id,
+        )
         return await self._memory_repository._fetch_all(  # noqa: SLF001
             """
             SELECT *
             FROM memory_objects
             WHERE user_id = ?
-              AND workspace_id = ?
+              AND {target_clause}
               AND status = ?
               AND privacy_level < 2
+              AND sensitivity = 'public'
               AND intimacy_boundary = ?
               AND object_type IN (?, ?, ?, ?, ?)
-              AND scope IN ('workspace', 'conversation', 'ephemeral_session')
+              AND (
+                CASE
+                    WHEN scope_canonical IS NOT NULL THEN scope_canonical
+                    WHEN scope IN ('conversation', 'ephemeral_session') THEN 'chat'
+                    WHEN scope = 'workspace' THEN 'character'
+                    WHEN scope IN ('global_user', 'assistant_mode') THEN 'user'
+                    ELSE scope
+                END
+              ) IN ('character', 'chat')
+              AND {visibility_clause}
             ORDER BY updated_at DESC, id ASC
             LIMIT ?
-            """,
+            """.format(
+                target_clause=target_clause,
+                visibility_clause=conversation_visibility_clause("memory_objects"),
+            ),
             (
                 user_id,
-                workspace_id,
+                *target_parameters,
                 MemoryStatus.ACTIVE.value,
                 IntimacyBoundary.ORDINARY.value,
                 MemoryObjectType.BELIEF.value,
@@ -1425,6 +1696,7 @@ class Compactor:
                 MemoryObjectType.CONSEQUENCE_CHAIN.value,
                 MemoryObjectType.STATE_SNAPSHOT.value,
                 MemoryObjectType.INTERACTION_CONTRACT.value,
+                None,
                 WORKSPACE_MEMORY_LIMIT,
             ),
         )
@@ -1438,15 +1710,18 @@ class Compactor:
               AND object_type = ?
               AND status = ?
               AND privacy_level < 2
+              AND sensitivity = 'public'
               AND intimacy_boundary = ?
+              AND {visibility_clause}
             ORDER BY updated_at DESC, id ASC
             LIMIT ?
-            """,
+            """.format(visibility_clause=conversation_visibility_clause("memory_objects")),
             (
                 user_id,
                 MemoryObjectType.BELIEF.value,
                 MemoryStatus.ACTIVE.value,
                 IntimacyBoundary.ORDINARY.value,
+                None,
                 THEMATIC_PROFILE_BELIEF_LIMIT,
             ),
         )
@@ -1460,17 +1735,20 @@ class Compactor:
               AND object_type = ?
               AND status = ?
               AND privacy_level < 2
+              AND sensitivity = 'public'
               AND intimacy_boundary = ?
+              AND {visibility_clause}
               AND json_extract(payload_json, '$.summary_kind') = ?
               AND CAST(json_extract(payload_json, '$.hierarchy_level') AS INTEGER) = 1
             ORDER BY updated_at DESC, id ASC
             LIMIT ?
-            """,
+            """.format(visibility_clause=conversation_visibility_clause("memory_objects")),
             (
                 user_id,
                 MemoryObjectType.SUMMARY_VIEW.value,
                 MemoryStatus.ACTIVE.value,
                 IntimacyBoundary.ORDINARY.value,
+                None,
                 SummaryViewKind.EPISODE.value,
                 THEMATIC_PROFILE_EPISODE_LIMIT,
             ),
@@ -1492,20 +1770,43 @@ class Compactor:
         )
 
     async def _workspace_conversation_chunks(self, user_id: str, workspace_id: str) -> list[dict[str, Any]]:
+        return await self._character_conversation_chunks(
+            user_id,
+            workspace_id,
+            workspace_id=workspace_id,
+        )
+
+    async def _character_conversation_chunks(
+        self,
+        user_id: str,
+        character_id: str,
+        *,
+        workspace_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        target_clause, target_parameters = self._character_target_clause(
+            table_alias="c",
+            character_id=character_id,
+            workspace_id=workspace_id,
+        )
         rows = await self._summary_repository._fetch_all(  # noqa: SLF001
-            """
+            f"""
             SELECT sv.*
             FROM summary_views AS sv
             JOIN conversations AS c ON c.id = sv.conversation_id
             WHERE c.user_id = ?
-              AND c.workspace_id = ?
+              AND {target_clause}
+              AND c.temporary = 0
+              AND COALESCE(c.isolated_mode, 0) = 0
+              AND c.status = ?
               AND sv.summary_kind = ?
+              AND sv.sensitivity = 'public'
             ORDER BY sv.created_at DESC, sv.id DESC
             LIMIT ?
             """,
             (
                 user_id,
-                workspace_id,
+                *target_parameters,
+                ConversationStatus.ACTIVE.value,
                 SummaryViewKind.CONVERSATION_CHUNK.value,
                 WORKSPACE_CHUNK_LIMIT,
             ),
@@ -1563,29 +1864,59 @@ class Compactor:
         return enriched_rows
 
     async def _workspace_consequence_chain_rows(self, user_id: str, workspace_id: str) -> list[dict[str, Any]]:
+        return await self._character_consequence_chain_rows(
+            user_id,
+            workspace_id,
+            workspace_id=workspace_id,
+        )
+
+    async def _character_consequence_chain_rows(
+        self,
+        user_id: str,
+        character_id: str,
+        *,
+        workspace_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        target_clause, target_parameters = self._character_target_clause(
+            table_alias="cc",
+            character_id=character_id,
+            workspace_id=workspace_id,
+        )
         return await self._consequence_repository._fetch_all(  # noqa: SLF001
-            """
+            f"""
             SELECT
                 cc.*,
                 action.canonical_text AS action_canonical_text,
                 outcome.canonical_text AS outcome_canonical_text,
-                tendency.canonical_text AS tendency_canonical_text
+                tendency.canonical_text AS tendency_canonical_text,
+                action.user_persona_id AS action_user_persona_id,
+                outcome.user_persona_id AS outcome_user_persona_id,
+                tendency.user_persona_id AS tendency_user_persona_id
             FROM consequence_chains AS cc
             JOIN memory_objects AS action ON action.id = cc.action_memory_id
             JOIN memory_objects AS outcome ON outcome.id = cc.outcome_memory_id
             LEFT JOIN memory_objects AS tendency ON tendency.id = cc.tendency_belief_id
             WHERE cc.user_id = ?
-              AND cc.workspace_id = ?
+              AND {target_clause}
               AND cc.status = 'active'
               AND action.privacy_level < 2
+              AND action.sensitivity = 'public'
               AND action.intimacy_boundary = 'ordinary'
               AND outcome.privacy_level < 2
+              AND outcome.sensitivity = 'public'
               AND outcome.intimacy_boundary = 'ordinary'
-              AND (tendency.id IS NULL OR (tendency.privacy_level < 2 AND tendency.intimacy_boundary = 'ordinary'))
+              AND (
+                  tendency.id IS NULL
+                  OR (
+                      tendency.privacy_level < 2
+                      AND tendency.sensitivity = 'public'
+                      AND tendency.intimacy_boundary = 'ordinary'
+                  )
+              )
             ORDER BY cc.confidence DESC, cc.updated_at DESC, cc.id ASC
             LIMIT ?
             """,
-            (user_id, workspace_id, WORKSPACE_CHAIN_LIMIT),
+            (user_id, *target_parameters, WORKSPACE_CHAIN_LIMIT),
         )
 
     async def _source_object_ids_for_message_range(
@@ -1650,7 +1981,7 @@ class Compactor:
             )
             rendered.append(
                 f"<message {attributes}>"
-                f"{html.escape(str(message['text']))}"
+                f"{html.escape(message_text_for_context(message))}"
                 "</message>"
             )
         return "\n".join(rendered)
@@ -1854,6 +2185,152 @@ class Compactor:
             ordered.append(normalized)
         return ordered
 
+    @staticmethod
+    def _namespace_value(row: dict[str, Any], key: str) -> str | None:
+        raw_value = row.get(key)
+        if raw_value is None:
+            return None
+        value = str(raw_value).strip()
+        return value or None
+
+    @classmethod
+    def _partition_rows_by_user_persona(cls, rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        partitions: dict[str | None, list[dict[str, Any]]] = {}
+        for row in rows:
+            partitions.setdefault(cls._namespace_value(row, "user_persona_id"), []).append(row)
+        return list(partitions.values())
+
+    @staticmethod
+    def _character_target_clause(
+        *,
+        table_alias: str,
+        character_id: str,
+        workspace_id: str | None,
+    ) -> tuple[str, tuple[str, ...]]:
+        if table_alias not in {"memory_objects", "c", "cc"}:
+            raise ValueError(f"Unsupported character target table alias: {table_alias}")
+        character_column = f"{table_alias}.character_id"
+        workspace_column = f"{table_alias}.workspace_id"
+        if workspace_id is not None and workspace_id == character_id:
+            return (
+                f"({character_column} = ? OR ({character_column} IS NULL AND {workspace_column} = ?))",
+                (character_id, workspace_id),
+            )
+        return f"{character_column} = ?", (character_id,)
+
+    @classmethod
+    def _partition_character_rollup_inputs_by_user_persona(
+        cls,
+        *,
+        memory_rows: list[dict[str, Any]],
+        chunk_rows: list[dict[str, Any]],
+        chain_rows: list[dict[str, Any]],
+    ) -> list[tuple[str | None, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]]:
+        partitions: dict[str | None, dict[str, list[dict[str, Any]]]] = {}
+
+        def partition_for(user_persona_id: str | None) -> dict[str, list[dict[str, Any]]]:
+            return partitions.setdefault(
+                user_persona_id,
+                {"memory": [], "chunk": [], "chain": []},
+            )
+
+        for row in memory_rows:
+            partition_for(cls._namespace_value(row, "user_persona_id"))["memory"].append(row)
+        for row in chunk_rows:
+            partition_for(cls._namespace_value(row, "user_persona_id"))["chunk"].append(row)
+        for row in chain_rows:
+            user_persona_id = cls._namespace_value(row, "user_persona_id")
+            if not cls._consequence_chain_matches_user_persona(row, user_persona_id):
+                continue
+            partition_for(user_persona_id)["chain"].append(row)
+
+        return [
+            (user_persona_id, rows["memory"], rows["chunk"], rows["chain"])
+            for user_persona_id, rows in partitions.items()
+            if rows["memory"] or rows["chunk"] or rows["chain"]
+        ]
+
+    @classmethod
+    def _consequence_chain_matches_user_persona(
+        cls,
+        row: dict[str, Any],
+        user_persona_id: str | None,
+    ) -> bool:
+        return all(
+            cls._namespace_value(row, key) == user_persona_id
+            for key in (
+                "user_persona_id",
+                "action_user_persona_id",
+                "outcome_user_persona_id",
+                "tendency_user_persona_id",
+            )
+            if row.get(key) is not None
+        )
+
+    @classmethod
+    def _single_namespace_text(cls, rows: list[dict[str, Any]], key: str) -> str | None:
+        values = {cls._namespace_value(row, key) for row in rows}
+        if len(values) == 1:
+            return next(iter(values))
+        return None
+
+    @classmethod
+    def _filter_source_rows_by_user_persona(
+        cls,
+        source_object_ids: list[str],
+        source_memory_rows: list[dict[str, Any]],
+        user_persona_id: str | None,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        source_rows_by_id = {
+            str(row.get("id") or "").strip(): row
+            for row in source_memory_rows
+            if str(row.get("id") or "").strip()
+        }
+        filtered_ids: list[str] = []
+        filtered_rows: list[dict[str, Any]] = []
+        for source_id in source_object_ids:
+            source_row = source_rows_by_id.get(source_id)
+            if (
+                source_row is not None
+                and cls._namespace_value(source_row, "user_persona_id") != user_persona_id
+            ):
+                continue
+            filtered_ids.append(source_id)
+            if source_row is not None:
+                filtered_rows.append(source_row)
+        return filtered_ids, filtered_rows
+
+    async def _character_rollup_available_source_ids(
+        self,
+        *,
+        user_id: str,
+        memory_rows: list[dict[str, Any]],
+        chunk_rows: list[dict[str, Any]],
+        chain_rows: list[dict[str, Any]],
+        user_persona_id: str | None,
+    ) -> list[str]:
+        available_source_ids = [
+            str(row["id"])
+            for row in memory_rows
+            if self._namespace_value(row, "user_persona_id") == user_persona_id
+        ]
+        chunk_source_ids = self._merge_summary_source_ids(chunk_rows)
+        chunk_source_rows = await self._memory_rows_by_ids(user_id, chunk_source_ids)
+        filtered_chunk_source_ids, _filtered_chunk_source_rows = self._filter_source_rows_by_user_persona(
+            chunk_source_ids,
+            chunk_source_rows,
+            user_persona_id,
+        )
+        available_source_ids.extend(filtered_chunk_source_ids)
+        for row in chain_rows:
+            if not self._consequence_chain_matches_user_persona(row, user_persona_id):
+                continue
+            for key in ("action_memory_id", "outcome_memory_id", "tendency_belief_id"):
+                value = row.get(key)
+                if value is not None:
+                    available_source_ids.append(str(value))
+        return self._unique_strings(available_source_ids)
+
     @classmethod
     def _merge_summary_source_ids(cls, summary_rows: list[dict[str, Any]]) -> list[str]:
         merged: list[str] = []
@@ -1902,6 +2379,64 @@ class Compactor:
         if not rows:
             return 0
         return max(int(row.get("privacy_level", 0)) for row in rows)
+
+    @classmethod
+    def _summary_sensitivity(cls, rows: list[dict[str, Any]]) -> MemorySensitivity:
+        rank = {
+            MemorySensitivity.UNKNOWN: 0,
+            MemorySensitivity.PUBLIC: 1,
+            MemorySensitivity.PRIVATE: 2,
+            MemorySensitivity.SECRET: 3,
+        }
+        values: list[MemorySensitivity] = []
+        for row in rows:
+            try:
+                values.append(MemorySensitivity(str(row.get("sensitivity") or "unknown")))
+            except ValueError:
+                values.append(MemorySensitivity.UNKNOWN)
+        return max(values, key=lambda value: rank[value], default=MemorySensitivity.UNKNOWN)
+
+    @classmethod
+    def _summary_themes(cls, rows: list[dict[str, Any]]) -> list[str]:
+        themes: list[str] = []
+        for row in rows:
+            raw_themes = row.get("themes_json")
+            if raw_themes is None:
+                raw_themes = row.get("themes")
+            if not isinstance(raw_themes, list):
+                continue
+            themes.extend(str(item).strip() for item in raw_themes if str(item).strip())
+        return cls._unique_strings(themes)
+
+    @staticmethod
+    def _summary_platform_locked(rows: list[dict[str, Any]]) -> bool:
+        return any(bool(row.get("platform_locked")) for row in rows)
+
+    @staticmethod
+    def _summary_platform_id_lock(rows: list[dict[str, Any]]) -> str | None:
+        locks = [
+            str(row.get("platform_id_lock") or row.get("platform_id") or "").strip()
+            for row in rows
+            if bool(row.get("platform_locked"))
+        ]
+        normalized = [item for item in locks if item]
+        if not normalized:
+            return None
+        first = normalized[0]
+        if all(item == first for item in normalized):
+            return first
+        return first
+
+    @staticmethod
+    def _single_optional_text(rows: list[dict[str, Any]], key: str) -> str | None:
+        values = {
+            str(row[key]).strip()
+            for row in rows
+            if row.get(key) is not None and str(row[key]).strip()
+        }
+        if len(values) == 1:
+            return next(iter(values))
+        return None
 
     @staticmethod
     def _max_intimacy_boundary(rows: list[dict[str, Any]]) -> IntimacyBoundary:
@@ -2391,6 +2926,26 @@ class Compactor:
 
     async def _next_workspace_rollup_timestamp(self, user_id: str, workspace_id: str) -> str:
         latest_rollup = await self._summary_repository.get_latest_workspace_rollup(user_id, workspace_id)
+        current_time = self._clock.now()
+        if latest_rollup is None:
+            return current_time.isoformat()
+
+        latest_created_at = datetime.fromisoformat(str(latest_rollup["created_at"]))
+        if latest_created_at >= current_time:
+            return (latest_created_at + timedelta(microseconds=1)).isoformat()
+        return current_time.isoformat()
+
+    async def _next_character_rollup_timestamp(
+        self,
+        user_id: str,
+        character_id: str,
+        user_persona_id: str | None,
+    ) -> str:
+        latest_rollup = await self._summary_repository.get_latest_character_rollup_for_persona(
+            user_id,
+            character_id,
+            user_persona_id,
+        )
         current_time = self._clock.now()
         if latest_rollup is None:
             return current_time.isoformat()

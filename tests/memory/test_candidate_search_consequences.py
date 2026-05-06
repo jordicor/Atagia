@@ -16,6 +16,7 @@ from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
     NeedTrigger,
@@ -93,6 +94,8 @@ async def _seed_chain(
             status=MemoryStatus.ACTIVE,
             payload={"source_message_ids": ["msg_user_1", "msg_assistant_1"]},
             memory_id="mem_tendency",
+            character_id="wrk_1",
+            scope_canonical=MemoryScope.CHARACTER.value,
         )
     await chains.create_chain(
         {
@@ -118,12 +121,16 @@ def _plan(
     *,
     fts_queries: list[str] | None = None,
     consequence_search_enabled: bool = False,
+    workspace_id: str | None = "wrk_1",
+    conversation_id: str = "cnv_1",
+    character_id: str | None = None,
 ) -> RetrievalPlan:
     resolved_fts_queries = fts_queries or ["regressions"]
     return RetrievalPlan(
         assistant_mode_id="coding_debug",
-        workspace_id="wrk_1",
-        conversation_id="cnv_1",
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        character_id=character_id,
         fts_queries=resolved_fts_queries,
         sub_query_plans=[
             {
@@ -173,6 +180,110 @@ async def test_consequence_chains_surface_for_supported_need_signals(need_type: 
 
 
 @pytest.mark.asyncio
+async def test_consequence_chains_cross_chat_for_character_without_workspace() -> None:
+    connection, memories, chains, search = await _build_runtime()
+    clock = FrozenClock(datetime(2026, 4, 2, 15, 0, tzinfo=timezone.utc))
+    conversations = ConversationRepository(connection, clock)
+    try:
+        await conversations.create_conversation(
+            "cnv_char_old",
+            "usr_1",
+            None,
+            "coding_debug",
+            "Old character chat",
+            character_id="char_debug",
+            platform_id="default",
+        )
+        await conversations.create_conversation(
+            "cnv_char_new",
+            "usr_1",
+            None,
+            "coding_debug",
+            "New character chat",
+            character_id="char_debug",
+            platform_id="default",
+        )
+        action = await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_char_old",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            scope_canonical=MemoryScope.CHAT.value,
+            canonical_text="Suggested a large refactor to simplify the character code path.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            status=MemoryStatus.ACTIVE,
+            payload={"source_message_ids": ["msg_assistant_char"]},
+            memory_id="mem_char_action",
+            character_id="char_debug",
+        )
+        outcome = await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_char_old",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            scope_canonical=MemoryScope.CHAT.value,
+            canonical_text="Regressions followed after the character refactor suggestion.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            status=MemoryStatus.ACTIVE,
+            payload={"source_message_ids": ["msg_user_char"]},
+            memory_id="mem_char_outcome",
+            character_id="char_debug",
+        )
+        tendency = await memories.create_memory_object(
+            user_id="usr_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.CONSEQUENCE_CHAIN,
+            scope=MemoryScope.WORKSPACE,
+            scope_canonical=MemoryScope.CHARACTER.value,
+            canonical_text="Prefer incremental patches with this character.",
+            source_kind=MemorySourceKind.INFERRED,
+            confidence=0.64,
+            privacy_level=0,
+            status=MemoryStatus.ACTIVE,
+            payload={"source_message_ids": ["msg_user_char", "msg_assistant_char"]},
+            memory_id="mem_char_tendency",
+            character_id="char_debug",
+        )
+        await chains.create_chain(
+            {
+                "id": "chn_char",
+                "user_id": "usr_1",
+                "workspace_id": None,
+                "conversation_id": "cnv_char_old",
+                "assistant_mode_id": "coding_debug",
+                "action_memory_id": str(action["id"]),
+                "outcome_memory_id": str(outcome["id"]),
+                "tendency_belief_id": str(tendency["id"]),
+                "confidence": 0.8,
+                "status": "active",
+                "created_at": "2026-04-02T15:00:00+00:00",
+                "updated_at": "2026-04-02T15:00:00+00:00",
+            }
+        )
+
+        candidates = await search.search(
+            _plan(
+                NeedTrigger.FOLLOW_UP_FAILURE,
+                consequence_search_enabled=True,
+                workspace_id=None,
+                conversation_id="cnv_char_new",
+                character_id="char_debug",
+            ),
+            "usr_1",
+        )
+
+        assert "mem_char_tendency" in [candidate["id"] for candidate in candidates]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_consequence_chains_do_not_surface_for_other_need_signals() -> None:
     connection, memories, chains, search = await _build_runtime()
     try:
@@ -211,6 +322,27 @@ async def test_consequence_chains_without_tendency_surface_outcome_memory() -> N
 
         assert tendency_id is None
         assert outcome_id in [candidate["id"] for candidate in candidates]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_consequence_chain_search_hides_chain_when_action_source_is_non_public() -> None:
+    connection, memories, chains, search = await _build_runtime()
+    try:
+        action_id, _outcome_id, tendency_id = await _seed_chain(memories, chains)
+        await connection.execute(
+            "UPDATE memory_objects SET sensitivity = ? WHERE id = ?",
+            (MemorySensitivity.PRIVATE.value, action_id),
+        )
+        await connection.commit()
+
+        candidates = await search.search(
+            _plan(NeedTrigger.FOLLOW_UP_FAILURE, consequence_search_enabled=True),
+            "usr_1",
+        )
+
+        assert tendency_id not in [candidate["id"] for candidate in candidates]
     finally:
         await connection.close()
 

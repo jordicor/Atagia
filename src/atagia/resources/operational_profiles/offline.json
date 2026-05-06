@@ -1,0 +1,13 @@
+{
+  "operational_profile_id": "offline",
+  "display_name": "Offline",
+  "risk_level": "sensitive",
+  "signals": {
+    "power": "normal",
+    "connectivity": "offline",
+    "safety": "normal",
+    "incident_scope": "none",
+    "compute": "local_only"
+  },
+  "policy_override": {}
+}

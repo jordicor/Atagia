@@ -10,11 +10,16 @@ from typing import Any
 
 import aiosqlite
 from fastapi import FastAPI
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 
 from atagia.api.routes_admin import router as admin_router
 from atagia.api.routes_activity import router as activity_router
 from atagia.api.routes_chat import router as chat_router
 from atagia.api.routes_memory import router as memory_router
+from atagia.api.routes_openai_proxy import router as openai_proxy_router
+from atagia.api.routes_openai_proxy import openai_proxy_validation_error_response
 from atagia.api.routes_verbatim_pins import router as verbatim_pins_router
 from atagia.core.clock import Clock, SystemClock
 from atagia.core.config import Settings
@@ -33,17 +38,20 @@ from atagia.models.schemas_jobs import (
     CONTRACT_STREAM_NAME,
     EVALUATION_STREAM_NAME,
     EXTRACT_STREAM_NAME,
+    GRAPH_STREAM_NAME,
     REVISE_STREAM_NAME,
     WORKER_GROUP_NAME,
 )
 from atagia.services.artifact_blob_store import ArtifactBlobStore
 from atagia.services.embeddings import EmbeddingIndex, create_embedding_index
+from atagia.services.job_recovery_service import JobRecoveryService
 from atagia.services.llm_client import ConfigurationError, LLMClient
 from atagia.services.model_resolution import log_resolution
 from atagia.services.providers import build_llm_client
 from atagia.workers.compaction_worker import CompactionWorker
 from atagia.workers.contract_worker import ContractWorker
 from atagia.workers.evaluation_worker import EvaluationWorker
+from atagia.workers.graph_sync_worker import GraphSyncWorker
 from atagia.workers.ingest_worker import IngestWorker
 from atagia.workers.lifecycle_worker import LifecycleWorker
 from atagia.workers.revision_worker import RevisionWorker
@@ -67,6 +75,7 @@ class AppRuntime:
     storage_backend: StorageBackend
     ingest_worker: IngestWorker | None
     contract_worker: ContractWorker | None
+    graph_worker: GraphSyncWorker | None
     revision_worker: RevisionWorker | None
     compaction_worker: CompactionWorker | None
     evaluation_worker: EvaluationWorker | None
@@ -179,12 +188,14 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
         storage_backend = _build_storage_backend(settings)
         ingest_worker: IngestWorker | None = None
         contract_worker: ContractWorker | None = None
+        graph_worker: GraphSyncWorker | None = None
         revision_worker: RevisionWorker | None = None
         compaction_worker: CompactionWorker | None = None
         evaluation_worker: EvaluationWorker | None = None
         for stream_name in (
             EXTRACT_STREAM_NAME,
             CONTRACT_STREAM_NAME,
+            GRAPH_STREAM_NAME,
             REVISE_STREAM_NAME,
             COMPACT_STREAM_NAME,
             EVALUATION_STREAM_NAME,
@@ -192,8 +203,17 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             await storage_backend.stream_ensure_group(stream_name, WORKER_GROUP_NAME)
         lifecycle_worker: LifecycleWorker | None = None
         if settings.workers_enabled:
+            if isinstance(storage_backend, InProcessBackend):
+                await JobRecoveryService(
+                    bootstrap_connection,
+                    clock,
+                    settings=settings,
+                    storage_backend=storage_backend,
+                    operational_profile_loader=operational_profile_loader,
+                ).recover_inprocess_stream_jobs()
             ingest_connection = await open_connection(database_path)
             contract_connection = await open_connection(database_path)
+            graph_connection = await open_connection(database_path)
             revision_connection = await open_connection(database_path)
             compaction_connection = await open_connection(database_path)
             evaluation_connection = await open_connection(database_path)
@@ -201,6 +221,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
                 [
                     ingest_connection,
                     contract_connection,
+                    graph_connection,
                     revision_connection,
                     compaction_connection,
                     evaluation_connection,
@@ -218,6 +239,14 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             contract_worker = ContractWorker(
                 storage_backend=storage_backend,
                 connection=contract_connection,
+                llm_client=llm_client,
+                clock=clock,
+                manifest_loader=manifest_loader,
+                settings=settings,
+            )
+            graph_worker = GraphSyncWorker(
+                storage_backend=storage_backend,
+                connection=graph_connection,
                 llm_client=llm_client,
                 clock=clock,
                 manifest_loader=manifest_loader,
@@ -251,6 +280,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
                 # cannot bleed across requests or each other.
                 asyncio.create_task(ingest_worker.run(), name="atagia-ingest-worker"),
                 asyncio.create_task(contract_worker.run(), name="atagia-contract-worker"),
+                asyncio.create_task(graph_worker.run(), name="atagia-graph-worker"),
                 asyncio.create_task(revision_worker.run(), name="atagia-revision-worker"),
                 asyncio.create_task(compaction_worker.run(), name="atagia-compaction-worker"),
                 asyncio.create_task(evaluation_worker.run(), name="atagia-evaluation-worker"),
@@ -262,6 +292,8 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
                 settings=settings,
                 embedding_index=embedding_index,
                 storage_backend=storage_backend,
+                artifact_blob_store=artifact_blob_store,
+                llm_client=llm_client,
             )
             worker_tasks.append(
                 asyncio.create_task(lifecycle_worker.run(), name="atagia-lifecycle-worker")
@@ -281,6 +313,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             storage_backend=storage_backend,
             ingest_worker=ingest_worker,
             contract_worker=contract_worker,
+            graph_worker=graph_worker,
             revision_worker=revision_worker,
             compaction_worker=compaction_worker,
             evaluation_worker=evaluation_worker,
@@ -324,7 +357,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         debug=resolved_settings.debug,
         lifespan=lifespan,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request, exc):
+        if request.url.path in {"/v1/chat/completions", "/v1/models"}:
+            return openai_proxy_validation_error_response(exc)
+        return await request_validation_exception_handler(request, exc)
+
+    if resolved_settings.cors_allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(resolved_settings.cors_allowed_origins),
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
     app.include_router(chat_router)
+    app.include_router(openai_proxy_router)
     app.include_router(activity_router)
     app.include_router(memory_router)
     app.include_router(verbatim_pins_router)

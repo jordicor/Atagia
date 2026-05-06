@@ -8,6 +8,7 @@ import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from atagia.api.dependencies import AuthContext, ensure_user_access, get_auth_context, get_connection, get_runtime
+from atagia.api.namespace_context import require_route_namespace_context
 from atagia.models.schemas_api import (
     VerbatimPinCreateRequest,
     VerbatimPinRecord,
@@ -30,16 +31,36 @@ async def create_verbatim_pin(
     runtime: AppRuntime = Depends(get_runtime),
 ) -> VerbatimPinRecord:
     ensure_user_access(payload.user_id, auth_context)
-    created = await VerbatimPinService(runtime).create_verbatim_pin(
+    namespace = await require_route_namespace_context(
         connection,
-        **payload.model_dump(),
+        runtime.clock,
+        user_id=payload.user_id,
+        conversation_id=payload.conversation_id,
+        platform_id=payload.platform_id,
+        user_persona_id=payload.user_persona_id,
+        character_id=payload.character_id,
+        incognito=payload.incognito,
     )
+    data = payload.model_dump()
+    data.update(namespace.memory_kwargs())
+    try:
+        created = await VerbatimPinService(runtime).create_verbatim_pin(
+            connection,
+            **data,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return VerbatimPinRecord.model_validate(created)
 
 
 @router.get("", response_model=list[VerbatimPinRecord])
 async def list_verbatim_pins(
     user_id: str = Query(...),
+    conversation_id: str = Query(...),
+    platform_id: str = Query(...),
+    user_persona_id: str | None = Query(default=None),
+    character_id: str | None = Query(default=None),
+    incognito: bool | None = Query(default=None),
     status_filter: list[VerbatimPinStatus] | None = Query(default=None, alias="status"),
     scope_filter: list[MemoryScope] | None = Query(default=None, alias="scope"),
     target_kind_filter: list[VerbatimPinTargetKind] | None = Query(default=None, alias="target_kind"),
@@ -53,6 +74,16 @@ async def list_verbatim_pins(
     runtime: AppRuntime = Depends(get_runtime),
 ) -> list[VerbatimPinRecord]:
     ensure_user_access(user_id, auth_context)
+    namespace = await require_route_namespace_context(
+        connection,
+        runtime.clock,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        platform_id=platform_id,
+        user_persona_id=user_persona_id,
+        character_id=character_id,
+        incognito=incognito,
+    )
     rows = await VerbatimPinService(runtime).list_verbatim_pins(
         connection,
         user_id=user_id,
@@ -64,6 +95,7 @@ async def list_verbatim_pins(
         target_id=target_id,
         include_deleted=include_deleted,
         active_only=active_only,
+        **namespace.memory_kwargs(),
     )
     return [VerbatimPinRecord.model_validate(row) for row in rows]
 
@@ -72,15 +104,31 @@ async def list_verbatim_pins(
 async def get_verbatim_pin(
     pin_id: str,
     user_id: str = Query(...),
+    conversation_id: str = Query(...),
+    platform_id: str = Query(...),
+    user_persona_id: str | None = Query(default=None),
+    character_id: str | None = Query(default=None),
+    incognito: bool | None = Query(default=None),
     auth_context: AuthContext = Depends(get_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
     runtime: AppRuntime = Depends(get_runtime),
 ) -> VerbatimPinRecord:
     ensure_user_access(user_id, auth_context)
+    namespace = await require_route_namespace_context(
+        connection,
+        runtime.clock,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        platform_id=platform_id,
+        user_persona_id=user_persona_id,
+        character_id=character_id,
+        incognito=incognito,
+    )
     row = await VerbatimPinService(runtime).get_verbatim_pin(
         connection,
         user_id=user_id,
         pin_id=pin_id,
+        **namespace.memory_kwargs(),
     )
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Verbatim pin not found for user")
@@ -92,17 +140,36 @@ async def update_verbatim_pin(
     pin_id: str,
     payload: VerbatimPinUpdateRequest,
     user_id: str = Query(...),
+    conversation_id: str = Query(...),
+    platform_id: str = Query(...),
+    user_persona_id: str | None = Query(default=None),
+    character_id: str | None = Query(default=None),
+    incognito: bool | None = Query(default=None),
     auth_context: AuthContext = Depends(get_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
     runtime: AppRuntime = Depends(get_runtime),
 ) -> VerbatimPinRecord:
     ensure_user_access(user_id, auth_context)
-    updated = await VerbatimPinService(runtime).update_verbatim_pin(
+    namespace = await require_route_namespace_context(
         connection,
+        runtime.clock,
         user_id=user_id,
-        pin_id=pin_id,
-        **payload.model_dump(exclude_none=True),
+        conversation_id=conversation_id,
+        platform_id=platform_id,
+        user_persona_id=user_persona_id,
+        character_id=character_id,
+        incognito=incognito,
     )
+    try:
+        updated = await VerbatimPinService(runtime).update_verbatim_pin(
+            connection,
+            user_id=user_id,
+            pin_id=pin_id,
+            **payload.model_dump(exclude_none=True),
+            **namespace.memory_kwargs(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Verbatim pin not found for user")
     return VerbatimPinRecord.model_validate(updated)
@@ -112,15 +179,31 @@ async def update_verbatim_pin(
 async def delete_verbatim_pin(
     pin_id: str,
     user_id: str = Query(...),
+    conversation_id: str = Query(...),
+    platform_id: str = Query(...),
+    user_persona_id: str | None = Query(default=None),
+    character_id: str | None = Query(default=None),
+    incognito: bool | None = Query(default=None),
     auth_context: AuthContext = Depends(get_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
     runtime: AppRuntime = Depends(get_runtime),
 ) -> VerbatimPinRecord:
     ensure_user_access(user_id, auth_context)
+    namespace = await require_route_namespace_context(
+        connection,
+        runtime.clock,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        platform_id=platform_id,
+        user_persona_id=user_persona_id,
+        character_id=character_id,
+        incognito=incognito,
+    )
     deleted = await VerbatimPinService(runtime).delete_verbatim_pin(
         connection,
         user_id=user_id,
         pin_id=pin_id,
+        **namespace.memory_kwargs(),
     )
     if deleted is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Verbatim pin not found for user")

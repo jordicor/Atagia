@@ -13,8 +13,9 @@ from atagia.core.contract_repository import ContractDimensionRepository
 from atagia.core.llm_output_limits import CONTRACT_PROJECTION_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import MemoryObjectRepository, MessageRepository
 from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
-from atagia.memory.policy_manifest import ResolvedPolicy
-from atagia.memory.scope_utils import resolve_scope_identifiers
+from atagia.memory.namespace import MemoryNamespaceContext
+from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
+from atagia.memory.scope_utils import resolve_namespace_identifiers
 from atagia.models.schemas_memory import (
     ContractProjectionResult,
     ContractSignal,
@@ -91,7 +92,8 @@ The current mode's privacy_ceiling is {privacy_ceiling}.
 You may extract items at any privacy level. Assign privacy_level honestly based on content sensitivity, not based on the ceiling.
 
 Rules:
-- Use only scopes allowed by the policy.
+- Use only `chat`, `character`, or `user` scopes from the policy's
+  `allowed_write_scopes`; do not output legacy scope names.
 - The dimension_name field is open-ended text, not a fixed enum.
 - Prefer the priority dimensions when relevant, but capture another dimension if it is explicitly expressed.
 - Keep canonical_text concise and grounded in the source message.
@@ -137,14 +139,14 @@ class ContractProjector:
         message_text: str,
         role: str,
         conversation_context: ExtractionConversationContext | dict[str, Any],
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
         user_id: str,
         occurred_at: str | None = None,
     ) -> list[ContractSignal]:
         context = ExtractionConversationContext.model_validate(conversation_context)
         if context.user_id != user_id:
             raise ValueError("Conversation context user_id must match the provided user_id")
-        if context.assistant_mode_id != resolved_policy.assistant_mode_id.value:
+        if context.assistant_mode_id != resolved_policy.profile_id.value:
             raise ValueError("Conversation context assistant_mode_id must match the resolved policy")
 
         source_message = await self._message_repository.get_message(context.source_message_id, context.user_id)
@@ -191,31 +193,38 @@ class ContractProjector:
             return []
 
         persisted_signals: list[ContractSignal] = []
+        namespace_context = self._namespace_context(context)
         for signal in result.signals:
-            if signal.scope not in resolved_policy.allowed_scopes:
-                continue
+            signal.scope = self._write_scope(signal.scope, context)
             if not self._is_grounded(signal.canonical_text, message_text):
                 continue
 
-            scope_ids = self._scope_identifiers(signal.scope, context)
+            scope_ids = resolve_namespace_identifiers(signal.scope, namespace_context)
             if scope_ids is None:
                 continue
+            legacy_scope_ids = self._legacy_scope_identifiers(signal.scope, context)
+            storage_scope = self._storage_scope(signal.scope)
             memory_status = self._resolve_memory_status(
                 signal=signal,
                 privacy_ceiling=resolved_policy.privacy_ceiling,
             )
             memory_object = await self._memory_repository.create_memory_object(
                 user_id=context.user_id,
-                workspace_id=scope_ids["workspace_id"],
-                conversation_id=scope_ids["conversation_id"],
-                assistant_mode_id=scope_ids["assistant_mode_id"],
+                workspace_id=legacy_scope_ids["workspace_id"],
+                conversation_id=legacy_scope_ids["conversation_id"],
+                assistant_mode_id=legacy_scope_ids["assistant_mode_id"],
                 object_type=MemoryObjectType.INTERACTION_CONTRACT,
-                scope=signal.scope,
+                scope=storage_scope,
                 canonical_text=signal.canonical_text,
                 payload={
                     "dimension_name": signal.dimension_name,
                     "value_json": signal.value_json,
                     "source_message_ids": [context.source_message_id],
+                    "source_turn_policy": self._source_turn_policy_snapshot(
+                        context,
+                        scope=signal.scope,
+                        platform_locked=not context.remember_across_devices,
+                    ),
                 },
                 source_kind=signal.source_kind,
                 confidence=signal.confidence,
@@ -224,6 +233,17 @@ class ContractProjector:
                 maya_score=0.8,
                 privacy_level=signal.privacy_level,
                 status=memory_status,
+                user_persona_id=scope_ids["user_persona_id"],
+                platform_id=namespace_context.platform_id,
+                character_id=scope_ids["character_id"],
+                auto_expires=context.temporary or context.purge_on_close,
+                platform_locked=not context.remember_across_devices,
+                platform_id_lock=(
+                    namespace_context.platform_id
+                    if not context.remember_across_devices
+                    else None
+                ),
+                scope_canonical=signal.scope.value,
             )
             if memory_object is None:
                 raise RuntimeError("Failed to create interaction_contract memory object")
@@ -234,10 +254,10 @@ class ContractProjector:
             ):
                 await self._contract_repository.upsert_projection(
                     user_id=context.user_id,
-                    assistant_mode_id=scope_ids["assistant_mode_id"],
-                    workspace_id=scope_ids["workspace_id"],
-                    conversation_id=scope_ids["conversation_id"],
-                    scope=signal.scope,
+                    assistant_mode_id=legacy_scope_ids["assistant_mode_id"],
+                    workspace_id=legacy_scope_ids["workspace_id"],
+                    conversation_id=legacy_scope_ids["conversation_id"],
+                    scope=storage_scope,
                     dimension_name=signal.dimension_name,
                     value_json=signal.value_json,
                     confidence=signal.confidence,
@@ -287,12 +307,25 @@ class ContractProjector:
         assistant_mode_id: str,
         workspace_id: str | None,
         conversation_id: str | None,
+        *,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> dict[str, dict[str, Any]]:
         rows = await self._contract_repository.list_for_context(
             user_id=user_id,
             assistant_mode_id=assistant_mode_id,
             workspace_id=workspace_id,
             conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
         )
         merged: dict[str, tuple[int, str, dict[str, Any]]] = {}
         for row in rows:
@@ -319,6 +352,12 @@ class ContractProjector:
             assistant_mode_id=context.assistant_mode_id,
             workspace_id=context.workspace_id,
             conversation_id=context.conversation_id,
+            user_persona_id=context.user_persona_id,
+            platform_id=context.platform_id,
+            character_id=context.character_id if context.character_id is not None else context.workspace_id,
+            incognito=context.incognito or context.isolated_mode,
+            remember_across_chats=context.remember_across_chats,
+            remember_across_devices=context.remember_across_devices,
         )
         return count == 0
 
@@ -327,7 +366,7 @@ class ContractProjector:
         message_text: str,
         role: str,
         context: ExtractionConversationContext,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
         cold_start: bool,
         occurred_at: str | None = None,
     ) -> str:
@@ -349,8 +388,8 @@ class ContractProjector:
         ) or "<message role=\"none\">(none)</message>"
         policy_json = json_utils.dumps(
             {
-                "assistant_mode_id": resolved_policy.assistant_mode_id.value,
-                "allowed_scopes": [scope.value for scope in resolved_policy.allowed_scopes],
+                "assistant_mode_id": resolved_policy.profile_id.value,
+                "allowed_write_scopes": self._allowed_write_scopes(context),
                 "contract_dimensions_priority": resolved_policy.contract_dimensions_priority,
                 "privacy_ceiling": resolved_policy.privacy_ceiling,
             },
@@ -386,16 +425,111 @@ class ContractProjector:
         return MemoryStatus.ACTIVE
 
     @staticmethod
-    def _scope_identifiers(
+    def _namespace_context(context: ExtractionConversationContext) -> MemoryNamespaceContext:
+        return MemoryNamespaceContext(
+            user_id=context.user_id,
+            user_persona_id=context.user_persona_id,
+            platform_id=context.platform_id or "default",
+            character_id=context.character_id if context.character_id is not None else context.workspace_id,
+            conversation_id=context.conversation_id,
+            mode=context.mode or context.assistant_mode_id,
+            incognito=context.incognito or context.isolated_mode,
+            remember_across_chats=context.remember_across_chats,
+            remember_across_devices=context.remember_across_devices,
+        )
+
+    @staticmethod
+    def _write_scope(scope: MemoryScope, context: ExtractionConversationContext) -> MemoryScope:
+        if scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION, MemoryScope.CHAT}:
+            resolved = MemoryScope.CHAT
+        elif scope in {MemoryScope.WORKSPACE, MemoryScope.CHARACTER}:
+            resolved = MemoryScope.CHARACTER
+        else:
+            resolved = MemoryScope.USER
+        if resolved is MemoryScope.CHARACTER and (
+            context.character_id if context.character_id is not None else context.workspace_id
+        ) is None:
+            resolved = MemoryScope.CHAT
+        if (
+            context.incognito
+            or context.isolated_mode
+            or not context.remember_across_chats
+            or context.temporary
+            or context.purge_on_close
+        ):
+            resolved = MemoryScope.CHAT
+        return resolved
+
+    @staticmethod
+    def _allowed_write_scopes(context: ExtractionConversationContext) -> list[str]:
+        if (
+            context.incognito
+            or context.isolated_mode
+            or not context.remember_across_chats
+            or context.temporary
+            or context.purge_on_close
+        ):
+            return [MemoryScope.CHAT.value]
+        scopes = [MemoryScope.CHAT.value]
+        if (context.character_id if context.character_id is not None else context.workspace_id) is not None:
+            scopes.append(MemoryScope.CHARACTER.value)
+        scopes.append(MemoryScope.USER.value)
+        return scopes
+
+    @staticmethod
+    def _legacy_scope_identifiers(
         scope: MemoryScope,
         context: ExtractionConversationContext,
-    ) -> dict[str, str | None] | None:
-        return resolve_scope_identifiers(
-            scope,
-            assistant_mode_id=context.assistant_mode_id,
-            workspace_id=context.workspace_id,
-            conversation_id=context.conversation_id,
-        )
+    ) -> dict[str, str | None]:
+        if scope is MemoryScope.CHAT:
+            return {
+                "assistant_mode_id": context.assistant_mode_id,
+                "workspace_id": context.workspace_id,
+                "conversation_id": context.conversation_id,
+            }
+        if scope is MemoryScope.CHARACTER:
+            return {
+                "assistant_mode_id": context.assistant_mode_id,
+                "workspace_id": context.workspace_id,
+                "conversation_id": None,
+            }
+        return {
+            "assistant_mode_id": None,
+            "workspace_id": None,
+            "conversation_id": None,
+        }
+
+    @staticmethod
+    def _storage_scope(scope: MemoryScope) -> MemoryScope:
+        if scope is MemoryScope.CHARACTER:
+            return MemoryScope.CHARACTER
+        if scope is MemoryScope.USER:
+            return MemoryScope.USER
+        return MemoryScope.CHAT
+
+    @staticmethod
+    def _source_turn_policy_snapshot(
+        context: ExtractionConversationContext,
+        *,
+        scope: MemoryScope,
+        platform_locked: bool,
+    ) -> dict[str, Any]:
+        return {
+            "user_persona_id": context.user_persona_id,
+            "platform_id": context.platform_id,
+            "character_id": context.character_id if context.character_id is not None else context.workspace_id,
+            "conversation_id": context.conversation_id,
+            "mode": context.mode or context.assistant_mode_id,
+            "incognito": context.incognito or context.isolated_mode,
+            "remember_across_chats": context.remember_across_chats,
+            "remember_across_devices": context.remember_across_devices,
+            "temporary": context.temporary,
+            "purge_on_close": context.purge_on_close,
+            "intended_scope": scope.value,
+            "auto_expires": context.temporary or context.purge_on_close,
+            "platform_locked": platform_locked,
+            "platform_id_lock": context.platform_id if platform_locked else None,
+        }
 
     @staticmethod
     def _normalize_token(token: str) -> str:

@@ -10,14 +10,21 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from atagia.core.timestamps import normalize_optional_timestamp
 from atagia.models.schemas_evaluation import MetricName
+from atagia.models.schemas_jobs import WorkerControlMode
 from atagia.models.schemas_memory import (
     ComposedContext,
+    ConfirmationStrategy,
+    IngestOrigin,
     IntimacyBoundary,
+    MemoryCategory,
+    MemoryPrivacyMode,
     MemoryScope,
+    MemorySensitivity,
     OperationalSignals,
     TopicWorkingSetTrace,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
+    resolve_confirmation_strategy,
 )
 
 
@@ -50,6 +57,201 @@ class CreateConversationRequest(BaseModel):
     workspace_id: str | None = None
     title: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    cross_chat_memory: bool = True
+    temporary: bool = False
+    temporary_ttl_seconds: int | None = Field(default=None, gt=0)
+    purge_on_close: bool | None = None
+    # Namespace redesign identity fields. They are accepted alongside the
+    # legacy fields during the additive phase; Phase 11 will drop the
+    # legacy ones. ``platform_id`` becomes required at the service /
+    # proxy / sidecar boundary in Phase 4 wiring; library callers may
+    # still omit it for now.
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    mode: str | None = None
+    incognito: bool | None = None
+
+
+class CloseConversationRequest(BaseModel):
+    """Close a conversation without deleting data unless explicitly requested."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    platform_id: str
+    user_persona_id: str | None = None
+    character_id: str | None = None
+    incognito: bool | None = None
+    purge: bool | None = None
+    confirmation: str | None = None
+
+
+class ConversationLifecycleRequest(BaseModel):
+    """Conversation lifecycle request scoped by user."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    platform_id: str
+    user_persona_id: str | None = None
+    character_id: str | None = None
+    incognito: bool | None = None
+
+
+class MemoryPreferencesResponse(BaseModel):
+    """Resolved user-level memory sharing preferences."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    remember_across_chats: bool = True
+    remember_across_devices: bool = True
+    memory_privacy_mode: MemoryPrivacyMode = MemoryPrivacyMode.BALANCED
+
+
+class UpdateMemoryPreferencesRequest(BaseModel):
+    """Partial update for user-level memory sharing preferences."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    remember_across_chats: bool | None = None
+    remember_across_devices: bool | None = None
+    memory_privacy_mode: MemoryPrivacyMode | None = None
+
+
+class ConversationIncognitoRequest(BaseModel):
+    """Set the reversible per-conversation incognito flag."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    incognito: bool
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+
+
+class SaveFromIncognitoRequest(BaseModel):
+    """Explicit rescue request for memories from an incognito conversation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    mode: str | None = None
+
+
+class IncognitoReviewMessage(BaseModel):
+    """One source message proposed for explicit incognito rescue review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str
+    role: Literal["user", "assistant"]
+    seq: int
+    text: str
+    occurred_at: str | None = None
+    content_kind: str = "text"
+    policy_reason: str = "normal"
+    skip_by_default: bool = False
+
+
+class SaveFromIncognitoResponse(BaseModel):
+    """Review manifest for an explicit incognito rescue request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    conversation_id: str
+    status: Literal["review_required"]
+    review_policy: Literal["non_incognito"]
+    source_message_count: int = Field(ge=0)
+    source_messages: list[IncognitoReviewMessage] = Field(default_factory=list)
+    suggested_memory_count: int = Field(ge=0)
+    suggested_memories: list[dict[str, Any]] = Field(default_factory=list)
+    writes_performed: bool = False
+
+
+class DeleteConversationRequest(BaseModel):
+    """Hard-delete a conversation and its conversation-scoped data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    platform_id: str
+    user_persona_id: str | None = None
+    character_id: str | None = None
+    incognito: bool | None = None
+    confirmation: str
+
+
+class EditMemoryRequest(BaseModel):
+    """Edit active evidence memory text."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    conversation_id: str
+    platform_id: str
+    user_persona_id: str | None = None
+    character_id: str | None = None
+    incognito: bool | None = None
+    canonical_text: str = Field(min_length=1)
+
+
+class DeleteMemoryRequest(BaseModel):
+    """Archive or hard-delete a memory object."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    conversation_id: str
+    platform_id: str
+    user_persona_id: str | None = None
+    character_id: str | None = None
+    incognito: bool | None = None
+    hard: bool = False
+    confirmation: str | None = None
+
+
+class EraseUserDataRequest(BaseModel):
+    """Erase all Atagia data for a user."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    confirmation: str
+
+
+class DeletionReport(BaseModel):
+    """Count-only report for a conversation or memory deletion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str | None = None
+    memory_id: str | None = None
+    deleted_memories: int = 0
+    deleted_messages: int = 0
+    deleted_summaries: int = 0
+    deleted_artifacts: int = 0
+    tombstone_id: str | None = None
+    already_deleted: bool = False
+
+
+class ErasureReport(BaseModel):
+    """Count-only report for a user erasure."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    deleted_memories: int = 0
+    deleted_conversations: int = 0
+    deleted_artifacts: int = 0
+    tombstone_id: str | None = None
+    already_erased: bool = False
 
 
 class CreateWorkspaceRequest(BaseModel):
@@ -77,6 +279,16 @@ class ChatReplyRequest(BaseModel):
     debug: bool = False
     operational_profile: str | None = Field(default=None, max_length=64)
     operational_signals: OperationalSignals | None = None
+    cross_chat_memory: bool = True
+    # Namespace redesign per-turn identity / privacy hints. They override
+    # the conversation defaults for this turn only (e.g. setting
+    # ``incognito=True`` on a single reply). ``mode`` is a retrieval
+    # profile hint and never participates in scope SQL.
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    mode: str | None = None
+    incognito: bool | None = None
 
     @field_validator("message_occurred_at")
     @classmethod
@@ -161,6 +373,18 @@ class AttachmentInput(BaseModel):
 ChatReplyRequest.model_rebuild()
 
 
+def _resolve_sidecar_confirmation_strategy_default(data: object) -> object:
+    if not isinstance(data, dict):
+        return data
+    normalized = dict(data)
+    if normalized.get("confirmation_strategy") is None:
+        normalized["confirmation_strategy"] = resolve_confirmation_strategy(
+            ingest_origin=normalized.get("ingest_origin"),
+            confirmation_strategy=None,
+        )
+    return normalized
+
+
 class SidecarContextRequest(BaseModel):
     """Request payload for sidecar context retrieval."""
 
@@ -168,12 +392,31 @@ class SidecarContextRequest(BaseModel):
 
     user_id: str
     message_text: str
+    message_id: str | None = None
+    source_seq: int | None = Field(default=None, ge=1)
     assistant_mode_id: str | None = None
     workspace_id: str | None = None
     message_occurred_at: str | None = None
     attachments: list[AttachmentInput] = Field(default_factory=list)
     operational_profile: str | None = Field(default=None, max_length=64)
     operational_signals: OperationalSignals | None = None
+    cross_chat_memory: bool = True
+    # Namespace redesign identity fields. ``platform_id`` becomes
+    # required for sidecar callers in Phase 4 wiring; until then it is
+    # optional so existing integrations keep working.
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    mode: str | None = None
+    incognito: bool | None = None
+    ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
+    confirmation_strategy: ConfirmationStrategy | None = None
+    memory_privacy_mode: MemoryPrivacyMode | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_confirmation_strategy_default(cls, data: object) -> object:
+        return _resolve_sidecar_confirmation_strategy_default(data)
 
     @field_validator("message_occurred_at")
     @classmethod
@@ -184,6 +427,14 @@ class SidecarContextRequest(BaseModel):
         datetime.fromisoformat(normalized)
         return normalized
 
+    @field_validator("message_id")
+    @classmethod
+    def validate_message_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
 
 class SidecarIngestMessageRequest(BaseModel):
     """Request payload for sidecar message ingestion."""
@@ -191,6 +442,8 @@ class SidecarIngestMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     user_id: str
+    message_id: str | None = None
+    source_seq: int | None = Field(default=None, ge=1)
     role: Literal["user", "assistant"]
     text: str
     assistant_mode_id: str | None = None
@@ -199,6 +452,20 @@ class SidecarIngestMessageRequest(BaseModel):
     attachments: list[AttachmentInput] = Field(default_factory=list)
     operational_profile: str | None = Field(default=None, max_length=64)
     operational_signals: OperationalSignals | None = None
+    cross_chat_memory: bool = True
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    mode: str | None = None
+    incognito: bool | None = None
+    ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
+    confirmation_strategy: ConfirmationStrategy | None = None
+    memory_privacy_mode: MemoryPrivacyMode | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_confirmation_strategy_default(cls, data: object) -> object:
+        return _resolve_sidecar_confirmation_strategy_default(data)
 
     @field_validator("occurred_at")
     @classmethod
@@ -208,6 +475,14 @@ class SidecarIngestMessageRequest(BaseModel):
             return None
         datetime.fromisoformat(normalized)
         return normalized
+
+    @field_validator("message_id")
+    @classmethod
+    def validate_message_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
 
 class SidecarAddResponseRequest(BaseModel):
@@ -216,10 +491,25 @@ class SidecarAddResponseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     user_id: str
+    message_id: str | None = None
+    source_seq: int | None = Field(default=None, ge=1)
     text: str
     occurred_at: str | None = None
     operational_profile: str | None = Field(default=None, max_length=64)
     operational_signals: OperationalSignals | None = None
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    mode: str | None = None
+    incognito: bool | None = None
+    ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
+    confirmation_strategy: ConfirmationStrategy | None = None
+    memory_privacy_mode: MemoryPrivacyMode | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_confirmation_strategy_default(cls, data: object) -> object:
+        return _resolve_sidecar_confirmation_strategy_default(data)
 
     @field_validator("occurred_at")
     @classmethod
@@ -230,6 +520,107 @@ class SidecarAddResponseRequest(BaseModel):
         datetime.fromisoformat(normalized)
         return normalized
 
+    @field_validator("message_id")
+    @classmethod
+    def validate_message_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class PendingMemoryConfirmationRecord(BaseModel):
+    """Safe pending-confirmation item for host user interfaces."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    memory_id: str
+    user_id: str
+    conversation_id: str
+    category: MemoryCategory
+    label: str
+    created_at: str
+    asked_at: str | None = None
+    confirmation_asked_once: bool = False
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    mode: str | None = None
+    incognito_snapshot: bool = False
+    intended_scope: str | None = None
+    intended_sensitivity: MemorySensitivity = MemorySensitivity.UNKNOWN
+    platform_locked: bool = False
+    platform_id_lock: str | None = None
+    policy_proven: bool = False
+    memory_status: str | None = None
+
+
+class PendingMemoryConfirmationListResponse(BaseModel):
+    """Pending-confirmation collection response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[PendingMemoryConfirmationRecord]
+
+
+class PendingMemoryConfirmationActionResponse(BaseModel):
+    """Result of confirming or declining a pending memory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool = True
+    memory_id: str
+    status: str
+
+
+class AdminReviewMemoryRecord(BaseModel):
+    """Admin-visible review-required memory item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    memory_id: str
+    user_id: str
+    conversation_id: str | None = None
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    mode: str | None = None
+    object_type: str
+    category: MemoryCategory
+    scope: str
+    scope_canonical: str | None = None
+    sensitivity: MemorySensitivity = MemorySensitivity.UNKNOWN
+    privacy_level: int = Field(ge=0, le=3)
+    confidence: float = Field(ge=0.0, le=1.0)
+    canonical_text: str
+    index_text: str | None = None
+    review_reason: str | None = None
+    ingest_origin: str | None = None
+    confirmation_strategy: str | None = None
+    memory_privacy_mode: str | None = None
+    source_message_ids: list[str] = Field(default_factory=list)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+
+
+class AdminReviewMemoryListResponse(BaseModel):
+    """Admin review-required collection response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AdminReviewMemoryRecord]
+
+
+class AdminReviewActionResponse(BaseModel):
+    """Result of an admin action on a review-required memory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool = True
+    memory_id: str
+    status: str
+
 
 class FlushRequest(BaseModel):
     """Request payload for waiting on pending sidecar background work."""
@@ -237,7 +628,64 @@ class FlushRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     user_id: str
+    conversation_id: str | None = None
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    incognito: bool = False
+    remember_across_chats: bool = True
+    remember_across_devices: bool = True
     timeout_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
+
+
+class MemoryProcessingEstimate(BaseModel):
+    """Rough remaining-time estimate for queued memory work."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    estimated_remaining_seconds: float | None = Field(default=None, ge=0.0)
+    estimate_range_seconds: list[float] | None = None
+    confidence: Literal["none", "low", "medium", "high"] = "none"
+    basis: Literal["none", "current_jobs", "historical_jobs"] = "none"
+
+    @field_validator("estimate_range_seconds")
+    @classmethod
+    def validate_estimate_range(cls, value: list[float] | None) -> list[float] | None:
+        if value is None:
+            return None
+        if len(value) != 2:
+            raise ValueError("estimate_range_seconds must contain exactly two values")
+        if value[0] < 0 or value[1] < 0:
+            raise ValueError("estimate_range_seconds values must be non-negative")
+        if value[1] < value[0]:
+            raise ValueError("estimate_range_seconds upper bound must be >= lower bound")
+        return value
+
+
+class MemoryProcessingStatus(BaseModel):
+    """Current durable-memory background processing status."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workers_enabled: bool
+    processing: bool
+    status: Literal["idle", "queued", "running", "retrying", "blocked", "degraded"]
+    pending_source_messages: int = Field(ge=0)
+    processed_source_messages: int = Field(ge=0)
+    tracked_source_messages: int = Field(ge=0)
+    pending_jobs: int = Field(ge=0)
+    running_jobs: int = Field(ge=0)
+    retrying_jobs: int = Field(ge=0)
+    failed_jobs: int = Field(ge=0)
+    dead_lettered_jobs: int = Field(ge=0)
+    pending_jobs_by_type: dict[str, int] = Field(default_factory=dict)
+    running_jobs_by_type: dict[str, int] = Field(default_factory=dict)
+    oldest_pending_age_seconds: float | None = Field(default=None, ge=0.0)
+    newest_job_queued_at: str | None = None
+    estimate: MemoryProcessingEstimate = Field(default_factory=MemoryProcessingEstimate)
+    global_queue_state: Literal["idle", "normal", "busy", "backlogged"] = "idle"
+    global_pending_jobs: int = Field(default=0, ge=0)
+    global_running_jobs: int = Field(default=0, ge=0)
 
 
 class ArtifactRecord(BaseModel):
@@ -350,6 +798,7 @@ class ChatReplyResponse(BaseModel):
     response_message_id: str
     reply_text: str
     retrieval_event_id: str | None = None
+    memory_processing: MemoryProcessingStatus | None = None
     debug: dict[str, Any] | None = None
 
 
@@ -366,6 +815,7 @@ class ChatResult(BaseModel):
     composed_context: ComposedContext | None = None
     detected_needs: list[str] = Field(default_factory=list)
     memories_used: list[dict[str, Any]] = Field(default_factory=list)
+    memory_processing: MemoryProcessingStatus | None = None
     debug: dict[str, Any] | None = None
 
 
@@ -428,6 +878,7 @@ class ContextResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    request_message_id: str | None = None
     system_prompt: str
     topic_working_set: TopicWorkingSetTrace = Field(default_factory=TopicWorkingSetTrace)
     topic_working_set_block: str = ""
@@ -445,6 +896,7 @@ class ContextResult(BaseModel):
     cache_age_seconds: float | None = None
     cache_source: Literal["sync", "cache_hit"] | None = None
     need_detection_skipped: bool = False
+    memory_processing: MemoryProcessingStatus | None = None
 
 
 class SidecarMutationResponse(BaseModel):
@@ -453,6 +905,10 @@ class SidecarMutationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool = True
+    message_id: str | None = None
+    seq: int | None = None
+    source_seq: int | None = None
+    idempotent_replay: bool = False
 
 
 class FlushResponse(BaseModel):
@@ -461,6 +917,40 @@ class FlushResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     completed: bool
+    memory_processing: MemoryProcessingStatus | None = None
+
+
+class WorkerControlRequest(BaseModel):
+    """Request payload for the admin background-processing stop switch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: WorkerControlMode
+    reason: str | None = Field(default=None, max_length=500)
+    timeout_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class WorkerControlResponse(BaseModel):
+    """Current admin background-processing control state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: WorkerControlMode
+    reason: str | None = None
+    updated_at: str | None = None
+    updated_by: str | None = None
+    new_source_jobs_allowed: bool
+    worker_claims_allowed: bool
+    periodic_work_allowed: bool
+    drain_completed: bool | None = None
 
 
 class ConversationActivityStats(BaseModel):
@@ -472,6 +962,16 @@ class ConversationActivityStats(BaseModel):
     conversation_id: str
     workspace_id: str | None = None
     assistant_mode_id: str
+    # Namespace redesign identity / privacy fields. They are populated by
+    # migration 0031 and by Phase 3 repository writes; older snapshots may
+    # leave them as None / defaults.
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    incognito: bool = False
+    remember_across_chats: bool = True
+    remember_across_devices: bool = True
+    effective_policy_hash: str | None = None
     timezone: str
     first_message_at: str | None = None
     last_message_at: str | None = None
@@ -517,6 +1017,10 @@ class ConversationWarmupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     user_id: str | None = None
+    platform_id: str
+    user_persona_id: str | None = None
+    character_id: str | None = None
+    incognito: bool | None = None
     max_messages: int = Field(default=12, ge=1, le=100)
     as_of: str | None = None
 
@@ -535,7 +1039,12 @@ class UserWarmupRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    conversation_id: str
     limit: int = Field(default=3, ge=1, le=20)
+    platform_id: str
+    user_persona_id: str | None = None
+    character_id: str | None = None
+    incognito: bool = False
     workspace_id: str | None = None
     assistant_mode_id: str | None = None
     as_of: str | None = None
@@ -583,6 +1092,10 @@ class WarmupRecommendedConversationsResponse(BaseModel):
     per_conversation_message_budget: int
     workspace_id: str | None = None
     assistant_mode_id: str | None = None
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    incognito: bool = False
     hot_conversations: list[ConversationActivityStats] = Field(default_factory=list)
     warmed_conversations: list[WarmupConversationResponse] = Field(default_factory=list)
     warmed_conversation_count: int
@@ -601,6 +1114,10 @@ class VerbatimPinCreateRequest(BaseModel):
     workspace_id: str | None = None
     conversation_id: str | None = None
     assistant_mode_id: str | None = None
+    user_persona_id: str | None = None
+    platform_id: str
+    character_id: str | None = None
+    incognito: bool | None = None
     canonical_text: str | None = None
     index_text: str | None = None
     target_span_start: int | None = Field(default=None, ge=0)
@@ -618,6 +1135,9 @@ class VerbatimPinCreateRequest(BaseModel):
         "workspace_id",
         "conversation_id",
         "assistant_mode_id",
+        "user_persona_id",
+        "platform_id",
+        "character_id",
         "canonical_text",
         "index_text",
         "reason",
@@ -749,6 +1269,24 @@ class VerbatimPinRecord(BaseModel):
     workspace_id: str | None = None
     conversation_id: str | None = None
     assistant_mode_id: str | None = None
+    # Namespace redesign identity / sensitivity / platform-lock fields. They
+    # are populated by migration 0031 and by Phase 4 pin writes; older pins
+    # leave them as None / defaults.
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
+    sensitivity: MemorySensitivity = MemorySensitivity.UNKNOWN
+    themes_json: list[str] = Field(default_factory=list)
+    platform_locked: bool = False
+    platform_id_lock: str | None = None
+    scope_canonical: str | None = None
+    incognito_snapshot: bool = False
+    remember_across_chats_snapshot: bool = True
+    remember_across_devices_snapshot: bool = True
+    policy_snapshot_json: dict[str, Any] = Field(default_factory=dict)
+    user_persona_key: str | None = None
+    character_key: str | None = None
+    conversation_key: str | None = None
     scope: MemoryScope
     target_kind: VerbatimPinTargetKind
     target_id: str
@@ -846,6 +1384,11 @@ class MemoryFeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     user_id: str
+    conversation_id: str
+    platform_id: str
+    user_persona_id: str | None = None
+    character_id: str | None = None
+    incognito: bool | None = None
     retrieval_event_id: str
     memory_id: str
     feedback_type: MemoryFeedbackType

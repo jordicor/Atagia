@@ -21,6 +21,7 @@ from atagia.core.repositories import (
     WorkspaceRepository,
 )
 from atagia.core.storage_backend import InProcessBackend
+from atagia.memory.belief_reviser import RevisionAction, RevisionDecision
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_jobs import (
     JobEnvelope,
@@ -206,6 +207,8 @@ async def _seed_belief(
         workspace_id=workspace_id,
         conversation_id=conversation_id,
         assistant_mode_id=assistant_mode_id,
+        platform_id="default",
+        character_id=workspace_id,
         object_type=MemoryObjectType.BELIEF,
         scope=scope,
         canonical_text="User prefers terse debugging answers.",
@@ -249,6 +252,8 @@ async def _seed_evidence(
         workspace_id="wrk_1",
         conversation_id=conversation_id,
         assistant_mode_id=assistant_mode_id,
+        platform_id="default",
+        character_id="wrk_1",
         object_type=MemoryObjectType.EVIDENCE,
         scope=MemoryScope.CONVERSATION,
         canonical_text=f"Evidence for {source_message_id}",
@@ -268,6 +273,9 @@ def _revision_job(
     scope: str,
     claim_key: str = "response_style.debugging",
     claim_value: str = "terse",
+    character_id: str | None = "wrk_1",
+    remember_across_chats: bool = True,
+    isolated_mode: bool = False,
 ) -> JobEnvelope:
     return JobEnvelope(
         job_id="job_revision_1",
@@ -285,7 +293,12 @@ def _revision_job(
             "assistant_mode_id": "coding_debug",
             "workspace_id": "wrk_1",
             "conversation_id": "cnv_1",
+            "platform_id": "default",
+            "character_id": character_id,
+            "remember_across_chats": remember_across_chats,
+            "sensitivity": "public",
             "scope": scope,
+            "isolated_mode": isolated_mode,
         },
         created_at=datetime(2026, 4, 1, 18, 0, tzinfo=timezone.utc),
     )
@@ -523,6 +536,56 @@ async def test_revision_worker_resets_tension_and_revises_once_threshold_is_reac
         assert result is not None
         assert result["action"] == "WEAKEN"
         assert result["signal_type"] == "contradictory"
+        assert result["trigger_tension_score"] == pytest.approx(0.60)
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_threshold_preview_runs_outside_write_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, _backend, memories, beliefs, worker = await _build_runtime([])
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        await beliefs.increment_tension(str(belief["id"]), 0.45, user_id="usr_1")
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_threshold_no_writer",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+
+        async def preview_without_open_write_transaction(
+            payload: RevisionJobPayload,
+        ) -> RevisionDecision:
+            assert payload.evidence_memory_ids == [str(evidence["id"])]
+            assert not connection.in_transaction
+            return RevisionDecision(
+                action=RevisionAction.WEAKEN,
+                explanation="Contradiction reached the threshold.",
+            )
+
+        monkeypatch.setattr(
+            worker,
+            "_preview_belief_revision",
+            preview_without_open_write_transaction,
+        )
+
+        result = await worker.process_job(
+            _revision_job(
+                belief_id=str(belief["id"]),
+                evidence_memory_ids=[str(evidence["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+                claim_value="verbose",
+            ).model_dump(mode="json")
+        )
+
+        assert result is not None
+        assert result["action"] == "WEAKEN"
         assert result["trigger_tension_score"] == pytest.approx(0.60)
         assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
     finally:
@@ -1038,10 +1101,103 @@ async def test_promotion_job_meeting_threshold_creates_belief() -> None:
 
         assert result.acked == 1
         assert len(beliefs) == 1
-        assert beliefs[0]["scope"] == MemoryScope.WORKSPACE.value
+        assert beliefs[0]["scope"] == MemoryScope.CHARACTER.value
+        assert beliefs[0]["scope_canonical"] == MemoryScope.CHARACTER.value
+        assert beliefs[0]["character_id"] == "wrk_1"
         assert beliefs[0]["assistant_mode_id"] == "coding_debug"
         assert beliefs[0]["workspace_id"] == "wrk_1"
         assert beliefs[0]["conversation_id"] is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_delayed_promotion_job_respects_current_cross_chat_disable() -> None:
+    connection, backend, memories, _beliefs, worker = await _build_runtime([])
+    try:
+        evidence_one = await _seed_evidence(
+            memories,
+            memory_id="mem_cross_chat_disable_a",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+            claim_key="response_style.debugging",
+        )
+        evidence_two = await _seed_evidence(
+            memories,
+            memory_id="mem_cross_chat_disable_b",
+            conversation_id="cnv_2",
+            assistant_mode_id="research_deep_dive",
+            source_message_id="msg_2",
+            claim_key="response_style.debugging",
+        )
+        await UserRepository(connection, worker._clock).update_memory_preferences(  # noqa: SLF001
+            "usr_1",
+            remember_across_chats=False,
+        )
+        await backend.stream_add(
+            REVISE_STREAM_NAME,
+            _revision_job(
+                belief_id="",
+                evidence_memory_ids=[str(evidence_one["id"]), str(evidence_two["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+            ).model_dump(mode="json"),
+        )
+
+        result = await worker.run_once()
+        beliefs = [
+            row
+            for row in await memories.list_for_user("usr_1")
+            if row["object_type"] == MemoryObjectType.BELIEF.value
+        ]
+
+        assert result.acked == 1
+        assert beliefs == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_isolated_promotion_job_never_creates_cross_chat_belief() -> None:
+    connection, backend, memories, _beliefs, worker = await _build_runtime([])
+    try:
+        evidence_one = await _seed_evidence(
+            memories,
+            memory_id="mem_isolated_evidence_a",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+            claim_key="response_style.debugging",
+        )
+        evidence_two = await _seed_evidence(
+            memories,
+            memory_id="mem_isolated_evidence_b",
+            conversation_id="cnv_2",
+            assistant_mode_id="research_deep_dive",
+            source_message_id="msg_2",
+            claim_key="response_style.debugging",
+        )
+        await backend.stream_add(
+            REVISE_STREAM_NAME,
+            _revision_job(
+                belief_id="",
+                evidence_memory_ids=[str(evidence_one["id"]), str(evidence_two["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+                isolated_mode=True,
+            ).model_dump(mode="json"),
+        )
+
+        result = await worker.run_once()
+        beliefs = [
+            row
+            for row in await memories.list_for_user("usr_1")
+            if row["object_type"] == MemoryObjectType.BELIEF.value
+        ]
+
+        assert result.acked == 1
+        assert beliefs == []
     finally:
         await connection.close()
 
@@ -1139,7 +1295,7 @@ async def test_explicit_user_statement_with_evidence_promotes_fast() -> None:
 
         assert result.acked == 1
         assert len(beliefs) == 1
-        assert beliefs[0]["scope"] == MemoryScope.ASSISTANT_MODE.value
+        assert beliefs[0]["scope"] == MemoryScope.USER.value
         assert beliefs[0]["assistant_mode_id"] == "coding_debug"
         assert beliefs[0]["workspace_id"] is None
         assert beliefs[0]["conversation_id"] is None

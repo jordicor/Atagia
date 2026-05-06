@@ -138,6 +138,7 @@ class RevisionContext(BaseModel):
     workspace_id: str | None = None
     conversation_id: str | None = None
     scope: MemoryScope
+    isolated_mode: bool = False
 
 
 class RevisionResult(BaseModel):
@@ -236,10 +237,13 @@ class BeliefReviser:
         new_evidence: list[dict[str, Any]],
         context: RevisionContext | dict[str, Any],
         decision: RevisionDecision,
+        *,
+        claim_key_already_validated: bool = False,
     ) -> RevisionResult:
         revision_context, belief_row, current_version = await self._load_revision_state(
             belief_id,
             context,
+            validate_claim_key=not claim_key_already_validated,
         )
         return await self._apply_decision(
             decision=decision,
@@ -253,6 +257,8 @@ class BeliefReviser:
         self,
         belief_id: str,
         context: RevisionContext | dict[str, Any],
+        *,
+        validate_claim_key: bool = True,
     ) -> tuple[RevisionContext, dict[str, Any], dict[str, Any]]:
         revision_context = RevisionContext.model_validate(context)
         belief_row = await self._memory_repository.get_memory_object(belief_id, revision_context.user_id)
@@ -264,7 +270,7 @@ class BeliefReviser:
         )
         if current_version is None:
             raise ValueError(f"Belief {belief_id} has no current version")
-        if not await are_claim_keys_equivalent(
+        if validate_claim_key and not await are_claim_keys_equivalent(
             self._llm_client,
             self._classifier_model,
             str(current_version["claim_key"]),
@@ -633,6 +639,17 @@ class BeliefReviser:
         pending_embedding_upserts: list[_PendingEmbeddingUpsert],
         pending_embedding_deletes: list[str],
     ) -> RevisionResult:
+        if context.isolated_mode:
+            return await self._apply_split_by_scope(
+                belief_row=belief_row,
+                current_version=current_version,
+                new_evidence=new_evidence,
+                context=context,
+                decision=decision,
+                explanation=explanation,
+                pending_embedding_upserts=pending_embedding_upserts,
+                pending_embedding_deletes=pending_embedding_deletes,
+            )
         successor = await self._create_belief_memory(
             base_belief=belief_row,
             claim_key=str(current_version["claim_key"]),

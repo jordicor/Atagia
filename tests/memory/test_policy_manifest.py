@@ -1,4 +1,4 @@
-"""Tests for assistant mode manifests and policy resolution."""
+"""Tests for retrieval profile manifests and policy resolution."""
 
 from __future__ import annotations
 
@@ -10,7 +10,13 @@ import pytest
 
 from atagia.core.clock import FrozenClock
 from atagia.core.db_sqlite import initialize_database
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
+from atagia.memory.policy_manifest import (
+    DEFAULT_RETRIEVAL_SCOPE_FILTER,
+    ManifestLoader,
+    PolicyResolver,
+    sync_assistant_modes,
+)
+from atagia.models.schemas_memory import MemoryScope, OperationalPolicyOverride
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -36,7 +42,6 @@ def test_load_all_manifests_successfully() -> None:
     loader = ManifestLoader(MANIFESTS_DIR)
 
     manifests = loader.load_all()
-    personal_assistant_payload = _load_manifest_json(MANIFESTS_DIR, "personal_assistant.json")
 
     assert set(manifests) == {
         "biographical_interview",
@@ -49,14 +54,13 @@ def test_load_all_manifests_successfully() -> None:
         "research_deep_dive",
     }
     assert manifests["coding_debug"].privacy_ceiling == 1
+    assert manifests["coding_debug"].profile_id.value == "coding_debug"
     assert manifests["coding_debug"].transcript_budget_tokens == 8000
     assert manifests["coding_debug"].context_cache_policy.max_messages_without_refresh == 5
-    assert manifests["general_qa"].cross_chat_allowed is False
     assert manifests["general_qa"].allow_intimacy_context is False
     assert manifests["intimacy"].allow_intimacy_context is True
     assert manifests["general_qa"].context_cache_policy.base_ttl_seconds == 900
     assert manifests["personal_assistant"].privacy_ceiling == 3
-    assert personal_assistant_payload["prompt_hash"] == manifests["personal_assistant"].prompt_hash
     assert manifests["research_deep_dive"].prompt_hash is not None
 
 
@@ -92,8 +96,9 @@ def test_policy_resolution_without_overrides_returns_manifest_values() -> None:
 
     resolved = PolicyResolver().resolve(manifest, None, None)
 
-    assert resolved.assistant_mode_id == manifest.assistant_mode_id
-    assert resolved.allowed_scopes == manifest.allowed_scopes
+    assert resolved.profile_id == manifest.profile_id
+    assert resolved.allowed_scopes == DEFAULT_RETRIEVAL_SCOPE_FILTER
+    assert MemoryScope.ASSISTANT_MODE not in resolved.allowed_scopes
     assert resolved.privacy_ceiling == manifest.privacy_ceiling
     assert resolved.context_budget_tokens == manifest.context_budget_tokens
     assert resolved.transcript_budget_tokens == manifest.transcript_budget_tokens
@@ -106,12 +111,12 @@ def test_policy_resolution_workspace_override_restricts_privacy_ceiling() -> Non
 
     resolved = PolicyResolver().resolve(
         manifest,
-        {"privacy_ceiling": 1, "cross_chat_allowed": False},
+        {"privacy_ceiling": 1},
         None,
     )
 
     assert resolved.privacy_ceiling == 1
-    assert resolved.cross_chat_allowed is False
+    assert resolved.cross_chat_allowed is True
     assert resolved.allow_intimacy_context is False
 
 
@@ -140,16 +145,18 @@ def test_policy_resolution_conversation_override_takes_preference_values() -> No
     assert [item.value for item in resolved.preferred_memory_types] == ["evidence", "summary_view"]
 
 
-def test_allowed_scopes_resolve_to_intersection() -> None:
+def test_allowed_scopes_are_not_retrieval_profile_gates() -> None:
     manifest = ManifestLoader(MANIFESTS_DIR).load_all()["coding_debug"]
 
     resolved = PolicyResolver().resolve(
         manifest,
-        {"allowed_scopes": ["workspace", "conversation"]},
-        {"allowed_scopes": ["conversation", "global_user"]},
+        None,
+        None,
+        OperationalPolicyOverride(allowed_scopes=[MemoryScope.CONVERSATION]),
     )
 
-    assert [scope.value for scope in resolved.allowed_scopes] == ["conversation"]
+    assert resolved.allowed_scopes == DEFAULT_RETRIEVAL_SCOPE_FILTER
+    assert MemoryScope.ASSISTANT_MODE not in resolved.allowed_scopes
 
 
 def test_prompt_hash_changes_when_context_cache_policy_changes(tmp_path: Path) -> None:

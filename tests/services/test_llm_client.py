@@ -467,20 +467,30 @@ async def test_complete_structured_parses_json_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_complete_structured_with_response_returns_raw_response() -> None:
+    client = LLMClient(provider_name="json", providers=[JsonProvider('{"label":"ok","score":7}')])
+
+    result = await client.complete_structured_with_response(_request(), StructuredPayload)
+
+    assert result.value == StructuredPayload(label="ok", score=7)
+    assert result.response.output_text == '{"label":"ok","score":7}'
+    assert result.used_schema_fallback is False
+
+
+@pytest.mark.asyncio
 async def test_complete_structured_rejects_invalid_json() -> None:
     client = LLMClient(provider_name="json", providers=[JsonProvider("not-json")])
 
-    with pytest.raises(StructuredOutputError):
+    with pytest.raises(StructuredOutputError) as exc_info:
         await client.complete_structured(_request(), StructuredPayload)
+    assert exc_info.value.output_text == "not-json"
 
 
 @pytest.mark.asyncio
 async def test_complete_structured_extracts_json_from_fenced_or_prefixed_text() -> None:
     client = LLMClient(
         provider_name="json",
-        providers=[
-            JsonProvider('Here is the payload:\n```json\n{"label":"ok","score":7}\n```')
-        ],
+        providers=[JsonProvider('Here is the payload:\n```json\n{"label":"ok","score":7}\n```')],
     )
 
     payload = await client.complete_structured(_request(), StructuredPayload)
@@ -492,11 +502,7 @@ async def test_complete_structured_extracts_json_from_fenced_or_prefixed_text() 
 async def test_complete_structured_extracts_generic_fence_and_repairs_json() -> None:
     client = LLMClient(
         provider_name="json",
-        providers=[
-            JsonProvider(
-                'Here is the payload:\n```\n{"label":"Use {braces}","score":7,}\n```\nDone.'
-            )
-        ],
+        providers=[JsonProvider('Here is the payload:\n```\n{"label":"Use {braces}","score":7,}\n```\nDone.')],
     )
 
     payload = await client.complete_structured(_request(), StructuredPayload)
@@ -578,7 +584,7 @@ async def test_complete_structured_normalizes_legacy_belief_claims_and_downgrade
                 '"durable_memory_items":['
                 '{"item_id":"belief_1","memory_type":"belief","canonical_text":"User likes tea.","claim_key":null,"claim_value":null},'
                 '{"item_id":"belief_2","memory_type":"belief","canonical_text":"Notifications are enabled.","claim_key":"preferences.notifications.enabled","claim_value":true}'
-                ']}'
+                "]}"
             )
         ],
     )
@@ -647,9 +653,7 @@ async def test_complete_routes_provider_qualified_model_and_applies_openai_profi
     provider = RecordingProvider("openai")
     client = LLMClient(providers=[provider])
 
-    await client.complete(
-        _request().model_copy(update={"model": "openai/gpt-5-mini,high"})
-    )
+    await client.complete(_request().model_copy(update={"model": "openai/gpt-5-mini,high"}))
 
     assert provider.requests[0].model == "gpt-5-mini"
     assert provider.requests[0].metadata["reasoning_effort"] == "high"
@@ -661,11 +665,7 @@ async def test_complete_applies_gemini_profile_without_exposing_thinking() -> No
     provider = RecordingProvider("gemini")
     client = LLMClient(providers=[provider])
 
-    await client.complete(
-        _request().model_copy(
-            update={"model": "google/gemini-3.1-flash-lite-preview"}
-        )
-    )
+    await client.complete(_request().model_copy(update={"model": "google/gemini-3.1-flash-lite-preview"}))
 
     assert provider.requests[0].model == "gemini-3.1-flash-lite-preview"
     assert provider.requests[0].include_thinking is False
@@ -698,16 +698,10 @@ async def test_complete_applies_openrouter_flashlite_profile_after_resolution() 
     provider = RecordingProvider("openrouter")
     client = LLMClient(providers=[provider])
 
-    await client.complete(
-        _request().model_copy(
-            update={"model": "openrouter/google/gemini-3.1-flash-lite-preview"}
-        )
-    )
+    await client.complete(_request().model_copy(update={"model": "openrouter/google/gemini-3.1-flash-lite-preview"}))
 
     assert provider.requests[0].model == "google/gemini-3.1-flash-lite-preview"
-    assert provider.requests[0].metadata["provider_extra_body"] == {
-        "reasoning": {"effort": "minimal"}
-    }
+    assert provider.requests[0].metadata["provider_extra_body"] == {"reasoning": {"effort": "minimal"}}
 
 
 @pytest.mark.asyncio

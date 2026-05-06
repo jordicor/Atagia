@@ -32,7 +32,7 @@ def test_routine_memory_does_not_require_high_risk_confirmation() -> None:
     )
 
 
-def test_secret_literals_are_withheld_in_ordinary_chat() -> None:
+def test_secret_literals_are_withheld_without_generalizing_to_all_exact_values() -> None:
     assert (
         disclosure_action(
             memory_category=MemoryCategory.PIN_OR_PASSWORD,
@@ -47,7 +47,7 @@ def test_secret_literals_are_withheld_in_ordinary_chat() -> None:
             privacy_level=3,
             preserve_verbatim=True,
         )
-        == HighRiskDisclosureAction.WITHHOLD_SECRET_LITERAL
+        == HighRiskDisclosureAction.ANSWER_IF_AUTHORIZED
     )
 
 

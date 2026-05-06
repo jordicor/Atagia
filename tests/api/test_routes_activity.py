@@ -100,12 +100,14 @@ def test_activity_routes_respect_service_user_claims_and_warmup_payloads(
             client.portal.call(users.create_user, "usr_1")
             client.portal.call(workspaces.create_workspace, "wrk_1", "usr_1", "Workspace", {"timezone": "UTC"})
             client.portal.call(
-                conversations.create_conversation,
-                "cnv_1",
-                "usr_1",
-                "wrk_1",
-                "coding_debug",
-                "Activity Chat",
+                lambda: conversations.create_conversation(
+                    "cnv_1",
+                    "usr_1",
+                    "wrk_1",
+                    "coding_debug",
+                    "Activity Chat",
+                    platform_id="web",
+                )
             )
             client.portal.call(
                 messages.create_message,
@@ -132,7 +134,12 @@ def test_activity_routes_respect_service_user_claims_and_warmup_payloads(
 
         listing = client.get(
             "/v1/users/usr_1/activity/conversations",
-            params={"limit": 5},
+            params={
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+                "character_id": "wrk_1",
+                "limit": 5,
+            },
             headers=headers,
         )
         assert listing.status_code == 200
@@ -141,23 +148,34 @@ def test_activity_routes_respect_service_user_claims_and_warmup_payloads(
 
         forbidden = client.get(
             "/v1/users/usr_1/activity/conversations",
-            params={"limit": 5},
+            params={
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+                "character_id": "wrk_1",
+                "limit": 5,
+            },
             headers=wrong_headers,
         )
         assert forbidden.status_code == 403
 
         invalid_limit = client.get(
             "/v1/users/usr_1/activity/conversations",
-            params={"limit": -1},
+            params={
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+                "character_id": "wrk_1",
+                "limit": -1,
+            },
             headers=headers,
         )
         assert invalid_limit.status_code == 422
 
         warmup = client.post(
             "/v1/conversations/cnv_1/warmup",
-            json={"max_messages": 2},
+            json={"platform_id": "web", "character_id": "wrk_1", "max_messages": 2},
             headers=headers,
         )
         assert warmup.status_code == 200
         assert warmup.json()["recent_window_key"] == "usr_1:cnv_1"
         assert warmup.json()["recent_message_count"] == 2
+        assert warmup.json()["recent_messages"] == []

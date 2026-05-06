@@ -7,7 +7,6 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import pytest
@@ -26,7 +25,9 @@ from atagia.core.repositories import (
     WorkspaceRepository,
 )
 from atagia.core.storage_backend import InProcessBackend
+from atagia.memory.extractor import ExtractionPersistenceDetails
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
+from atagia.memory.text_chunker import ChunkingPlan, TextChunk
 from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
     CONTRACT_STREAM_NAME,
@@ -35,9 +36,10 @@ from atagia.models.schemas_jobs import (
     JobType,
     MessageJobPayload,
     REVISE_STREAM_NAME,
+    WorkerControlMode,
     WORKER_GROUP_NAME,
 )
-from atagia.models.schemas_memory import MemoryObjectType
+from atagia.models.schemas_memory import ExtractionResult, MemoryObjectType
 from atagia.services.llm_client import (
     LLMError,
     LLMClient,
@@ -48,6 +50,7 @@ from atagia.services.llm_client import (
     LLMProvider,
     StructuredOutputError,
 )
+from atagia.services.worker_control_service import WorkerControlService
 from atagia.workers.contract_worker import ContractWorker
 from atagia.workers.ingest_worker import IngestWorker
 
@@ -284,6 +287,14 @@ def _extract_job(message_id: str, *, workspace_id: str | None = None) -> JobEnve
     )
 
 
+def _test_chunk_plan(text: str = "I prefer concise debugging answers for retry issues.") -> ChunkingPlan:
+    return ChunkingPlan(
+        chunks=[TextChunk(text=text)],
+        chunked=False,
+        fallback_count=0,
+    )
+
+
 def _contract_job(message_id: str) -> JobEnvelope:
     return JobEnvelope(
         job_id="job_contract_1",
@@ -301,6 +312,43 @@ def _contract_job(message_id: str) -> JobEnvelope:
         },
         created_at=datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc),
     )
+
+
+@pytest.mark.asyncio
+async def test_ingest_worker_hard_pause_does_not_claim_stream_job() -> None:
+    (
+        connection,
+        clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime([])
+    try:
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"])).model_dump(mode="json"),
+        )
+        await WorkerControlService(connection, clock).set_mode(
+            WorkerControlMode.HARD_PAUSE,
+            reason="restore",
+        )
+
+        result = await ingest_worker.run_once(block_ms=0)
+
+        assert result.received == 0
+        queued = await backend.stream_read(
+            EXTRACT_STREAM_NAME,
+            WORKER_GROUP_NAME,
+            "probe",
+            count=1,
+            block_ms=0,
+        )
+        assert len(queued) == 1
+    finally:
+        await connection.close()
 
 
 @pytest.mark.asyncio
@@ -488,7 +536,7 @@ async def test_ingest_worker_logs_structured_job_failure_without_traceback(
         [],
     )
     try:
-        ingest_worker._extractor.extract_with_persistence_details = fake_extract
+        ingest_worker._extractor.extract_with_persistence_and_chunk_plan = fake_extract
         await backend.stream_add(
             EXTRACT_STREAM_NAME,
             _extract_job(str(message["id"])).model_dump(mode="json"),
@@ -583,6 +631,46 @@ async def test_ingest_worker_enqueues_compaction_job_without_workspace_after_thr
 
 
 @pytest.mark.asyncio
+async def test_ingest_worker_dedupes_pending_compaction_for_same_conversation_window() -> None:
+    payload = json.dumps(
+        {
+            "evidences": [],
+            "beliefs": [],
+            "contract_signals": [],
+            "state_updates": [],
+            "mode_guess": None,
+            "nothing_durable": True,
+        }
+    )
+    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+        [payload, payload],
+        workspace_id=None,
+        extra_messages=9,
+    )
+    try:
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"]), workspace_id=None).model_dump(mode="json"),
+        )
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"]), workspace_id=None).model_dump(mode="json"),
+        )
+
+        first = await ingest_worker.run_once()
+        second = await ingest_worker.run_once()
+        first_compact_job = await backend.dequeue_job(f"stream:{COMPACT_STREAM_NAME}", timeout_seconds=0)
+        second_compact_job = await backend.dequeue_job(f"stream:{COMPACT_STREAM_NAME}", timeout_seconds=0)
+
+        assert first.acked == 1
+        assert second.acked == 1
+        assert first_compact_job is not None
+        assert second_compact_job is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_ingest_worker_rolls_back_failed_topic_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -668,7 +756,11 @@ async def test_ingest_skips_revision_when_disabled() -> None:
 
     async def fake_extract(*args, **kwargs):
         del args, kwargs
-        return SimpleNamespace(nothing_durable=False), persisted
+        return ExtractionPersistenceDetails(
+            result=ExtractionResult(nothing_durable=False),
+            persisted=persisted,
+            chunk_plan=_test_chunk_plan(),
+        )
 
     async def skip_side_effects(*args, **kwargs) -> None:
         del args, kwargs
@@ -677,7 +769,7 @@ async def test_ingest_skips_revision_when_disabled() -> None:
         [],
     )
     try:
-        control_worker._extractor.extract_with_persistence_details = fake_extract
+        control_worker._extractor.extract_with_persistence_and_chunk_plan = fake_extract
         control_worker._process_consequence_detection = skip_side_effects
         control_worker._maybe_enqueue_conversation_compaction = skip_side_effects
         await control_backend.stream_add(
@@ -701,7 +793,7 @@ async def test_ingest_skips_revision_when_disabled() -> None:
         settings=_settings(skip_belief_revision=True),
     )
     try:
-        ingest_worker._extractor.extract_with_persistence_details = fake_extract
+        ingest_worker._extractor.extract_with_persistence_and_chunk_plan = fake_extract
         ingest_worker._process_consequence_detection = skip_side_effects
         ingest_worker._maybe_enqueue_conversation_compaction = skip_side_effects
         await backend.stream_add(
@@ -736,7 +828,7 @@ async def test_ingest_treats_non_json_after_schema_fallback_as_noop(
         [],
     )
     try:
-        ingest_worker._extractor.extract_with_persistence_details = fake_extract
+        ingest_worker._extractor.extract_with_persistence_and_chunk_plan = fake_extract
         ingest_worker._process_consequence_detection = skip_side_effects
         ingest_worker._maybe_enqueue_conversation_compaction = skip_side_effects
         await backend.stream_add(

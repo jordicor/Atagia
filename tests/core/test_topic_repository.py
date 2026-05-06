@@ -160,6 +160,10 @@ async def test_update_topic_and_snapshot_keep_active_and_parked_work_sets_compac
                 "last_touched_at": "2026-04-26T02:25:00+00:00",
                 "confidence": 0.5,
                 "privacy_level": 0,
+                "sensitivity": "public",
+                "themes": [],
+                "platform_locked": 0,
+                "platform_id_lock": None,
                 "intimacy_boundary": "ordinary",
                 "intimacy_boundary_confidence": 0.0,
             }

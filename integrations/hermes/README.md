@@ -1,6 +1,6 @@
 # Hermes Integration
 
-Status: planned.
+Status: provider shape scaffolded; concrete API validation pending.
 
 Hermes-style stacks often already have a memory-provider abstraction. Atagia can
 fit either as a provider adapter or as an upstream sidecar proxy.
@@ -17,5 +17,11 @@ fit either as a provider adapter or as an upstream sidecar proxy.
 ## Missing Atagia Pieces
 
 - Concrete Hermes adapter API validation against a real install.
-- Provider package or plugin scaffold.
+- Provider package or plugin wrapper around `atagia_provider.py` once the target
+  provider interface is confirmed.
 - Import/export mapping between Hermes memory records and Atagia objects.
+
+## Files
+
+- `atagia_provider.py` is a copyable retrieve/record/ingest facade over
+  `SidecarBridge`. Wrap it in the host's concrete memory-provider interface.

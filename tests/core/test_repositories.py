@@ -21,12 +21,15 @@ from atagia.core.repositories import (
     WorkspaceRepository,
 )
 from atagia.models.schemas_memory import (
+    MemoryCategory,
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
     SummaryViewKind,
 )
+from atagia.services.errors import ConversationNotActiveError
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
@@ -69,6 +72,7 @@ async def test_user_and_workspace_crud_round_trip() -> None:
         deleted = await users.get_user("usr_a")
         assert deleted["deleted_at"] == "2026-03-30T12:01:00+00:00"
         assert deleted["updated_at"] == "2026-03-30T12:01:00+00:00"
+        assert await users.get_active_user("usr_a") is None
     finally:
         await connection.close()
 
@@ -89,18 +93,59 @@ async def test_conversation_crud_and_workspace_filtering() -> None:
         first = await conversations.create_conversation("cnv_a", "usr_a", "wrk_a", "coding_debug", "First")
         clock.advance(seconds=30)
         second = await conversations.create_conversation("cnv_b", "usr_a", "wrk_b", "coding_debug", "Second")
+        clock.advance(seconds=30)
+        temporary = await conversations.create_conversation(
+            "cnv_temp",
+            "usr_a",
+            None,
+            "coding_debug",
+            "Temporary",
+            temporary=True,
+            temporary_ttl_seconds=900,
+            purge_on_close=True,
+        )
+        clock.advance(seconds=30)
+        isolated = await conversations.create_conversation(
+            "cnv_isolated",
+            "usr_a",
+            None,
+            "coding_debug",
+            "Isolated",
+            isolated_mode=True,
+        )
 
         assert first["workspace_id"] == "wrk_a"
         assert second["workspace_id"] == "wrk_b"
+        assert temporary["temporary"] == 1
+        assert temporary["temporary_ttl_seconds"] == 900
+        assert temporary["purge_on_close"] == 1
+        assert temporary["last_activity_at"] == temporary["created_at"]
+        assert isolated["isolated_mode"] == 1
         assert await conversations.get_conversation("cnv_a", "usr_b") is None
-        assert [item["id"] for item in await conversations.list_conversations("usr_a")] == ["cnv_b", "cnv_a"]
+        assert [item["id"] for item in await conversations.list_conversations("usr_a")] == [
+            "cnv_isolated",
+            "cnv_b",
+            "cnv_a",
+        ]
+        assert [
+            item["id"]
+            for item in await conversations.list_conversations("usr_a", include_temporary=True)
+        ] == ["cnv_isolated", "cnv_temp", "cnv_b", "cnv_a"]
         assert [item["id"] for item in await conversations.list_conversations("usr_a", workspace_id="wrk_a")] == ["cnv_a"]
 
         clock.advance(seconds=30)
         await conversations.update_conversation_status("cnv_a", "usr_a", "archived")
         archived = await conversations.get_conversation("cnv_a", "usr_a")
         assert archived["status"] == "archived"
-        assert archived["updated_at"] == "2026-03-30T12:01:00+00:00"
+        assert archived["updated_at"] == "2026-03-30T12:02:00+00:00"
+        assert [item["id"] for item in await conversations.list_conversations("usr_a")] == [
+            "cnv_isolated",
+            "cnv_b",
+        ]
+        assert [
+            item["id"]
+            for item in await conversations.list_conversations("usr_a", include_archived=True)
+        ] == ["cnv_a", "cnv_isolated", "cnv_b"]
     finally:
         await connection.close()
 
@@ -122,11 +167,101 @@ async def test_message_round_trip_ordering_and_user_isolation() -> None:
         await messages.create_message("msg_2", "cnv_a", "assistant", 2, "Second", 1, {})
         await messages.create_message("msg_1", "cnv_a", "user", 1, "First", 1, {"source": "user"})
         await messages.create_message("msg_3", "cnv_b", "user", 1, "Other user", 1, {})
+        conversation = await conversations.get_conversation("cnv_a", "usr_a")
+        assert conversation["last_activity_at"] == "2026-03-30T12:00:00+00:00"
 
         ordered = await messages.get_messages("cnv_a", "usr_a", limit=10, offset=0)
         assert [item["id"] for item in ordered] == ["msg_1", "msg_2"]
         assert ordered[0]["metadata_json"] == {"source": "user"}
         assert await messages.get_messages("cnv_a", "usr_b", limit=10, offset=0) == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_create_message_rejects_non_active_conversation_atomically() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+        await conversations.update_conversation_status("cnv_a", "usr_a", "closed")
+
+        with pytest.raises(ConversationNotActiveError):
+            await messages.create_message("msg_closed", "cnv_a", "user", None, "Nope", 1, {})
+
+        rows = await messages.get_messages("cnv_a", "usr_a", limit=10, offset=0)
+        conversation = await conversations.get_conversation("cnv_a", "usr_a")
+        assert rows == []
+        assert conversation["last_activity_at"] == "2026-03-30T12:00:00+00:00"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_temporary_conversation_messages_are_hidden_from_other_conversations() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_active", "usr_a", None, "coding_debug", "Active")
+        await conversations.create_conversation(
+            "cnv_temp",
+            "usr_a",
+            None,
+            "coding_debug",
+            "Temp",
+            temporary=True,
+            purge_on_close=True,
+        )
+        await conversations.create_conversation(
+            "cnv_isolated",
+            "usr_a",
+            None,
+            "coding_debug",
+            "Isolated",
+            isolated_mode=True,
+        )
+        await conversations.create_conversation("cnv_pending", "usr_a", None, "coding_debug", "Pending")
+        await messages.create_message("msg_active", "cnv_active", "user", None, "visible kiwi", 1, {})
+        await messages.create_message("msg_temp", "cnv_temp", "user", None, "secret kiwi", 1, {})
+        await messages.create_message("msg_isolated", "cnv_isolated", "user", None, "isolated kiwi", 1, {})
+        await messages.create_message("msg_pending", "cnv_pending", "user", None, "pending kiwi", 1, {})
+        await conversations.update_conversation_status("cnv_pending", "usr_a", "pending_deletion")
+
+        visible_to_active = await messages.search_messages_with_privacy(
+            user_id="usr_a",
+            query="kiwi",
+            privacy_ceiling=3,
+            limit=10,
+            allow_conversation_id="cnv_active",
+        )
+        visible_to_temp = await messages.search_messages_with_privacy(
+            user_id="usr_a",
+            query="kiwi",
+            privacy_ceiling=3,
+            limit=10,
+            allow_conversation_id="cnv_temp",
+        )
+        visible_to_isolated = await messages.search_messages_with_privacy(
+            user_id="usr_a",
+            query="kiwi",
+            privacy_ceiling=3,
+            limit=10,
+            allow_conversation_id="cnv_isolated",
+        )
+
+        assert [row["id"] for row in visible_to_active] == ["msg_active"]
+        assert {row["id"] for row in visible_to_temp} == {"msg_active", "msg_temp"}
+        assert [row["id"] for row in visible_to_isolated] == ["msg_isolated"]
     finally:
         await connection.close()
 
@@ -278,7 +413,7 @@ async def test_create_message_derives_context_policy_columns_from_metadata_and_s
             "user",
             3,
             "x" * 5000,
-            700,
+            4096,
             {},
         )
         auto_mechanical = await messages.create_message(
@@ -286,8 +421,17 @@ async def test_create_message_derives_context_policy_columns_from_metadata_and_s
             "cnv_a",
             "assistant",
             None,
-            "y" * 5000,
-            700,
+            "y" * 17000,
+            None,
+            {},
+        )
+        long_but_below_token_threshold = await messages.create_message(
+            "msg_long_below_token_threshold",
+            "cnv_a",
+            "user",
+            None,
+            "z" * 5000,
+            None,
             {},
         )
 
@@ -320,6 +464,9 @@ async def test_create_message_derives_context_policy_columns_from_metadata_and_s
         assert auto_mechanical["context_placeholder"] is not None
         assert "seq=4" in auto_mechanical["context_placeholder"]
         assert "msg_auto_mechanical" in auto_mechanical["context_placeholder"]
+        assert long_but_below_token_threshold["heavy_content"] == 0
+        assert long_but_below_token_threshold["include_raw"] == 1
+        assert long_but_below_token_threshold["skip_by_default"] == 0
     finally:
         await connection.close()
 
@@ -368,8 +515,8 @@ async def test_memory_object_search_filters_by_user_before_ranking() -> None:
                 maya_score, privacy_level, valid_from, valid_to, status, created_at, updated_at
             )
             VALUES
-                (?, ?, NULL, NULL, ?, 'evidence', 'conversation', ?, '{}', 'extracted', 0.5, 0.5, 0.0, 0.0, 0, NULL, NULL, 'active', ?, ?),
-                (?, ?, NULL, NULL, ?, 'evidence', 'conversation', ?, '{}', 'extracted', 0.5, 0.5, 0.0, 0.0, 0, NULL, NULL, 'active', ?, ?)
+                (?, ?, NULL, NULL, ?, 'evidence', 'chat', ?, '{}', 'extracted', 0.5, 0.5, 0.0, 0.0, 0, NULL, NULL, 'active', ?, ?),
+                (?, ?, NULL, NULL, ?, 'evidence', 'chat', ?, '{}', 'extracted', 0.5, 0.5, 0.0, 0.0, 0, NULL, NULL, 'active', ?, ?)
             """,
             (
                 "mem_a",
@@ -540,6 +687,119 @@ async def test_count_for_context_counts_only_active_memories() -> None:
 
 
 @pytest.mark.asyncio
+async def test_context_helpers_apply_phase7_namespace_platform_and_sensitivity_gates() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        workspaces = WorkspaceRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await workspaces.create_workspace("wrk_a", "usr_a", "Character")
+        await conversations.create_conversation("cnv_a", "usr_a", "wrk_a", "coding_debug", "Chat A")
+        await conversations.create_conversation("cnv_other", "usr_a", "wrk_a", "coding_debug", "Other")
+
+        seed_kwargs = {
+            "user_id": "usr_a",
+            "assistant_mode_id": "coding_debug",
+            "object_type": MemoryObjectType.EVIDENCE,
+            "source_kind": MemorySourceKind.EXTRACTED,
+            "confidence": 0.9,
+            "privacy_level": 0,
+            "status": MemoryStatus.ACTIVE,
+            "user_persona_id": "persona_a",
+            "platform_id": "default",
+            "sensitivity": MemorySensitivity.PUBLIC,
+        }
+        await memories.create_memory_object(
+            **seed_kwargs,
+            memory_id="mem_chat",
+            conversation_id="cnv_a",
+            workspace_id="wrk_a",
+            scope=MemoryScope.CONVERSATION,
+            scope_canonical=MemoryScope.CHAT.value,
+            canonical_text="chat context",
+        )
+        await memories.create_memory_object(
+            **seed_kwargs,
+            memory_id="mem_character",
+            workspace_id="wrk_a",
+            conversation_id=None,
+            character_id="char_a",
+            scope=MemoryScope.WORKSPACE,
+            scope_canonical=MemoryScope.CHARACTER.value,
+            canonical_text="character context",
+        )
+        await memories.create_memory_object(
+            **seed_kwargs,
+            memory_id="mem_user",
+            workspace_id=None,
+            conversation_id=None,
+            scope=MemoryScope.GLOBAL_USER,
+            scope_canonical=MemoryScope.USER.value,
+            canonical_text="user context",
+        )
+        await memories.create_memory_object(
+            **seed_kwargs,
+            memory_id="mem_other_chat",
+            workspace_id="wrk_a",
+            conversation_id="cnv_other",
+            scope=MemoryScope.CONVERSATION,
+            scope_canonical=MemoryScope.CHAT.value,
+            canonical_text="other chat context",
+        )
+        await memories.create_memory_object(
+            **{**seed_kwargs, "sensitivity": MemorySensitivity.PRIVATE},
+            memory_id="mem_private",
+            workspace_id="wrk_a",
+            conversation_id="cnv_a",
+            scope=MemoryScope.CONVERSATION,
+            scope_canonical=MemoryScope.CHAT.value,
+            canonical_text="private context",
+        )
+        await memories.create_memory_object(
+            **{**seed_kwargs, "platform_id": "ios"},
+            memory_id="mem_wrong_platform",
+            workspace_id=None,
+            conversation_id=None,
+            scope=MemoryScope.GLOBAL_USER,
+            scope_canonical=MemoryScope.USER.value,
+            canonical_text="wrong platform context",
+            platform_locked=True,
+            platform_id_lock="ios",
+        )
+
+        rows = await memories.list_eligible_for_context(
+            "usr_a",
+            [MemoryScope.CONVERSATION, MemoryScope.WORKSPACE, MemoryScope.GLOBAL_USER],
+            workspace_id="wrk_a",
+            conversation_id="cnv_a",
+            assistant_mode_id="coding_debug",
+            privacy_ceiling=3,
+            user_persona_id="persona_a",
+            platform_id="default",
+            character_id="char_a",
+        )
+        count = await memories.count_for_context(
+            "usr_a",
+            [MemoryScope.CONVERSATION, MemoryScope.WORKSPACE, MemoryScope.GLOBAL_USER],
+            workspace_id="wrk_a",
+            conversation_id="cnv_a",
+            assistant_mode_id="coding_debug",
+            user_persona_id="persona_a",
+            platform_id="default",
+            character_id="char_a",
+        )
+
+        assert {row["id"] for row in rows} == {"mem_chat", "mem_character", "mem_user"}
+        assert count == 3
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_memory_repository_helpers_default_to_retrieval_eligible_statuses() -> None:
     connection, clock = await _connection_and_clock()
     try:
@@ -670,13 +930,13 @@ async def test_get_state_snapshot_excludes_expired_ephemeral_rows() -> None:
             user_id="usr_a",
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.STATE_SNAPSHOT,
-            scope=MemoryScope.ASSISTANT_MODE,
+            scope=MemoryScope.GLOBAL_USER,
             canonical_text="User is working from home.",
             payload={"status": "working"},
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.9,
             privacy_level=0,
-            memory_id="mem_state_assistant",
+            memory_id="mem_state_user",
         )
         await memories.create_memory_object(
             user_id="usr_a",
@@ -833,5 +1093,324 @@ async def test_upsert_summary_mirror_is_deterministic_and_updates_in_place() -> 
         assert rows[0]["payload_json"]["summary_view_id"] == "sum_episode_1"
         assert rows[0]["payload_json"]["source_object_ids"] == ["mem_1", "mem_2"]
         assert rows[0]["privacy_level"] == 2
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_user_memory_preferences_default_true_and_round_trip() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        created = await users.create_user(user_id="usr_pref")
+        assert created["remember_across_chats"] == 1
+        assert created["remember_across_devices"] == 1
+        assert created["memory_privacy_mode"] == "balanced"
+
+        prefs = await users.get_memory_preferences("usr_pref")
+        assert prefs == {
+            "remember_across_chats": True,
+            "remember_across_devices": True,
+            "memory_privacy_mode": "balanced",
+        }
+
+        updated = await users.update_memory_preferences(
+            "usr_pref",
+            remember_across_chats=False,
+        )
+        assert updated == {
+            "remember_across_chats": False,
+            "remember_across_devices": True,
+            "memory_privacy_mode": "balanced",
+        }
+
+        # Partial update preserves the unspecified flag.
+        updated_again = await users.update_memory_preferences(
+            "usr_pref",
+            remember_across_devices=False,
+            memory_privacy_mode="trusted_private",
+        )
+        assert updated_again == {
+            "remember_across_chats": False,
+            "remember_across_devices": False,
+            "memory_privacy_mode": "trusted_private",
+        }
+
+        # No-op update returns the current preferences without writing.
+        passthrough = await users.update_memory_preferences("usr_pref")
+        assert passthrough == updated_again
+
+        # Erased / unknown user returns None.
+        assert await users.get_memory_preferences("missing") is None
+        assert await users.update_memory_preferences("missing", remember_across_chats=True) is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_create_conversation_populates_redesign_identity_columns() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        await users.create_user(user_id="usr_ident")
+        await _insert_assistant_mode(connection, mode_id="companion")
+        workspaces = WorkspaceRepository(connection, clock)
+        await workspaces.create_workspace(
+            workspace_id="ws_ident",
+            user_id="usr_ident",
+            name="Workspace identity",
+        )
+
+        conversations = ConversationRepository(connection, clock)
+        # Caller does not pass new identity fields -> values mirror legacy
+        # ones so retrieval that reads the canonical columns works for
+        # legacy-only callers without a Phase 4 cut.
+        legacy_only = await conversations.create_conversation(
+            conversation_id="cnv_legacy",
+            user_id="usr_ident",
+            workspace_id="ws_ident",
+            assistant_mode_id="companion",
+            title="legacy",
+        )
+        assert legacy_only["mode"] == "companion"
+        assert legacy_only["character_id"] == "ws_ident"
+        assert legacy_only["incognito"] == 0
+        # ``platform_id`` stays None for legacy-only callers; Phase 4 makes
+        # it required at the public boundary.
+        assert legacy_only["platform_id"] is None
+        assert legacy_only["user_persona_id"] is None
+
+        # Caller passes new identity fields explicitly -> they win.
+        canonical = await conversations.create_conversation(
+            conversation_id="cnv_canon",
+            user_id="usr_ident",
+            workspace_id="ws_ident",
+            assistant_mode_id="companion",
+            title="canonical",
+            user_persona_id="alter",
+            platform_id="sillytavern_desktop",
+            character_id="galactic_explorer",
+            mode="brainstorm",
+            incognito=True,
+        )
+        assert canonical["user_persona_id"] == "alter"
+        assert canonical["platform_id"] == "sillytavern_desktop"
+        assert canonical["character_id"] == "galactic_explorer"
+        assert canonical["mode"] == "brainstorm"
+        assert canonical["incognito"] == 1
+        assert canonical["isolated_mode"] == 1
+    finally:
+        await connection.close()
+
+
+def test_namespace_scope_clauses_emits_chat_only_when_incognito() -> None:
+    clauses, parameters = MemoryObjectRepository.namespace_scope_clauses(
+        [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+        user_persona_id=None,
+        character_id="ch1",
+        conversation_id="cnv_1",
+        remember_across_chats=True,
+        incognito=True,
+    )
+    assert len(clauses) == 1
+    assert "scope_canonical = 'chat'" in clauses[0]
+    assert parameters == [None, "cnv_1"]
+
+
+def test_namespace_scope_clauses_emits_chat_only_when_cross_chat_disabled() -> None:
+    clauses, _ = MemoryObjectRepository.namespace_scope_clauses(
+        [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+        user_persona_id="alter",
+        character_id="ch1",
+        conversation_id="cnv_1",
+        remember_across_chats=False,
+        incognito=False,
+    )
+    assert len(clauses) == 1
+    assert "scope_canonical = 'chat'" in clauses[0]
+
+
+def test_namespace_scope_clauses_drops_character_when_id_missing() -> None:
+    clauses, _ = MemoryObjectRepository.namespace_scope_clauses(
+        [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+        user_persona_id=None,
+        character_id=None,
+        conversation_id="cnv_1",
+        remember_across_chats=True,
+        incognito=False,
+    )
+    assert len(clauses) == 2
+    assert "scope_canonical = 'character'" not in " ".join(clauses)
+    assert any("scope_canonical = 'chat'" in c for c in clauses)
+    assert any("scope_canonical = 'user'" in c for c in clauses)
+
+
+def test_namespace_scope_clauses_emits_all_three_when_eligible() -> None:
+    clauses, parameters = MemoryObjectRepository.namespace_scope_clauses(
+        [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+        user_persona_id="alter",
+        character_id="ch1",
+        conversation_id="cnv_1",
+        remember_across_chats=True,
+        incognito=False,
+    )
+    assert len(clauses) == 3
+    assert "scope_canonical = 'chat'" in clauses[0]
+    assert "scope_canonical = 'character'" in clauses[1]
+    assert "scope_canonical = 'user'" in clauses[2]
+    # Each clause produces the parameters expected by the OR-combination.
+    assert parameters == ["alter", "cnv_1", "alter", "ch1", "alter"]
+
+
+def test_sensitivity_filter_clause_default_is_fail_closed() -> None:
+    clause = MemoryObjectRepository.sensitivity_filter_clause(gates_enabled=False)
+    assert "sensitivity = 'public'" in clause
+    open_clause = MemoryObjectRepository.sensitivity_filter_clause(gates_enabled=True)
+    assert "private" in open_clause and "secret" in open_clause
+    assert "unknown" not in open_clause
+
+
+def test_platform_lock_clause_handles_cross_device_off() -> None:
+    on_clause, on_params = MemoryObjectRepository.platform_lock_clause(
+        platform_id="p1", remember_across_devices=True
+    )
+    assert "platform_locked = 0" in on_clause
+    assert on_params == ["p1"]
+    off_clause, off_params = MemoryObjectRepository.platform_lock_clause(
+        platform_id="p1", remember_across_devices=False
+    )
+    assert "platform_id = ?" in off_clause
+    assert off_params == ["p1", "p1"]
+
+
+@pytest.mark.asyncio
+async def test_create_memory_object_populates_redesign_fields_with_strictest_wins() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        await users.create_user(user_id="usr_mem")
+        await _insert_assistant_mode(connection, mode_id="companion")
+        memories = MemoryObjectRepository(connection, clock)
+
+        # privacy_level=1 with a high-risk medication category must escalate
+        # to ``private`` (strictest-wins) even though privacy_level alone
+        # would map to ``public``.
+        med = await memories.create_memory_object(
+            user_id="usr_mem",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="user takes sertraline 50mg",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=1,
+            memory_category=MemoryCategory.MEDICATION,
+        )
+        assert med["sensitivity"] == "private"
+        assert med["scope_canonical"] == "user"
+        assert med["themes_json"] == []
+        assert med["auto_expires"] == 0
+        assert med["platform_locked"] == 0
+
+        # Ephemeral session scope auto-expires.
+        eph_conv = await ConversationRepository(connection, clock).create_conversation(
+            conversation_id="cnv_eph",
+            user_id="usr_mem",
+            workspace_id=None,
+            assistant_mode_id="companion",
+            title="ephemeral",
+        )
+        eph = await memories.create_memory_object(
+            user_id="usr_mem",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.EPHEMERAL_SESSION,
+            canonical_text="ephemeral note",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.5,
+            privacy_level=0,
+            conversation_id=eph_conv["id"],
+            assistant_mode_id="companion",
+        )
+        assert eph["scope_canonical"] == "chat"
+        assert eph["auto_expires"] == 1
+        assert eph["sensitivity"] == "public"
+
+        # PIN/password category always escalates to secret.
+        pin = await memories.create_memory_object(
+            user_id="usr_mem",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="user shared a PIN earlier",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            memory_category=MemoryCategory.PIN_OR_PASSWORD,
+        )
+        assert pin["sensitivity"] == "secret"
+
+        # Explicit caller-supplied sensitivity wins over the derived value.
+        forced = await memories.create_memory_object(
+            user_id="usr_mem",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="explicit secret",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            sensitivity=MemorySensitivity.SECRET,
+            themes=["security", "credentials"],
+            platform_locked=True,
+            platform_id_lock="sillytavern_desktop",
+            user_persona_id="alter",
+            character_id="ch1",
+            platform_id="sillytavern_desktop",
+        )
+        assert forced["sensitivity"] == "secret"
+        assert forced["themes_json"] == ["security", "credentials"]
+        assert forced["platform_locked"] == 1
+        assert forced["platform_id_lock"] == "sillytavern_desktop"
+        assert forced["user_persona_id"] == "alter"
+        assert forced["character_id"] == "ch1"
+        assert forced["platform_id"] == "sillytavern_desktop"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_set_conversation_incognito_is_reversible_and_mirrors_isolated_mode() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        await users.create_user(user_id="usr_inc")
+        await _insert_assistant_mode(connection, mode_id="companion")
+        conversations = ConversationRepository(connection, clock)
+        created = await conversations.create_conversation(
+            conversation_id="cnv_inc",
+            user_id="usr_inc",
+            workspace_id=None,
+            assistant_mode_id="companion",
+            title="incognito test",
+        )
+        assert created["incognito"] == 0
+        assert created["isolated_mode"] == 0
+
+        toggled_on = await conversations.set_conversation_incognito(
+            "cnv_inc", "usr_inc", True
+        )
+        assert toggled_on["incognito"] == 1
+        # Legacy isolated_mode stays in sync so legacy retrieval still
+        # treats the conversation as isolated.
+        assert toggled_on["isolated_mode"] == 1
+
+        toggled_off = await conversations.set_conversation_incognito(
+            "cnv_inc", "usr_inc", False
+        )
+        assert toggled_off["incognito"] == 0
+        assert toggled_off["isolated_mode"] == 0
+
+        # Toggling again works (truly reversible, not one-way).
+        toggled_on_again = await conversations.set_conversation_incognito(
+            "cnv_inc", "usr_inc", True
+        )
+        assert toggled_on_again["incognito"] == 1
     finally:
         await connection.close()

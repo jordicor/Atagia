@@ -103,12 +103,16 @@ def test_summarize_retrieval_custody_counts_channels_and_selected() -> None:
                 {
                     "candidate_kind": "evidence",
                     "channels": ["embedding", "fts"],
+                    "scope_canonical": "chat",
+                    "sensitivity": "public",
                     "composer_decision": "selected",
                     "selected": True,
                 },
                 {
                     "candidate_kind": "verbatim_evidence_search_window",
                     "channels": ["verbatim_evidence_search"],
+                    "scope_canonical": "user",
+                    "sensitivity": "private",
                     "composer_decision": "not_selected",
                     "filter_reason": "not_scored_or_filtered",
                     "selected": False,
@@ -125,6 +129,10 @@ def test_summarize_retrieval_custody_counts_channels_and_selected() -> None:
         "candidate_kind_counts": {"evidence": 1, "verbatim_evidence_search_window": 1},
         "composer_decision_counts": {"not_selected": 1, "selected": 1},
         "filter_reason_counts": {"not_scored_or_filtered": 1},
+        "scope_counts": {"chat": 1, "user": 1},
+        "selected_scope_counts": {"chat": 1},
+        "sensitivity_counts": {"private": 1, "public": 1},
+        "selected_sensitivity_counts": {"public": 1},
     }
 
 
@@ -145,4 +153,27 @@ def test_format_retrieval_custody_summary_is_terminal_friendly() -> None:
         "kinds=memory=2 "
         "decisions=not_selected=1 selected=1 "
         "filters=not_scored_or_filtered=1"
+    )
+
+
+def test_format_retrieval_custody_summary_includes_namespace_and_sensitivity() -> None:
+    summary = {
+        "candidate_count": 2,
+        "selected_count": 1,
+        "channel_counts": {"fts": 2},
+        "selected_channel_counts": {"fts": 1},
+        "scope_counts": {"chat": 1, "user": 1},
+        "sensitivity_counts": {"private": 1, "public": 1},
+        "candidate_kind_counts": {"memory": 2},
+        "composer_decision_counts": {"selected": 1, "not_selected": 1},
+        "filter_reason_counts": {"sensitivity_filtered": 1},
+    }
+
+    assert format_retrieval_custody_summary(summary) == (
+        "Retrieval custody: candidates=2 selected=1 "
+        "channels=fts=2 selected_channels=fts=1 "
+        "scopes=chat=1 user=1 sensitivity=private=1 public=1 "
+        "kinds=memory=2 "
+        "decisions=not_selected=1 selected=1 "
+        "filters=sensitivity_filtered=1"
     )

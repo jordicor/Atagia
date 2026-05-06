@@ -72,6 +72,5 @@ def disclosure_action(
     """Return the ordinary-chat disclosure action for structured memory metadata."""
     if memory_category in SECRET_LITERAL_MEMORY_CATEGORIES:
         return HighRiskDisclosureAction.WITHHOLD_SECRET_LITERAL
-    if preserve_verbatim and privacy_level >= 3:
-        return HighRiskDisclosureAction.WITHHOLD_SECRET_LITERAL
+    _ = privacy_level, preserve_verbatim
     return HighRiskDisclosureAction.ANSWER_IF_AUTHORIZED

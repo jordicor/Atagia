@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import hashlib
+import math
+import re
 from typing import Any
 
 import aiosqlite
@@ -14,17 +17,119 @@ from atagia.core.ids import generate_prefixed_id, new_memory_id
 from atagia.core.storage_backend import StorageBackend
 from atagia.core.timestamps import normalize_optional_timestamp
 from atagia.models.schemas_memory import (
+    ConversationStatus,
     IntimacyBoundary,
     MemoryCategory,
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
     SummaryViewKind,
 )
 from atagia.memory.intimacy_boundary_policy import memory_object_intimacy_sql_clause
+from atagia.services.errors import ConversationNotActiveError, UserDeletedError
 
 RETRIEVAL_ELIGIBLE_MEMORY_STATUSES: tuple[MemoryStatus, ...] = (MemoryStatus.ACTIVE,)
+_SAFE_SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Categories that the high-risk policy treats as inherently sensitive.
+# Used for the strictest-wins sensitivity derivation when callers don't pass
+# an explicit value; the namespace redesign plan lists these as private-or-
+# stricter regardless of the source row's privacy_level.
+_HIGH_RISK_PRIVATE_CATEGORIES: frozenset[MemoryCategory] = frozenset(
+    {
+        MemoryCategory.MEDICATION,
+        MemoryCategory.FINANCIAL,
+        MemoryCategory.DATE_OF_BIRTH,
+        MemoryCategory.OTHER_SENSITIVE,
+    }
+)
+_HIGH_RISK_SECRET_CATEGORIES: frozenset[MemoryCategory] = frozenset(
+    {MemoryCategory.PIN_OR_PASSWORD}
+)
+# Intimacy boundary values that cannot stay public regardless of the
+# privacy_level baseline.
+_PRIVATE_INTIMACY_BOUNDARIES: frozenset[IntimacyBoundary] = frozenset(
+    {
+        IntimacyBoundary.ROMANTIC_PRIVATE,
+        IntimacyBoundary.INTIMACY_PRIVATE,
+        IntimacyBoundary.INTIMACY_PREFERENCE_PRIVATE,
+        IntimacyBoundary.INTIMACY_BOUNDARY,
+        IntimacyBoundary.AMBIGUOUS_INTIMATE,
+        IntimacyBoundary.SAFETY_BLOCKED,
+    }
+)
+
+_SENSITIVITY_RANK: dict[MemorySensitivity, int] = {
+    MemorySensitivity.UNKNOWN: 0,
+    MemorySensitivity.PUBLIC: 1,
+    MemorySensitivity.PRIVATE: 2,
+    MemorySensitivity.SECRET: 3,
+}
+_INTIMACY_RANK: dict[IntimacyBoundary, int] = {
+    IntimacyBoundary.ORDINARY: 0,
+    IntimacyBoundary.ROMANTIC_PRIVATE: 1,
+    IntimacyBoundary.INTIMACY_PRIVATE: 2,
+    IntimacyBoundary.INTIMACY_PREFERENCE_PRIVATE: 3,
+    IntimacyBoundary.INTIMACY_BOUNDARY: 4,
+    IntimacyBoundary.AMBIGUOUS_INTIMATE: 5,
+    IntimacyBoundary.SAFETY_BLOCKED: 6,
+}
+
+
+def _max_sensitivity(*values: MemorySensitivity) -> MemorySensitivity:
+    """Return the strictest value (`secret` > `private` > `public` > `unknown`)."""
+
+    return max(values, key=lambda v: _SENSITIVITY_RANK[v])
+
+
+def _max_intimacy_boundary(*values: IntimacyBoundary) -> IntimacyBoundary:
+    """Return the strictest intimacy boundary."""
+
+    return max(values, key=lambda v: _INTIMACY_RANK[v])
+
+
+def _derive_sensitivity_from_privacy(
+    privacy_level: int,
+    intimacy_boundary: IntimacyBoundary,
+    memory_category: MemoryCategory,
+) -> MemorySensitivity:
+    """Map legacy fields to the new sensitivity enum with strictest-wins.
+
+    Mirrors the SQL backfill in migration 0031 plus the high-risk and
+    intimacy overrides documented in the plan. Used as the default when a
+    writer does not pass ``sensitivity`` explicitly.
+    """
+
+    if privacy_level >= 3:
+        baseline = MemorySensitivity.SECRET
+    elif privacy_level == 2:
+        baseline = MemorySensitivity.PRIVATE
+    elif privacy_level <= 1:
+        baseline = MemorySensitivity.PUBLIC
+    else:
+        baseline = MemorySensitivity.UNKNOWN
+
+    if memory_category in _HIGH_RISK_SECRET_CATEGORIES:
+        baseline = _max_sensitivity(baseline, MemorySensitivity.SECRET)
+    elif memory_category in _HIGH_RISK_PRIVATE_CATEGORIES:
+        baseline = _max_sensitivity(baseline, MemorySensitivity.PRIVATE)
+    if intimacy_boundary in _PRIVATE_INTIMACY_BOUNDARIES:
+        baseline = _max_sensitivity(baseline, MemorySensitivity.PRIVATE)
+    return baseline
+
+
+def _legacy_scope_to_canonical(scope: MemoryScope) -> str:
+    """Map any accepted scope alias to the post-redesign storage scope."""
+
+    if scope is MemoryScope.GLOBAL_USER or scope is MemoryScope.ASSISTANT_MODE or scope is MemoryScope.USER:
+        return "user"
+    if scope is MemoryScope.CONVERSATION or scope is MemoryScope.EPHEMERAL_SESSION or scope is MemoryScope.CHAT:
+        return "chat"
+    if scope is MemoryScope.WORKSPACE or scope is MemoryScope.CHARACTER:
+        return "character"
+    return scope.value
 
 
 def _decode_json_columns(row: aiosqlite.Row | None) -> dict[str, Any] | None:
@@ -58,8 +163,7 @@ def _encode_language_codes(language_codes: list[str] | None) -> str | None:
     return json_utils.dumps(normalized)
 
 
-_HEAVY_MESSAGE_TOKEN_THRESHOLD = 512
-_HEAVY_MESSAGE_CHAR_THRESHOLD = 4096
+_HEAVY_MESSAGE_TOKEN_THRESHOLD = 4096
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -90,9 +194,15 @@ def _normalize_optional_text(value: Any, *, max_length: int | None = None) -> st
 
 
 def _is_mechanically_heavy(text: str, token_count: int | None) -> bool:
-    if token_count is not None and token_count >= _HEAVY_MESSAGE_TOKEN_THRESHOLD:
-        return True
-    return len(text) >= _HEAVY_MESSAGE_CHAR_THRESHOLD
+    return _message_token_estimate(text, token_count) >= _HEAVY_MESSAGE_TOKEN_THRESHOLD
+
+
+def _message_token_estimate(text: str, token_count: int | None) -> int:
+    if token_count is not None and token_count > 0:
+        return token_count
+    if not text:
+        return 0
+    return max(1, math.ceil(len(text) / 4))
 
 
 def _build_context_placeholder(
@@ -137,6 +247,38 @@ def _status_filter_clause(
     return f"{column_name} IN ({placeholders})", [status.value for status in statuses]
 
 
+def conversation_visibility_clause(
+    table_alias: str,
+    *,
+    conversation_id_col: str = "conversation_id",
+    include_archived: bool = False,
+) -> str:
+    """Return a SQL predicate hiding isolated/lifecycle-hidden conversation rows.
+
+    The clause uses one parameter: the active conversation id. Passing ``NULL``
+    hides all temporary and isolated conversation rows.
+    """
+    if not _SAFE_SQL_IDENTIFIER.match(table_alias):
+        raise ValueError(f"Unsafe SQL table alias: {table_alias!r}")
+    if not _SAFE_SQL_IDENTIFIER.match(conversation_id_col):
+        raise ValueError(f"Unsafe SQL column name: {conversation_id_col!r}")
+    hidden_status_clause = "visibility_conv.status = 'pending_deletion'"
+    if not include_archived:
+        hidden_status_clause += " OR visibility_conv.status = 'archived'"
+    qualified_column = f"{table_alias}.{conversation_id_col}"
+    return (
+        "("
+        f"{qualified_column} IS NULL "
+        f"OR {qualified_column} = ? "
+        "OR NOT EXISTS ("
+        "SELECT 1 FROM conversations AS visibility_conv "
+        f"WHERE visibility_conv.id = {qualified_column} "
+        f"AND (visibility_conv.temporary = 1 OR visibility_conv.isolated_mode = 1 OR {hidden_status_clause})"
+        ")"
+        ")"
+    )
+
+
 class BaseRepository:
     """Shared helpers for SQLite-backed repositories."""
 
@@ -172,6 +314,8 @@ class UserRepository(BaseRepository):
 
     async def create_user(self, user_id: str | None = None, external_ref: str | None = None) -> dict[str, Any]:
         resolved_user_id = user_id or generate_prefixed_id("usr")
+        if await self.has_user_erasure_marker(resolved_user_id):
+            raise UserDeletedError("User has been erased")
         timestamp = self._timestamp()
         await self._connection.execute(
             """
@@ -189,6 +333,32 @@ class UserRepository(BaseRepository):
             (user_id,),
         )
 
+    async def get_active_user(self, user_id: str) -> dict[str, Any] | None:
+        return await self._fetch_one(
+            """
+            SELECT *
+            FROM users
+            WHERE id = ?
+              AND deleted_at IS NULL
+            """,
+            (user_id,),
+        )
+
+    async def has_user_erasure_marker(self, user_id: str) -> bool:
+        marker_hash = user_erasure_marker_hash(user_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT 1
+            FROM deletion_tombstones
+            WHERE entity_type = 'user'
+              AND deletion_reason = 'right_to_erasure'
+              AND json_extract(scope_summary, '$.user_id_sha256') = ?
+            LIMIT 1
+            """,
+            (marker_hash,),
+        )
+        return await cursor.fetchone() is not None
+
     async def delete_user(self, user_id: str) -> None:
         timestamp = self._timestamp()
         await self._connection.execute(
@@ -200,6 +370,110 @@ class UserRepository(BaseRepository):
             (timestamp, timestamp, user_id),
         )
         await self._connection.commit()
+
+    # ------------------------------------------------------------------
+    # Namespace redesign: cross-chat / cross-device memory preferences.
+    # ------------------------------------------------------------------
+
+    async def get_memory_preferences(
+        self, user_id: str
+    ) -> dict[str, Any] | None:
+        """Return resolved memory preferences for the user.
+
+        Defaults are baked into the schema (both flags start at 1) so a
+        legacy row migrated by 0031 returns the same values a fresh row
+        would.
+        """
+
+        row = await self._fetch_one(
+            """
+            SELECT remember_across_chats,
+                   remember_across_devices,
+                   memory_privacy_mode
+            FROM users
+            WHERE id = ?
+              AND deleted_at IS NULL
+            """,
+            (user_id,),
+        )
+        if row is None:
+            return None
+        return {
+            "remember_across_chats": bool(row["remember_across_chats"]),
+            "remember_across_devices": bool(row["remember_across_devices"]),
+            "memory_privacy_mode": str(row["memory_privacy_mode"] or "balanced"),
+        }
+
+    async def update_memory_preferences(
+        self,
+        user_id: str,
+        *,
+        remember_across_chats: bool | None = None,
+        remember_across_devices: bool | None = None,
+        memory_privacy_mode: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Update one or both memory preferences and bump updated_at.
+
+        Cache invalidation (context cache, recent-window cache, retrieval
+        snapshots) is intentionally not handled here. Callers compose this
+        repository call inside a higher-level service that owns the
+        per-user cache generation guard, because the repository layer does
+        not know about cache backends. Phase 4 wires that up.
+        """
+
+        if (
+            remember_across_chats is None
+            and remember_across_devices is None
+            and memory_privacy_mode is None
+        ):
+            return await self.get_memory_preferences(user_id)
+        existing = await self.get_memory_preferences(user_id)
+        if existing is None:
+            return None
+        new_chats = (
+            existing["remember_across_chats"]
+            if remember_across_chats is None
+            else bool(remember_across_chats)
+        )
+        new_devices = (
+            existing["remember_across_devices"]
+            if remember_across_devices is None
+            else bool(remember_across_devices)
+        )
+        new_privacy_mode = (
+            str(existing["memory_privacy_mode"])
+            if memory_privacy_mode is None
+            else str(memory_privacy_mode)
+        )
+        timestamp = self._timestamp()
+        await self._connection.execute(
+            """
+            UPDATE users
+            SET remember_across_chats = ?,
+                remember_across_devices = ?,
+                memory_privacy_mode = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND deleted_at IS NULL
+            """,
+            (
+                1 if new_chats else 0,
+                1 if new_devices else 0,
+                new_privacy_mode,
+                timestamp,
+                user_id,
+            ),
+        )
+        await self._connection.commit()
+        return {
+            "remember_across_chats": new_chats,
+            "remember_across_devices": new_devices,
+            "memory_privacy_mode": new_privacy_mode,
+        }
+
+
+def user_erasure_marker_hash(user_id: str) -> str:
+    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()
 
 
 class WorkspaceRepository(BaseRepository):
@@ -280,9 +554,39 @@ class ConversationRepository(BaseRepository):
         assistant_mode_id: str,
         title: str | None,
         metadata: dict[str, Any] | None = None,
+        temporary: bool = False,
+        temporary_ttl_seconds: int | None = None,
+        purge_on_close: bool = False,
+        isolated_mode: bool = False,
+        *,
+        # Namespace redesign identity fields. They are optional during the
+        # additive phase so existing callers keep working; Phase 4 makes
+        # ``platform_id`` required at the API/proxy/sidecar boundary.
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        mode: str | None = None,
+        incognito: bool | None = None,
     ) -> dict[str, Any]:
         resolved_conversation_id = conversation_id or generate_prefixed_id("cnv")
         timestamp = self._timestamp()
+        # Mirror legacy fields onto the canonical columns so the new
+        # repository filters in Phase 3+ have the data they need without
+        # the caller having to pass it twice. ``incognito`` defaults to
+        # ``isolated_mode`` to preserve current behavior; when callers pass
+        # ``incognito`` explicitly, the legacy ``isolated_mode`` column is
+        # mirrored from it so legacy retrieval that still reads the
+        # ``isolated_mode`` column behaves identically until Phase 11.
+        resolved_mode = mode if mode is not None else assistant_mode_id
+        resolved_character_id = (
+            character_id if character_id is not None else workspace_id
+        )
+        if incognito is None:
+            resolved_incognito = int(isolated_mode)
+            resolved_isolated_mode = int(isolated_mode)
+        else:
+            resolved_incognito = int(bool(incognito))
+            resolved_isolated_mode = resolved_incognito
         await self._connection.execute(
             """
             INSERT INTO conversations(
@@ -292,11 +596,22 @@ class ConversationRepository(BaseRepository):
                 assistant_mode_id,
                 title,
                 status,
+                temporary,
+                temporary_ttl_seconds,
+                purge_on_close,
+                isolated_mode,
+                last_activity_at,
+                closed_at,
                 metadata_json,
                 created_at,
-                updated_at
+                updated_at,
+                user_persona_id,
+                platform_id,
+                character_id,
+                mode,
+                incognito
             )
-            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 resolved_conversation_id,
@@ -304,9 +619,19 @@ class ConversationRepository(BaseRepository):
                 workspace_id,
                 assistant_mode_id,
                 title,
+                int(temporary),
+                temporary_ttl_seconds,
+                int(purge_on_close),
+                resolved_isolated_mode,
+                timestamp,
                 _encode_json(metadata),
                 timestamp,
                 timestamp,
+                user_persona_id,
+                platform_id,
+                resolved_character_id,
+                resolved_mode,
+                resolved_incognito,
             ),
         )
         await self._connection.commit()
@@ -323,12 +648,32 @@ class ConversationRepository(BaseRepository):
             (conversation_id, user_id),
         )
 
+    async def get_active_conversation(self, conversation_id: str, user_id: str) -> dict[str, Any] | None:
+        return await self._fetch_one(
+            """
+            SELECT *
+            FROM conversations
+            WHERE id = ?
+              AND user_id = ?
+              AND status = ?
+            """,
+            (conversation_id, user_id, ConversationStatus.ACTIVE.value),
+        )
+
     async def list_conversations(
         self,
         user_id: str,
         workspace_id: str | None = None,
         assistant_mode_id: str | None = None,
         status: str | None = None,
+        include_temporary: bool = False,
+        include_archived: bool = False,
+        *,
+        namespace_filter: bool = False,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
     ) -> list[dict[str, Any]]:
         clauses = ["user_id = ?"]
         parameters: list[Any] = [user_id]
@@ -338,9 +683,30 @@ class ConversationRepository(BaseRepository):
         if assistant_mode_id is not None:
             clauses.append("assistant_mode_id = ?")
             parameters.append(assistant_mode_id)
+        if namespace_filter:
+            clauses.append("user_persona_id IS ?")
+            clauses.append("platform_id = ?")
+            clauses.append("character_id IS ?")
+            clauses.append("incognito = ?")
+            parameters.extend([user_persona_id, platform_id, character_id, 1 if incognito else 0])
         if status is not None:
+            ConversationStatus(status)
             clauses.append("status = ?")
             parameters.append(status)
+        elif include_archived:
+            clauses.append("status IN (?, ?, ?)")
+            parameters.extend(
+                [
+                    ConversationStatus.ACTIVE.value,
+                    ConversationStatus.CLOSED.value,
+                    ConversationStatus.ARCHIVED.value,
+                ]
+            )
+        else:
+            clauses.append("status = ?")
+            parameters.append(ConversationStatus.ACTIVE.value)
+        if not include_temporary:
+            clauses.append("temporary = 0")
 
         return await self._fetch_all(
             """
@@ -352,15 +718,71 @@ class ConversationRepository(BaseRepository):
             tuple(parameters),
         )
 
-    async def update_conversation_status(self, conversation_id: str, user_id: str, status: str) -> None:
+    async def mark_conversation_isolated(self, conversation_id: str, user_id: str) -> dict[str, Any] | None:
+        timestamp = self._timestamp()
         await self._connection.execute(
             """
             UPDATE conversations
-            SET status = ?, updated_at = ?
+            SET isolated_mode = 1,
+                incognito = 1,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+              AND isolated_mode = 0
+            """,
+            (timestamp, conversation_id, user_id),
+        )
+        await self._connection.commit()
+        return await self.get_conversation(conversation_id, user_id)
+
+    async def set_conversation_incognito(
+        self,
+        conversation_id: str,
+        user_id: str,
+        incognito: bool,
+        *,
+        commit: bool = True,
+    ) -> dict[str, Any] | None:
+        """Toggle the per-conversation ``incognito`` flag.
+
+        Reversible per the redesign plan: setting ``incognito=False`` after
+        a previous ``True`` does *not* automatically re-promote derived data
+        that was narrowed while incognito was on. Cache invalidation,
+        transactional narrowing of broad derived rows, and queued-job
+        cancellation belong to the service layer that owns those caches and
+        workers (Phase 4 + Phase 8); this method is the underlying flip.
+        """
+
+        timestamp = self._timestamp()
+        target = 1 if incognito else 0
+        await self._connection.execute(
+            """
+            UPDATE conversations
+            SET incognito = ?,
+                isolated_mode = ?,
+                updated_at = ?
             WHERE id = ?
               AND user_id = ?
             """,
-            (status, self._timestamp(), conversation_id, user_id),
+            (target, target, timestamp, conversation_id, user_id),
+        )
+        if commit:
+            await self._connection.commit()
+        return await self.get_conversation(conversation_id, user_id)
+
+    async def update_conversation_status(self, conversation_id: str, user_id: str, status: str) -> None:
+        ConversationStatus(status)
+        timestamp = self._timestamp()
+        await self._connection.execute(
+            """
+            UPDATE conversations
+            SET status = ?,
+                updated_at = ?,
+                closed_at = CASE WHEN ? = 'closed' THEN COALESCE(closed_at, ?) ELSE closed_at END
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (status, timestamp, status, timestamp, conversation_id, user_id),
         )
         await self._connection.commit()
 
@@ -494,7 +916,7 @@ class MessageRepository(BaseRepository):
             metadata=metadata,
         )
         if seq is None:
-            await self._connection.execute(
+            cursor = await self._connection.execute(
                 """
                 INSERT INTO messages(
                     id,
@@ -518,9 +940,16 @@ class MessageRepository(BaseRepository):
                 )
                 SELECT
                     ?,
+                    c.id,
                     ?,
-                    ?,
-                    COALESCE(MAX(seq), 0) + 1,
+                    COALESCE(
+                        (
+                            SELECT MAX(existing.seq)
+                            FROM messages AS existing
+                            WHERE existing.conversation_id = c.id
+                        ),
+                        0
+                    ) + 1,
                     ?,
                     ?,
                     ?,
@@ -535,12 +964,12 @@ class MessageRepository(BaseRepository):
                     ?,
                     ?,
                     ?
-                FROM messages
-                WHERE conversation_id = ?
+                FROM conversations AS c
+                WHERE c.id = ?
+                  AND c.status = 'active'
                 """,
                 (
                     resolved_message_id,
-                    conversation_id,
                     role,
                     text,
                     token_count,
@@ -560,7 +989,7 @@ class MessageRepository(BaseRepository):
                 ),
             )
         else:
-            await self._connection.execute(
+            cursor = await self._connection.execute(
                 """
                 INSERT INTO messages(
                     id,
@@ -582,11 +1011,31 @@ class MessageRepository(BaseRepository):
                     created_at,
                     occurred_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT
+                    ?,
+                    c.id,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?
+                FROM conversations AS c
+                WHERE c.id = ?
+                  AND c.status = 'active'
                 """,
                 (
                     resolved_message_id,
-                    conversation_id,
                     role,
                     seq,
                     text,
@@ -603,8 +1052,31 @@ class MessageRepository(BaseRepository):
                     message_policy["policy_reason"],
                     timestamp,
                     resolved_occurred_at,
+                    conversation_id,
                 ),
             )
+        if cursor.rowcount == 0:
+            raise ConversationNotActiveError("Conversation is not active")
+        await self._connection.execute(
+            """
+            UPDATE conversations
+            SET last_activity_at = CASE
+                    WHEN last_activity_at IS NULL THEN ?
+                    WHEN datetime(?) > datetime(last_activity_at) THEN ?
+                    ELSE last_activity_at
+                END,
+                updated_at = ?
+            WHERE id = ?
+              AND status = 'active'
+            """,
+            (
+                resolved_occurred_at or timestamp,
+                resolved_occurred_at or timestamp,
+                resolved_occurred_at or timestamp,
+                timestamp,
+                conversation_id,
+            ),
+        )
         if commit:
             await self._connection.commit()
         created = await self._fetch_one(
@@ -679,6 +1151,31 @@ class MessageRepository(BaseRepository):
             (conversation_id, user_id, limit),
         )
 
+    async def get_recent_messages_before_seq(
+        self,
+        conversation_id: str,
+        user_id: str,
+        before_seq: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            """
+            SELECT *
+            FROM (
+                SELECT m.*
+                FROM messages AS m
+                JOIN conversations AS c ON c.id = m.conversation_id
+                WHERE m.conversation_id = ?
+                  AND c.user_id = ?
+                  AND m.seq < ?
+                ORDER BY m.seq DESC
+                LIMIT ?
+            ) AS recent_messages
+            ORDER BY seq ASC
+            """,
+            (conversation_id, user_id, before_seq, limit),
+        )
+
     async def list_messages_for_conversation(
         self,
         conversation_id: str,
@@ -747,7 +1244,50 @@ class MessageRepository(BaseRepository):
             (message_id, user_id),
         )
 
-    async def search_messages(self, user_id: str, query: str, limit: int) -> list[dict[str, Any]]:
+    async def get_message_by_seq(
+        self,
+        conversation_id: str,
+        user_id: str,
+        seq: int,
+    ) -> dict[str, Any] | None:
+        return await self._fetch_one(
+            """
+            SELECT m.*
+            FROM messages AS m
+            JOIN conversations AS c ON c.id = m.conversation_id
+            WHERE m.conversation_id = ?
+              AND c.user_id = ?
+              AND m.seq = ?
+            """,
+            (conversation_id, user_id, seq),
+        )
+
+    async def get_message_for_idempotency(
+        self,
+        message_id: str,
+    ) -> dict[str, Any] | None:
+        """Return a message with owner metadata for internal idempotency checks."""
+        return await self._fetch_one(
+            """
+            SELECT
+                m.*,
+                c.user_id AS _conversation_user_id
+            FROM messages AS m
+            JOIN conversations AS c ON c.id = m.conversation_id
+            WHERE m.id = ?
+            """,
+            (message_id,),
+        )
+
+    async def search_messages(
+        self,
+        user_id: str,
+        query: str,
+        limit: int,
+        *,
+        allow_conversation_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        isolate_to_allowed = await self._conversation_is_isolated(allow_conversation_id, user_id)
         return await self._fetch_all(
             """
             SELECT
@@ -757,11 +1297,22 @@ class MessageRepository(BaseRepository):
             JOIN messages AS m ON m._rowid = messages_fts.rowid
             JOIN conversations AS c ON c.id = m.conversation_id
             WHERE c.user_id = ?
+              AND {visibility_clause}
+              AND (? = 0 OR c.id = ?)
               AND messages_fts MATCH ?
             ORDER BY rank ASC, m.seq ASC
             LIMIT ?
-            """,
-            (user_id, query, limit),
+            """.format(
+                visibility_clause=conversation_visibility_clause("c", conversation_id_col="id"),
+            ),
+            (
+                user_id,
+                allow_conversation_id,
+                int(isolate_to_allowed),
+                allow_conversation_id,
+                query,
+                limit,
+            ),
         )
 
     async def search_messages_with_privacy(
@@ -772,6 +1323,7 @@ class MessageRepository(BaseRepository):
         privacy_ceiling: int,
         limit: int,
         allow_conversation_id: str | None = None,
+        active_conversation_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Wave 1 batch 2 (1-C): privacy-filtered FTS search on messages.
 
@@ -790,13 +1342,15 @@ class MessageRepository(BaseRepository):
         """
         if limit <= 0:
             return []
+        isolate_to_allowed = await self._conversation_is_isolated(allow_conversation_id, user_id)
         return await self._fetch_all(
             """
             SELECT
                 m.*,
                 c.assistant_mode_id AS conversation_assistant_mode_id,
                 am.privacy_ceiling AS mode_privacy_ceiling,
-                bm25(messages_fts) AS rank
+                bm25(messages_fts) AS rank,
+                snippet(messages_fts, 0, '', '', ' ... ', 64) AS fts_snippet
             FROM messages_fts
             JOIN messages AS m ON m._rowid = messages_fts.rowid
             JOIN conversations AS c ON c.id = m.conversation_id
@@ -804,6 +1358,9 @@ class MessageRepository(BaseRepository):
             WHERE c.user_id = ?
               AND (am.privacy_ceiling <= ? OR (? IS NOT NULL AND c.id = ?))
               AND c.status = 'active'
+              AND {visibility_clause}
+              AND (? = 0 OR c.id = ?)
+              AND (? = 0 OR c.id = ?)
               AND NOT EXISTS (
                   SELECT 1
                   FROM memory_objects AS pending
@@ -816,17 +1373,43 @@ class MessageRepository(BaseRepository):
               AND messages_fts MATCH ?
             ORDER BY rank ASC, m.seq ASC
             LIMIT ?
-            """,
+            """.format(
+                visibility_clause=conversation_visibility_clause("c", conversation_id_col="id"),
+            ),
             (
                 user_id,
                 privacy_ceiling,
                 allow_conversation_id,
+                allow_conversation_id,
+                allow_conversation_id,
+                int(isolate_to_allowed),
+                allow_conversation_id,
+                int(active_conversation_only),
                 allow_conversation_id,
                 user_id,
                 query,
                 limit,
             ),
         )
+
+    async def _conversation_is_isolated(
+        self,
+        conversation_id: str | None,
+        user_id: str,
+    ) -> bool:
+        if conversation_id is None:
+            return False
+        cursor = await self._connection.execute(
+            """
+            SELECT isolated_mode
+            FROM conversations
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (conversation_id, user_id),
+        )
+        row = await cursor.fetchone()
+        return bool(row is not None and row["isolated_mode"])
 
     async def fetch_message_window(
         self,
@@ -898,8 +1481,12 @@ class MessageRepository(BaseRepository):
               AND (
                   {clauses}
               )
-            """.format(clauses=" OR ".join(clauses)),
-            tuple([user_id, *parameters]),
+              AND {visibility_clause}
+            """.format(
+                clauses=" OR ".join(clauses),
+                visibility_clause=conversation_visibility_clause("c", conversation_id_col="id"),
+            ),
+            tuple([user_id, *parameters, conversation_id]),
         )
         row = await cursor.fetchone()
         return int(row["total_length"])
@@ -937,9 +1524,13 @@ class MessageRepository(BaseRepository):
               AND (
                   {clauses}
               )
+              AND {visibility_clause}
             ORDER BY c.created_at ASC, m.conversation_id ASC, m.seq ASC
-            """.format(clauses=" OR ".join(clauses)),
-            tuple([user_id, *parameters]),
+            """.format(
+                clauses=" OR ".join(clauses),
+                visibility_clause=conversation_visibility_clause("c", conversation_id_col="id"),
+            ),
+            tuple([user_id, *parameters, conversation_id]),
         )
 
     @staticmethod
@@ -955,18 +1546,15 @@ class MessageRepository(BaseRepository):
         for scope in scopes:
             if scope is MemoryScope.GLOBAL_USER:
                 clauses.append("1 = 1")
-            elif scope is MemoryScope.ASSISTANT_MODE:
-                clauses.append("c.assistant_mode_id = ?")
-                parameters.append(assistant_mode_id)
             elif scope is MemoryScope.WORKSPACE and workspace_id is not None:
-                clauses.append("(c.assistant_mode_id = ? AND c.workspace_id = ?)")
-                parameters.extend([assistant_mode_id, workspace_id])
+                clauses.append("(c.workspace_id = ?)")
+                parameters.append(workspace_id)
             elif scope is MemoryScope.CONVERSATION:
-                clauses.append("(c.assistant_mode_id = ? AND c.id = ?)")
-                parameters.extend([assistant_mode_id, conversation_id])
+                clauses.append("(c.id = ?)")
+                parameters.append(conversation_id)
             elif scope is MemoryScope.EPHEMERAL_SESSION:
-                clauses.append("(c.assistant_mode_id = ? AND c.id = ?)")
-                parameters.extend([assistant_mode_id, conversation_id])
+                clauses.append("(c.id = ?)")
+                parameters.append(conversation_id)
         return clauses, parameters
 
 
@@ -991,6 +1579,59 @@ class MemoryObjectRepository(BaseRepository):
               AND user_id = ?
             """,
             (memory_id, user_id),
+        )
+
+    async def get_visible_memory_object(
+        self,
+        memory_id: str,
+        user_id: str,
+        *,
+        conversation_id: str,
+        user_persona_id: str | None,
+        platform_id: str,
+        character_id: str | None,
+        incognito: bool,
+        remember_across_chats: bool,
+        remember_across_devices: bool,
+        sensitivity_gates_enabled: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return a memory only if it is visible in the active namespace."""
+
+        clauses, parameters = self.namespace_visibility_clauses(
+            [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            conversation_id=conversation_id,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+            incognito=incognito,
+            sensitivity_gates_enabled=sensitivity_gates_enabled,
+            table_alias="mo",
+        )
+        if not clauses:
+            return None
+        return await self._fetch_one(
+            """
+            SELECT mo.*
+            FROM memory_objects AS mo
+            WHERE mo.id = ?
+              AND mo.user_id = ?
+              AND mo.status != ?
+              AND mo.archived_by_conversation_id IS NULL
+              AND {visibility_clause}
+              AND {namespace_clauses}
+            """.format(
+                visibility_clause=conversation_visibility_clause("mo"),
+                namespace_clauses=" AND ".join(clauses),
+            ),
+            (
+                memory_id,
+                user_id,
+                MemoryStatus.DELETED.value,
+                conversation_id,
+                *parameters,
+            ),
         )
 
     async def archive_memory_object(
@@ -1114,6 +1755,14 @@ class MemoryObjectRepository(BaseRepository):
         intimacy_boundary_confidence: float = 0.0,
         status: MemoryStatus = MemoryStatus.ACTIVE,
         payload: dict[str, Any] | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        sensitivity: MemorySensitivity | None = None,
+        themes: list[str] | None = None,
+        platform_locked: bool = False,
+        platform_id_lock: str | None = None,
+        scope_canonical: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         mirror_id = summary_mirror_id(summary_view_id)
@@ -1154,16 +1803,29 @@ class MemoryObjectRepository(BaseRepository):
                 preserve_verbatim=False,
                 status=status,
                 memory_id=mirror_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                sensitivity=sensitivity,
+                themes=themes,
+                platform_locked=platform_locked,
+                platform_id_lock=platform_id_lock,
+                scope_canonical=scope_canonical,
                 commit=commit,
             )
 
+        storage_scope = _legacy_scope_to_canonical(scope)
         await self._connection.execute(
             """
             UPDATE memory_objects
             SET workspace_id = ?,
                 conversation_id = ?,
                 assistant_mode_id = ?,
+                user_persona_id = ?,
+                platform_id = ?,
+                character_id = ?,
                 scope = ?,
+                scope_canonical = ?,
                 canonical_text = ?,
                 index_text = ?,
                 payload_json = ?,
@@ -1176,6 +1838,10 @@ class MemoryObjectRepository(BaseRepository):
                 memory_category = ?,
                 intimacy_boundary = ?,
                 intimacy_boundary_confidence = ?,
+                sensitivity = ?,
+                themes_json = ?,
+                platform_locked = ?,
+                platform_id_lock = ?,
                 preserve_verbatim = ?,
                 status = ?,
                 updated_at = ?
@@ -1186,7 +1852,11 @@ class MemoryObjectRepository(BaseRepository):
                 workspace_id,
                 conversation_id,
                 assistant_mode_id,
-                scope.value,
+                user_persona_id,
+                platform_id,
+                character_id,
+                storage_scope,
+                scope_canonical or storage_scope,
                 summary_text,
                 index_text,
                 _encode_json(normalized_payload),
@@ -1199,6 +1869,17 @@ class MemoryObjectRepository(BaseRepository):
                 MemoryCategory.UNKNOWN.value,
                 intimacy_boundary.value,
                 float(intimacy_boundary_confidence),
+                (
+                    sensitivity
+                    or _derive_sensitivity_from_privacy(
+                        privacy_level,
+                        intimacy_boundary,
+                        MemoryCategory.UNKNOWN,
+                    )
+                ).value,
+                _encode_json(list(themes or [])),
+                int(platform_locked),
+                platform_id_lock,
                 0,
                 status.value,
                 self._timestamp(),
@@ -1243,6 +1924,15 @@ class MemoryObjectRepository(BaseRepository):
         language_codes: list[str] | None = None,
         memory_id: str | None = None,
         commit: bool = True,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        sensitivity: MemorySensitivity | None = None,
+        themes: list[str] | None = None,
+        auto_expires: bool | None = None,
+        platform_locked: bool = False,
+        platform_id_lock: str | None = None,
+        scope_canonical: str | None = None,
     ) -> dict[str, Any]:
         created, _was_created = await self._create_memory_object_impl(
             user_id=user_id,
@@ -1272,6 +1962,15 @@ class MemoryObjectRepository(BaseRepository):
             language_codes=language_codes,
             memory_id=memory_id,
             commit=commit,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            sensitivity=sensitivity,
+            themes=themes,
+            auto_expires=auto_expires,
+            platform_locked=platform_locked,
+            platform_id_lock=platform_id_lock,
+            scope_canonical=scope_canonical,
         )
         return created
 
@@ -1305,6 +2004,15 @@ class MemoryObjectRepository(BaseRepository):
         language_codes: list[str] | None = None,
         memory_id: str | None = None,
         commit: bool = True,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        sensitivity: MemorySensitivity | None = None,
+        themes: list[str] | None = None,
+        auto_expires: bool | None = None,
+        platform_locked: bool = False,
+        platform_id_lock: str | None = None,
+        scope_canonical: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         return await self._create_memory_object_impl(
             user_id=user_id,
@@ -1334,6 +2042,15 @@ class MemoryObjectRepository(BaseRepository):
             language_codes=language_codes,
             memory_id=memory_id,
             commit=commit,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            sensitivity=sensitivity,
+            themes=themes,
+            auto_expires=auto_expires,
+            platform_locked=platform_locked,
+            platform_id_lock=platform_id_lock,
+            scope_canonical=scope_canonical,
         )
 
     async def _create_memory_object_impl(
@@ -1366,10 +2083,37 @@ class MemoryObjectRepository(BaseRepository):
         language_codes: list[str] | None = None,
         memory_id: str | None = None,
         commit: bool = True,
+        # Namespace redesign fields. Callers that don't supply them get
+        # sensible defaults derived from privacy_level / scope so legacy
+        # writers populate the new columns without changes.
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        sensitivity: MemorySensitivity | None = None,
+        themes: list[str] | None = None,
+        auto_expires: bool | None = None,
+        platform_locked: bool = False,
+        platform_id_lock: str | None = None,
+        scope_canonical: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         resolved_memory_id = memory_id or new_memory_id()
         timestamp = self._timestamp()
         language_codes_json = _encode_language_codes(language_codes)
+
+        resolved_sensitivity = (
+            sensitivity if sensitivity is not None
+            else _derive_sensitivity_from_privacy(privacy_level, intimacy_boundary, memory_category)
+        )
+        resolved_themes_json = _encode_json(list(themes or []))
+        resolved_auto_expires = (
+            int(auto_expires) if auto_expires is not None
+            else (1 if scope is MemoryScope.EPHEMERAL_SESSION else 0)
+        )
+        resolved_storage_scope = _legacy_scope_to_canonical(scope)
+        resolved_scope_canonical = scope_canonical or resolved_storage_scope
+        if resolved_scope_canonical not in {"chat", "character", "user"}:
+            resolved_scope_canonical = resolved_storage_scope
+
         parameters = (
             resolved_memory_id,
             user_id,
@@ -1377,7 +2121,7 @@ class MemoryObjectRepository(BaseRepository):
             conversation_id,
             assistant_mode_id,
             object_type.value,
-            scope.value,
+            resolved_storage_scope,
             canonical_text,
             index_text,
             extraction_hash,
@@ -1399,6 +2143,15 @@ class MemoryObjectRepository(BaseRepository):
             status.value,
             timestamp,
             timestamp,
+            user_persona_id,
+            platform_id,
+            character_id,
+            resolved_sensitivity.value,
+            resolved_themes_json,
+            resolved_auto_expires,
+            int(platform_locked),
+            platform_id_lock,
+            resolved_scope_canonical,
         )
         try:
             await self._connection.execute(
@@ -1431,9 +2184,18 @@ class MemoryObjectRepository(BaseRepository):
                     language_codes_json,
                     status,
                     created_at,
-                    updated_at
+                    updated_at,
+                    user_persona_id,
+                    platform_id,
+                    character_id,
+                    sensitivity,
+                    themes_json,
+                    auto_expires,
+                    platform_locked,
+                    platform_id_lock,
+                    scope_canonical
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 parameters,
             )
@@ -1467,6 +2229,49 @@ class MemoryObjectRepository(BaseRepository):
               AND extraction_hash = ?
             """,
             (user_id, extraction_hash),
+        )
+
+    async def find_memory_object_for_extraction_merge(
+        self,
+        *,
+        user_id: str,
+        canonical_text: str,
+        object_type: MemoryObjectType,
+        scope: MemoryScope,
+        user_persona_id: str | None,
+        character_id: str | None,
+        conversation_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Find an existing same-namespace row when hashes differ by locks.
+
+        Extraction hashes include platform-lock state after Phase 6. This
+        lookup prevents a later unlocked restatement from creating a broad
+        duplicate of an already locked memory.
+        """
+
+        return await self._fetch_one(
+            """
+            SELECT *
+            FROM memory_objects
+            WHERE user_id = ?
+              AND object_type = ?
+              AND COALESCE(scope_canonical, scope) = ?
+              AND LOWER(TRIM(canonical_text)) = LOWER(TRIM(?))
+              AND user_persona_id IS ?
+              AND character_id IS ?
+              AND conversation_id IS ?
+            ORDER BY platform_locked DESC, updated_at DESC, _rowid DESC
+            LIMIT 1
+            """,
+            (
+                user_id,
+                object_type.value,
+                _legacy_scope_to_canonical(scope),
+                canonical_text,
+                user_persona_id,
+                character_id,
+                conversation_id,
+            ),
         )
 
     async def refresh_memory_object_provenance(
@@ -1539,6 +2344,112 @@ class MemoryObjectRepository(BaseRepository):
             raise ValueError(f"Unknown memory_id: {memory_id}")
         return refreshed
 
+    async def merge_memory_object_write_restrictions(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        privacy_level: int,
+        intimacy_boundary: IntimacyBoundary,
+        intimacy_boundary_confidence: float,
+        sensitivity: MemorySensitivity,
+        themes: list[str],
+        auto_expires: bool,
+        platform_locked: bool,
+        platform_id_lock: str | None,
+        extraction_hash: str | None = None,
+        review_required: bool = False,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Tighten an existing row after an extraction dedupe hit.
+
+        This is deliberately one-way: later occurrences can make an existing
+        memory more restricted, but cannot make it less sensitive, unlock it,
+        remove expiry, or broaden gate themes.
+        """
+
+        existing = await self.get_memory_object(memory_id, user_id)
+        if existing is None:
+            raise ValueError(f"Unknown memory_id: {memory_id}")
+
+        existing_sensitivity = MemorySensitivity(str(existing.get("sensitivity") or "unknown"))
+        resolved_sensitivity = _max_sensitivity(existing_sensitivity, sensitivity)
+        existing_boundary = IntimacyBoundary(str(existing.get("intimacy_boundary") or "ordinary"))
+        resolved_boundary = _max_intimacy_boundary(existing_boundary, intimacy_boundary)
+        existing_platform_locked = bool(int(existing.get("platform_locked") or 0))
+        resolved_platform_locked = existing_platform_locked or platform_locked
+        existing_lock = existing.get("platform_id_lock")
+        resolved_platform_id_lock = existing_lock
+        resolved_status = str(existing.get("status"))
+
+        if platform_locked:
+            if existing_platform_locked and existing_lock and platform_id_lock and existing_lock != platform_id_lock:
+                resolved_status = MemoryStatus.REVIEW_REQUIRED.value
+            elif not existing_platform_locked:
+                resolved_platform_id_lock = platform_id_lock
+            elif existing_lock is None:
+                resolved_platform_id_lock = platform_id_lock
+        if review_required and resolved_status == MemoryStatus.ACTIVE.value:
+            resolved_status = MemoryStatus.REVIEW_REQUIRED.value
+
+        existing_themes = existing.get("themes_json") or []
+        if not isinstance(existing_themes, list):
+            existing_themes = []
+        if _SENSITIVITY_RANK[resolved_sensitivity] > _SENSITIVITY_RANK[existing_sensitivity]:
+            resolved_themes = themes or [str(theme) for theme in existing_themes]
+        elif existing_themes:
+            resolved_themes = [str(theme) for theme in existing_themes]
+        else:
+            resolved_themes = themes
+
+        resolved_privacy_level = max(int(existing.get("privacy_level") or 0), int(privacy_level))
+        resolved_auto_expires = bool(int(existing.get("auto_expires") or 0)) or auto_expires
+        resolved_extraction_hash = extraction_hash or existing.get("extraction_hash")
+
+        timestamp = self._timestamp()
+        await self._connection.execute(
+            """
+            UPDATE memory_objects
+            SET privacy_level = ?,
+                intimacy_boundary = ?,
+                intimacy_boundary_confidence = ?,
+                sensitivity = ?,
+                themes_json = ?,
+                auto_expires = ?,
+                platform_locked = ?,
+                platform_id_lock = ?,
+                extraction_hash = ?,
+                status = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (
+                resolved_privacy_level,
+                resolved_boundary.value,
+                max(
+                    float(existing.get("intimacy_boundary_confidence") or 0.0),
+                    float(intimacy_boundary_confidence),
+                ),
+                resolved_sensitivity.value,
+                _encode_json(resolved_themes),
+                1 if resolved_auto_expires else 0,
+                1 if resolved_platform_locked else 0,
+                resolved_platform_id_lock,
+                resolved_extraction_hash,
+                resolved_status,
+                timestamp,
+                memory_id,
+                user_id,
+            ),
+        )
+        if commit:
+            await self._connection.commit()
+        refreshed = await self.get_memory_object(memory_id, user_id)
+        if refreshed is None:
+            raise ValueError(f"Unknown memory_id: {memory_id}")
+        return refreshed
+
     async def count_for_user_scopes(
         self,
         user_id: str,
@@ -1560,13 +2471,36 @@ class MemoryObjectRepository(BaseRepository):
         workspace_id: str | None,
         conversation_id: str | None,
         assistant_mode_id: str | None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
+        sensitivity_gates_enabled: bool = False,
     ) -> int:
-        clauses, parameters = self._context_scope_clauses(
-            scopes,
-            workspace_id=workspace_id,
-            conversation_id=conversation_id,
-            assistant_mode_id=assistant_mode_id,
-        )
+        if platform_id is not None and conversation_id is not None:
+            clauses, parameters = self.namespace_visibility_clauses(
+                scopes,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                conversation_id=conversation_id,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                incognito=incognito,
+                sensitivity_gates_enabled=sensitivity_gates_enabled,
+                table_alias="memory_objects",
+            )
+            clause_joiner = " AND "
+        else:
+            clauses, parameters = self._context_scope_clauses(
+                scopes,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                assistant_mode_id=assistant_mode_id,
+            )
+            clause_joiner = " OR "
         if not clauses:
             return 0
 
@@ -1579,15 +2513,19 @@ class MemoryObjectRepository(BaseRepository):
                   {clauses}
               )
               AND status IN ({status_placeholders})
+              AND archived_by_conversation_id IS NULL
+              AND {visibility_clause}
             """.format(
-                clauses=" OR ".join(clauses),
+                clauses=clause_joiner.join(clauses),
                 status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                visibility_clause=conversation_visibility_clause("memory_objects"),
             ),
             tuple(
                 [
                     user_id,
                     *parameters,
                     *(status.value for status in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                    conversation_id,
                 ]
             ),
         )
@@ -1604,6 +2542,13 @@ class MemoryObjectRepository(BaseRepository):
         assistant_mode_id: str | None,
         privacy_ceiling: int,
         allow_intimacy_context: bool = False,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
+        sensitivity_gates_enabled: bool = False,
     ) -> int:
         """Return the total canonical_text length for eligible active memories.
 
@@ -1611,12 +2556,28 @@ class MemoryObjectRepository(BaseRepository):
         active status, and privacy ceiling. Used to detect small corpora
         where the full memory set fits inside the context budget.
         """
-        clauses, parameters = self._context_scope_clauses(
-            scopes,
-            workspace_id=workspace_id,
-            conversation_id=conversation_id,
-            assistant_mode_id=assistant_mode_id,
-        )
+        if platform_id is not None and conversation_id is not None:
+            clauses, parameters = self.namespace_visibility_clauses(
+                scopes,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                conversation_id=conversation_id,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                incognito=incognito,
+                sensitivity_gates_enabled=sensitivity_gates_enabled,
+                table_alias="memory_objects",
+            )
+            clause_joiner = " AND "
+        else:
+            clauses, parameters = self._context_scope_clauses(
+                scopes,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                assistant_mode_id=assistant_mode_id,
+            )
+            clause_joiner = " OR "
         if not clauses:
             return 0
 
@@ -1629,11 +2590,14 @@ class MemoryObjectRepository(BaseRepository):
                   {clauses}
               )
               AND status IN ({status_placeholders})
+              AND archived_by_conversation_id IS NULL
+              AND {visibility_clause}
               AND privacy_level <= ?
               AND {intimacy_filter}
             """.format(
-                clauses=" OR ".join(clauses),
+                clauses=clause_joiner.join(clauses),
                 status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                visibility_clause=conversation_visibility_clause("memory_objects"),
                 intimacy_filter=memory_object_intimacy_sql_clause(
                     "memory_objects",
                     allow_intimacy_context=allow_intimacy_context,
@@ -1644,6 +2608,7 @@ class MemoryObjectRepository(BaseRepository):
                     user_id,
                     *parameters,
                     *(status.value for status in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                    conversation_id,
                     privacy_ceiling,
                 ]
             ),
@@ -1661,14 +2626,37 @@ class MemoryObjectRepository(BaseRepository):
         assistant_mode_id: str | None,
         privacy_ceiling: int,
         allow_intimacy_context: bool = False,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
+        sensitivity_gates_enabled: bool = False,
     ) -> list[dict[str, Any]]:
         """Return eligible active memory objects for small-corpus composition."""
-        clauses, parameters = self._context_scope_clauses(
-            scopes,
-            workspace_id=workspace_id,
-            conversation_id=conversation_id,
-            assistant_mode_id=assistant_mode_id,
-        )
+        if platform_id is not None and conversation_id is not None:
+            clauses, parameters = self.namespace_visibility_clauses(
+                scopes,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                conversation_id=conversation_id,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                incognito=incognito,
+                sensitivity_gates_enabled=sensitivity_gates_enabled,
+                table_alias="memory_objects",
+            )
+            clause_joiner = " AND "
+        else:
+            clauses, parameters = self._context_scope_clauses(
+                scopes,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                assistant_mode_id=assistant_mode_id,
+            )
+            clause_joiner = " OR "
         if not clauses:
             return []
 
@@ -1681,12 +2669,15 @@ class MemoryObjectRepository(BaseRepository):
                   {clauses}
               )
               AND status IN ({status_placeholders})
+              AND archived_by_conversation_id IS NULL
+              AND {visibility_clause}
               AND privacy_level <= ?
               AND {intimacy_filter}
             ORDER BY updated_at DESC, id ASC
             """.format(
-                clauses=" OR ".join(clauses),
+                clauses=clause_joiner.join(clauses),
                 status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                visibility_clause=conversation_visibility_clause("memory_objects"),
                 intimacy_filter=memory_object_intimacy_sql_clause(
                     "memory_objects",
                     allow_intimacy_context=allow_intimacy_context,
@@ -1697,9 +2688,183 @@ class MemoryObjectRepository(BaseRepository):
                     user_id,
                     *parameters,
                     *(status.value for status in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                    conversation_id,
                     privacy_ceiling,
                 ]
             ),
+        )
+
+    @staticmethod
+    def namespace_scope_clauses(
+        scopes: list[MemoryScope],
+        *,
+        user_persona_id: str | None,
+        character_id: str | None,
+        conversation_id: str,
+        remember_across_chats: bool,
+        incognito: bool,
+        table_alias: str = "memory_objects",
+    ) -> tuple[list[str], list[Any]]:
+        """Build namespace-aware scope filters for the canonical scopes.
+
+        Returns OR-able clauses that retrieval can combine with the user
+        filter. Unlike the legacy ``_context_scope_clauses``, this helper
+        works against ``scope_canonical`` (populated by Phase 1 backfill /
+        Phase 3 writes) and enforces persona / character / conversation
+        ownership directly.
+
+        Cross-chat eligibility (character + user scopes) requires both
+        ``incognito=False`` and ``remember_across_chats=True``; otherwise
+        only the chat scope clause is emitted regardless of what the
+        caller asked for.
+        """
+
+        prefix = f"{table_alias}." if table_alias else ""
+        cross_chat = (not incognito) and remember_across_chats
+
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        for scope in scopes:
+            if scope is MemoryScope.CHAT:
+                clauses.append(
+                    f"({prefix}scope_canonical = 'chat' "
+                    f"AND {prefix}user_persona_id IS ? "
+                    f"AND {prefix}conversation_id = ?)"
+                )
+                parameters.extend([user_persona_id, conversation_id])
+            elif scope is MemoryScope.CHARACTER and cross_chat and character_id is not None:
+                clauses.append(
+                    f"({prefix}scope_canonical = 'character' "
+                    f"AND {prefix}user_persona_id IS ? "
+                    f"AND {prefix}character_id = ?)"
+                )
+                parameters.extend([user_persona_id, character_id])
+            elif scope is MemoryScope.USER and cross_chat:
+                clauses.append(
+                    f"({prefix}scope_canonical = 'user' "
+                    f"AND {prefix}user_persona_id IS ?)"
+                )
+                parameters.append(user_persona_id)
+        return clauses, parameters
+
+    @staticmethod
+    def canonical_retrieval_scopes(scopes: list[MemoryScope]) -> list[MemoryScope]:
+        """Translate policy/storage scopes to the post-redesign reader scopes."""
+
+        canonical: list[MemoryScope] = []
+        for scope in scopes:
+            if scope in {
+                MemoryScope.CHAT,
+                MemoryScope.CONVERSATION,
+                MemoryScope.EPHEMERAL_SESSION,
+            }:
+                target = MemoryScope.CHAT
+            elif scope in {MemoryScope.CHARACTER, MemoryScope.WORKSPACE}:
+                target = MemoryScope.CHARACTER
+            elif scope in {
+                MemoryScope.USER,
+                MemoryScope.GLOBAL_USER,
+                MemoryScope.ASSISTANT_MODE,
+            }:
+                target = MemoryScope.USER
+            else:
+                continue
+            if target not in canonical:
+                canonical.append(target)
+        return canonical
+
+    @staticmethod
+    def namespace_visibility_clauses(
+        scopes: list[MemoryScope],
+        *,
+        user_persona_id: str | None,
+        platform_id: str,
+        character_id: str | None,
+        conversation_id: str,
+        remember_across_chats: bool,
+        remember_across_devices: bool,
+        incognito: bool,
+        sensitivity_gates_enabled: bool = False,
+        table_alias: str = "memory_objects",
+    ) -> tuple[list[str], list[Any]]:
+        """Build the Phase 7 namespace/platform/sensitivity reader filters."""
+
+        scope_clauses, scope_parameters = MemoryObjectRepository.namespace_scope_clauses(
+            MemoryObjectRepository.canonical_retrieval_scopes(scopes),
+            user_persona_id=user_persona_id,
+            character_id=character_id,
+            conversation_id=conversation_id,
+            remember_across_chats=remember_across_chats,
+            incognito=incognito,
+            table_alias=table_alias,
+        )
+        if not scope_clauses:
+            return [], []
+        platform_clause, platform_parameters = MemoryObjectRepository.platform_lock_clause(
+            platform_id=platform_id,
+            remember_across_devices=remember_across_devices,
+            table_alias=table_alias,
+        )
+        return (
+            [
+                "(" + " OR ".join(scope_clauses) + ")",
+                MemoryObjectRepository.sensitivity_filter_clause(
+                    gates_enabled=sensitivity_gates_enabled,
+                    table_alias=table_alias,
+                ),
+                platform_clause,
+            ],
+            [*scope_parameters, *platform_parameters],
+        )
+
+    @staticmethod
+    def sensitivity_filter_clause(
+        *,
+        gates_enabled: bool,
+        table_alias: str = "memory_objects",
+    ) -> str:
+        """SQL fragment that gates retrieval by sensitivity.
+
+        With ``gates_enabled=False`` (the v1 default chosen for Atagia) the
+        clause hides ``unknown`` / ``private`` / ``secret`` rows
+        fail-closed. They remain reachable through admin/review paths and
+        through direct id lookup, but never through ordinary retrieval.
+
+        With ``gates_enabled=True`` only ``unknown`` is hidden by default;
+        ``private`` and ``secret`` rows become candidates that the
+        retrieval pipeline must run through the LLM theme gate and the
+        explicit-reference gate respectively.
+        """
+
+        prefix = f"{table_alias}." if table_alias else ""
+        if gates_enabled:
+            return f"({prefix}sensitivity IN ('public', 'private', 'secret'))"
+        return f"({prefix}sensitivity = 'public')"
+
+    @staticmethod
+    def platform_lock_clause(
+        *,
+        platform_id: str,
+        remember_across_devices: bool,
+        table_alias: str = "memory_objects",
+    ) -> tuple[str, list[Any]]:
+        """SQL fragment that enforces ``platform_locked`` and cross-device.
+
+        Locked rows are visible only on their locked platform. When the
+        user disabled cross-device memory, only rows that originated on or
+        are locked to the active platform are eligible.
+        """
+
+        prefix = f"{table_alias}." if table_alias else ""
+        if remember_across_devices:
+            return (
+                f"({prefix}platform_locked = 0 OR {prefix}platform_id_lock = ?)",
+                [platform_id],
+            )
+        return (
+            f"({prefix}platform_id_lock = ? "
+            f"OR ({prefix}platform_locked = 0 AND {prefix}platform_id = ?))",
+            [platform_id, platform_id],
         )
 
     @staticmethod
@@ -1710,41 +2875,29 @@ class MemoryObjectRepository(BaseRepository):
         conversation_id: str | None,
         assistant_mode_id: str | None,
     ) -> tuple[list[str], list[Any]]:
+        del assistant_mode_id
+        scope_expr = (
+            "CASE "
+            "WHEN scope_canonical IS NOT NULL THEN scope_canonical "
+            "WHEN scope IN ('conversation', 'ephemeral_session') THEN 'chat' "
+            "WHEN scope = 'workspace' THEN 'character' "
+            "WHEN scope IN ('global_user', 'assistant_mode') THEN 'user' "
+            "ELSE scope END"
+        )
         clauses: list[str] = []
         parameters: list[Any] = []
-        for scope in scopes:
-            if scope is MemoryScope.GLOBAL_USER:
-                clauses.append("(scope = 'global_user')")
-            elif scope is MemoryScope.ASSISTANT_MODE and assistant_mode_id is not None:
-                clauses.append("(scope = 'assistant_mode' AND assistant_mode_id = ?)")
-                parameters.append(assistant_mode_id)
-            elif (
-                scope is MemoryScope.WORKSPACE
-                and workspace_id is not None
-                and assistant_mode_id is not None
-            ):
+        for scope in MemoryObjectRepository.canonical_retrieval_scopes(scopes):
+            if scope is MemoryScope.USER:
+                clauses.append(f"({scope_expr} = 'user')")
+            elif scope is MemoryScope.CHARACTER and workspace_id is not None:
                 clauses.append(
-                    "(scope = 'workspace' AND assistant_mode_id = ? AND workspace_id = ?)"
+                    f"({scope_expr} = 'character' "
+                    "AND (character_id = ? OR (character_id IS NULL AND workspace_id = ?)))"
                 )
-                parameters.extend([assistant_mode_id, workspace_id])
-            elif (
-                scope is MemoryScope.CONVERSATION
-                and conversation_id is not None
-                and assistant_mode_id is not None
-            ):
-                clauses.append(
-                    "(scope = 'conversation' AND assistant_mode_id = ? AND conversation_id = ?)"
-                )
-                parameters.extend([assistant_mode_id, conversation_id])
-            elif (
-                scope is MemoryScope.EPHEMERAL_SESSION
-                and conversation_id is not None
-                and assistant_mode_id is not None
-            ):
-                clauses.append(
-                    "(scope = 'ephemeral_session' AND assistant_mode_id = ? AND conversation_id = ?)"
-                )
-                parameters.extend([assistant_mode_id, conversation_id])
+                parameters.extend([workspace_id, workspace_id])
+            elif scope is MemoryScope.CHAT and conversation_id is not None:
+                clauses.append(f"({scope_expr} = 'chat' AND conversation_id = ?)")
+                parameters.append(conversation_id)
         return clauses, parameters
 
     async def get_state_snapshot(
@@ -1755,12 +2908,39 @@ class MemoryObjectRepository(BaseRepository):
         workspace_id: str | None,
         conversation_id: str | None,
         allow_intimacy_context: bool = False,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
+        sensitivity_gates_enabled: bool = False,
     ) -> dict[str, Any]:
-        clauses, parameters = self._state_context_clauses(
-            assistant_mode_id=assistant_mode_id,
-            workspace_id=workspace_id,
-            conversation_id=conversation_id,
-        )
+        if platform_id is not None and conversation_id is not None:
+            clauses, parameters = self.namespace_visibility_clauses(
+                [
+                    MemoryScope.CHAT,
+                    MemoryScope.CHARACTER,
+                    MemoryScope.USER,
+                ],
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                conversation_id=conversation_id,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                incognito=incognito,
+                sensitivity_gates_enabled=sensitivity_gates_enabled,
+                table_alias="memory_objects",
+            )
+            clause_joiner = " AND "
+        else:
+            clauses, parameters = self._state_context_clauses(
+                assistant_mode_id=assistant_mode_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+            )
+            clause_joiner = " OR "
         if not clauses:
             return {}
 
@@ -1772,10 +2952,13 @@ class MemoryObjectRepository(BaseRepository):
               AND object_type = ?
               AND status = ?
               AND ({clauses})
+              AND archived_by_conversation_id IS NULL
+              AND {visibility_clause}
               AND {intimacy_filter}
             ORDER BY updated_at DESC, id ASC
             """.format(
-                clauses=" OR ".join(clauses),
+                clauses=clause_joiner.join(clauses),
+                visibility_clause=conversation_visibility_clause("memory_objects"),
                 intimacy_filter=memory_object_intimacy_sql_clause(
                     "memory_objects",
                     allow_intimacy_context=allow_intimacy_context,
@@ -1786,6 +2969,7 @@ class MemoryObjectRepository(BaseRepository):
                 MemoryObjectType.STATE_SNAPSHOT.value,
                 MemoryStatus.ACTIVE.value,
                 *parameters,
+                conversation_id,
             ),
         )
 
@@ -1794,7 +2978,9 @@ class MemoryObjectRepository(BaseRepository):
         for row in rows:
             if self._is_expired_ephemeral_state_snapshot(row, now):
                 continue
-            scope_rank = self._state_scope_rank(row["scope"])
+            scope_rank = self._state_scope_rank(
+                str(row.get("scope_canonical") or row.get("scope") or "")
+            )
             updated_at = str(row["updated_at"])
             payload = row.get("payload_json") or {}
             if not isinstance(payload, dict):
@@ -1839,6 +3025,9 @@ class MemoryObjectRepository(BaseRepository):
         if conversation_id is not None:
             clauses.append("mo.conversation_id = ?")
             parameters.append(conversation_id)
+        clauses.append("mo.archived_by_conversation_id IS NULL")
+        clauses.append(conversation_visibility_clause("mo"))
+        parameters.append(conversation_id)
         cursor = await self._connection.execute(
             """
             SELECT 1
@@ -1865,6 +3054,9 @@ class MemoryObjectRepository(BaseRepository):
         if status_clause:
             clauses.append(status_clause)
             parameters.extend(status_parameters)
+        clauses.append("archived_by_conversation_id IS NULL")
+        clauses.append(conversation_visibility_clause("memory_objects"))
+        parameters.append(None)
         return await self._fetch_all(
             """
             SELECT *
@@ -1903,6 +3095,9 @@ class MemoryObjectRepository(BaseRepository):
         if conversation_id is not None:
             clauses.append("mo.conversation_id = ?")
             parameters.append(conversation_id)
+        clauses.append("mo.archived_by_conversation_id IS NULL")
+        clauses.append(conversation_visibility_clause("mo"))
+        parameters.append(conversation_id)
         return await self._fetch_all(
             """
             SELECT DISTINCT mo.*
@@ -1922,6 +3117,7 @@ class MemoryObjectRepository(BaseRepository):
         limit: int,
         *,
         statuses: tuple[MemoryStatus, ...] | None = RETRIEVAL_ELIGIBLE_MEMORY_STATUSES,
+        conversation_id: str | None = None,
     ) -> list[dict[str, Any]]:
         clauses = ["mo.user_id = ?", "memory_objects_fts MATCH ?"]
         parameters: list[Any] = [user_id, query]
@@ -1929,6 +3125,9 @@ class MemoryObjectRepository(BaseRepository):
         if status_clause:
             clauses.append(status_clause)
             parameters.extend(status_parameters)
+        clauses.append("mo.archived_by_conversation_id IS NULL")
+        clauses.append(conversation_visibility_clause("mo"))
+        parameters.append(conversation_id)
         parameters.append(limit)
         return await self._fetch_all(
             """
@@ -1951,30 +3150,38 @@ class MemoryObjectRepository(BaseRepository):
         workspace_id: str | None,
         conversation_id: str | None,
     ) -> tuple[list[str], list[Any]]:
-        clauses = ["(scope = 'global_user')"]
+        del assistant_mode_id
+        scope_expr = (
+            "CASE "
+            "WHEN scope_canonical IS NOT NULL THEN scope_canonical "
+            "WHEN scope IN ('conversation', 'ephemeral_session') THEN 'chat' "
+            "WHEN scope = 'workspace' THEN 'character' "
+            "WHEN scope IN ('global_user', 'assistant_mode') THEN 'user' "
+            "ELSE scope END"
+        )
+        clauses = [f"({scope_expr} = 'user')"]
         parameters: list[Any] = []
-        if assistant_mode_id is not None:
-            clauses.append("(scope = 'assistant_mode' AND assistant_mode_id = ?)")
-            parameters.append(assistant_mode_id)
-            if workspace_id is not None:
-                clauses.append("(scope = 'workspace' AND assistant_mode_id = ? AND workspace_id = ?)")
-                parameters.extend([assistant_mode_id, workspace_id])
-            if conversation_id is not None:
-                clauses.append("(scope = 'conversation' AND assistant_mode_id = ? AND conversation_id = ?)")
-                clauses.append(
-                    "(scope = 'ephemeral_session' AND assistant_mode_id = ? AND conversation_id = ?)"
-                )
-                parameters.extend([assistant_mode_id, conversation_id, assistant_mode_id, conversation_id])
+        if workspace_id is not None:
+            clauses.append(
+                f"({scope_expr} = 'character' "
+                "AND (character_id = ? OR (character_id IS NULL AND workspace_id = ?)))"
+            )
+            parameters.extend([workspace_id, workspace_id])
+        if conversation_id is not None:
+            clauses.append(f"({scope_expr} = 'chat' AND conversation_id = ?)")
+            parameters.append(conversation_id)
         return clauses, parameters
 
     @staticmethod
     def _state_scope_rank(scope_value: str) -> int:
         order = {
             MemoryScope.GLOBAL_USER.value: 0,
-            MemoryScope.ASSISTANT_MODE.value: 1,
-            MemoryScope.WORKSPACE.value: 2,
-            MemoryScope.CONVERSATION.value: 3,
-            MemoryScope.EPHEMERAL_SESSION.value: 4,
+            MemoryScope.USER.value: 0,
+            MemoryScope.WORKSPACE.value: 1,
+            MemoryScope.CHARACTER.value: 1,
+            MemoryScope.CONVERSATION.value: 2,
+            MemoryScope.EPHEMERAL_SESSION.value: 3,
+            MemoryScope.CHAT.value: 3,
         }
         return order.get(scope_value, -1)
 

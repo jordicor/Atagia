@@ -21,7 +21,7 @@ from atagia.memory.context_staleness import (
     ContextStalenessScore,
     ContextStalenessScorer,
 )
-from atagia.memory.policy_manifest import ResolvedPolicy, compute_effective_policy_hash
+from atagia.memory.policy_manifest import ResolvedRetrievalPolicy, compute_effective_policy_hash
 from atagia.models.schemas_api import MemorySummary
 from atagia.models.schemas_cache import ContextCacheEntry
 from atagia.models.schemas_memory import ComposedContext, ResolvedOperationalProfile
@@ -32,9 +32,10 @@ if TYPE_CHECKING:
     from atagia.app import AppRuntime
 from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
+    apply_conversation_policy_overlay,
     build_memory_summaries,
     default_operational_profile_snapshot,
-    resolve_assistant_mode_id,
+    resolve_retrieval_profile_id,
     resolve_operational_profile,
     resolve_policy,
 )
@@ -68,7 +69,7 @@ class AdaptiveContextResolution:
     """Normalized result returned by adaptive context resolution."""
 
     conversation: dict[str, Any]
-    resolved_policy: ResolvedPolicy
+    resolved_policy: ResolvedRetrievalPolicy
     resolved_operational_profile: ResolvedOperationalProfile
     composed_context: ComposedContext
     current_contract: dict[str, dict[str, Any]]
@@ -144,7 +145,7 @@ class ContextCacheService:
         if active_conversation is None:
             raise ConversationNotFoundError("Conversation not found for user")
 
-        resolved_mode_id = resolve_assistant_mode_id(
+        resolved_mode_id = resolve_retrieval_profile_id(
             str(active_conversation["assistant_mode_id"]),
             assistant_mode_id,
         )
@@ -159,6 +160,10 @@ class ContextCacheService:
             resolved_mode_id,
             self.runtime.policy_resolver,
             resolved_operational_profile,
+        )
+        resolved_policy = apply_conversation_policy_overlay(
+            resolved_policy,
+            active_conversation,
         )
         effective_policy_hash = compute_effective_policy_hash(resolved_policy)
         current_messages = stored_messages
@@ -384,19 +389,47 @@ class ContextCacheService:
             user_id,
             conversation_id,
         )
+        await self.runtime.storage_backend.delete_recent_window_for_conversation(
+            user_id,
+            conversation_id,
+        )
         return cache_key
 
     async def invalidate_conversation_cache_for_conversation(
         self,
         conversation: dict[str, Any],
     ) -> int:
-        return await self.runtime.storage_backend.delete_context_views_for_conversation(
-            str(conversation["user_id"]),
-            str(conversation["id"]),
+        user_id = str(conversation["user_id"])
+        conversation_id = str(conversation["id"])
+        deleted = await self.runtime.storage_backend.delete_context_views_for_conversation(
+            user_id,
+            conversation_id,
         )
+        deleted += await self.runtime.storage_backend.delete_recent_window_for_conversation(
+            user_id,
+            conversation_id,
+        )
+        return deleted
+
+    async def invalidate_conversation_cache_by_id(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> int:
+        deleted = await self.runtime.storage_backend.delete_context_views_for_conversation(
+            user_id,
+            conversation_id,
+        )
+        deleted += await self.runtime.storage_backend.delete_recent_window_for_conversation(
+            user_id,
+            conversation_id,
+        )
+        return deleted
 
     async def invalidate_user_cache(self, user_id: str) -> int:
-        return await self.runtime.storage_backend.delete_context_views_for_user(user_id)
+        deleted = await self.runtime.storage_backend.delete_context_views_for_user(user_id)
+        deleted += await self.runtime.storage_backend.delete_recent_windows_for_user(user_id)
+        return deleted
 
     @staticmethod
     def build_user_guard_key(user_id: str) -> str:
@@ -434,7 +467,7 @@ class ContextCacheService:
             return False
         return True
 
-    def _cache_ttl_seconds(self, resolved_policy: ResolvedPolicy) -> int:
+    def _cache_ttl_seconds(self, resolved_policy: ResolvedRetrievalPolicy) -> int:
         base_ttl = resolved_policy.context_cache_policy.base_ttl_seconds
         return max(
             self.runtime.settings.context_cache_min_ttl_seconds,

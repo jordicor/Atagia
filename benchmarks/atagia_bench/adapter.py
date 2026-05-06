@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 _DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -25,7 +25,9 @@ class AtagiaBenchPersona(BaseModel):
     age: int
     occupation: str
     profile: str
-    assistant_modes: list[str]
+    assistant_modes: list[str] = Field(
+        validation_alias=AliasChoices("modes", "assistant_modes")
+    )
     conversation_count: int
     test_scenarios: list[str]
 
@@ -47,7 +49,9 @@ class AtagiaBenchConversation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     conversation_id: str
-    assistant_mode_id: str
+    assistant_mode_id: str = Field(
+        validation_alias=AliasChoices("mode", "assistant_mode_id")
+    )
     timestamp_base: str
     turns: list[AtagiaBenchTurn] = Field(default_factory=list)
 

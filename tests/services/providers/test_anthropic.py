@@ -240,6 +240,51 @@ async def test_anthropic_stream_maps_text_thinking_and_tool_calls() -> None:
 
 
 @pytest.mark.asyncio
+async def test_anthropic_stream_buffers_sdk_tool_use_events() -> None:
+    final_message = SimpleNamespace(
+        stop_reason="tool_use",
+        usage=SimpleNamespace(model_dump=lambda exclude_none=True: {"input_tokens": 3, "output_tokens": 5}),
+    )
+    stream_manager = FakeStreamManager(
+        events=[
+            SimpleNamespace(
+                type="content_block_start",
+                index=0,
+                content_block=SimpleNamespace(
+                    type="tool_use",
+                    id="tool_1",
+                    name="lookup",
+                    input={},
+                ),
+            ),
+            SimpleNamespace(
+                type="content_block_delta",
+                index=0,
+                delta=SimpleNamespace(
+                    type="input_json_delta",
+                    partial_json='{"q":"x"}',
+                ),
+            ),
+            SimpleNamespace(type="content_block_stop", index=0),
+        ],
+        final_message=final_message,
+    )
+    messages = FakeAnthropicMessages(stream_manager=stream_manager)
+    provider = AnthropicProvider(api_key="test", client=FakeAnthropicClient(messages))
+
+    events = [event async for event in provider.stream(_request())]
+
+    assert [event.type for event in events] == ["tool_call", "done"]
+    assert events[0].payload == {
+        "id": "tool_1",
+        "type": "tool_use",
+        "name": "lookup",
+        "input": {"q": "x"},
+    }
+    assert events[1].payload["usage"] == {"input_tokens": 3, "output_tokens": 5}
+
+
+@pytest.mark.asyncio
 async def test_anthropic_stream_emits_done_then_raises_on_max_tokens() -> None:
     final_message = SimpleNamespace(
         stop_reason="max_tokens",

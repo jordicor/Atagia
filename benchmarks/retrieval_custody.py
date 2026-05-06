@@ -54,6 +54,15 @@ def build_retrieval_custody(
                 for value in raw_candidate.get("matched_sub_queries") or []
             ],
             "fused_score": raw_candidate.get("rrf_score"),
+            "scope": raw_candidate.get("scope"),
+            "scope_canonical": raw_candidate.get("scope_canonical") or raw_candidate.get("scope"),
+            "user_persona_id": raw_candidate.get("user_persona_id"),
+            "platform_id": raw_candidate.get("platform_id"),
+            "character_id": raw_candidate.get("character_id"),
+            "conversation_id": raw_candidate.get("conversation_id"),
+            "sensitivity": raw_candidate.get("sensitivity"),
+            "platform_locked": _optional_bool(raw_candidate.get("platform_locked")),
+            "privacy_level": raw_candidate.get("privacy_level"),
             "scored": scored is not None,
             "filter_reason": None if scored is not None else "not_scored_or_filtered",
             "scorer": _scorer_record(scored),
@@ -126,3 +135,14 @@ def _scorer_record(scored: Any | None) -> dict[str, Any] | None:
         "penalty": scored.penalty,
         "final_score": scored.final_score,
     }
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return bool(value)

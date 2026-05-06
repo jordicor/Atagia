@@ -7,7 +7,9 @@ from atagia.integrations.prompt_injection import (
     build_injection_decision,
     context_messages_for_provider,
     extract_context_message_id,
+    extract_context_system_prompt,
 )
+from atagia.models.schemas_api import ContextResult
 
 
 @dataclass(slots=True)
@@ -42,3 +44,16 @@ def test_extract_context_message_id_accepts_object_context() -> None:
     context = ContextObject(system_prompt="Memory", request_message_id="msg_2")
 
     assert extract_context_message_id(context) == "msg_2"
+
+
+def test_context_result_exposes_prompt_and_request_message_id() -> None:
+    context = ContextResult(
+        system_prompt="Memory",
+        request_message_id="aurvek:msg:1",
+    )
+
+    decision = build_injection_decision("Base prompt", context)
+
+    assert extract_context_system_prompt(context) == "Memory"
+    assert decision.active is True
+    assert decision.atagia_user_message_id == "aurvek:msg:1"

@@ -17,7 +17,7 @@ from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
 )
-from atagia.memory.belief_reviser import BeliefReviser, RevisionContext, RevisionDecision
+from atagia.memory.belief_reviser import BeliefReviser, RevisionAction, RevisionContext, RevisionDecision
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
@@ -413,12 +413,55 @@ async def test_split_by_mode_archives_original_and_creates_mode_scoped_belief() 
         assert archived is not None
         assert child is not None
         assert archived["status"] == MemoryStatus.ARCHIVED.value
-        assert child["scope"] == MemoryScope.ASSISTANT_MODE.value
+        assert child["scope"] == MemoryScope.USER.value
         assert child["assistant_mode_id"] == "coding_debug"
         assert child["workspace_id"] is None
         assert child["conversation_id"] is None
         assert json.loads(version["condition_json"]) == {"mode": "coding_debug"}
         assert links[0]["relation_type"] == "derived_from"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_isolated_split_by_mode_creates_conversation_scoped_belief() -> None:
+    connection, memories, beliefs, reviser = await _build_runtime("SPLIT_BY_MODE")
+    try:
+        belief = await _seed_belief(
+            memories,
+            beliefs,
+            scope=MemoryScope.GLOBAL_USER,
+            assistant_mode_id=None,
+            workspace_id=None,
+            conversation_id=None,
+        )
+
+        result = await reviser.revise(
+            belief_id=str(belief["id"]),
+            new_evidence=[],
+            context=RevisionContext(
+                user_id="usr_1",
+                claim_key="response_style.debugging",
+                claim_value=json.dumps("terse"),
+                source_message_id="msg_4",
+                assistant_mode_id="coding_debug",
+                workspace_id="wrk_1",
+                conversation_id="cnv_1",
+                scope=MemoryScope.CONVERSATION,
+                isolated_mode=True,
+            ),
+        )
+
+        child = await memories.get_memory_object(result.new_belief_ids[0], "usr_1")
+        version = await _current_version(connection, result.new_belief_ids[0])
+
+        assert result.action == RevisionAction.SPLIT_BY_SCOPE
+        assert child is not None
+        assert child["scope"] == MemoryScope.CHAT.value
+        assert child["assistant_mode_id"] == "coding_debug"
+        assert child["workspace_id"] == "wrk_1"
+        assert child["conversation_id"] == "cnv_1"
+        assert json.loads(version["condition_json"]) == {"scope": "conversation"}
     finally:
         await connection.close()
 
@@ -457,7 +500,7 @@ async def test_split_by_scope_archives_original_and_creates_narrower_belief() ->
         assert archived is not None
         assert child is not None
         assert archived["status"] == MemoryStatus.ARCHIVED.value
-        assert child["scope"] == MemoryScope.CONVERSATION.value
+        assert child["scope"] == MemoryScope.CHAT.value
         assert links[0]["relation_type"] == "derived_from"
     finally:
         await connection.close()

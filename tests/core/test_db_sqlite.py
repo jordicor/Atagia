@@ -8,7 +8,7 @@ from shutil import copy2
 import aiosqlite
 import pytest
 
-from atagia.core.db_sqlite import MigrationManager, initialize_database
+from atagia.core.db_sqlite import SQLITE_BUSY_TIMEOUT_MS, MigrationManager, initialize_database
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
@@ -48,14 +48,23 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "contract_dimensions_current",
             "conversations",
             "evaluation_metrics",
+            "graph_entities",
+            "graph_entity_aliases",
+            "graph_entity_mentions",
+            "graph_projection_runs",
+            "graph_relationship_sources",
+            "graph_relationships",
             "memory_feedback_events",
             "memory_embedding_metadata",
             "memory_links",
             "memory_consent_profile",
+            "memory_edit_history",
             "memory_objects",
             "memory_objects_fts",
             "messages",
             "messages_fts",
+            "deletion_tombstones",
+            "pending_file_deletions",
             "pending_memory_confirmations",
             "retrieval_events",
             "schema_migrations",
@@ -64,9 +73,11 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "verbatim_pins_fts",
             "users",
             "workspaces",
+            "worker_job_runs",
         }.issubset(names)
         assert await _fetch_one_value(connection, "PRAGMA foreign_keys;") == 1
         assert await _fetch_one_value(connection, "PRAGMA journal_mode;") != "wal"
+        assert await _fetch_one_value(connection, "PRAGMA busy_timeout;") == SQLITE_BUSY_TIMEOUT_MS
         assert await _fetch_one_value(
             connection,
             "SELECT COUNT(*) FROM schema_migrations;",
@@ -104,6 +115,39 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
         assert "temporal_type" in memory_columns
         assert "tension_score" in memory_columns
         assert "tension_updated_at" in memory_columns
+        assert "archived_by_conversation_id" in memory_columns
+        conversation_columns_cursor = await connection.execute("PRAGMA table_info(conversations);")
+        conversation_columns = {row["name"] for row in await conversation_columns_cursor.fetchall()}
+        assert {
+            "temporary",
+            "temporary_ttl_seconds",
+            "purge_on_close",
+            "isolated_mode",
+            "last_activity_at",
+            "closed_at",
+        }.issubset(conversation_columns)
+        worker_job_columns_cursor = await connection.execute("PRAGMA table_info(worker_job_runs);")
+        worker_job_columns = {row["name"] for row in await worker_job_columns_cursor.fetchall()}
+        assert {
+            "job_id",
+            "stream_name",
+            "job_type",
+            "user_id",
+            "conversation_id",
+            "source_message_ids_json",
+            "status",
+            "attempt_count",
+            "source_token_estimate",
+            "size_bucket",
+            "queued_at",
+            "started_at",
+            "finished_at",
+            "last_heartbeat_at",
+            "duration_ms",
+            "error_class",
+            "error_message",
+            "metadata_json",
+        }.issubset(worker_job_columns)
         consent_columns_cursor = await connection.execute("PRAGMA table_info(memory_consent_profile);")
         consent_columns = {row["name"] for row in await consent_columns_cursor.fetchall()}
         assert {"user_id", "category", "confirmed_count", "declined_count"}.issubset(consent_columns)
@@ -123,6 +167,16 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
         memory_fts_columns = {row["name"] for row in await memory_fts_columns_cursor.fetchall()}
         assert "canonical_text" in memory_fts_columns
         assert "index_text" in memory_fts_columns
+        graph_mentions_columns_cursor = await connection.execute("PRAGMA table_info(graph_entity_mentions);")
+        graph_mentions_columns = {
+            row["name"] for row in await graph_mentions_columns_cursor.fetchall()
+        }
+        assert "source_occurrence_key" in graph_mentions_columns
+        graph_source_columns_cursor = await connection.execute("PRAGMA table_info(graph_relationship_sources);")
+        graph_source_columns = {
+            row["name"] for row in await graph_source_columns_cursor.fetchall()
+        }
+        assert "source_occurrence_key" in graph_source_columns
         pin_columns_cursor = await connection.execute("PRAGMA table_info(verbatim_pins);")
         pin_columns = {row["name"] for row in await pin_columns_cursor.fetchall()}
         assert {
@@ -224,6 +278,37 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "likely_soon_score",
             "schedule_pattern_kind",
         }.issubset(activity_columns)
+        graph_entity_columns_cursor = await connection.execute("PRAGMA table_info(graph_entities);")
+        graph_entity_columns = {row["name"] for row in await graph_entity_columns_cursor.fetchall()}
+        assert {
+            "_rowid",
+            "id",
+            "user_id",
+            "entity_type",
+            "display_name",
+            "confidence",
+            "status",
+            "privacy_level",
+            "intimacy_boundary",
+            "created_at",
+            "updated_at",
+        }.issubset(graph_entity_columns)
+        graph_relationship_columns_cursor = await connection.execute("PRAGMA table_info(graph_relationships);")
+        graph_relationship_columns = {
+            row["name"] for row in await graph_relationship_columns_cursor.fetchall()
+        }
+        assert {
+            "_rowid",
+            "id",
+            "user_id",
+            "source_entity_id",
+            "target_entity_id",
+            "target_value_json",
+            "predicate",
+            "scope",
+            "status",
+            "dedupe_key",
+        }.issubset(graph_relationship_columns)
     finally:
         await connection.close()
 
@@ -275,7 +360,7 @@ async def test_rowid_fts_and_review_required_status_work() -> None:
                 maya_score, privacy_level, valid_from, valid_to, status, created_at, updated_at
             )
             VALUES (
-                'mem_1', 'usr_1', NULL, 'cnv_1', 'coding_debug', 'evidence', 'conversation',
+                'mem_1', 'usr_1', NULL, 'cnv_1', 'coding_debug', 'evidence', 'chat',
                 'User prefers fast answers', 'websocket latency incident', '{}', 'extracted', 0.6, 0.5, 0.0,
                 0.0, 1, NULL, NULL, 'review_required', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
             )
@@ -346,13 +431,13 @@ async def test_memory_objects_accept_pending_and_declined_statuses() -> None:
             )
             VALUES
                 (
-                    'mem_pending', 'usr_1', 'personal_assistant', 'evidence', 'conversation',
+                    'mem_pending', 'usr_1', 'personal_assistant', 'evidence', 'chat',
                     'Banking card PIN: 4512', '{}', 'extracted', 0.9, 0.5, 0.0, 0.0, 3,
                     'pin_or_password', 1, NULL, NULL, 'unknown',
                     'pending_user_confirmation', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
                 ),
                 (
-                    'mem_declined', 'usr_1', 'personal_assistant', 'evidence', 'conversation',
+                    'mem_declined', 'usr_1', 'personal_assistant', 'evidence', 'chat',
                     'Company card PIN: 7000', '{}', 'extracted', 0.9, 0.5, 0.0, 0.0, 3,
                     'pin_or_password', 1, NULL, NULL, 'unknown',
                     'declined', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
@@ -396,7 +481,7 @@ async def test_verbatim_pins_fts_uses_safe_index_text_and_honors_rowid() -> None
                 expires_at, deleted_at, payload_json
             )
             VALUES (
-                'vbp_1', 'usr_1', 'conversation', 'message', 'msg_1',
+                'vbp_1', 'usr_1', 'chat', 'message', 'msg_1',
                 'Bank card PIN: 4512', 'bank card PIN',
                 3, 'active', 'banking', 'usr_1',
                 '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00',
@@ -544,7 +629,7 @@ async def test_summary_view_orphaning_and_contract_uniqueness() -> None:
                 maya_score, privacy_level, valid_from, valid_to, status, created_at, updated_at
             )
             VALUES (
-                'mem_1', 'usr_1', 'wrk_1', NULL, 'general_qa', 'interaction_contract', 'workspace',
+                'mem_1', 'usr_1', 'wrk_1', NULL, 'general_qa', 'interaction_contract', 'character',
                 'User prefers concise answers', '{}', 'extracted', 0.8, 0.5, 0.0,
                 0.0, 0, NULL, NULL, 'active', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
             )
@@ -569,7 +654,7 @@ async def test_summary_view_orphaning_and_contract_uniqueness() -> None:
                 dimension_name, value_json, confidence, source_memory_id, updated_at
             )
             VALUES (
-                'ctr_1', 'usr_1', 'wrk_1', NULL, 'general_qa', 'workspace',
+                'ctr_1', 'usr_1', 'wrk_1', NULL, 'general_qa', 'character',
                 'depth', '{"level":"low"}', 0.8, 'mem_1', '2026-03-30T00:00:00+00:00'
             )
             """
@@ -584,7 +669,7 @@ async def test_summary_view_orphaning_and_contract_uniqueness() -> None:
                     dimension_name, value_json, confidence, source_memory_id, updated_at
                 )
                 VALUES (
-                    'ctr_2', 'usr_1', 'wrk_1', NULL, 'general_qa', 'workspace',
+                    'ctr_2', 'usr_1', 'wrk_1', NULL, 'general_qa', 'character',
                     'depth', '{"level":"medium"}', 0.9, 'mem_1', '2026-03-30T00:00:00+00:00'
                 )
                 """
@@ -629,7 +714,7 @@ async def test_memory_extraction_hash_is_unique_per_user() -> None:
                 maya_score, privacy_level, valid_from, valid_to, status, created_at, updated_at
             )
             VALUES (
-                'mem_1', 'usr_1', NULL, NULL, 'coding_debug', 'evidence', 'assistant_mode',
+                'mem_1', 'usr_1', NULL, NULL, 'coding_debug', 'evidence', 'user',
                 'Same memory', 'hash_1', '{}', 'extracted', 0.9, 0.5, 0.0,
                 0.0, 0, NULL, NULL, 'active', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
             )
@@ -646,7 +731,7 @@ async def test_memory_extraction_hash_is_unique_per_user() -> None:
                     maya_score, privacy_level, valid_from, valid_to, status, created_at, updated_at
                 )
                 VALUES (
-                    'mem_2', 'usr_1', NULL, NULL, 'coding_debug', 'evidence', 'assistant_mode',
+                    'mem_2', 'usr_1', NULL, NULL, 'coding_debug', 'evidence', 'user',
                     'Duplicate hash', 'hash_1', '{}', 'extracted', 0.8, 0.5, 0.0,
                     0.0, 0, NULL, NULL, 'active', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
                 )
@@ -661,7 +746,7 @@ async def test_memory_extraction_hash_is_unique_per_user() -> None:
                 maya_score, privacy_level, valid_from, valid_to, status, created_at, updated_at
             )
             VALUES (
-                'mem_3', 'usr_2', NULL, NULL, 'coding_debug', 'evidence', 'assistant_mode',
+                'mem_3', 'usr_2', NULL, NULL, 'coding_debug', 'evidence', 'user',
                 'Other user same hash', 'hash_1', '{}', 'extracted', 0.8, 0.5, 0.0,
                 0.0, 0, NULL, NULL, 'active', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
             )
@@ -733,7 +818,33 @@ async def test_migration_0012_backfills_summary_view_user_ids_and_drops_orphans(
         )
         rows = await rows_cursor.fetchall()
 
-        assert [migration.version for migration in applied] == [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+        assert [migration.version for migration in applied] == [
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+        ]
         assert [row["id"] for row in rows] == ["sum_conv", "sum_rollup"]
         assert all(row["user_id"] == "usr_1" for row in rows)
         assert all(row["hierarchy_level"] == 0 for row in rows)
@@ -741,3 +852,664 @@ async def test_migration_0012_backfills_summary_view_user_ids_and_drops_orphans(
         assert rows[1]["source_message_start_seq"] == 0
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_0032_converts_workspace_rollups_to_character_rollups(tmp_path: Path) -> None:
+    db_path = tmp_path / "phase8.sqlite"
+    bootstrap_migrations = tmp_path / "bootstrap_migrations_0032"
+    bootstrap_migrations.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if path.name.startswith("0032"):
+            break
+        copy2(path, bootstrap_migrations / path.name)
+
+    connection = await initialize_database(str(db_path), bootstrap_migrations)
+    try:
+        await connection.executescript(
+            """
+            INSERT INTO users(id, created_at, updated_at)
+            VALUES ('usr_1', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+
+            INSERT INTO assistant_modes(id, display_name, memory_policy_json, created_at, updated_at, privacy_ceiling)
+            VALUES ('mode_1', 'Mode', '{}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 3);
+
+            INSERT INTO workspaces(id, user_id, name, created_at, updated_at)
+            VALUES ('ws_1', 'usr_1', 'WS', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+
+            INSERT INTO summary_views(
+                id, user_id, workspace_id, summary_kind, summary_text,
+                source_object_ids_json, maya_score, model, created_at
+            )
+            VALUES (
+                'sum_rollup', 'usr_1', 'ws_1', 'workspace_rollup', 'Workspace summary',
+                '[]', 1.5, 'model-a', '2026-01-01T00:00:00+00:00'
+            );
+
+            INSERT INTO memory_objects(
+                id, user_id, workspace_id, assistant_mode_id, object_type, scope,
+                scope_canonical, canonical_text, payload_json, source_kind,
+                confidence, privacy_level, status, created_at, updated_at
+            )
+            VALUES (
+                'sum_mem_sum_rollup', 'usr_1', 'ws_1', 'mode_1', 'summary_view', 'workspace',
+                'legacy_workspace', 'Workspace summary',
+                '{"summary_kind":"workspace_rollup","summary_view_id":"sum_rollup","hierarchy_level":0,"source_object_ids":[]}',
+                'summarized', 0.72, 0, 'active',
+                '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+            );
+            """
+        )
+        await connection.commit()
+    finally:
+        await connection.close()
+
+    upgraded = await initialize_database(str(db_path), MIGRATIONS_DIR)
+    try:
+        cursor = await upgraded.execute(
+            """
+            SELECT summary_kind, character_id, platform_id, sensitivity, scope_canonical
+            FROM summary_views
+            WHERE id = 'sum_rollup'
+            """
+        )
+        summary = await cursor.fetchone()
+        assert summary["summary_kind"] == "character_rollup"
+        assert summary["character_id"] == "ws_1"
+        assert summary["platform_id"] == "default"
+        assert summary["sensitivity"] == "public"
+        assert summary["scope_canonical"] == "character"
+
+        cursor = await upgraded.execute(
+            """
+            SELECT payload_json, character_id, platform_id, sensitivity, scope_canonical
+            FROM memory_objects
+            WHERE id = 'sum_mem_sum_rollup'
+            """
+        )
+        mirror = await cursor.fetchone()
+        assert mirror["character_id"] == "ws_1"
+        assert mirror["platform_id"] == "default"
+        assert mirror["sensitivity"] == "public"
+        assert mirror["scope_canonical"] == "character"
+        assert '"summary_kind":"character_rollup"' in mirror["payload_json"]
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_0033_upgrades_existing_secondary_surfaces(tmp_path: Path) -> None:
+    db_path = tmp_path / "phase10.sqlite"
+    bootstrap_migrations = tmp_path / "bootstrap_migrations_0033"
+    bootstrap_migrations.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if path.name.startswith("0033"):
+            break
+        copy2(path, bootstrap_migrations / path.name)
+
+    connection = await initialize_database(str(db_path), bootstrap_migrations)
+    try:
+        await connection.executescript(
+            """
+            INSERT INTO users(
+                id, created_at, updated_at, remember_across_chats, remember_across_devices
+            )
+            VALUES ('usr_1', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 1, 0);
+
+            INSERT INTO assistant_modes(id, display_name, memory_policy_json, created_at, updated_at, privacy_ceiling)
+            VALUES ('mode_1', 'Mode', '{}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 3);
+
+            INSERT INTO workspaces(id, user_id, name, created_at, updated_at)
+            VALUES ('ws_1', 'usr_1', 'WS', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+
+            INSERT INTO conversations(
+                id, user_id, workspace_id, assistant_mode_id, status,
+                user_persona_id, platform_id, character_id, incognito,
+                created_at, updated_at
+            )
+            VALUES (
+                'cnv_1', 'usr_1', 'ws_1', 'mode_1', 'active',
+                'persona_1', 'web', 'char_1', 0,
+                '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+            );
+
+            INSERT INTO artifacts(
+                id, user_id, workspace_id, conversation_id, artifact_type,
+                source_kind, status, privacy_level, created_at, updated_at
+            )
+            VALUES (
+                'art_1', 'usr_1', 'ws_1', 'cnv_1', 'pasted_text',
+                'pasted_text', 'ready', 2,
+                '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+            );
+
+            INSERT INTO memory_objects(
+                id, user_id, workspace_id, conversation_id, assistant_mode_id,
+                object_type, scope, canonical_text, payload_json, source_kind,
+                confidence, privacy_level, status, created_at, updated_at
+            )
+            VALUES (
+                'mem_1', 'usr_1', 'ws_1', NULL, 'mode_1',
+                'interaction_contract', 'conversation', 'Keep answers concise',
+                '{}', 'extracted', 0.8, 0, 'active',
+                '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+            );
+
+            INSERT INTO contract_dimensions_current(
+                id, user_id, workspace_id, conversation_id, assistant_mode_id,
+                scope, dimension_name, value_json, confidence,
+                source_memory_id, updated_at
+            )
+            VALUES (
+                'ctr_1', 'usr_1', 'ws_1', NULL, 'mode_1',
+                'conversation', 'tone', '{"style":"brief"}', 0.8,
+                'mem_1', '2026-01-01T00:00:00+00:00'
+            );
+            """
+        )
+        await connection.commit()
+    finally:
+        await connection.close()
+
+    upgraded = await initialize_database(str(db_path), MIGRATIONS_DIR)
+    try:
+        cursor = await upgraded.execute("PRAGMA table_xinfo(contract_dimensions_current)")
+        contract_columns = {row["name"] for row in await cursor.fetchall()}
+        assert "scope_canonical_key" in contract_columns
+
+        cursor = await upgraded.execute(
+            """
+            SELECT scope_canonical, scope_canonical_key
+            FROM contract_dimensions_current
+            WHERE id = 'ctr_1'
+            """
+        )
+        contract = await cursor.fetchone()
+        assert contract["scope_canonical"] == "chat"
+        assert contract["scope_canonical_key"] == "chat"
+
+        await upgraded.execute(
+            """
+            INSERT INTO contract_dimensions_current(
+                id, user_id, workspace_id, conversation_id, assistant_mode_id,
+                scope, dimension_name, value_json, confidence,
+                source_memory_id, user_persona_id, character_id,
+                scope_canonical, updated_at
+            )
+            VALUES (
+                'ctr_2', 'usr_1', 'ws_1', NULL, 'mode_1',
+                'character', 'tone', '{"style":"warm"}', 0.9,
+                'mem_1', 'persona_1', 'char_1',
+                'character', '2026-01-01T00:00:00+00:00'
+            )
+            """
+        )
+
+        cursor = await upgraded.execute(
+            """
+            SELECT
+                user_persona_id,
+                platform_id,
+                character_id,
+                sensitivity,
+                platform_locked,
+                platform_id_lock,
+                scope_canonical,
+                incognito_snapshot,
+                remember_across_chats_snapshot,
+                remember_across_devices_snapshot
+            FROM artifacts
+            WHERE id = 'art_1'
+            """
+        )
+        artifact = await cursor.fetchone()
+        assert dict(artifact) == {
+            "user_persona_id": "persona_1",
+            "platform_id": "web",
+            "character_id": "char_1",
+            "sensitivity": "private",
+            "platform_locked": 1,
+            "platform_id_lock": "web",
+            "scope_canonical": "chat",
+            "incognito_snapshot": 0,
+            "remember_across_chats_snapshot": 1,
+            "remember_across_devices_snapshot": 0,
+        }
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_0034_finalizes_canonical_scope_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "phase11.sqlite"
+    bootstrap_migrations = tmp_path / "bootstrap_migrations_0034"
+    bootstrap_migrations.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if path.name.startswith("0034"):
+            break
+        copy2(path, bootstrap_migrations / path.name)
+
+    connection = await initialize_database(str(db_path), bootstrap_migrations)
+    try:
+        await connection.executescript(
+            """
+            INSERT INTO users(id, created_at, updated_at, remember_across_chats, remember_across_devices)
+            VALUES ('usr_1', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 1, 1);
+
+            INSERT INTO assistant_modes(id, display_name, memory_policy_json, created_at, updated_at, privacy_ceiling)
+            VALUES ('mode_1', 'Mode', '{}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 3);
+
+            INSERT INTO workspaces(id, user_id, name, created_at, updated_at)
+            VALUES ('ws_1', 'usr_1', 'WS', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+
+            INSERT INTO conversations(
+                id, user_id, workspace_id, assistant_mode_id, status,
+                user_persona_id, platform_id, character_id, mode, incognito,
+                created_at, updated_at
+            )
+            VALUES (
+                'cnv_1', 'usr_1', 'ws_1', 'mode_1', 'active',
+                NULL, 'default', 'char_1', 'mode_1', 0,
+                '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+            );
+
+            INSERT INTO memory_objects(
+                id, user_id, workspace_id, conversation_id, assistant_mode_id,
+                object_type, scope, scope_canonical, canonical_text, index_text,
+                payload_json, source_kind, confidence, privacy_level,
+                status, created_at, updated_at
+            )
+            VALUES
+                (
+                    'mem_chat', 'usr_1', 'ws_1', 'cnv_1', 'mode_1',
+                    'evidence', 'conversation', 'chat', 'chat fact', 'chat fact',
+                    '{}', 'extracted', 0.9, 0, 'active',
+                    '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                ),
+                (
+                    'mem_user', 'usr_1', NULL, NULL, NULL,
+                    'belief', 'global_user', 'user', 'user fact', 'user fact',
+                    '{}', 'extracted', 0.8, 0, 'active',
+                    '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                ),
+                (
+                    'mem_legacy_workspace', 'usr_1', 'ws_1', NULL, 'mode_1',
+                    'belief', 'workspace', 'legacy_workspace', 'legacy workspace fact', 'legacy workspace fact',
+                    '{}', 'extracted', 0.7, 0, 'active',
+                    '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                );
+
+            INSERT INTO memory_embedding_metadata(memory_id, user_id, object_type, scope, created_at, scope_canonical)
+            VALUES
+                ('mem_chat', 'usr_1', 'evidence', 'conversation', '2026-01-01T00:00:00+00:00', 'chat'),
+                ('mem_legacy_workspace', 'usr_1', 'belief', 'workspace', '2026-01-01T00:00:00+00:00', 'legacy_workspace');
+
+            INSERT INTO memory_links(
+                id, user_id, src_memory_id, dst_memory_id, relation_type, weight, metadata_json, created_at
+            )
+            VALUES
+                ('lnk_keep', 'usr_1', 'mem_chat', 'mem_chat', 'supports', 1.0, '{}', '2026-01-01T00:00:00+00:00'),
+                ('lnk_drop', 'usr_1', 'mem_chat', 'mem_legacy_workspace', 'belongs_to_workspace', 1.0, '{}', '2026-01-01T00:00:00+00:00');
+
+            INSERT INTO verbatim_pins(
+                id, user_id, workspace_id, conversation_id, assistant_mode_id,
+                scope, target_kind, target_id, canonical_text, index_text,
+                privacy_level, created_by, created_at, updated_at,
+                sensitivity, scope_canonical
+            )
+            VALUES (
+                'pin_1', 'usr_1', 'ws_1', 'cnv_1', 'mode_1',
+                'conversation', 'message', 'msg_1', 'exact quote', 'exact quote',
+                0, 'usr_1', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00',
+                'public', 'chat'
+            );
+
+            INSERT INTO contract_dimensions_current(
+                id, user_id, workspace_id, conversation_id, assistant_mode_id,
+                scope, scope_canonical, dimension_name, value_json, confidence,
+                source_memory_id, updated_at
+            )
+            VALUES (
+                'ctr_1', 'usr_1', 'ws_1', 'cnv_1', 'mode_1',
+                'conversation', 'chat', 'tone', '{"style":"brief"}', 0.8,
+                'mem_chat', '2026-01-01T00:00:00+00:00'
+            );
+            """
+        )
+        await connection.commit()
+    finally:
+        await connection.close()
+
+    upgraded = await initialize_database(str(db_path), MIGRATIONS_DIR)
+    try:
+        async def create_sql(table: str) -> str:
+            cursor = await upgraded.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            )
+            row = await cursor.fetchone()
+            return str(row["sql"])
+
+        memory_sql = await create_sql("memory_objects")
+        pin_sql = await create_sql("verbatim_pins")
+        assert "scope IN ('chat', 'character', 'user')" in memory_sql
+        assert "global_user" not in memory_sql
+        assert "scope IN ('chat', 'character', 'user')" in pin_sql
+        assert "ephemeral_session" not in pin_sql
+
+        with pytest.raises(aiosqlite.IntegrityError):
+            await upgraded.execute(
+                """
+                INSERT INTO memory_objects(
+                    id, user_id, object_type, scope, canonical_text,
+                    source_kind, confidence, privacy_level, created_at, updated_at
+                )
+                VALUES (
+                    'mem_bad_scope', 'usr_1', 'evidence', 'conversation', 'bad',
+                    'extracted', 0.5, 0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                )
+                """
+            )
+
+        cursor = await upgraded.execute("SELECT id, scope, scope_canonical FROM memory_objects ORDER BY id")
+        memories = {row["id"]: dict(row) for row in await cursor.fetchall()}
+        assert memories == {
+            "mem_chat": {"id": "mem_chat", "scope": "chat", "scope_canonical": "chat"},
+            "mem_user": {"id": "mem_user", "scope": "user", "scope_canonical": "user"},
+        }
+
+        cursor = await upgraded.execute(
+            "SELECT affected_count, sample_ids_json FROM memory_redesign_phase11_report "
+            "WHERE table_name = 'memory_objects'"
+        )
+        report = await cursor.fetchone()
+        assert report["affected_count"] == 1
+        assert "mem_legacy_workspace" in report["sample_ids_json"]
+
+        cursor = await upgraded.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM memory_objects_fts
+            JOIN memory_objects ON memory_objects._rowid = memory_objects_fts.rowid
+            """
+        )
+        fts_memory_count = await cursor.fetchone()
+        assert fts_memory_count["count"] == len(memories)
+
+        cursor = await upgraded.execute("SELECT scope, scope_canonical FROM verbatim_pins WHERE id = 'pin_1'")
+        pin = await cursor.fetchone()
+        assert dict(pin) == {"scope": "chat", "scope_canonical": "chat"}
+
+        cursor = await upgraded.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM verbatim_pins_fts
+            JOIN verbatim_pins ON verbatim_pins._rowid = verbatim_pins_fts.rowid
+            """
+        )
+        fts_pin_count = await cursor.fetchone()
+        assert fts_pin_count["count"] == 1
+
+        cursor = await upgraded.execute("SELECT scope, scope_canonical FROM contract_dimensions_current")
+        contract = await cursor.fetchone()
+        assert dict(contract) == {"scope": "chat", "scope_canonical": "chat"}
+
+        cursor = await upgraded.execute("SELECT id, relation_type FROM memory_links ORDER BY id")
+        links = [dict(row) for row in await cursor.fetchall()]
+        assert links == [{"id": "lnk_keep", "relation_type": "supports"}]
+
+        cursor = await upgraded.execute("PRAGMA table_info(conversations)")
+        conversation_columns = {row["name"]: row for row in await cursor.fetchall()}
+        assert conversation_columns["assistant_mode_id"]["notnull"] == 0
+
+        await upgraded.execute(
+            """
+            INSERT INTO memory_consent_profile(user_id, category, confirmed_count, declined_count, updated_at)
+            VALUES ('usr_1', 'financial', 0, 0, '2026-01-01T00:00:00+00:00')
+            """
+        )
+        await upgraded.execute(
+            """
+            INSERT INTO memory_consent_profile(
+                user_id, category, confirmed_count, declined_count, updated_at, user_persona_id
+            )
+            VALUES ('usr_1', 'financial', 0, 0, '2026-01-01T00:00:00+00:00', 'persona_1')
+            """
+        )
+        await upgraded.commit()
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_0031_adds_redesign_identity_columns() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    try:
+        async def column_names(table: str) -> set[str]:
+            # `table_xinfo` is the variant that surfaces VIRTUAL generated
+            # columns alongside ordinary columns; `table_info` hides them.
+            cursor = await connection.execute(f"PRAGMA table_xinfo({table})")
+            return {row["name"] for row in await cursor.fetchall()}
+
+        users_columns = await column_names("users")
+        assert {
+            "remember_across_chats",
+            "remember_across_devices",
+            "memory_privacy_mode",
+        }.issubset(users_columns)
+
+        conversations_columns = await column_names("conversations")
+        assert {
+            "user_persona_id",
+            "platform_id",
+            "character_id",
+            "mode",
+            "incognito",
+        }.issubset(conversations_columns)
+
+        memory_columns = await column_names("memory_objects")
+        assert {
+            "user_persona_id",
+            "platform_id",
+            "character_id",
+            "sensitivity",
+            "themes_json",
+            "auto_expires",
+            "platform_locked",
+            "platform_id_lock",
+            "scope_canonical",
+        }.issubset(memory_columns)
+
+        message_columns = await column_names("messages")
+        assert {
+            "user_persona_id_snapshot",
+            "platform_id_snapshot",
+            "character_id_snapshot",
+            "mode_snapshot",
+            "incognito_snapshot",
+            "remember_across_chats_snapshot",
+            "remember_across_devices_snapshot",
+            "temporary_snapshot",
+            "purge_on_close_snapshot",
+            "valid_to_snapshot",
+            "policy_snapshot_json",
+            "sensitivity",
+            "themes_json",
+            "platform_locked",
+            "platform_id_lock",
+        }.issubset(message_columns)
+
+        consent_columns = await column_names("memory_consent_profile")
+        assert {"user_persona_id", "user_persona_key"}.issubset(consent_columns)
+
+        contract_columns = await column_names("contract_dimensions_current")
+        assert {
+            "user_persona_id",
+            "platform_id",
+            "character_id",
+            "user_persona_key",
+            "character_key",
+            "conversation_key",
+            "scope_canonical_key",
+            "policy_snapshot_json",
+        }.issubset(contract_columns)
+
+        artifact_columns = await column_names("artifacts")
+        assert {
+            "user_persona_id",
+            "platform_id",
+            "character_id",
+            "sensitivity",
+            "platform_locked",
+            "platform_id_lock",
+            "scope_canonical",
+            "policy_snapshot_json",
+        }.issubset(artifact_columns)
+
+        pending_columns = await column_names("pending_memory_confirmations")
+        assert {
+            "user_persona_id",
+            "platform_id",
+            "character_id",
+            "policy_proven",
+            "intended_scope",
+            "intended_sensitivity",
+        }.issubset(pending_columns)
+
+        worker_columns = await column_names("worker_job_runs")
+        assert {
+            "user_persona_id",
+            "platform_id",
+            "character_id",
+            "incognito_snapshot",
+            "policy_snapshot_json",
+        }.issubset(worker_columns)
+
+        embedding_columns = await column_names("memory_embedding_metadata")
+        assert {
+            "user_persona_id",
+            "platform_id",
+            "character_id",
+            "sensitivity",
+            "platform_locked",
+            "platform_id_lock",
+            "scope_canonical",
+        }.issubset(embedding_columns)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_0031_backfills_legacy_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "phase1.sqlite"
+    pre_connection = await initialize_database(str(db_path), MIGRATIONS_DIR)
+    try:
+        await pre_connection.execute("ROLLBACK")
+    except Exception:
+        pass
+    await pre_connection.close()
+
+    # Reset and apply only migrations 0001..0030 to simulate a pre-Phase-1 DB.
+    if db_path.exists():
+        db_path.unlink()
+    bootstrap_migrations = tmp_path / "bootstrap_migrations"
+    bootstrap_migrations.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if path.name.startswith("0031"):
+            break
+        copy2(path, bootstrap_migrations / path.name)
+
+    connection = await initialize_database(str(db_path), bootstrap_migrations)
+    try:
+        await connection.executescript(
+            """
+            INSERT INTO users(id, created_at, updated_at) VALUES
+                ('usr_1', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+            INSERT INTO assistant_modes(id, display_name, memory_policy_json, created_at, updated_at, privacy_ceiling)
+                VALUES ('mode_1', 'Mode', '{}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 3);
+            INSERT INTO workspaces(id, user_id, name, created_at, updated_at)
+                VALUES ('ws_1', 'usr_1', 'WS', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+            INSERT INTO conversations(id, user_id, workspace_id, assistant_mode_id, status, created_at, updated_at, isolated_mode)
+                VALUES
+                ('cnv_normal', 'usr_1', 'ws_1', 'mode_1', 'active', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 0),
+                ('cnv_iso', 'usr_1', NULL, 'mode_1', 'active', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 1);
+            INSERT INTO memory_objects(id, user_id, workspace_id, conversation_id, assistant_mode_id, object_type, scope, canonical_text, source_kind, privacy_level, created_at, updated_at)
+                VALUES
+                ('m_global', 'usr_1', NULL, NULL, NULL, 'belief', 'global_user', 'g', 'extracted', 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                ('m_workspace', 'usr_1', 'ws_1', NULL, 'mode_1', 'belief', 'workspace', 'w', 'extracted', 2, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                ('m_conv', 'usr_1', NULL, 'cnv_normal', 'mode_1', 'belief', 'conversation', 'c', 'extracted', 0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                ('m_eph', 'usr_1', NULL, 'cnv_normal', 'mode_1', 'belief', 'ephemeral_session', 'e', 'extracted', 3, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                ('m_amode', 'usr_1', NULL, NULL, 'mode_1', 'belief', 'assistant_mode', 'a', 'extracted', 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+            INSERT INTO memory_consent_profile(user_id, category, confirmed_count, declined_count, updated_at)
+                VALUES ('usr_1', 'medication', 0, 0, '2026-01-01T00:00:00+00:00');
+            """
+        )
+        await connection.commit()
+    finally:
+        await connection.close()
+
+    # Apply 0031 against the populated DB.
+    upgraded = await initialize_database(str(db_path), MIGRATIONS_DIR)
+    try:
+        cursor = await upgraded.execute(
+            "SELECT id, mode, character_id, platform_id, incognito FROM conversations ORDER BY id"
+        )
+        conversations = {row["id"]: dict(row) for row in await cursor.fetchall()}
+        assert conversations["cnv_normal"]["mode"] == "mode_1"
+        assert conversations["cnv_normal"]["character_id"] == "ws_1"
+        assert conversations["cnv_normal"]["platform_id"] == "default"
+        assert conversations["cnv_normal"]["incognito"] == 0
+        assert conversations["cnv_iso"]["incognito"] == 1
+        assert conversations["cnv_iso"]["character_id"] is None
+
+        cursor = await upgraded.execute(
+            "SELECT id, scope, scope_canonical, sensitivity, auto_expires, character_id, platform_id "
+            "FROM memory_objects ORDER BY id"
+        )
+        memories = {row["id"]: dict(row) for row in await cursor.fetchall()}
+        assert memories["m_global"]["scope_canonical"] == "user"
+        assert memories["m_global"]["sensitivity"] == "public"
+        assert memories["m_conv"]["scope_canonical"] == "chat"
+        assert memories["m_conv"]["character_id"] == "ws_1"
+        assert memories["m_eph"]["scope_canonical"] == "chat"
+        assert memories["m_eph"]["sensitivity"] == "secret"
+        assert memories["m_eph"]["auto_expires"] == 1
+        assert "m_workspace" not in memories
+        assert "m_amode" not in memories
+
+        cursor = await upgraded.execute(
+            "SELECT affected_count, sample_ids_json FROM memory_redesign_phase11_report "
+            "WHERE table_name = 'memory_objects'"
+        )
+        phase11_report = await cursor.fetchone()
+        assert phase11_report["affected_count"] == 2
+        assert "m_workspace" in phase11_report["sample_ids_json"]
+        assert "m_amode" in phase11_report["sample_ids_json"]
+
+        cursor = await upgraded.execute(
+            """
+            SELECT remember_across_chats, remember_across_devices, memory_privacy_mode
+            FROM users
+            WHERE id = 'usr_1'
+            """
+        )
+        user_row = await cursor.fetchone()
+        assert user_row["remember_across_chats"] == 1
+        assert user_row["remember_across_devices"] == 1
+        assert user_row["memory_privacy_mode"] == "balanced"
+
+        # Tagged-key generated columns must encode NULL as 'n' and non-NULL as
+        # 'v:<length>:<value>'. Insert a second persona-bound row to confirm.
+        await upgraded.execute(
+            "INSERT INTO memory_consent_profile(user_id, category, confirmed_count, declined_count, updated_at, user_persona_id)"
+            " VALUES ('usr_1', 'financial', 0, 0, '2026-01-01T00:00:00+00:00', 'persona_alter')"
+        )
+        await upgraded.commit()
+        cursor = await upgraded.execute(
+            "SELECT category, user_persona_id, user_persona_key FROM memory_consent_profile ORDER BY category"
+        )
+        keys = {row["category"]: dict(row) for row in await cursor.fetchall()}
+        assert keys["medication"]["user_persona_key"] == "n"
+        assert keys["financial"]["user_persona_key"] == "v:13:persona_alter"
+    finally:
+        await upgraded.close()

@@ -27,10 +27,12 @@ from atagia.models.schemas_memory import (
     MemoryCategory,
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
 )
 from atagia.services.chat_service import ChatService
+from atagia.services.sidecar_service import SidecarService
 from atagia.services.errors import LLMUnavailableError
 from atagia.services.llm_client import (
     LLMClient,
@@ -45,7 +47,9 @@ from atagia.workers.ingest_worker import IngestWorker
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
-_MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
+_CANDIDATE_SCORE_KEY_PATTERN = re.compile(
+    r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
+)
 _NO_DURABLE_OUTPUT = json.dumps(
     {
         "evidences": [],
@@ -106,15 +110,17 @@ class ConfirmationFlowProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_scoring":
-            memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
-                    [
-                        {"memory_id": memory_id, "llm_applicability": 0.5}
-                        for memory_id in memory_ids
-                    ]
+                    {
+                        "scores": [
+                            {"score_key": score_key, "llm_applicability": 0.5}
+                            for _memory_id, score_key in candidate_keys
+                        ]
+                    }
                 ),
             )
         if purpose == "intent_classifier_explicit":
@@ -388,6 +394,10 @@ async def _seed_pending_memory(
             memory_id=str(created["id"]),
             category=category,
             created_at=str(created["created_at"]),
+            intended_scope=MemoryScope.USER,
+            intended_sensitivity=MemorySensitivity.SECRET,
+            policy_snapshot={"source": "seeded_test_memory"},
+            policy_proven=True,
             commit=False,
         )
         if asked_at is not None:
@@ -517,6 +527,82 @@ async def test_walk_a_first_sensitive_share_becomes_pending_then_confirms_active
         assert await _get_marker(runtime, str(updated[0]["id"])) is None
         assert profile is not None
         assert profile["confirmed_count"] == 1
+    finally:
+        await _close_runtime(runtime, ingest_worker)
+
+
+@pytest.mark.asyncio
+async def test_sidecar_backfill_sensitive_share_goes_to_review_not_user_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider, ingest_worker = await _build_runtime(
+        tmp_path,
+        monkeypatch,
+        extraction_outputs=[
+            _pin_output(canonical_text="Banking card PIN: 4512", index_text="bank card PIN"),
+        ],
+    )
+    try:
+        await SidecarService(runtime).ingest_message(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            role="user",
+            text="My banking card PIN is 4512.",
+            mode="personal_assistant",
+            message_id="aurvek:msg:4512",
+            ingest_origin="backfill",
+        )
+        await _drain_user_extract_jobs(runtime, ingest_worker)
+
+        memories = await _list_all_memories(runtime)
+        assert len(memories) == 1
+        assert memories[0]["status"] == MemoryStatus.REVIEW_REQUIRED.value
+        payload = memories[0]["payload_json"]
+        assert isinstance(payload, dict)
+        assert payload["ingest_origin"] == "backfill"
+        assert payload["confirmation_strategy"] == "admin_review_only"
+        assert payload["review_reason"] == "confirmation_not_allowed_for_ingest_origin"
+        assert await _get_marker(runtime, str(memories[0]["id"])) is None
+    finally:
+        await _close_runtime(runtime, ingest_worker)
+
+
+@pytest.mark.asyncio
+async def test_sidecar_trusted_private_backfill_stores_sensitive_share_without_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider, ingest_worker = await _build_runtime(
+        tmp_path,
+        monkeypatch,
+        extraction_outputs=[
+            _pin_output(canonical_text="Banking card PIN: 4512", index_text="bank card PIN"),
+        ],
+    )
+    try:
+        await SidecarService(runtime).ingest_message(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            role="user",
+            text="My banking card PIN is 4512.",
+            mode="personal_assistant",
+            message_id="aurvek:msg:4512",
+            ingest_origin="backfill",
+            memory_privacy_mode="trusted_private",
+        )
+        await _drain_user_extract_jobs(runtime, ingest_worker)
+
+        memories = await _list_all_memories(runtime)
+        assert len(memories) == 1
+        assert memories[0]["status"] == MemoryStatus.ACTIVE.value
+        payload = memories[0]["payload_json"]
+        assert isinstance(payload, dict)
+        assert payload["ingest_origin"] == "backfill"
+        assert payload["confirmation_strategy"] == "admin_review_only"
+        assert payload["memory_privacy_mode"] == "trusted_private"
+        assert "review_reason" not in payload
+        assert await _get_marker(runtime, str(memories[0]["id"])) is None
     finally:
         await _close_runtime(runtime, ingest_worker)
 

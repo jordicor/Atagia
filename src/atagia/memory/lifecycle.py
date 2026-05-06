@@ -38,6 +38,10 @@ class LifecycleCycleResult(BaseModel):
     deleted_count: int = 0
     declined_count: int = 0
     skipped_evidence_count: int = 0
+    expired_temporary_conversations_count: int = 0
+    purged_pending_conversations_count: int = 0
+    purged_tombstones_count: int = 0
+    processed_pending_file_deletions_count: int = 0
 
 
 class MemoryLifecycleManager:
@@ -73,6 +77,7 @@ class MemoryLifecycleManager:
         ).isoformat()
         review_cutoff = (now - timedelta(days=self._settings.lifecycle_review_ttl_days)).isoformat()
         pending_cutoff = (now - timedelta(days=PENDING_USER_CONFIRMATION_TTL_DAYS)).isoformat()
+        tombstone_cutoff = (now - timedelta(days=self._settings.tombstone_retention_days)).isoformat()
         result = LifecycleCycleResult()
         self._affected_user_ids = set()
 
@@ -87,7 +92,11 @@ class MemoryLifecycleManager:
             archived_ids = [ref.memory_id for ref in archived_refs]
             result.archived_count = len(archived_ids)
             result.skipped_evidence_count = await self._count_preserved_evidence()
-            ephemeral_refs = await self._delete_expired_ephemeral(ephemeral_cutoff)
+            ephemeral_refs = await self._delete_expired_auto_expires(
+                timestamp,
+                fallback_cutoff=ephemeral_cutoff,
+            )
+            ephemeral_refs = self._unique_refs(ephemeral_refs)
             ephemeral_ids = [ref.memory_id for ref in ephemeral_refs]
             review_required_refs = await self._delete_expired_review_required(review_cutoff)
             review_required_ids = [ref.memory_id for ref in review_required_refs]
@@ -104,6 +113,7 @@ class MemoryLifecycleManager:
             result.deleted_count = len(ephemeral_ids) + len(review_required_ids)
             await self._refresh_contract_dimensions(projection_keys)
             await self._cleanup_orphaned_contract_dimensions()
+            result.purged_tombstones_count = await self._purge_expired_tombstones(tombstone_cutoff)
 
             if dry_run:
                 await self._connection.rollback()
@@ -293,6 +303,16 @@ class MemoryLifecycleManager:
         row = await cursor.fetchone()
         return int(row["count"])
 
+    async def _purge_expired_tombstones(self, cutoff: str) -> int:
+        cursor = await self._connection.execute(
+            """
+            DELETE FROM deletion_tombstones
+            WHERE deleted_at < ?
+            """,
+            (cutoff,),
+        )
+        return int(cursor.rowcount)
+
     async def _decline_expired_pending_confirmations(
         self,
         cutoff: str,
@@ -384,6 +404,33 @@ class MemoryLifecycleManager:
             ),
         )
 
+    async def _delete_expired_auto_expires(
+        self,
+        timestamp: str,
+        *,
+        fallback_cutoff: str,
+    ) -> list[_LifecycleMemoryRef]:
+        return await self._select_memory_refs(
+            """
+            SELECT id, user_id
+            FROM memory_objects
+            WHERE auto_expires = 1
+              AND status IN (?, ?, ?, ?)
+              AND (
+                    (valid_to IS NOT NULL AND valid_to < ?)
+                 OR (valid_to IS NULL AND created_at < ?)
+              )
+            """,
+            (
+                MemoryStatus.ACTIVE.value,
+                MemoryStatus.SUPERSEDED.value,
+                MemoryStatus.ARCHIVED.value,
+                MemoryStatus.REVIEW_REQUIRED.value,
+                timestamp,
+                fallback_cutoff,
+            ),
+        )
+
     async def _delete_expired_review_required(self, cutoff: str) -> list[_LifecycleMemoryRef]:
         return await self._select_memory_refs(
             """
@@ -399,6 +446,17 @@ class MemoryLifecycleManager:
                 cutoff,
             ),
         )
+
+    @staticmethod
+    def _unique_refs(refs: list[_LifecycleMemoryRef]) -> list[_LifecycleMemoryRef]:
+        unique: list[_LifecycleMemoryRef] = []
+        seen: set[str] = set()
+        for ref in refs:
+            if ref.memory_id in seen:
+                continue
+            seen.add(ref.memory_id)
+            unique.append(ref)
+        return unique
 
     async def _cleanup_orphaned_contract_dimensions(self) -> None:
         await self._connection.execute(
@@ -419,13 +477,14 @@ class MemoryLifecycleManager:
         )
 
     async def _refresh_contract_dimensions(self, projection_keys: list[dict[str, Any]]) -> None:
-        seen: set[tuple[str, str | None, str | None, str | None, str, str]] = set()
+        seen: set[tuple[str, str | None, str | None, str | None, str | None, str, str]] = set()
         for key in projection_keys:
             dedupe_key = (
                 str(key["user_id"]),
-                key["assistant_mode_id"],
-                key["workspace_id"],
+                key.get("user_persona_id"),
+                key.get("character_id"),
                 key["conversation_id"],
+                key.get("scope_canonical"),
                 str(key["scope"]),
                 str(key["dimension_name"]),
             )
@@ -439,6 +498,9 @@ class MemoryLifecycleManager:
                 conversation_id=key["conversation_id"],
                 scope=MemoryScope(str(key["scope"])),
                 dimension_name=str(key["dimension_name"]),
+                user_persona_id=key.get("user_persona_id"),
+                character_id=key.get("character_id"),
+                scope_canonical=key.get("scope_canonical"),
                 commit=False,
             )
 

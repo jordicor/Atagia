@@ -14,6 +14,7 @@ from atagia.core.config import Settings
 from atagia.core.contract_repository import ContractDimensionRepository
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository, WorkspaceRepository
+from atagia.core.summary_repository import SummaryRepository
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
 from atagia.memory.context_composer import ContextComposer
@@ -48,6 +49,30 @@ from atagia.services.retrieval_pipeline import RetrievalPipeline
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 _MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
+_CANDIDATE_SCORE_KEY_PATTERN = re.compile(
+    r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
+)
+
+
+def _score_keys_by_memory_id(prompt: str) -> dict[str, str]:
+    return {
+        memory_id: score_key
+        for memory_id, score_key in _CANDIDATE_SCORE_KEY_PATTERN.findall(prompt)
+    }
+
+
+def _scores_for_prompt(
+    prompt: str,
+    score_map: dict[str, float],
+    *,
+    omitted_memory_ids: set[str] | None = None,
+) -> list[dict[str, float | str]]:
+    omitted = omitted_memory_ids or set()
+    return [
+        {"score_key": score_key, "llm_applicability": score_map.get(memory_id, 0.5)}
+        for memory_id, score_key in _score_keys_by_memory_id(prompt).items()
+        if memory_id not in omitted
+    ]
 
 
 class PipelineProvider(LLMProvider):
@@ -85,12 +110,8 @@ class PipelineProvider(LLMProvider):
                 output_text=json.dumps(self.need_response),
             )
         if purpose == "applicability_scoring":
-            memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
             payload = {
-                "scores": [
-                    {"memory_id": memory_id, "llm_applicability": self.score_map.get(memory_id, 0.5)}
-                    for memory_id in memory_ids
-                ],
+                "scores": _scores_for_prompt(request.messages[1].content, self.score_map),
             }
             return LLMCompletionResponse(
                 provider=self.name,
@@ -143,13 +164,12 @@ class OmitFirstApplicabilityScoreProvider(PipelineProvider):
 
         self.requests.append(request)
         self._scoring_calls += 1
-        memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
         payload = {
-            "scores": [
-                {"memory_id": memory_id, "llm_applicability": self.score_map.get(memory_id, 0.5)}
-                for memory_id in memory_ids
-                if not (self._scoring_calls == 1 and memory_id == self._omitted_memory_id)
-            ],
+            "scores": _scores_for_prompt(
+                request.messages[1].content,
+                self.score_map,
+                omitted_memory_ids={self._omitted_memory_id} if self._scoring_calls == 1 else set(),
+            ),
         }
         return LLMCompletionResponse(
             provider=self.name,
@@ -178,14 +198,13 @@ class MalformedFirstApplicabilityScoreProvider(PipelineProvider):
 
         self.requests.append(request)
         self._scoring_calls += 1
-        memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
-        scores: list[dict[str, object]] = []
-        for memory_id in memory_ids:
+        scores: list[dict[str, float | str]] = []
+        for memory_id, score_key in _score_keys_by_memory_id(request.messages[1].content).items():
             score = self.score_map.get(memory_id, 0.5)
             if self._scoring_calls == 1 and memory_id == self._malformed_memory_id:
-                scores.append({"llm_applicability": score})
+                scores.append({"score_key": "candidate_999", "llm_applicability": score})
             else:
-                scores.append({"memory_id": memory_id, "llm_applicability": score})
+                scores.append({"score_key": score_key, "llm_applicability": score})
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
@@ -212,19 +231,16 @@ class InvalidFirstApplicabilityScoreProvider(PipelineProvider):
         self.requests.append(request)
         self._scoring_calls += 1
         if self._scoring_calls == 1:
+            score_key = next(iter(_score_keys_by_memory_id(request.messages[1].content).values()))
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
-                    {"scores": [{"memory_id": "mem_present", "llm_applicability": 2.0}]}
+                    {"scores": [{"score_key": score_key, "llm_applicability": 2.0}]}
                 ),
             )
-        memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
         payload = {
-            "scores": [
-                {"memory_id": memory_id, "llm_applicability": self.score_map.get(memory_id, 0.5)}
-                for memory_id in memory_ids
-            ],
+            "scores": _scores_for_prompt(request.messages[1].content, self.score_map),
         }
         return LLMCompletionResponse(
             provider=self.name,
@@ -304,6 +320,12 @@ async def _seed_memory(
     assistant_mode_id: str = "coding_debug",
     status: MemoryStatus = MemoryStatus.ACTIVE,
 ) -> dict[str, object]:
+    scope_canonical = {
+        MemoryScope.CONVERSATION: MemoryScope.CHAT.value,
+        MemoryScope.EPHEMERAL_SESSION: MemoryScope.CHAT.value,
+        MemoryScope.WORKSPACE: MemoryScope.CHARACTER.value,
+        MemoryScope.GLOBAL_USER: MemoryScope.USER.value,
+    }.get(scope)
     return await memories.create_memory_object(
         user_id="usr_1",
         workspace_id="wrk_1",
@@ -317,6 +339,9 @@ async def _seed_memory(
         privacy_level=0,
         status=status,
         memory_id=memory_id,
+        platform_id="default",
+        character_id="wrk_1" if scope is MemoryScope.WORKSPACE else None,
+        scope_canonical=scope_canonical,
     )
 
 
@@ -373,12 +398,25 @@ def _candidate_record(
     updated_at: str = "2026-04-05T12:00:00+00:00",
     retrieval_sources: list[str] | None = None,
 ) -> dict[str, object]:
+    scope_canonical = {
+        MemoryScope.CONVERSATION: MemoryScope.CHAT.value,
+        MemoryScope.EPHEMERAL_SESSION: MemoryScope.CHAT.value,
+        MemoryScope.WORKSPACE: MemoryScope.CHARACTER.value,
+        MemoryScope.GLOBAL_USER: MemoryScope.USER.value,
+    }.get(scope, scope.value)
     return {
         "id": memory_id,
         "object_type": object_type.value,
         "status": status.value,
         "scope": scope.value,
+        "scope_canonical": scope_canonical,
         "privacy_level": privacy_level,
+        "sensitivity": "public",
+        "user_persona_id": None,
+        "platform_id": "default",
+        "character_id": "wrk_1" if scope is MemoryScope.WORKSPACE else None,
+        "platform_locked": 0,
+        "platform_id_lock": None,
         "assistant_mode_id": "general_qa",
         "conversation_id": "cnv_1" if scope is MemoryScope.CONVERSATION else None,
         "workspace_id": "wrk_1" if scope in {MemoryScope.CONVERSATION, MemoryScope.WORKSPACE} else None,
@@ -1042,6 +1080,68 @@ async def test_pipeline_force_all_scopes_overrides_scope_filter() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pipeline_resolves_character_rollup_with_namespace_gates() -> None:
+    connection, _memories, _contracts, pipeline, _provider, _resolved_policy, context = await _build_runtime()
+    summaries = SummaryRepository(connection, FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+    try:
+        await summaries.create_summary(
+            "usr_1",
+            {
+                "id": "sum_character_rollup",
+                "workspace_id": "wrk_1",
+                "user_persona_id": "persona_writer",
+                "platform_id": "web",
+                "character_id": "char_debug",
+                "source_message_start_seq": None,
+                "source_message_end_seq": None,
+                "summary_kind": "character_rollup",
+                "summary_text": "Character-specific debugging style.",
+                "source_object_ids_json": [],
+                "sensitivity": "public",
+                "scope_canonical": "character",
+                "maya_score": 1.5,
+                "model": "model-a",
+                "created_at": "2026-04-05T12:00:00+00:00",
+            },
+        )
+        plan = _slot_fill_plan().model_copy(
+            update={
+                "user_persona_id": "persona_writer",
+                "platform_id": "web",
+                "character_id": "char_debug",
+                "remember_across_devices": False,
+            }
+        )
+        gated_context = context.model_copy(
+            update={
+                "user_persona_id": "persona_writer",
+                "platform_id": "web",
+                "character_id": "char_debug",
+                "remember_across_devices": False,
+            }
+        )
+
+        row = await pipeline._resolve_workspace_rollup(  # noqa: SLF001
+            conversation_context=gated_context,
+            retrieval_plan=plan,
+            workspace_rollup=None,
+            ablation=AblationConfig(),
+        )
+        other_platform_row = await pipeline._resolve_workspace_rollup(  # noqa: SLF001
+            conversation_context=gated_context.model_copy(update={"platform_id": "mobile"}),
+            retrieval_plan=plan.model_copy(update={"platform_id": "mobile"}),
+            workspace_rollup=None,
+            ablation=AblationConfig(),
+        )
+
+        assert row is not None
+        assert row["summary_text"] == "Character-specific debugging style."
+        assert other_platform_row is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_pipeline_high_stakes_filters_derived_memory_and_workspace_rollup() -> None:
     message_text = "database migration rollback safety"
     provider = PipelineProvider(
@@ -1136,9 +1236,9 @@ async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None
         )
         await _seed_memory(
             memories,
-            memory_id="mem_mode",
+            memory_id="mem_user",
             canonical_text="User prefers concise debugging answers.",
-            scope=MemoryScope.ASSISTANT_MODE,
+            scope=MemoryScope.GLOBAL_USER,
         )
 
         result = await pipeline.execute(
@@ -1162,8 +1262,8 @@ async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None
             for request in provider.requests
         )
         returned_ids = {candidate["id"] for candidate in result.raw_candidates}
-        assert returned_ids == {"mem_conv", "mem_mode"}
-        assert set(result.composed_context.selected_memory_ids) == {"mem_conv", "mem_mode"}
+        assert returned_ids == {"mem_conv", "mem_user"}
+        assert set(result.composed_context.selected_memory_ids) == {"mem_conv", "mem_user"}
         assert result.retrieval_sufficiency is not None
         assert result.retrieval_sufficiency.state == "retrieval_sufficient"
         assert result.retrieval_sufficiency.scored_candidate_count == 2
@@ -1171,7 +1271,7 @@ async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None
             record["candidate_id"]: record
             for record in result.candidate_custody
         }
-        assert set(custody_by_id) == {"mem_conv", "mem_mode"}
+        assert set(custody_by_id) == {"mem_conv", "mem_user"}
         assert all(
             record["score_status"] == "scored"
             for record in custody_by_id.values()
@@ -1403,6 +1503,85 @@ async def test_pipeline_backfills_source_quote_for_selected_memory_source_messag
 
         assert "mem_job_loss" in result.composed_context.selected_memory_ids
         assert "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 1: Jon: Lost my job as a banker yesterday" in result.composed_context.memory_block
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_does_not_backfill_source_quote_from_other_conversation() -> None:
+    from atagia.core.repositories import MessageRepository
+
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["Jon banker job"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "Jon banker job",
+                    "fts_phrase": "Jon banker job",
+                }
+            ],
+            "query_type": "temporal",
+            "retrieval_levels": [0],
+            "exact_recall_needed": True,
+            "exact_facets": ["date"],
+        },
+        score_map={"mem_cross_chat_source": 0.95},
+    )
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        mode_id="general_qa",
+        provider=provider,
+    )
+    try:
+        clock = FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc))
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        await conversations.create_conversation("cnv_other", "usr_1", "wrk_1", "general_qa", "Other Chat")
+        await messages.create_message(
+            message_id="msg_other_source",
+            conversation_id="cnv_other",
+            role="user",
+            seq=None,
+            text="Jon: Lost my job as a banker yesterday.",
+            occurred_at="2023-01-20T16:04:00+00:00",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            assistant_mode_id="general_qa",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="Jon lost his banker job before starting a business.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            payload={
+                "source_message_ids": ["msg_other_source"],
+                "source_message_window_start_occurred_at": "2023-01-20T16:04:00+00:00",
+                "source_message_window_end_occurred_at": "2023-01-20T16:04:00+00:00",
+            },
+            memory_id="mem_cross_chat_source",
+            platform_id="default",
+            scope_canonical=MemoryScope.USER.value,
+        )
+
+        result = await pipeline.execute(
+            message_text="When did Jon lose his job as a banker?",
+            conversation_context=context.model_copy(update={"assistant_mode_id": "general_qa"}),
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {
+                    "id": "msg_current",
+                    "conversation_id": "cnv_1",
+                    "role": "user",
+                    "text": "When did Jon lose his job as a banker?",
+                },
+            ],
+        )
+
+        assert "mem_cross_chat_source" in result.composed_context.selected_memory_ids
+        assert "source_quote:" not in result.composed_context.memory_block
     finally:
         await connection.close()
 
@@ -2231,6 +2410,54 @@ async def test_summary_support_regrounding_fetches_missing_support_by_id() -> No
             "mem_support_a",
             "mem_support_b",
         ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_summary_support_regrounding_rejects_cross_persona_fetched_support() -> None:
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        mode_id="general_qa"
+    )
+    try:
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="general_qa",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Persona-specific source memory from another namespace.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            memory_id="mem_other_persona",
+            user_persona_id="persona_b",
+            platform_id="default",
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        summary = _candidate_record(
+            memory_id="sum_episode",
+            canonical_text="Abstract outage summary.",
+            object_type=MemoryObjectType.SUMMARY_VIEW,
+            rrf_score=1.0,
+            payload_json={
+                "summary_kind": "episode",
+                "hierarchy_level": 1,
+                "source_object_ids": ["mem_other_persona"],
+            },
+        )
+
+        updated_shortlist = await pipeline._reground_summary_support_shortlist(
+            shortlist=[summary],
+            filtered_candidates=[summary],
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            detected_needs=[],
+            retrieval_plan=_slot_fill_plan(),
+        )
+
+        assert [candidate["id"] for candidate in updated_shortlist] == ["sum_episode"]
     finally:
         await connection.close()
 

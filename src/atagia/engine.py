@@ -7,9 +7,22 @@ from pathlib import Path
 from typing import Any
 
 from atagia.app import AppRuntime, initialize_runtime
-from atagia.core.config import Settings
-from atagia.core.repositories import WorkspaceRepository
-from atagia.models.schemas_api import ChatResult, ContextResult
+from atagia.core.config import Settings, configured_resource_path
+from atagia.core import json_utils
+from atagia.core.repositories import MemoryObjectRepository, WorkspaceRepository
+from atagia.models.schemas_api import (
+    ChatResult,
+    ContextResult,
+    DeletionReport,
+    ErasureReport,
+    MemoryPreferencesResponse,
+    MemoryProcessingStatus,
+    PendingMemoryConfirmationActionResponse,
+    PendingMemoryConfirmationListResponse,
+    AdminReviewActionResponse,
+    AdminReviewMemoryListResponse,
+    WorkerControlResponse,
+)
 from atagia.models.schemas_api import (
     ActivitySnapshotResponse,
     ConversationActivityStats,
@@ -18,22 +31,46 @@ from atagia.models.schemas_api import (
     WarmupRecommendedConversationsResponse,
 )
 from atagia.models.schemas_replay import AblationConfig
+from atagia.models.schemas_jobs import WorkerControlMode
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
+    MemoryCategory,
     MemoryScope,
+    MemoryStatus,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
 from atagia.services.chat_service import ChatService
+from atagia.services.confirmation_service import PendingConfirmationService
+from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.conversation_activity_service import ConversationActivityService
+from atagia.services.lifecycle_service import (
+    HARD_DELETE_MEMORY_CONFIRMATION,
+    ConversationLifecycleService,
+)
 from atagia.services.sidecar_service import SidecarService
 from atagia.services.verbatim_pin_service import VerbatimPinService
 from atagia.services.errors import RuntimeNotInitializedError
+from atagia.services.job_tracking_service import JobTrackingService
+from atagia.services.worker_control_service import WorkerControlService
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_MIGRATIONS_DIR = _PROJECT_ROOT / "migrations"
-_DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
-_DEFAULT_OPERATIONAL_PROFILES_DIR = _PROJECT_ROOT / "operational_profiles"
+
+async def _worker_control_response(
+    service: WorkerControlService,
+    *,
+    drain_completed: bool | None = None,
+) -> WorkerControlResponse:
+    state = await service.get_state()
+    return WorkerControlResponse(
+        mode=state.mode,
+        reason=state.reason,
+        updated_at=state.updated_at,
+        updated_by=state.updated_by,
+        new_source_jobs_allowed=await service.allows_new_source_jobs(),
+        worker_claims_allowed=await service.allows_worker_claims(),
+        periodic_work_allowed=await service.allows_periodic_work(),
+        drain_completed=drain_completed,
+    )
 
 
 class Atagia:
@@ -63,7 +100,7 @@ class Atagia:
         skip_belief_revision: bool = False,
         skip_compaction: bool = False,
         context_cache_enabled: bool | None = None,
-        chunking_enabled: bool | None = None,
+        disable_chunking_extraction: bool | None = None,
         assistant_guidance_enabled: bool | None = None,
         recent_transcript_budget_tokens: int | None = None,
     ) -> None:
@@ -99,7 +136,7 @@ class Atagia:
         self._skip_belief_revision = skip_belief_revision
         self._skip_compaction = skip_compaction
         self._context_cache_enabled = context_cache_enabled
-        self._chunking_enabled = chunking_enabled
+        self._disable_chunking_extraction = disable_chunking_extraction
         self._assistant_guidance_enabled = assistant_guidance_enabled
         self._recent_transcript_budget_tokens = recent_transcript_budget_tokens
         self._runtime: AppRuntime | None = None
@@ -134,9 +171,19 @@ class Atagia:
         occurred_at: str | None = None,
         ablation: AblationConfig | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        message_id: str | None = None,
+        source_seq: int | None = None,
         *,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
+        cross_chat_memory: bool = True,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool | None = None,
+        ingest_origin: str | None = None,
+        confirmation_strategy: str | None = None,
+        memory_privacy_mode: str | None = None,
     ) -> ContextResult:
         """Run retrieval, persist the user message, and return a ready system prompt."""
         runtime = await self._require_runtime()
@@ -149,8 +196,18 @@ class Atagia:
             occurred_at=occurred_at,
             ablation=ablation,
             attachments=attachments,
+            message_id=message_id,
+            source_seq=source_seq,
             operational_profile=operational_profile,
             operational_signals=operational_signals,
+            cross_chat_memory=cross_chat_memory,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            ingest_origin=ingest_origin,
+            confirmation_strategy=confirmation_strategy,
+            memory_privacy_mode=memory_privacy_mode,
         )
 
     async def flush(self, timeout_seconds: float = 30.0) -> bool:
@@ -159,6 +216,237 @@ class Atagia:
         if not runtime.settings.workers_enabled:
             return False
         return await runtime.storage_backend.drain(timeout_seconds)
+
+    async def get_worker_control(self) -> WorkerControlResponse:
+        """Return the current background-processing stop-switch state."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            service = WorkerControlService(connection, runtime.clock)
+            return await _worker_control_response(service)
+        finally:
+            await connection.close()
+
+    async def set_worker_control(
+        self,
+        mode: WorkerControlMode | str,
+        *,
+        reason: str | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> WorkerControlResponse:
+        """Set the background-processing stop-switch state."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            service = WorkerControlService(connection, runtime.clock)
+            resolved_mode = WorkerControlMode(mode)
+            await service.set_mode(
+                resolved_mode,
+                reason=reason,
+                updated_by="library_admin",
+            )
+            drain_completed: bool | None = None
+            if resolved_mode is WorkerControlMode.DRAIN_AND_PAUSE:
+                drain_completed = (
+                    await runtime.storage_backend.drain(timeout_seconds)
+                    if runtime.settings.workers_enabled
+                    else False
+                )
+            return await _worker_control_response(
+                service,
+                drain_completed=drain_completed,
+            )
+        finally:
+            await connection.close()
+
+    async def get_processing_status(
+        self,
+        user_id: str,
+        conversation_id: str | None = None,
+        *,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
+    ) -> MemoryProcessingStatus:
+        """Return current background memory-processing status."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            return await JobTrackingService(
+                connection,
+                runtime.clock,
+                workers_enabled=runtime.settings.workers_enabled,
+            ).get_status(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id or "default",
+                character_id=character_id,
+                incognito=incognito,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+            )
+        finally:
+            await connection.close()
+
+    async def list_pending_memory_confirmations(
+        self,
+        user_id: str,
+        **filters: Any,
+    ) -> PendingMemoryConfirmationListResponse:
+        """Return safe pending-confirmation records for host user interfaces."""
+
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            items = await PendingConfirmationService(
+                connection,
+                runtime.clock,
+            ).list_pending_confirmations(
+                user_id=user_id,
+                conversation_id=filters.get("conversation_id"),
+                platform_id=filters.get("platform_id"),
+                user_persona_id=filters.get("user_persona_id"),
+                character_id=filters.get("character_id"),
+                category=(
+                    MemoryCategory(filters["category"])
+                    if filters.get("category") is not None
+                    else None
+                ),
+                limit=int(filters.get("limit", 100)),
+                offset=int(filters.get("offset", 0)),
+            )
+            return PendingMemoryConfirmationListResponse.model_validate({"items": items})
+        finally:
+            await connection.close()
+
+    async def confirm_pending_memory(
+        self,
+        user_id: str,
+        memory_id: str,
+    ) -> PendingMemoryConfirmationActionResponse:
+        """Confirm one pending memory using Atagia's consent transition."""
+
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            memory = await PendingConfirmationService(
+                connection,
+                runtime.clock,
+                embedding_index=runtime.embedding_index,
+            ).confirm_pending_memory(user_id=user_id, memory_id=memory_id)
+            return PendingMemoryConfirmationActionResponse(
+                memory_id=str(memory["id"]),
+                status=str(memory["status"]),
+            )
+        finally:
+            await connection.close()
+
+    async def decline_pending_memory(
+        self,
+        user_id: str,
+        memory_id: str,
+    ) -> PendingMemoryConfirmationActionResponse:
+        """Decline one pending memory using Atagia's consent transition."""
+
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            memory = await PendingConfirmationService(
+                connection,
+                runtime.clock,
+            ).decline_pending_memory(user_id=user_id, memory_id=memory_id)
+            return PendingMemoryConfirmationActionResponse(
+                memory_id=str(memory["id"]),
+                status=str(memory["status"]),
+            )
+        finally:
+            await connection.close()
+
+    async def list_review_required_memories(
+        self,
+        **filters: Any,
+    ) -> AdminReviewMemoryListResponse:
+        """Return admin-visible review-required memories."""
+
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            items = await self._list_review_required_rows(
+                connection,
+                user_id=filters.get("user_id"),
+                platform_id=filters.get("platform_id"),
+                user_persona_id=filters.get("user_persona_id"),
+                character_id=filters.get("character_id"),
+                category=filters.get("category"),
+                ingest_origin=filters.get("ingest_origin"),
+                limit=int(filters.get("limit", 100)),
+                offset=int(filters.get("offset", 0)),
+            )
+            return AdminReviewMemoryListResponse.model_validate({"items": items})
+        finally:
+            await connection.close()
+
+    async def archive_review_required_memory(
+        self,
+        user_id: str,
+        memory_id: str,
+    ) -> AdminReviewActionResponse:
+        """Archive one review-required memory."""
+
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            memory = await MemoryObjectRepository(
+                connection,
+                runtime.clock,
+            ).get_memory_object(memory_id, user_id)
+            if memory is None or memory.get("status") != MemoryStatus.REVIEW_REQUIRED.value:
+                raise ValueError("Review-required memory not found")
+            await ConversationLifecycleService(runtime).delete_memory(
+                connection,
+                user_id=user_id,
+                memory_id=memory_id,
+            )
+            return AdminReviewActionResponse(
+                memory_id=memory_id,
+                status=MemoryStatus.ARCHIVED.value,
+            )
+        finally:
+            await connection.close()
+
+    async def delete_review_required_memory(
+        self,
+        user_id: str,
+        memory_id: str,
+    ) -> AdminReviewActionResponse:
+        """Hard-delete one review-required memory."""
+
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            memory = await MemoryObjectRepository(
+                connection,
+                runtime.clock,
+            ).get_memory_object(memory_id, user_id)
+            if memory is None or memory.get("status") != MemoryStatus.REVIEW_REQUIRED.value:
+                raise ValueError("Review-required memory not found")
+            await ConversationLifecycleService(runtime).delete_memory(
+                connection,
+                user_id=user_id,
+                memory_id=memory_id,
+                hard=True,
+                confirmation=HARD_DELETE_MEMORY_CONFIRMATION,
+            )
+            return AdminReviewActionResponse(
+                memory_id=memory_id,
+                status=MemoryStatus.DELETED.value,
+            )
+        finally:
+            await connection.close()
 
     async def ingest_message(
         self,
@@ -170,9 +458,19 @@ class Atagia:
         workspace_id: str | None = None,
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        message_id: str | None = None,
+        source_seq: int | None = None,
         *,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
+        cross_chat_memory: bool = True,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool | None = None,
+        ingest_origin: str | None = None,
+        confirmation_strategy: str | None = None,
+        memory_privacy_mode: str | None = None,
     ) -> None:
         """Store a message and enqueue extraction without running retrieval."""
         runtime = await self._require_runtime()
@@ -185,8 +483,18 @@ class Atagia:
             workspace_id=workspace_id,
             occurred_at=occurred_at,
             attachments=attachments,
+            message_id=message_id,
+            source_seq=source_seq,
             operational_profile=operational_profile,
             operational_signals=operational_signals,
+            cross_chat_memory=cross_chat_memory,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            ingest_origin=ingest_origin,
+            confirmation_strategy=confirmation_strategy,
+            memory_privacy_mode=memory_privacy_mode,
         )
 
     async def add_response(
@@ -196,8 +504,18 @@ class Atagia:
         text: str,
         occurred_at: str | None = None,
         *,
+        message_id: str | None = None,
+        source_seq: int | None = None,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        mode: str | None = None,
+        incognito: bool | None = None,
+        ingest_origin: str | None = None,
+        confirmation_strategy: str | None = None,
+        memory_privacy_mode: str | None = None,
     ) -> None:
         """Persist an assistant response in the conversation history."""
         runtime = await self._require_runtime()
@@ -206,8 +524,18 @@ class Atagia:
             conversation_id=conversation_id,
             text=text,
             occurred_at=occurred_at,
+            message_id=message_id,
+            source_seq=source_seq,
             operational_profile=operational_profile,
             operational_signals=operational_signals,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            mode=mode,
+            incognito=incognito,
+            ingest_origin=ingest_origin,
+            confirmation_strategy=confirmation_strategy,
+            memory_privacy_mode=memory_privacy_mode,
         )
 
     async def chat(
@@ -222,6 +550,11 @@ class Atagia:
         *,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
+        cross_chat_memory: bool = True,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool | None = None,
     ) -> ChatResult:
         """Run the full chat flow, including the LLM response generation."""
         runtime = await self._require_runtime()
@@ -235,6 +568,12 @@ class Atagia:
                 conversation_id=conversation_id,
                 workspace_id=workspace_id,
                 assistant_mode_id=mode,
+                cross_chat_memory=cross_chat_memory,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                mode=mode,
+                incognito=incognito,
             )
         finally:
             await connection.close()
@@ -247,6 +586,50 @@ class Atagia:
             message_occurred_at=occurred_at,
             operational_profile=operational_profile,
             operational_signals=operational_signals,
+            cross_chat_memory=cross_chat_memory,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id if character_id is not None else workspace_id,
+            mode=mode,
+            incognito=incognito,
+        )
+
+    async def get_memory_preferences(self, user_id: str) -> MemoryPreferencesResponse:
+        """Return user-level memory sharing preferences."""
+        runtime = await self._require_runtime()
+        preferences = await SidecarService(runtime).get_memory_preferences(user_id)
+        return MemoryPreferencesResponse.model_validate(preferences)
+
+    async def set_memory_preferences(
+        self,
+        user_id: str,
+        *,
+        remember_across_chats: bool | None = None,
+        remember_across_devices: bool | None = None,
+        memory_privacy_mode: str | None = None,
+    ) -> MemoryPreferencesResponse:
+        """Update user-level memory sharing preferences."""
+        runtime = await self._require_runtime()
+        preferences = await SidecarService(runtime).set_memory_preferences(
+            user_id,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+            memory_privacy_mode=memory_privacy_mode,
+        )
+        return MemoryPreferencesResponse.model_validate(preferences)
+
+    async def set_conversation_incognito(
+        self,
+        user_id: str,
+        conversation_id: str,
+        incognito: bool,
+    ) -> dict[str, Any]:
+        """Set the reversible per-conversation incognito flag."""
+        runtime = await self._require_runtime()
+        return await SidecarService(runtime).set_conversation_incognito(
+            user_id,
+            conversation_id,
+            incognito,
         )
 
     async def create_user(self, user_id: str) -> None:
@@ -277,6 +660,18 @@ class Atagia:
         conversation_id: str | None,
         workspace_id: str | None = None,
         assistant_mode_id: str | None = None,
+        *,
+        temporary: bool = False,
+        temporary_ttl_seconds: int | None = None,
+        purge_on_close: bool | None = None,
+        cross_chat_memory: bool = True,
+        # Public namespace identity fields. Legacy workspace/assistant-mode
+        # aliases remain accepted for compatibility with older fixtures.
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        mode: str | None = None,
+        incognito: bool | None = None,
     ) -> str:
         """Create a conversation and return its identifier."""
         runtime = await self._require_runtime()
@@ -290,8 +685,135 @@ class Atagia:
                 conversation_id=conversation_id,
                 workspace_id=workspace_id,
                 assistant_mode_id=assistant_mode_id,
+                temporary=temporary,
+                temporary_ttl_seconds=temporary_ttl_seconds,
+                purge_on_close=purge_on_close,
+                cross_chat_memory=cross_chat_memory,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                mode=mode,
+                incognito=incognito,
             )
             return str(conversation["id"])
+        finally:
+            await connection.close()
+
+    async def close_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        purge: bool | None = None,
+        confirmation: str | None = None,
+    ) -> DeletionReport | dict[str, Any]:
+        """Close a conversation, optionally purging it when confirmed."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            return await ConversationLifecycleService(runtime).close_conversation(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                purge=purge,
+                confirmation=confirmation,
+            )
+        finally:
+            await connection.close()
+
+    async def archive_conversation(self, user_id: str, conversation_id: str) -> dict[str, Any]:
+        """Archive a conversation and hide its derived data from default retrieval."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            return await ConversationLifecycleService(runtime).archive_conversation(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
+        finally:
+            await connection.close()
+
+    async def delete_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        confirmation: str,
+    ) -> DeletionReport:
+        """Hard-delete a conversation cascade after explicit confirmation."""
+        runtime = await self._require_runtime()
+        cache_service = ContextCacheService(runtime)
+        async with cache_service.user_cache_guard(user_id):
+            connection = await runtime.open_connection()
+            try:
+                return await ConversationLifecycleService(runtime).delete_conversation(
+                    connection,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    confirmation=confirmation,
+                )
+            finally:
+                await connection.close()
+
+    async def edit_memory(
+        self,
+        user_id: str,
+        memory_id: str,
+        new_text: str,
+        *,
+        edit_source: str = "api",
+        edited_by: str = "system",
+    ) -> dict[str, Any]:
+        """Edit an active evidence memory and preserve the previous text."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            return await ConversationLifecycleService(runtime).edit_memory(
+                connection,
+                user_id=user_id,
+                memory_id=memory_id,
+                new_text=new_text,
+                edit_source=edit_source,
+                edited_by=edited_by,
+            )
+        finally:
+            await connection.close()
+
+    async def delete_memory(
+        self,
+        user_id: str,
+        memory_id: str,
+        *,
+        hard: bool = False,
+        confirmation: str | None = None,
+    ) -> DeletionReport:
+        """Archive or hard-delete a memory object."""
+        runtime = await self._require_runtime()
+        cache_service = ContextCacheService(runtime)
+        async with cache_service.user_cache_guard(user_id):
+            connection = await runtime.open_connection()
+            try:
+                return await ConversationLifecycleService(runtime).delete_memory(
+                    connection,
+                    user_id=user_id,
+                    memory_id=memory_id,
+                    hard=hard,
+                    confirmation=confirmation,
+                )
+            finally:
+                await connection.close()
+
+    async def erase_user_data(self, user_id: str, *, confirmation: str) -> ErasureReport:
+        """Erase all user data after explicit right-to-erasure confirmation."""
+        runtime = await self._require_runtime()
+        connection = await runtime.open_connection()
+        try:
+            return await ConversationLifecycleService(runtime).erase_user_data(
+                connection,
+                user_id=user_id,
+                confirmation=confirmation,
+            )
         finally:
             await connection.close()
 
@@ -600,15 +1122,22 @@ class Atagia:
         env_settings = Settings.from_env()
         manifests_path = (
             self._manifests_dir
-            or os.getenv("ATAGIA_MANIFESTS_PATH")
-            or str(_DEFAULT_MANIFESTS_DIR)
+            or configured_resource_path(
+                "manifests",
+                os.getenv("ATAGIA_MANIFESTS_PATH"),
+            )
         )
         operational_profiles_path = (
             self._operational_profiles_dir
-            or os.getenv("ATAGIA_OPERATIONAL_PROFILES_PATH")
-            or str(_DEFAULT_OPERATIONAL_PROFILES_DIR)
+            or configured_resource_path(
+                "operational_profiles",
+                os.getenv("ATAGIA_OPERATIONAL_PROFILES_PATH"),
+            )
         )
-        migrations_path = os.getenv("ATAGIA_MIGRATIONS_PATH") or str(_DEFAULT_MIGRATIONS_DIR)
+        migrations_path = configured_resource_path(
+            "migrations",
+            os.getenv("ATAGIA_MIGRATIONS_PATH"),
+        )
         use_env_redis = self._redis_url is None and env_settings.storage_backend == "redis"
         storage_backend = "redis" if self._redis_url is not None or use_env_redis else "inprocess"
         anthropic_api_key = self._anthropic_api_key or env_settings.anthropic_api_key
@@ -658,6 +1187,11 @@ class Atagia:
                 if self._llm_intimacy_proactive_routing_enabled is None
                 else self._llm_intimacy_proactive_routing_enabled
             ),
+            llm_debug_io_enabled=env_settings.llm_debug_io_enabled,
+            llm_debug_io_dir=env_settings.llm_debug_io_dir,
+            llm_debug_io_purposes=env_settings.llm_debug_io_purposes,
+            llm_debug_io_raw=env_settings.llm_debug_io_raw,
+            llm_debug_io_max_chars=env_settings.llm_debug_io_max_chars,
             service_mode=False,
             service_api_key=None,
             admin_api_key=None,
@@ -690,12 +1224,18 @@ class Atagia:
             ),
             context_cache_min_ttl_seconds=env_settings.context_cache_min_ttl_seconds,
             context_cache_max_ttl_seconds=env_settings.context_cache_max_ttl_seconds,
-            chunking_enabled=(
-                env_settings.chunking_enabled
-                if self._chunking_enabled is None
-                else self._chunking_enabled
+            temporary_default_ttl_seconds=env_settings.temporary_default_ttl_seconds,
+            temporary_default_purge_on_close=env_settings.temporary_default_purge_on_close,
+            tombstone_retention_days=env_settings.tombstone_retention_days,
+            erasure_purge_streams=env_settings.erasure_purge_streams,
+            disable_chunking_extraction=(
+                env_settings.disable_chunking_extraction
+                if self._disable_chunking_extraction is None
+                else self._disable_chunking_extraction
             ),
-            chunking_threshold_tokens=env_settings.chunking_threshold_tokens,
+            chunking_extraction_threshold_tokens=(
+                env_settings.chunking_extraction_threshold_tokens
+            ),
             extraction_watchdog_enabled=env_settings.extraction_watchdog_enabled,
             extraction_watchdog_allow_different_provider=(
                 env_settings.extraction_watchdog_allow_different_provider
@@ -734,6 +1274,7 @@ class Atagia:
                 env_settings.benchmark_disable_raw_recent_transcript
             ),
             recent_transcript_overage_ratio=env_settings.recent_transcript_overage_ratio,
+            graph_projection_enabled=env_settings.graph_projection_enabled,
             verbatim_evidence_search_enabled=env_settings.verbatim_evidence_search_enabled,
             verbatim_evidence_search_rrf_weight=env_settings.verbatim_evidence_search_rrf_weight,
             verbatim_evidence_search_limit=env_settings.verbatim_evidence_search_limit,
@@ -747,3 +1288,88 @@ class Atagia:
         if self._runtime is None:
             raise RuntimeNotInitializedError("Atagia runtime is not initialized")
         return self._runtime
+
+    @staticmethod
+    async def _list_review_required_rows(
+        connection: Any,
+        *,
+        user_id: str | None,
+        platform_id: str | None,
+        user_persona_id: str | None,
+        character_id: str | None,
+        category: MemoryCategory | str | None,
+        ingest_origin: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[dict[str, Any]]:
+        clauses = ["status = ?"]
+        parameters: list[Any] = [MemoryStatus.REVIEW_REQUIRED.value]
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            parameters.append(user_id)
+        if platform_id is not None:
+            clauses.append("platform_id = ?")
+            parameters.append(platform_id)
+        if user_persona_id is not None:
+            clauses.append("user_persona_id IS ?")
+            parameters.append(user_persona_id)
+        if character_id is not None:
+            clauses.append("character_id IS ?")
+            parameters.append(character_id)
+        if category is not None:
+            clauses.append("memory_category = ?")
+            parameters.append(MemoryCategory(category).value)
+        if ingest_origin is not None:
+            clauses.append("json_extract(payload_json, '$.ingest_origin') = ?")
+            parameters.append(ingest_origin)
+        cursor = await connection.execute(
+            """
+            SELECT *
+            FROM memory_objects
+            WHERE {clauses}
+            ORDER BY created_at ASC, _rowid ASC
+            LIMIT ?
+            OFFSET ?
+            """.format(clauses=" AND ".join(clauses)),
+            (*parameters, max(1, min(limit, 500)), max(0, offset)),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        await cursor.close()
+        return [Atagia._review_memory_record(row) for row in rows]
+
+    @staticmethod
+    def _review_memory_record(row: dict[str, Any]) -> dict[str, Any]:
+        payload = row.get("payload_json")
+        if isinstance(payload, str) and payload.strip():
+            decoded = json_utils.loads(payload)
+            payload = decoded if isinstance(decoded, dict) else {}
+        elif not isinstance(payload, dict):
+            payload = {}
+        source_message_ids = payload.get("source_message_ids")
+        if not isinstance(source_message_ids, list):
+            source_message_ids = []
+        return {
+            "memory_id": str(row["id"]),
+            "user_id": str(row["user_id"]),
+            "conversation_id": row.get("conversation_id"),
+            "user_persona_id": row.get("user_persona_id"),
+            "platform_id": row.get("platform_id"),
+            "character_id": row.get("character_id"),
+            "mode": row.get("assistant_mode_id"),
+            "object_type": str(row["object_type"]),
+            "category": str(row["memory_category"]),
+            "scope": str(row["scope"]),
+            "scope_canonical": row.get("scope_canonical"),
+            "sensitivity": str(row.get("sensitivity") or "unknown"),
+            "privacy_level": int(row["privacy_level"]),
+            "confidence": float(row["confidence"]),
+            "canonical_text": str(row["canonical_text"]),
+            "index_text": row.get("index_text"),
+            "review_reason": payload.get("review_reason"),
+            "ingest_origin": payload.get("ingest_origin"),
+            "confirmation_strategy": payload.get("confirmation_strategy"),
+            "source_message_ids": [str(item) for item in source_message_ids],
+            "payload": payload,
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }

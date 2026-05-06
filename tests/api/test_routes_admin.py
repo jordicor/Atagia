@@ -17,7 +17,13 @@ from atagia.core.consequence_repository import ConsequenceRepository
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.summary_repository import SummaryRepository
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
+from atagia.models.schemas_memory import (
+    MemoryCategory,
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    MemoryStatus,
+)
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -149,6 +155,8 @@ def _settings(tmp_path: Path) -> Settings:
         llm_ingest_model="openai/chat-test-model",
         llm_retrieval_model="openai/score-test-model",
         llm_component_models={"intent_classifier": "openai/classify-test-model"},
+        artifact_blob_storage_kind="local_file",
+        artifact_blob_storage_path=str(tmp_path / "artifact-blobs"),
         service_mode=True,
         service_api_key="service-key",
         admin_api_key="admin-key",
@@ -164,6 +172,112 @@ def _connection(client: TestClient):
         yield connection
     finally:
         client.portal.call(connection.close)
+
+
+def test_admin_worker_control_modes_are_persisted(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    headers = {"Authorization": "Bearer admin-key"}
+    with TestClient(app) as client:
+        default_response = client.get("/v1/admin/worker-control", headers=headers)
+        assert default_response.status_code == 200
+        assert default_response.json()["mode"] == "active"
+        assert default_response.json()["new_source_jobs_allowed"] is True
+
+        pause_response = client.post(
+            "/v1/admin/worker-control",
+            headers=headers,
+            json={"mode": "pause_new_jobs", "reason": "backup"},
+        )
+        assert pause_response.status_code == 200
+        pause_payload = pause_response.json()
+        assert pause_payload["mode"] == "pause_new_jobs"
+        assert pause_payload["new_source_jobs_allowed"] is False
+        assert pause_payload["worker_claims_allowed"] is True
+        assert pause_payload["periodic_work_allowed"] is False
+
+        hard_response = client.post(
+            "/v1/admin/worker-control",
+            headers=headers,
+            json={"mode": "hard_pause", "reason": "restore"},
+        )
+        assert hard_response.status_code == 200
+        hard_payload = hard_response.json()
+        assert hard_payload["mode"] == "hard_pause"
+        assert hard_payload["worker_claims_allowed"] is False
+
+        drain_response = client.post(
+            "/v1/admin/worker-control",
+            headers=headers,
+            json={"mode": "drain_and_pause", "timeout_seconds": 0.1},
+        )
+        assert drain_response.status_code == 200
+        drain_payload = drain_response.json()
+        assert drain_payload["mode"] == "drain_and_pause"
+        assert drain_payload["new_source_jobs_allowed"] is False
+        assert drain_payload["drain_completed"] is False
+
+
+def test_admin_can_list_and_archive_review_required_memory(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    headers = {"Authorization": "Bearer admin-key"}
+    with TestClient(app) as client:
+        with _connection(client) as connection:
+            clock = client.app.state.runtime.clock
+            users = UserRepository(connection, clock)
+            conversations = ConversationRepository(connection, clock)
+            memories = MemoryObjectRepository(connection, clock)
+            client.portal.call(users.create_user, "usr_1")
+            client.portal.call(
+                lambda: conversations.create_conversation(
+                    "cnv_1",
+                    "usr_1",
+                    None,
+                    "personal_assistant",
+                    "Review Chat",
+                    platform_id="aurvek",
+                )
+            )
+            client.portal.call(
+                lambda: memories.create_memory_object(
+                    memory_id="mem_review_route",
+                    user_id="usr_1",
+                    conversation_id="cnv_1",
+                    assistant_mode_id="personal_assistant",
+                    object_type=MemoryObjectType.EVIDENCE,
+                    scope=MemoryScope.USER,
+                    canonical_text="Imported bank PIN: 4512",
+                    index_text="bank PIN",
+                    payload={
+                        "ingest_origin": "backfill",
+                        "confirmation_strategy": "admin_review_only",
+                        "review_reason": "confirmation_not_allowed_for_ingest_origin",
+                        "source_message_ids": ["aurvek:msg:4512"],
+                    },
+                    source_kind=MemorySourceKind.EXTRACTED,
+                    confidence=0.97,
+                    privacy_level=3,
+                    memory_category=MemoryCategory.PIN_OR_PASSWORD,
+                    preserve_verbatim=True,
+                    status=MemoryStatus.REVIEW_REQUIRED,
+                    platform_id="aurvek",
+                )
+            )
+
+        listed = client.get(
+            "/v1/admin/memory-review",
+            headers=headers,
+            params={"platform_id": "aurvek", "ingest_origin": "backfill"},
+        )
+        archived = client.post(
+            "/v1/admin/memory-review/usr_1/mem_review_route/archive",
+            headers=headers,
+        )
+
+        assert listed.status_code == 200
+        assert listed.json()["items"][0]["memory_id"] == "mem_review_route"
+        assert listed.json()["items"][0]["source_message_ids"] == ["aurvek:msg:4512"]
+        assert archived.status_code == 200
+        assert archived.json()["status"] == MemoryStatus.ARCHIVED.value
 
 
 def test_admin_routes_require_admin_key_and_can_inspect_retrieval_event(tmp_path: Path) -> None:
@@ -424,6 +538,95 @@ def test_admin_lifecycle_route_invalidates_cache_for_affected_users(tmp_path: Pa
             }
 
 
+def test_admin_lifecycle_expires_idle_temporary_conversations(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime
+        runtime.clock = FrozenClock(datetime(2026, 4, 10, 10, 0, tzinfo=timezone.utc))
+        with _connection(client) as connection:
+            users = UserRepository(connection, runtime.clock)
+            conversations = ConversationRepository(connection, runtime.clock)
+            messages = MessageRepository(connection, runtime.clock)
+            client.portal.call(users.create_user, "usr_1")
+            client.portal.call(
+                conversations.create_conversation,
+                "cnv_close",
+                "usr_1",
+                None,
+                "coding_debug",
+                "Close",
+                None,
+                True,
+                3600,
+                False,
+            )
+            client.portal.call(
+                conversations.create_conversation,
+                "cnv_purge",
+                "usr_1",
+                None,
+                "coding_debug",
+                "Purge",
+                None,
+                True,
+                3600,
+                True,
+            )
+            client.portal.call(messages.create_message, "msg_purge", "cnv_purge", "user", 1, "Temp", 1, {})
+            stored_blob = runtime.artifact_blob_store.store_bytes(
+                user_id="usr_1",
+                content_bytes=b"queued cleanup",
+            )
+            client.portal.call(
+                connection.execute,
+                """
+                INSERT INTO pending_file_deletions(
+                    id,
+                    storage_uri,
+                    storage_root,
+                    sha256,
+                    reason,
+                    tombstone_id,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, 'user_erasure', ?, ?)
+                """,
+                (
+                    "pfd_retry",
+                    stored_blob.storage_uri,
+                    str(runtime.artifact_blob_store.base_dir),
+                    stored_blob.sha256,
+                    "tmb_retry",
+                    runtime.clock.now().isoformat(),
+                ),
+            )
+            client.portal.call(connection.commit)
+
+        runtime.clock = FrozenClock(datetime(2026, 4, 10, 12, 1, tzinfo=timezone.utc))
+        response = client.post(
+            "/v1/admin/lifecycle/run",
+            headers={"Authorization": "Bearer admin-key"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["expired_temporary_conversations_count"] == 2
+        assert response.json()["processed_pending_file_deletions_count"] == 1
+        assert not Path(stored_blob.storage_uri).exists()
+        with _connection(client) as connection:
+            conversations = ConversationRepository(connection, runtime.clock)
+            close_row = client.portal.call(conversations.get_conversation, "cnv_close", "usr_1")
+            purge_row = client.portal.call(conversations.get_conversation, "cnv_purge", "usr_1")
+            assert close_row["status"] == "closed"
+            assert purge_row is None
+            remaining_messages = client.portal.call(
+                lambda: connection.execute_fetchall(
+                    "SELECT id FROM messages WHERE conversation_id = ?",
+                    ("cnv_purge",),
+                )
+            )
+            assert remaining_messages == []
+
+
 def test_admin_can_list_consequence_chains(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
@@ -566,6 +769,7 @@ def test_admin_can_compact_conversation_and_workspace(tmp_path: Path) -> None:
                     "user_id": "usr_1",
                     "assistant_mode_id": "coding_debug",
                     "workspace_id": workspace["id"],
+                    "platform_id": "web",
                     "title": "Chat",
                     "metadata": {},
                 },
@@ -593,7 +797,8 @@ def test_admin_can_compact_conversation_and_workspace(tmp_path: Path) -> None:
             summaries = SummaryRepository(connection, runtime.clock)
             workspace_summary = client.portal.call(summaries.get_summary, workspace_summary_id, "usr_1")
             assert workspace_summary is not None
-            assert workspace_summary["summary_kind"] == "workspace_rollup"
+            assert workspace_summary["summary_kind"] == "character_rollup"
+            assert workspace_summary["character_id"] == workspace["id"]
             assert workspace_summary["summary_text"] == "Workspace prefers patch-first debugging."
 
 

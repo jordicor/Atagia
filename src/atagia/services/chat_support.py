@@ -19,7 +19,7 @@ from atagia.memory.operational_profile import (
     OperationalProfileLoader,
     OperationalTrustPolicy,
 )
-from atagia.memory.policy_manifest import PolicyResolver, ResolvedPolicy
+from atagia.memory.policy_manifest import PolicyResolver, ResolvedRetrievalPolicy
 from atagia.models.schemas_api import (
     MemorySummary,
     RecentTranscriptEntry,
@@ -34,16 +34,26 @@ from atagia.models.schemas_jobs import (
     MessageJobPayload,
 )
 from atagia.models.schemas_memory import (
+    ConfirmationStrategy,
     ExtractionContextMessage,
     ExtractionConversationContext,
+    IngestOrigin,
+    MemoryPrivacyMode,
+    MemoryScope,
     OperationalProfileSnapshot,
     OperationalSignals,
     RawContextAccessMode,
     ResolvedOperationalProfile,
+    resolve_confirmation_strategy,
+    resolve_memory_privacy_mode,
 )
 from atagia.models.schemas_replay import PipelineResult
-from atagia.services.errors import AssistantModeMismatchError, UnknownAssistantModeError
+from atagia.services.errors import UnknownAssistantModeError
+from atagia.services.job_tracking_service import (
+    JobTrackingService,
+)
 from atagia.services.model_resolution import resolve_component_model
+from atagia.services.worker_control_service import WorkerControlService
 
 DEFAULT_ASSISTANT_MODE_ID = "general_qa"
 RECENT_CONTEXT_MESSAGES = 6
@@ -173,30 +183,26 @@ class RecentTranscriptWindow:
     trace: RecentTranscriptTrace
 
 
-def resolve_assistant_mode_id(
-    conversation_mode_id: str,
-    requested_mode_id: str | None,
+def resolve_retrieval_profile_id(
+    default_profile_id: str,
+    requested_profile_id: str | None,
 ) -> str:
-    """Return the active assistant mode, rejecting conflicting overrides."""
-    if requested_mode_id is None:
-        return conversation_mode_id
-    if requested_mode_id != conversation_mode_id:
-        raise AssistantModeMismatchError(
-            "Requested assistant mode does not match the existing conversation mode"
-        )
-    return requested_mode_id
+    """Return the requested retrieval profile or the conversation default."""
+    if requested_profile_id is None:
+        return default_profile_id
+    return requested_profile_id
 
 
 def resolve_policy(
     manifests: dict[str, Any],
-    assistant_mode_id: str,
+    profile_id: str,
     policy_resolver: PolicyResolver,
     operational_profile: ResolvedOperationalProfile | None = None,
-) -> ResolvedPolicy:
-    """Resolve the active assistant mode policy."""
-    manifest = manifests.get(assistant_mode_id)
+) -> ResolvedRetrievalPolicy:
+    """Resolve the active retrieval profile."""
+    manifest = manifests.get(profile_id)
     if manifest is None:
-        raise UnknownAssistantModeError(f"Unknown assistant mode: {assistant_mode_id}")
+        raise UnknownAssistantModeError(f"Unknown retrieval profile: {profile_id}")
     return policy_resolver.resolve(
         manifest,
         None,
@@ -204,6 +210,24 @@ def resolve_policy(
         operational_profile.policy_override
         if operational_profile is not None
         else None,
+    )
+
+
+def apply_conversation_policy_overlay(
+    resolved_policy: ResolvedRetrievalPolicy,
+    conversation: dict[str, Any],
+) -> ResolvedRetrievalPolicy:
+    """Apply conversation-local policy restrictions."""
+    if not bool(conversation.get("temporary")) and not bool(conversation.get("isolated_mode")):
+        return resolved_policy
+    return resolved_policy.model_copy(
+        update={
+            "cross_chat_allowed": False,
+            "allowed_scopes": [
+                MemoryScope.CONVERSATION,
+                MemoryScope.EPHEMERAL_SESSION,
+            ],
+        }
     )
 
 
@@ -291,27 +315,18 @@ def render_topic_working_set_block(
     snapshot: Any,
     *,
     allow_intimacy_context: bool = False,
+    privacy_ceiling: int | None = None,
 ) -> str:
     """Render Topic Working Set orientation for assistant prompts."""
-    payload = _topic_snapshot_payload(snapshot)
+    payload = filter_topic_working_set_snapshot(
+        snapshot,
+        allow_intimacy_context=allow_intimacy_context,
+        privacy_ceiling=privacy_ceiling,
+    )
     if not payload:
         return ""
-    active = [
-        topic
-        for topic in list(payload.get("active_topics") or [])
-        if _topic_allowed_by_intimacy_boundary(
-            topic,
-            allow_intimacy_context=allow_intimacy_context,
-        )
-    ]
-    parked = [
-        topic
-        for topic in list(payload.get("parked_topics") or [])
-        if _topic_allowed_by_intimacy_boundary(
-            topic,
-            allow_intimacy_context=allow_intimacy_context,
-        )
-    ]
+    active = list(payload.get("active_topics") or [])
+    parked = list(payload.get("parked_topics") or [])
     if not active and not parked:
         return ""
 
@@ -360,6 +375,42 @@ def render_topic_working_set_block(
     return "\n".join(lines)
 
 
+def filter_topic_working_set_snapshot(
+    snapshot: Any,
+    *,
+    allow_intimacy_context: bool = False,
+    privacy_ceiling: int | None = None,
+) -> dict[str, Any]:
+    """Return a prompt-safe topic snapshot under the active policy ceiling."""
+    payload = _topic_snapshot_payload(snapshot)
+    if not payload:
+        return {}
+    active = [
+        topic
+        for topic in list(payload.get("active_topics") or [])
+        if _topic_allowed_by_policy(
+            topic,
+            allow_intimacy_context=allow_intimacy_context,
+            privacy_ceiling=privacy_ceiling,
+        )
+    ]
+    parked = [
+        topic
+        for topic in list(payload.get("parked_topics") or [])
+        if _topic_allowed_by_policy(
+            topic,
+            allow_intimacy_context=allow_intimacy_context,
+            privacy_ceiling=privacy_ceiling,
+        )
+    ]
+    freshness = payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
+    return {
+        "active_topics": active,
+        "parked_topics": parked,
+        "freshness": dict(freshness),
+    }
+
+
 def _topic_snapshot_payload(snapshot: Any) -> dict[str, Any]:
     if snapshot is None:
         return {}
@@ -370,6 +421,27 @@ def _topic_snapshot_payload(snapshot: Any) -> dict[str, Any]:
         dumped = model_dump(mode="json")
         return dumped if isinstance(dumped, dict) else {}
     return {}
+
+
+def _topic_allowed_by_policy(
+    topic: dict[str, Any],
+    *,
+    allow_intimacy_context: bool,
+    privacy_ceiling: int | None,
+) -> bool:
+    if str(topic.get("sensitivity") or "unknown") != "public":
+        return False
+    if privacy_ceiling is not None:
+        try:
+            topic_privacy_level = int(topic.get("privacy_level") or 0)
+        except (TypeError, ValueError):
+            topic_privacy_level = 0
+        if topic_privacy_level > privacy_ceiling:
+            return False
+    return _topic_allowed_by_intimacy_boundary(
+        topic,
+        allow_intimacy_context=allow_intimacy_context,
+    )
 
 
 def _topic_allowed_by_intimacy_boundary(
@@ -462,6 +534,13 @@ def _build_placeholder_text(message: dict[str, Any]) -> str:
     )
 
 
+def message_text_for_context(message: dict[str, Any]) -> str:
+    """Return safe prompt text for a stored message."""
+    if _message_should_skip_by_default(message):
+        return _build_placeholder_text(message)
+    return str(message.get("text") or "")
+
+
 def format_chunk_summary(chunk: dict[str, Any]) -> str:
     """Wrap a chunk summary in a rigid historical-context envelope."""
     summary_text = str(chunk.get("summary_text", ""))
@@ -485,7 +564,8 @@ def build_transcript_window(
     allow_intimacy_context: bool = False,
 ) -> list[TranscriptEntry]:
     """Build a token-budgeted transcript window over prior conversation history."""
-    _ = raw_context_access_mode
+    normalized_raw_mode = _normalize_raw_context_access_mode(raw_context_access_mode)
+    allow_skipped_raw = normalized_raw_mode in {"skipped_raw", "verbatim"}
     eligible_chunks = [
         chunk
         for chunk in chunks
@@ -516,9 +596,9 @@ def build_transcript_window(
     for message in messages:
         if int(message["seq"]) in covered_seqs:
             continue
-        if not _message_should_skip_by_default(message):
+        if not _message_should_skip_by_default(message) or allow_skipped_raw:
             continue
-        entry = _transcript_entry_for_message(message)
+        entry = _transcript_entry_for_message(message, allow_skipped_raw=allow_skipped_raw)
         if entry.seq in seen_seqs:
             continue
         entries.append(entry)
@@ -530,7 +610,7 @@ def build_transcript_window(
         seq = int(message["seq"])
         if seq in seen_seqs:
             continue
-        entry = _transcript_entry_for_message(message)
+        entry = _transcript_entry_for_message(message, allow_skipped_raw=allow_skipped_raw)
         entries.append(entry)
         seen_seqs.add(entry.seq)
         remaining_tokens -= entry.token_estimate
@@ -543,7 +623,7 @@ def build_transcript_window(
     ]
 
     for message in reversed(uncovered_messages):
-        entry = _transcript_entry_for_message(message)
+        entry = _transcript_entry_for_message(message, allow_skipped_raw=allow_skipped_raw)
         if entry.token_estimate > remaining_tokens:
             continue
         entries.append(entry)
@@ -571,7 +651,10 @@ def build_transcript_window(
         expected_count = len(
             [seq for seq in range(chunk_start, chunk_end + 1) if seq not in seen_seqs]
         )
-        raw_entries = [_transcript_entry_for_message(message) for message in chunk_messages]
+        raw_entries = [
+            _transcript_entry_for_message(message, allow_skipped_raw=allow_skipped_raw)
+            for message in chunk_messages
+        ]
         raw_tokens = sum(entry.token_estimate for entry in raw_entries)
 
         if (
@@ -609,8 +692,12 @@ def _summary_chunk_allowed_by_intimacy_boundary(
     )
 
 
-def _transcript_entry_for_message(message: dict[str, Any]) -> RawMessage | PlaceholderMessage:
-    if _message_should_skip_by_default(message):
+def _transcript_entry_for_message(
+    message: dict[str, Any],
+    *,
+    allow_skipped_raw: bool = False,
+) -> RawMessage | PlaceholderMessage:
+    if _message_should_skip_by_default(message) and not allow_skipped_raw:
         return PlaceholderMessage(message, _build_placeholder_text(message))
     return RawMessage(message)
 
@@ -924,12 +1011,13 @@ def _message_token_estimate(message: dict[str, Any]) -> int:
 
 def build_system_prompt(
     assistant_mode_id: str,
-    resolved_policy: ResolvedPolicy,
+    resolved_policy: ResolvedRetrievalPolicy,
     contract_block: str,
     workspace_block: str,
     memory_block: str,
     state_block: str,
     topic_context_block: str = "",
+    memory_processing_block: str = "",
     recent_transcript_block: str = "",
     assistant_guidance_block: str = "",
     current_user_display_name: str | None = None,
@@ -958,6 +1046,29 @@ def build_system_prompt(
             "object descriptions, and phrases."
         ),
         (
+            "When retrieved memories conflict on an exact fact, prefer direct "
+            "user source_quote or source_excerpt wording first, then active "
+            "beliefs with the same source support, then unsupported paraphrases "
+            "or summaries. Do not let a paraphrase without source_quote override "
+            "a direct quote. If the conflict remains unresolved, say it is "
+            "ambiguous and show the competing values."
+        ),
+        (
+            "A retrieved memory saying that someone was called, addressed as, "
+            "mislabeled as, nicknamed, or confused with a name is not evidence "
+            "of their legal/full/true name when a direct quote or active belief "
+            "states a different legal/full/true name. Treat it as an alias, "
+            "nickname, or misidentification unless the source explicitly says "
+            "it is the person's true name."
+        ),
+        (
+            "When answering about multiple people, places, or objects, bind "
+            "each relationship, event, address, preference, or attribute to "
+            "the specific entity supported by the retrieved context. Do not "
+            "apply a fact retrieved for one listed entity to another listed "
+            "entity unless the context explicitly says it applies to both."
+        ),
+        (
             "When listing items from memory (hobbies, activities, preferences, "
             "possessions, events), include all distinct items found across the "
             "retrieved memories, including lower-ranked entries and artifact "
@@ -968,11 +1079,24 @@ def build_system_prompt(
             "When the question asks for a specific fact, answer with the best "
             "available evidence from the retrieved context. If the exact answer "
             "is present, give it directly. If only adjacent or partial evidence "
-            "is present, you may combine and infer from that evidence — name "
-            "the entity (book, place, person, date, etc.) the user is asking "
-            "about whenever it is named anywhere in the retrieved context, "
-            "even if the linkage to the question phrasing is implicit. Only say "
-            "you do not have that information when the retrieved context truly "
+            "is present, you may combine evidence from the retrieved context, "
+            "but mark uncertain links as uncertain. Do not supply meanings, "
+            "etymologies, personal relationships, identities, causes, dates, "
+            "numbers, or exact labels from world knowledge or unstated "
+            "assumptions; those facts need explicit retrieved support. Do not "
+            "infer that a name, handle, brand, or nickname derives from a "
+            "legal name, surname, or substring merely because the spelling "
+            "overlaps; describe it as a coincidence or unsupported inference "
+            "unless the retrieved source explicitly states the origin. Treat a "
+            "name's meaning, origin, and reason for choosing it as separate "
+            "facts. If retrieved context only places an alias near a full or "
+            "legal name, that supports the alias and the legal name, not that "
+            "the alias is shortened from the legal name. When origin is not "
+            "explicitly supported, say what is explicitly supported and state "
+            "that the origin is not in the retrieved evidence. Do not "
+            "resolve ambiguous pronouns into a specific person unless the "
+            "retrieved context clearly supports that resolution. Only say you "
+            "do not have that information when the retrieved context truly "
             "lacks any evidence about the asked entity. For medical, legal, "
             "financial, credential, or other clearly private details, do not "
             "substitute nearby or inferred facts."
@@ -1031,6 +1155,8 @@ def build_system_prompt(
         parts.append(render_prompt_data_section("workspace_context", workspace_block))
     if topic_context_block:
         parts.append(render_prompt_data_section("topic_context", topic_context_block))
+    if memory_processing_block:
+        parts.append(render_prompt_data_section("memory_processing_status", memory_processing_block))
     if recent_transcript_block:
         parts.append(recent_transcript_block)
     if memory_block:
@@ -1057,10 +1183,24 @@ def build_job_payload(
         role=role,
         assistant_mode_id=conversation_context.assistant_mode_id,
         workspace_id=conversation_context.workspace_id,
+        user_persona_id=conversation_context.user_persona_id,
+        platform_id=conversation_context.platform_id,
+        character_id=conversation_context.character_id,
+        mode=conversation_context.mode,
+        incognito=conversation_context.incognito,
+        remember_across_chats=conversation_context.remember_across_chats,
+        remember_across_devices=conversation_context.remember_across_devices,
         recent_messages=[
             message.model_dump(mode="json")
             for message in conversation_context.recent_messages
         ],
+        temporary=conversation_context.temporary,
+        temporary_ttl_seconds=conversation_context.temporary_ttl_seconds,
+        purge_on_close=conversation_context.purge_on_close,
+        isolated_mode=conversation_context.isolated_mode,
+        ingest_origin=conversation_context.ingest_origin,
+        confirmation_strategy=conversation_context.confirmation_strategy,
+        memory_privacy_mode=conversation_context.memory_privacy_mode,
     )
 
 
@@ -1075,15 +1215,46 @@ def build_message_jobs(
     role: str,
     include_contract_projection: bool | None = None,
     operational_profile: OperationalProfileSnapshot | None = None,
+    memory_preferences: dict[str, Any] | None = None,
+    ingest_origin: IngestOrigin | str | None = None,
+    confirmation_strategy: ConfirmationStrategy | str | None = None,
+    memory_privacy_mode: MemoryPrivacyMode | str | None = None,
 ) -> list[tuple[str, JobEnvelope]]:
     """Build stream jobs for one persisted message."""
+    preferences = memory_preferences or {}
+    resolved_platform_id = str(conversation.get("platform_id") or "default")
+    resolved_character_id = conversation.get("character_id")
+    if resolved_character_id is None:
+        resolved_character_id = conversation.get("workspace_id")
+    resolved_incognito = bool(conversation.get("incognito")) or bool(
+        conversation.get("isolated_mode")
+    )
     conversation_context = ExtractionConversationContext(
         user_id=str(conversation["user_id"]),
         conversation_id=str(conversation["id"]),
         source_message_id=message_id,
         workspace_id=conversation["workspace_id"],
         assistant_mode_id=str(conversation["assistant_mode_id"]),
+        user_persona_id=conversation.get("user_persona_id"),
+        platform_id=resolved_platform_id,
+        character_id=resolved_character_id,
+        mode=str(conversation.get("mode") or conversation["assistant_mode_id"]),
+        incognito=resolved_incognito,
+        remember_across_chats=bool(preferences.get("remember_across_chats", True)),
+        remember_across_devices=bool(preferences.get("remember_across_devices", True)),
         recent_messages=recent_context(prior_messages),
+        temporary=bool(conversation.get("temporary")),
+        temporary_ttl_seconds=conversation.get("temporary_ttl_seconds"),
+        purge_on_close=bool(conversation.get("purge_on_close")),
+        isolated_mode=bool(conversation.get("isolated_mode")),
+        ingest_origin=ingest_origin or IngestOrigin.LIVE_TURN,
+        confirmation_strategy=resolve_confirmation_strategy(
+            ingest_origin=ingest_origin,
+            confirmation_strategy=confirmation_strategy,
+        ),
+        memory_privacy_mode=resolve_memory_privacy_mode(
+            memory_privacy_mode or preferences.get("memory_privacy_mode")
+        ),
     )
     payload = build_job_payload(
         conversation_context=conversation_context,
@@ -1131,11 +1302,25 @@ async def enqueue_message_jobs(
     *,
     storage_backend: Any,
     jobs: list[tuple[str, JobEnvelope]],
+    job_tracking_service: JobTrackingService | None = None,
+    worker_control_service: WorkerControlService | None = None,
 ) -> list[str]:
     """Enqueue message-derived worker jobs and return their job identifiers."""
+    if (
+        worker_control_service is not None
+        and not await worker_control_service.allows_new_source_jobs()
+    ):
+        return []
     job_ids: list[str] = []
     for stream_name, job in jobs:
-        await storage_backend.stream_add(stream_name, job.model_dump(mode="json"))
+        if job_tracking_service is not None:
+            await job_tracking_service.create_queued_job(stream_name, job)
+        try:
+            await storage_backend.stream_add(stream_name, job.model_dump(mode="json"))
+        except Exception as exc:
+            if job_tracking_service is not None:
+                await job_tracking_service.mark_enqueue_failed(job, exc)
+            raise
         job_ids.append(job.job_id)
     return job_ids
 

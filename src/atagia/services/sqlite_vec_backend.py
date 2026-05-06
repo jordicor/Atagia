@@ -27,6 +27,17 @@ def compose_embedding_text(canonical_text: str, index_text: Any | None) -> str:
     return f"{canonical_text}\n{normalized_index_text}"
 
 
+def _canonical_metadata_scope(scope: object) -> str:
+    value = str(scope or "").strip()
+    if value in {"conversation", "ephemeral_session", "chat"}:
+        return "chat"
+    if value in {"workspace", "character"}:
+        return "character"
+    if value in {"global_user", "assistant_mode", "user"}:
+        return "user"
+    return value
+
+
 class SQLiteVecBackend(EmbeddingIndex):
     """Embedding index backed by sqlite-vec virtual tables."""
 
@@ -111,7 +122,7 @@ class SQLiteVecBackend(EmbeddingIndex):
                     memory_id,
                     str(metadata["user_id"]),
                     str(metadata["object_type"]),
-                    str(metadata["scope"]),
+                    _canonical_metadata_scope(metadata["scope"]),
                     str(metadata.get("created_at", "")),
                 ),
             )

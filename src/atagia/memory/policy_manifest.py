@@ -1,4 +1,4 @@
-"""Assistant mode manifest loading, resolution, and database syncing."""
+"""Retrieval profile loading, resolution, and legacy database syncing."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.core.canonical import canonical_json_bytes, canonical_json_hash
 from atagia.models.schemas_memory import (
-    AssistantModeId,
-    AssistantModeManifest,
+    RetrievalProfileId,
+    RetrievalProfileManifest,
     ContextCachePolicy,
     MemoryObjectType,
     MemoryScope,
@@ -22,7 +22,13 @@ from atagia.models.schemas_memory import (
     RetrievalParams,
 )
 
-EXPECTED_ASSISTANT_MODE_IDS = frozenset(mode.value for mode in AssistantModeId)
+EXPECTED_RETRIEVAL_PROFILE_IDS = frozenset(profile.value for profile in RetrievalProfileId)
+DEFAULT_RETRIEVAL_SCOPE_FILTER = [
+    MemoryScope.GLOBAL_USER,
+    MemoryScope.WORKSPACE,
+    MemoryScope.CONVERSATION,
+    MemoryScope.EPHEMERAL_SESSION,
+]
 
 
 def _ensure_unique_values[T](values: list[T]) -> list[T]:
@@ -31,11 +37,11 @@ def _ensure_unique_values[T](values: list[T]) -> list[T]:
     return values
 
 
-def _manifest_payload(manifest: AssistantModeManifest) -> dict[str, Any]:
+def _manifest_payload(manifest: RetrievalProfileManifest) -> dict[str, Any]:
     return manifest.model_dump(mode="json")
 
 
-def _manifest_json(manifest: AssistantModeManifest) -> str:
+def _manifest_json(manifest: RetrievalProfileManifest) -> str:
     return canonical_json_bytes(_manifest_payload(manifest)).decode("utf-8")
 
 
@@ -57,13 +63,11 @@ class RetrievalParamsOverride(BaseModel):
 
 
 class PolicyOverride(BaseModel):
-    """Workspace or conversation-level policy overrides."""
+    """Workspace or conversation-level retrieval-profile tuning overrides."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    cross_chat_allowed: bool | None = None
     allow_intimacy_context: bool | None = None
-    allowed_scopes: list[MemoryScope] | None = None
     preferred_memory_types: list[MemoryObjectType] | None = None
     need_triggers: list[NeedTrigger] | None = None
     contract_dimensions_priority: list[str] | None = None
@@ -71,13 +75,6 @@ class PolicyOverride(BaseModel):
     context_budget_tokens: int | None = Field(default=None, gt=0)
     transcript_budget_tokens: int | None = Field(default=None, gt=0)
     retrieval_params: RetrievalParamsOverride | None = None
-
-    @field_validator("allowed_scopes")
-    @classmethod
-    def validate_allowed_scopes(cls, values: list[MemoryScope] | None) -> list[MemoryScope] | None:
-        if values is None:
-            return values
-        return _ensure_unique_values(values)
 
     @field_validator("preferred_memory_types")
     @classmethod
@@ -106,12 +103,12 @@ class PolicyOverride(BaseModel):
         return _ensure_unique_values(values)
 
 
-class ResolvedPolicy(BaseModel):
-    """Fully resolved policy ready for retrieval planning."""
+class ResolvedRetrievalPolicy(BaseModel):
+    """Fully resolved retrieval profile ready for retrieval planning."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    assistant_mode_id: AssistantModeId
+    profile_id: RetrievalProfileId
     display_name: str
     prompt_hash: str
     cross_chat_allowed: bool
@@ -128,50 +125,50 @@ class ResolvedPolicy(BaseModel):
 
 
 class ManifestLoader:
-    """Filesystem-backed assistant mode manifest loader."""
+    """Filesystem-backed retrieval profile manifest loader."""
 
     def __init__(self, manifests_dir: Path) -> None:
         self._manifests_dir = manifests_dir
-        self._manifests: dict[str, AssistantModeManifest] = {}
+        self._manifests: dict[str, RetrievalProfileManifest] = {}
 
-    def load_all(self) -> dict[str, AssistantModeManifest]:
+    def load_all(self) -> dict[str, RetrievalProfileManifest]:
         if not self._manifests_dir.exists():
             raise FileNotFoundError(f"Missing manifests directory: {self._manifests_dir}")
 
-        manifests: dict[str, AssistantModeManifest] = {}
+        manifests: dict[str, RetrievalProfileManifest] = {}
         for path in sorted(self._manifests_dir.glob("*.json")):
             payload = json_utils.loads(path.read_text(encoding="utf-8"))
-            manifest = AssistantModeManifest.model_validate(payload)
+            manifest = RetrievalProfileManifest.model_validate(payload)
             manifest = manifest.model_copy(update={"prompt_hash": compute_prompt_hash(_manifest_payload(manifest))})
-            mode_id = manifest.assistant_mode_id.value
-            if mode_id in manifests:
-                raise ValueError(f"Duplicate manifest for assistant mode: {mode_id}")
-            manifests[mode_id] = manifest
+            profile_id = manifest.profile_id.value
+            if profile_id in manifests:
+                raise ValueError(f"Duplicate retrieval profile manifest: {profile_id}")
+            manifests[profile_id] = manifest
 
-        missing = EXPECTED_ASSISTANT_MODE_IDS - manifests.keys()
+        missing = EXPECTED_RETRIEVAL_PROFILE_IDS - manifests.keys()
         if missing:
-            missing_modes = ", ".join(sorted(missing))
-            raise ValueError(f"Missing assistant mode manifests: {missing_modes}")
+            missing_profiles = ", ".join(sorted(missing))
+            raise ValueError(f"Missing retrieval profile manifests: {missing_profiles}")
 
         self._manifests = manifests
         return dict(manifests)
 
-    def get(self, mode_id: str) -> AssistantModeManifest:
+    def get(self, mode_id: str) -> RetrievalProfileManifest:
         if not self._manifests:
             self.load_all()
         return self._manifests[mode_id]
 
 
 class PolicyResolver:
-    """Merge assistant mode policies with workspace and conversation overrides."""
+    """Merge retrieval profile tuning with runtime overrides."""
 
     def resolve(
         self,
-        manifest: AssistantModeManifest,
+        manifest: RetrievalProfileManifest,
         workspace_override: dict[str, Any] | None,
         conversation_override: dict[str, Any] | None,
         operational_override: OperationalPolicyOverride | dict[str, Any] | None = None,
-    ) -> ResolvedPolicy:
+    ) -> ResolvedRetrievalPolicy:
         workspace = PolicyOverride.model_validate(workspace_override or {})
         conversation = PolicyOverride.model_validate(conversation_override or {})
         operational = OperationalPolicyOverride.model_validate(operational_override or {})
@@ -181,26 +178,17 @@ class PolicyResolver:
             conversation.retrieval_params,
         )
 
-        return ResolvedPolicy(
-            assistant_mode_id=manifest.assistant_mode_id,
+        return ResolvedRetrievalPolicy(
+            profile_id=manifest.profile_id,
             display_name=manifest.display_name,
             prompt_hash=manifest.prompt_hash or compute_prompt_hash(_manifest_payload(manifest)),
-            cross_chat_allowed=self._resolve_cross_chat_allowed(
-                manifest.cross_chat_allowed,
-                workspace.cross_chat_allowed,
-                conversation.cross_chat_allowed,
-            ),
+            cross_chat_allowed=True,
             allow_intimacy_context=self._resolve_allow_intimacy_context(
                 manifest.allow_intimacy_context,
                 workspace.allow_intimacy_context,
                 conversation.allow_intimacy_context,
             ),
-            allowed_scopes=self._resolve_allowed_scopes(
-                manifest.allowed_scopes,
-                workspace.allowed_scopes,
-                conversation.allowed_scopes,
-                operational.allowed_scopes,
-            ),
+            allowed_scopes=list(DEFAULT_RETRIEVAL_SCOPE_FILTER),
             preferred_memory_types=self._pick_most_specific_list(
                 manifest.preferred_memory_types,
                 workspace.preferred_memory_types,
@@ -250,35 +238,12 @@ class PolicyResolver:
         )
 
     @staticmethod
-    def _resolve_cross_chat_allowed(
-        manifest_value: bool,
-        workspace_value: bool | None,
-        conversation_value: bool | None,
-    ) -> bool:
-        return manifest_value and (workspace_value is not False) and (conversation_value is not False)
-
-    @staticmethod
     def _resolve_allow_intimacy_context(
         manifest_value: bool,
         workspace_value: bool | None,
         conversation_value: bool | None,
     ) -> bool:
         return manifest_value and (workspace_value is not False) and (conversation_value is not False)
-
-    @staticmethod
-    def _resolve_allowed_scopes(
-        manifest_scopes: list[MemoryScope],
-        workspace_scopes: list[MemoryScope] | None,
-        conversation_scopes: list[MemoryScope] | None,
-        operational_scopes: list[MemoryScope] | None = None,
-    ) -> list[MemoryScope]:
-        allowed = list(manifest_scopes)
-        for override_scopes in (workspace_scopes, conversation_scopes, operational_scopes):
-            if override_scopes is None:
-                continue
-            override_set = set(override_scopes)
-            allowed = [scope for scope in allowed if scope in override_set]
-        return allowed
 
     @staticmethod
     def _resolve_privacy_ceiling(
@@ -369,24 +334,24 @@ class PolicyResolver:
         return RetrievalParams.model_validate(resolved)
 
 
-def compute_effective_policy_hash(resolved: ResolvedPolicy) -> str:
+def compute_effective_policy_hash(resolved: ResolvedRetrievalPolicy) -> str:
     """Compute a stable hash for the fully resolved runtime policy."""
     return canonical_json_hash(resolved.model_dump(mode="json", exclude={"prompt_hash"}))
 
 
 async def sync_assistant_modes(
     connection: aiosqlite.Connection,
-    manifests: dict[str, AssistantModeManifest],
+    manifests: dict[str, RetrievalProfileManifest],
     clock: Clock,
 ) -> None:
-    """Upsert assistant mode rows so the database matches manifest files."""
-    missing = EXPECTED_ASSISTANT_MODE_IDS - manifests.keys()
+    """Upsert legacy assistant_modes rows so the database matches profiles."""
+    missing = EXPECTED_RETRIEVAL_PROFILE_IDS - manifests.keys()
     if missing:
-        missing_modes = ", ".join(sorted(missing))
-        raise ValueError(f"Cannot sync assistant modes, missing manifests: {missing_modes}")
+        missing_profiles = ", ".join(sorted(missing))
+        raise ValueError(f"Cannot sync retrieval profiles, missing manifests: {missing_profiles}")
 
     timestamp = clock.now().isoformat()
-    for mode_id in sorted(EXPECTED_ASSISTANT_MODE_IDS):
+    for mode_id in sorted(EXPECTED_RETRIEVAL_PROFILE_IDS):
         manifest = manifests[mode_id]
         await connection.execute(
             """
@@ -424,7 +389,7 @@ async def load_and_sync_assistant_modes(
     connection: aiosqlite.Connection,
     manifests_dir: Path,
     clock: Clock,
-) -> dict[str, AssistantModeManifest]:
+) -> dict[str, RetrievalProfileManifest]:
     """Load manifests from disk and persist them into assistant_modes."""
     loader = ManifestLoader(manifests_dir)
     manifests = loader.load_all()

@@ -79,6 +79,7 @@ async def _create_memory_at(
     valid_to: str | None = None,
     temporal_type: str = "unknown",
     memory_category: MemoryCategory = MemoryCategory.UNKNOWN,
+    auto_expires: bool | None = None,
 ) -> dict[str, object]:
     original = clock.current
     clock.current = created_at
@@ -101,6 +102,7 @@ async def _create_memory_at(
             valid_to=valid_to,
             temporal_type=temporal_type,
             memory_category=memory_category,
+            auto_expires=auto_expires,
         )
     finally:
         clock.current = original
@@ -320,6 +322,32 @@ async def test_non_expired_state_snapshot_is_not_archived_by_low_value_sweep() -
 
 
 @pytest.mark.asyncio
+async def test_auto_expires_memory_with_expired_valid_to_is_deleted() -> None:
+    connection, clock, memories, _contracts = await _build_runtime()
+    try:
+        await _create_memory_at(
+            memories,
+            clock,
+            created_at=clock.now() - timedelta(minutes=10),
+            memory_id="mem_auto_expired",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Temporary chat-local evidence",
+            confidence=0.9,
+            vitality=0.9,
+            valid_to=(clock.now() - timedelta(minutes=1)).isoformat(),
+            auto_expires=True,
+        )
+
+        result = await MemoryLifecycleManager(connection, clock, _settings()).run_cycle()
+
+        assert result.deleted_count == 1
+        assert await memories.get_memory_object("mem_auto_expired", "usr_1") is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_expired_ephemeral_state_snapshot_is_archived() -> None:
     connection, clock, memories, _contracts = await _build_runtime()
     try:
@@ -445,7 +473,7 @@ async def test_contract_dimensions_cleanup_after_archive() -> None:
         )
         await contracts.upsert_projection(
             user_id="usr_1",
-            assistant_mode_id="coding_debug",
+            assistant_mode_id=None,
             workspace_id=None,
             conversation_id=None,
             scope=MemoryScope.ASSISTANT_MODE,
@@ -472,10 +500,11 @@ async def test_contract_dimensions_fall_back_to_best_remaining_active_memory() -
             created_at=clock.now() - timedelta(days=10),
             memory_id="mem_contract_primary",
             object_type=MemoryObjectType.INTERACTION_CONTRACT,
-            scope=MemoryScope.ASSISTANT_MODE,
+            scope=MemoryScope.GLOBAL_USER,
             canonical_text="User strongly prefers direct answers",
             confidence=0.2,
             vitality=0.04,
+            assistant_mode_id=None,
             conversation_id=None,
             payload={
                 "dimension_name": "directness",
@@ -488,10 +517,11 @@ async def test_contract_dimensions_fall_back_to_best_remaining_active_memory() -
             created_at=clock.now() - timedelta(days=1),
             memory_id="mem_contract_fallback",
             object_type=MemoryObjectType.INTERACTION_CONTRACT,
-            scope=MemoryScope.ASSISTANT_MODE,
+            scope=MemoryScope.GLOBAL_USER,
             canonical_text="User prefers direct answers",
             confidence=0.6,
             vitality=0.4,
+            assistant_mode_id=None,
             conversation_id=None,
             payload={
                 "dimension_name": "directness",
@@ -500,10 +530,10 @@ async def test_contract_dimensions_fall_back_to_best_remaining_active_memory() -
         )
         await contracts.upsert_projection(
             user_id="usr_1",
-            assistant_mode_id="coding_debug",
+            assistant_mode_id=None,
             workspace_id=None,
             conversation_id=None,
-            scope=MemoryScope.ASSISTANT_MODE,
+            scope=MemoryScope.GLOBAL_USER,
             dimension_name="directness",
             value_json={"label": "very_direct"},
             confidence=0.9,
@@ -544,6 +574,42 @@ async def test_dry_run_reports_changes_without_committing() -> None:
         assert memory is not None
         assert memory["status"] == MemoryStatus.ACTIVE.value
         assert memory["vitality"] == pytest.approx(0.04)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_purges_expired_tombstones() -> None:
+    connection, clock, _memories, _contracts = await _build_runtime()
+    try:
+        await connection.execute(
+            """
+            INSERT INTO deletion_tombstones(
+                id,
+                entity_type,
+                deleted_at,
+                deletion_reason,
+                deleted_by,
+                scope_summary
+            )
+            VALUES
+                ('tmb_old', 'conversation', ?, 'user_request', 'system', '{}'),
+                ('tmb_recent', 'user', ?, 'right_to_erasure', 'system', '{}')
+            """,
+            (
+                (clock.now() - timedelta(days=1826)).isoformat(),
+                (clock.now() - timedelta(days=10)).isoformat(),
+            ),
+        )
+        await connection.commit()
+
+        result = await MemoryLifecycleManager(connection, clock, _settings()).run_cycle()
+        rows = await connection.execute_fetchall(
+            "SELECT id FROM deletion_tombstones ORDER BY id ASC",
+        )
+
+        assert result.purged_tombstones_count == 1
+        assert [row["id"] for row in rows] == ["tmb_recent"]
     finally:
         await connection.close()
 

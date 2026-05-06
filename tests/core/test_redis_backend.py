@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
+import json
 from time import monotonic
 
 import pytest
@@ -169,6 +171,70 @@ class FakeRedisCacheClient:
         return None
 
 
+class FakeRedisPurgeClient:
+    def __init__(self) -> None:
+        self._lists: dict[str, list[str]] = {
+            "queue:dead_letter:atagia:extract": [
+                json.dumps({"payload": {"user_id": "usr_1", "conversation_id": "cnv_1"}}),
+                json.dumps({"payload": {"user_id": "usr_2", "conversation_id": "cnv_2"}}),
+            ]
+        }
+        self._streams: dict[str, list[tuple[str, dict[str, str]]]] = {
+            "atagia:extract": [
+                ("1-0", {"payload": json.dumps({"user_id": "usr_1", "conversation_id": "cnv_1"})}),
+                ("2-0", {"payload": json.dumps({"user_id": "usr_2", "conversation_id": "cnv_2"})}),
+            ]
+        }
+        self.acked: list[tuple[str, str, str]] = []
+        self.deleted: list[tuple[str, str]] = []
+
+    async def scan_iter(self, match: str = "*"):
+        for key in [*self._lists, *self._streams]:
+            if fnmatch.fnmatch(key, match):
+                yield key
+
+    async def lrange(self, key: str, start: int, end: int) -> list[str]:
+        del start, end
+        return list(self._lists.get(key, []))
+
+    async def delete(self, key: str) -> int:
+        if key in self._lists:
+            self._lists.pop(key, None)
+            return 1
+        return 0
+
+    async def rpush(self, key: str, *values: str) -> int:
+        self._lists.setdefault(key, []).extend(values)
+        return len(self._lists[key])
+
+    async def type(self, key: str) -> str:
+        if key in self._streams:
+            return "stream"
+        if key in self._lists:
+            return "list"
+        return "none"
+
+    async def xrange(self, key: str, start: str, end: str) -> list[tuple[str, dict[str, str]]]:
+        del start, end
+        return list(self._streams.get(key, []))
+
+    async def xinfo_groups(self, stream_name: str) -> list[dict[str, object]]:
+        del stream_name
+        return [{"name": "atagia-workers"}]
+
+    async def xack(self, stream_name: str, group_name: str, message_id: str) -> int:
+        self.acked.append((stream_name, group_name, message_id))
+        return 1
+
+    async def xdel(self, stream_name: str, message_id: str) -> int:
+        self.deleted.append((stream_name, message_id))
+        entries = self._streams.get(stream_name, [])
+        self._streams[stream_name] = [
+            entry for entry in entries if entry[0] != message_id
+        ]
+        return 1
+
+
 def _drain_backend(states: list[tuple[int, int]]) -> RedisBackend:
     backend = object.__new__(RedisBackend)
     backend._client = FakeRedisDrainClient(states)
@@ -179,6 +245,13 @@ def _drain_backend(states: list[tuple[int, int]]) -> RedisBackend:
 def _cache_backend() -> RedisBackend:
     backend = object.__new__(RedisBackend)
     backend._client = FakeRedisCacheClient()
+    backend._stream_groups = set()
+    return backend
+
+
+def _purge_backend() -> RedisBackend:
+    backend = object.__new__(RedisBackend)
+    backend._client = FakeRedisPurgeClient()
     backend._stream_groups = set()
     return backend
 
@@ -328,6 +401,21 @@ async def test_redis_backend_monotonic_publish_expires_user_index_members() -> N
     assert await backend.get_context_view("ctx:1") is None
     assert await backend._client.smembers("context_view_user:usr_1") == set()
     assert await backend.delete_context_views_for_user("usr_1") == 0
+
+
+@pytest.mark.asyncio
+async def test_redis_backend_purge_user_jobs_scans_persisted_streams_without_registered_groups() -> None:
+    backend = _purge_backend()
+
+    purged = await backend.purge_user_jobs("usr_1")
+
+    assert purged == 2
+    assert backend._client._lists["queue:dead_letter:atagia:extract"] == [
+        json.dumps({"payload": {"user_id": "usr_2", "conversation_id": "cnv_2"}})
+    ]
+    assert [message_id for message_id, _fields in backend._client._streams["atagia:extract"]] == ["2-0"]
+    assert backend._client.acked == [("atagia:extract", "atagia-workers", "1-0")]
+    assert backend._client.deleted == [("atagia:extract", "1-0")]
 
 
 @pytest.mark.asyncio

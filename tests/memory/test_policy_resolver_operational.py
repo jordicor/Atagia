@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from atagia.memory.policy_manifest import (
+    DEFAULT_RETRIEVAL_SCOPE_FILTER,
     ManifestLoader,
     PolicyResolver,
     PolicyOverride,
@@ -28,7 +31,6 @@ def test_operational_overlay_restricts_without_mutating_prompt_hash() -> None:
     resolved = resolver.resolve(
         manifest,
         workspace_override={
-            "allowed_scopes": ["workspace", "conversation"],
             "preferred_memory_types": ["evidence"],
             "privacy_ceiling": 0,
             "context_budget_tokens": 4000,
@@ -59,7 +61,7 @@ def test_operational_overlay_restricts_without_mutating_prompt_hash() -> None:
     assert compute_effective_policy_hash(resolved) != compute_effective_policy_hash(
         resolver.resolve(manifest, None, None)
     )
-    assert resolved.allowed_scopes == [MemoryScope.CONVERSATION]
+    assert resolved.allowed_scopes == DEFAULT_RETRIEVAL_SCOPE_FILTER
     assert resolved.preferred_memory_types == [MemoryObjectType.CONSEQUENCE_CHAIN]
     assert resolved.need_triggers[-1] is NeedTrigger.SENSITIVE_CONTEXT
     assert len(resolved.need_triggers) == len(set(resolved.need_triggers))
@@ -89,4 +91,10 @@ def test_operational_override_dict_is_accepted_by_policy_models() -> None:
         "need_triggers": ["ambiguity"],
         "context_budget_tokens": 1000,
     }
-    assert PolicyOverride.model_validate(payload).context_budget_tokens == 1000
+    with pytest.raises(ValueError):
+        PolicyOverride.model_validate(payload)
+
+    profile_tuning_payload = {
+        key: value for key, value in payload.items() if key != "allowed_scopes"
+    }
+    assert PolicyOverride.model_validate(profile_tuning_payload).context_budget_tokens == 1000

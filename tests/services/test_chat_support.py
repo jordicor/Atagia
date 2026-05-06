@@ -8,21 +8,49 @@ from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.services.chat_support import (
     ChunkSummary,
     RawMessage,
+    apply_conversation_policy_overlay,
     build_recent_transcript_guidance,
     build_recent_transcript_window,
     build_system_prompt,
     build_transcript_window,
     build_transcript_window_trace,
     estimate_tokens,
+    filter_topic_working_set_snapshot,
     format_chunk_summary,
     missing_uncovered_tail_start_seq,
     recent_context,
     render_recent_transcript_json_block,
     render_topic_working_set_block,
     render_transcript_window,
+    resolve_retrieval_profile_id,
 )
+from atagia.models.schemas_memory import MemoryScope
 
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+
+
+def test_requested_retrieval_profile_can_override_conversation_default() -> None:
+    assert (
+        resolve_retrieval_profile_id("coding_debug", "general_qa")
+        == "general_qa"
+    )
+    assert resolve_retrieval_profile_id("coding_debug", None) == "coding_debug"
+
+
+def test_isolated_conversation_policy_overlay_limits_scopes() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["coding_debug"]
+    resolved_policy = PolicyResolver().resolve(manifest, None, None)
+
+    isolated_policy = apply_conversation_policy_overlay(
+        resolved_policy,
+        {"temporary": 0, "isolated_mode": 1},
+    )
+
+    assert isolated_policy.cross_chat_allowed is False
+    assert isolated_policy.allowed_scopes == [
+        MemoryScope.CONVERSATION,
+        MemoryScope.EPHEMERAL_SESSION,
+    ]
 
 
 def _message(seq: int, *, role: str | None = None, text: str) -> dict[str, object]:
@@ -266,7 +294,7 @@ def test_context_placeholder_is_compact_when_host_supplies_long_value() -> None:
     assert len(rendered[0]["text"]) <= 300
 
 
-def test_build_transcript_window_blocks_raw_access_for_skipped_messages() -> (
+def test_build_transcript_window_allows_raw_access_for_skipped_raw_mode() -> (
     None
 ):
     messages = [
@@ -297,11 +325,10 @@ def test_build_transcript_window_blocks_raw_access_for_skipped_messages() -> (
     rendered = render_transcript_window(entries)
     trace = build_transcript_window_trace(entries, budget)
 
-    assert [entry["kind"] for entry in rendered] == ["raw", "raw", "raw", "placeholder"]
-    assert rendered[3]["text"].startswith("[Skipped message | id=msg_4 seq=4 role=user")
-    assert rendered[3]["text"] != messages[3]["text"]
-    assert trace["placeholder_message_seqs"] == [4]
-    assert trace["skipped_message_seqs"] == [4]
+    assert [entry["kind"] for entry in rendered] == ["raw", "raw", "raw", "raw"]
+    assert rendered[3]["text"] == messages[3]["text"]
+    assert trace["placeholder_message_seqs"] == []
+    assert trace["skipped_message_seqs"] == []
 
 
 def test_build_transcript_window_keeps_old_heavy_message_hidden_by_default() -> None:
@@ -366,8 +393,20 @@ def test_build_transcript_window_trace_and_system_prompt_include_summary_boundar
     assert "not as the event date when event_time" in prompt
     assert "last Saturday" in prompt
     assert "Calculate the actual calendar date when possible." in prompt
+    assert "bind each relationship, event, address, preference" in prompt
+    assert "unless the context explicitly says it applies to both" in prompt
     assert "include all distinct items found across the retrieved memories" in prompt
     assert "including lower-ranked entries and artifact snippets" in prompt
+    assert "When retrieved memories conflict on an exact fact" in prompt
+    assert "Do not let a paraphrase without source_quote override" in prompt
+    assert "mislabeled as, nicknamed, or confused with a name" in prompt
+    assert "Do not supply meanings, etymologies, personal relationships" in prompt
+    assert "from world knowledge or unstated assumptions" in prompt
+    assert "merely because the spelling overlaps" in prompt
+    assert "unless the retrieved source explicitly states the origin" in prompt
+    assert "Treat a name's meaning, origin, and reason for choosing it as separate facts" in prompt
+    assert "not that the alias is shortened from the legal name" in prompt
+    assert "Do not resolve ambiguous pronouns into a specific person" in prompt
     assert "do not substitute nearby or inferred facts" in prompt
     assert "you may use it inside that same active conversation/mode" in prompt
     assert "The current authenticated user is Alex Rivera." in prompt
@@ -394,12 +433,13 @@ def test_topic_working_set_block_renders_freshness_and_system_prompt_order() -> 
             "active_topics": [
                 {
                     "title": "Trip planning",
-                    "summary": "Current travel thread.",
-                    "active_goal": "Decide the next booking step.",
-                    "decisions": ["Keep Bangkok as the arrival city."],
-                    "open_questions": ["Which hotel is still pending?"],
-                }
-            ],
+                        "summary": "Current travel thread.",
+                        "active_goal": "Decide the next booking step.",
+                        "decisions": ["Keep Bangkok as the arrival city."],
+                        "open_questions": ["Which hotel is still pending?"],
+                        "sensitivity": "public",
+                    }
+                ],
             "parked_topics": [],
             "freshness": {
                 "status": "slightly_stale",
@@ -426,6 +466,43 @@ def test_topic_working_set_block_renders_freshness_and_system_prompt_order() -> 
     assert "Processed through message seq: 8" in topic_block
     assert prompt.index("<topic_context>") < prompt.index("<recent_transcript_json>")
     assert prompt.index("<recent_transcript_json>") < prompt.index("<retrieved_memory>")
+
+
+def test_topic_working_set_block_respects_privacy_ceiling() -> None:
+    snapshot = {
+        "active_topics": [
+            {
+                "title": "Visible planning",
+                "summary": "Low-sensitivity thread.",
+                "privacy_level": 1,
+                "sensitivity": "public",
+            },
+            {
+                "title": "Private finance",
+                "summary": "High-sensitivity thread.",
+                "privacy_level": 3,
+                "sensitivity": "secret",
+            },
+        ],
+        "parked_topics": [
+            {
+                "title": "Private health",
+                "summary": "High-sensitivity parked topic.",
+                "privacy_level": 3,
+                "sensitivity": "private",
+            }
+        ],
+        "freshness": {"status": "fresh"},
+    }
+
+    filtered = filter_topic_working_set_snapshot(snapshot, privacy_ceiling=1)
+    block = render_topic_working_set_block(snapshot, privacy_ceiling=1)
+
+    assert [topic["title"] for topic in filtered["active_topics"]] == ["Visible planning"]
+    assert filtered["parked_topics"] == []
+    assert "Visible planning" in block
+    assert "Private finance" not in block
+    assert "Private health" not in block
 
 
 def test_missing_uncovered_tail_start_seq_returns_none_when_recent_window_is_contiguous() -> (

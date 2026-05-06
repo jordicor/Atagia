@@ -308,6 +308,45 @@ async def test_create_memory_link_persists_valid_relation() -> None:
         assert row["relation_type"] == "supports"
         assert row["src_memory_id"] == "mem_source"
         assert row["dst_memory_id"] == "mem_target"
+        assert row["conversation_id"] == "cnv_1"
+        assert row["sensitivity"] == "public"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_create_memory_link_rejects_cross_chat_conversations() -> None:
+    connection, memories, beliefs = await _build_runtime()
+    try:
+        await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="First chat evidence",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            payload={},
+            memory_id="mem_source",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_2",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Second chat evidence",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            payload={},
+            memory_id="mem_target",
+        )
+
+        with pytest.raises(ValueError, match="chat conversation boundaries"):
+            await beliefs.create_memory_link("mem_source", "mem_target", "supports", 0.9)
     finally:
         await connection.close()
 
@@ -402,10 +441,12 @@ async def test_tension_evidence_buffer_round_trips_unique_ids() -> None:
             ["mem_e1", "mem_e2", "mem_e1"],
             user_id="usr_1",
         )
+        observed = await beliefs.get_tension_evidence_ids("mem_buffer", user_id="usr_1")
         popped = await beliefs.pop_tension_evidence_ids("mem_buffer", user_id="usr_1")
         row = await memories.get_memory_object("mem_buffer", "usr_1")
 
         assert merged == ["mem_e1", "mem_e2"]
+        assert observed == ["mem_e1", "mem_e2"]
         assert popped == ["mem_e1", "mem_e2"]
         assert row is not None
         assert row["payload_json"].get("tension_evidence_memory_ids") is None

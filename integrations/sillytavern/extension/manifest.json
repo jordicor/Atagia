@@ -1,0 +1,15 @@
+{
+  "display_name": "Atagia Memory",
+  "loading_order": 50,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Atagia",
+  "version": "0.1.0",
+  "homePage": "https://github.com/jordicor/atagia",
+  "auto_update": false,
+  "minimum_client_version": "1.0.0",
+  "generate_interceptor": "atagiaMemoryInterceptor",
+  "hooks": {
+    "activate": "onActivate"
+  }
+}

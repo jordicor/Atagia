@@ -25,6 +25,7 @@ from atagia.api.dependencies import (
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.ids import new_job_id
+from atagia.core import json_utils
 from atagia.core.metrics_repository import MetricsRepository
 from atagia.core.repositories import UserRepository
 from atagia.core.retrieval_event_repository import AdminAuditRepository, RetrievalEventRepository
@@ -36,7 +37,14 @@ from atagia.memory.lifecycle_runner import LifecycleLockError, run_lifecycle_dir
 from atagia.memory.metrics_computer import MetricsComputer, normalize_time_bucket
 from atagia.memory.policy_manifest import ManifestLoader
 from atagia.models.schemas_api import AdminMetricsComputeRequest
-from atagia.models.schemas_api import AdminEmbeddingBackfillRequest
+from atagia.models.schemas_api import (
+    AdminEmbeddingBackfillRequest,
+    AdminReviewActionResponse,
+    AdminReviewMemoryListResponse,
+)
+from atagia.models.schemas_api import WorkerControlRequest, WorkerControlResponse
+from atagia.models.schemas_memory import MemoryCategory, MemoryStatus
+from atagia.models.schemas_jobs import WorkerControlMode
 from atagia.models.schemas_evaluation import MetricName, RetrievalSummaryStats
 from atagia.models.schemas_jobs import EVALUATION_STREAM_NAME, EvaluationJobPayload, JobEnvelope, JobType
 from atagia.models.schemas_replay import (
@@ -52,6 +60,13 @@ from atagia.services.llm_client import LLMClient
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.embedding_backfill_service import EmbeddingBackfillResult, EmbeddingBackfillService
 from atagia.services.admin_rebuild_service import AdminRebuildService, RebuildResult
+from atagia.services.errors import DeletionConfirmationError, MemoryNotFoundError
+from atagia.services.job_tracking_service import JobTrackingService
+from atagia.services.lifecycle_service import (
+    HARD_DELETE_MEMORY_CONFIRMATION,
+    ConversationLifecycleService,
+)
+from atagia.services.worker_control_service import WorkerControlService
 from atagia.services.dataset_exporter import (
     AnonymizedExportDisabledError,
     ConversationExportNotFoundError,
@@ -63,6 +78,24 @@ from atagia.services.retrieval_pipeline import RetrievalPipeline
 from atagia.core.storage_backend import StorageBackend
 
 router = APIRouter(prefix="/v1/admin", tags=["admin"])
+
+
+async def _worker_control_response(
+    service: WorkerControlService,
+    *,
+    drain_completed: bool | None = None,
+) -> WorkerControlResponse:
+    state = await service.get_state()
+    return WorkerControlResponse(
+        mode=state.mode,
+        reason=state.reason,
+        updated_at=state.updated_at,
+        updated_by=state.updated_by,
+        new_source_jobs_allowed=await service.allows_new_source_jobs(),
+        worker_claims_allowed=await service.allows_worker_claims(),
+        periodic_work_allowed=await service.allows_periodic_work(),
+        drain_completed=drain_completed,
+    )
 
 
 async def _audit_admin_action(
@@ -81,6 +114,280 @@ async def _audit_admin_action(
         target_type=target_type,
         target_id=target_id,
         metadata=metadata or {},
+    )
+
+
+def _decode_payload_json(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        parsed = json_utils.loads(value)
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _review_memory_record(row: dict[str, Any]) -> dict[str, Any]:
+    payload = _decode_payload_json(row.get("payload_json"))
+    source_message_ids = payload.get("source_message_ids")
+    if not isinstance(source_message_ids, list):
+        source_message_ids = []
+    return {
+        "memory_id": str(row["id"]),
+        "user_id": str(row["user_id"]),
+        "conversation_id": row.get("conversation_id"),
+        "user_persona_id": row.get("user_persona_id"),
+        "platform_id": row.get("platform_id"),
+        "character_id": row.get("character_id"),
+        "mode": row.get("assistant_mode_id"),
+        "object_type": str(row["object_type"]),
+        "category": str(row["memory_category"]),
+        "scope": str(row["scope"]),
+        "scope_canonical": row.get("scope_canonical"),
+        "sensitivity": str(row.get("sensitivity") or "unknown"),
+        "privacy_level": int(row["privacy_level"]),
+        "confidence": float(row["confidence"]),
+        "canonical_text": str(row["canonical_text"]),
+        "index_text": row.get("index_text"),
+        "review_reason": payload.get("review_reason"),
+        "ingest_origin": payload.get("ingest_origin"),
+        "confirmation_strategy": payload.get("confirmation_strategy"),
+        "memory_privacy_mode": payload.get("memory_privacy_mode"),
+        "source_message_ids": [str(item) for item in source_message_ids],
+        "payload": payload,
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+    }
+
+
+async def _list_review_required_memories(
+    connection: aiosqlite.Connection,
+    *,
+    user_id: str | None,
+    platform_id: str | None,
+    user_persona_id: str | None,
+    character_id: str | None,
+    category: MemoryCategory | None,
+    ingest_origin: str | None,
+    limit: int,
+    offset: int,
+) -> list[dict[str, Any]]:
+    clauses = ["status = ?"]
+    parameters: list[Any] = [MemoryStatus.REVIEW_REQUIRED.value]
+    if user_id is not None:
+        clauses.append("user_id = ?")
+        parameters.append(user_id)
+    if platform_id is not None:
+        clauses.append("platform_id = ?")
+        parameters.append(platform_id)
+    if user_persona_id is not None:
+        clauses.append("user_persona_id IS ?")
+        parameters.append(user_persona_id)
+    if character_id is not None:
+        clauses.append("character_id IS ?")
+        parameters.append(character_id)
+    if category is not None:
+        clauses.append("memory_category = ?")
+        parameters.append(category.value)
+    if ingest_origin is not None:
+        clauses.append("json_extract(payload_json, '$.ingest_origin') = ?")
+        parameters.append(ingest_origin)
+    cursor = await connection.execute(
+        """
+        SELECT *
+        FROM memory_objects
+        WHERE {clauses}
+        ORDER BY created_at ASC, _rowid ASC
+        LIMIT ?
+        OFFSET ?
+        """.format(clauses=" AND ".join(clauses)),
+        (*parameters, limit, offset),
+    )
+    rows = [dict(row) for row in await cursor.fetchall()]
+    await cursor.close()
+    return [_review_memory_record(row) for row in rows]
+
+
+async def _get_review_required_memory(
+    connection: aiosqlite.Connection,
+    *,
+    user_id: str,
+    memory_id: str,
+) -> dict[str, Any]:
+    cursor = await connection.execute(
+        """
+        SELECT *
+        FROM memory_objects
+        WHERE id = ?
+          AND user_id = ?
+          AND status = ?
+        """,
+        (memory_id, user_id, MemoryStatus.REVIEW_REQUIRED.value),
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Review-required memory not found",
+        )
+    return dict(row)
+
+
+@router.get("/worker-control", response_model=WorkerControlResponse)
+async def get_worker_control(
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+) -> WorkerControlResponse:
+    del auth_context
+    return await _worker_control_response(WorkerControlService(connection, clock))
+
+
+@router.post("/worker-control", response_model=WorkerControlResponse)
+async def set_worker_control(
+    payload: WorkerControlRequest,
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+    runtime: "AppRuntime" = Depends(get_runtime),
+) -> WorkerControlResponse:
+    service = WorkerControlService(connection, clock)
+    state = await service.set_mode(
+        payload.mode,
+        reason=payload.reason,
+        updated_by=auth_context.actor_id,
+    )
+    drain_completed: bool | None = None
+    if payload.mode is WorkerControlMode.DRAIN_AND_PAUSE:
+        if not runtime.settings.workers_enabled:
+            drain_completed = False
+        else:
+            drain_completed = await runtime.storage_backend.drain(payload.timeout_seconds)
+    await _audit_admin_action(
+        connection,
+        clock,
+        auth_context,
+        action="set_worker_control",
+        target_type="worker_control",
+        target_id=state.mode.value,
+        metadata={
+            "mode": state.mode.value,
+            "reason": state.reason,
+            "drain_completed": drain_completed,
+        },
+    )
+    return await _worker_control_response(service, drain_completed=drain_completed)
+
+
+@router.get("/memory-review", response_model=AdminReviewMemoryListResponse)
+async def list_review_required_memories(
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    user_id: str | None = Query(default=None),
+    platform_id: str | None = Query(default=None),
+    user_persona_id: str | None = Query(default=None),
+    character_id: str | None = Query(default=None),
+    category: MemoryCategory | None = Query(default=None),
+    ingest_origin: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> AdminReviewMemoryListResponse:
+    del auth_context
+    items = await _list_review_required_memories(
+        connection,
+        user_id=user_id,
+        platform_id=platform_id,
+        user_persona_id=user_persona_id,
+        character_id=character_id,
+        category=category,
+        ingest_origin=ingest_origin,
+        limit=limit,
+        offset=offset,
+    )
+    return AdminReviewMemoryListResponse.model_validate({"items": items})
+
+
+@router.post(
+    "/memory-review/{user_id}/{memory_id}/archive",
+    response_model=AdminReviewActionResponse,
+)
+async def archive_review_required_memory(
+    user_id: str,
+    memory_id: str,
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+    runtime: "AppRuntime" = Depends(get_runtime),
+) -> AdminReviewActionResponse:
+    await _get_review_required_memory(
+        connection,
+        user_id=user_id,
+        memory_id=memory_id,
+    )
+    await ConversationLifecycleService(runtime).delete_memory(
+        connection,
+        memory_id=memory_id,
+        user_id=user_id,
+    )
+    await _audit_admin_action(
+        connection,
+        clock,
+        auth_context,
+        action="archive_review_required_memory",
+        target_type="memory_object",
+        target_id=memory_id,
+        metadata={"user_id": user_id, "previous_status": "review_required"},
+    )
+    await connection.commit()
+    return AdminReviewActionResponse(
+        memory_id=memory_id,
+        status=MemoryStatus.ARCHIVED.value,
+    )
+
+
+@router.post(
+    "/memory-review/{user_id}/{memory_id}/delete",
+    response_model=AdminReviewActionResponse,
+)
+async def delete_review_required_memory(
+    user_id: str,
+    memory_id: str,
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+    runtime: "AppRuntime" = Depends(get_runtime),
+) -> AdminReviewActionResponse:
+    await _get_review_required_memory(
+        connection,
+        user_id=user_id,
+        memory_id=memory_id,
+    )
+    try:
+        await ConversationLifecycleService(runtime).delete_memory(
+            connection,
+            user_id=user_id,
+            memory_id=memory_id,
+            hard=True,
+            confirmation=HARD_DELETE_MEMORY_CONFIRMATION,
+        )
+    except (DeletionConfirmationError, MemoryNotFoundError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    await _audit_admin_action(
+        connection,
+        clock,
+        auth_context,
+        action="delete_review_required_memory",
+        target_type="memory_object",
+        target_id=memory_id,
+        metadata={"user_id": user_id, "previous_status": "review_required"},
+    )
+    await connection.commit()
+    return AdminReviewActionResponse(
+        memory_id=memory_id,
+        status=MemoryStatus.DELETED.value,
     )
 
 
@@ -359,6 +666,9 @@ async def run_lifecycle(
             settings=settings,
             embedding_index=embedding_index,
             storage_backend=storage_backend,
+            artifact_blob_store=runtime.artifact_blob_store,
+            llm_client=runtime.llm_client,
+            lifecycle_runtime=runtime,
             dry_run=dry_run,
         )
     except LifecycleLockError as exc:
@@ -483,11 +793,22 @@ async def compute_metrics(
                     assistant_mode_id=payload.assistant_mode_id,
                     metrics=["ccr"],
                 ).model_dump(mode="json"),
+                created_at=clock.now(),
             )
-            await storage_backend.stream_add(
-                EVALUATION_STREAM_NAME,
-                evaluation_job.model_dump(mode="json"),
+            job_tracking = JobTrackingService(
+                connection,
+                clock,
+                workers_enabled=settings.workers_enabled,
             )
+            await job_tracking.create_queued_job(EVALUATION_STREAM_NAME, evaluation_job)
+            try:
+                await storage_backend.stream_add(
+                    EVALUATION_STREAM_NAME,
+                    evaluation_job.model_dump(mode="json"),
+                )
+            except Exception as exc:
+                await job_tracking.mark_enqueue_failed(evaluation_job, exc)
+                raise
             queued_metrics.append(MetricName.CCR.value)
             continue
 

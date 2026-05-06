@@ -67,7 +67,16 @@ def build_candidate_custody(
             ),
             "fused_score": _safe_float(candidate.get("rrf_score")),
             "scope": _safe_optional_str(candidate.get("scope")),
+            "scope_canonical": _safe_optional_str(
+                candidate.get("scope_canonical") or candidate.get("scope")
+            ),
+            "user_persona_id": _safe_optional_str(candidate.get("user_persona_id")),
+            "platform_id": _safe_optional_str(candidate.get("platform_id")),
+            "character_id": _safe_optional_str(candidate.get("character_id")),
+            "conversation_id": _safe_optional_str(candidate.get("conversation_id")),
             "status": _safe_optional_str(candidate.get("status")),
+            "sensitivity": _safe_optional_str(candidate.get("sensitivity")),
+            "platform_locked": _safe_bool(candidate.get("platform_locked")),
             "privacy_level": _safe_int(candidate.get("privacy_level")),
             "intimacy_boundary": _safe_optional_str(
                 candidate.get("intimacy_boundary") or "ordinary"
@@ -245,6 +254,17 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return bool(value)
 
 
 def _safe_optional_str(value: Any) -> str | None:

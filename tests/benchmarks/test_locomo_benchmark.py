@@ -35,9 +35,12 @@ from atagia.services.llm_client import (
     LLMError,
     LLMProvider,
 )
+from atagia.services.model_resolution import COMPONENTS_BY_ID
 
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
-_MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
+_CANDIDATE_SCORE_KEY_PATTERN = re.compile(
+    r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
+)
 
 
 class BenchmarkProvider(LLMProvider):
@@ -69,11 +72,13 @@ class BenchmarkProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_scoring":
-            memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
-            payload = [
-                {"memory_id": memory_id, "llm_applicability": 0.9}
-                for memory_id in memory_ids
-            ]
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
+            payload = {
+                "scores": [
+                    {"score_key": score_key, "llm_applicability": 0.9}
+                    for _memory_id, score_key in candidate_keys
+                ]
+            }
             return self._response(request, json.dumps(payload))
         if purpose == "memory_extraction":
             message_text = request.messages[-1].content
@@ -431,13 +436,22 @@ def _write_dataset_with_missing_timestamp(tmp_path: Path) -> Path:
     return data_path
 
 
+def _clear_ambient_llm_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "ATAGIA_LLM_FORCED_GLOBAL_MODEL",
+        "ATAGIA_LLM_INGEST_MODEL",
+        "ATAGIA_LLM_RETRIEVAL_MODEL",
+        "ATAGIA_LLM_CHAT_MODEL",
+    ):
+        monkeypatch.setenv(name, "")
+    for component_id in COMPONENTS_BY_ID:
+        monkeypatch.setenv(f"ATAGIA_LLM_MODEL__{component_id.upper()}", "")
+
+
 def test_atagia_constructor_accepts_phase_model_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ATAGIA_LLM_FORCED_GLOBAL_MODEL", "")
-    monkeypatch.setenv("ATAGIA_LLM_INGEST_MODEL", "")
-    monkeypatch.setenv("ATAGIA_LLM_RETRIEVAL_MODEL", "")
-    monkeypatch.setenv("ATAGIA_LLM_CHAT_MODEL", "")
+    _clear_ambient_llm_model_env(monkeypatch)
     engine = Atagia(
         llm_ingest_model="openai/ingest-model,minimal",
         llm_retrieval_model="openai/retrieval-model,medium",
@@ -523,6 +537,11 @@ async def test_benchmark_single_conversation(
     assert report.model_info["provider"] == "openai"
     assert report.model_info["answer_model"] == "openai/answer-model"
     assert report.model_info["judge_model"] == "openai/judge-model"
+    assert report.model_info["mode"] == "general_qa"
+    assert report.model_info["retrieval_profile_id"] == "general_qa"
+    assert report.model_info["platform_id"] == "locomo"
+    assert report.model_info["user_persona_id"] is None
+    assert report.model_info["character_id"] is None
     assert report.model_info["ingest_mode"] == "online"
     assert report.model_info["parallel_questions"] == 1
     assert report.model_info["benchmark_db"]["ingest_mode"] == "online"
@@ -545,6 +564,7 @@ async def test_benchmark_routes_models_by_phase_and_component(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _clear_ambient_llm_model_env(monkeypatch)
     provider = BenchmarkProvider()
     _install_stub_client(monkeypatch, provider)
     benchmark = LoCoMoBenchmark(
@@ -1024,6 +1044,11 @@ async def test_benchmark_max_turns_limits_ingestion(
         *,
         operational_profile: str | None = None,
         operational_signals: dict[str, object] | None = None,
+        cross_chat_memory: bool = True,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool | None = None,
     ) -> None:
         ingested_messages.append((role, text, occurred_at))
         await original_ingest_message(
@@ -1038,6 +1063,11 @@ async def test_benchmark_max_turns_limits_ingestion(
             attachments=attachments,
             operational_profile=operational_profile,
             operational_signals=operational_signals,
+            cross_chat_memory=cross_chat_memory,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
         )
 
     monkeypatch.setattr(Atagia, "ingest_message", _capture_ingest_message)
@@ -1084,6 +1114,11 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
         *,
         operational_profile: str | None = None,
         operational_signals: dict[str, object] | None = None,
+        cross_chat_memory: bool = True,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool | None = None,
     ) -> None:
         raise AssertionError("bulk ingest should persist messages without live enqueue")
 
@@ -1122,6 +1157,11 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
     retained_db = retained_dbs[0]
     metadata = json.loads((retained_db.parent / "run_metadata.json").read_text())
     assert metadata["ingest_mode"] == "bulk"
+    assert metadata["mode"] == "general_qa"
+    assert metadata["retrieval_profile_id"] == "general_qa"
+    assert metadata["platform_id"] == "locomo"
+    assert metadata["user_persona_id"] is None
+    assert metadata["character_id"] is None
     assert metadata["status"] == "complete"
     assert metadata["rebuild_result"]["processed_messages"] == 6
     assert "parallel_questions" not in metadata

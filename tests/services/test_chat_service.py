@@ -30,7 +30,9 @@ from atagia.services.llm_client import (
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
-_MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
+_CANDIDATE_SCORE_KEY_PATTERN = re.compile(
+    r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
+)
 
 
 class ChatServiceProvider(LLMProvider):
@@ -78,15 +80,17 @@ class ChatServiceProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_scoring":
-            memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
-                    [
-                        {"memory_id": memory_id, "llm_applicability": 0.5}
-                        for memory_id in memory_ids
-                    ]
+                    {
+                        "scores": [
+                            {"score_key": score_key, "llm_applicability": 0.5}
+                            for _memory_id, score_key in candidate_keys
+                        ]
+                    }
                 ),
             )
         if purpose == "consent_confirmation_intent":

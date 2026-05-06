@@ -362,6 +362,41 @@ async def test_builder_creates_action_outcome_and_tendency_links() -> None:
 
 
 @pytest.mark.asyncio
+async def test_builder_infers_tendency_before_opening_write_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, memories, builder, resolved_policy, context = await _build_runtime(outputs=[])
+    try:
+        async def infer_without_open_write_transaction(*args, **kwargs) -> str:
+            del args, kwargs
+            assert not connection.in_transaction
+            return "This workflow prefers incremental changes."
+
+        monkeypatch.setattr(builder, "_infer_tendency_text", infer_without_open_write_transaction)
+
+        result = await builder.build_chain(
+            ConsequenceSignal(
+                is_consequence=True,
+                action_description="Suggested a large refactor.",
+                outcome_description="Regressions appeared afterwards.",
+                outcome_sentiment="negative",
+                confidence=0.8,
+                likely_action_message_id=None,
+            ),
+            user_id="usr_1",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+        )
+
+        assert result is not None
+        tendency = await memories.get_memory_object(str(result.tendency_belief_id), "usr_1")
+        assert tendency is not None
+        assert tendency["canonical_text"] == "This workflow prefers incremental changes."
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_builder_returns_none_when_action_memory_cannot_be_found_or_created(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

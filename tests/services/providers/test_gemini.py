@@ -304,6 +304,94 @@ async def test_gemini_complete_maps_tools_and_function_calls() -> None:
 
 
 @pytest.mark.asyncio
+async def test_gemini_tool_result_uses_prior_function_name_for_call_id() -> None:
+    models = FakeGeminiModels(
+        completion_response=_response(parts=[_part(text="done")])
+    )
+    provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
+    request = _request(
+        messages=[
+            LLMMessage(role="user", content="Use lookup."),
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_lookup",
+                        "type": "function",
+                        "name": "lookup",
+                        "arguments": json.dumps({"query": "atagia"}),
+                    }
+                ],
+            ),
+            LLMMessage(
+                role="tool",
+                content="{\"result\":\"ok\"}",
+                name="call_lookup",
+            ),
+        ]
+    )
+
+    await provider.complete(request)
+
+    contents = models.generate_content_calls[0]["contents"]
+    function_call = contents[1].parts[0].function_call
+    function_response = contents[2].parts[0].function_response
+    assert function_call.id == "call_lookup"
+    assert function_call.name == "lookup"
+    assert function_response.id == "call_lookup"
+    assert function_response.name == "lookup"
+
+
+@pytest.mark.asyncio
+async def test_gemini_tool_result_preserves_ids_for_same_function_calls() -> None:
+    models = FakeGeminiModels(
+        completion_response=_response(parts=[_part(text="done")])
+    )
+    provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
+    request = _request(
+        messages=[
+            LLMMessage(role="user", content="Use lookup twice."),
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_lookup_a",
+                        "type": "function",
+                        "name": "lookup",
+                        "arguments": json.dumps({"query": "a"}),
+                    },
+                    {
+                        "id": "call_lookup_b",
+                        "type": "function",
+                        "name": "lookup",
+                        "arguments": json.dumps({"query": "b"}),
+                    },
+                ],
+            ),
+            LLMMessage(role="tool", content="A", name="call_lookup_a"),
+            LLMMessage(role="tool", content="B", name="call_lookup_b"),
+        ]
+    )
+
+    await provider.complete(request)
+
+    contents = models.generate_content_calls[0]["contents"]
+    function_calls = [part.function_call for part in contents[1].parts]
+    function_responses = [
+        contents[2].parts[0].function_response,
+        contents[3].parts[0].function_response,
+    ]
+    assert [call.id for call in function_calls] == ["call_lookup_a", "call_lookup_b"]
+    assert [response.id for response in function_responses] == [
+        "call_lookup_a",
+        "call_lookup_b",
+    ]
+    assert [response.name for response in function_responses] == ["lookup", "lookup"]
+
+
+@pytest.mark.asyncio
 async def test_gemini_complete_raises_non_transient_on_max_tokens() -> None:
     models = FakeGeminiModels(
         completion_response=_response(

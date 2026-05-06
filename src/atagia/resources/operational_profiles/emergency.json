@@ -1,0 +1,13 @@
+{
+  "operational_profile_id": "emergency",
+  "display_name": "Emergency",
+  "risk_level": "high_risk",
+  "signals": {
+    "power": "normal",
+    "connectivity": "online",
+    "safety": "emergency",
+    "incident_scope": "none",
+    "compute": "remote_allowed"
+  },
+  "policy_override": {}
+}

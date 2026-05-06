@@ -8,7 +8,7 @@ import aiosqlite
 
 from atagia.core.clock import Clock
 from atagia.core.ids import generate_prefixed_id, new_retrieval_id
-from atagia.core.repositories import BaseRepository, _encode_json
+from atagia.core.repositories import BaseRepository, MemoryObjectRepository, _encode_json
 
 
 class MemoryFeedbackOwnershipError(ValueError):
@@ -34,13 +34,20 @@ class RetrievalEventRepository(BaseRepository):
                 request_message_id,
                 response_message_id,
                 assistant_mode_id,
+                user_persona_id,
+                platform_id,
+                character_id,
+                mode,
+                incognito,
+                remember_across_chats,
+                remember_across_devices,
                 retrieval_plan_json,
                 selected_memory_ids_json,
                 context_view_json,
                 outcome_json,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -49,6 +56,13 @@ class RetrievalEventRepository(BaseRepository):
                 event["request_message_id"],
                 event.get("response_message_id"),
                 event["assistant_mode_id"],
+                event.get("user_persona_id"),
+                event.get("platform_id"),
+                event.get("character_id"),
+                event.get("mode"),
+                1 if event.get("incognito") else 0,
+                1 if event.get("remember_across_chats", True) else 0,
+                1 if event.get("remember_across_devices", True) else 0,
                 _encode_json(event["retrieval_plan_json"]),
                 _encode_json(event.get("selected_memory_ids_json", [])),
                 _encode_json(event.get("context_view_json", {})),
@@ -165,12 +179,22 @@ class MemoryFeedbackRepository(BaseRepository):
         feedback_type: str,
         score: float | None,
         metadata: dict[str, Any] | None = None,
+        *,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
+        mode: str | None = None,
     ) -> dict[str, Any]:
         selected_memory_ids: set[str] | None = None
+        namespace_required = conversation_id is not None and platform_id is not None
         if retrieval_event_id is not None:
             event_row = await self._fetch_one(
                 """
-                SELECT selected_memory_ids_json
+                SELECT *
                 FROM retrieval_events
                 WHERE id = ?
                   AND user_id = ?
@@ -181,25 +205,56 @@ class MemoryFeedbackRepository(BaseRepository):
                 raise MemoryFeedbackOwnershipError(
                     f"Retrieval event {retrieval_event_id} does not belong to user {user_id}"
                 )
+            if namespace_required and (
+                event_row.get("conversation_id") != conversation_id
+                or event_row.get("user_persona_id") != user_persona_id
+                or event_row.get("platform_id") != platform_id
+                or event_row.get("character_id") != character_id
+                or bool(event_row.get("incognito")) != bool(incognito)
+            ):
+                raise MemoryFeedbackOwnershipError(
+                    f"Retrieval event {retrieval_event_id} is outside the requested namespace"
+                )
             raw_selected_ids = event_row.get("selected_memory_ids_json") or []
             if isinstance(raw_selected_ids, list):
                 selected_memory_ids = {str(item) for item in raw_selected_ids}
             else:
                 selected_memory_ids = set()
         if memory_id is not None:
-            cursor = await self._connection.execute(
-                """
-                SELECT 1
-                FROM memory_objects
-                WHERE id = ?
-                  AND user_id = ?
-                """,
-                (memory_id, user_id),
-            )
-            if await cursor.fetchone() is None:
-                raise MemoryFeedbackOwnershipError(
-                    f"Memory object {memory_id} does not belong to user {user_id}"
+            if namespace_required:
+                memory = await MemoryObjectRepository(
+                    self._connection,
+                    self._clock,
+                ).get_visible_memory_object(
+                    memory_id,
+                    user_id,
+                    conversation_id=conversation_id,
+                    user_persona_id=user_persona_id,
+                    platform_id=platform_id,
+                    character_id=character_id,
+                    incognito=incognito,
+                    remember_across_chats=remember_across_chats,
+                    remember_across_devices=remember_across_devices,
+                    sensitivity_gates_enabled=True,
                 )
+                if memory is None:
+                    raise MemoryFeedbackOwnershipError(
+                        f"Memory object {memory_id} is outside the requested namespace"
+                    )
+            else:
+                cursor = await self._connection.execute(
+                    """
+                    SELECT 1
+                    FROM memory_objects
+                    WHERE id = ?
+                      AND user_id = ?
+                    """,
+                    (memory_id, user_id),
+                )
+                if await cursor.fetchone() is None:
+                    raise MemoryFeedbackOwnershipError(
+                        f"Memory object {memory_id} does not belong to user {user_id}"
+                    )
             if selected_memory_ids is not None and memory_id not in selected_memory_ids:
                 raise MemoryFeedbackMismatchError(
                     f"Memory object {memory_id} was not selected in retrieval event {retrieval_event_id}"
@@ -217,9 +272,18 @@ class MemoryFeedbackRepository(BaseRepository):
                 feedback_type,
                 score,
                 metadata_json,
-                created_at
+                created_at,
+                user_persona_id,
+                platform_id,
+                character_id,
+                conversation_id,
+                mode,
+                incognito_snapshot,
+                remember_across_chats_snapshot,
+                remember_across_devices_snapshot,
+                policy_snapshot_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 feedback_id,
@@ -230,6 +294,21 @@ class MemoryFeedbackRepository(BaseRepository):
                 score,
                 _encode_json(metadata),
                 timestamp,
+                user_persona_id,
+                platform_id,
+                character_id,
+                conversation_id,
+                mode,
+                1 if incognito else 0,
+                1 if remember_across_chats else 0,
+                1 if remember_across_devices else 0,
+                _encode_json(
+                    {
+                        "source": "memory_feedback",
+                        "conversation_id": conversation_id,
+                        "mode": mode,
+                    }
+                ),
             ),
         )
         await self._connection.commit()

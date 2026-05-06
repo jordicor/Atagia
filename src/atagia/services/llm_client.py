@@ -68,9 +68,16 @@ class ConfigurationError(LLMError):
 class StructuredOutputError(LLMError):
     """Raised when structured output validation fails."""
 
-    def __init__(self, message: str, *, details: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: tuple[str, ...] = (),
+        output_text: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.details = details
+        self.output_text = output_text
 
 
 class TransientLLMError(LLMError):
@@ -98,6 +105,7 @@ class LLMMessage(BaseModel):
     role: str
     content: str
     name: str | None = None
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class LLMToolSpec(BaseModel):
@@ -137,6 +145,15 @@ class LLMCompletionResponse(BaseModel):
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     usage: dict[str, Any] = Field(default_factory=dict)
     raw_response: dict[str, Any] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredCompletionResult(Generic[T]):
+    """Structured completion payload plus the raw provider response."""
+
+    value: T
+    response: LLMCompletionResponse
+    used_schema_fallback: bool = False
 
 
 class LLMEmbeddingRequest(BaseModel):
@@ -226,9 +243,7 @@ class LLMClient(Generic[T]):
         intimacy_proactive_routing_enabled: bool = False,
     ) -> None:
         self._provider_name = provider_name.strip().lower() if provider_name is not None else None
-        self._providers = {
-            provider.name.strip().lower(): provider for provider in (providers or [])
-        }
+        self._providers = {provider.name.strip().lower(): provider for provider in (providers or [])}
         self._retry_policy = retry_policy or RetryPolicy()
         self._allow_unqualified_single_provider_models = allow_unqualified_single_provider_models
         self._intimacy_fallback_models = dict(intimacy_fallback_models or {})
@@ -392,10 +407,7 @@ class LLMClient(Generic[T]):
                             usage = event_usage
                 return LLMCompletionResponse(
                     provider=provider.name,
-                    model=str(
-                        provider_request.metadata.get("atagia_model_spec")
-                        or provider_request.model
-                    ),
+                    model=str(provider_request.metadata.get("atagia_model_spec") or provider_request.model),
                     output_text=output_text,
                     thinking=thinking or None,
                     tool_calls=tool_calls,
@@ -442,8 +454,7 @@ class LLMClient(Generic[T]):
 
         component_id = self._component_id_for_request(request)
         logger.warning(
-            "Retrying LLM request with intimacy fallback model "
-            "component_id=%s purpose=%s primary_model=%s fallback_model=%s error_class=%s",
+            "Retrying LLM request with intimacy fallback model component_id=%s purpose=%s primary_model=%s fallback_model=%s error_class=%s",
             component_id or "<unknown>",
             request.metadata.get("purpose") or "<unset>",
             request.model,
@@ -487,8 +498,7 @@ class LLMClient(Generic[T]):
 
         component_id = self._component_id_for_request(request)
         logger.info(
-            "Routing LLM request directly to intimacy model "
-            "component_id=%s purpose=%s primary_model=%s intimacy_model=%s",
+            "Routing LLM request directly to intimacy model component_id=%s purpose=%s primary_model=%s intimacy_model=%s",
             component_id or "<unknown>",
             request.metadata.get("purpose") or "<unset>",
             request.model,
@@ -736,6 +746,13 @@ class LLMClient(Generic[T]):
         request: LLMCompletionRequest,
         schema: type[T],
     ) -> T:
+        return (await self.complete_structured_with_response(request, schema)).value
+
+    async def complete_structured_with_response(
+        self,
+        request: LLMCompletionRequest,
+        schema: type[T],
+    ) -> StructuredCompletionResult[T]:
         used_schema_fallback = False
         try:
             response = await self.complete(request)
@@ -757,7 +774,12 @@ class LLMClient(Generic[T]):
                     }
                 )
             )
-        return self._validate_structured_response(response, schema, used_schema_fallback)
+        value = self._validate_structured_response(response, schema, used_schema_fallback)
+        return StructuredCompletionResult(
+            value=value,
+            response=response,
+            used_schema_fallback=used_schema_fallback,
+        )
 
     async def complete_structured_streamed(
         self,
@@ -813,8 +835,10 @@ class LLMClient(Generic[T]):
         message = str(exc).lower()
         return (
             "compiled grammar is too large" in message
-            or "additionalproperties" in message and "must be explicitly set to false" in message
-            or "maxitems" in message and "not supported" in message
+            or "additionalproperties" in message
+            and "must be explicitly set to false" in message
+            or "maxitems" in message
+            and "not supported" in message
         )
 
     @staticmethod
@@ -843,10 +867,12 @@ class LLMClient(Generic[T]):
                 raise StructuredOutputError(
                     "Provider returned non-JSON structured output after schema fallback",
                     details=exc.details,
+                    output_text=response.output_text,
                 ) from exc
             raise StructuredOutputError(
                 "Provider returned non-JSON structured output",
                 details=exc.details,
+                output_text=response.output_text,
             ) from exc
 
         adapter = TypeAdapter(schema)
@@ -856,6 +882,7 @@ class LLMClient(Generic[T]):
             raise StructuredOutputError(
                 "Provider returned invalid structured output",
                 details=self._structured_error_details(exc),
+                output_text=response.output_text,
             ) from exc
 
     @classmethod

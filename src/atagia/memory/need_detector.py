@@ -10,7 +10,7 @@ from pydantic import TypeAdapter
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.llm_output_limits import NEED_DETECTOR_MAX_OUTPUT_TOKENS
-from atagia.memory.policy_manifest import ResolvedPolicy
+from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.models.schemas_memory import (
     DetectedNeed,
     ExtractionConversationContext,
@@ -199,7 +199,7 @@ class NeedDetector:
         message_text: str,
         role: str,
         conversation_context: ExtractionConversationContext | dict[str, Any],
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
         user_language_profile: list[dict[str, Any]],
     ) -> QueryIntelligenceResult:
         if user_language_profile is None:
@@ -282,7 +282,7 @@ class NeedDetector:
         message_text: str,
         role: str,
         context: ExtractionConversationContext,
-        resolved_policy: ResolvedPolicy,
+        resolved_policy: ResolvedRetrievalPolicy,
         user_language_profile: list[dict[str, Any]],
     ) -> str:
         escaped_message_text = html.escape(message_text)

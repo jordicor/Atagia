@@ -22,6 +22,7 @@ from atagia.core.repositories import (
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.chat_support import default_operational_profile_snapshot
+from atagia.services.errors import MessageIdConflictError, SourceSequenceConflictError
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -32,7 +33,9 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 
-_MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
+_CANDIDATE_SCORE_KEY_PATTERN = re.compile(
+    r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
+)
 
 
 class EngineProvider(LLMProvider):
@@ -65,15 +68,15 @@ class EngineProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_scoring":
-            memory_ids = _MEMORY_ID_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
                     {
                         "scores": [
-                            {"memory_id": memory_id, "llm_applicability": 0.5}
-                            for memory_id in memory_ids
+                            {"score_key": score_key, "llm_applicability": 0.5}
+                            for _memory_id, score_key in candidate_keys
                         ],
                     }
                 ),
@@ -162,6 +165,48 @@ class FailingEngineProvider(EngineProvider):
         return await super().complete(request)
 
 
+def test_engine_build_settings_preserves_llm_debug_io_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    debug_dir = tmp_path / "llm-debug"
+    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO", "true")
+    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_DIR", str(debug_dir))
+    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_PURPOSES", "applicability_scoring")
+    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_RAW", "true")
+    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_MAX_CHARS", "12345")
+    engine = Atagia(
+        db_path=tmp_path / "debug-settings.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    settings = engine._build_settings()
+
+    assert settings.llm_debug_io_enabled is True
+    assert settings.llm_debug_io_dir == str(debug_dir)
+    assert settings.llm_debug_io_purposes == ("applicability_scoring",)
+    assert settings.llm_debug_io_raw is True
+    assert settings.llm_debug_io_max_chars == 12345
+
+
+def test_engine_build_settings_resolves_resource_env_from_external_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ATAGIA_MIGRATIONS_PATH", "./migrations")
+    monkeypatch.setenv("ATAGIA_MANIFESTS_PATH", "./manifests")
+    monkeypatch.setenv("ATAGIA_OPERATIONAL_PROFILES_PATH", "./operational_profiles")
+
+    engine = Atagia(db_path=tmp_path / "external-cwd.db")
+    settings = engine._build_settings()
+
+    assert settings.migrations_dir().exists()
+    assert settings.manifests_dir().exists()
+    assert settings.operational_profiles_dir().exists()
+
+
 def _install_stub_client(monkeypatch: pytest.MonkeyPatch, provider: EngineProvider) -> None:
     monkeypatch.setattr(
         "atagia.app.build_llm_client",
@@ -213,23 +258,40 @@ async def test_engine_setup_respects_env_context_cache_toggle(
 
 
 @pytest.mark.asyncio
-async def test_engine_setup_respects_chunking_override(
+async def test_engine_setup_respects_env_graph_projection_toggle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    monkeypatch.setenv("ATAGIA_CHUNKING_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_GRAPH_PROJECTION_ENABLED", "true")
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+
+    await engine.setup()
+    try:
+        assert engine.runtime is not None
+        assert engine.runtime.settings.graph_projection_enabled is True
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_setup_respects_chunking_disable_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    monkeypatch.setenv("ATAGIA_DISABLE_CHUNKING_EXTRACTION", "false")
     engine = Atagia(
         db_path=":memory:",
         openai_api_key="test-openai-key",
         llm_forced_global_model="openai/test-model",
-        chunking_enabled=False,
+        disable_chunking_extraction=True,
     )
 
     await engine.setup()
     try:
         assert engine.runtime is not None
-        assert engine.runtime.settings.chunking_enabled is False
+        assert engine.runtime.settings.disable_chunking_extraction is True
     finally:
         await engine.close()
 
@@ -267,6 +329,181 @@ async def test_engine_create_entities(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_engine_lifecycle_methods(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_close",
+            assistant_mode_id="coding_debug",
+            temporary=True,
+            temporary_ttl_seconds=3600,
+            purge_on_close=False,
+        )
+        closed = await engine.close_conversation("usr_1", "cnv_close")
+        assert closed["status"] == "closed"
+
+        await engine.create_conversation("usr_1", "cnv_memory", assistant_mode_id="coding_debug")
+        connection = await engine.runtime.open_connection()
+        try:
+            memories = MemoryObjectRepository(connection, engine.runtime.clock)
+            await memories.create_memory_object(
+                user_id="usr_1",
+                conversation_id="cnv_memory",
+                assistant_mode_id="coding_debug",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.CONVERSATION,
+                canonical_text="Original lifecycle memory.",
+                source_kind=MemorySourceKind.EXTRACTED,
+                confidence=0.9,
+                privacy_level=0,
+                memory_id="mem_lifecycle",
+            )
+        finally:
+            await connection.close()
+
+        edited = await engine.edit_memory("usr_1", "mem_lifecycle", "Updated lifecycle memory.")
+        assert edited["canonical_text"] == "Updated lifecycle memory."
+        memory_report = await engine.delete_memory("usr_1", "mem_lifecycle", hard=True, confirmation="HARD_DELETE_MEMORY")
+        assert memory_report.deleted_memories == 1
+
+        conversation_report = await engine.delete_conversation(
+            "usr_1",
+            "cnv_memory",
+            confirmation="DELETE_CONVERSATION",
+        )
+        assert conversation_report.conversation_id == "cnv_memory"
+
+        await engine.create_conversation("usr_1", "cnv_erase", assistant_mode_id="coding_debug")
+        erase_report = await engine.erase_user_data("usr_1", confirmation="ERASE_ALL_DATA")
+        assert erase_report.deleted_conversations == 3
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_deletes_only_targeted_retrieval_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        for conversation_id in ("cnv_mem_1", "cnv_mem_2", "cnv_del_1", "cnv_del_2"):
+            await engine.create_conversation("usr_1", conversation_id, assistant_mode_id="coding_debug")
+
+        connection = await engine.runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, engine.runtime.clock)
+            memories = MemoryObjectRepository(connection, engine.runtime.clock)
+            events = RetrievalEventRepository(connection, engine.runtime.clock)
+            for conversation_id, message_id in (
+                ("cnv_mem_1", "msg_mem_1"),
+                ("cnv_mem_2", "msg_mem_2"),
+                ("cnv_del_1", "msg_del_1"),
+                ("cnv_del_2", "msg_del_2"),
+            ):
+                await messages.create_message(message_id, conversation_id, "user", 1, "hello", 1, {})
+            for conversation_id, memory_id, text in (
+                ("cnv_mem_1", "mem_target", "target memory"),
+                ("cnv_mem_2", "mem_other", "other memory"),
+            ):
+                await memories.create_memory_object(
+                    user_id="usr_1",
+                    conversation_id=conversation_id,
+                    assistant_mode_id="coding_debug",
+                    object_type=MemoryObjectType.EVIDENCE,
+                    scope=MemoryScope.CONVERSATION,
+                    canonical_text=text,
+                    source_kind=MemorySourceKind.EXTRACTED,
+                    confidence=0.9,
+                    privacy_level=0,
+                    memory_id=memory_id,
+                )
+            await memories.create_memory_object(
+                user_id="usr_1",
+                conversation_id=None,
+                assistant_mode_id="coding_debug",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.USER,
+                canonical_text="broad memory sourced by a deleted chat",
+                source_kind=MemorySourceKind.EXTRACTED,
+                confidence=0.9,
+                privacy_level=0,
+                payload={"source_message_ids": ["msg_del_1"]},
+                memory_id="mem_del_broad",
+            )
+            for event_id, conversation_id, message_id, selected_ids in (
+                ("evt_mem_target", "cnv_mem_1", "msg_mem_1", ["mem_target"]),
+                ("evt_mem_other", "cnv_mem_2", "msg_mem_2", ["mem_other"]),
+                ("evt_del_target", "cnv_del_1", "msg_del_1", []),
+                ("evt_cross_selected", "cnv_del_2", "msg_del_2", ["mem_del_broad"]),
+                ("evt_del_other", "cnv_del_2", "msg_del_2", []),
+            ):
+                await events.create_event(
+                    {
+                        "id": event_id,
+                        "user_id": "usr_1",
+                        "conversation_id": conversation_id,
+                        "request_message_id": message_id,
+                        "assistant_mode_id": "coding_debug",
+                        "retrieval_plan_json": {},
+                        "selected_memory_ids_json": selected_ids,
+                        "context_view_json": {"event_id": event_id},
+                        "outcome_json": {},
+                    }
+                )
+        finally:
+            await connection.close()
+
+        await engine.delete_memory(
+            "usr_1",
+            "mem_target",
+            hard=True,
+            confirmation="HARD_DELETE_MEMORY",
+        )
+        cache_key = ContextCacheService.build_cache_key(
+            user_id="usr_1",
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_del_2",
+            workspace_id=None,
+            operational_profile_token=_normal_operational_profile_token(engine),
+        )
+        await engine.runtime.storage_backend.set_context_view(
+            cache_key,
+            {"user_id": "usr_1", "conversation_id": "cnv_del_2"},
+            ttl_seconds=60,
+        )
+        assert await engine.runtime.storage_backend.get_context_view(cache_key) is not None
+        await engine.delete_conversation(
+            "usr_1",
+            "cnv_del_1",
+            confirmation="DELETE_CONVERSATION",
+        )
+        assert await engine.runtime.storage_backend.get_context_view(cache_key) is None
+
+        connection = await engine.runtime.open_connection()
+        try:
+            events = RetrievalEventRepository(connection, engine.runtime.clock)
+            remaining_ids = {
+                row["id"] for row in await events.list_events("usr_1", None, limit=20)
+            }
+            assert remaining_ids == {"evt_mem_other", "evt_del_other"}
+        finally:
+            await connection.close()
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_engine_get_context(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
@@ -286,10 +523,12 @@ async def test_engine_get_context(monkeypatch: pytest.MonkeyPatch) -> None:
             conversation_id="cnv_1",
             message="Please help me debug this retry loop.",
             occurred_at="2023-05-08T13:56:00",
+            message_id="aurvek:msg:ctx-1",
         )
 
         assert isinstance(context.system_prompt, str)
         assert context.system_prompt
+        assert context.request_message_id == "aurvek:msg:ctx-1"
         assert context.recent_transcript == []
         assert context.recent_transcript_trace is not None
         connection = await engine.runtime.open_connection()
@@ -297,8 +536,26 @@ async def test_engine_get_context(monkeypatch: pytest.MonkeyPatch) -> None:
             messages = MessageRepository(connection, engine.runtime.clock)
             stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
             assert stored_messages[-1]["role"] == "user"
+            assert stored_messages[-1]["id"] == "aurvek:msg:ctx-1"
             assert stored_messages[-1]["text"] == "Please help me debug this retry loop."
             assert stored_messages[-1]["occurred_at"] == "2023-05-08T13:56:00"
+        finally:
+            await connection.close()
+
+        duplicate_context = await engine.get_context(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message="Please help me debug this retry loop.",
+            occurred_at="2023-05-08T13:56:00",
+            message_id="aurvek:msg:ctx-1",
+        )
+
+        assert duplicate_context.request_message_id == "aurvek:msg:ctx-1"
+        connection = await engine.runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, engine.runtime.clock)
+            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            assert [message["id"] for message in stored_messages] == ["aurvek:msg:ctx-1"]
         finally:
             await connection.close()
     finally:
@@ -457,6 +714,14 @@ async def test_engine_add_response(
             conversation_id="cnv_1",
             text="Check the retry guard first.",
             occurred_at="2023-05-09T14:10:00",
+            message_id="aurvek:msg:assistant-1",
+        )
+        await engine.add_response(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            text="Check the retry guard first.",
+            occurred_at="2023-05-09T14:10:00",
+            message_id="aurvek:msg:assistant-1",
         )
         assert await engine.flush(timeout_seconds=5.0) is True
 
@@ -465,8 +730,13 @@ async def test_engine_add_response(
             messages = MessageRepository(connection, engine.runtime.clock)
             stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
             assert stored_messages[-1]["role"] == "assistant"
+            assert stored_messages[-1]["id"] == "aurvek:msg:assistant-1"
             assert stored_messages[-1]["text"] == "Check the retry guard first."
             assert stored_messages[-1]["occurred_at"] == "2023-05-09T14:10:00"
+            assert [message["role"] for message in stored_messages] == [
+                "user",
+                "assistant",
+            ]
         finally:
             await connection.close()
 
@@ -828,6 +1098,260 @@ async def test_engine_ingest_message(
             and "<message_timestamp>2023-05-08T13:56:00</message_timestamp>" in request.messages[1].content
             for request in provider.requests
         )
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_ingest_message_is_idempotent_by_message_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-engine-ingest-idempotent.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            mode="coding_debug",
+            platform_id="aurvek",
+        )
+
+        await engine.ingest_message(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            role="user",
+            text="Please remember the retry guard.",
+            mode="coding_debug",
+            platform_id="aurvek",
+            message_id="aurvek:msg:1",
+        )
+        await engine.ingest_message(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            role="user",
+            text="Please remember the retry guard.",
+            mode="coding_debug",
+            platform_id="aurvek",
+            message_id="aurvek:msg:1",
+        )
+
+        assert await engine.flush(timeout_seconds=5.0) is True
+        connection = await engine.runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, engine.runtime.clock)
+            stored_messages = await messages.get_messages(
+                "cnv_1",
+                "usr_1",
+                limit=10,
+                offset=0,
+            )
+            assert [message["id"] for message in stored_messages] == ["aurvek:msg:1"]
+        finally:
+            await connection.close()
+        purposes = [request.metadata.get("purpose") for request in provider.requests]
+        assert purposes.count("memory_extraction") == 1
+        assert purposes.count("contract_projection") == 1
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_ingest_message_source_seq_preserves_backfill_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-engine-ingest-source-seq.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            mode="coding_debug",
+            platform_id="aurvek",
+        )
+
+        await engine.ingest_message(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            role="user",
+            text="First message.",
+            mode="coding_debug",
+            platform_id="aurvek",
+            message_id="aurvek:msg:1",
+            source_seq=1,
+        )
+        await engine.ingest_message(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            role="user",
+            text="Third message arrived before retry.",
+            mode="coding_debug",
+            platform_id="aurvek",
+            message_id="aurvek:msg:3",
+            source_seq=3,
+        )
+        await engine.ingest_message(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            role="assistant",
+            text="Second message retry.",
+            mode="coding_debug",
+            platform_id="aurvek",
+            message_id="aurvek:msg:2",
+            source_seq=2,
+        )
+        await engine.ingest_message(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            role="assistant",
+            text="Second message retry.",
+            mode="coding_debug",
+            platform_id="aurvek",
+            message_id="aurvek:msg:2",
+            source_seq=2,
+        )
+
+        with pytest.raises(SourceSequenceConflictError, match="source_seq already exists"):
+            await engine.ingest_message(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                role="user",
+                text="Different message for occupied source seq.",
+                mode="coding_debug",
+                platform_id="aurvek",
+                message_id="aurvek:msg:other",
+                source_seq=2,
+            )
+
+        connection = await engine.runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, engine.runtime.clock)
+            stored_messages = await messages.get_messages(
+                "cnv_1",
+                "usr_1",
+                limit=10,
+                offset=0,
+            )
+            assert [(message["id"], message["seq"]) for message in stored_messages] == [
+                ("aurvek:msg:1", 1),
+                ("aurvek:msg:2", 2),
+                ("aurvek:msg:3", 3),
+            ]
+        finally:
+            await connection.close()
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_message_id_conflict_rejects_incompatible_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-engine-message-id-conflict.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            mode="coding_debug",
+            platform_id="aurvek",
+        )
+        await engine.ingest_message(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            role="user",
+            text="Original content.",
+            mode="coding_debug",
+            platform_id="aurvek",
+            message_id="aurvek:msg:1",
+        )
+
+        with pytest.raises(MessageIdConflictError, match="different role or text"):
+            await engine.ingest_message(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                role="user",
+                text="Changed content.",
+                mode="coding_debug",
+                platform_id="aurvek",
+                message_id="aurvek:msg:1",
+            )
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_ingest_message_marks_large_plain_text_skip_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-engine-heavy-message.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+        skip_compaction=True,
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+        )
+        huge_text = "large biography segment " * 800
+        await engine.ingest_message(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            role="user",
+            text=huge_text,
+        )
+
+        assert await engine.flush(timeout_seconds=5.0) is True
+
+        connection = await engine.runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, engine.runtime.clock)
+            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            stored = stored_messages[-1]
+            assert stored["text"] == huge_text
+            assert stored["include_raw"] == 0
+            assert stored["skip_by_default"] == 1
+            assert stored["heavy_content"] == 1
+            assert stored["requires_explicit_request"] == 1
+            assert stored["policy_reason"] == "mechanical_size_threshold"
+            assert "large biography segment" not in stored["context_placeholder"]
+        finally:
+            await connection.close()
     finally:
         await engine.close()
 

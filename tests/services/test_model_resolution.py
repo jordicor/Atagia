@@ -189,6 +189,7 @@ def test_default_flashlite_migration_scope_is_explicit() -> None:
         "compactor",
         "belief_reviser",
         "contract_projection",
+        "graph_projection",
         "consequence_builder",
         "consequence_detector",
         "topic_working_set",

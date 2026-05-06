@@ -7,11 +7,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from atagia.core.repositories import BaseRepository, _encode_json, summary_mirror_id
-from atagia.models.schemas_memory import IntimacyBoundary, SummaryViewKind
+from atagia.models.schemas_memory import IntimacyBoundary, MemorySensitivity, SummaryViewKind
 
 _SUMMARY_KIND_LEVELS = {
     SummaryViewKind.CONVERSATION_CHUNK: 0,
     SummaryViewKind.WORKSPACE_ROLLUP: 0,
+    SummaryViewKind.CHARACTER_ROLLUP: 0,
     SummaryViewKind.CONTEXT_VIEW: 0,
     SummaryViewKind.EPISODE: 1,
     SummaryViewKind.THEMATIC_PROFILE: 2,
@@ -24,6 +25,9 @@ class _SummaryCreate(BaseModel):
     id: str
     conversation_id: str | None = None
     workspace_id: str | None = None
+    user_persona_id: str | None = None
+    platform_id: str | None = None
+    character_id: str | None = None
     source_message_start_seq: int | None = Field(default=None, ge=0)
     source_message_end_seq: int | None = Field(default=None, ge=0)
     summary_kind: SummaryViewKind
@@ -32,6 +36,11 @@ class _SummaryCreate(BaseModel):
     source_object_ids_json: list[str] = Field(default_factory=list)
     intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
     intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    sensitivity: MemorySensitivity = MemorySensitivity.UNKNOWN
+    themes_json: list[str] = Field(default_factory=list)
+    platform_locked: bool = False
+    platform_id_lock: str | None = None
+    scope_canonical: str | None = None
     maya_score: float
     model: str
     created_at: str
@@ -46,11 +55,25 @@ class _SummaryCreate(BaseModel):
                 f"summary_kind {self.summary_kind.value} requires hierarchy_level={expected_level}"
             )
         if (
-            self.summary_kind in {SummaryViewKind.CONVERSATION_CHUNK, SummaryViewKind.WORKSPACE_ROLLUP, SummaryViewKind.CONTEXT_VIEW}
+            self.summary_kind
+            in {
+                SummaryViewKind.CONVERSATION_CHUNK,
+                SummaryViewKind.WORKSPACE_ROLLUP,
+                SummaryViewKind.CHARACTER_ROLLUP,
+                SummaryViewKind.CONTEXT_VIEW,
+            }
             and self.conversation_id is None
             and self.workspace_id is None
+            and self.character_id is None
         ):
-            raise ValueError("Summary views require conversation_id or workspace_id")
+            raise ValueError("Summary views require conversation_id, workspace_id, or character_id")
+        if (
+            self.summary_kind is SummaryViewKind.CONVERSATION_CHUNK
+            and self.sensitivity is MemorySensitivity.UNKNOWN
+            and self.intimacy_boundary is IntimacyBoundary.ORDINARY
+        ):
+            self.sensitivity = MemorySensitivity.PUBLIC
+            self.scope_canonical = self.scope_canonical or "chat"
         return self
 
 
@@ -84,12 +107,20 @@ class SummaryRepository(BaseRepository):
                 source_object_ids_json,
                 intimacy_boundary,
                 intimacy_boundary_confidence,
+                user_persona_id,
+                platform_id,
+                character_id,
+                sensitivity,
+                themes_json,
+                platform_locked,
+                platform_id_lock,
+                scope_canonical,
                 maya_score,
                 model,
                 hierarchy_level,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.id,
@@ -103,6 +134,14 @@ class SummaryRepository(BaseRepository):
                 _encode_json(payload.source_object_ids_json),
                 payload.intimacy_boundary.value,
                 payload.intimacy_boundary_confidence,
+                payload.user_persona_id,
+                payload.platform_id,
+                payload.character_id,
+                payload.sensitivity.value,
+                _encode_json(payload.themes_json),
+                int(payload.platform_locked),
+                payload.platform_id_lock,
+                payload.scope_canonical,
                 payload.maya_score,
                 payload.model,
                 payload.hierarchy_level,
@@ -205,6 +244,24 @@ class SummaryRepository(BaseRepository):
             (user_id, SummaryViewKind.CONVERSATION_CHUNK.value),
         )
 
+    async def list_cross_chat_user_conversation_chunks(self, user_id: str) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            """
+            SELECT sv.*
+            FROM summary_views AS sv
+            JOIN conversations AS c
+              ON c.id = sv.conversation_id
+             AND c.user_id = sv.user_id
+            WHERE sv.user_id = ?
+              AND sv.summary_kind = ?
+              AND c.temporary = 0
+              AND COALESCE(c.isolated_mode, 0) = 0
+              AND c.status = 'active'
+            ORDER BY sv.created_at ASC, sv.id ASC
+            """,
+            (user_id, SummaryViewKind.CONVERSATION_CHUNK.value),
+        )
+
     async def get_latest_conversation_chunk(
         self,
         user_id: str,
@@ -243,6 +300,26 @@ class SummaryRepository(BaseRepository):
             (user_id, workspace_id, SummaryViewKind.WORKSPACE_ROLLUP.value, limit),
         )
 
+    async def list_character_rollups(
+        self,
+        user_id: str,
+        character_id: str,
+        *,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            """
+            SELECT sv.*
+            FROM summary_views AS sv
+            WHERE sv.user_id = ?
+              AND sv.character_id = ?
+              AND sv.summary_kind = ?
+            ORDER BY sv.created_at DESC, sv.id DESC
+            LIMIT ?
+            """,
+            (user_id, character_id, SummaryViewKind.CHARACTER_ROLLUP.value, limit),
+        )
+
     async def get_latest_workspace_rollup(
         self,
         user_id: str,
@@ -259,6 +336,44 @@ class SummaryRepository(BaseRepository):
             LIMIT 1
             """,
             (user_id, workspace_id, SummaryViewKind.WORKSPACE_ROLLUP.value),
+        )
+
+    async def get_latest_character_rollup(
+        self,
+        user_id: str,
+        character_id: str,
+    ) -> dict[str, Any] | None:
+        return await self._fetch_one(
+            """
+            SELECT sv.*
+            FROM summary_views AS sv
+            WHERE sv.user_id = ?
+              AND sv.character_id = ?
+              AND sv.summary_kind = ?
+            ORDER BY sv.created_at DESC, sv.id DESC
+            LIMIT 1
+            """,
+            (user_id, character_id, SummaryViewKind.CHARACTER_ROLLUP.value),
+        )
+
+    async def get_latest_character_rollup_for_persona(
+        self,
+        user_id: str,
+        character_id: str,
+        user_persona_id: str | None,
+    ) -> dict[str, Any] | None:
+        return await self._fetch_one(
+            """
+            SELECT sv.*
+            FROM summary_views AS sv
+            WHERE sv.user_id = ?
+              AND sv.character_id = ?
+              AND sv.user_persona_id IS ?
+              AND sv.summary_kind = ?
+            ORDER BY sv.created_at DESC, sv.id DESC
+            LIMIT 1
+            """,
+            (user_id, character_id, user_persona_id, SummaryViewKind.CHARACTER_ROLLUP.value),
         )
 
     async def list_summaries_by_kind(
@@ -343,6 +458,62 @@ class SummaryRepository(BaseRepository):
             LIMIT -1 OFFSET ?
             """,
             (user_id, workspace_id, SummaryViewKind.WORKSPACE_ROLLUP.value, keep_count),
+        )
+        if not rows:
+            return 0
+        summary_ids = [str(row["id"]) for row in rows]
+        return await self.delete_summaries(user_id, summary_ids, commit=True)
+
+    async def delete_old_character_rollups(
+        self,
+        user_id: str,
+        character_id: str,
+        *,
+        keep_count: int = 3,
+    ) -> int:
+        rows = await self._fetch_all(
+            """
+            SELECT sv.id
+            FROM summary_views AS sv
+            WHERE sv.user_id = ?
+              AND sv.character_id = ?
+              AND sv.summary_kind = ?
+            ORDER BY sv.created_at DESC, sv.id DESC
+            LIMIT -1 OFFSET ?
+            """,
+            (user_id, character_id, SummaryViewKind.CHARACTER_ROLLUP.value, keep_count),
+        )
+        if not rows:
+            return 0
+        summary_ids = [str(row["id"]) for row in rows]
+        return await self.delete_summaries(user_id, summary_ids, commit=True)
+
+    async def delete_old_character_rollups_for_persona(
+        self,
+        user_id: str,
+        character_id: str,
+        user_persona_id: str | None,
+        *,
+        keep_count: int = 3,
+    ) -> int:
+        rows = await self._fetch_all(
+            """
+            SELECT sv.id
+            FROM summary_views AS sv
+            WHERE sv.user_id = ?
+              AND sv.character_id = ?
+              AND sv.user_persona_id IS ?
+              AND sv.summary_kind = ?
+            ORDER BY sv.created_at DESC, sv.id DESC
+            LIMIT -1 OFFSET ?
+            """,
+            (
+                user_id,
+                character_id,
+                user_persona_id,
+                SummaryViewKind.CHARACTER_ROLLUP.value,
+                keep_count,
+            ),
         )
         if not rows:
             return 0

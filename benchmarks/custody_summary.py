@@ -18,6 +18,11 @@ def summarize_retrieval_custody(
     candidate_kind_counts: Counter[str] = Counter()
     composer_decision_counts: Counter[str] = Counter()
     filter_reason_counts: Counter[str] = Counter()
+    scope_counts: Counter[str] = Counter()
+    selected_scope_counts: Counter[str] = Counter()
+    sensitivity_counts: Counter[str] = Counter()
+    selected_sensitivity_counts: Counter[str] = Counter()
+    platform_locked_count = 0
 
     for group in custody_groups:
         for record in group:
@@ -36,11 +41,23 @@ def summarize_retrieval_custody(
             filter_reason = record.get("filter_reason")
             if filter_reason is not None:
                 filter_reason_counts[str(filter_reason)] += 1
+            scope = record.get("scope_canonical") or record.get("scope")
+            if scope is not None:
+                scope_counts[str(scope)] += 1
+            sensitivity = record.get("sensitivity")
+            if sensitivity is not None:
+                sensitivity_counts[str(sensitivity)] += 1
+            if record.get("platform_locked") is True:
+                platform_locked_count += 1
             if record.get("selected") is True:
                 selected_count += 1
                 selected_channel_counts.update(normalized_channels)
+                if scope is not None:
+                    selected_scope_counts[str(scope)] += 1
+                if sensitivity is not None:
+                    selected_sensitivity_counts[str(sensitivity)] += 1
 
-    return {
+    summary: dict[str, object] = {
         "candidate_count": candidate_count,
         "selected_count": selected_count,
         "channel_counts": dict(sorted(channel_counts.items())),
@@ -49,6 +66,15 @@ def summarize_retrieval_custody(
         "composer_decision_counts": dict(sorted(composer_decision_counts.items())),
         "filter_reason_counts": dict(sorted(filter_reason_counts.items())),
     }
+    if scope_counts:
+        summary["scope_counts"] = dict(sorted(scope_counts.items()))
+        summary["selected_scope_counts"] = dict(sorted(selected_scope_counts.items()))
+    if sensitivity_counts:
+        summary["sensitivity_counts"] = dict(sorted(sensitivity_counts.items()))
+        summary["selected_sensitivity_counts"] = dict(sorted(selected_sensitivity_counts.items()))
+    if platform_locked_count:
+        summary["platform_locked_count"] = platform_locked_count
+    return summary
 
 
 def format_retrieval_custody_summary(value: object) -> str:
@@ -57,14 +83,23 @@ def format_retrieval_custody_summary(value: object) -> str:
         return "Retrieval custody: unavailable"
     candidate_count = _int_summary_value(value, "candidate_count")
     selected_count = _int_summary_value(value, "selected_count")
-    return (
-        f"Retrieval custody: candidates={candidate_count} selected={selected_count} "
-        f"channels={_format_count_mapping(value.get('channel_counts'))} "
-        f"selected_channels={_format_count_mapping(value.get('selected_channel_counts'))} "
-        f"kinds={_format_count_mapping(value.get('candidate_kind_counts'))} "
-        f"decisions={_format_count_mapping(value.get('composer_decision_counts'))} "
-        f"filters={_format_count_mapping(value.get('filter_reason_counts'))}"
+    parts = [
+        f"Retrieval custody: candidates={candidate_count} selected={selected_count}",
+        f"channels={_format_count_mapping(value.get('channel_counts'))}",
+        f"selected_channels={_format_count_mapping(value.get('selected_channel_counts'))}",
+    ]
+    if value.get("scope_counts"):
+        parts.append(f"scopes={_format_count_mapping(value.get('scope_counts'))}")
+    if value.get("sensitivity_counts"):
+        parts.append(f"sensitivity={_format_count_mapping(value.get('sensitivity_counts'))}")
+    parts.extend(
+        [
+            f"kinds={_format_count_mapping(value.get('candidate_kind_counts'))}",
+            f"decisions={_format_count_mapping(value.get('composer_decision_counts'))}",
+            f"filters={_format_count_mapping(value.get('filter_reason_counts'))}",
+        ]
     )
+    return " ".join(parts)
 
 
 def _format_count_mapping(value: object) -> str:

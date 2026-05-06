@@ -7,7 +7,7 @@ import logging
 from typing import Any
 
 from atagia.core.llm_output_limits import CHAT_REPLY_MAX_OUTPUT_TOKENS
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
+from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.core.topic_repository import TopicRepository
@@ -19,28 +19,41 @@ from atagia.memory.intimacy_boundary_policy import (
     strongest_intimacy_boundary,
 )
 from atagia.models.schemas_api import ChatResult
+from atagia.models.schemas_memory import ConversationStatus
 from atagia.services.artifact_service import ArtifactService
 from atagia.services.chat_support import (
     CONTEXT_VIEW_TTL_SECONDS,
     RECENT_FETCH_LIMIT,
     RECENT_WINDOW_MESSAGES,
+    apply_conversation_policy_overlay,
     build_message_jobs,
     build_system_prompt,
     build_transcript_window,
     build_transcript_window_trace,
     chat_model,
     enqueue_message_jobs,
+    filter_topic_working_set_snapshot,
     missing_uncovered_tail_start_seq,
     render_transcript_window,
     render_topic_working_set_block,
-    resolve_assistant_mode_id,
+    resolve_retrieval_profile_id,
     resolve_operational_profile,
     resolve_policy,
     summarize_memory_summaries,
 )
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.confirmation_service import PendingConfirmationService
-from atagia.services.errors import ConversationNotFoundError, LLMUnavailableError
+from atagia.services.job_tracking_service import (
+    JobTrackingService,
+    render_memory_processing_status_block,
+)
+from atagia.services.worker_control_service import WorkerControlService
+from atagia.services.errors import (
+    ConversationNotActiveError,
+    ConversationNotFoundError,
+    LLMUnavailableError,
+    UserDeletedError,
+)
 from atagia.services.llm_client import (
     LLMCompletionRequest,
     LLMError,
@@ -71,6 +84,12 @@ class ChatService:
         debug: bool = False,
         operational_profile: str | None = None,
         operational_signals: Any | None = None,
+        cross_chat_memory: bool = True,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        mode: str | None = None,
+        incognito: bool | None = None,
     ) -> ChatResult:
         """Run the full retrieval, generation, persistence, and background-job flow."""
         cache_service = ContextCacheService(self.runtime)
@@ -79,6 +98,7 @@ class ChatService:
             connection = await self.runtime.open_connection()
             try:
                 conversations = ConversationRepository(connection, self.runtime.clock)
+                users = UserRepository(connection, self.runtime.clock)
                 messages = MessageRepository(connection, self.runtime.clock)
                 memories = MemoryObjectRepository(connection, self.runtime.clock)
                 events = RetrievalEventRepository(connection, self.runtime.clock)
@@ -95,14 +115,51 @@ class ChatService:
                     llm_client=self.runtime.llm_client,
                     settings=self.runtime.settings,
                 )
+                job_tracking = JobTrackingService(
+                    connection,
+                    self.runtime.clock,
+                    workers_enabled=self.runtime.settings.workers_enabled,
+                    settings=self.runtime.settings,
+                )
 
                 conversation = await conversations.get_conversation(conversation_id, user_id)
                 if conversation is None:
                     raise ConversationNotFoundError("Conversation not found for user")
+                _validate_optional_identity(
+                    conversation,
+                    user_persona_id=user_persona_id,
+                    platform_id=platform_id,
+                    character_id=character_id,
+                )
+                if await users.get_active_user(user_id) is None:
+                    raise UserDeletedError("User has been erased or does not exist")
+                memory_preferences = await users.get_memory_preferences(user_id)
+                if str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
+                    raise ConversationNotActiveError("Conversation is not active")
+                if not cross_chat_memory and not bool(conversation.get("isolated_mode")):
+                    updated = await conversations.mark_conversation_isolated(
+                        conversation_id,
+                        user_id,
+                    )
+                    if updated is not None:
+                        await cache_service.invalidate_conversation_cache_for_conversation(
+                            updated
+                        )
+                        conversation = updated
+                if incognito is True and not bool(conversation.get("incognito")):
+                    updated = await conversations.mark_conversation_isolated(
+                        conversation_id,
+                        user_id,
+                    )
+                    if updated is not None:
+                        await cache_service.invalidate_conversation_cache_for_conversation(
+                            updated
+                        )
+                        conversation = updated
 
-                resolved_mode_id = resolve_assistant_mode_id(
+                resolved_mode_id = resolve_retrieval_profile_id(
                     str(conversation["assistant_mode_id"]),
-                    assistant_mode_id,
+                    mode if mode is not None else assistant_mode_id,
                 )
                 resolved_operational_profile = resolve_operational_profile(
                     loader=self.runtime.operational_profile_loader,
@@ -115,6 +172,10 @@ class ChatService:
                     resolved_mode_id,
                     self.runtime.policy_resolver,
                     resolved_operational_profile,
+                )
+                resolved_policy = apply_conversation_policy_overlay(
+                    resolved_policy,
+                    conversation,
                 )
                 attachment_bundle = artifacts.prepare_attachments(
                     message_text=message_text,
@@ -146,6 +207,13 @@ class ChatService:
                         workspace_id=conversation["workspace_id"],
                         conversation_id=conversation_id,
                         assistant_mode_id=resolved_mode_id,
+                        user_persona_id=conversation.get("user_persona_id"),
+                        platform_id=conversation.get("platform_id") or "default",
+                        character_id=conversation.get("character_id") or conversation.get("workspace_id"),
+                        incognito=bool(conversation.get("incognito"))
+                        or bool(conversation.get("isolated_mode")),
+                        remember_across_chats=bool(conversation.get("remember_across_chats", 1)),
+                        remember_across_devices=bool(conversation.get("remember_across_devices", 1)),
                     )
                     == 0
                 )
@@ -160,7 +228,7 @@ class ChatService:
                     user_id=user_id,
                     conversation_id=conversation_id,
                     message_text=prompt_message_text,
-                    assistant_mode_id=assistant_mode_id,
+                    assistant_mode_id=resolved_mode_id,
                     stored_messages=prior_messages,
                     conversation=conversation,
                     operational_profile=operational_profile,
@@ -185,9 +253,19 @@ class ChatService:
                         self.runtime.settings.topic_working_set_stale_token_lag
                     ),
                 )
-                topic_context_block = render_topic_working_set_block(
+                visible_topic_snapshot = filter_topic_working_set_snapshot(
                     topic_snapshot,
                     allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
+                    privacy_ceiling=resolution.resolved_policy.privacy_ceiling,
+                )
+                topic_context_block = render_topic_working_set_block(
+                    visible_topic_snapshot,
+                    allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
+                    privacy_ceiling=resolution.resolved_policy.privacy_ceiling,
+                )
+                prompt_memory_processing = await job_tracking.get_status(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
                 )
                 if self.runtime.settings.benchmark_disable_raw_recent_transcript:
                     transcript_entries = []
@@ -232,6 +310,9 @@ class ChatService:
                                     resolution.composed_context.memory_block,
                                     resolution.composed_context.state_block,
                                     topic_context_block=topic_context_block,
+                                    memory_processing_block=render_memory_processing_status_block(
+                                        prompt_memory_processing
+                                    ),
                                 ),
                             ),
                             *[
@@ -248,7 +329,7 @@ class ChatService:
                             "assistant_mode_id": resolved_mode_id,
                             "purpose": "chat_reply",
                             **self._chat_intimacy_metadata(
-                                topic_snapshot,
+                                visible_topic_snapshot,
                                 allow_intimacy_context=(
                                     resolution.resolved_policy.allow_intimacy_context
                                 ),
@@ -274,20 +355,7 @@ class ChatService:
                         seq=None,
                         text=prompt_message_text,
                         token_count=None,
-                        metadata={
-                            **(metadata or {}),
-                            "attachments": attachment_bundle.attachments,
-                            "attachment_count": len(attachment_bundle.artifacts),
-                            "attachment_artifact_ids": [
-                                str(prepared.artifact["id"]) for prepared in attachment_bundle.artifacts
-                            ],
-                            "artifact_backed": bool(attachment_bundle.artifacts),
-                            "skip_by_default": bool(attachment_bundle.artifacts),
-                            "include_raw": not bool(attachment_bundle.artifacts),
-                            "requires_explicit_request": bool(attachment_bundle.artifacts),
-                            "content_kind": "artifact" if attachment_bundle.artifacts else "text",
-                            "context_placeholder": attachment_bundle.context_placeholder,
-                        },
+                        metadata=attachment_bundle.message_metadata(metadata),
                         occurred_at=resolved_user_occurred_at,
                         commit=False,
                     )
@@ -315,6 +383,14 @@ class ChatService:
                             "request_message_id": user_message["id"],
                             "response_message_id": assistant_message["id"],
                             "assistant_mode_id": resolved_mode_id,
+                            "user_persona_id": conversation.get("user_persona_id"),
+                            "platform_id": conversation.get("platform_id") or "default",
+                            "character_id": conversation.get("character_id") or conversation.get("workspace_id"),
+                            "mode": conversation.get("mode") or resolved_mode_id,
+                            "incognito": bool(conversation.get("incognito")) or bool(conversation.get("isolated_mode")),
+                            "remember_across_chats": bool(memory_preferences["remember_across_chats"]),
+                            "remember_across_devices": bool(memory_preferences["remember_across_devices"]),
+                            "memory_privacy_mode": memory_preferences["memory_privacy_mode"],
                             "retrieval_plan_json": resolution.source_retrieval_plan,
                             "selected_memory_ids_json": resolution.composed_context.selected_memory_ids,
                             "context_view_json": resolution.composed_context.model_dump(mode="json"),
@@ -368,6 +444,7 @@ class ChatService:
                 post_commit_errors: list[str] = []
                 enqueued_job_ids: list[str] = []
                 background_tasks_enqueued = False
+                memory_processing = prompt_memory_processing
 
                 try:
                     if invalidate_confirmation_cache:
@@ -439,6 +516,7 @@ class ChatService:
                     occurred_at=resolve_message_occurred_at(user_message),
                     role="user",
                     operational_profile=resolution.resolved_operational_profile.snapshot,
+                    memory_preferences=memory_preferences,
                 )
                 assistant_jobs = build_message_jobs(
                     clock=self.runtime.clock,
@@ -449,13 +527,23 @@ class ChatService:
                     occurred_at=resolve_message_occurred_at(assistant_message),
                     role="assistant",
                     operational_profile=resolution.resolved_operational_profile.snapshot,
+                    memory_preferences=memory_preferences,
                 )
                 try:
                     enqueued_job_ids = await enqueue_message_jobs(
                         storage_backend=self.runtime.storage_backend,
                         jobs=[*user_jobs, *assistant_jobs],
+                        job_tracking_service=job_tracking,
+                        worker_control_service=WorkerControlService(
+                            connection,
+                            self.runtime.clock,
+                        ),
                     )
-                    background_tasks_enqueued = True
+                    memory_processing = await job_tracking.get_status(
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                    )
+                    background_tasks_enqueued = bool(enqueued_job_ids)
                 except Exception:
                     logger.exception(
                         "Failed to enqueue post-response jobs for retrieval_event_id=%s",
@@ -497,7 +585,12 @@ class ChatService:
                         },
                         "enqueued_job_ids": enqueued_job_ids,
                         "post_commit_errors": post_commit_errors,
-                        "topic_working_set": topic_snapshot,
+                        "memory_processing": (
+                            None
+                            if memory_processing is None
+                            else memory_processing.model_dump(mode="json")
+                        ),
+                        "topic_working_set": visible_topic_snapshot,
                         "topic_working_set_block": topic_context_block,
                     }
                     if llm_response.thinking:
@@ -512,6 +605,7 @@ class ChatService:
                     composed_context=resolution.composed_context,
                     detected_needs=resolution.detected_needs,
                     memories_used=summarize_memory_summaries(resolution.memory_summaries),
+                    memory_processing=memory_processing,
                     debug=debug_payload,
                 )
             except LLMError as exc:
@@ -570,3 +664,21 @@ def _intimacy_policy_filtered_count(candidate_custody: list[dict[str, Any]]) -> 
         for record in candidate_custody
         if record.get("filter_reason") == INTIMACY_FILTER_REASON
     )
+
+
+def _validate_optional_identity(
+    conversation: dict[str, Any],
+    *,
+    user_persona_id: str | None,
+    platform_id: str | None,
+    character_id: str | None,
+) -> None:
+    for field_name, expected in (
+        ("user_persona_id", user_persona_id),
+        ("platform_id", platform_id),
+        ("character_id", character_id),
+    ):
+        actual = conversation.get(field_name)
+        actual_text = None if actual is None else str(actual)
+        if actual_text != expected:
+            raise ConversationNotFoundError("Conversation not found for user")

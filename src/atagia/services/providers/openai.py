@@ -165,12 +165,37 @@ def _openai_messages(request: LLMCompletionRequest) -> list[dict[str, Any]]:
             "role": message.role,
             "content": message.content,
         }
+        if message.role == "assistant" and message.tool_calls:
+            payload["tool_calls"] = _openai_message_tool_calls(message.tool_calls)
+            if not message.content:
+                payload["content"] = None
         if message.name:
             if message.role == "tool":
                 payload["tool_call_id"] = message.name
             else:
                 payload["name"] = message.name
         converted.append(payload)
+    return converted
+
+
+def _openai_message_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for index, tool_call in enumerate(tool_calls):
+        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        name = str(function.get("name") or tool_call.get("name") or "tool")
+        raw_arguments = (
+            function.get("arguments")
+            if "arguments" in function
+            else tool_call.get("arguments", tool_call.get("input", {}))
+        )
+        arguments = raw_arguments if isinstance(raw_arguments, str) else json.dumps(raw_arguments)
+        converted.append(
+            {
+                "id": str(tool_call.get("id") or f"call_atagia_{index}"),
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+        )
     return converted
 
 
@@ -284,7 +309,7 @@ class OpenAICompatibleProvider(LLMProvider):
         }
         if request.tools:
             kwargs["tools"] = _openai_tools(request)
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = request.metadata.get("openai_tool_choice") or "auto"
         response_format = _response_format(request.response_schema)
         if response_format is not None:
             kwargs["response_format"] = response_format

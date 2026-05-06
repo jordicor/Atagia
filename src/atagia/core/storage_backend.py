@@ -32,6 +32,32 @@ def extract_context_view_conversation_id(context_view: dict[str, Any]) -> str | 
     return normalized or None
 
 
+def _nested_job_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    nested = payload.get("payload")
+    if isinstance(nested, dict) and ("user_id" in nested or "conversation_id" in nested):
+        return nested
+    return payload
+
+
+def _job_matches_user(payload: Any, user_id: str) -> bool:
+    job = _nested_job_payload(payload)
+    if job is None:
+        return False
+    return str(job.get("user_id") or "") == user_id
+
+
+def _job_matches_conversation(payload: Any, conversation_id: str) -> bool:
+    job = _nested_job_payload(payload)
+    if job is None:
+        return False
+    if str(job.get("conversation_id") or "") == conversation_id:
+        return True
+    message_ids = job.get("message_ids")
+    return False if not isinstance(message_ids, list) else False
+
+
 class StorageBackend:
     """Interface for Redis-backed or in-process transient state."""
 
@@ -72,6 +98,22 @@ class StorageBackend:
         user_id: str,
         conversation_id: str,
     ) -> int:
+        raise NotImplementedError
+
+    async def delete_recent_windows_for_user(self, user_id: str) -> int:
+        raise NotImplementedError
+
+    async def delete_recent_window_for_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> int:
+        raise NotImplementedError
+
+    async def purge_user_jobs(self, user_id: str) -> int:
+        raise NotImplementedError
+
+    async def purge_conversation_jobs(self, user_id: str, conversation_id: str) -> int:
         raise NotImplementedError
 
     async def enqueue_job(self, queue_name: str, payload: dict[str, Any]) -> None:
@@ -237,6 +279,29 @@ class InProcessBackend(StorageBackend):
         with self._guard:
             self._recent_windows[key] = copy.deepcopy(messages)
 
+    async def delete_recent_windows_for_user(self, user_id: str) -> int:
+        prefix = f"{user_id}:"
+        with self._guard:
+            keys = [
+                key
+                for key in self._recent_windows
+                if key == user_id or key.startswith(prefix)
+            ]
+            for key in keys:
+                self._recent_windows.pop(key, None)
+            return len(keys)
+
+    async def delete_recent_window_for_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> int:
+        key = f"{user_id}:{conversation_id}"
+        with self._guard:
+            existed = key in self._recent_windows
+            self._recent_windows.pop(key, None)
+            return 1 if existed else 0
+
     async def get_context_view(self, key: str) -> dict[str, Any] | None:
         with self._guard:
             self._purge_expired()
@@ -310,6 +375,46 @@ class InProcessBackend(StorageBackend):
                 if self._delete_context_view_locked(key):
                     deleted += 1
             return deleted
+
+    async def purge_user_jobs(self, user_id: str) -> int:
+        with self._guard:
+            return self._purge_jobs_locked(lambda payload: _job_matches_user(payload, user_id))
+
+    async def purge_conversation_jobs(self, user_id: str, conversation_id: str) -> int:
+        with self._guard:
+            return self._purge_jobs_locked(
+                lambda payload: (
+                    _job_matches_user(payload, user_id)
+                    and _job_matches_conversation(payload, conversation_id)
+                )
+            )
+
+    def _purge_jobs_locked(self, should_drop: Any) -> int:
+        purged = 0
+        for queue in self._queues.values():
+            retained: list[dict[str, Any]] = []
+            while True:
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                payload = item.get("payload") if isinstance(item, dict) and "payload" in item else item
+                if should_drop(payload):
+                    purged += 1
+                    continue
+                retained.append(item)
+            for item in retained:
+                queue.put_nowait(item)
+
+        for pending in self._stream_pending.values():
+            for message_id, entry in list(pending.items()):
+                payload = entry.get("payload") if isinstance(entry, dict) else None
+                if should_drop(payload):
+                    pending.pop(message_id, None)
+                    purged += 1
+                    if self._pending_job_count > 0:
+                        self._pending_job_count -= 1
+        return purged
 
     async def enqueue_job(self, queue_name: str, payload: dict[str, Any]) -> None:
         queue = self._queues.setdefault(queue_name, asyncio.Queue())

@@ -6,12 +6,36 @@ import hashlib
 from typing import Any, Iterable
 
 from atagia.core.ids import generate_prefixed_id
-from atagia.core.repositories import BaseRepository, _decode_json_columns, _encode_json
+from atagia.core.repositories import (
+    BaseRepository,
+    MemoryObjectRepository,
+    _decode_json_columns,
+    _derive_sensitivity_from_privacy,
+    _encode_json,
+    conversation_visibility_clause,
+)
 from atagia.memory.intimacy_boundary_policy import (
     memory_object_intimacy_sql_clause,
     normalize_intimacy_boundary,
 )
-from atagia.models.schemas_memory import IntimacyBoundary, MemoryScope
+from atagia.models.schemas_memory import (
+    IntimacyBoundary,
+    MemoryCategory,
+    MemoryScope,
+    MemorySensitivity,
+)
+
+
+def _canonical_artifact_scope(
+    *,
+    workspace_id: str | None,
+    conversation_id: str | None,
+) -> str:
+    if conversation_id is not None:
+        return MemoryScope.CHAT.value
+    if workspace_id is not None:
+        return MemoryScope.CHARACTER.value
+    return MemoryScope.USER.value
 
 
 class ArtifactRepository(BaseRepository):
@@ -49,10 +73,31 @@ class ArtifactRepository(BaseRepository):
         storage_uri: str | None = None,
         blob_byte_size: int | None = None,
         blob_sha256: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        sensitivity: MemorySensitivity | None = None,
+        themes: list[str] | None = None,
+        platform_locked: bool = False,
+        platform_id_lock: str | None = None,
+        scope_canonical: str | None = None,
+        incognito_snapshot: bool = False,
+        remember_across_chats_snapshot: bool = True,
+        remember_across_devices_snapshot: bool = True,
+        policy_snapshot: dict[str, Any] | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_artifact_id = artifact_id or generate_prefixed_id("art")
         resolved_intimacy_boundary = normalize_intimacy_boundary(intimacy_boundary)
+        resolved_sensitivity = sensitivity or _derive_sensitivity_from_privacy(
+            privacy_level,
+            resolved_intimacy_boundary,
+            MemoryCategory.UNKNOWN,
+        )
+        resolved_scope_canonical = scope_canonical or _canonical_artifact_scope(
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+        )
         timestamp = self._timestamp()
         await self._connection.execute(
             """
@@ -81,11 +126,23 @@ class ArtifactRepository(BaseRepository):
                 metadata_json,
                 summary_text,
                 index_text,
+                user_persona_id,
+                platform_id,
+                character_id,
+                sensitivity,
+                themes_json,
+                platform_locked,
+                platform_id_lock,
+                scope_canonical,
+                incognito_snapshot,
+                remember_across_chats_snapshot,
+                remember_across_devices_snapshot,
+                policy_snapshot_json,
                 created_at,
                 updated_at,
                 deleted_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """,
             (
                 resolved_artifact_id,
@@ -112,6 +169,18 @@ class ArtifactRepository(BaseRepository):
                 _encode_json(metadata_json),
                 summary_text,
                 index_text,
+                user_persona_id,
+                platform_id or "default",
+                character_id if character_id is not None else workspace_id,
+                resolved_sensitivity.value,
+                _encode_json(list(themes or [])),
+                int(platform_locked),
+                platform_id_lock,
+                resolved_scope_canonical,
+                int(incognito_snapshot),
+                int(remember_across_chats_snapshot),
+                int(remember_across_devices_snapshot),
+                _encode_json(policy_snapshot or {}),
                 timestamp,
                 timestamp,
             ),
@@ -373,6 +442,12 @@ class ArtifactRepository(BaseRepository):
         conversation_id: str,
         limit: int,
         allow_intimacy_context: bool = False,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -384,13 +459,20 @@ class ArtifactRepository(BaseRepository):
         if not normalized_message_ids:
             return []
         deduped_message_ids = list(dict.fromkeys(normalized_message_ids))
-        scope_clauses, scope_parameters = self._scope_clauses(
+        visibility_clauses, visibility_parameters, visibility_joiner = self._visibility_clauses(
             scope_filter,
             assistant_mode_id=assistant_mode_id,
             workspace_id=workspace_id,
             conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+            allow_sensitive=allow_intimacy_context,
         )
-        if not scope_clauses:
+        if not visibility_clauses:
             return []
         requested_values = ", ".join("(?, ?)" for _ in deduped_message_ids)
         query_text = """
@@ -436,7 +518,8 @@ class ArtifactRepository(BaseRepository):
               AND a.deleted_at IS NULL
               AND a.privacy_level <= ?
               AND {intimacy_filter}
-              AND ({scope_clauses})
+              AND ({visibility_clauses})
+              AND {visibility_clause}
             ORDER BY
                 requested.message_order ASC,
                 CASE WHEN ac.kind = 'summary' THEN 1 ELSE 0 END ASC,
@@ -445,7 +528,8 @@ class ArtifactRepository(BaseRepository):
             LIMIT ?
         """.format(
             requested_values=requested_values,
-            scope_clauses=" OR ".join(scope_clauses),
+            visibility_clauses=visibility_joiner.join(visibility_clauses),
+            visibility_clause=conversation_visibility_clause("a"),
             intimacy_filter=(
                 f"{memory_object_intimacy_sql_clause('ac', allow_intimacy_context=allow_intimacy_context)} "
                 f"AND {memory_object_intimacy_sql_clause('a', allow_intimacy_context=allow_intimacy_context)}"
@@ -460,7 +544,8 @@ class ArtifactRepository(BaseRepository):
                 *requested_parameters,
                 user_id,
                 privacy_ceiling,
-                *scope_parameters,
+                *visibility_parameters,
+                conversation_id,
                 limit,
             ),
         )
@@ -548,16 +633,29 @@ class ArtifactRepository(BaseRepository):
         conversation_id: str,
         limit: int,
         allow_intimacy_context: bool = False,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
-        scope_clauses, scope_parameters = self._scope_clauses(
+        visibility_clauses, visibility_parameters, visibility_joiner = self._visibility_clauses(
             scope_filter,
             assistant_mode_id=assistant_mode_id,
             workspace_id=workspace_id,
             conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+            allow_sensitive=allow_intimacy_context,
         )
-        if not scope_clauses:
+        if not visibility_clauses:
             return []
         query_text = """
             SELECT
@@ -597,7 +695,8 @@ class ArtifactRepository(BaseRepository):
               AND a.deleted_at IS NULL
               AND a.privacy_level <= ?
               AND {intimacy_filter}
-              AND ({scope_clauses})
+              AND ({visibility_clauses})
+              AND {visibility_clause}
               AND artifact_chunks_fts MATCH ?
             ORDER BY
                 CASE WHEN ac.kind = 'summary' THEN 1 ELSE 0 END ASC,
@@ -607,7 +706,8 @@ class ArtifactRepository(BaseRepository):
                 ac.id ASC
             LIMIT ?
         """.format(
-            scope_clauses=" OR ".join(scope_clauses),
+            visibility_clauses=visibility_joiner.join(visibility_clauses),
+            visibility_clause=conversation_visibility_clause("a"),
             intimacy_filter=(
                 f"{memory_object_intimacy_sql_clause('ac', allow_intimacy_context=allow_intimacy_context)} "
                 f"AND {memory_object_intimacy_sql_clause('a', allow_intimacy_context=allow_intimacy_context)}"
@@ -618,13 +718,51 @@ class ArtifactRepository(BaseRepository):
             (
                 user_id,
                 privacy_ceiling,
-                *scope_parameters,
+                *visibility_parameters,
+                conversation_id,
                 query,
                 limit,
             ),
         )
         rows = await cursor.fetchall()
         return [row for row in (_decode_json_columns(row) for row in rows) if row is not None]
+
+    @staticmethod
+    def _visibility_clauses(
+        scope_filter: list[MemoryScope],
+        *,
+        assistant_mode_id: str,
+        workspace_id: str | None,
+        conversation_id: str,
+        user_persona_id: str | None,
+        platform_id: str | None,
+        character_id: str | None,
+        incognito: bool,
+        remember_across_chats: bool,
+        remember_across_devices: bool,
+        allow_sensitive: bool = False,
+    ) -> tuple[list[str], list[Any], str]:
+        if platform_id is None:
+            clauses, parameters = ArtifactRepository._scope_clauses(
+                scope_filter,
+                assistant_mode_id=assistant_mode_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+            )
+            return clauses, parameters, " OR "
+        clauses, parameters = MemoryObjectRepository.namespace_visibility_clauses(
+            scope_filter,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id if character_id is not None else workspace_id,
+            conversation_id=conversation_id,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+            incognito=incognito,
+            sensitivity_gates_enabled=allow_sensitive,
+            table_alias="a",
+        )
+        return clauses, parameters, " AND "
 
     @staticmethod
     def _scope_clauses(
@@ -639,16 +777,13 @@ class ArtifactRepository(BaseRepository):
         for scope in scope_filter:
             if scope is MemoryScope.GLOBAL_USER:
                 clauses.append("(a.workspace_id IS NULL AND a.conversation_id IS NULL)")
-            elif scope is MemoryScope.ASSISTANT_MODE:
-                clauses.append("c.assistant_mode_id = ?")
-                parameters.append(assistant_mode_id)
             elif scope is MemoryScope.WORKSPACE and workspace_id is not None:
-                clauses.append("(c.assistant_mode_id = ? AND a.workspace_id = ?)")
-                parameters.extend([assistant_mode_id, workspace_id])
+                clauses.append("(a.workspace_id = ?)")
+                parameters.append(workspace_id)
             elif scope is MemoryScope.CONVERSATION:
-                clauses.append("(c.assistant_mode_id = ? AND a.conversation_id = ?)")
-                parameters.extend([assistant_mode_id, conversation_id])
+                clauses.append("(a.conversation_id = ?)")
+                parameters.append(conversation_id)
             elif scope is MemoryScope.EPHEMERAL_SESSION:
-                clauses.append("(c.assistant_mode_id = ? AND a.conversation_id = ?)")
-                parameters.extend([assistant_mode_id, conversation_id])
+                clauses.append("(a.conversation_id = ?)")
+                parameters.append(conversation_id)
         return clauses, parameters

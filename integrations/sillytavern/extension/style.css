@@ -1,0 +1,24 @@
+.atagia-memory-settings textarea {
+  min-height: 5rem;
+  width: 100%;
+}
+
+.atagia-memory-settings .atagia-memory-row {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.5rem 0;
+}
+
+.atagia-memory-settings .atagia-memory-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+
+.atagia-memory-preview {
+  white-space: pre-wrap;
+  max-height: 16rem;
+  overflow: auto;
+  margin-top: 0.5rem;
+}

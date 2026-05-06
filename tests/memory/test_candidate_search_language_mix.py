@@ -54,8 +54,11 @@ async def _seed_memory(
     status: MemoryStatus = MemoryStatus.ACTIVE,
     privacy_level: int = 0,
     intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+    character_id: str | None = None,
+    scope_canonical: str | None = None,
+    platform_id: str | None = None,
 ) -> None:
-    await memories.create_memory_object(
+        await memories.create_memory_object(
         user_id="usr_1",
         workspace_id=workspace_id,
         conversation_id=conversation_id,
@@ -71,6 +74,9 @@ async def _seed_memory(
         status=status,
         language_codes=language_codes,
         memory_id=memory_id,
+        character_id=character_id,
+        scope_canonical=scope_canonical,
+        platform_id=platform_id,
     )
 
 
@@ -151,14 +157,59 @@ async def test_aggregate_retrievable_language_mix_filters_by_scope_status_privac
         assert profile == [
             {
                 "language_code": "es",
-                "memory_count": 2,
-                "last_seen_at": "2026-04-05T12:00:02+00:00",
+                "memory_count": 1,
+                "last_seen_at": "2026-04-05T12:00:01+00:00",
             },
             {
                 "language_code": "en",
                 "memory_count": 1,
                 "last_seen_at": "2026-04-05T12:00:00+00:00",
             },
+        ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_retrievable_language_mix_uses_canonical_character_scope() -> None:
+    connection, clock, memories, search = await _build_runtime()
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_legacy_workspace",
+            canonical_text="legacy workspace language",
+            language_codes=["es"],
+            scope=MemoryScope.WORKSPACE,
+            conversation_id=None,
+        )
+        clock.advance(seconds=1)
+        await _seed_memory(
+            memories,
+            memory_id="mem_character",
+            canonical_text="canonical character language",
+            language_codes=["ca"],
+            scope=MemoryScope.WORKSPACE,
+            conversation_id=None,
+            character_id="wrk_1",
+            scope_canonical=MemoryScope.CHARACTER.value,
+        )
+
+        profile = await search.aggregate_retrievable_language_mix(
+            user_id="usr_1",
+            scope_filter=[MemoryScope.WORKSPACE],
+            assistant_mode_id="coding_debug",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            privacy_ceiling=1,
+            character_id="wrk_1",
+        )
+
+        assert profile == [
+            {
+                "language_code": "ca",
+                "memory_count": 1,
+                "last_seen_at": "2026-04-05T12:00:01+00:00",
+            }
         ]
     finally:
         await connection.close()
@@ -233,7 +284,7 @@ async def test_aggregate_retrievable_language_mix_returns_empty_on_cold_start() 
 
 
 @pytest.mark.asyncio
-async def test_aggregate_retrievable_language_mix_can_include_authorized_intimacy_context() -> None:
+async def test_aggregate_retrievable_language_mix_hides_non_public_even_with_intimacy_context() -> None:
     connection, _clock, memories, search = await _build_runtime()
     try:
         await _seed_memory(
@@ -264,12 +315,6 @@ async def test_aggregate_retrievable_language_mix_can_include_authorized_intimac
         )
 
         assert ordinary_profile == []
-        assert authorized_profile == [
-            {
-                "language_code": "es",
-                "memory_count": 1,
-                "last_seen_at": "2026-04-05T12:00:00+00:00",
-            }
-        ]
+        assert authorized_profile == []
     finally:
         await connection.close()

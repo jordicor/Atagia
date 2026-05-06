@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import aiosqlite
+
+from atagia.core import json_utils
 from atagia.core.repositories import BaseRepository
-from atagia.models.schemas_memory import MemoryCategory
+from atagia.models.schemas_memory import MemoryCategory, MemoryScope, MemorySensitivity
 
 
 class MemoryConsentProfileRepository(BaseRepository):
@@ -15,6 +18,7 @@ class MemoryConsentProfileRepository(BaseRepository):
         self,
         user_id: str,
         category: MemoryCategory,
+        user_persona_id: str | None = None,
     ) -> dict[str, Any] | None:
         return await self._fetch_one(
             """
@@ -22,8 +26,9 @@ class MemoryConsentProfileRepository(BaseRepository):
             FROM memory_consent_profile
             WHERE user_id = ?
               AND category = ?
+              AND user_persona_id IS ?
             """,
-            (user_id, category.value),
+            (user_id, category.value, user_persona_id),
         )
 
     async def upsert_profile(
@@ -33,41 +38,90 @@ class MemoryConsentProfileRepository(BaseRepository):
         category: MemoryCategory,
         confirmed_count: int,
         declined_count: int,
+        user_persona_id: str | None = None,
         last_confirmed_at: str | None = None,
         last_declined_at: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         timestamp = self._timestamp()
-        cursor = await self._connection.execute(
-            """
-            INSERT INTO memory_consent_profile(
-                user_id,
-                category,
-                confirmed_count,
-                declined_count,
-                last_confirmed_at,
-                last_declined_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, category) DO UPDATE SET
-                confirmed_count = excluded.confirmed_count,
-                declined_count = excluded.declined_count,
-                last_confirmed_at = excluded.last_confirmed_at,
-                last_declined_at = excluded.last_declined_at,
-                updated_at = excluded.updated_at
-            RETURNING *
-            """,
-            (
-                user_id,
-                category.value,
-                confirmed_count,
-                declined_count,
-                last_confirmed_at,
-                last_declined_at,
-                timestamp,
-            ),
+        existing = await self.get_profile(
+            user_id,
+            category,
+            user_persona_id=user_persona_id,
         )
+        if existing is not None:
+            cursor = await self._connection.execute(
+                """
+                UPDATE memory_consent_profile
+                SET confirmed_count = ?,
+                    declined_count = ?,
+                    last_confirmed_at = ?,
+                    last_declined_at = ?,
+                    updated_at = ?
+                WHERE _rowid = ?
+                RETURNING *
+                """,
+                (
+                    confirmed_count,
+                    declined_count,
+                    last_confirmed_at,
+                    last_declined_at,
+                    timestamp,
+                    existing["_rowid"],
+                ),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if commit:
+                await self._connection.commit()
+            if row is None:
+                raise RuntimeError("Failed to update consent profile")
+            decoded = self._decode_row(row)
+            if decoded is None:
+                raise RuntimeError("Failed to decode consent profile")
+            return decoded
+        try:
+            cursor = await self._connection.execute(
+                """
+                INSERT INTO memory_consent_profile(
+                    user_id,
+                    category,
+                    confirmed_count,
+                    declined_count,
+                    last_confirmed_at,
+                    last_declined_at,
+                    updated_at,
+                    user_persona_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING *
+                """,
+                (
+                    user_id,
+                    category.value,
+                    confirmed_count,
+                    declined_count,
+                    last_confirmed_at,
+                    last_declined_at,
+                    timestamp,
+                    user_persona_id,
+                ),
+            )
+        except aiosqlite.IntegrityError:
+            # The additive migration cannot remove the old UNIQUE(user_id,
+            # category) autoindex until the Phase 11 table rebuild. Fail closed:
+            # do not overwrite another persona's consent profile.
+            return {
+                "user_id": user_id,
+                "category": category.value,
+                "confirmed_count": confirmed_count,
+                "declined_count": declined_count,
+                "last_confirmed_at": last_confirmed_at,
+                "last_declined_at": last_declined_at,
+                "updated_at": timestamp,
+                "user_persona_id": user_persona_id,
+                "not_persisted_reason": "legacy_unique_user_category",
+            }
         row = await cursor.fetchone()
         await cursor.close()
         if commit:
@@ -83,7 +137,11 @@ class MemoryConsentProfileRepository(BaseRepository):
     def _decode_row(row: Any) -> dict[str, Any] | None:
         if row is None:
             return None
-        return dict(row)
+        payload = dict(row)
+        value = payload.get("policy_snapshot_json")
+        if isinstance(value, str):
+            payload["policy_snapshot_json"] = json_utils.loads(value)
+        return payload
 
 
 class PendingMemoryConfirmationRepository(BaseRepository):
@@ -97,6 +155,22 @@ class PendingMemoryConfirmationRepository(BaseRepository):
         memory_id: str,
         category: MemoryCategory,
         created_at: str,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        mode: str | None = None,
+        incognito_snapshot: bool = False,
+        remember_across_chats_snapshot: bool = True,
+        remember_across_devices_snapshot: bool = True,
+        temporary_snapshot: bool = False,
+        purge_on_close_snapshot: bool = False,
+        valid_to_snapshot: str | None = None,
+        intended_scope: MemoryScope | None = None,
+        intended_sensitivity: MemorySensitivity = MemorySensitivity.UNKNOWN,
+        platform_locked: bool = False,
+        platform_id_lock: str | None = None,
+        policy_snapshot: dict[str, Any] | None = None,
+        policy_proven: bool = False,
         commit: bool = True,
     ) -> dict[str, Any]:
         cursor = await self._connection.execute(
@@ -106,9 +180,25 @@ class PendingMemoryConfirmationRepository(BaseRepository):
                 conversation_id,
                 memory_id,
                 memory_category,
-                created_at
+                created_at,
+                user_persona_id,
+                platform_id,
+                character_id,
+                mode,
+                incognito_snapshot,
+                remember_across_chats_snapshot,
+                remember_across_devices_snapshot,
+                temporary_snapshot,
+                purge_on_close_snapshot,
+                valid_to_snapshot,
+                intended_scope,
+                intended_sensitivity,
+                platform_locked,
+                platform_id_lock,
+                policy_snapshot_json,
+                policy_proven
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, memory_id) DO NOTHING
             RETURNING *
             """,
@@ -118,6 +208,22 @@ class PendingMemoryConfirmationRepository(BaseRepository):
                 memory_id,
                 category.value,
                 created_at,
+                user_persona_id,
+                platform_id,
+                character_id,
+                mode,
+                1 if incognito_snapshot else 0,
+                1 if remember_across_chats_snapshot else 0,
+                1 if remember_across_devices_snapshot else 0,
+                1 if temporary_snapshot else 0,
+                1 if purge_on_close_snapshot else 0,
+                valid_to_snapshot,
+                intended_scope.value if intended_scope is not None else None,
+                intended_sensitivity.value,
+                1 if platform_locked else 0,
+                platform_id_lock,
+                json_utils.dumps(policy_snapshot or {}, sort_keys=True),
+                1 if policy_proven else 0,
             ),
         )
         row = await cursor.fetchone()
@@ -146,6 +252,61 @@ class PendingMemoryConfirmationRepository(BaseRepository):
               AND memory_id = ?
             """,
             (user_id, memory_id),
+        )
+
+    async def list_pending_markers(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str | None = None,
+        platform_id: str | None = None,
+        user_persona_id: str | None = None,
+        character_id: str | None = None,
+        category: MemoryCategory | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        clauses = [
+            "pmc.user_id = ?",
+            "mo.status = 'pending_user_confirmation'",
+        ]
+        parameters: list[Any] = [user_id]
+        if conversation_id is not None:
+            clauses.append("pmc.conversation_id = ?")
+            parameters.append(conversation_id)
+        if platform_id is not None:
+            clauses.append("pmc.platform_id = ?")
+            parameters.append(platform_id)
+        if user_persona_id is not None:
+            clauses.append("pmc.user_persona_id IS ?")
+            parameters.append(user_persona_id)
+        if character_id is not None:
+            clauses.append("pmc.character_id IS ?")
+            parameters.append(character_id)
+        if category is not None:
+            clauses.append("pmc.memory_category = ?")
+            parameters.append(category.value)
+        return await self._fetch_all(
+            """
+            SELECT
+                pmc.*,
+                mo.object_type,
+                mo.scope,
+                mo.scope_canonical,
+                mo.index_text,
+                mo.canonical_text,
+                mo.privacy_level,
+                mo.sensitivity,
+                mo.intimacy_boundary,
+                mo.status AS memory_status
+            FROM pending_memory_confirmations AS pmc
+            JOIN memory_objects AS mo ON mo.id = pmc.memory_id
+            WHERE {clauses}
+            ORDER BY pmc.created_at ASC, pmc._rowid ASC
+            LIMIT ?
+            OFFSET ?
+            """.format(clauses=" AND ".join(clauses)),
+            (*parameters, max(1, min(int(limit), 500)), max(0, int(offset))),
         )
 
     async def get_oldest_unasked_marker(
@@ -287,4 +448,8 @@ class PendingMemoryConfirmationRepository(BaseRepository):
     def _decode_row(row: Any) -> dict[str, Any] | None:
         if row is None:
             return None
-        return dict(row)
+        payload = dict(row)
+        value = payload.get("policy_snapshot_json")
+        if isinstance(value, str):
+            payload["policy_snapshot_json"] = json_utils.loads(value)
+        return payload

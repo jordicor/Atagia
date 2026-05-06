@@ -7,7 +7,14 @@ from typing import Any
 import aiosqlite
 
 from atagia.core.ids import generate_prefixed_id
-from atagia.core.repositories import BaseRepository, _decode_json_columns, _encode_json
+from atagia.core.repositories import (
+    BaseRepository,
+    MemoryObjectRepository,
+    _decode_json_columns,
+    _derive_sensitivity_from_privacy,
+    _encode_json,
+    conversation_visibility_clause,
+)
 from atagia.core.timestamps import normalize_optional_timestamp
 from atagia.memory.intimacy_boundary_policy import (
     is_blocked_intimacy_boundary,
@@ -15,7 +22,14 @@ from atagia.memory.intimacy_boundary_policy import (
     minimum_privacy_for_intimacy_boundary,
     normalize_intimacy_boundary,
 )
-from atagia.models.schemas_memory import IntimacyBoundary, MemoryScope, VerbatimPinStatus, VerbatimPinTargetKind
+from atagia.models.schemas_memory import (
+    IntimacyBoundary,
+    MemoryCategory,
+    MemoryScope,
+    MemorySensitivity,
+    VerbatimPinStatus,
+    VerbatimPinTargetKind,
+)
 
 
 def _normalize_optional_text(value: Any) -> str | None:
@@ -30,6 +44,14 @@ def _normalize_required_text(value: Any) -> str:
     if normalized is None:
         raise ValueError("value must be a non-empty string")
     return normalized
+
+
+def _canonical_pin_scope(scope: MemoryScope) -> str:
+    if scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION, MemoryScope.CHAT}:
+        return MemoryScope.CHAT.value
+    if scope in {MemoryScope.WORKSPACE, MemoryScope.CHARACTER}:
+        return MemoryScope.CHARACTER.value
+    return MemoryScope.USER.value
 
 
 class VerbatimPinRepository(BaseRepository):
@@ -66,6 +88,18 @@ class VerbatimPinRepository(BaseRepository):
         payload_json: dict[str, Any] | None = None,
         pin_id: str | None = None,
         status: VerbatimPinStatus = VerbatimPinStatus.ACTIVE,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        sensitivity: MemorySensitivity | None = None,
+        themes: list[str] | None = None,
+        platform_locked: bool = False,
+        platform_id_lock: str | None = None,
+        scope_canonical: str | None = None,
+        incognito_snapshot: bool = False,
+        remember_across_chats_snapshot: bool = True,
+        remember_across_devices_snapshot: bool = True,
+        policy_snapshot: dict[str, Any] | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_pin_id = pin_id or generate_prefixed_id("vbp")
@@ -76,6 +110,14 @@ class VerbatimPinRepository(BaseRepository):
             resolved_intimacy_boundary,
             privacy_level=privacy_level,
         )
+        resolved_sensitivity = sensitivity or _derive_sensitivity_from_privacy(
+            resolved_privacy_level,
+            resolved_intimacy_boundary,
+            memory_category=MemoryCategory.UNKNOWN,
+        )
+        resolved_scope_canonical = scope_canonical or _canonical_pin_scope(scope)
+        resolved_storage_scope = resolved_scope_canonical
+        resolved_character_id = character_id if character_id is not None else workspace_id
         timestamp = self._timestamp()
         normalized_expires_at = normalize_optional_timestamp(expires_at)
         parameters = (
@@ -84,7 +126,7 @@ class VerbatimPinRepository(BaseRepository):
             _normalize_optional_text(workspace_id),
             _normalize_optional_text(conversation_id),
             _normalize_optional_text(assistant_mode_id),
-            scope.value,
+            resolved_storage_scope,
             target_kind.value,
             _normalize_required_text(target_id),
             target_span_start,
@@ -102,6 +144,18 @@ class VerbatimPinRepository(BaseRepository):
             normalized_expires_at,
             None,
             _encode_json(payload_json),
+            user_persona_id,
+            platform_id or "default",
+            resolved_character_id,
+            resolved_sensitivity.value,
+            _encode_json(list(themes or [])),
+            int(platform_locked),
+            platform_id_lock,
+            resolved_scope_canonical,
+            int(incognito_snapshot),
+            int(remember_across_chats_snapshot),
+            int(remember_across_devices_snapshot),
+            _encode_json(policy_snapshot or {}),
         )
         await self._connection.execute(
             """
@@ -128,9 +182,21 @@ class VerbatimPinRepository(BaseRepository):
                 updated_at,
                 expires_at,
                 deleted_at,
-                payload_json
+                payload_json,
+                user_persona_id,
+                platform_id,
+                character_id,
+                sensitivity,
+                themes_json,
+                platform_locked,
+                platform_id_lock,
+                scope_canonical,
+                incognito_snapshot,
+                remember_across_chats_snapshot,
+                remember_across_devices_snapshot,
+                policy_snapshot_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             parameters,
         )
@@ -141,15 +207,37 @@ class VerbatimPinRepository(BaseRepository):
             raise RuntimeError(f"Failed to create verbatim pin {resolved_pin_id}")
         return created
 
-    async def get_verbatim_pin(self, pin_id: str, user_id: str) -> dict[str, Any] | None:
+    async def get_verbatim_pin(
+        self,
+        pin_id: str,
+        user_id: str,
+        *,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
+    ) -> dict[str, Any] | None:
+        visibility_clause, visibility_parameters = self._namespace_crud_sql(
+            conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+        )
         return self._strip_rowid(await self._fetch_one(
-            """
+            f"""
             SELECT *
-            FROM verbatim_pins
+            FROM verbatim_pins AS vp
             WHERE id = ?
               AND user_id = ?
+              {visibility_clause}
             """,
-            (pin_id, user_id),
+            (pin_id, user_id, *visibility_parameters),
         ))
 
     async def list_verbatim_pins(
@@ -165,6 +253,13 @@ class VerbatimPinRepository(BaseRepository):
         include_deleted: bool = False,
         active_only: bool = False,
         as_of: str | None = None,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> list[dict[str, Any]]:
         clauses = ["user_id = ?"]
         parameters: list[Any] = [user_id]
@@ -187,9 +282,10 @@ class VerbatimPinRepository(BaseRepository):
         if scope_filter is not None:
             if not scope_filter:
                 return []
-            placeholders = ", ".join("?" for _ in scope_filter)
+            canonical_scope_filter = sorted({_canonical_pin_scope(scope) for scope in scope_filter})
+            placeholders = ", ".join("?" for _ in canonical_scope_filter)
             clauses.append(f"scope IN ({placeholders})")
-            parameters.extend(scope.value for scope in scope_filter)
+            parameters.extend(canonical_scope_filter)
 
         if target_kind_filter is not None:
             if not target_kind_filter:
@@ -201,13 +297,25 @@ class VerbatimPinRepository(BaseRepository):
         if target_id is not None:
             clauses.append("target_id = ?")
             parameters.append(_normalize_required_text(target_id))
+        visibility_clause, visibility_parameters = self._namespace_crud_sql(
+            conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+        )
+        if visibility_clause:
+            clauses.append(visibility_clause.removeprefix(" AND "))
+            parameters.extend(visibility_parameters)
 
         resolved_limit = max(1, min(500, int(limit)))
         resolved_offset = max(0, int(offset))
         rows = await self._fetch_all(
             """
             SELECT *
-            FROM verbatim_pins
+            FROM verbatim_pins AS vp
             WHERE {where_clause}
             ORDER BY updated_at DESC, created_at DESC, id ASC
             LIMIT ?
@@ -234,19 +342,41 @@ class VerbatimPinRepository(BaseRepository):
         limit: int,
         allow_intimacy_context: bool = False,
         as_of: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
         normalized_query = _normalize_optional_text(query)
         if normalized_query is None:
             return []
-        scope_clauses, scope_parameters = self._scope_clauses(
-            scope_filter,
-            assistant_mode_id=assistant_mode_id,
-            workspace_id=workspace_id,
-            conversation_id=conversation_id,
-        )
-        if not scope_clauses:
+        if platform_id is not None:
+            visibility_clauses, visibility_parameters = MemoryObjectRepository.namespace_visibility_clauses(
+                scope_filter,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id if character_id is not None else workspace_id,
+                conversation_id=conversation_id,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                incognito=incognito,
+                sensitivity_gates_enabled=allow_intimacy_context,
+                table_alias="vp",
+            )
+            visibility_joiner = " AND "
+        else:
+            visibility_clauses, visibility_parameters = self._scope_clauses(
+                scope_filter,
+                assistant_mode_id=assistant_mode_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+            )
+            visibility_joiner = " OR "
+        if not visibility_clauses:
             return []
         resolved_as_of = normalize_optional_timestamp(as_of) or self._timestamp()
         cursor = await self._connection.execute(
@@ -257,26 +387,29 @@ class VerbatimPinRepository(BaseRepository):
             FROM verbatim_pins_fts
             JOIN verbatim_pins AS vp ON vp._rowid = verbatim_pins_fts.rowid
             WHERE vp.user_id = ?
-              AND ({scope_clauses})
+              AND ({visibility_clauses})
               AND vp.status = ?
               AND vp.privacy_level <= ?
               AND {intimacy_filter}
+              AND {visibility_clause}
               AND (vp.expires_at IS NULL OR datetime(vp.expires_at) > datetime(?))
               AND verbatim_pins_fts MATCH ?
             ORDER BY rank ASC, vp.updated_at DESC, vp.created_at DESC, vp.id ASC
             LIMIT ?
             """.format(
-                scope_clauses=" OR ".join(scope_clauses),
+                visibility_clauses=visibility_joiner.join(visibility_clauses),
                 intimacy_filter=memory_object_intimacy_sql_clause(
                     "vp",
                     allow_intimacy_context=allow_intimacy_context,
                 ),
+                visibility_clause=conversation_visibility_clause("vp"),
             ),
             (
                 user_id,
-                *scope_parameters,
+                *visibility_parameters,
                 VerbatimPinStatus.ACTIVE.value,
                 privacy_ceiling,
+                conversation_id,
                 resolved_as_of,
                 normalized_query,
                 limit,
@@ -306,9 +439,26 @@ class VerbatimPinRepository(BaseRepository):
         expires_at: str | None = None,
         payload_json: dict[str, Any] | None = None,
         deleted_at: str | None = None,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
         commit: bool = True,
     ) -> dict[str, Any] | None:
-        existing = await self.get_verbatim_pin(pin_id, user_id)
+        existing = await self.get_verbatim_pin(
+            pin_id,
+            user_id,
+            conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+        )
         if existing is None:
             return None
 
@@ -375,33 +525,68 @@ class VerbatimPinRepository(BaseRepository):
         if updates:
             updates.append("updated_at = ?")
             parameters.append(self._timestamp())
-            parameters.extend([pin_id, user_id])
+            visibility_clause, visibility_parameters = self._namespace_crud_sql(
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                table_alias="",
+            )
+            parameters.extend([pin_id, user_id, *visibility_parameters])
             await self._connection.execute(
                 """
                 UPDATE verbatim_pins
                 SET {updates}
                 WHERE id = ?
                   AND user_id = ?
-                """.format(updates=", ".join(updates)),
+                  {visibility_clause}
+                """.format(updates=", ".join(updates), visibility_clause=visibility_clause),
                 tuple(parameters),
             )
             if commit:
                 await self._connection.commit()
         elif commit:
             await self._connection.commit()
-        return await self.get_verbatim_pin(pin_id, user_id)
+        return await self.get_verbatim_pin(
+            pin_id,
+            user_id,
+            conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+        )
 
     async def archive_verbatim_pin(
         self,
         pin_id: str,
         user_id: str,
         *,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
         commit: bool = True,
     ) -> dict[str, Any] | None:
         return await self.update_verbatim_pin(
             pin_id,
             user_id,
             status=VerbatimPinStatus.ARCHIVED,
+            conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
             commit=commit,
         )
 
@@ -410,6 +595,13 @@ class VerbatimPinRepository(BaseRepository):
         pin_id: str,
         user_id: str,
         *,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
         commit: bool = True,
     ) -> dict[str, Any] | None:
         return await self.update_verbatim_pin(
@@ -417,8 +609,45 @@ class VerbatimPinRepository(BaseRepository):
             user_id,
             status=VerbatimPinStatus.DELETED,
             deleted_at=self._timestamp(),
+            conversation_id=conversation_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
             commit=commit,
         )
+
+    @staticmethod
+    def _namespace_crud_sql(
+        *,
+        conversation_id: str | None,
+        user_persona_id: str | None,
+        platform_id: str | None,
+        character_id: str | None,
+        incognito: bool,
+        remember_across_chats: bool,
+        remember_across_devices: bool,
+        table_alias: str = "vp",
+    ) -> tuple[str, list[Any]]:
+        if platform_id is None or conversation_id is None:
+            return "", []
+        clauses, parameters = MemoryObjectRepository.namespace_visibility_clauses(
+            [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            conversation_id=conversation_id,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+            incognito=incognito,
+            sensitivity_gates_enabled=False,
+            table_alias=table_alias,
+        )
+        if not clauses:
+            return " AND 0", []
+        return " AND " + " AND ".join(clauses), parameters
 
     @staticmethod
     def _scope_clauses(
@@ -429,27 +658,31 @@ class VerbatimPinRepository(BaseRepository):
         conversation_id: str,
         alias: str = "vp",
     ) -> tuple[list[str], list[Any]]:
+        del assistant_mode_id
+        scope_expr = (
+            f"CASE "
+            f"WHEN {alias}.scope_canonical IS NOT NULL THEN {alias}.scope_canonical "
+            f"WHEN {alias}.scope IN ('conversation', 'ephemeral_session') THEN 'chat' "
+            f"WHEN {alias}.scope = 'workspace' THEN 'character' "
+            f"WHEN {alias}.scope IN ('global_user', 'assistant_mode') THEN 'user' "
+            f"ELSE {alias}.scope END"
+        )
         clauses: list[str] = []
         parameters: list[Any] = []
-        for scope in scope_filter:
-            if scope is MemoryScope.WORKSPACE and workspace_id is None:
-                continue
-            if scope is MemoryScope.ASSISTANT_MODE:
-                clauses.append(f"({alias}.scope = ? AND {alias}.assistant_mode_id = ?)")
-                parameters.extend([scope.value, assistant_mode_id])
-                continue
-            if scope is MemoryScope.WORKSPACE:
+        canonical_scopes = MemoryObjectRepository.canonical_retrieval_scopes(scope_filter)
+        for scope in canonical_scopes:
+            if scope is MemoryScope.CHARACTER and workspace_id is not None:
                 clauses.append(
-                    f"({alias}.scope = ? AND {alias}.assistant_mode_id = ? AND {alias}.workspace_id = ?)"
+                    f"({scope_expr} = 'character' "
+                    f"AND ({alias}.character_id = ? OR ({alias}.character_id IS NULL AND {alias}.workspace_id = ?)))"
                 )
-                parameters.extend([scope.value, assistant_mode_id, workspace_id])
+                parameters.extend([workspace_id, workspace_id])
                 continue
-            if scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION}:
+            if scope is MemoryScope.CHAT:
                 clauses.append(
-                    f"({alias}.scope = ? AND {alias}.assistant_mode_id = ? AND {alias}.conversation_id = ?)"
+                    f"({scope_expr} = 'chat' AND {alias}.conversation_id = ?)"
                 )
-                parameters.extend([scope.value, assistant_mode_id, conversation_id])
+                parameters.append(conversation_id)
                 continue
-            clauses.append(f"({alias}.scope = ?)")
-            parameters.append(scope.value)
+            clauses.append(f"({scope_expr} = 'user')")
         return clauses, parameters

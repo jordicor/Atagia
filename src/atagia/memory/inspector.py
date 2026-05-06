@@ -11,6 +11,16 @@ from atagia.core.repositories import BaseRepository
 from atagia.core.retrieval_event_repository import AdminAuditRepository, RetrievalEventRepository
 
 
+def _canonical_scope_filter(scope: str) -> str:
+    if scope in {"conversation", "ephemeral_session"}:
+        return "chat"
+    if scope == "workspace":
+        return "character"
+    if scope in {"global_user", "assistant_mode"}:
+        return "user"
+    return scope
+
+
 class _InspectionRepository(BaseRepository):
     """Read-oriented queries used by the admin inspector."""
 
@@ -51,7 +61,7 @@ class _InspectionRepository(BaseRepository):
             parameters.append(object_type)
         if scope is not None:
             clauses.append("scope = ?")
-            parameters.append(scope)
+            parameters.append(_canonical_scope_filter(scope))
         if status is not None:
             clauses.append("status = ?")
             parameters.append(status)

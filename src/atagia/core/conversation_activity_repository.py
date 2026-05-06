@@ -22,6 +22,13 @@ class ConversationActivityRepository(BaseRepository):
                 conversation_id,
                 workspace_id,
                 assistant_mode_id,
+                user_persona_id,
+                platform_id,
+                character_id,
+                incognito,
+                remember_across_chats,
+                remember_across_devices,
+                effective_policy_hash,
                 timezone,
                 first_message_at,
                 last_message_at,
@@ -49,11 +56,18 @@ class ConversationActivityRepository(BaseRepository):
                 updated_at
             )
             VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(user_id, conversation_id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 assistant_mode_id = excluded.assistant_mode_id,
+                user_persona_id = excluded.user_persona_id,
+                platform_id = excluded.platform_id,
+                character_id = excluded.character_id,
+                incognito = excluded.incognito,
+                remember_across_chats = excluded.remember_across_chats,
+                remember_across_devices = excluded.remember_across_devices,
+                effective_policy_hash = excluded.effective_policy_hash,
                 timezone = excluded.timezone,
                 first_message_at = excluded.first_message_at,
                 last_message_at = excluded.last_message_at,
@@ -84,7 +98,14 @@ class ConversationActivityRepository(BaseRepository):
                 stats["user_id"],
                 stats["conversation_id"],
                 stats.get("workspace_id"),
-                stats["assistant_mode_id"],
+                stats.get("assistant_mode_id"),
+                stats.get("user_persona_id"),
+                stats.get("platform_id"),
+                stats.get("character_id"),
+                1 if stats.get("incognito") else 0,
+                1 if stats.get("remember_across_chats", True) else 0,
+                1 if stats.get("remember_across_devices", True) else 0,
+                stats.get("effective_policy_hash"),
                 stats.get("timezone", "UTC"),
                 stats.get("first_message_at"),
                 stats.get("last_message_at"),
@@ -155,6 +176,11 @@ class ConversationActivityRepository(BaseRepository):
         user_id: str,
         workspace_id: str | None = None,
         assistant_mode_id: str | None = None,
+        namespace_filter: bool = False,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
         limit: int | None = None,
         as_of: str | None = None,
         active_only: bool = False,
@@ -170,6 +196,12 @@ class ConversationActivityRepository(BaseRepository):
         if assistant_mode_id is not None:
             clauses.append("cas.assistant_mode_id = ?")
             parameters.append(assistant_mode_id)
+        if namespace_filter:
+            clauses.append("cas.user_persona_id IS ?")
+            clauses.append("cas.platform_id = ?")
+            clauses.append("cas.character_id IS ?")
+            clauses.append("cas.incognito = ?")
+            parameters.extend([user_persona_id, platform_id, character_id, 1 if incognito else 0])
         limit_clause = ""
         if limit is not None:
             limit_clause = "LIMIT ?"

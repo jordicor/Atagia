@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
+from atagia.core.db_sqlite import close_connection, open_connection
 from atagia.core.storage_backend import StorageBackend
 from atagia.memory.lifecycle_runner import try_run_lifecycle
 from atagia.services.embeddings import EmbeddingIndex
+from atagia.services.worker_control_service import WorkerControlService
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +34,16 @@ class LifecycleWorker:
         settings: Settings,
         embedding_index: EmbeddingIndex,
         storage_backend: StorageBackend,
+        artifact_blob_store: Any | None = None,
+        llm_client: Any | None = None,
     ) -> None:
         self._database_path = database_path
         self._clock = clock
         self._settings = settings
         self._embedding_index = embedding_index
         self._storage_backend = storage_backend
+        self._artifact_blob_store = artifact_blob_store
+        self._llm_client = llm_client
 
     async def run(self) -> None:
         """Loop forever, running lifecycle at the configured interval."""
@@ -44,16 +51,29 @@ class LifecycleWorker:
         logger.info("Lifecycle worker started (poll_interval=%ds)", interval)
         while True:
             try:
-                await try_run_lifecycle(
-                    database_path=self._database_path,
-                    clock=self._clock,
-                    settings=self._settings,
-                    embedding_index=self._embedding_index,
-                    storage_backend=self._storage_backend,
-                )
+                if await self._allows_periodic_work():
+                    await try_run_lifecycle(
+                        database_path=self._database_path,
+                        clock=self._clock,
+                        settings=self._settings,
+                        embedding_index=self._embedding_index,
+                        storage_backend=self._storage_backend,
+                        artifact_blob_store=self._artifact_blob_store,
+                        llm_client=self._llm_client,
+                    )
             except asyncio.CancelledError:
                 logger.info("Lifecycle worker cancelled")
                 raise
             except Exception:
                 logger.exception("Lifecycle worker iteration failed")
             await asyncio.sleep(interval)
+
+    async def _allows_periodic_work(self) -> bool:
+        connection = await open_connection(self._database_path)
+        try:
+            return await WorkerControlService(
+                connection,
+                self._clock,
+            ).allows_periodic_work()
+        finally:
+            await close_connection(connection)

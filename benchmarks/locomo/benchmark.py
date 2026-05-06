@@ -68,7 +68,11 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
-_DEFAULT_ASSISTANT_MODE_ID = "general_qa"
+_DEFAULT_RETRIEVAL_PROFILE_ID = "general_qa"
+_BENCHMARK_USER_ID = "benchmark-user"
+_BENCHMARK_PLATFORM_ID = "locomo"
+_BENCHMARK_USER_PERSONA_ID: str | None = None
+_BENCHMARK_CHARACTER_ID: str | None = None
 _BENCHMARK_DB_FILENAME = "benchmark.db"
 _BENCHMARK_METADATA_FILENAME = "run_metadata.json"
 _BENCHMARK_INGESTION_PROGRESS_FILENAME = "ingestion_progress.json"
@@ -671,7 +675,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 raise RuntimeError("Atagia runtime was unexpectedly unavailable")
             llm_recorder = LLMCallRecorder()
             install_llm_call_recorder(runtime.llm_client, llm_recorder)
-            user_id = "benchmark-user"
+            user_id = _BENCHMARK_USER_ID
             rebuild_result: RebuildResult | None = None
             if evaluate_only:
                 turn_message_ids = await self._load_turn_message_ids(
@@ -685,7 +689,11 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 await engine.create_conversation(
                     user_id,
                     conversation.conversation_id,
-                    assistant_mode_id=_DEFAULT_ASSISTANT_MODE_ID,
+                    assistant_mode_id=_DEFAULT_RETRIEVAL_PROFILE_ID,
+                    user_persona_id=_BENCHMARK_USER_PERSONA_ID,
+                    platform_id=_BENCHMARK_PLATFORM_ID,
+                    character_id=_BENCHMARK_CHARACTER_ID,
+                    mode=_DEFAULT_RETRIEVAL_PROFILE_ID,
                 )
                 if metadata_dir is not None:
                     self._write_ingestion_metadata(
@@ -864,6 +872,10 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 conversation_id=conversation.conversation_id,
                 role=turn.role,
                 text=f"{turn.speaker}: {turn.text}",
+                mode=_DEFAULT_RETRIEVAL_PROFILE_ID,
+                user_persona_id=_BENCHMARK_USER_PERSONA_ID,
+                platform_id=_BENCHMARK_PLATFORM_ID,
+                character_id=_BENCHMARK_CHARACTER_ID,
                 occurred_at=turn.timestamp or None,
                 attachments=turn.attachments or None,
             )
@@ -1277,7 +1289,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
             )
             retrieval_started_at = perf_counter()
             try:
-                pipeline_result, assistant_mode_id = await self._retrieve_question_context(
+                pipeline_result, retrieval_profile_id = await self._retrieve_question_context(
                     engine,
                     user_id=user_id,
                     conversation_id=conversation.conversation_id,
@@ -1309,7 +1321,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
             try:
                 prediction = await self._generate_answer(
                     runtime=runtime,
-                    assistant_mode_id=assistant_mode_id,
+                    assistant_mode_id=retrieval_profile_id,
                     pipeline_result=pipeline_result,
                     question_text=question.question_text,
                     trusted_evaluation=trusted_evaluation,
@@ -1321,7 +1333,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                     question=question,
                     pipeline_result=pipeline_result,
                     retrieval_trace=retrieval_trace,
-                    assistant_mode_id=assistant_mode_id,
+                    retrieval_profile_id=retrieval_profile_id,
                     conversation_id=conversation.conversation_id,
                     turn_message_ids=turn_message_ids,
                     passed=False,
@@ -1357,7 +1369,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                     question=question,
                     pipeline_result=pipeline_result,
                     retrieval_trace=retrieval_trace,
-                    assistant_mode_id=assistant_mode_id,
+                    retrieval_profile_id=retrieval_profile_id,
                     conversation_id=conversation.conversation_id,
                     turn_message_ids=turn_message_ids,
                     passed=False,
@@ -1386,7 +1398,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
             question=question,
             pipeline_result=pipeline_result,
             retrieval_trace=retrieval_trace,
-            assistant_mode_id=assistant_mode_id,
+            retrieval_profile_id=retrieval_profile_id,
             conversation_id=conversation.conversation_id,
             turn_message_ids=turn_message_ids,
             passed=bool(score_result.score),
@@ -1480,7 +1492,11 @@ class LoCoMoBenchmark(BenchmarkRunner):
             conversation = await conversations.get_conversation(conversation_id, user_id)
             if conversation is None:
                 raise ValueError(f"Conversation {conversation_id} was not found for benchmark user")
-            assistant_mode_id = str(conversation["assistant_mode_id"])
+            retrieval_profile_id = str(
+                conversation.get("mode")
+                or conversation.get("assistant_mode_id")
+                or _DEFAULT_RETRIEVAL_PROFILE_ID
+            )
         finally:
             await connection.close()
 
@@ -1488,11 +1504,11 @@ class LoCoMoBenchmark(BenchmarkRunner):
             user_id=user_id,
             conversation_id=conversation_id,
             message_text=question_text,
-            mode=assistant_mode_id,
+            mode=retrieval_profile_id,
             ablation=ablation,
             trace=trace,
         )
-        return pipeline_result, assistant_mode_id
+        return pipeline_result, retrieval_profile_id
 
     async def _build_question_trace(
         self,
@@ -1502,7 +1518,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
         question: BenchmarkQuestion,
         pipeline_result: PipelineResult,
         retrieval_trace: RetrievalTrace,
-        assistant_mode_id: str,
+        retrieval_profile_id: str,
         conversation_id: str,
         turn_message_ids: dict[str, str],
         passed: bool,
@@ -1578,7 +1594,8 @@ class LoCoMoBenchmark(BenchmarkRunner):
             ),
             "trusted_evaluation": trusted_evaluation,
             "trusted_activation_count": trusted_activation_count,
-            "assistant_mode_id": assistant_mode_id,
+            "mode": retrieval_profile_id,
+            "retrieval_profile_id": retrieval_profile_id,
             "retrieval_conversation_id": conversation_id,
             "evidence_turn_ids": list(question.evidence_turn_ids),
             "evidence_message_ids": evidence_message_ids,
@@ -1795,7 +1812,11 @@ class LoCoMoBenchmark(BenchmarkRunner):
             "chat_model": self._chat_model,
             "component_models": dict(sorted(self._component_models.items())),
             "answer_prompt_variant": self._answer_prompt_variant,
-            "assistant_mode_id": _DEFAULT_ASSISTANT_MODE_ID,
+            "mode": _DEFAULT_RETRIEVAL_PROFILE_ID,
+            "retrieval_profile_id": _DEFAULT_RETRIEVAL_PROFILE_ID,
+            "platform_id": _BENCHMARK_PLATFORM_ID,
+            "user_persona_id": _BENCHMARK_USER_PERSONA_ID,
+            "character_id": _BENCHMARK_CHARACTER_ID,
         }
 
     def _build_report(
@@ -2188,7 +2209,11 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 else conversation.turns
             ),
             "max_turns": max_turns,
-            "assistant_mode_id": _DEFAULT_ASSISTANT_MODE_ID,
+            "mode": _DEFAULT_RETRIEVAL_PROFILE_ID,
+            "retrieval_profile_id": _DEFAULT_RETRIEVAL_PROFILE_ID,
+            "platform_id": _BENCHMARK_PLATFORM_ID,
+            "user_persona_id": _BENCHMARK_USER_PERSONA_ID,
+            "character_id": _BENCHMARK_CHARACTER_ID,
             "provider": self._llm_provider,
             "llm_model": self._answer_model or self._chat_model or self._forced_global_model,
             "answer_model": self._answer_model or self._chat_model or self._forced_global_model,

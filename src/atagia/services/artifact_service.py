@@ -49,6 +49,31 @@ class AttachmentBundle:
     attachments: list[dict[str, Any]]
     artifacts: list[PreparedArtifact]
 
+    def message_metadata(self, base_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Return message metadata without overriding raw-text safety for plain text."""
+        metadata = dict(base_metadata or {})
+        metadata.update(
+            {
+                "attachments": self.attachments,
+                "attachment_count": len(self.artifacts),
+                "attachment_artifact_ids": [
+                    str(prepared.artifact["id"]) for prepared in self.artifacts
+                ],
+                "artifact_backed": bool(self.artifacts),
+            }
+        )
+        if self.artifacts:
+            metadata.update(
+                {
+                    "skip_by_default": True,
+                    "include_raw": False,
+                    "requires_explicit_request": True,
+                    "content_kind": "artifact",
+                    "context_placeholder": self.context_placeholder,
+                }
+            )
+        return metadata
+
 
 @dataclass(frozen=True, slots=True)
 class ArtifactPayload:
@@ -166,6 +191,20 @@ class ArtifactService:
                 storage_uri=blob.get("storage_uri") if blob else None,
                 blob_byte_size=blob.get("byte_size") if blob else None,
                 blob_sha256=blob.get("sha256") if blob else None,
+                user_persona_id=artifact.get("user_persona_id"),
+                platform_id=artifact.get("platform_id"),
+                character_id=artifact.get("character_id"),
+                platform_locked=bool(artifact.get("platform_locked", False)),
+                platform_id_lock=artifact.get("platform_id_lock"),
+                scope_canonical=artifact.get("scope_canonical"),
+                incognito_snapshot=bool(artifact.get("incognito_snapshot", False)),
+                remember_across_chats_snapshot=bool(
+                    artifact.get("remember_across_chats_snapshot", True)
+                ),
+                remember_across_devices_snapshot=bool(
+                    artifact.get("remember_across_devices_snapshot", True)
+                ),
+                policy_snapshot=dict(artifact.get("policy_snapshot_json") or {}),
                 commit=False,
             )
             artifact_id = str(created_artifact["id"])
@@ -299,6 +338,27 @@ class ArtifactService:
             metadata.setdefault("intimacy_boundary_policy", {
                 "requires_explicit_intimacy_context": True,
             })
+        platform_id = str(conversation.get("platform_id") or "default")
+        character_id = conversation.get("character_id") or conversation.get("workspace_id")
+        remember_across_chats = conversation.get("remember_across_chats", True) is not False
+        remember_across_devices = conversation.get("remember_across_devices", True) is not False
+        incognito = bool(conversation.get("incognito") or conversation.get("isolated_mode"))
+        platform_locked = not remember_across_devices
+        policy_snapshot = {
+            "user_persona_id": conversation.get("user_persona_id"),
+            "platform_id": platform_id,
+            "character_id": character_id,
+            "conversation_id": conversation.get("id"),
+            "mode": conversation.get("mode") or conversation.get("assistant_mode_id"),
+            "incognito": incognito,
+            "remember_across_chats": remember_across_chats,
+            "remember_across_devices": remember_across_devices,
+            "temporary": bool(conversation.get("temporary")),
+            "purge_on_close": bool(conversation.get("purge_on_close")),
+            "intended_scope": "chat",
+            "platform_locked": platform_locked,
+            "platform_id_lock": platform_id if platform_locked else None,
+        }
         return PreparedArtifact(
             artifact={
                 "id": artifact_id,
@@ -325,6 +385,16 @@ class ArtifactService:
                 "metadata_json": metadata,
                 "summary_text": summary_text,
                 "index_text": index_text,
+                "user_persona_id": conversation.get("user_persona_id"),
+                "platform_id": platform_id,
+                "character_id": character_id,
+                "platform_locked": platform_locked,
+                "platform_id_lock": platform_id if platform_locked else None,
+                "scope_canonical": "chat",
+                "incognito_snapshot": incognito,
+                "remember_across_chats_snapshot": remember_across_chats,
+                "remember_across_devices_snapshot": remember_across_devices,
+                "policy_snapshot_json": policy_snapshot,
             },
             blob={
                 "storage_kind": storage_kind,

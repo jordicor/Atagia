@@ -14,6 +14,7 @@ from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.memory.retrieval_comparator import RetrievalComparator
 from atagia.models.schemas_memory import ExtractionContextMessage, ExtractionConversationContext
 from atagia.models.schemas_replay import AblationConfig, ReplayResult
+from atagia.services.chat_support import apply_conversation_policy_overlay
 from atagia.services.retrieval_pipeline import RetrievalPipeline
 
 RECENT_CONTEXT_MESSAGES = 6
@@ -62,19 +63,82 @@ class ReplayService:
         if conversation is None:
             raise ValueError("Conversation not found for user")
 
+        event_has_namespace = any(
+            event.get(key) is not None
+            for key in ("user_persona_id", "platform_id", "character_id", "mode")
+        )
+        replay_user_persona_id = (
+            event.get("user_persona_id")
+            if event_has_namespace
+            else conversation.get("user_persona_id")
+        )
+        replay_platform_id = (
+            str(event.get("platform_id") or "default")
+            if event_has_namespace
+            else str(conversation.get("platform_id") or "default")
+        )
+        replay_character_id = (
+            event.get("character_id")
+            if event_has_namespace
+            else (
+                conversation.get("character_id")
+                if conversation.get("character_id") is not None
+                else conversation.get("workspace_id")
+            )
+        )
+        replay_mode = (
+            str(event.get("mode") or event["assistant_mode_id"])
+            if event_has_namespace
+            else str(conversation.get("mode") or conversation["assistant_mode_id"])
+        )
+        replay_incognito = (
+            bool(event.get("incognito"))
+            if event_has_namespace
+            else bool(conversation.get("incognito")) or bool(conversation.get("isolated_mode"))
+        )
+        replay_remember_across_chats = (
+            bool(event.get("remember_across_chats"))
+            if event_has_namespace
+            else bool(conversation.get("remember_across_chats", True))
+        )
+        replay_remember_across_devices = (
+            bool(event.get("remember_across_devices"))
+            if event_has_namespace
+            else bool(conversation.get("remember_across_devices", True))
+        )
         transcript, conversation_context, message_text = await self._reconstruct_context(
             conversation_id=str(conversation["id"]),
             user_id=user_id,
             request_message_id=str(event["request_message_id"]),
             workspace_id=conversation.get("workspace_id"),
-            assistant_mode_id=str(conversation["assistant_mode_id"]),
+            assistant_mode_id=str(event["assistant_mode_id"]),
+            user_persona_id=replay_user_persona_id,
+            platform_id=replay_platform_id,
+            character_id=replay_character_id,
+            mode=replay_mode,
+            temporary=bool(conversation.get("temporary")),
+            temporary_ttl_seconds=conversation.get("temporary_ttl_seconds"),
+            purge_on_close=bool(conversation.get("purge_on_close")),
+            isolated_mode=bool(conversation.get("isolated_mode")),
+            incognito=replay_incognito,
+            remember_across_chats=replay_remember_across_chats,
+            remember_across_devices=replay_remember_across_devices,
         )
-        resolved_policy = self._resolve_policy(str(conversation["assistant_mode_id"]))
+        resolved_policy = apply_conversation_policy_overlay(
+            self._resolve_policy(str(event["assistant_mode_id"])),
+            conversation,
+        )
         cold_start = await self._is_cold_start(
             user_id=user_id,
             conversation_id=str(conversation["id"]),
             workspace_id=conversation.get("workspace_id"),
-            assistant_mode_id=str(conversation["assistant_mode_id"]),
+            assistant_mode_id=str(event["assistant_mode_id"]),
+            user_persona_id=conversation_context.user_persona_id,
+            platform_id=conversation_context.platform_id,
+            character_id=conversation_context.character_id,
+            incognito=conversation_context.incognito,
+            remember_across_chats=conversation_context.remember_across_chats,
+            remember_across_devices=conversation_context.remember_across_devices,
             resolved_policy=resolved_policy,
         )
         replay_pipeline_result = await self._retrieval_pipeline.execute(
@@ -140,6 +204,17 @@ class ReplayService:
         request_message_id: str,
         workspace_id: str | None,
         assistant_mode_id: str,
+        user_persona_id: str | None = None,
+        platform_id: str = "default",
+        character_id: str | None = None,
+        mode: str | None = None,
+        temporary: bool = False,
+        temporary_ttl_seconds: int | None = None,
+        purge_on_close: bool = False,
+        isolated_mode: bool = False,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
     ) -> tuple[list[dict[str, Any]], ExtractionConversationContext, str]:
         messages = await self._message_repository.get_messages(conversation_id, user_id, limit=5000, offset=0)
         request_message = next((message for message in messages if str(message["id"]) == request_message_id), None)
@@ -154,6 +229,10 @@ class ReplayService:
             source_message_id=request_message_id,
             workspace_id=workspace_id,
             assistant_mode_id=assistant_mode_id,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            mode=mode,
             recent_messages=[
                 ExtractionContextMessage(
                     role=str(message["role"]),
@@ -161,6 +240,13 @@ class ReplayService:
                 )
                 for message in prior_messages[-RECENT_CONTEXT_MESSAGES:]
             ],
+            temporary=temporary,
+            temporary_ttl_seconds=temporary_ttl_seconds,
+            purge_on_close=purge_on_close,
+            isolated_mode=isolated_mode,
+            incognito=incognito,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
         )
         return transcript, conversation_context, str(request_message["text"])
 
@@ -175,6 +261,12 @@ class ReplayService:
         conversation_id: str,
         workspace_id: str | None,
         assistant_mode_id: str,
+        user_persona_id: str | None,
+        platform_id: str,
+        character_id: str | None,
+        incognito: bool,
+        remember_across_chats: bool,
+        remember_across_devices: bool,
         resolved_policy: Any,
     ) -> bool:
         return (
@@ -184,6 +276,12 @@ class ReplayService:
                 workspace_id=workspace_id,
                 conversation_id=conversation_id,
                 assistant_mode_id=assistant_mode_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
             )
             == 0
         )

@@ -1,0 +1,13 @@
+{
+  "operational_profile_id": "low_power",
+  "display_name": "Low Power",
+  "risk_level": "normal",
+  "signals": {
+    "power": "constrained",
+    "connectivity": "online",
+    "safety": "normal",
+    "incident_scope": "none",
+    "compute": "remote_allowed"
+  },
+  "policy_override": {}
+}

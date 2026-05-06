@@ -40,6 +40,10 @@ docs/*
 !docs/IMPLEMENTATION_PLAN_v2.md
 !docs/PLATFORM_STATUS.md
 !docs/NEXT_ENGINEERING_STEPS.md
+!docs/HOST_SIDECAR_INTEGRATION.md
+!docs/MEMORY_NAMESPACES_AND_SCOPES.md
+!docs/MEMORY_REDESIGN_IMPLEMENTATION_PLAN.md
+!docs/PROPOSAL_lightweight_sqlite_graph.md
 !docs/BEYOND_HUMAN_MEMORY.md
 !docs/Beyond_Similarity_Applicability_Governed_Memory.md
 !docs/tmp/

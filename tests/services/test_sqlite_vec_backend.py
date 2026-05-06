@@ -101,7 +101,7 @@ async def _insert_stub_memory(connection, memory_id: str, user_id: str) -> None:
                id, user_id, conversation_id, assistant_mode_id, object_type, scope,
                canonical_text, payload_json, source_kind, confidence, stability, vitality,
                maya_score, privacy_level, status, created_at, updated_at
-           ) VALUES (?, ?, 'conv_stub', 'general_qa', 'evidence', 'conversation',
+           ) VALUES (?, ?, 'conv_stub', 'general_qa', 'evidence', 'chat',
                'stub', '{}', 'extracted', 0.5, 0.5, 1.0, 0.0, 0, 'active', ?, ?)""",
         (memory_id, user_id, _TS, _TS),
     )

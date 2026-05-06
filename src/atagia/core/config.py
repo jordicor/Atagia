@@ -18,6 +18,56 @@ from atagia.services.model_resolution import (
 _DOTENV_LOADED = False
 
 
+def _repo_root() -> Path | None:
+    here = Path(__file__).resolve()
+    for parent in (here, *here.parents):
+        if (parent / "pyproject.toml").exists():
+            return parent
+    return None
+
+
+def _repo_resource_path(name: str) -> Path | None:
+    repo_root = _repo_root()
+    if repo_root is None:
+        return None
+    candidate = repo_root / name
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def default_resource_path(name: str) -> str:
+    """Return a repo resource path, falling back to packaged resources."""
+    repo_path = _repo_resource_path(name)
+    if repo_path is not None:
+        return str(repo_path)
+    return str(Path(__file__).resolve().parents[1] / "resources" / name)
+
+
+def configured_resource_path(name: str, configured: str | None) -> str:
+    """Resolve configured resource directories safely across host cwd values."""
+    if not configured:
+        return default_resource_path(name)
+
+    path = Path(configured).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    if (Path.cwd() / path).exists():
+        return str(path)
+
+    repo_root = _repo_root()
+    if repo_root is not None:
+        repo_relative = repo_root / path
+        if repo_relative.exists():
+            return str(repo_relative)
+
+    if path == Path(name) or path.as_posix().lstrip("./") == name:
+        return default_resource_path(name)
+
+    return str(path)
+
+
 def _load_dotenv_once() -> None:
     """Load .env from the project root, idempotent across calls.
 
@@ -62,6 +112,14 @@ def _env_optional_int(name: str) -> int | None:
     return int(value)
 
 
+def _env_optional_str(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS = 2048
 
 
@@ -84,6 +142,10 @@ class Settings:
     admin_api_key: str | None
     workers_enabled: bool
     debug: bool
+    worker_circuit_breaker_enabled: bool = True
+    worker_circuit_breaker_failure_threshold: int = 20
+    worker_circuit_breaker_window_seconds: int = 180
+    worker_circuit_breaker_min_failure_ratio: float = 0.8
     anthropic_api_key: str | None = None
     google_api_key: str | None = None
     anthropic_base_url: str | None = None
@@ -97,6 +159,11 @@ class Settings:
     llm_intimacy_retrieval_model: str | None = None
     llm_intimacy_component_models: dict[str, str] = field(default_factory=dict)
     llm_intimacy_proactive_routing_enabled: bool = False
+    llm_debug_io_enabled: bool = False
+    llm_debug_io_dir: str = "./docs/tmp/llm_debug"
+    llm_debug_io_purposes: tuple[str, ...] = ()
+    llm_debug_io_raw: bool = False
+    llm_debug_io_max_chars: int = 50_000
     operational_profiles_path: str = "./operational_profiles"
     artifact_blob_storage_kind: str = "sqlite_blob"
     artifact_blob_storage_path: str = "./data/artifact_blobs"
@@ -134,8 +201,12 @@ class Settings:
     context_cache_enabled: bool = True
     context_cache_min_ttl_seconds: int = 60
     context_cache_max_ttl_seconds: int = 3600
-    chunking_enabled: bool = False
-    chunking_threshold_tokens: int = 2000
+    temporary_default_ttl_seconds: int | None = None
+    temporary_default_purge_on_close: bool = True
+    tombstone_retention_days: int = 1825
+    erasure_purge_streams: bool = True
+    disable_chunking_extraction: bool = False
+    chunking_extraction_threshold_tokens: int = 2048
     extraction_watchdog_enabled: bool = True
     extraction_watchdog_allow_different_provider: bool = False
     extraction_watchdog_min_elapsed_seconds: float = 8.0
@@ -160,6 +231,7 @@ class Settings:
     topic_working_set_refresh_token_lag: int = 2000
     topic_working_set_stale_token_lag: int = 5000
     topic_working_set_refresh_batch_messages: int = 8
+    graph_projection_enabled: bool = False
     # FTS-backed verbatim evidence as first-class search channel.
     verbatim_evidence_search_enabled: bool = True
     # Evidence-search RRF weight, slightly lower than memory_objects by
@@ -175,16 +247,32 @@ class Settings:
     # neighbouring evidence accessible.
     verbatim_evidence_window_size: int = 3
     verbatim_evidence_window_overlap: int = 1
+    openai_proxy_model_id: str = "atagia-memory-proxy"
+    openai_proxy_upstream_model: str | None = None
+    openai_proxy_default_mode: str | None = None
+    cors_allowed_origins: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not self.openai_proxy_model_id.strip():
+            raise ValueError("openai_proxy_model_id cannot be blank")
         if self.context_cache_min_ttl_seconds <= 0:
             raise ValueError("context_cache_min_ttl_seconds must be positive")
+        if self.worker_circuit_breaker_failure_threshold <= 0:
+            raise ValueError("worker_circuit_breaker_failure_threshold must be positive")
+        if self.worker_circuit_breaker_window_seconds <= 0:
+            raise ValueError("worker_circuit_breaker_window_seconds must be positive")
+        if not 0.0 <= self.worker_circuit_breaker_min_failure_ratio <= 1.0:
+            raise ValueError("worker_circuit_breaker_min_failure_ratio must be in the interval [0.0, 1.0]")
         if self.context_cache_max_ttl_seconds <= 0:
             raise ValueError("context_cache_max_ttl_seconds must be positive")
         if self.context_cache_max_ttl_seconds < self.context_cache_min_ttl_seconds:
             raise ValueError("context_cache_max_ttl_seconds must be >= context_cache_min_ttl_seconds")
-        if self.chunking_threshold_tokens <= 0:
-            raise ValueError("chunking_threshold_tokens must be positive")
+        if self.temporary_default_ttl_seconds is not None and self.temporary_default_ttl_seconds <= 0:
+            raise ValueError("temporary_default_ttl_seconds must be positive when set")
+        if self.tombstone_retention_days <= 0:
+            raise ValueError("tombstone_retention_days must be positive")
+        if self.chunking_extraction_threshold_tokens <= 0:
+            raise ValueError("chunking_extraction_threshold_tokens must be positive")
         if self.extraction_watchdog_min_elapsed_seconds < 0:
             raise ValueError("extraction_watchdog_min_elapsed_seconds must be non-negative")
         if self.extraction_watchdog_min_output_tokens <= 0:
@@ -225,37 +313,28 @@ class Settings:
             raise ValueError("operational_allowed_profiles must contain at least one profile")
         if any(not profile_id.strip() for profile_id in self.operational_allowed_profiles):
             raise ValueError("operational_allowed_profiles cannot contain blank profile ids")
+        if not self.llm_debug_io_dir.strip():
+            raise ValueError("llm_debug_io_dir cannot be blank")
+        if self.llm_debug_io_max_chars < 0:
+            raise ValueError("llm_debug_io_max_chars must be non-negative")
         if self.artifact_blob_storage_kind not in {"sqlite_blob", "local_file"}:
             raise ValueError("artifact_blob_storage_kind must be 'sqlite_blob' or 'local_file'")
         if self.artifact_blob_storage_kind == "local_file" and not self.artifact_blob_storage_path.strip():
             raise ValueError("artifact_blob_storage_path is required for local_file artifact storage")
         if not 0.0 <= self.small_corpus_token_threshold_ratio <= 1.0:
-            raise ValueError(
-                "small_corpus_token_threshold_ratio must be in the interval [0.0, 1.0]"
-            )
-        if (
-            self.recent_transcript_budget_tokens is not None
-            and self.recent_transcript_budget_tokens <= 0
-        ):
+            raise ValueError("small_corpus_token_threshold_ratio must be in the interval [0.0, 1.0]")
+        if self.recent_transcript_budget_tokens is not None and self.recent_transcript_budget_tokens <= 0:
             raise ValueError("recent_transcript_budget_tokens must be positive")
         if not 0.0 <= self.recent_transcript_overage_ratio <= 1.0:
-            raise ValueError(
-                "recent_transcript_overage_ratio must be in the interval [0.0, 1.0]"
-            )
+            raise ValueError("recent_transcript_overage_ratio must be in the interval [0.0, 1.0]")
         if self.topic_working_set_refresh_message_lag <= 0:
             raise ValueError("topic_working_set_refresh_message_lag must be positive")
         if self.topic_working_set_stale_message_lag < self.topic_working_set_refresh_message_lag:
-            raise ValueError(
-                "topic_working_set_stale_message_lag must be >= "
-                "topic_working_set_refresh_message_lag"
-            )
+            raise ValueError("topic_working_set_stale_message_lag must be >= topic_working_set_refresh_message_lag")
         if self.topic_working_set_refresh_token_lag <= 0:
             raise ValueError("topic_working_set_refresh_token_lag must be positive")
         if self.topic_working_set_stale_token_lag < self.topic_working_set_refresh_token_lag:
-            raise ValueError(
-                "topic_working_set_stale_token_lag must be >= "
-                "topic_working_set_refresh_token_lag"
-            )
+            raise ValueError("topic_working_set_stale_token_lag must be >= topic_working_set_refresh_token_lag")
         if self.topic_working_set_refresh_batch_messages <= 0:
             raise ValueError("topic_working_set_refresh_batch_messages must be positive")
         if not 0.0 <= self.verbatim_evidence_search_rrf_weight <= 2.0:
@@ -276,16 +355,24 @@ class Settings:
         _load_dotenv_once()
         return cls(
             sqlite_path=os.getenv("ATAGIA_SQLITE_PATH", "./data/atagia.db"),
-            migrations_path=os.getenv("ATAGIA_MIGRATIONS_PATH", "./migrations"),
-            manifests_path=os.getenv("ATAGIA_MANIFESTS_PATH", "./manifests"),
-            operational_profiles_path=os.getenv(
-                "ATAGIA_OPERATIONAL_PROFILES_PATH",
-                "./operational_profiles",
+            migrations_path=configured_resource_path(
+                "migrations",
+                os.getenv("ATAGIA_MIGRATIONS_PATH"),
+            ),
+            manifests_path=configured_resource_path(
+                "manifests",
+                os.getenv("ATAGIA_MANIFESTS_PATH"),
+            ),
+            operational_profiles_path=configured_resource_path(
+                "operational_profiles",
+                os.getenv("ATAGIA_OPERATIONAL_PROFILES_PATH"),
             ),
             artifact_blob_storage_kind=os.getenv(
                 "ATAGIA_ARTIFACT_BLOB_STORAGE_KIND",
                 "sqlite_blob",
-            ).strip().lower(),
+            )
+            .strip()
+            .lower(),
             artifact_blob_storage_path=os.getenv(
                 "ATAGIA_ARTIFACT_BLOB_STORAGE_PATH",
                 "./data/artifact_blobs",
@@ -306,14 +393,20 @@ class Settings:
             llm_retrieval_model=os.getenv("ATAGIA_LLM_RETRIEVAL_MODEL") or None,
             llm_component_models=component_env_models_from_env(os.environ),
             llm_intimacy_ingest_model=os.getenv("ATAGIA_LLM_INTIMACY_INGEST_MODEL") or None,
-            llm_intimacy_retrieval_model=(
-                os.getenv("ATAGIA_LLM_INTIMACY_RETRIEVAL_MODEL") or None
-            ),
+            llm_intimacy_retrieval_model=(os.getenv("ATAGIA_LLM_INTIMACY_RETRIEVAL_MODEL") or None),
             llm_intimacy_component_models=intimacy_component_env_models_from_env(os.environ),
             llm_intimacy_proactive_routing_enabled=_env_bool(
                 "ATAGIA_LLM_INTIMACY_PROACTIVE_ROUTING_ENABLED",
                 False,
             ),
+            llm_debug_io_enabled=_env_bool("ATAGIA_DEBUG_LLM_IO", False),
+            llm_debug_io_dir=os.getenv(
+                "ATAGIA_DEBUG_LLM_IO_DIR",
+                "./docs/tmp/llm_debug",
+            ),
+            llm_debug_io_purposes=_env_csv_tuple("ATAGIA_DEBUG_LLM_IO_PURPOSES", ()),
+            llm_debug_io_raw=_env_bool("ATAGIA_DEBUG_LLM_IO_RAW", False),
+            llm_debug_io_max_chars=int(os.getenv("ATAGIA_DEBUG_LLM_IO_MAX_CHARS", "50000")),
             service_mode=_env_bool("ATAGIA_SERVICE_MODE", False),
             service_api_key=os.getenv("ATAGIA_SERVICE_API_KEY") or None,
             admin_api_key=os.getenv("ATAGIA_ADMIN_API_KEY") or None,
@@ -323,6 +416,19 @@ class Settings:
             ),
             workers_enabled=_env_bool("ATAGIA_WORKERS_ENABLED", False),
             debug=_env_bool("ATAGIA_DEBUG", False),
+            worker_circuit_breaker_enabled=_env_bool(
+                "ATAGIA_WORKER_CIRCUIT_BREAKER_ENABLED",
+                True,
+            ),
+            worker_circuit_breaker_failure_threshold=int(
+                os.getenv("ATAGIA_WORKER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "20")
+            ),
+            worker_circuit_breaker_window_seconds=int(
+                os.getenv("ATAGIA_WORKER_CIRCUIT_BREAKER_WINDOW_SECONDS", "180")
+            ),
+            worker_circuit_breaker_min_failure_ratio=float(
+                os.getenv("ATAGIA_WORKER_CIRCUIT_BREAKER_MIN_FAILURE_RATIO", "0.8")
+            ),
             google_api_key=os.getenv("ATAGIA_GOOGLE_API_KEY") or None,
             allow_insecure_http=_env_bool("ATAGIA_ALLOW_INSECURE_HTTP", False),
             embedding_backend=os.getenv("ATAGIA_EMBEDDING_BACKEND", "none").strip().lower(),
@@ -336,12 +442,8 @@ class Settings:
             ephemeral_scoring_hours=int(os.getenv("ATAGIA_EPHEMERAL_SCORING_HOURS", "24")),
             lifecycle_ephemeral_ttl_hours=int(os.getenv("ATAGIA_LIFECYCLE_EPHEMERAL_TTL_HOURS", "24")),
             lifecycle_review_ttl_days=int(os.getenv("ATAGIA_LIFECYCLE_REVIEW_TTL_DAYS", "7")),
-            promotion_conv_to_ws_min_conversations=int(
-                os.getenv("ATAGIA_PROMOTION_CONV_TO_WS_MIN_CONVERSATIONS", "2")
-            ),
-            promotion_ws_to_global_min_sessions=int(
-                os.getenv("ATAGIA_PROMOTION_WS_TO_GLOBAL_MIN_SESSIONS", "3")
-            ),
+            promotion_conv_to_ws_min_conversations=int(os.getenv("ATAGIA_PROMOTION_CONV_TO_WS_MIN_CONVERSATIONS", "2")),
+            promotion_ws_to_global_min_sessions=int(os.getenv("ATAGIA_PROMOTION_WS_TO_GLOBAL_MIN_SESSIONS", "3")),
             promotion_require_mode_consistency=_env_bool(
                 "ATAGIA_PROMOTION_REQUIRE_MODE_CONSISTENCY",
                 True,
@@ -377,16 +479,20 @@ class Settings:
                 ("normal", "low_power", "offline"),
             ),
             context_cache_enabled=_env_bool("ATAGIA_CONTEXT_CACHE_ENABLED", True),
-            context_cache_min_ttl_seconds=int(
-                os.getenv("ATAGIA_CONTEXT_CACHE_MIN_TTL_SECONDS", "60")
+            context_cache_min_ttl_seconds=int(os.getenv("ATAGIA_CONTEXT_CACHE_MIN_TTL_SECONDS", "60")),
+            context_cache_max_ttl_seconds=int(os.getenv("ATAGIA_CONTEXT_CACHE_MAX_TTL_SECONDS", "3600")),
+            temporary_default_ttl_seconds=_env_optional_int("ATAGIA_TEMPORARY_DEFAULT_TTL_SECONDS"),
+            temporary_default_purge_on_close=_env_bool(
+                "ATAGIA_TEMPORARY_DEFAULT_PURGE_ON_CLOSE",
+                True,
             ),
-            context_cache_max_ttl_seconds=int(
-                os.getenv("ATAGIA_CONTEXT_CACHE_MAX_TTL_SECONDS", "3600")
+            tombstone_retention_days=int(os.getenv("ATAGIA_TOMBSTONE_RETENTION_DAYS", "1825")),
+            erasure_purge_streams=_env_bool("ATAGIA_ERASURE_PURGE_STREAMS", True),
+            disable_chunking_extraction=_env_bool(
+                "ATAGIA_DISABLE_CHUNKING_EXTRACTION",
+                False,
             ),
-            chunking_enabled=_env_bool("ATAGIA_CHUNKING_ENABLED", False),
-            chunking_threshold_tokens=int(
-                os.getenv("ATAGIA_CHUNKING_THRESHOLD_TOKENS", "2000")
-            ),
+            chunking_extraction_threshold_tokens=int(os.getenv("ATAGIA_CHUNKING_EXTRACTION_THRESHOLD_TOKENS", "2048")),
             extraction_watchdog_enabled=_env_bool("ATAGIA_EXTRACTION_WATCHDOG_ENABLED", True),
             extraction_watchdog_allow_different_provider=_env_bool(
                 "ATAGIA_EXTRACTION_WATCHDOG_ALLOW_DIFFERENT_PROVIDER",
@@ -401,9 +507,7 @@ class Settings:
             extraction_watchdog_check_interval_tokens=int(
                 os.getenv("ATAGIA_EXTRACTION_WATCHDOG_CHECK_INTERVAL_TOKENS", "1024")
             ),
-            extraction_watchdog_max_checks=int(
-                os.getenv("ATAGIA_EXTRACTION_WATCHDOG_MAX_CHECKS", "2")
-            ),
+            extraction_watchdog_max_checks=int(os.getenv("ATAGIA_EXTRACTION_WATCHDOG_MAX_CHECKS", "2")),
             extraction_watchdog_llm_timeout_seconds=float(
                 os.getenv("ATAGIA_EXTRACTION_WATCHDOG_LLM_TIMEOUT_SECONDS", "8.0")
             ),
@@ -414,61 +518,46 @@ class Settings:
                 os.getenv("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_OUTPUT_TOKENS", "4096")
             ),
             lifecycle_lazy_enabled=_env_bool("ATAGIA_LIFECYCLE_LAZY_ENABLED", True),
-            lifecycle_min_interval_seconds=int(
-                os.getenv("ATAGIA_LIFECYCLE_MIN_INTERVAL_SECONDS", "3600")
-            ),
+            lifecycle_min_interval_seconds=int(os.getenv("ATAGIA_LIFECYCLE_MIN_INTERVAL_SECONDS", "3600")),
             lifecycle_worker_enabled=_env_bool("ATAGIA_LIFECYCLE_WORKER_ENABLED", False),
-            lifecycle_worker_interval_seconds=int(
-                os.getenv("ATAGIA_LIFECYCLE_WORKER_INTERVAL_SECONDS", "3600")
-            ),
-            small_corpus_token_threshold_ratio=float(
-                os.getenv("ATAGIA_SMALL_CORPUS_TOKEN_THRESHOLD_RATIO", "0.7")
-            ),
+            lifecycle_worker_interval_seconds=int(os.getenv("ATAGIA_LIFECYCLE_WORKER_INTERVAL_SECONDS", "3600")),
+            small_corpus_token_threshold_ratio=float(os.getenv("ATAGIA_SMALL_CORPUS_TOKEN_THRESHOLD_RATIO", "0.7")),
             assistant_guidance_enabled=_env_bool(
                 "ATAGIA_ASSISTANT_GUIDANCE_ENABLED",
                 True,
             ),
-            recent_transcript_budget_tokens=_env_optional_int(
-                "ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS"
-            ),
+            recent_transcript_budget_tokens=_env_optional_int("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS"),
             benchmark_disable_raw_recent_transcript=_env_bool(
                 "ATAGIA_BENCHMARK_DISABLE_RAW_RECENT_TRANSCRIPT",
                 False,
             ),
-            recent_transcript_overage_ratio=float(
-                os.getenv("ATAGIA_RECENT_TRANSCRIPT_OVERAGE_RATIO", "0.025")
-            ),
+            recent_transcript_overage_ratio=float(os.getenv("ATAGIA_RECENT_TRANSCRIPT_OVERAGE_RATIO", "0.025")),
             topic_working_set_enabled=_env_bool("ATAGIA_TOPIC_WORKING_SET_ENABLED", True),
-            topic_working_set_refresh_message_lag=int(
-                os.getenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_MESSAGE_LAG", "4")
-            ),
-            topic_working_set_stale_message_lag=int(
-                os.getenv("ATAGIA_TOPIC_WORKING_SET_STALE_MESSAGE_LAG", "10")
-            ),
-            topic_working_set_refresh_token_lag=int(
-                os.getenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_TOKEN_LAG", "2000")
-            ),
-            topic_working_set_stale_token_lag=int(
-                os.getenv("ATAGIA_TOPIC_WORKING_SET_STALE_TOKEN_LAG", "5000")
-            ),
+            topic_working_set_refresh_message_lag=int(os.getenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_MESSAGE_LAG", "4")),
+            topic_working_set_stale_message_lag=int(os.getenv("ATAGIA_TOPIC_WORKING_SET_STALE_MESSAGE_LAG", "10")),
+            topic_working_set_refresh_token_lag=int(os.getenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_TOKEN_LAG", "2000")),
+            topic_working_set_stale_token_lag=int(os.getenv("ATAGIA_TOPIC_WORKING_SET_STALE_TOKEN_LAG", "5000")),
             topic_working_set_refresh_batch_messages=int(
                 os.getenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_BATCH_MESSAGES", "8")
             ),
+            graph_projection_enabled=_env_bool("ATAGIA_GRAPH_PROJECTION_ENABLED", False),
             verbatim_evidence_search_enabled=_env_bool(
                 "ATAGIA_VERBATIM_EVIDENCE_SEARCH_ENABLED",
                 True,
             ),
-            verbatim_evidence_search_rrf_weight=float(
-                os.getenv("ATAGIA_VERBATIM_EVIDENCE_SEARCH_RRF_WEIGHT", "0.75")
+            verbatim_evidence_search_rrf_weight=float(os.getenv("ATAGIA_VERBATIM_EVIDENCE_SEARCH_RRF_WEIGHT", "0.75")),
+            verbatim_evidence_search_limit=int(os.getenv("ATAGIA_VERBATIM_EVIDENCE_SEARCH_LIMIT", "8")),
+            verbatim_evidence_window_size=int(os.getenv("ATAGIA_VERBATIM_EVIDENCE_WINDOW_SIZE", "3")),
+            verbatim_evidence_window_overlap=int(os.getenv("ATAGIA_VERBATIM_EVIDENCE_WINDOW_OVERLAP", "1")),
+            openai_proxy_model_id=os.getenv(
+                "ATAGIA_PROXY_MODEL_ID",
+                "atagia-memory-proxy",
             ),
-            verbatim_evidence_search_limit=int(
-                os.getenv("ATAGIA_VERBATIM_EVIDENCE_SEARCH_LIMIT", "8")
-            ),
-            verbatim_evidence_window_size=int(
-                os.getenv("ATAGIA_VERBATIM_EVIDENCE_WINDOW_SIZE", "3")
-            ),
-            verbatim_evidence_window_overlap=int(
-                os.getenv("ATAGIA_VERBATIM_EVIDENCE_WINDOW_OVERLAP", "1")
+            openai_proxy_upstream_model=_env_optional_str("ATAGIA_PROXY_UPSTREAM_MODEL"),
+            openai_proxy_default_mode=_env_optional_str("ATAGIA_PROXY_DEFAULT_MODE"),
+            cors_allowed_origins=_env_csv_tuple(
+                "ATAGIA_CORS_ALLOWED_ORIGINS",
+                (),
             ),
         )
 
