@@ -56,6 +56,7 @@ _SUFFICIENCY_BUCKETS: dict[str, TaxonomyBucket] = {
 
 _KNOWN_DIAGNOSIS = frozenset([*_DIAGNOSIS_BUCKETS, "passed"])
 _KNOWN_SUFFICIENCY = frozenset([*_SUFFICIENCY_BUCKETS, "retrieval_sufficient"])
+_KNOWN_FAILURE_STAGES = frozenset({"retrieval", "answer_generation", "judge"})
 
 
 class FailureTaxonomyItem(BaseModel):
@@ -70,6 +71,7 @@ class FailureTaxonomyItem(BaseModel):
     category_tags: list[str] = Field(default_factory=list)
     diagnosis_bucket: str
     sufficiency_diagnostic: str
+    failure_stage: str | None = None
     taxonomy_bucket: TaxonomyBucket
     memories_used: int = Field(ge=0)
     retrieval_time_ms: float = Field(ge=0.0)
@@ -94,6 +96,7 @@ class FailureTaxonomyReport(BaseModel):
     taxonomy_counts: dict[str, int] = Field(default_factory=dict)
     diagnosis_counts: dict[str, int] = Field(default_factory=dict)
     sufficiency_counts: dict[str, int] = Field(default_factory=dict)
+    failure_stage_counts: dict[str, int] = Field(default_factory=dict)
     memories_used: dict[str, float | int | None] = Field(
         default_factory=lambda: summarize_numeric_values([])
     )
@@ -131,6 +134,9 @@ def build_failure_taxonomy_report(
     taxonomy_counts = Counter(item.taxonomy_bucket for item in items)
     diagnosis_counts = Counter(item.diagnosis_bucket for item in items)
     sufficiency_counts = Counter(item.sufficiency_diagnostic for item in items)
+    failure_stage_counts = Counter(
+        item.failure_stage for item in items if item.failure_stage is not None
+    )
 
     return FailureTaxonomyReport(
         benchmark_name=str(getattr(report, "benchmark_name")),
@@ -142,6 +148,7 @@ def build_failure_taxonomy_report(
         taxonomy_counts=dict(sorted(taxonomy_counts.items())),
         diagnosis_counts=dict(sorted(diagnosis_counts.items())),
         sufficiency_counts=dict(sorted(sufficiency_counts.items())),
+        failure_stage_counts=dict(sorted(failure_stage_counts.items())),
         memories_used=summarize_numeric_values(item.memories_used for item in items),
         retrieval_time_ms=summarize_numeric_values(item.retrieval_time_ms for item in items),
         retrieval_custody_summary=summarize_retrieval_custody(
@@ -191,6 +198,7 @@ def failure_taxonomy_manifest_summary(report: FailureTaxonomyReport) -> dict[str
         "taxonomy_counts": dict(report.taxonomy_counts),
         "diagnosis_counts": dict(report.diagnosis_counts),
         "sufficiency_counts": dict(report.sufficiency_counts),
+        "failure_stage_counts": dict(report.failure_stage_counts),
     }
 
 
@@ -235,6 +243,7 @@ def _from_atagia_result(result: AtagiaQuestionResult) -> _NormalizedResult:
 def _build_item(result: _NormalizedResult) -> FailureTaxonomyItem:
     diagnosis = _known_value(result.trace.get("diagnosis_bucket"), _KNOWN_DIAGNOSIS)
     sufficiency = _known_value(result.trace.get("sufficiency_diagnostic"), _KNOWN_SUFFICIENCY)
+    failure_stage = _known_optional_value(result.trace.get("failure_stage"), _KNOWN_FAILURE_STAGES)
     custody = _trace_dict_list(result.trace, "retrieval_custody")
     return FailureTaxonomyItem(
         question_id=result.question_id,
@@ -244,6 +253,7 @@ def _build_item(result: _NormalizedResult) -> FailureTaxonomyItem:
         category_tags=list(result.category_tags),
         diagnosis_bucket=diagnosis,
         sufficiency_diagnostic=sufficiency,
+        failure_stage=failure_stage,
         taxonomy_bucket=_taxonomy_bucket(diagnosis, sufficiency),
         memories_used=result.memories_used,
         retrieval_time_ms=result.retrieval_time_ms,
@@ -265,6 +275,15 @@ def _taxonomy_bucket(diagnosis: str, sufficiency: str) -> TaxonomyBucket:
 
 def _known_value(value: Any, known_values: frozenset[str]) -> str:
     normalized = str(value).strip() if value is not None else ""
+    return normalized if normalized in known_values else "unknown"
+
+
+def _known_optional_value(value: Any, known_values: frozenset[str]) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
     return normalized if normalized in known_values else "unknown"
 
 

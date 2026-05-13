@@ -18,6 +18,7 @@ from atagia.core.repositories import (
     UserRepository,
     conversation_visibility_clause,
 )
+from atagia.core.space_repository import SpaceRepository, space_snapshot
 from atagia.core.ids import new_job_id
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.core.timestamps import resolve_message_occurred_at
@@ -33,6 +34,10 @@ from atagia.memory.operational_profile import (
     OperationalProfileNotAuthorizedError,
     UnknownOperationalProfileError,
 )
+from atagia.memory.embodiment_policy import embodiment_visibility_sql_clause_for_context
+from atagia.memory.realm_policy import realm_visibility_sql_clause_for_context
+from atagia.memory.space_policy import space_visibility_sql_clause_for_context
+from atagia.memory.mind_policy import mind_visibility_sql_clause_for_context
 from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
     build_job_payload,
@@ -58,6 +63,12 @@ from atagia.services.lifecycle_service import (
     ConversationLifecycleService,
 )
 from atagia.services.job_tracking_service import JobTrackingService
+from atagia.services.presence_resolution import (
+    ensure_conversation_active_presence,
+    resolve_source_presence_for_role,
+)
+from atagia.services.embodiment_resolution import ensure_conversation_active_embodiment
+from atagia.services.realm_resolution import ensure_conversation_active_realm
 from atagia.services.worker_control_service import WorkerControlService
 
 try:
@@ -85,6 +96,8 @@ class AtagiaContext:
     platform_id: str
     user_persona_id: str | None = None
     character_id: str | None = None
+    embodiment_id: str | None = None
+    realm_id: str | None = None
     conversation_id: str | None = None
     incognito: bool = False
 
@@ -97,6 +110,8 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[AtagiaContext]:
     platform_id = _required_env_text("ATAGIA_PLATFORM_ID")
     user_persona_id = _optional_env_text("ATAGIA_USER_PERSONA_ID")
     character_id = _optional_env_text("ATAGIA_CHARACTER_ID")
+    embodiment_id = _optional_env_text("ATAGIA_EMBODIMENT_ID")
+    realm_id = _optional_env_text("ATAGIA_REALM_ID")
     conversation_id = _optional_env_text("ATAGIA_CONVERSATION_ID")
     incognito = _env_bool("ATAGIA_INCOGNITO", default=False)
     await engine.setup()
@@ -107,6 +122,8 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[AtagiaContext]:
             platform_id=platform_id,
             user_persona_id=user_persona_id,
             character_id=character_id,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
             conversation_id=conversation_id,
             incognito=incognito,
         )
@@ -167,6 +184,8 @@ async def _mcp_namespace_kwargs(
     user_persona_id: str | None,
     character_id: str | None,
     incognito: bool,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
     require_active: bool = True,
 ) -> dict[str, Any]:
     if conversation_id is None:
@@ -192,9 +211,32 @@ async def _mcp_namespace_kwargs(
             or bool(conversation.get("incognito")) != bool(incognito)
         ):
             raise ConversationNotFoundError("Conversation not found for namespace")
+        if embodiment_id is not None:
+            conversation, _active_embodiment = await ensure_conversation_active_embodiment(
+                connection,
+                runtime.clock,
+                conversation=conversation,
+                embodiment_id=embodiment_id,
+            )
+        if realm_id is not None:
+            conversation, _active_realm = await ensure_conversation_active_realm(
+                connection,
+                runtime.clock,
+                conversation=conversation,
+                realm_id=realm_id,
+            )
         preferences = await UserRepository(connection, runtime.clock).get_memory_preferences(user_id)
         if preferences is None:
             raise ValueError("User not found")
+        active_space_id = conversation.get("active_space_id")
+        active_space_boundary_mode = None
+        if active_space_id is not None:
+            space_row = await SpaceRepository(connection, runtime.clock).get_space(
+                owner_user_id=user_id,
+                space_id=str(active_space_id),
+            )
+            if space_row is not None:
+                active_space_boundary_mode = space_snapshot(space_row).boundary_mode.value
         return {
             "conversation_id": conversation_id,
             "user_persona_id": user_persona_id,
@@ -203,6 +245,12 @@ async def _mcp_namespace_kwargs(
             "incognito": incognito,
             "remember_across_chats": bool(preferences["remember_across_chats"]),
             "remember_across_devices": bool(preferences["remember_across_devices"]),
+            "active_space_id": active_space_id,
+            "active_space_boundary_mode": active_space_boundary_mode,
+            "active_mind_id": conversation.get("active_mind_id"),
+            "mind_topology": conversation.get("mind_topology") or "unimind",
+            "active_embodiment_id": conversation.get("active_embodiment_id"),
+            "active_realm_id": conversation.get("active_realm_id"),
         }
     finally:
         await connection.close()
@@ -217,6 +265,8 @@ async def _ensure_conversation_id(
     mode: str | None = None,
     user_persona_id: str | None = None,
     character_id: str | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
     incognito: bool = False,
 ) -> str:
     """Create or reuse a conversation and return its identifier."""
@@ -233,6 +283,8 @@ async def _ensure_conversation_id(
         platform_id=platform_id,
         user_persona_id=user_persona_id,
         character_id=character_id,
+        embodiment_id=embodiment_id,
+        realm_id=realm_id,
         mode=mode,
         incognito=incognito,
     )
@@ -250,6 +302,8 @@ async def _get_context_impl(
     operational_signals: dict[str, Any] | None = None,
     user_persona_id: str | None = None,
     character_id: str | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
     incognito: bool = False,
 ) -> str:
     """Retrieve relevant memories for a message as a JSON string."""
@@ -262,6 +316,8 @@ async def _get_context_impl(
         mode=mode,
         user_persona_id=user_persona_id,
         character_id=character_id,
+        embodiment_id=embodiment_id,
+        realm_id=realm_id,
         incognito=incognito,
     )
     context = await engine.get_context(
@@ -274,6 +330,8 @@ async def _get_context_impl(
         user_persona_id=user_persona_id,
         platform_id=platform_id,
         character_id=character_id,
+        embodiment_id=embodiment_id,
+        realm_id=realm_id,
         incognito=incognito,
         ablation=AblationConfig(disable_context_cache=True),
     )
@@ -320,6 +378,8 @@ async def _add_memory_impl(
     operational_signals: dict[str, Any] | None = None,
     user_persona_id: str | None = None,
     character_id: str | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
     incognito: bool = False,
 ) -> str:
     """Store a user message and enqueue extraction jobs."""
@@ -331,6 +391,8 @@ async def _add_memory_impl(
         default_conversation_id=default_conversation_id,
         user_persona_id=user_persona_id,
         character_id=character_id,
+        embodiment_id=embodiment_id,
+        realm_id=realm_id,
         incognito=incognito,
     )
     runtime = await _runtime(engine)
@@ -351,6 +413,19 @@ async def _add_memory_impl(
             conversation = await conversations.get_conversation(resolved_conversation_id, user_id)
             if conversation is None:
                 raise ValueError("Conversation not found for user")
+            conversation, active_presence = await ensure_conversation_active_presence(
+                connection,
+                runtime.clock,
+                conversation=conversation,
+                character_id=character_id,
+            )
+            source_presence = await resolve_source_presence_for_role(
+                connection,
+                runtime.clock,
+                owner_user_id=user_id,
+                role="user",
+                active_presence=active_presence,
+            )
             memory_preferences = await users.get_memory_preferences(user_id)
             prior_messages = await messages.get_recent_messages(
                 resolved_conversation_id,
@@ -369,6 +444,13 @@ async def _add_memory_impl(
                     token_count=None,
                     metadata={"source": "mcp_add_memory"},
                     occurred_at=message_occurred_at,
+                    active_presence_id=active_presence.presence_id,
+                    source_presence_id=source_presence.presence_id,
+                    space_id=conversation.get("active_space_id"),
+                    active_mind_id=conversation.get("active_mind_id"),
+                    source_mind_id=conversation.get("active_mind_id"),
+                    active_embodiment_id=conversation.get("active_embodiment_id"),
+                    active_realm_id=conversation.get("active_realm_id"),
                     commit=False,
                 )
                 payload = build_job_payload(
@@ -377,6 +459,12 @@ async def _add_memory_impl(
                         user_message["id"],
                         prior_messages,
                         memory_preferences=memory_preferences,
+                        active_presence_id=active_presence.presence_id,
+                        active_presence_kind=active_presence.kind.value,
+                        active_presence_display_name=active_presence.display_name,
+                        source_presence_id=source_presence.presence_id,
+                        source_presence_kind=source_presence.kind.value,
+                        source_presence_display_name=source_presence.display_name,
                     ),
                     message_text=message,
                     message_occurred_at=resolve_message_occurred_at(user_message),
@@ -473,6 +561,8 @@ async def _search_memories_impl(
     platform_id: str,
     user_persona_id: str | None = None,
     character_id: str | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
     incognito: bool = False,
 ) -> str:
     """Search memories via FTS and return a JSON array string."""
@@ -484,6 +574,8 @@ async def _search_memories_impl(
         conversation_id=conversation_id,
         user_persona_id=user_persona_id,
         character_id=character_id,
+        embodiment_id=embodiment_id,
+        realm_id=realm_id,
         incognito=incognito,
     )
     connection = await runtime.open_connection()
@@ -521,6 +613,8 @@ async def _list_memories_impl(
     platform_id: str,
     user_persona_id: str | None = None,
     character_id: str | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
     incognito: bool = False,
 ) -> str:
     """List stored memories as a JSON array string."""
@@ -532,6 +626,8 @@ async def _list_memories_impl(
         conversation_id=conversation_id,
         user_persona_id=user_persona_id,
         character_id=character_id,
+        embodiment_id=embodiment_id,
+        realm_id=realm_id,
         incognito=incognito,
         require_active=False,
     )
@@ -572,6 +668,12 @@ async def _list_visible_mcp_memories(
     incognito: bool,
     remember_across_chats: bool,
     remember_across_devices: bool,
+    active_space_id: str | None,
+    active_space_boundary_mode: str | None,
+    active_mind_id: str | None,
+    mind_topology: str | None,
+    active_embodiment_id: str | None,
+    active_realm_id: str | None,
 ) -> list[dict[str, Any]]:
     visibility_clauses, visibility_parameters = MemoryObjectRepository.namespace_visibility_clauses(
         [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
@@ -587,12 +689,34 @@ async def _list_visible_mcp_memories(
     )
     if not visibility_clauses:
         return []
+    space_clause, space_parameters = space_visibility_sql_clause_for_context(
+        active_space_id=active_space_id,
+        active_space_boundary_mode=active_space_boundary_mode,
+        alias="mo",
+    )
+    mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+        active_mind_id=active_mind_id,
+        mind_topology=mind_topology,
+        alias="mo",
+    )
+    embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+        active_embodiment_id=active_embodiment_id,
+        alias="mo",
+    )
+    realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+        active_realm_id=active_realm_id,
+        alias="mo",
+    )
     clauses = [
         "mo.user_id = ?",
         "mo.status IN (?, ?)",
         "mo.archived_by_conversation_id IS NULL",
         conversation_visibility_clause("mo"),
         *visibility_clauses,
+        space_clause,
+        mind_clause,
+        embodiment_clause,
+        realm_clause,
     ]
     parameters: list[Any] = [
         user_id,
@@ -600,6 +724,10 @@ async def _list_visible_mcp_memories(
         MemoryStatus.ARCHIVED.value,
         conversation_id,
         *visibility_parameters,
+        *space_parameters,
+        *mind_parameters,
+        *embodiment_parameters,
+        *realm_parameters,
     ]
     normalized_type = memory_type.strip() if memory_type is not None else None
     if normalized_type:
@@ -632,6 +760,12 @@ async def _search_visible_mcp_memories(
     incognito: bool,
     remember_across_chats: bool,
     remember_across_devices: bool,
+    active_space_id: str | None,
+    active_space_boundary_mode: str | None,
+    active_mind_id: str | None,
+    mind_topology: str | None,
+    active_embodiment_id: str | None,
+    active_realm_id: str | None,
 ) -> list[dict[str, Any]]:
     visibility_clauses, visibility_parameters = MemoryObjectRepository.namespace_visibility_clauses(
         [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
@@ -647,6 +781,24 @@ async def _search_visible_mcp_memories(
     )
     if not visibility_clauses:
         return []
+    space_clause, space_parameters = space_visibility_sql_clause_for_context(
+        active_space_id=active_space_id,
+        active_space_boundary_mode=active_space_boundary_mode,
+        alias="mo",
+    )
+    mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+        active_mind_id=active_mind_id,
+        mind_topology=mind_topology,
+        alias="mo",
+    )
+    embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+        active_embodiment_id=active_embodiment_id,
+        alias="mo",
+    )
+    realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+        active_realm_id=active_realm_id,
+        alias="mo",
+    )
     clauses = [
         "mo.user_id = ?",
         "memory_objects_fts MATCH ?",
@@ -654,6 +806,10 @@ async def _search_visible_mcp_memories(
         "mo.archived_by_conversation_id IS NULL",
         conversation_visibility_clause("mo"),
         *visibility_clauses,
+        space_clause,
+        mind_clause,
+        embodiment_clause,
+        realm_clause,
     ]
     parameters: list[Any] = [
         user_id,
@@ -661,6 +817,10 @@ async def _search_visible_mcp_memories(
         MemoryStatus.ACTIVE.value,
         conversation_id,
         *visibility_parameters,
+        *space_parameters,
+        *mind_parameters,
+        *embodiment_parameters,
+        *realm_parameters,
         max(1, min(100, int(limit))),
     ]
     cursor = await connection.execute(
@@ -690,6 +850,8 @@ async def _delete_memory_impl(
     platform_id: str,
     user_persona_id: str | None = None,
     character_id: str | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
     incognito: bool = False,
 ) -> str:
     """Archive or hard-delete a memory object and return a confirmation string."""
@@ -701,6 +863,8 @@ async def _delete_memory_impl(
         conversation_id=conversation_id,
         user_persona_id=user_persona_id,
         character_id=character_id,
+        embodiment_id=embodiment_id,
+        realm_id=realm_id,
         incognito=incognito,
     )
     cache_service = ContextCacheService(runtime)
@@ -732,6 +896,8 @@ async def _edit_memory_impl(
     platform_id: str,
     user_persona_id: str | None = None,
     character_id: str | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
     incognito: bool = False,
 ) -> str:
     runtime = await _runtime(engine)
@@ -742,6 +908,8 @@ async def _edit_memory_impl(
         conversation_id=conversation_id,
         user_persona_id=user_persona_id,
         character_id=character_id,
+        embodiment_id=embodiment_id,
+        realm_id=realm_id,
         incognito=incognito,
     )
     cache_service = ContextCacheService(runtime)
@@ -879,6 +1047,12 @@ def _conversation_context(
     prior_messages: list[dict[str, Any]],
     *,
     memory_preferences: dict[str, Any] | None = None,
+    active_presence_id: str | None = None,
+    active_presence_kind: str = "unknown",
+    active_presence_display_name: str | None = None,
+    source_presence_id: str | None = None,
+    source_presence_kind: str = "unknown",
+    source_presence_display_name: str | None = None,
 ) -> ExtractionConversationContext:
     preferences = memory_preferences or {}
     return ExtractionConversationContext(
@@ -894,6 +1068,21 @@ def _conversation_context(
             if conversation.get("character_id") is not None
             else conversation.get("workspace_id")
         ),
+        active_presence_id=active_presence_id or conversation.get("active_presence_id"),
+        active_presence_kind=active_presence_kind,
+        active_presence_display_name=active_presence_display_name,
+        source_presence_id=source_presence_id,
+        source_presence_kind=source_presence_kind,
+        source_presence_display_name=source_presence_display_name,
+        active_space_id=conversation.get("active_space_id"),
+        active_space_boundary_mode=conversation.get("active_space_boundary_mode") or "focus",
+        active_mind_id=conversation.get("active_mind_id"),
+        source_mind_id=conversation.get("active_mind_id"),
+        mind_topology=conversation.get("mind_topology") or "unimind",
+        active_embodiment_id=conversation.get("active_embodiment_id"),
+        cross_embodiment_mode=conversation.get("cross_embodiment_mode") or "direct_if_same_body",
+        active_realm_id=conversation.get("active_realm_id"),
+        cross_realm_mode=conversation.get("cross_realm_mode") or "none",
         mode=str(conversation.get("mode") or conversation["assistant_mode_id"]),
         recent_messages=recent_context(prior_messages),
         temporary=bool(conversation.get("temporary")),
@@ -957,6 +1146,8 @@ async def atagia_get_context(
             operational_signals=operational_signals,
             user_persona_id=ctx.request_context.lifespan_context.user_persona_id,
             character_id=ctx.request_context.lifespan_context.character_id,
+            embodiment_id=ctx.request_context.lifespan_context.embodiment_id,
+            realm_id=ctx.request_context.lifespan_context.realm_id,
             incognito=incognito or ctx.request_context.lifespan_context.incognito,
         )
     except _EXPECTED_TOOL_ERRORS as exc:
@@ -987,6 +1178,8 @@ async def atagia_add_memory(
             operational_signals=operational_signals,
             user_persona_id=ctx.request_context.lifespan_context.user_persona_id,
             character_id=ctx.request_context.lifespan_context.character_id,
+            embodiment_id=ctx.request_context.lifespan_context.embodiment_id,
+            realm_id=ctx.request_context.lifespan_context.realm_id,
             incognito=incognito or ctx.request_context.lifespan_context.incognito,
         )
     except _EXPECTED_TOOL_ERRORS as exc:
@@ -1012,6 +1205,8 @@ async def atagia_search_memories(
             platform_id=ctx.request_context.lifespan_context.platform_id,
             user_persona_id=ctx.request_context.lifespan_context.user_persona_id,
             character_id=ctx.request_context.lifespan_context.character_id,
+            embodiment_id=ctx.request_context.lifespan_context.embodiment_id,
+            realm_id=ctx.request_context.lifespan_context.realm_id,
             incognito=ctx.request_context.lifespan_context.incognito,
         )
     except _EXPECTED_TOOL_ERRORS as exc:
@@ -1074,6 +1269,8 @@ async def atagia_list_memories(
             platform_id=ctx.request_context.lifespan_context.platform_id,
             user_persona_id=ctx.request_context.lifespan_context.user_persona_id,
             character_id=ctx.request_context.lifespan_context.character_id,
+            embodiment_id=ctx.request_context.lifespan_context.embodiment_id,
+            realm_id=ctx.request_context.lifespan_context.realm_id,
             incognito=ctx.request_context.lifespan_context.incognito,
         )
     except _EXPECTED_TOOL_ERRORS as exc:
@@ -1101,6 +1298,8 @@ async def atagia_delete_memory(
             platform_id=ctx.request_context.lifespan_context.platform_id,
             user_persona_id=ctx.request_context.lifespan_context.user_persona_id,
             character_id=ctx.request_context.lifespan_context.character_id,
+            embodiment_id=ctx.request_context.lifespan_context.embodiment_id,
+            realm_id=ctx.request_context.lifespan_context.realm_id,
             incognito=ctx.request_context.lifespan_context.incognito,
         )
     except _EXPECTED_TOOL_ERRORS as exc:
@@ -1126,6 +1325,8 @@ async def atagia_edit_memory(
             platform_id=ctx.request_context.lifespan_context.platform_id,
             user_persona_id=ctx.request_context.lifespan_context.user_persona_id,
             character_id=ctx.request_context.lifespan_context.character_id,
+            embodiment_id=ctx.request_context.lifespan_context.embodiment_id,
+            realm_id=ctx.request_context.lifespan_context.realm_id,
             incognito=ctx.request_context.lifespan_context.incognito,
         )
     except _EXPECTED_TOOL_ERRORS as exc:

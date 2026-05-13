@@ -1,80 +1,86 @@
 # Atagia Integrations
 
 This directory contains reference adapters, host-specific notes, and copyable
-integration scaffolds for platforms that want to use Atagia as a memory
-sidecar. It is not a runtime package.
+integration bundles for platforms that use Atagia as a memory sidecar. It is
+not a runtime package.
 
-Reusable Python code belongs under `src/atagia/integrations/` so it ships with
-the package. This top-level directory is for platform glue, examples, and
-operator notes that a host application can copy or adapt.
+Reusable package code belongs under `src/atagia/integrations/`. Platform folders
+here stay thin over the canonical `SidecarService` / `SidecarBridge` contract so
+there is no second integration API.
 
-Production host code should import the canonical contract from
-`atagia.integrations`, not from this directory. Platform folders here should
-stay thin examples over that package API so there is no second bridge contract.
+## Readiness Matrix
+
+| Platform | implemented | mock-verified | live-smoke-pending | importer-ready | review-ui-ready | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| OpenAI-compatible proxy | yes | yes | yes | n/a | n/a | Headers and `metadata` identity, streaming SSE, tool calls, usage chunks, fail-open persistence |
+| SillyTavern extension | yes | yes | yes | yes | partial | Browser extension uses `chatMetadata`, `setExtensionPrompt`, stable IDs, response persistence, debug inspector |
+| Open WebUI filter | yes | yes | yes | n/a | partial | `inlet()` context injection, `outlet()` response persistence, debug state; API-direct users should prefer the proxy |
+| OpenClaw plugin | yes | yes | yes | yes | partial | Copyable JS plugin with `before_prompt_build`, `llm_output`, `before_compaction`, `session_end` |
+| Hermes MemoryProvider | yes | yes | yes | yes | partial | Copyable `plugins/memory/atagia/` provider with non-blocking daemon sync worker |
+
+`partial` review UI means the bundle exposes a mini inspector/debug status for
+the last Atagia request, resolved IDs, injected preview, and fail-open errors.
+Full memory review/edit UX still belongs to the host-specific live smoke pass.
 
 ## Current Layout
 
 | Path | Status | Purpose |
 |---|---:|---|
-| `src/atagia/integrations/sidecar_bridge.py` | Working scaffold | Generic fail-open Python bridge over local or HTTP Atagia transports |
-| `src/atagia/integrations/message_projection.py` | Working scaffold | Safe conversion of common host/provider message shapes into text |
-| `src/atagia/integrations/prompt_injection.py` | Working scaffold | Prompt injection helpers for host-managed LLM calls |
-| `src/atagia/integrations/aurvek.py` | Working conventions | Aurvek ID helpers; no Aurvek imports or runtime dependency |
-| `integrations/aurvek/` | Copyable example | Aurvek-style host wrapper over the canonical package bridge |
-| `integrations/openai-compatible/` | MVP implemented | Universal proxy surface for hosts that only speak OpenAI-compatible APIs |
-| `integrations/sillytavern/` | Scaffolded | SillyTavern proxy setup plus native browser extension scaffold |
-| `integrations/open-webui/` | Scaffolded | Copyable Open WebUI filter function |
-| `integrations/openclaw/` | Scaffolded | Copyable OpenClaw pre/post model adapter shape |
-| `integrations/hermes/` | Scaffolded | Copyable Hermes/Honcho-style memory provider facade |
+| `src/atagia/integrations/sidecar_bridge.py` | implemented | Generic fail-open Python bridge over local or HTTP Atagia transports |
+| `src/atagia/integrations/message_projection.py` | implemented | Safe conversion of common host/provider message shapes into text |
+| `src/atagia/integrations/prompt_injection.py` | implemented | Prompt injection helpers for host-managed LLM calls |
+| `src/atagia/integrations/aurvek.py` | implemented | Aurvek ID helpers; no Aurvek imports or runtime dependency |
+| `integrations/aurvek/` | mock-verified | Aurvek-style host wrapper over the canonical package bridge |
+| `integrations/openai-compatible/` | mock-verified | Universal OpenAI-compatible proxy surface |
+| `integrations/sillytavern/extension/` | mock-verified | Copyable SillyTavern browser extension |
+| `integrations/open-webui/` | mock-verified | Copyable Open WebUI Filter Function |
+| `integrations/openclaw/plugin/` | mock-verified | Copyable OpenClaw plugin bundle |
+| `integrations/hermes/plugins/memory/atagia/` | mock-verified | Copyable Hermes MemoryProvider plugin |
+| `integrations/importers/` | mock-verified | Offline importers for chat/session exports |
 
-## Minimum Host Pattern
+## Common Contract
 
-Every host adapter should do the same small loop:
+Every host adapter should follow the same loop:
 
-1. Map the verified host `user_id` and `conversation_id` to stable Atagia IDs.
-2. Call `ensure_user_and_conversation()` before or during warmup.
-3. Convert the current user message to text with `message_to_text()`.
-4. Call `get_context_for_turn()` before the host LLM request, passing a stable
-   `message_id` when the host has one. For historical imports, also pass
-   `source_seq` as the host conversation-local message order and
-   `ingest_origin="backfill"`.
-5. Append `context.system_prompt` to the host system prompt with
-   `build_injection_decision()`.
-6. If Atagia is acting as primary context, avoid also sending a huge duplicated
-   local history window.
-7. After the host model responds, call `record_assistant_response()` with the
-   host response `message_id` when available.
-8. Fail open: if Atagia is disabled or unavailable, the host should keep using
-   its existing context path.
+1. Map verified host `user_id`, `platform_id`, and `conversation_id` to stable
+   Atagia IDs. The proxy rejects requests missing any of these three.
+2. Pass stable `message_id` and `source_seq` for the live user turn when the host
+   can derive them.
+3. Call context retrieval before the host LLM request using
+   `ingest_origin="live_turn"` and
+   `confirmation_strategy="live_prompt_allowed"`.
+4. Inject only the returned prompt context. Do not persist synthetic Atagia
+   prompt blocks into host chat history.
+5. After the model responds, persist the assistant response with its own stable
+   `response_message_id` / `response_source_seq` when available.
+6. For imports/backfills, call `/v1/conversations/{id}/messages` with
+   `ingest_origin="backfill"` and
+   `confirmation_strategy="admin_review_only"`.
+7. Pass `memory_privacy_mode` explicitly. Use `balanced` by default and
+   `trusted_private` only when the user has granted broad private-memory trust.
+8. Fail open: if Atagia is disabled or unavailable, the host continues its
+   normal context path.
 
-`message_id` is optional and idempotent in the sidecar contract. Retrying the
-same role/text with the same id does not duplicate; reusing the id for different
-content returns a conflict.
+`message_id` is idempotent. Retrying the same role/text with the same ID does
+not duplicate; reusing an ID for different content returns a conflict.
 
-`source_seq` is the canonical optional order field for backfills. When present,
-Atagia stores it as the conversation `seq`, allowing retries of older failed
-messages to preserve chronological order. Host examples should not introduce a
-parallel `host_seq` alias.
+`source_seq` is the optional conversation-local order field. These bundles use
+deterministic source sequences that remain rerunnable while changing for edited
+or regenerated text.
 
-`ingest_origin` is the canonical live-vs-import selector. The default
-`live_turn` allows normal user confirmation prompts. `backfill` and
-`admin_import` default to admin review for sensitive candidates, so old history
-does not create pending user confirmations.
+## Verification
 
-`memory_privacy_mode` is the canonical user trust selector. `balanced` is the
-default and preserves confirmation/review gates for sensitive storage.
-`trusted_private` is explicit broad consent from the user: Atagia will not
-route a candidate to pending confirmation or review solely because it is
-sensitive, private, or imported.
+The mock verification gate for these bundles is:
 
-## What Is Still Missing For Plug-And-Play
+```bash
+./.venv/bin/pytest \
+  tests/api/test_openai_proxy.py \
+  tests/integrations/test_platform_scaffolds.py \
+  tests/integrations/test_open_webui_filter.py \
+  tests/integrations/test_platform_importers.py \
+  tests/integrations/test_hermes_plugin.py \
+  tests/integrations/test_node_bundles.py
+```
 
-- Live SillyTavern extension smoke validation.
-- Live Open WebUI filter smoke validation and packaging.
-- OpenClaw and Hermes concrete adapter APIs once their extension hooks are
-  finalized against real installs.
-- OpenAI-compatible proxy hardening against real OpenAI-compatible clients,
-  especially tool calling, model aliases, and streaming failure recovery.
-- Importers for chat histories beyond the current private Aurvek ChatLab.
-- Host UI for the canonical pending-confirmation and admin review endpoints.
-- A visible context/injection inspector for debugging what Atagia added.
+The next session should run live smoke tests against real SillyTavern,
+OpenClaw, and Hermes installs.

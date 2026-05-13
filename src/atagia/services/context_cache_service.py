@@ -48,6 +48,7 @@ CACHE_GUARD_TTL_SECONDS = 5 * 60
 CACHE_GUARD_ACQUIRE_TIMEOUT_SECONDS = 30.0
 CACHE_GUARD_INITIAL_DELAY_SECONDS = 0.01
 CACHE_GUARD_MAX_DELAY_SECONDS = 0.25
+CONTEXT_CACHE_KEY_VERSION = 8
 DISCARDABLE_CACHE_SIGNALS = frozenset(
     {
         "assistant_mode_id_mismatch",
@@ -179,12 +180,21 @@ class ContextCacheService:
             assistant_mode_id=resolved_mode_id,
             conversation_id=conversation_id,
             workspace_id=active_conversation.get("workspace_id"),
+            active_presence_id=active_conversation.get("active_presence_id"),
+            active_space_id=active_conversation.get("active_space_id"),
+            active_mind_id=active_conversation.get("active_mind_id"),
+            mind_topology=active_conversation.get("mind_topology"),
+            active_embodiment_id=active_conversation.get("active_embodiment_id"),
+            active_realm_id=active_conversation.get("active_realm_id"),
             operational_profile_token=resolved_operational_profile.snapshot.token,
         )
         current_message_seq = self._next_message_seq(current_messages)
         cache_lookup_started = perf_counter()
+        cache_allowed = self._cache_enabled(ablation) and str(
+            active_conversation.get("mind_topology") or "unimind"
+        ) != "ojocentauri"
         raw_entry: dict[str, Any] | None = None
-        if self._cache_enabled(ablation):
+        if cache_allowed:
             raw_entry = await self.runtime.storage_backend.get_context_view(cache_key)
         cache_lookup_elapsed = perf_counter() - cache_lookup_started
 
@@ -200,7 +210,7 @@ class ContextCacheService:
                     workspace_id=active_conversation.get("workspace_id"),
                     message_text=message_text,
                     current_message_seq=current_message_seq,
-                    cache_enabled=self._cache_enabled(ablation),
+                    cache_enabled=cache_allowed,
                     operational_profile=resolved_operational_profile.snapshot,
                     effective_policy_hash=effective_policy_hash,
                     benchmark_mode=False,
@@ -263,7 +273,7 @@ class ContextCacheService:
         memory_summaries = build_memory_summaries(pipeline_result)
         pending_entry: ContextCacheEntry | None = None
         cache_ttl_seconds: int | None = None
-        if self._cache_enabled(ablation):
+        if cache_allowed:
             pending_entry = ContextCacheEntry(
                 cache_key=cache_key,
                 user_id=user_id,
@@ -373,6 +383,12 @@ class ContextCacheService:
         assistant_mode_id: str,
         conversation_id: str,
         workspace_id: str | None,
+        active_presence_id: str | None = None,
+        active_space_id: str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> str:
         operational_snapshot = default_operational_profile_snapshot(
             loader=self.runtime.operational_profile_loader,
@@ -383,6 +399,12 @@ class ContextCacheService:
             assistant_mode_id=assistant_mode_id,
             conversation_id=conversation_id,
             workspace_id=workspace_id,
+            active_presence_id=active_presence_id,
+            active_space_id=active_space_id,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
             operational_profile_token=operational_snapshot.token,
         )
         await self.runtime.storage_backend.delete_context_views_for_conversation(
@@ -447,16 +469,30 @@ class ContextCacheService:
         conversation_id: str,
         workspace_id: str | None,
         operational_profile_token: str,
+        active_presence_id: str | None = None,
+        active_space_id: str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> str:
         cache_subject = {
-            "v": 2,
+            "v": CONTEXT_CACHE_KEY_VERSION,
+            "active_embodiment_id": active_embodiment_id,
+            "active_mind_id": active_mind_id,
+            "active_presence_id": active_presence_id,
+            "active_realm_id": active_realm_id,
+            "active_space_id": active_space_id,
             "assistant_mode_id": assistant_mode_id,
             "conversation_id": conversation_id,
+            "mind_topology": mind_topology or "unimind",
             "operational_profile_token": operational_profile_token,
             "user_id": user_id,
             "workspace_id": workspace_id,
         }
-        return "ctx:v2:" + hashlib.sha256(canonical_json_bytes(cache_subject)).hexdigest()
+        return f"ctx:v{CONTEXT_CACHE_KEY_VERSION}:" + hashlib.sha256(
+            canonical_json_bytes(cache_subject)
+        ).hexdigest()
 
     def _cache_enabled(self, ablation: AblationConfig | None) -> bool:
         if not self.runtime.settings.context_cache_enabled:
@@ -464,6 +500,8 @@ class ContextCacheService:
         if ablation is not None and ablation.disable_context_cache:
             return False
         if ablation is not None and ablation.composer_strategy not in {None, "score_first"}:
+            return False
+        if ablation is not None and ablation.override_retrieval_params:
             return False
         return True
 

@@ -16,17 +16,26 @@ mcp_available = pytest.importorskip("mcp", reason="mcp package not installed")
 from atagia import Atagia
 from atagia.core.clock import FrozenClock
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
+from atagia.core.space_repository import SpaceRepository
 from atagia.models.schemas_jobs import EXTRACT_STREAM_NAME, JobEnvelope, WORKER_GROUP_NAME
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
+from atagia.models.schemas_memory import (
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    MemoryStatus,
+    SpaceBoundaryMode,
+)
 from atagia.mcp_server import (
     _add_memory_impl,
     _delete_conversation_impl,
     _delete_memory_impl,
+    _edit_memory_impl,
     _get_context_impl,
     _list_memories_impl,
     _search_memories_impl,
+    lifespan,
 )
-from atagia.services.errors import DeletionConfirmationError
+from atagia.services.errors import DeletionConfirmationError, MemoryNotFoundError
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.chat_support import default_operational_profile_snapshot
@@ -179,6 +188,13 @@ async def _seed_memory(
     object_type: MemoryObjectType = MemoryObjectType.EVIDENCE,
     status: MemoryStatus = MemoryStatus.ACTIVE,
     privacy_level: int = 0,
+    scope: MemoryScope = MemoryScope.CONVERSATION,
+    conversation_id: str | None = "cnv_1",
+    platform_id: str = "web",
+    space_id: str | None = None,
+    space_boundary_mode: SpaceBoundaryMode | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
 ) -> None:
     runtime = engine.runtime
     if runtime is None:
@@ -186,19 +202,30 @@ async def _seed_memory(
     connection = await runtime.open_connection()
     try:
         memories = MemoryObjectRepository(connection, runtime.clock)
+        scope_canonical = {
+            MemoryScope.CONVERSATION: MemoryScope.CHAT.value,
+            MemoryScope.EPHEMERAL_SESSION: MemoryScope.CHAT.value,
+            MemoryScope.WORKSPACE: MemoryScope.CHARACTER.value,
+            MemoryScope.GLOBAL_USER: MemoryScope.USER.value,
+        }.get(scope)
         await memories.create_memory_object(
             user_id="usr_1",
-            conversation_id="cnv_1",
+            conversation_id=conversation_id,
             assistant_mode_id="coding_debug",
             object_type=object_type,
-            scope=MemoryScope.CONVERSATION,
+            scope=scope,
             canonical_text=text,
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.9,
             privacy_level=privacy_level,
             status=status,
             memory_id=memory_id,
-            platform_id="web",
+            platform_id=platform_id,
+            scope_canonical=scope_canonical,
+            space_id=space_id,
+            space_boundary_mode=space_boundary_mode.value if space_boundary_mode is not None else None,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
         )
     finally:
         await connection.close()
@@ -253,6 +280,7 @@ async def test_mcp_get_context(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             workspace_id=None,
+            active_presence_id="char_mcp",
             operational_profile_token=_normal_operational_profile_token(engine),
         )
         assert await engine.runtime.storage_backend.get_context_view(cache_key) is None
@@ -270,6 +298,314 @@ async def test_mcp_get_context(
             assert conversation["character_id"] == "char_mcp"
         finally:
             await connection.close()
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_lifespan_reads_embodiment_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_DB_PATH", str(tmp_path / "atagia-mcp-env.db"))
+    monkeypatch.setenv("ATAGIA_USER_ID", "usr_1")
+    monkeypatch.setenv("ATAGIA_PLATFORM_ID", "mcp")
+    monkeypatch.setenv("ATAGIA_EMBODIMENT_ID", "body_env")
+    monkeypatch.setenv("ATAGIA_REALM_ID", "realm_env")
+
+    async with lifespan(None) as context:
+        assert context.user_id == "usr_1"
+        assert context.platform_id == "mcp"
+        assert context.embodiment_id == "body_env"
+        assert context.realm_id == "realm_env"
+
+
+@pytest.mark.asyncio
+async def test_mcp_context_and_add_memory_propagate_embodiment_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = MCPProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-mcp.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await _get_context_impl(
+            engine,
+            "usr_1",
+            "mcp",
+            "Please help me debug this retry loop.",
+            conversation_id="cnv_body",
+            mode="coding_debug",
+            user_persona_id="persona_mcp",
+            character_id="char_mcp",
+            embodiment_id="body_mcp",
+        )
+        await _add_memory_impl(
+            engine,
+            "usr_1",
+            "mcp",
+            "Please remember that this chat is on the headset.",
+            conversation_id="cnv_body",
+            user_persona_id="persona_mcp",
+            character_id="char_mcp",
+            embodiment_id="body_mcp",
+        )
+
+        runtime = engine.runtime
+        if runtime is None:
+            raise AssertionError("Engine runtime should remain initialized")
+        connection = await runtime.open_connection()
+        try:
+            conversation = await ConversationRepository(connection, runtime.clock).get_conversation(
+                "cnv_body",
+                "usr_1",
+            )
+            assert conversation is not None
+            assert conversation["active_embodiment_id"] == "body_mcp"
+            messages = await MessageRepository(connection, runtime.clock).get_messages(
+                "cnv_body",
+                "usr_1",
+                limit=10,
+                offset=0,
+            )
+            assert len(messages) >= 2
+            assert {message["active_embodiment_id"] for message in messages} == {
+                "body_mcp"
+            }
+        finally:
+            await connection.close()
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_context_and_add_memory_propagate_realm_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = MCPProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-mcp.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await _get_context_impl(
+            engine,
+            "usr_1",
+            "mcp",
+            "Please help me debug this retry loop.",
+            conversation_id="cnv_realm",
+            mode="coding_debug",
+            user_persona_id="persona_mcp",
+            character_id="char_mcp",
+            realm_id="realm_mcp",
+        )
+        await _add_memory_impl(
+            engine,
+            "usr_1",
+            "mcp",
+            "Please remember that this chat is in a story realm.",
+            conversation_id="cnv_realm",
+            user_persona_id="persona_mcp",
+            character_id="char_mcp",
+            realm_id="realm_mcp",
+        )
+
+        runtime = engine.runtime
+        if runtime is None:
+            raise AssertionError("Engine runtime should remain initialized")
+        connection = await runtime.open_connection()
+        try:
+            conversation = await ConversationRepository(connection, runtime.clock).get_conversation(
+                "cnv_realm",
+                "usr_1",
+            )
+            assert conversation is not None
+            assert conversation["active_realm_id"] == "realm_mcp"
+            messages = await MessageRepository(connection, runtime.clock).get_messages(
+                "cnv_realm",
+                "usr_1",
+                limit=10,
+                offset=0,
+            )
+            assert len(messages) >= 2
+            assert {message["active_realm_id"] for message in messages} == {
+                "realm_mcp"
+            }
+        finally:
+            await connection.close()
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_memory_tools_can_apply_env_embodiment_to_existing_conversation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = MCPProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-mcp.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_env",
+            assistant_mode_id="coding_debug",
+            platform_id="mcp",
+        )
+        await _seed_memory(
+            engine,
+            memory_id="mem_body_env",
+            text="environmentbodytoken memory belongs to the headset",
+            scope=MemoryScope.GLOBAL_USER,
+            conversation_id=None,
+            platform_id="mcp",
+            embodiment_id="body_env",
+        )
+
+        before_env = json.loads(
+            await _list_memories_impl(
+                engine,
+                "usr_1",
+                conversation_id="cnv_env",
+                platform_id="mcp",
+            )
+        )
+        with_env = json.loads(
+            await _list_memories_impl(
+                engine,
+                "usr_1",
+                conversation_id="cnv_env",
+                platform_id="mcp",
+                embodiment_id="body_env",
+            )
+        )
+        search_with_env = json.loads(
+            await _search_memories_impl(
+                engine,
+                "usr_1",
+                "environmentbodytoken",
+                conversation_id="cnv_env",
+                platform_id="mcp",
+                embodiment_id="body_env",
+            )
+        )
+
+        runtime = engine.runtime
+        if runtime is None:
+            raise AssertionError("Engine runtime should remain initialized")
+        connection = await runtime.open_connection()
+        try:
+            conversation = await ConversationRepository(connection, runtime.clock).get_conversation(
+                "cnv_env",
+                "usr_1",
+            )
+            assert conversation is not None
+            assert conversation["active_embodiment_id"] == "body_env"
+        finally:
+            await connection.close()
+
+        assert {memory["id"] for memory in before_env} == set()
+        assert {memory["id"] for memory in with_env} == {"mem_body_env"}
+        assert {memory["id"] for memory in search_with_env} == {"mem_body_env"}
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_memory_tools_can_apply_env_realm_to_existing_conversation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = MCPProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-mcp.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_realm_env",
+            assistant_mode_id="coding_debug",
+            platform_id="mcp",
+        )
+        await _seed_memory(
+            engine,
+            memory_id="mem_realm_env",
+            text="environmentrealmtoken memory belongs to the story realm",
+            scope=MemoryScope.GLOBAL_USER,
+            conversation_id=None,
+            platform_id="mcp",
+            realm_id="realm_env",
+        )
+
+        before_env = json.loads(
+            await _list_memories_impl(
+                engine,
+                "usr_1",
+                conversation_id="cnv_realm_env",
+                platform_id="mcp",
+            )
+        )
+        with_env = json.loads(
+            await _list_memories_impl(
+                engine,
+                "usr_1",
+                conversation_id="cnv_realm_env",
+                platform_id="mcp",
+                realm_id="realm_env",
+            )
+        )
+        search_with_env = json.loads(
+            await _search_memories_impl(
+                engine,
+                "usr_1",
+                "environmentrealmtoken",
+                conversation_id="cnv_realm_env",
+                platform_id="mcp",
+                realm_id="realm_env",
+            )
+        )
+
+        runtime = engine.runtime
+        if runtime is None:
+            raise AssertionError("Engine runtime should remain initialized")
+        connection = await runtime.open_connection()
+        try:
+            conversation = await ConversationRepository(connection, runtime.clock).get_conversation(
+                "cnv_realm_env",
+                "usr_1",
+            )
+            assert conversation is not None
+            assert conversation["active_realm_id"] == "realm_env"
+        finally:
+            await connection.close()
+
+        assert {memory["id"] for memory in before_env} == set()
+        assert {memory["id"] for memory in with_env} == {"mem_realm_env"}
+        assert {memory["id"] for memory in search_with_env} == {"mem_realm_env"}
     finally:
         await engine.close()
 
@@ -382,6 +718,7 @@ async def test_mcp_add_memory(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             workspace_id=None,
+            active_presence_id="default_assistant",
             operational_profile_token=_normal_operational_profile_token(engine),
         )
         await engine.runtime.storage_backend.set_context_view(
@@ -734,5 +1071,179 @@ async def test_mcp_list_memories(
         assert len(belief_memories) == 1
         assert belief_memories[0]["id"] == "mem_belief"
         assert belief_memories[0]["type"] == MemoryObjectType.BELIEF.value
+    finally:
+        await engine.close()
+
+
+@pytest.mark.parametrize(
+    ("space_id", "boundary_mode"),
+    [
+        ("space_vault", SpaceBoundaryMode.PRIVACY_VAULT),
+        ("space_severed", SpaceBoundaryMode.SEVERANCE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mcp_memory_tools_enforce_space_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    space_id: str,
+    boundary_mode: SpaceBoundaryMode,
+) -> None:
+    provider = MCPProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-mcp.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        runtime = engine.runtime
+        if runtime is None:
+            raise AssertionError("Engine runtime should be initialized")
+        connection = await runtime.open_connection()
+        try:
+            await SpaceRepository(connection, runtime.clock).resolve_space(
+                owner_user_id="usr_1",
+                space_id=space_id,
+                boundary_mode=boundary_mode,
+                display_name=space_id,
+                source_kind="explicit",
+                source_id=space_id,
+            )
+        finally:
+            await connection.close()
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_outside",
+            assistant_mode_id="coding_debug",
+            platform_id="web",
+        )
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_inside",
+            assistant_mode_id="coding_debug",
+            platform_id="web",
+            space_id=space_id,
+        )
+        for operation in ("list", "edit", "delete"):
+            await _seed_memory(
+                engine,
+                memory_id=f"mem_{space_id}_{operation}",
+                text=f"{operation} mcp boundary token inside {space_id}",
+                scope=MemoryScope.GLOBAL_USER,
+                conversation_id=None,
+                platform_id="web",
+                space_id=space_id,
+                space_boundary_mode=boundary_mode,
+            )
+
+        outside_list = json.loads(
+            await _list_memories_impl(
+                engine,
+                "usr_1",
+                conversation_id="cnv_outside",
+                platform_id="web",
+            )
+        )
+        outside_search = json.loads(
+            await _search_memories_impl(
+                engine,
+                "usr_1",
+                "boundary",
+                conversation_id="cnv_outside",
+                platform_id="web",
+            )
+        )
+        outside_ids = {memory["id"] for memory in outside_list}
+        outside_search_ids = {memory["id"] for memory in outside_search}
+        assert f"mem_{space_id}_list" not in outside_ids
+        assert f"mem_{space_id}_list" not in outside_search_ids
+
+        with pytest.raises(MemoryNotFoundError):
+            await _edit_memory_impl(
+                engine,
+                "usr_1",
+                f"mem_{space_id}_edit",
+                "Outside MCP edit must not land.",
+                conversation_id="cnv_outside",
+                platform_id="web",
+            )
+        with pytest.raises(MemoryNotFoundError):
+            await _delete_memory_impl(
+                engine,
+                "usr_1",
+                f"mem_{space_id}_delete",
+                conversation_id="cnv_outside",
+                platform_id="web",
+            )
+
+        connection = await runtime.open_connection()
+        try:
+            memories = MemoryObjectRepository(connection, runtime.clock)
+            edit_memory = await memories.get_memory_object(f"mem_{space_id}_edit", "usr_1")
+            delete_memory = await memories.get_memory_object(f"mem_{space_id}_delete", "usr_1")
+            assert edit_memory is not None
+            assert delete_memory is not None
+            assert edit_memory["canonical_text"] == f"edit mcp boundary token inside {space_id}"
+            assert delete_memory["status"] == MemoryStatus.ACTIVE.value
+        finally:
+            await connection.close()
+
+        inside_list = json.loads(
+            await _list_memories_impl(
+                engine,
+                "usr_1",
+                conversation_id="cnv_inside",
+                platform_id="web",
+            )
+        )
+        inside_search = json.loads(
+            await _search_memories_impl(
+                engine,
+                "usr_1",
+                "boundary",
+                conversation_id="cnv_inside",
+                platform_id="web",
+            )
+        )
+        inside_ids = {memory["id"] for memory in inside_list}
+        inside_search_ids = {memory["id"] for memory in inside_search}
+        assert f"mem_{space_id}_list" in inside_ids
+        assert f"mem_{space_id}_list" in inside_search_ids
+
+        edited_payload = json.loads(
+            await _edit_memory_impl(
+                engine,
+                "usr_1",
+                f"mem_{space_id}_edit",
+                "Inside MCP edit is allowed.",
+                conversation_id="cnv_inside",
+                platform_id="web",
+            )
+        )
+        assert edited_payload == {
+            "id": f"mem_{space_id}_edit",
+            "canonical_text": "Inside MCP edit is allowed.",
+        }
+
+        confirmation = await _delete_memory_impl(
+            engine,
+            "usr_1",
+            f"mem_{space_id}_delete",
+            conversation_id="cnv_inside",
+            platform_id="web",
+        )
+        assert confirmation == f"Archived memory mem_{space_id}_delete."
+        connection = await runtime.open_connection()
+        try:
+            memories = MemoryObjectRepository(connection, runtime.clock)
+            archived_memory = await memories.get_memory_object(f"mem_{space_id}_delete", "usr_1")
+            assert archived_memory is not None
+            assert archived_memory["status"] == MemoryStatus.ARCHIVED.value
+        finally:
+            await connection.close()
     finally:
         await engine.close()

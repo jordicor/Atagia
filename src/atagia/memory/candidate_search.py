@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import math
 import re
 from typing import Any
 
@@ -18,13 +19,31 @@ from atagia.core.repositories import (
     conversation_visibility_clause,
 )
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
+from atagia.memory.embodiment_policy import (
+    candidate_allows_embodiment_boundary,
+    embodiment_visibility_sql_clause,
+)
 from atagia.memory.intimacy_boundary_policy import (
     candidate_allows_intimacy_boundary,
     coalesced_intimacy_sql_clause,
     memory_object_intimacy_sql_clause,
     strongest_intimacy_boundary,
 )
+from atagia.memory.mind_policy import (
+    annotate_overseer_grants_for_rows,
+    candidate_allows_mind_boundary,
+    mind_visibility_sql_clause,
+)
+from atagia.memory.realm_policy import (
+    annotate_realm_bridge_modes_for_rows,
+    candidate_allows_realm_boundary,
+    realm_visibility_sql_clause,
+)
 from atagia.memory.retrieval_planner import build_retrieval_fts_queries
+from atagia.memory.space_policy import (
+    candidate_allows_space_boundary,
+    space_visibility_sql_clause,
+)
 from atagia.models.schemas_memory import (
     MemoryCategory,
     MemoryObjectType,
@@ -32,6 +51,7 @@ from atagia.models.schemas_memory import (
     MemorySourceKind,
     MemoryStatus,
     RetrievalPlan,
+    SpaceBoundaryMode,
     SummaryViewKind,
 )
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
@@ -54,6 +74,30 @@ _CHANNEL_ORDER = (
     "consequence",
     "verbatim_evidence_search",
 )
+_QUERY_TYPE_CHANNEL_MULTIPLIERS: dict[str, dict[str, float]] = {
+    "slot_fill": {
+        "embedding": 0.75,
+        "consequence": 0.85,
+        "verbatim_evidence_search": 1.15,
+    },
+    "temporal": {
+        "embedding": 0.75,
+        "consequence": 0.85,
+        "verbatim_evidence_search": 1.20,
+    },
+    "broad_list": {
+        "verbatim_pin": 0.90,
+        "artifact_chunk": 0.90,
+        "fts": 0.90,
+        "consequence": 0.90,
+        "verbatim_evidence_search": 0.85,
+    },
+}
+_EXACT_RECALL_CHANNEL_MULTIPLIERS: dict[str, float] = {
+    "embedding": 0.65,
+    "consequence": 0.85,
+    "verbatim_evidence_search": 1.25,
+}
 _VERBATIM_EVIDENCE_WINDOW_ID_PREFIX = "vew_"
 # Widest-to-narrowest order used to assign a synthetic scope to a
 # verbatim evidence window. The widest scope compatible with both the
@@ -72,6 +116,12 @@ _TEMPORAL_NON_OVERLAP_PRIORITY = 2
 _STALE_EPHEMERAL_PRIORITY = 1
 _SKIPPED_RAW_VERBATIM_MAX_CHARS = 12000
 _SKIPPED_RAW_VERBATIM_SNIPPET_MAX_CHARS = 2000
+_SENSITIVITY_RANK = {
+    "unknown": 0,
+    "public": 1,
+    "private": 2,
+    "secret": 3,
+}
 
 
 def _canonical_scope_value(scope_value: str) -> str:
@@ -86,6 +136,13 @@ def _canonical_scope_value(scope_value: str) -> str:
 def _assert_safe_alias(alias: str) -> None:
     if not _SAFE_ALIAS_PATTERN.match(alias):
         raise ValueError(f"Unsafe SQL alias: {alias!r}")
+
+
+def _sql_float_literal(value: float) -> str:
+    resolved = float(value)
+    if not math.isfinite(resolved) or resolved <= 0.0:
+        raise ValueError(f"Unsafe BM25 column weight: {value!r}")
+    return format(resolved, ".12g")
 
 
 class CandidateSearch:
@@ -110,6 +167,11 @@ class CandidateSearch:
         self._verbatim_evidence_search_weight = float(
             self._settings.verbatim_evidence_search_rrf_weight
         )
+        self._memory_bm25_sql = (
+            "bm25(memory_objects_fts, "
+            f"{_sql_float_literal(self._settings.memory_fts_canonical_bm25_weight)}, "
+            f"{_sql_float_literal(self._settings.memory_fts_index_bm25_weight)})"
+        )
         self._verbatim_evidence_search_limit = int(self._settings.verbatim_evidence_search_limit)
         self._verbatim_evidence_window_size = int(self._settings.verbatim_evidence_window_size)
         self._verbatim_evidence_window_overlap = int(self._settings.verbatim_evidence_window_overlap)
@@ -130,6 +192,11 @@ class CandidateSearch:
             return []
 
         status_placeholders = ", ".join("?" for _ in plan.status_filter)
+        privacy_filter, privacy_parameters = self._privacy_ceiling_filter_clause(
+            plan,
+            alias="mo",
+        )
+        intimacy_filter = self._memory_intimacy_filter_clause(plan, alias="mo")
         scope_order_case = self._scope_order_case(plan.scope_filter)
         temporal_order_case = self._temporal_order_case(plan, alias="mo")
         retrieval_level_clauses, retrieval_level_parameters = self._retrieval_level_clauses(plan)
@@ -137,13 +204,13 @@ class CandidateSearch:
         query = """
             SELECT
                 mo.*,
-                bm25(memory_objects_fts) AS rank
+                {memory_bm25_sql} AS rank
             FROM memory_objects_fts
             JOIN memory_objects AS mo ON mo._rowid = memory_objects_fts.rowid
             WHERE mo.user_id = ?
               AND {visibility_clauses}
               AND mo.status IN ({status_placeholders})
-              AND mo.privacy_level <= ?
+              AND {privacy_filter}
               AND {intimacy_filter}
               AND ({retrieval_level_clauses})
               AND mo.archived_by_conversation_id IS NULL
@@ -154,14 +221,13 @@ class CandidateSearch:
         """.format(
             visibility_clauses=" AND ".join(visibility_clauses),
             status_placeholders=status_placeholders,
+            privacy_filter=privacy_filter,
             retrieval_level_clauses=" OR ".join(retrieval_level_clauses),
             temporal_order_case=temporal_order_case,
             scope_order_case=scope_order_case,
-            intimacy_filter=memory_object_intimacy_sql_clause(
-                "mo",
-                allow_intimacy_context=plan.allow_intimacy_context,
-            ),
+            intimacy_filter=intimacy_filter,
             visibility_clause=conversation_visibility_clause("mo"),
+            memory_bm25_sql=self._memory_bm25_sql,
         )
 
         aggregated: dict[str, dict[str, Any]] = {}
@@ -172,7 +238,7 @@ class CandidateSearch:
                     user_id,
                     *visibility_parameters,
                     *(status.value for status in plan.status_filter),
-                    plan.privacy_ceiling,
+                    *privacy_parameters,
                     *retrieval_level_parameters,
                     plan.conversation_id,
                     fts_query,
@@ -181,17 +247,24 @@ class CandidateSearch:
                 )
                 cursor = await self._connection.execute(query, parameters)
                 rows = await cursor.fetchall()
+                decoded_rows = [
+                    decoded
+                    for decoded in (_decode_json_columns(row) for row in rows)
+                    if decoded is not None
+                ]
+                await self._annotate_overseer_grants(decoded_rows, plan)
+                await self._annotate_realm_bridge_modes(decoded_rows, plan)
                 fts_candidates = self._assign_position_ranks(
                     [
                         self._annotate_fts_candidate(decoded)
-                        for decoded in (_decode_json_columns(row) for row in rows)
-                        if decoded is not None
+                        for decoded in decoded_rows
                     ]
                 )
                 self._merge_channel_candidates(
                     sub_query_aggregated,
                     fts_candidates,
                     channel="fts",
+                    plan=plan,
                 )
             verbatim_pin_candidates = await self._search_verbatim_pins(
                 plan=plan,
@@ -202,6 +275,7 @@ class CandidateSearch:
                 sub_query_aggregated,
                 verbatim_pin_candidates,
                 channel="verbatim_pin",
+                plan=plan,
             )
             artifact_chunk_candidates = await self._search_artifact_chunks(
                 plan=plan,
@@ -214,6 +288,7 @@ class CandidateSearch:
                 sub_query_aggregated,
                 artifact_chunk_candidates,
                 channel="artifact_chunk",
+                plan=plan,
             )
             if self._needs_consequence_chain_search(plan):
                 consequence_candidates = await self._search_consequence_chains(
@@ -225,6 +300,7 @@ class CandidateSearch:
                     sub_query_aggregated,
                     consequence_candidates,
                     channel="consequence",
+                    plan=plan,
                 )
             embedding_candidates = await self.search_by_embedding(
                 query_text=sub_query.text,
@@ -236,6 +312,7 @@ class CandidateSearch:
                 sub_query_aggregated,
                 embedding_candidates,
                 channel="embedding",
+                plan=plan,
             )
             # FTS-backed evidence lane. Each sub-query contributes
             # conversation windows from the messages table alongside
@@ -251,6 +328,7 @@ class CandidateSearch:
                 sub_query_aggregated,
                 verbatim_evidence_search_candidates,
                 channel="verbatim_evidence_search",
+                plan=plan,
             )
             linked_artifact_chunk_candidates = await self._search_artifact_chunks(
                 plan=plan,
@@ -263,6 +341,7 @@ class CandidateSearch:
                 sub_query_aggregated,
                 linked_artifact_chunk_candidates,
                 channel="artifact_chunk",
+                plan=plan,
             )
             # Collapse evidence windows that overlap memory-object
             # candidates already retrieved for this sub-query. Memories
@@ -394,12 +473,13 @@ class CandidateSearch:
         plan: RetrievalPlan,
         embedding_index: EmbeddingIndex,
     ) -> list[dict[str, Any]]:
-        if embedding_index.vector_limit == 0 or plan.vector_limit == 0:
+        vector_limit = self._effective_embedding_limit(plan, embedding_index)
+        if vector_limit == 0:
             return []
         matches = await embedding_index.search(
             query_text,
             user_id,
-            self._embedding_channel_limit(plan) * _CHANNEL_OVERFETCH_MULTIPLIER,
+            self._embedding_search_limit(vector_limit),
         )
         if not matches:
             return []
@@ -411,7 +491,11 @@ class CandidateSearch:
                 user_id,
                 conversation_id=plan.conversation_id,
             )
-            if row is None or not self._matches_plan_filters(row, plan):
+            if row is None:
+                continue
+            await self._annotate_overseer_grants([row], plan)
+            await self._annotate_realm_bridge_modes([row], plan)
+            if not self._matches_plan_filters(row, plan):
                 continue
             row["similarity_score"] = match.score
             row["embedding_similarity_score"] = match.score
@@ -422,8 +506,8 @@ class CandidateSearch:
             candidates.append(row)
         candidates = self._sort_embedding_candidates(candidates, plan)
         if candidates and all(candidate.get("position_rank") is not None for candidate in candidates):
-            return candidates[: plan.vector_limit]
-        return self._sort_embedding_candidates(self._assign_position_ranks(candidates), plan)[: plan.vector_limit]
+            return candidates[:vector_limit]
+        return self._sort_embedding_candidates(self._assign_position_ranks(candidates), plan)[:vector_limit]
 
     async def _search_verbatim_pins(
         self,
@@ -450,13 +534,13 @@ class CandidateSearch:
             rows = await self._verbatim_pin_repository.search_active_verbatim_pins(
                 user_id=user_id,
                 query=fts_query,
-                privacy_ceiling=plan.privacy_ceiling,
+                privacy_ceiling=self._effective_privacy_ceiling(plan),
                 scope_filter=plan.scope_filter,
                 assistant_mode_id=plan.assistant_mode_id,
                 workspace_id=plan.workspace_id,
                 conversation_id=plan.conversation_id,
                 limit=self._fts_channel_limit(plan),
-                allow_intimacy_context=plan.allow_intimacy_context,
+                allow_intimacy_context=self._effective_allow_intimacy_context(plan),
                 as_of=self._clock.now().isoformat(),
                 user_persona_id=plan.user_persona_id,
                 platform_id=plan.platform_id,
@@ -464,12 +548,23 @@ class CandidateSearch:
                 incognito=plan.incognito,
                 remember_across_chats=plan.remember_across_chats,
                 remember_across_devices=plan.remember_across_devices,
+                allow_private_sensitivity=self._effective_allow_private_sensitivity(plan),
+                active_space_id=plan.active_space_id,
+                active_space_boundary_mode=plan.active_space_boundary_mode,
+                active_mind_id=plan.active_mind_id,
+                mind_topology=plan.mind_topology,
+                active_embodiment_id=plan.active_embodiment_id,
+                active_realm_id=plan.active_realm_id,
             )
+            await self._annotate_overseer_grants(rows, plan)
+            await self._annotate_realm_bridge_modes(rows, plan)
             for row in rows:
                 pin_candidate = self._build_verbatim_pin_candidate(
                     row,
                     sub_query_text=sub_query.text,
                 )
+                if not self._matches_plan_filters(pin_candidate, plan):
+                    continue
                 memory_id = str(pin_candidate["id"])
                 existing = aggregated.get(memory_id)
                 if existing is None or float(pin_candidate.get("rank", 0.0)) < float(
@@ -504,10 +599,10 @@ class CandidateSearch:
             return []
 
         aggregated: dict[str, dict[str, Any]] = {}
-        for row in await self._artifact_repository.list_artifact_chunks_for_messages(
+        linked_rows = await self._artifact_repository.list_artifact_chunks_for_messages(
             user_id=user_id,
             message_ids=self._source_message_ids_from_candidates(linked_candidates),
-            privacy_ceiling=plan.privacy_ceiling,
+            privacy_ceiling=self._effective_privacy_ceiling(plan),
             # Artifact rows do not yet carry the full namespace metadata, so
             # Phase 7 only exposes chunks attached to the active chat.
             scope_filter=[MemoryScope.CONVERSATION],
@@ -515,21 +610,39 @@ class CandidateSearch:
             workspace_id=plan.workspace_id,
             conversation_id=plan.conversation_id,
             limit=self._fts_channel_limit(plan),
-            allow_intimacy_context=plan.allow_intimacy_context,
+            allow_intimacy_context=self._effective_allow_intimacy_context(plan),
             user_persona_id=plan.user_persona_id,
             platform_id=plan.platform_id,
             character_id=plan.character_id,
             incognito=plan.incognito,
             remember_across_chats=plan.remember_across_chats,
             remember_across_devices=plan.remember_across_devices,
-        ):
-            artifact_candidate = self._build_artifact_chunk_candidate(
-                row,
-                plan=plan,
-                sub_query_text=sub_query.text,
-            )
-            artifact_candidate["artifact_linked_source_message"] = True
-            if artifact_candidate.get("scope") is None:
+            allow_private_sensitivity=self._effective_allow_private_sensitivity(plan),
+            active_space_id=plan.active_space_id,
+            active_space_boundary_mode=plan.active_space_boundary_mode,
+            active_mind_id=plan.active_mind_id,
+            mind_topology=plan.mind_topology,
+            active_embodiment_id=plan.active_embodiment_id,
+            active_realm_id=plan.active_realm_id,
+        )
+        linked_artifact_candidates = [
+            {
+                **self._build_artifact_chunk_candidate(
+                    row,
+                    plan=plan,
+                    sub_query_text=sub_query.text,
+                ),
+                "artifact_linked_source_message": True,
+            }
+            for row in linked_rows
+        ]
+        await self._annotate_overseer_grants(linked_artifact_candidates, plan)
+        await self._annotate_realm_bridge_modes(linked_artifact_candidates, plan)
+        for artifact_candidate in linked_artifact_candidates:
+            if artifact_candidate.get("scope") is None or not self._matches_plan_filters(
+                artifact_candidate,
+                plan,
+            ):
                 continue
             aggregated[str(artifact_candidate["id"])] = artifact_candidate
 
@@ -539,27 +652,42 @@ class CandidateSearch:
             rows = await self._artifact_repository.search_artifact_chunks(
                 user_id=user_id,
                 query=fts_query,
-                privacy_ceiling=plan.privacy_ceiling,
+                privacy_ceiling=self._effective_privacy_ceiling(plan),
                 scope_filter=[MemoryScope.CONVERSATION],
                 assistant_mode_id=plan.assistant_mode_id,
                 workspace_id=plan.workspace_id,
                 conversation_id=plan.conversation_id,
                 limit=self._fts_channel_limit(plan),
-                allow_intimacy_context=plan.allow_intimacy_context,
+                allow_intimacy_context=self._effective_allow_intimacy_context(plan),
                 user_persona_id=plan.user_persona_id,
                 platform_id=plan.platform_id,
                 character_id=plan.character_id,
                 incognito=plan.incognito,
                 remember_across_chats=plan.remember_across_chats,
                 remember_across_devices=plan.remember_across_devices,
+                allow_private_sensitivity=self._effective_allow_private_sensitivity(plan),
+                active_space_id=plan.active_space_id,
+                active_space_boundary_mode=plan.active_space_boundary_mode,
+                active_mind_id=plan.active_mind_id,
+                mind_topology=plan.mind_topology,
+                active_embodiment_id=plan.active_embodiment_id,
+                active_realm_id=plan.active_realm_id,
             )
-            for row in rows:
-                artifact_candidate = self._build_artifact_chunk_candidate(
+            artifact_candidates = [
+                self._build_artifact_chunk_candidate(
                     row,
                     plan=plan,
                     sub_query_text=sub_query.text,
                 )
-                if artifact_candidate.get("scope") is None:
+                for row in rows
+            ]
+            await self._annotate_overseer_grants(artifact_candidates, plan)
+            await self._annotate_realm_bridge_modes(artifact_candidates, plan)
+            for artifact_candidate in artifact_candidates:
+                if artifact_candidate.get("scope") is None or not self._matches_plan_filters(
+                    artifact_candidate,
+                    plan,
+                ):
                     continue
                 memory_id = str(artifact_candidate["id"])
                 existing = aggregated.get(memory_id)
@@ -697,6 +825,10 @@ class CandidateSearch:
         chain_visibility_clauses, chain_visibility_parameters = self._memory_visibility_clauses(
             plan,
             alias="cc",
+            include_space=False,
+            include_mind=False,
+            include_embodiment=False,
+            include_realm=False,
         )
         if not chain_visibility_clauses:
             return []
@@ -710,6 +842,26 @@ class CandidateSearch:
             chain_relevance_parameters.append(plan.character_id)
         status_placeholders = ", ".join("?" for _ in plan.status_filter)
         status_values = tuple(status.value for status in plan.status_filter)
+        action_privacy_filter, action_privacy_parameters = self._privacy_ceiling_filter_clause(
+            plan,
+            alias="action",
+        )
+        outcome_privacy_filter, outcome_privacy_parameters = self._privacy_ceiling_filter_clause(
+            plan,
+            alias="outcome",
+        )
+        tendency_privacy_filter, tendency_privacy_parameters = self._privacy_ceiling_filter_clause(
+            plan,
+            alias="tendency",
+        )
+        candidate_intimacy_filter = self._coalesced_intimacy_filter_clause(
+            plan,
+            primary_alias="tendency",
+            fallback_alias="outcome",
+        )
+        action_intimacy_filter = self._memory_intimacy_filter_clause(plan, alias="action")
+        outcome_intimacy_filter = self._memory_intimacy_filter_clause(plan, alias="outcome")
+        tendency_intimacy_filter = self._memory_intimacy_filter_clause(plan, alias="tendency")
         scope_order_case = self._coalesced_scope_order_case(
             plan.scope_filter,
             primary_alias="tendency",
@@ -731,6 +883,12 @@ class CandidateSearch:
                 COALESCE(tendency.user_persona_id, outcome.user_persona_id) AS user_persona_id,
                 COALESCE(tendency.platform_id, outcome.platform_id) AS platform_id,
                 COALESCE(tendency.character_id, outcome.character_id) AS character_id,
+                COALESCE(tendency.space_id, outcome.space_id) AS space_id,
+                COALESCE(tendency.space_boundary_mode, outcome.space_boundary_mode) AS space_boundary_mode,
+                COALESCE(tendency.memory_owner_id, outcome.memory_owner_id) AS memory_owner_id,
+                COALESCE(tendency.source_mind_id, outcome.source_mind_id) AS source_mind_id,
+                COALESCE(tendency.embodiment_id, outcome.embodiment_id) AS embodiment_id,
+                COALESCE(tendency.realm_id, outcome.realm_id) AS realm_id,
                 COALESCE(tendency.object_type, outcome.object_type) AS object_type,
                 COALESCE(tendency.scope, outcome.scope) AS scope,
                 COALESCE(tendency.scope_canonical, outcome.scope_canonical) AS scope_canonical,
@@ -757,7 +915,7 @@ class CandidateSearch:
                 action.canonical_text AS action_canonical_text,
                 outcome.canonical_text AS outcome_canonical_text,
                 tendency.canonical_text AS tendency_canonical_text,
-                bm25(memory_objects_fts) AS rank
+                {memory_bm25_sql} AS rank
             FROM memory_objects_fts
             JOIN memory_objects AS matched ON matched._rowid = memory_objects_fts.rowid
             JOIN consequence_chains AS cc ON matched.id = cc.{match_column}
@@ -770,14 +928,14 @@ class CandidateSearch:
               AND matched.user_id = ?
               AND action.user_id = ?
               AND action.status IN ({status_placeholders})
-              AND action.privacy_level <= ?
+              AND {action_privacy_filter}
               AND action.archived_by_conversation_id IS NULL
               AND {action_visibility_clause}
               AND {action_visibility_clauses}
               AND {action_intimacy_filter}
               AND outcome.user_id = ?
               AND outcome.status IN ({status_placeholders})
-              AND outcome.privacy_level <= ?
+              AND {outcome_privacy_filter}
               AND outcome.archived_by_conversation_id IS NULL
               AND {outcome_visibility_clause}
               AND {outcome_visibility_clauses}
@@ -787,7 +945,7 @@ class CandidateSearch:
                   OR (
                       tendency.user_id = ?
                       AND tendency.status IN ({status_placeholders})
-                      AND tendency.privacy_level <= ?
+                      AND {tendency_privacy_filter}
                       AND tendency.archived_by_conversation_id IS NULL
                       AND {tendency_visibility_clause}
                       AND {tendency_visibility_clauses}
@@ -809,32 +967,23 @@ class CandidateSearch:
             status_placeholders=status_placeholders,
             action_visibility_clause=conversation_visibility_clause("action"),
             action_visibility_clauses=" AND ".join(action_visibility_clauses),
+            action_privacy_filter=action_privacy_filter,
             outcome_visibility_clause=conversation_visibility_clause("outcome"),
             outcome_visibility_clauses=" AND ".join(outcome_visibility_clauses),
+            outcome_privacy_filter=outcome_privacy_filter,
             tendency_visibility_clause=conversation_visibility_clause("tendency"),
             tendency_visibility_clauses=" AND ".join(tendency_visibility_clauses),
-            candidate_intimacy_filter=coalesced_intimacy_sql_clause(
-                "tendency",
-                "outcome",
-                allow_intimacy_context=plan.allow_intimacy_context,
-            ),
-            action_intimacy_filter=memory_object_intimacy_sql_clause(
-                "action",
-                allow_intimacy_context=plan.allow_intimacy_context,
-            ),
-            outcome_intimacy_filter=memory_object_intimacy_sql_clause(
-                "outcome",
-                allow_intimacy_context=plan.allow_intimacy_context,
-            ),
-            tendency_intimacy_filter=memory_object_intimacy_sql_clause(
-                "tendency",
-                allow_intimacy_context=plan.allow_intimacy_context,
-            ),
+            tendency_privacy_filter=tendency_privacy_filter,
+            candidate_intimacy_filter=candidate_intimacy_filter,
+            action_intimacy_filter=action_intimacy_filter,
+            outcome_intimacy_filter=outcome_intimacy_filter,
+            tendency_intimacy_filter=tendency_intimacy_filter,
             candidate_scope_clauses=" OR ".join(candidate_scope_clauses),
             chain_visibility_clauses=" AND ".join(chain_visibility_clauses),
             chain_relevance_clauses=" OR ".join(chain_relevance_clauses),
             temporal_order_case=temporal_order_case,
             scope_order_case=scope_order_case,
+            memory_bm25_sql=self._memory_bm25_sql,
         )
         parameters = (
             user_id,
@@ -842,17 +991,17 @@ class CandidateSearch:
             user_id,
             user_id,
             *status_values,
-            plan.privacy_ceiling,
+            *action_privacy_parameters,
             plan.conversation_id,
             *action_visibility_parameters,
             user_id,
             *status_values,
-            plan.privacy_ceiling,
+            *outcome_privacy_parameters,
             plan.conversation_id,
             *outcome_visibility_parameters,
             user_id,
             *status_values,
-            plan.privacy_ceiling,
+            *tendency_privacy_parameters,
             plan.conversation_id,
             *tendency_visibility_parameters,
             *candidate_scope_parameters,
@@ -863,10 +1012,17 @@ class CandidateSearch:
         )
         cursor = await self._connection.execute(query, parameters)
         rows = await cursor.fetchall()
-        return [
+        decoded_rows = [
             decoded
             for decoded in (_decode_json_columns(row) for row in rows)
-            if decoded is not None and self._matches_plan_filters(decoded, plan)
+            if decoded is not None
+        ]
+        await self._annotate_overseer_grants(decoded_rows, plan)
+        await self._annotate_realm_bridge_modes(decoded_rows, plan)
+        return [
+            decoded
+            for decoded in decoded_rows
+            if self._matches_plan_filters(decoded, plan)
         ]
 
     @staticmethod
@@ -879,6 +1035,31 @@ class CandidateSearch:
         if not isinstance(payload, dict):
             payload = {}
         rank = float(pin_row.get("rank") or 0.0)
+        candidate_payload = {
+            **payload,
+            "verbatim_pin_id": str(pin_row["id"]),
+            "verbatim_pin_target_kind": str(pin_row["target_kind"]),
+            "verbatim_pin_target_id": str(pin_row["target_id"]),
+            "intimacy_boundary": str(pin_row.get("intimacy_boundary") or "ordinary"),
+            "intimacy_boundary_confidence": float(pin_row.get("intimacy_boundary_confidence") or 0.0),
+        }
+        if pin_row.get("space_id") is not None:
+            candidate_payload["space_boundary"] = {
+                "active_space_id": pin_row.get("space_id"),
+                "boundary_mode": pin_row.get("space_boundary_mode"),
+            }
+        if pin_row.get("embodiment_id") is not None:
+            candidate_payload["embodiment"] = {
+                "active_embodiment_id": pin_row.get("embodiment_id"),
+            }
+        if pin_row.get("realm_id") is not None:
+            candidate_payload["realm"] = {
+                "active_realm_id": pin_row.get("realm_id"),
+            }
+            if pin_row.get("realm_bridge_mode") not in {None, "same"}:
+                candidate_payload["realm"]["cross_realm_mode"] = pin_row.get(
+                    "realm_bridge_mode"
+                )
         candidate = {
             "_rowid": pin_row.get("_rowid"),
             "id": str(pin_row["id"]),
@@ -905,20 +1086,21 @@ class CandidateSearch:
             "themes_json": pin_row.get("themes_json") or [],
             "platform_locked": int(pin_row.get("platform_locked") or 0),
             "platform_id_lock": pin_row.get("platform_id_lock"),
+            "space_id": pin_row.get("space_id"),
+            "space_boundary_mode": pin_row.get("space_boundary_mode"),
+            "memory_owner_id": pin_row.get("memory_owner_id"),
+            "source_mind_id": pin_row.get("source_mind_id"),
+            "embodiment_id": pin_row.get("embodiment_id"),
+            "realm_id": pin_row.get("realm_id"),
+            "realm_bridge_mode": pin_row.get("realm_bridge_mode"),
+            "realm_relation": pin_row.get("realm_relation"),
             "reason": pin_row.get("reason"),
             "created_by": str(pin_row["created_by"]),
             "created_at": str(pin_row["created_at"]),
             "updated_at": str(pin_row["updated_at"]),
             "expires_at": pin_row.get("expires_at"),
             "deleted_at": pin_row.get("deleted_at"),
-            "payload_json": {
-                **payload,
-                "verbatim_pin_id": str(pin_row["id"]),
-                "verbatim_pin_target_kind": str(pin_row["target_kind"]),
-                "verbatim_pin_target_id": str(pin_row["target_id"]),
-                "intimacy_boundary": str(pin_row.get("intimacy_boundary") or "ordinary"),
-                "intimacy_boundary_confidence": float(pin_row.get("intimacy_boundary_confidence") or 0.0),
-            },
+            "payload_json": candidate_payload,
             "source_kind": MemorySourceKind.VERBATIM.value,
             "object_type": MemoryObjectType.EVIDENCE.value,
             "confidence": 1.0,
@@ -944,19 +1126,62 @@ class CandidateSearch:
         plan: RetrievalPlan,
         *,
         alias: str = "mo",
+        include_space: bool = True,
+        include_mind: bool = True,
+        include_embodiment: bool = True,
+        include_realm: bool = True,
     ) -> tuple[list[str], list[Any]]:
-        return MemoryObjectRepository.namespace_visibility_clauses(
-            plan.scope_filter,
+        scope_clauses, scope_parameters = MemoryObjectRepository.namespace_scope_clauses(
+            MemoryObjectRepository.canonical_retrieval_scopes(plan.scope_filter),
             user_persona_id=plan.user_persona_id,
-            platform_id=plan.platform_id,
             character_id=plan.character_id if plan.character_id is not None else plan.workspace_id,
             conversation_id=plan.conversation_id,
             remember_across_chats=plan.remember_across_chats,
-            remember_across_devices=plan.remember_across_devices,
             incognito=plan.incognito,
-            sensitivity_gates_enabled=False,
+            table_alias=alias,
+            allow_cross_conversation_chat=CandidateSearch._privacy_sql_filters_disabled(plan),
+        )
+        if not scope_clauses:
+            return [], []
+        platform_clause, platform_parameters = MemoryObjectRepository.platform_lock_clause(
+            platform_id=str(plan.platform_id or "default"),
+            remember_across_devices=plan.remember_across_devices,
             table_alias=alias,
         )
+        clauses = [
+            "(" + " OR ".join(scope_clauses) + ")",
+        ]
+        parameters = [*scope_parameters]
+        if include_space:
+            space_clause, space_parameters = space_visibility_sql_clause(plan, alias=alias)
+            clauses.append(space_clause)
+            parameters.extend(space_parameters)
+        if include_mind:
+            mind_clause, mind_parameters = mind_visibility_sql_clause(plan, alias=alias)
+            clauses.append(mind_clause)
+            parameters.extend(mind_parameters)
+        if include_embodiment:
+            embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause(
+                plan,
+                alias=alias,
+            )
+            clauses.append(embodiment_clause)
+            parameters.extend(embodiment_parameters)
+        if include_realm:
+            realm_clause, realm_parameters = realm_visibility_sql_clause(
+                plan,
+                alias=alias,
+            )
+            clauses.append(realm_clause)
+            parameters.extend(realm_parameters)
+        clauses.extend(
+            [
+                CandidateSearch._plan_sensitivity_filter_clause(plan, alias),
+                platform_clause,
+            ]
+        )
+        parameters.extend(platform_parameters)
+        return clauses, parameters
 
     @staticmethod
     def _consequence_source_visibility_clauses(
@@ -972,6 +1197,7 @@ class CandidateSearch:
             remember_across_chats=plan.remember_across_chats,
             incognito=plan.incognito,
             table_alias=alias,
+            allow_cross_conversation_chat=CandidateSearch._privacy_sql_filters_disabled(plan),
         )
         source_scope_clause = (
             f"({alias}.scope_canonical = 'chat' "
@@ -983,16 +1209,102 @@ class CandidateSearch:
             remember_across_devices=plan.remember_across_devices,
             table_alias=alias,
         )
+        space_clause, space_parameters = space_visibility_sql_clause(plan, alias=alias)
+        mind_clause, mind_parameters = mind_visibility_sql_clause(plan, alias=alias)
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause(plan, alias=alias)
+        realm_clause, realm_parameters = realm_visibility_sql_clause(plan, alias=alias)
         return (
             [
                 "(" + " OR ".join([*scope_clauses, source_scope_clause]) + ")",
-                MemoryObjectRepository.sensitivity_filter_clause(
-                    gates_enabled=False,
-                    table_alias=alias,
-                ),
+                space_clause,
+                mind_clause,
+                embodiment_clause,
+                realm_clause,
+                CandidateSearch._plan_sensitivity_filter_clause(plan, alias),
                 platform_clause,
             ],
-            [*scope_parameters, *platform_parameters],
+            [
+                *scope_parameters,
+                *space_parameters,
+                *mind_parameters,
+                *embodiment_parameters,
+                *realm_parameters,
+                *platform_parameters,
+            ],
+        )
+
+    @staticmethod
+    def _plan_sensitivity_filter_clause(plan: RetrievalPlan, alias: str) -> str:
+        _assert_safe_alias(alias)
+        if CandidateSearch._privacy_sql_filters_disabled(plan):
+            return "1 = 1"
+        prefix = f"{alias}." if alias else ""
+        if plan.allow_private_sensitivity:
+            return f"({prefix}sensitivity IN ('public', 'private'))"
+        return MemoryObjectRepository.sensitivity_filter_clause(
+            gates_enabled=False,
+            table_alias=alias,
+        )
+
+    @staticmethod
+    def _privacy_sql_filters_disabled(plan: RetrievalPlan) -> bool:
+        return plan.privacy_enforcement == "off"
+
+    @staticmethod
+    def _privacy_ceiling_filter_clause(
+        plan: RetrievalPlan,
+        *,
+        alias: str,
+    ) -> tuple[str, list[Any]]:
+        _assert_safe_alias(alias)
+        if CandidateSearch._privacy_sql_filters_disabled(plan):
+            return "1 = 1", []
+        prefix = f"{alias}." if alias else ""
+        return f"{prefix}privacy_level <= ?", [plan.privacy_ceiling]
+
+    @staticmethod
+    def _effective_privacy_ceiling(plan: RetrievalPlan) -> int:
+        if CandidateSearch._privacy_sql_filters_disabled(plan):
+            return 3
+        return plan.privacy_ceiling
+
+    @staticmethod
+    def _effective_allow_intimacy_context(plan: RetrievalPlan) -> bool:
+        if CandidateSearch._privacy_sql_filters_disabled(plan):
+            return True
+        return plan.allow_intimacy_context
+
+    @staticmethod
+    def _effective_allow_private_sensitivity(plan: RetrievalPlan) -> bool:
+        if CandidateSearch._privacy_sql_filters_disabled(plan):
+            return False
+        return plan.allow_private_sensitivity
+
+    @staticmethod
+    def _memory_intimacy_filter_clause(plan: RetrievalPlan, *, alias: str) -> str:
+        _assert_safe_alias(alias)
+        if CandidateSearch._privacy_sql_filters_disabled(plan):
+            return "1 = 1"
+        return memory_object_intimacy_sql_clause(
+            alias,
+            allow_intimacy_context=plan.allow_intimacy_context,
+        )
+
+    @staticmethod
+    def _coalesced_intimacy_filter_clause(
+        plan: RetrievalPlan,
+        *,
+        primary_alias: str,
+        fallback_alias: str,
+    ) -> str:
+        _assert_safe_alias(primary_alias)
+        _assert_safe_alias(fallback_alias)
+        if CandidateSearch._privacy_sql_filters_disabled(plan):
+            return "1 = 1"
+        return coalesced_intimacy_sql_clause(
+            primary_alias,
+            fallback_alias,
+            allow_intimacy_context=plan.allow_intimacy_context,
         )
 
     @staticmethod
@@ -1240,10 +1552,11 @@ class CandidateSearch:
             rows = await self._message_repository.search_messages_with_privacy(
                 user_id=user_id,
                 query=fts_query,
-                privacy_ceiling=plan.privacy_ceiling,
+                privacy_ceiling=self._effective_privacy_ceiling(plan),
                 limit=self._verbatim_evidence_search_limit,
                 allow_conversation_id=plan.conversation_id,
-                active_conversation_only=True,
+                active_conversation_only=not self._privacy_sql_filters_disabled(plan),
+                include_pending_confirmation_sources=self._privacy_sql_filters_disabled(plan),
             )
             for row in rows:
                 window_candidate = await self._build_verbatim_evidence_search_window_candidate(
@@ -1319,10 +1632,11 @@ class CandidateSearch:
             self._message_with_seed_snippet(message, seed_row=seed_row, seed_seq=seed_seq)
             for message in window_messages
         ]
-        window_messages = await self._gate_pending_confirmation_window_messages(
-            user_id=user_id,
-            messages=window_messages,
-        )
+        if not self._privacy_sql_filters_disabled(plan):
+            window_messages = await self._gate_pending_confirmation_window_messages(
+                user_id=user_id,
+                messages=window_messages,
+            )
         conversation_mode_id = str(seed_row.get("conversation_assistant_mode_id") or "")
         # Scope mapping guards cross-conversation leakage for the
         # downstream scope filter. Mode is retrieval-profile tuning, not
@@ -1388,6 +1702,49 @@ class CandidateSearch:
             "source_message_window_start_occurred_at": source_window_start,
             "source_message_window_end_occurred_at": source_window_end,
         }
+        space_id, space_boundary_mode = self._source_space_fields(
+            plan,
+            [seed_row, *window_messages],
+            space_id_key="space_id",
+            boundary_mode_key="message_space_boundary_mode",
+        )
+        if space_id is not None:
+            payload["space_boundary"] = {
+                "active_space_id": space_id,
+                "boundary_mode": space_boundary_mode,
+            }
+        memory_owner_id, source_mind_id = self._source_mind_fields(
+            plan,
+            [seed_row, *window_messages],
+        )
+        if memory_owner_id is not None:
+            payload["mind_perspective"] = {
+                "memory_owner_id": memory_owner_id,
+                "source_mind_id": source_mind_id,
+                "mind_topology": (
+                    plan.mind_topology.value
+                    if hasattr(plan.mind_topology, "value")
+                    else str(plan.mind_topology)
+                ),
+            }
+        embodiment_id = self._source_embodiment_id(
+            plan,
+            [seed_row, *window_messages],
+            keys=("active_embodiment_id", "embodiment_id"),
+        )
+        if embodiment_id is not None:
+            payload["embodiment"] = {
+                "active_embodiment_id": embodiment_id,
+            }
+        realm_id = self._source_realm_id(
+            plan,
+            [seed_row, *window_messages],
+            keys=("active_realm_id", "realm_id"),
+        )
+        if realm_id is not None:
+            payload["realm"] = {
+                "active_realm_id": realm_id,
+            }
         fts_rank = float(seed_row.get("rank") or 0.0)
         # Phase 7 only permits raw/verbatim evidence from the active chat.
         # The window is user-visible transcript evidence rather than a
@@ -1405,6 +1762,12 @@ class CandidateSearch:
             "user_persona_id": plan.user_persona_id,
             "platform_id": plan.platform_id,
             "character_id": plan.character_id if plan.character_id is not None else plan.workspace_id,
+            "space_id": space_id,
+            "space_boundary_mode": space_boundary_mode,
+            "memory_owner_id": memory_owner_id,
+            "source_mind_id": source_mind_id,
+            "embodiment_id": embodiment_id,
+            "realm_id": realm_id,
             "object_type": MemoryObjectType.EVIDENCE.value,
             "scope": resolved_scope.value,
             "scope_canonical": MemoryScope.CHAT.value,
@@ -1649,7 +2012,61 @@ class CandidateSearch:
             default=0.0,
         )
         privacy_level = int(row.get("privacy_level", 0))
-        sensitivity = "public" if privacy_level <= 1 and intimacy_boundary == "ordinary" else "private"
+        derived_sensitivity = "public" if privacy_level <= 1 and intimacy_boundary == "ordinary" else "private"
+        sensitivity = CandidateSearch._strictest_sensitivity(
+            str(row.get("artifact_sensitivity") or "unknown"),
+            derived_sensitivity,
+        )
+        space_id, space_boundary_mode = CandidateSearch._source_space_fields(
+            plan,
+            [row],
+            space_id_key="source_message_space_id",
+            boundary_mode_key="source_message_space_boundary_mode",
+        )
+        space_payload = (
+            {"active_space_id": space_id, "boundary_mode": space_boundary_mode}
+            if space_id is not None
+            else None
+        )
+        memory_owner_id, source_mind_id = CandidateSearch._source_mind_fields(
+            plan,
+            [row],
+            owner_id_keys=("artifact_memory_owner_id", "source_message_active_mind_id", "active_mind_id"),
+            source_id_keys=("artifact_source_mind_id", "source_message_source_mind_id", "source_mind_id"),
+        )
+        mind_payload = (
+            {
+                "memory_owner_id": memory_owner_id,
+                "source_mind_id": source_mind_id,
+                "mind_topology": (
+                    plan.mind_topology.value
+                    if hasattr(plan.mind_topology, "value")
+                    else str(plan.mind_topology)
+                ),
+            }
+            if memory_owner_id is not None
+            else None
+        )
+        embodiment_id = CandidateSearch._source_embodiment_id(
+            plan,
+            [row],
+            keys=("artifact_embodiment_id", "source_message_active_embodiment_id", "active_embodiment_id"),
+        )
+        embodiment_payload = (
+            {"active_embodiment_id": embodiment_id}
+            if embodiment_id is not None
+            else None
+        )
+        realm_id = CandidateSearch._source_realm_id(
+            plan,
+            [row],
+            keys=("artifact_realm_id", "source_message_active_realm_id", "active_realm_id"),
+        )
+        realm_payload = (
+            {"active_realm_id": realm_id}
+            if realm_id is not None
+            else None
+        )
         candidate: dict[str, Any] = {
             "_rowid": None,
             "id": chunk_id,
@@ -1672,6 +2089,12 @@ class CandidateSearch:
             "user_persona_id": plan.user_persona_id,
             "platform_id": plan.platform_id,
             "character_id": plan.character_id if plan.character_id is not None else plan.workspace_id,
+            "space_id": space_id,
+            "space_boundary_mode": space_boundary_mode,
+            "memory_owner_id": memory_owner_id,
+            "source_mind_id": source_mind_id,
+            "embodiment_id": embodiment_id,
+            "realm_id": realm_id,
             "object_type": MemoryObjectType.EVIDENCE.value,
             "scope": CandidateSearch._scope_for_artifact_row(row, plan),
             "scope_canonical": MemoryScope.CHAT.value,
@@ -1697,6 +2120,10 @@ class CandidateSearch:
                 "source_window_end_occurred_at": source_window_end,
                 "intimacy_boundary": intimacy_boundary,
                 "intimacy_boundary_confidence": intimacy_boundary_confidence,
+                **({"space_boundary": space_payload} if space_payload is not None else {}),
+                **({"mind_perspective": mind_payload} if mind_payload is not None else {}),
+                **({"embodiment": embodiment_payload} if embodiment_payload is not None else {}),
+                **({"realm": realm_payload} if realm_payload is not None else {}),
             },
             "source_kind": MemorySourceKind.VERBATIM.value
             if preserve_verbatim
@@ -1735,6 +2162,118 @@ class CandidateSearch:
         candidate["retrieval_source"] = "artifact_chunk"
         candidate["matched_sub_queries"] = [sub_query_text]
         return candidate
+
+    @staticmethod
+    def _source_space_fields(
+        plan: RetrievalPlan,
+        rows: list[dict[str, Any]],
+        *,
+        space_id_key: str,
+        boundary_mode_key: str,
+    ) -> tuple[str | None, str | None]:
+        space_id = next(
+            (
+                str(row.get(space_id_key)).strip()
+                for row in rows
+                if row.get(space_id_key) is not None and str(row.get(space_id_key)).strip()
+            ),
+            None,
+        )
+        if space_id is None:
+            space_id = plan.active_space_id
+        if space_id is None:
+            return None, None
+        boundary_mode = next(
+            (
+                str(row.get(boundary_mode_key)).strip()
+                for row in rows
+                if row.get(boundary_mode_key) is not None
+                and str(row.get(boundary_mode_key)).strip()
+            ),
+            None,
+        )
+        if boundary_mode is None and space_id == plan.active_space_id:
+            boundary_mode = (
+                plan.active_space_boundary_mode.value
+                if isinstance(plan.active_space_boundary_mode, SpaceBoundaryMode)
+                else plan.active_space_boundary_mode
+            )
+        try:
+            resolved_mode = SpaceBoundaryMode(str(boundary_mode or SpaceBoundaryMode.FOCUS.value)).value
+        except ValueError:
+            resolved_mode = SpaceBoundaryMode.FOCUS.value
+        return space_id, resolved_mode
+
+    @staticmethod
+    def _source_mind_fields(
+        plan: RetrievalPlan,
+        rows: list[dict[str, Any]],
+        *,
+        owner_id_keys: tuple[str, ...] = ("active_mind_id", "memory_owner_id"),
+        source_id_keys: tuple[str, ...] = ("source_mind_id", "active_mind_id"),
+    ) -> tuple[str | None, str | None]:
+        owner_id = CandidateSearch._first_text_from_rows(rows, owner_id_keys)
+        source_id = CandidateSearch._first_text_from_rows(rows, source_id_keys)
+        if owner_id is None:
+            owner_id = plan.active_mind_id
+        if source_id is None:
+            source_id = owner_id or plan.active_mind_id
+        return owner_id, source_id
+
+    @staticmethod
+    def _source_embodiment_id(
+        plan: RetrievalPlan,
+        rows: list[dict[str, Any]],
+        *,
+        keys: tuple[str, ...],
+    ) -> str | None:
+        embodiment_id = CandidateSearch._first_text_from_rows(rows, keys)
+        if embodiment_id is None:
+            embodiment_id = plan.active_embodiment_id
+        return embodiment_id
+
+    @staticmethod
+    def _source_realm_id(
+        plan: RetrievalPlan,
+        rows: list[dict[str, Any]],
+        *,
+        keys: tuple[str, ...],
+    ) -> str | None:
+        realm_id = CandidateSearch._first_text_from_rows(rows, keys)
+        if realm_id is None:
+            realm_id = plan.active_realm_id
+        return realm_id
+
+    @staticmethod
+    def _first_text_from_rows(
+        rows: list[dict[str, Any]],
+        keys: tuple[str, ...],
+    ) -> str | None:
+        for row in rows:
+            for key in keys:
+                value = row.get(key)
+                if value is None:
+                    continue
+                normalized = str(value).strip()
+                if normalized:
+                    return normalized
+        return None
+
+    @staticmethod
+    def _optional_text(value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
+
+    @staticmethod
+    def _strictest_sensitivity(*values: str) -> str:
+        resolved = "unknown"
+        for value in values:
+            candidate = str(value or "unknown")
+            if _SENSITIVITY_RANK.get(candidate, -1) > _SENSITIVITY_RANK[resolved]:
+                resolved = candidate
+        return resolved
 
     @staticmethod
     def _message_with_seed_snippet(
@@ -1909,6 +2448,8 @@ class CandidateSearch:
         """
         if channel_scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION, MemoryScope.CHAT}:
             if conversation_id != plan.conversation_id:
+                if CandidateSearch._privacy_sql_filters_disabled(plan):
+                    return MemoryScope.CONVERSATION
                 return None
             if channel_scope is MemoryScope.EPHEMERAL_SESSION:
                 return MemoryScope.EPHEMERAL_SESSION
@@ -1956,18 +2497,58 @@ class CandidateSearch:
         for window_id in to_drop:
             aggregated.pop(window_id, None)
 
+    async def _annotate_realm_bridge_modes(
+        self,
+        rows: list[dict[str, Any]],
+        plan: RetrievalPlan,
+        *,
+        realm_keys: tuple[str, ...] = ("realm_id", "active_realm_id"),
+    ) -> None:
+        await annotate_realm_bridge_modes_for_rows(
+            self._connection,
+            rows,
+            active_realm_id=plan.active_realm_id,
+            realm_keys=realm_keys,
+        )
+
+    async def _annotate_overseer_grants(
+        self,
+        rows: list[dict[str, Any]],
+        plan: RetrievalPlan,
+    ) -> None:
+        await annotate_overseer_grants_for_rows(
+            self._connection,
+            rows,
+            active_mind_id=plan.active_mind_id,
+            mind_topology=plan.mind_topology,
+        )
+
     @classmethod
     def _matches_plan_filters(cls, candidate: dict[str, Any], plan: RetrievalPlan) -> bool:
-        if int(candidate.get("privacy_level", 0)) > plan.privacy_ceiling:
-            return False
-        if str(candidate.get("sensitivity") or "unknown") != "public":
-            return False
+        if not cls._privacy_sql_filters_disabled(plan):
+            if int(candidate.get("privacy_level", 0)) > plan.privacy_ceiling:
+                return False
+            sensitivity = str(candidate.get("sensitivity") or "unknown")
+            if sensitivity != "public" and not (
+                sensitivity == "private" and plan.allow_private_sensitivity
+            ):
+                return False
         if not cls._candidate_matches_platform(candidate, plan):
             return False
-        if not candidate_allows_intimacy_boundary(
+        if not cls._privacy_sql_filters_disabled(
+            plan
+        ) and not candidate_allows_intimacy_boundary(
             candidate,
             allow_intimacy_context=plan.allow_intimacy_context,
         ):
+            return False
+        if not candidate_allows_space_boundary(candidate, plan):
+            return False
+        if not candidate_allows_mind_boundary(candidate, plan):
+            return False
+        if not candidate_allows_embodiment_boundary(candidate, plan):
+            return False
+        if not candidate_allows_realm_boundary(candidate, plan):
             return False
         if candidate.get("status") not in {status.value for status in plan.status_filter}:
             return False
@@ -2022,6 +2603,8 @@ class CandidateSearch:
                 and candidate.get("character_id") == expected_character_id
             )
         if scope == MemoryScope.CHAT.value:
+            if CandidateSearch._privacy_sql_filters_disabled(plan):
+                return MemoryScope.CHAT in allowed and (not plan.incognito) and plan.remember_across_chats
             return (
                 MemoryScope.CHAT in allowed
                 and candidate.get("conversation_id") == plan.conversation_id
@@ -2127,6 +2710,7 @@ class CandidateSearch:
         candidates: list[dict[str, Any]],
         *,
         channel: str,
+        plan: RetrievalPlan,
     ) -> None:
         for candidate in candidates:
             position_rank = candidate.get("position_rank")
@@ -2163,7 +2747,12 @@ class CandidateSearch:
                 if rank is not None
             )
             current["retrieval_source"] = "+".join(current["retrieval_sources"])
-            raw_rrf_score, normalized_rrf_score = self._compute_rrf_scores(current["channel_ranks"])
+            raw_rrf_score, normalized_rrf_score = self._compute_rrf_scores(
+                current["channel_ranks"],
+                query_type=plan.query_type,
+                exact_recall_mode=plan.exact_recall_mode,
+                raw_context_access_mode=plan.raw_context_access_mode,
+            )
             current["rrf_score_raw"] = raw_rrf_score
             current["rrf_score"] = normalized_rrf_score
 
@@ -2238,6 +2827,8 @@ class CandidateSearch:
                 current["subquery_ranks"].values(),
                 max_lists=total_sub_queries,
                 query_type=plan.query_type,
+                exact_recall_mode=plan.exact_recall_mode,
+                raw_context_access_mode=plan.raw_context_access_mode,
                 channel_ranks=current.get("channel_ranks"),
             )
             current["rrf_score_raw"] = raw_rrf_score
@@ -2254,28 +2845,79 @@ class CandidateSearch:
         channel_candidate["retrieval_source"] = ""
         return channel_candidate
 
-    def _compute_rrf_scores(self, channel_ranks: dict[str, int | None]) -> tuple[float, float]:
+    def _compute_rrf_scores(
+        self,
+        channel_ranks: dict[str, int | None],
+        *,
+        query_type: str = "default",
+        exact_recall_mode: bool = False,
+        raw_context_access_mode: str = "normal",
+    ) -> tuple[float, float]:
         raw_score = 0.0
         for channel, rank in channel_ranks.items():
             if rank is None:
                 continue
-            raw_score += self._channel_weight(channel) * (1.0 / (self._rrf_k + int(rank)))
-        normalized_score = raw_score / self._max_rrf_score()
+            raw_score += self._channel_weight(
+                channel,
+                query_type=query_type,
+                exact_recall_mode=exact_recall_mode,
+                raw_context_access_mode=raw_context_access_mode,
+            ) * (1.0 / (self._rrf_k + int(rank)))
+        normalized_score = raw_score / self._max_rrf_score(
+            query_type=query_type,
+            exact_recall_mode=exact_recall_mode,
+            raw_context_access_mode=raw_context_access_mode,
+        )
         return raw_score, max(0.0, min(1.0, normalized_score))
 
-    def _max_rrf_score(self) -> float:
+    def _max_rrf_score(
+        self,
+        *,
+        query_type: str = "default",
+        exact_recall_mode: bool = False,
+        raw_context_access_mode: str = "normal",
+    ) -> float:
         # Upper bound assumes every channel contributes its best rank,
         # with the weighted raw evidence channel included so a pure raw
         # hit can normalise against the same ceiling as a full-hit.
         return sum(
-            self._channel_weight(channel) * (1.0 / (self._rrf_k + 1))
+            self._channel_weight(
+                channel,
+                query_type=query_type,
+                exact_recall_mode=exact_recall_mode,
+                raw_context_access_mode=raw_context_access_mode,
+            ) * (1.0 / (self._rrf_k + 1))
             for channel in _CHANNEL_ORDER
         )
 
-    def _channel_weight(self, channel: str) -> float:
+    def _channel_weight(
+        self,
+        channel: str,
+        *,
+        query_type: str = "default",
+        exact_recall_mode: bool = False,
+        raw_context_access_mode: str = "normal",
+    ) -> float:
+        multiplier_map = self._channel_multiplier_map(
+            query_type=query_type,
+            exact_recall_mode=exact_recall_mode,
+            raw_context_access_mode=raw_context_access_mode,
+        )
+        multiplier = multiplier_map.get(channel, 1.0)
         if channel == "verbatim_evidence_search":
-            return self._verbatim_evidence_search_weight
-        return 1.0
+            return self._verbatim_evidence_search_weight * multiplier
+        return multiplier
+
+    @staticmethod
+    def _channel_multiplier_map(
+        *,
+        query_type: str,
+        exact_recall_mode: bool,
+        raw_context_access_mode: str,
+    ) -> dict[str, float]:
+        if exact_recall_mode or raw_context_access_mode in {"artifact", "verbatim"}:
+            return _EXACT_RECALL_CHANNEL_MULTIPLIERS
+        return _QUERY_TYPE_CHANNEL_MULTIPLIERS.get(query_type, {})
 
     def _compute_rank_fusion_scores(
         self,
@@ -2283,6 +2925,8 @@ class CandidateSearch:
         *,
         max_lists: int,
         query_type: str,
+        exact_recall_mode: bool = False,
+        raw_context_access_mode: str = "normal",
         channel_ranks: dict[str, int | None] | None = None,
     ) -> tuple[float, float]:
         rank_values = [int(rank) for rank in ranks if rank is not None]
@@ -2296,7 +2940,12 @@ class CandidateSearch:
         # below-unit channels (e.g. the verbatim_evidence_search safety-net channel).
         # A candidate that also matched a unit-weight channel keeps the
         # full score.
-        candidate_channel_weight = self._candidate_channel_weight(channel_ranks)
+        candidate_channel_weight = self._candidate_channel_weight(
+            channel_ranks,
+            query_type=query_type,
+            exact_recall_mode=exact_recall_mode,
+            raw_context_access_mode=raw_context_access_mode,
+        )
         raw_score *= candidate_channel_weight
         if query_type == "broad_list":
             score_list_count = max_lists
@@ -2313,6 +2962,10 @@ class CandidateSearch:
     def _candidate_channel_weight(
         self,
         channel_ranks: dict[str, int | None] | None,
+        *,
+        query_type: str = "default",
+        exact_recall_mode: bool = False,
+        raw_context_access_mode: str = "normal",
     ) -> float:
         """Return the effective channel weight for a merged candidate.
 
@@ -2326,7 +2979,12 @@ class CandidateSearch:
         if not channel_ranks:
             return 1.0
         contributing_weights = [
-            self._channel_weight(channel)
+            self._channel_weight(
+                channel,
+                query_type=query_type,
+                exact_recall_mode=exact_recall_mode,
+                raw_context_access_mode=raw_context_access_mode,
+            )
             for channel, rank in channel_ranks.items()
             if rank is not None
         ]
@@ -2467,8 +3125,17 @@ class CandidateSearch:
         return plan.max_candidates * _CHANNEL_OVERFETCH_MULTIPLIER
 
     @staticmethod
-    def _embedding_channel_limit(plan: RetrievalPlan) -> int:
-        return plan.vector_limit * _CHANNEL_OVERFETCH_MULTIPLIER
+    def _effective_embedding_limit(
+        plan: RetrievalPlan,
+        embedding_index: EmbeddingIndex,
+    ) -> int:
+        backend_limit = max(0, int(embedding_index.vector_limit))
+        if backend_limit == 0 or plan.vector_limit == 0:
+            return 0
+        return min(plan.vector_limit, backend_limit)
+
+    def _embedding_search_limit(self, vector_limit: int) -> int:
+        return vector_limit * self._settings.embedding_search_overfetch_multiplier
 
     def _is_stale_ephemeral(self, candidate: dict[str, Any]) -> bool:
         valid_from, effective_end = self._ephemeral_effective_range(

@@ -42,7 +42,14 @@ async def create_verbatim_pin(
         incognito=payload.incognito,
     )
     data = payload.model_dump()
-    data.update(namespace.memory_kwargs())
+    data.update(
+        namespace.memory_kwargs(
+            include_space=True,
+            include_mind=True,
+            include_embodiment=True,
+            include_realm=True,
+        )
+    )
     try:
         created = await VerbatimPinService(runtime).create_verbatim_pin(
             connection,
@@ -95,7 +102,12 @@ async def list_verbatim_pins(
         target_id=target_id,
         include_deleted=include_deleted,
         active_only=active_only,
-        **namespace.memory_kwargs(),
+        **namespace.memory_kwargs(
+            include_space=True,
+            include_mind=True,
+            include_embodiment=True,
+            include_realm=True,
+        ),
     )
     return [VerbatimPinRecord.model_validate(row) for row in rows]
 
@@ -128,7 +140,12 @@ async def get_verbatim_pin(
         connection,
         user_id=user_id,
         pin_id=pin_id,
-        **namespace.memory_kwargs(),
+        **namespace.memory_kwargs(
+            include_space=True,
+            include_mind=True,
+            include_embodiment=True,
+            include_realm=True,
+        ),
     )
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Verbatim pin not found for user")
@@ -166,7 +183,12 @@ async def update_verbatim_pin(
             user_id=user_id,
             pin_id=pin_id,
             **payload.model_dump(exclude_none=True),
-            **namespace.memory_kwargs(),
+            **namespace.memory_kwargs(
+                include_space=True,
+                include_mind=True,
+                include_embodiment=True,
+                include_realm=True,
+            ),
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -203,7 +225,12 @@ async def delete_verbatim_pin(
         connection,
         user_id=user_id,
         pin_id=pin_id,
-        **namespace.memory_kwargs(),
+        **namespace.memory_kwargs(
+            include_space=True,
+            include_mind=True,
+            include_embodiment=True,
+            include_realm=True,
+        ),
     )
     if deleted is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Verbatim pin not found for user")

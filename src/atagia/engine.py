@@ -53,6 +53,7 @@ from atagia.services.verbatim_pin_service import VerbatimPinService
 from atagia.services.errors import RuntimeNotInitializedError
 from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.worker_control_service import WorkerControlService
+from atagia.services.model_resolution import COMPONENTS_BY_ID
 
 
 async def _worker_control_response(
@@ -73,6 +74,21 @@ async def _worker_control_response(
     )
 
 
+def _models_after_phase_overrides(
+    ambient_models: dict[str, str],
+    explicit_models: dict[str, str],
+    overridden_categories: set[str],
+) -> dict[str, str]:
+    models: dict[str, str] = {}
+    for component_id, model in ambient_models.items():
+        component = COMPONENTS_BY_ID.get(component_id)
+        if component is not None and component.category in overridden_categories:
+            continue
+        models[component_id] = model
+    models.update(explicit_models)
+    return models
+
+
 class Atagia:
     """Library interface for retrieval and chat flows."""
 
@@ -91,11 +107,14 @@ class Atagia:
         llm_intimacy_retrieval_model: str | None = None,
         llm_intimacy_component_models: dict[str, str] | None = None,
         llm_intimacy_proactive_routing_enabled: bool | None = None,
+        llm_structured_output_retry_attempts: int | None = None,
+        llm_structured_output_rescue_enabled: bool | None = None,
+        llm_structured_output_rescue_model: str | None = None,
         anthropic_api_key: str | None = None,
         openai_api_key: str | None = None,
         google_api_key: str | None = None,
         openrouter_api_key: str | None = None,
-        embedding_backend: str = "none",
+        embedding_backend: str | None = None,
         embedding_model: str | None = None,
         skip_belief_revision: bool = False,
         skip_compaction: bool = False,
@@ -127,6 +146,9 @@ class Atagia:
         self._llm_intimacy_proactive_routing_enabled = (
             llm_intimacy_proactive_routing_enabled
         )
+        self._llm_structured_output_retry_attempts = llm_structured_output_retry_attempts
+        self._llm_structured_output_rescue_enabled = llm_structured_output_rescue_enabled
+        self._llm_structured_output_rescue_model = llm_structured_output_rescue_model
         self._anthropic_api_key = anthropic_api_key
         self._openai_api_key = openai_api_key
         self._google_api_key = google_api_key
@@ -180,6 +202,12 @@ class Atagia:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -204,6 +232,12 @@ class Atagia:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            mind_id=mind_id,
+            mind_topology=mind_topology,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             incognito=incognito,
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
@@ -467,6 +501,12 @@ class Atagia:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -491,6 +531,12 @@ class Atagia:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            mind_id=mind_id,
+            mind_topology=mind_topology,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             incognito=incognito,
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
@@ -511,6 +557,12 @@ class Atagia:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
@@ -531,6 +583,12 @@ class Atagia:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            mind_id=mind_id,
+            mind_topology=mind_topology,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             mode=mode,
             incognito=incognito,
             ingest_origin=ingest_origin,
@@ -554,6 +612,12 @@ class Atagia:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
     ) -> ChatResult:
         """Run the full chat flow, including the LLM response generation."""
@@ -572,6 +636,12 @@ class Atagia:
                 user_persona_id=user_persona_id,
                 platform_id=platform_id,
                 character_id=character_id,
+                active_presence_id=active_presence_id,
+                mind_id=mind_id,
+                mind_topology=mind_topology,
+                embodiment_id=embodiment_id,
+                realm_id=realm_id,
+                space_id=space_id,
                 mode=mode,
                 incognito=incognito,
             )
@@ -590,6 +660,12 @@ class Atagia:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id if character_id is not None else workspace_id,
+            active_presence_id=active_presence_id,
+            mind_id=mind_id,
+            mind_topology=mind_topology,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             mode=mode,
             incognito=incognito,
         )
@@ -670,6 +746,12 @@ class Atagia:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
     ) -> str:
@@ -692,6 +774,12 @@ class Atagia:
                 user_persona_id=user_persona_id,
                 platform_id=platform_id,
                 character_id=character_id,
+                active_presence_id=active_presence_id,
+                mind_id=mind_id,
+                mind_topology=mind_topology,
+                embodiment_id=embodiment_id,
+                realm_id=realm_id,
+                space_id=space_id,
                 mode=mode,
                 incognito=incognito,
             )
@@ -1148,10 +1236,33 @@ class Atagia:
             self._llm_forced_global_model
             or env_settings.llm_forced_global_model
         )
-        component_models = dict(env_settings.llm_component_models)
-        component_models.update(self._llm_component_models)
-        intimacy_component_models = dict(env_settings.llm_intimacy_component_models)
-        intimacy_component_models.update(self._llm_intimacy_component_models)
+        overridden_categories = {
+            category
+            for category, model in (
+                ("ingest", self._llm_ingest_model),
+                ("retrieval", self._llm_retrieval_model),
+                ("chat", self._llm_chat_model),
+            )
+            if model is not None
+        }
+        component_models = _models_after_phase_overrides(
+            env_settings.llm_component_models,
+            self._llm_component_models,
+            overridden_categories,
+        )
+        overridden_intimacy_categories = {
+            category
+            for category, model in (
+                ("ingest", self._llm_intimacy_ingest_model),
+                ("retrieval", self._llm_intimacy_retrieval_model),
+            )
+            if model is not None
+        }
+        intimacy_component_models = _models_after_phase_overrides(
+            env_settings.llm_intimacy_component_models,
+            self._llm_intimacy_component_models,
+            overridden_intimacy_categories,
+        )
         return Settings(
             sqlite_path=self._db_path,
             migrations_path=migrations_path,
@@ -1187,6 +1298,20 @@ class Atagia:
                 if self._llm_intimacy_proactive_routing_enabled is None
                 else self._llm_intimacy_proactive_routing_enabled
             ),
+            llm_structured_output_retry_attempts=(
+                env_settings.llm_structured_output_retry_attempts
+                if self._llm_structured_output_retry_attempts is None
+                else self._llm_structured_output_retry_attempts
+            ),
+            llm_structured_output_rescue_enabled=(
+                env_settings.llm_structured_output_rescue_enabled
+                if self._llm_structured_output_rescue_enabled is None
+                else self._llm_structured_output_rescue_enabled
+            ),
+            llm_structured_output_rescue_model=(
+                self._llm_structured_output_rescue_model
+                or env_settings.llm_structured_output_rescue_model
+            ),
             llm_debug_io_enabled=env_settings.llm_debug_io_enabled,
             llm_debug_io_dir=env_settings.llm_debug_io_dir,
             llm_debug_io_purposes=env_settings.llm_debug_io_purposes,
@@ -1198,9 +1323,15 @@ class Atagia:
             workers_enabled=True,
             debug=env_settings.debug,
             allow_insecure_http=True,
-            embedding_backend=self._embedding_backend,
+            embedding_backend=self._embedding_backend or env_settings.embedding_backend,
             embedding_model=self._embedding_model or env_settings.embedding_model,
             embedding_dimension=env_settings.embedding_dimension,
+            embedding_vector_limit_cap=env_settings.embedding_vector_limit_cap,
+            embedding_search_overfetch_multiplier=(
+                env_settings.embedding_search_overfetch_multiplier
+            ),
+            memory_fts_canonical_bm25_weight=env_settings.memory_fts_canonical_bm25_weight,
+            memory_fts_index_bm25_weight=env_settings.memory_fts_index_bm25_weight,
             lifecycle_decay_days=env_settings.lifecycle_decay_days,
             lifecycle_decay_rate=env_settings.lifecycle_decay_rate,
             lifecycle_archive_vitality=env_settings.lifecycle_archive_vitality,
@@ -1274,6 +1405,22 @@ class Atagia:
                 env_settings.benchmark_disable_raw_recent_transcript
             ),
             recent_transcript_overage_ratio=env_settings.recent_transcript_overage_ratio,
+            topic_working_set_enabled=env_settings.topic_working_set_enabled,
+            topic_working_set_refresh_message_lag=(
+                env_settings.topic_working_set_refresh_message_lag
+            ),
+            topic_working_set_stale_message_lag=(
+                env_settings.topic_working_set_stale_message_lag
+            ),
+            topic_working_set_refresh_token_lag=(
+                env_settings.topic_working_set_refresh_token_lag
+            ),
+            topic_working_set_stale_token_lag=(
+                env_settings.topic_working_set_stale_token_lag
+            ),
+            topic_working_set_refresh_batch_messages=(
+                env_settings.topic_working_set_refresh_batch_messages
+            ),
             graph_projection_enabled=env_settings.graph_projection_enabled,
             verbatim_evidence_search_enabled=env_settings.verbatim_evidence_search_enabled,
             verbatim_evidence_search_rrf_weight=env_settings.verbatim_evidence_search_rrf_weight,

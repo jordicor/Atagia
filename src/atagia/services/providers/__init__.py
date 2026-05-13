@@ -65,6 +65,9 @@ def build_llm_client(
         intimacy_proactive_routing_enabled=(
             settings.llm_intimacy_proactive_routing_enabled
         ),
+        structured_output_retry_attempts=settings.llm_structured_output_retry_attempts,
+        structured_output_rescue_enabled=settings.llm_structured_output_rescue_enabled,
+        structured_output_rescue_model=settings.llm_structured_output_rescue_model,
     )
 
     for provider_slug in sorted(required_provider_slugs(settings)):

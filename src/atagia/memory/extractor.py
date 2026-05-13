@@ -78,7 +78,7 @@ from atagia.services.privacy_filter_client import (
     OpenAIPrivacyFilterClient,
 )
 
-DEFAULT_EXTRACTION_MODEL = "openrouter/google/gemini-3.1-flash-lite-preview"
+DEFAULT_EXTRACTION_MODEL = "openrouter/google/gemini-3.1-flash-lite"
 REVIEW_REQUIRED_CONFIDENCE = 0.4
 NORMAL_EVIDENCE_ACTIVE_THRESHOLD = 0.5
 COLD_START_EVIDENCE_ACTIVE_THRESHOLD = 0.3
@@ -237,6 +237,16 @@ Rules:
   At least one code is required. Use multiple codes only when the text
   genuinely mixes languages. Do not translate -- report the language of
   the text as it exists, not what you think it should be in.
+- Each extracted memory may include `subject_presence_ids`. Use only IDs listed
+  in policy `presence_attribution.known_subject_presence_ids`. Include the
+  source Presence when the memory is about the speaker/source, include the
+  active Presence when the memory is about the active assistant/facet, and leave
+  it empty when the subject is unclear.
+- New memories inherit the active Space in policy `space_boundary.active_space_id`.
+  Do not infer projects, folders, or capsules from keywords.
+- New memories inherit the active Embodiment in policy
+  `embodiment.active_embodiment_id`. Do not infer physical bodies, devices, or
+  capabilities from keywords.
 
 Natural memory annotations:
 {natural_capture_block}
@@ -626,6 +636,10 @@ class MemoryExtractor:
                     "temporary": context.temporary,
                     "purge_on_close": context.purge_on_close,
                 },
+                "presence_attribution": self._presence_attribution_payload(context),
+                "space_boundary": self._space_boundary_payload(context),
+                "mind_perspective": self._mind_perspective_payload(context),
+                "embodiment": self._embodiment_payload(context),
             },
             indent=2,
             sort_keys=True,
@@ -960,6 +974,16 @@ class MemoryExtractor:
             workspace_id=context.workspace_id,
             conversation_id=context.conversation_id,
             assistant_mode_id=context.assistant_mode_id,
+            user_persona_id=context.user_persona_id,
+            platform_id=context.platform_id,
+            character_id=context.character_id if context.character_id is not None else context.workspace_id,
+            incognito=context.incognito or context.isolated_mode,
+            remember_across_chats=context.remember_across_chats,
+            remember_across_devices=context.remember_across_devices,
+            active_mind_id=context.active_mind_id,
+            mind_topology=context.mind_topology,
+            active_embodiment_id=context.active_embodiment_id,
+            active_realm_id=context.active_realm_id,
         )
         return count == 0
 
@@ -1102,6 +1126,13 @@ class MemoryExtractor:
                         user_persona_id=scope_identifiers["user_persona_id"],
                         character_id=scope_identifiers["character_id"],
                         conversation_id=scope_identifiers["conversation_id"],
+                        active_presence_id=context.active_presence_id,
+                        source_presence_id=context.source_presence_id,
+                        space_id=context.active_space_id,
+                        memory_owner_id=context.active_mind_id,
+                        source_mind_id=context.source_mind_id or context.active_mind_id,
+                        embodiment_id=context.active_embodiment_id,
+                        realm_id=context.active_realm_id,
                     )
                 if existing is not None:
                     refreshed = await self._memory_repository.refresh_memory_object_provenance(
@@ -1111,7 +1142,23 @@ class MemoryExtractor:
                         workspace_id=legacy_scope_identifiers["workspace_id"],
                         conversation_id=legacy_scope_identifiers["conversation_id"],
                         source_message_ids=[context.source_message_id],
+                        active_presence_id=context.active_presence_id,
+                        source_presence_id=context.source_presence_id,
+                        space_id=context.active_space_id,
+                        space_boundary_mode=context.active_space_boundary_mode.value
+                        if context.active_space_id is not None
+                        else None,
+                        memory_owner_id=context.active_mind_id,
+                        source_mind_id=context.source_mind_id or context.active_mind_id,
+                        embodiment_id=context.active_embodiment_id,
+                        realm_id=context.active_realm_id,
                         touch=True,
+                        commit=False,
+                    )
+                    await self._memory_repository.add_memory_object_subjects(
+                        user_id=context.user_id,
+                        memory_id=str(refreshed["id"]),
+                        subject_presence_ids=self._subject_presence_ids(item, context),
                         commit=False,
                     )
                     persisted.append(
@@ -1151,6 +1198,11 @@ class MemoryExtractor:
                 if write_policy.reasons:
                     payload["write_policy_reasons"] = list(write_policy.reasons)
                 payload["ingest_origin"] = context.ingest_origin.value
+                payload["presence_attribution"] = self._presence_attribution_payload(context)
+                payload["space_boundary"] = self._space_boundary_payload(context)
+                payload["mind_perspective"] = self._mind_perspective_payload(context)
+                payload["embodiment"] = self._embodiment_payload(context)
+                payload["realm"] = self._realm_payload(context)
                 payload["confirmation_strategy"] = (
                     context.confirmation_strategy.value
                     if context.confirmation_strategy is not None
@@ -1240,6 +1292,16 @@ class MemoryExtractor:
                     platform_locked=write_policy.platform_locked,
                     platform_id_lock=write_policy.platform_id_lock,
                     scope_canonical=write_policy.scope.value,
+                    active_presence_id=context.active_presence_id,
+                    source_presence_id=context.source_presence_id,
+                    space_id=context.active_space_id,
+                    space_boundary_mode=context.active_space_boundary_mode.value
+                    if context.active_space_id is not None
+                    else None,
+                    memory_owner_id=context.active_mind_id,
+                    source_mind_id=context.source_mind_id or context.active_mind_id,
+                    embodiment_id=context.active_embodiment_id,
+                    realm_id=context.active_realm_id,
                     commit=False,
                 )
                 if isinstance(item, ExtractedBelief) and was_created:
@@ -1257,7 +1319,23 @@ class MemoryExtractor:
                     workspace_id=legacy_scope_identifiers["workspace_id"],
                     conversation_id=legacy_scope_identifiers["conversation_id"],
                     source_message_ids=[context.source_message_id],
+                    active_presence_id=context.active_presence_id,
+                    source_presence_id=context.source_presence_id,
+                    space_id=context.active_space_id,
+                    space_boundary_mode=context.active_space_boundary_mode.value
+                    if context.active_space_id is not None
+                    else None,
+                    memory_owner_id=context.active_mind_id,
+                    source_mind_id=context.source_mind_id or context.active_mind_id,
+                    embodiment_id=context.active_embodiment_id,
+                    realm_id=context.active_realm_id,
                     touch=False,
+                    commit=False,
+                )
+                await self._memory_repository.add_memory_object_subjects(
+                    user_id=context.user_id,
+                    memory_id=str(created["id"]),
+                    subject_presence_ids=self._subject_presence_ids(item, context),
                     commit=False,
                 )
                 if decision.status is MemoryStatus.PENDING_USER_CONFIRMATION:
@@ -1326,6 +1404,76 @@ class MemoryExtractor:
                     created_at=pending["created_at"],
                 )
         return persisted
+
+    @staticmethod
+    def _presence_attribution_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+        known_subject_presence_ids = []
+        for presence_id in (context.active_presence_id, context.source_presence_id):
+            if presence_id is not None and presence_id not in known_subject_presence_ids:
+                known_subject_presence_ids.append(presence_id)
+        return {
+            "active": {
+                "presence_id": context.active_presence_id,
+                "kind": context.active_presence_kind.value,
+                "display_name": context.active_presence_display_name,
+            },
+            "source": {
+                "presence_id": context.source_presence_id,
+                "kind": context.source_presence_kind.value,
+                "display_name": context.source_presence_display_name,
+            },
+            "known_subject_presence_ids": known_subject_presence_ids,
+        }
+
+    @staticmethod
+    def _space_boundary_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "active_space_id": context.active_space_id,
+            "boundary_mode": context.active_space_boundary_mode.value,
+            "display_name": context.active_space_display_name,
+        }
+
+    @staticmethod
+    def _mind_perspective_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "memory_owner_id": context.active_mind_id,
+            "source_mind_id": context.source_mind_id or context.active_mind_id,
+            "mind_topology": context.mind_topology.value,
+            "display_name": context.active_mind_display_name,
+        }
+
+    @staticmethod
+    def _embodiment_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "active_embodiment_id": context.active_embodiment_id,
+            "cross_embodiment_mode": context.cross_embodiment_mode.value,
+            "display_name": context.active_embodiment_display_name,
+        }
+
+    @staticmethod
+    def _realm_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "active_realm_id": context.active_realm_id,
+            "cross_realm_mode": context.cross_realm_mode.value,
+            "display_name": context.active_realm_display_name,
+        }
+
+    @staticmethod
+    def _subject_presence_ids(
+        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        context: ExtractionConversationContext,
+    ) -> list[str]:
+        valid_ids = [
+            presence_id
+            for presence_id in (context.active_presence_id, context.source_presence_id)
+            if presence_id is not None
+        ]
+        valid_set = set(valid_ids)
+        resolved: list[str] = []
+        for presence_id in item.subject_presence_ids:
+            if presence_id in valid_set and presence_id not in resolved:
+                resolved.append(presence_id)
+        return resolved
 
     @staticmethod
     def _namespace_context(context: ExtractionConversationContext) -> MemoryNamespaceContext:
@@ -1560,6 +1708,13 @@ class MemoryExtractor:
             "user_persona_id": context.user_persona_id,
             "platform_id": context.platform_id,
             "character_id": context.character_id if context.character_id is not None else context.workspace_id,
+            "active_mind_id": context.active_mind_id,
+            "source_mind_id": context.source_mind_id or context.active_mind_id,
+            "mind_topology": context.mind_topology.value,
+            "active_embodiment_id": context.active_embodiment_id,
+            "cross_embodiment_mode": context.cross_embodiment_mode.value,
+            "active_realm_id": context.active_realm_id,
+            "cross_realm_mode": context.cross_realm_mode.value,
             "conversation_id": context.conversation_id,
             "mode": context.mode or context.assistant_mode_id,
             "incognito": context.incognito or context.isolated_mode,
@@ -1854,11 +2009,22 @@ class MemoryExtractor:
         canonical_scope = MemoryExtractor._canonical_write_scope(scope)
         if canonical_scope is MemoryScope.CHARACTER and namespace_context.character_id is None:
             return None
+        namespace_seed = namespace_scope_hash_seed(
+            canonical_scope,
+            namespace_context,
+            platform_locked=platform_locked,
+        )
         return "|".join(
-            namespace_scope_hash_seed(
-                canonical_scope,
-                namespace_context,
-                platform_locked=platform_locked,
+            (
+                *namespace_seed,
+                f"active_presence:{context.active_presence_id or ''}",
+                f"source_presence:{context.source_presence_id or ''}",
+                f"active_space:{context.active_space_id or ''}",
+                f"active_mind:{context.active_mind_id or ''}",
+                f"source_mind:{context.source_mind_id or ''}",
+                f"mind_topology:{context.mind_topology.value}",
+                f"active_embodiment:{context.active_embodiment_id or ''}",
+                f"active_realm:{context.active_realm_id or ''}",
             )
         )
 

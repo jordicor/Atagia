@@ -77,6 +77,54 @@ def test_llm_call_summary_aggregates_provider_reported_costs() -> None:
     assert recorder.records()[0]["cost_counts"] == summary["cost_totals"]
 
 
+def test_llm_call_summary_counts_structured_output_repair_calls() -> None:
+    recorder = LLMCallRecorder()
+    retry_request = LLMCompletionRequest(
+        model="openrouter/test-model",
+        messages=[LLMMessage(role="user", content="hello")],
+        metadata={
+            "purpose": "need_detection",
+            "atagia_structured_output_retry": True,
+            "atagia_structured_output_retry_attempt": 1,
+        },
+    )
+    rescue_request = LLMCompletionRequest(
+        model="anthropic/claude-opus-4-7",
+        messages=[LLMMessage(role="user", content="hello")],
+        metadata={
+            "purpose": "need_detection",
+            "atagia_structured_output_rescue": True,
+            "atagia_structured_output_rescue_model": "anthropic/claude-opus-4-7",
+        },
+    )
+
+    for request in (retry_request, rescue_request):
+        recorder.record_completion_success(
+            request,
+            LLMCompletionResponse(
+                provider="test",
+                model=request.model,
+                output_text="{}",
+            ),
+            latency_ms=10.0,
+        )
+
+    summary = recorder.summary()
+
+    assert summary["structured_output_repair"]["retry_calls"] == 1
+    assert summary["structured_output_repair"]["rescue_calls"] == 1
+    assert summary["structured_output_repair"]["rescue_model_call_counts"] == {
+        "anthropic/claude-opus-4-7": 1
+    }
+    assert summary["by_purpose"]["need_detection"]["structured_output_repair"] == {
+        "retry_calls": 1,
+        "rescue_calls": 1,
+        "rescue_model_call_counts": {"anthropic/claude-opus-4-7": 1},
+        "by_purpose": {"need_detection": {"retry_calls": 1, "rescue_calls": 1}},
+    }
+    assert recorder.records()[1]["metadata"]["atagia_structured_output_rescue"] is True
+
+
 def test_merge_llm_call_summaries_preserves_cost_totals_by_purpose() -> None:
     merged = merge_llm_call_summaries(
         [

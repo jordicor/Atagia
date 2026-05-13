@@ -8,6 +8,8 @@ from typing import Any
 import aiosqlite
 
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
+from atagia.core.realm_repository import RealmRepository, realm_snapshot
+from atagia.core.space_repository import SpaceRepository, space_snapshot
 from atagia.core.topic_repository import TopicRepository
 from atagia.models.schemas_memory import ExtractionConversationContext, RetrievalTrace
 from atagia.models.schemas_memory import ResolvedOperationalProfile, TopicWorkingSetTrace
@@ -135,6 +137,33 @@ class RetrievalService:
             message_text=message_text,
             conversation_id=conversation_id,
         )
+        active_space_id = active_conversation.get("active_space_id")
+        active_space_boundary_mode = active_conversation.get("active_space_boundary_mode")
+        active_space_display_name = active_conversation.get("active_space_display_name")
+        active_mind_id = active_conversation.get("active_mind_id")
+        mind_topology = active_conversation.get("mind_topology") or "unimind"
+        active_embodiment_id = active_conversation.get("active_embodiment_id")
+        active_realm_id = active_conversation.get("active_realm_id")
+        active_realm_display_name = active_conversation.get("active_realm_display_name")
+        cross_realm_mode = active_conversation.get("cross_realm_mode")
+        if active_space_id is not None and active_space_boundary_mode is None:
+            space_row = await SpaceRepository(connection, self.runtime.clock).get_space(
+                owner_user_id=user_id,
+                space_id=str(active_space_id),
+            )
+            if space_row is not None:
+                space = space_snapshot(space_row)
+                active_space_boundary_mode = space.boundary_mode.value
+                active_space_display_name = space.display_name
+        if active_realm_id is not None and cross_realm_mode is None:
+            realm_row = await RealmRepository(connection, self.runtime.clock).get_realm(
+                owner_user_id=user_id,
+                realm_id=str(active_realm_id),
+            )
+            if realm_row is not None:
+                realm = realm_snapshot(realm_row)
+                cross_realm_mode = realm.cross_realm_mode.value
+                active_realm_display_name = realm.display_name
         conversation_context = ExtractionConversationContext(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -148,6 +177,17 @@ class RetrievalService:
                 if active_conversation.get("character_id") is not None
                 else active_conversation.get("workspace_id")
             ),
+            active_presence_id=active_conversation.get("active_presence_id"),
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode or "focus",
+            active_space_display_name=active_space_display_name,
+            active_mind_id=active_mind_id,
+            source_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
+            active_realm_display_name=active_realm_display_name,
+            cross_realm_mode=cross_realm_mode or "none",
             mode=str(active_conversation.get("mode") or assistant_mode_id),
             recent_messages=recent_context(prior_messages),
             temporary=bool(active_conversation.get("temporary")),
@@ -172,6 +212,10 @@ class RetrievalService:
                 incognito=conversation_context.incognito,
                 remember_across_chats=conversation_context.remember_across_chats,
                 remember_across_devices=conversation_context.remember_across_devices,
+                active_mind_id=conversation_context.active_mind_id,
+                mind_topology=conversation_context.mind_topology,
+                active_embodiment_id=conversation_context.active_embodiment_id,
+                active_realm_id=conversation_context.active_realm_id,
             )
             == 0
         )

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from openai import AsyncOpenAI
 
+from atagia.services.llm_client import LLMCompletionRequest
 from atagia.services.providers.openai import OpenAICompatibleProvider
 
 
@@ -11,6 +14,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
     """OpenRouter uses the OpenAI-compatible SDK surface."""
 
     name = "openrouter"
+    supports_native_structured_output = False
 
     def __init__(
         self,
@@ -31,3 +35,8 @@ class OpenRouterProvider(OpenAICompatibleProvider):
             client=client,
         )
 
+    def _completion_response_format(
+        self,
+        request: LLMCompletionRequest,
+    ) -> dict[str, Any] | None:
+        return None

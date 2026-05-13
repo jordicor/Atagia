@@ -477,7 +477,20 @@ class MemoryLifecycleManager:
         )
 
     async def _refresh_contract_dimensions(self, projection_keys: list[dict[str, Any]]) -> None:
-        seen: set[tuple[str, str | None, str | None, str | None, str | None, str, str]] = set()
+        seen: set[
+            tuple[
+                str,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+                str,
+                str,
+            ]
+        ] = set()
         for key in projection_keys:
             dedupe_key = (
                 str(key["user_id"]),
@@ -485,6 +498,9 @@ class MemoryLifecycleManager:
                 key.get("character_id"),
                 key["conversation_id"],
                 key.get("scope_canonical"),
+                key.get("space_id"),
+                key.get("memory_owner_id"),
+                key.get("embodiment_id"),
                 str(key["scope"]),
                 str(key["dimension_name"]),
             )
@@ -500,6 +516,9 @@ class MemoryLifecycleManager:
                 dimension_name=str(key["dimension_name"]),
                 user_persona_id=key.get("user_persona_id"),
                 character_id=key.get("character_id"),
+                space_id=key.get("space_id"),
+                memory_owner_id=key.get("memory_owner_id"),
+                embodiment_id=key.get("embodiment_id"),
                 scope_canonical=key.get("scope_canonical"),
                 commit=False,
             )

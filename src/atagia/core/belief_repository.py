@@ -354,6 +354,10 @@ class BeliefRepository(BaseRepository):
                 mo.user_persona_id,
                 mo.platform_id,
                 mo.character_id,
+                mo.memory_owner_id,
+                mo.source_mind_id,
+                mo.embodiment_id,
+                mo.realm_id,
                 mo.sensitivity,
                 mo.platform_locked,
                 mo.platform_id_lock,
@@ -507,6 +511,8 @@ class BeliefRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any]:
         cursor = await self._connection.execute(
             """
@@ -523,7 +529,9 @@ class BeliefRepository(BaseRepository):
                     mo.character_id,
                     mo.sensitivity,
                     mo.platform_locked,
-                    mo.platform_id_lock
+                    mo.platform_id_lock,
+                    mo.embodiment_id,
+                    mo.realm_id
                 FROM memory_objects AS mo
                 JOIN belief_versions AS bv
                   ON bv.belief_id = mo.id
@@ -545,7 +553,9 @@ class BeliefRepository(BaseRepository):
                     mo.character_id,
                     mo.sensitivity,
                     mo.platform_locked,
-                    mo.platform_id_lock
+                    mo.platform_id_lock,
+                    mo.embodiment_id,
+                    mo.realm_id
                 FROM memory_objects AS mo
                 WHERE mo.user_id = ?
                   AND mo.status = ?
@@ -575,6 +585,10 @@ class BeliefRepository(BaseRepository):
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
         )
+        applicable_realm_ids = await self._applicable_realm_ids(
+            owner_user_id=user_id,
+            active_realm_id=active_realm_id,
+        )
         rows = []
         for row in await cursor.fetchall():
             payload = dict(row)
@@ -589,6 +603,20 @@ class BeliefRepository(BaseRepository):
                 remember_across_devices=remember_across_devices,
             ):
                 continue
+            row_embodiment = payload.get("embodiment_id")
+            row_embodiment_id = None if row_embodiment is None else str(row_embodiment)
+            if active_embodiment_id is None:
+                if row_embodiment_id is not None:
+                    continue
+            elif row_embodiment_id is not None and row_embodiment_id != active_embodiment_id:
+                continue
+            row_realm = payload.get("realm_id")
+            row_realm_id = None if row_realm is None else str(row_realm)
+            if active_realm_id is None:
+                if row_realm_id is not None:
+                    continue
+            elif row_realm_id is not None and row_realm_id not in applicable_realm_ids:
+                continue
             rows.append(payload)
         stats = {
             "total_evidence": len(rows),
@@ -600,6 +628,29 @@ class BeliefRepository(BaseRepository):
         if stats["distinct_conversations"] < min_conversations:
             return stats
         return stats
+
+    async def _applicable_realm_ids(
+        self,
+        *,
+        owner_user_id: str,
+        active_realm_id: str | None,
+    ) -> set[str]:
+        if active_realm_id is None:
+            return set()
+        allowed = {active_realm_id}
+        cursor = await self._connection.execute(
+            """
+            SELECT target_realm_id
+            FROM realm_bridges
+            WHERE owner_user_id = ?
+              AND source_realm_id = ?
+              AND cross_realm_mode = 'applicable'
+            """,
+            (owner_user_id, active_realm_id),
+        )
+        for row in await cursor.fetchall():
+            allowed.add(str(row["target_realm_id"]))
+        return allowed
 
     @staticmethod
     def _namespace_filter_requested(

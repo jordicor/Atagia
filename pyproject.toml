@@ -22,7 +22,7 @@ dependencies = [
   "aiosqlite>=0.20,<1.0",
   "anthropic>=0.86,<1.0",
   "fastapi>=0.115,<1.0",
-  "google-genai>=1.73.1,<2.0",
+  "google-genai>=2.1.0,<3.0",
   "httpx>=0.28,<1.0",
   "openai>=1.0,<2.0",
   "orjson>=3.10,<4.0",
@@ -48,6 +48,7 @@ embeddings = [
 atagia-api = "atagia.cli:main"
 atagia-mcp = "atagia.mcp_server:main"
 atagia-embeddings-backfill = "atagia.embedding_backfill_cli:main"
+atagia-artifact-payload-migrate = "atagia.artifact_payload_migrate_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

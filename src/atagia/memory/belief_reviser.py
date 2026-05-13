@@ -861,6 +861,19 @@ class BeliefReviser:
         payload["claim_key"] = claim_key
         payload["claim_value"] = claim_value
         payload["source_message_ids"] = [source_message_id]
+        if base_belief.get("memory_owner_id") is not None:
+            payload["mind_perspective"] = {
+                "memory_owner_id": base_belief.get("memory_owner_id"),
+                "source_mind_id": (
+                    base_belief.get("source_mind_id")
+                    or base_belief.get("memory_owner_id")
+                ),
+            }
+        if base_belief.get("embodiment_id") is not None:
+            payload["embodiment"] = {
+                "active_embodiment_id": base_belief.get("embodiment_id"),
+                "cross_embodiment_mode": "direct_if_same_body",
+            }
         policy_rows = source_rows if source_rows is not None else [base_belief]
         intimacy_boundary = strongest_intimacy_boundary(policy_rows)
         intimacy_boundary_confidence = max(
@@ -908,6 +921,12 @@ class BeliefReviser:
             status=MemoryStatus.ACTIVE,
             valid_from=valid_from,
             valid_to=None,
+            memory_owner_id=base_belief.get("memory_owner_id"),
+            source_mind_id=(
+                base_belief.get("source_mind_id")
+                or base_belief.get("memory_owner_id")
+            ),
+            embodiment_id=base_belief.get("embodiment_id"),
             commit=False,
         )
         await self._belief_repository.create_first_version(

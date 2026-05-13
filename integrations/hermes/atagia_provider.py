@@ -37,6 +37,9 @@ class AtagiaHermesProvider:
         user_persona_id: str | None = None,
         character_id: str | None = None,
         incognito: bool | None = None,
+        message_id: str | None = None,
+        source_seq: int | None = None,
+        memory_privacy_mode: str | None = None,
     ) -> HermesMemoryContext:
         context = await self.bridge.get_context_for_turn(
             user_id=user_id,
@@ -47,6 +50,11 @@ class AtagiaHermesProvider:
             platform_id=platform_id,
             character_id=character_id,
             incognito=incognito,
+            message_id=message_id,
+            source_seq=source_seq,
+            ingest_origin="live_turn",
+            confirmation_strategy="live_prompt_allowed",
+            memory_privacy_mode=memory_privacy_mode,
         )
         return HermesMemoryContext(
             system_prompt=extract_context_system_prompt(context),
@@ -64,6 +72,9 @@ class AtagiaHermesProvider:
         user_persona_id: str | None = None,
         character_id: str | None = None,
         incognito: bool | None = None,
+        message_id: str | None = None,
+        source_seq: int | None = None,
+        memory_privacy_mode: str | None = None,
     ) -> bool:
         return await self.bridge.record_assistant_response(
             user_id=user_id,
@@ -74,6 +85,11 @@ class AtagiaHermesProvider:
             platform_id=platform_id,
             character_id=character_id,
             incognito=incognito,
+            message_id=message_id,
+            source_seq=source_seq,
+            ingest_origin="live_turn",
+            confirmation_strategy="live_prompt_allowed",
+            memory_privacy_mode=memory_privacy_mode,
         )
 
     async def ingest_historical_message(
@@ -88,6 +104,9 @@ class AtagiaHermesProvider:
         user_persona_id: str | None = None,
         character_id: str | None = None,
         incognito: bool | None = None,
+        message_id: str | None = None,
+        source_seq: int | None = None,
+        memory_privacy_mode: str | None = None,
     ) -> bool:
         if role not in {"user", "assistant"}:
             raise ValueError("role must be 'user' or 'assistant'")
@@ -101,6 +120,11 @@ class AtagiaHermesProvider:
             platform_id=platform_id,
             character_id=character_id,
             incognito=incognito,
+            message_id=message_id,
+            source_seq=source_seq,
+            ingest_origin="backfill",
+            confirmation_strategy="admin_review_only",
+            memory_privacy_mode=memory_privacy_mode,
         )
 
     async def close(self) -> None:

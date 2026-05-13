@@ -155,6 +155,44 @@ async def test_openrouter_complete_raises_transient_on_error_finish_reason() -> 
         await provider.complete(request)
 
 
+@pytest.mark.asyncio
+async def test_openrouter_complete_omits_response_format_for_structured_schema() -> None:
+    response = SimpleNamespace(
+        model="anthropic/claude-sonnet-4.6",
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"score":0.8}'))],
+        usage=None,
+        model_dump=lambda: {"id": "gen_1"},
+    )
+    completions = FakeChatCompletions(response)
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://atagia.org",
+        app_name="Atagia",
+        client=FakeOpenAIClient(completions),
+    )
+
+    request = LLMCompletionRequest(
+        model="anthropic/claude-sonnet-4.6",
+        messages=[LLMMessage(role="user", content="Return JSON.")],
+        max_output_tokens=128,
+        response_schema={
+            "type": "object",
+            "properties": {
+                "score": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+            },
+        },
+    )
+
+    completion = await provider.complete(request)
+
+    assert completion.output_text == '{"score":0.8}'
+    assert "response_format" not in completions.calls[0]
+
+
 def test_openrouter_default_headers_and_factory_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 

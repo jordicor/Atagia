@@ -9,7 +9,9 @@ import pytest
 from atagia.services.model_resolution import (
     COMPONENTS_BY_ID,
     ModelResolutionError,
+    OPENROUTER_DEEPSEEK_V4_FLASH_MODEL,
     OPENROUTER_FLASH_LITE_MODEL,
+    component_id_for_llm_purpose,
     parse_embedding_model_spec,
     parse_model_spec,
     provider_qualified_model,
@@ -32,6 +34,9 @@ class ResolutionSettings:
     llm_intimacy_ingest_model: str | None = None
     llm_intimacy_retrieval_model: str | None = None
     llm_intimacy_component_models: dict[str, str] = field(default_factory=dict)
+    llm_structured_output_retry_attempts: int = 1
+    llm_structured_output_rescue_enabled: bool = False
+    llm_structured_output_rescue_model: str | None = None
     embedding_backend: str = "none"
     embedding_model: str | None = None
     anthropic_api_key: str | None = None
@@ -41,12 +46,12 @@ class ResolutionSettings:
 
 
 def test_parse_model_spec_strips_public_provider_prefix() -> None:
-    parsed = parse_model_spec("google/gemini-3.1-flash-lite-preview,medium")
+    parsed = parse_model_spec("google/gemini-3.1-flash-lite,medium")
 
     assert parsed.provider_slug == "google"
     assert parsed.provider_name == "gemini"
-    assert parsed.request_model == "gemini-3.1-flash-lite-preview"
-    assert parsed.canonical_spec == "google/gemini-3.1-flash-lite-preview,medium"
+    assert parsed.request_model == "gemini-3.1-flash-lite"
+    assert parsed.canonical_spec == "google/gemini-3.1-flash-lite,medium"
     assert parsed.thinking_level == "medium"
 
 
@@ -56,6 +61,34 @@ def test_parse_model_spec_preserves_openrouter_vendor_segment() -> None:
     assert parsed.provider_name == "openrouter"
     assert parsed.request_model == "deepseek/deepseek-v4-flash"
     assert parsed.thinking_level == "high"
+
+
+def test_openrouter_provider_qualifies_google_vendor_models() -> None:
+    assert (
+        provider_qualified_model(
+            "openrouter",
+            "google/gemini-3.1-flash-lite",
+        )
+        == "openrouter/google/gemini-3.1-flash-lite"
+    )
+
+
+def test_explicit_provider_qualified_model_still_wins_without_openrouter_provider() -> None:
+    assert (
+        provider_qualified_model(
+            "anthropic",
+            "google/gemini-3.1-flash-lite",
+        )
+        == "google/gemini-3.1-flash-lite"
+    )
+
+
+@pytest.mark.parametrize("level", ["low", "xhigh", "max"])
+def test_parse_model_spec_accepts_extended_thinking_levels(level: str) -> None:
+    parsed = parse_model_spec(f"anthropic/claude-opus-4-7,{level}")
+
+    assert parsed.request_model == "claude-opus-4-7"
+    assert parsed.thinking_level == level
 
 
 def test_parse_embedding_model_rejects_thinking_level() -> None:
@@ -73,7 +106,7 @@ def test_resolution_precedence_forced_component_category_default() -> None:
     assert resolve_component_model(settings, "extractor") == "openai/gpt-5-mini"
     assert resolve_component_model(settings, "belief_reviser") == "anthropic/claude-haiku-4-5"
     assert resolve_component_model(settings, "need_detector") == "google/gemini-3-flash-preview"
-    assert resolve_component_model(settings, "chat") == "anthropic/claude-sonnet-4-6"
+    assert resolve_component_model(settings, "chat") == OPENROUTER_DEEPSEEK_V4_FLASH_MODEL
 
     forced = ResolutionSettings(
         llm_forced_global_model="openrouter/deepseek/deepseek-v4-flash"
@@ -101,7 +134,7 @@ def test_resolve_component_uses_openrouter_flashlite_for_extractor() -> None:
 
     assert resolved.parsed.canonical_model == OPENROUTER_FLASH_LITE_MODEL
     assert resolved.parsed.provider_slug == "openrouter"
-    assert resolved.parsed.request_model == "google/gemini-3.1-flash-lite-preview"
+    assert resolved.parsed.request_model == "google/gemini-3.1-flash-lite"
     assert resolved.provenance == "default"
 
 
@@ -136,7 +169,7 @@ def test_intimacy_fallback_resolution_uses_component_then_category() -> None:
         llm_intimacy_ingest_model="openrouter/z-ai/glm-4.6",
         llm_intimacy_retrieval_model="openrouter/x-ai/grok-4.1-fast",
         llm_intimacy_component_models={
-            "extractor": "google/gemini-3.1-flash-lite-preview"
+            "extractor": "google/gemini-3.1-flash-lite"
         },
     )
 
@@ -146,7 +179,7 @@ def test_intimacy_fallback_resolution_uses_component_then_category() -> None:
     chat = resolve_intimacy_component(settings, "chat")
 
     assert extractor is not None
-    assert extractor.model_spec == "google/gemini-3.1-flash-lite-preview"
+    assert extractor.model_spec == "google/gemini-3.1-flash-lite"
     assert extractor.provenance == "intimacy component override"
     assert compactor is not None
     assert compactor.model_spec == "openrouter/z-ai/glm-4.6"
@@ -174,12 +207,17 @@ def test_sensitive_components_stay_on_sonnet_by_default() -> None:
         "summary_privacy_refiner",
         "consent_confirmation",
         "export_anonymizer",
-        "chat",
     }
 
     for component_id in sensitive_component_ids:
         resolved = resolve_component(ResolutionSettings(), component_id)
         assert resolved.parsed.canonical_model == "anthropic/claude-sonnet-4-6"
+
+
+def test_chat_defaults_to_deepseek_v4_flash_for_dev_cost() -> None:
+    resolved = resolve_component(ResolutionSettings(), "chat")
+
+    assert resolved.parsed.canonical_model == OPENROUTER_DEEPSEEK_V4_FLASH_MODEL
 
 
 def test_default_flashlite_migration_scope_is_explicit() -> None:
@@ -195,6 +233,7 @@ def test_default_flashlite_migration_scope_is_explicit() -> None:
         "topic_working_set",
         "intent_classifier",
         "need_detector",
+        "coverage_expander",
         "applicability_scorer",
         "context_staleness",
         "metrics_computer",
@@ -202,6 +241,10 @@ def test_default_flashlite_migration_scope_is_explicit() -> None:
 
     for component_id in migrated_component_ids:
         assert COMPONENTS_BY_ID[component_id].default_model == OPENROUTER_FLASH_LITE_MODEL
+
+
+def test_coverage_expansion_purpose_maps_to_component() -> None:
+    assert component_id_for_llm_purpose("coverage_expansion") == "coverage_expander"
 
 
 def test_forced_global_model_limits_required_completion_provider() -> None:
@@ -223,6 +266,19 @@ def test_intimacy_fallback_provider_keys_are_required() -> None:
 
     assert required_provider_slugs(settings) == {"openai", "openrouter"}
     with pytest.raises(ModelResolutionError, match="ATAGIA_OPENROUTER_API_KEY"):
+        validate_required_provider_keys(settings)
+
+
+def test_structured_output_rescue_provider_key_is_required() -> None:
+    settings = ResolutionSettings(
+        llm_forced_global_model="openrouter/deepseek/deepseek-v4-flash",
+        llm_structured_output_rescue_enabled=True,
+        llm_structured_output_rescue_model="anthropic/claude-opus-4-7",
+        openrouter_api_key="openrouter-key",
+    )
+
+    assert required_provider_slugs(settings) == {"anthropic", "openrouter"}
+    with pytest.raises(ModelResolutionError, match="ATAGIA_ANTHROPIC_API_KEY"):
         validate_required_provider_keys(settings)
 
 

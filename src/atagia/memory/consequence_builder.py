@@ -17,8 +17,12 @@ from atagia.core.consequence_repository import ConsequenceRepository
 from atagia.core.ids import generate_prefixed_id
 from atagia.core.llm_output_limits import CONSEQUENCE_BUILDER_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import MemoryObjectRepository
+from atagia.memory.embodiment_policy import embodiment_visibility_sql_clause_for_context
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
+from atagia.memory.mind_policy import mind_visibility_sql_clause_for_context
+from atagia.memory.realm_policy import realm_visibility_sql_clause_for_context
 from atagia.memory.retrieval_planner import build_safe_fts_queries
+from atagia.memory.space_policy import space_visibility_sql_clause_for_context
 from atagia.models.schemas_memory import (
     ConsequenceChainResult,
     ConsequenceSentiment,
@@ -399,6 +403,10 @@ class ConsequenceChainBuilder:
                     conversation_context,
                     scope=scope,
                 ),
+                "space_boundary": self._space_boundary_payload(conversation_context),
+                "mind_perspective": self._mind_perspective_payload(conversation_context),
+                "embodiment": self._embodiment_payload(conversation_context),
+                "realm": self._realm_payload(conversation_context),
             },
             extraction_hash=self._compute_consequence_hash(
                 signal.action_description,
@@ -414,6 +422,16 @@ class ConsequenceChainBuilder:
             platform_locked=self._platform_locked(conversation_context),
             platform_id_lock=self._platform_id_lock(conversation_context),
             scope_canonical=scope.value,
+            active_presence_id=conversation_context.active_presence_id,
+            source_presence_id=conversation_context.source_presence_id,
+            space_id=conversation_context.active_space_id,
+            space_boundary_mode=conversation_context.active_space_boundary_mode.value
+            if conversation_context.active_space_id is not None
+            else None,
+            memory_owner_id=conversation_context.active_mind_id,
+            source_mind_id=conversation_context.source_mind_id or conversation_context.active_mind_id,
+            embodiment_id=conversation_context.active_embodiment_id,
+            realm_id=conversation_context.active_realm_id,
             commit=False,
         )
 
@@ -448,6 +466,10 @@ class ConsequenceChainBuilder:
                     conversation_context,
                     scope=action_scope,
                 ),
+                "space_boundary": self._space_boundary_payload(conversation_context),
+                "mind_perspective": self._mind_perspective_payload(conversation_context),
+                "embodiment": self._embodiment_payload(conversation_context),
+                "realm": self._realm_payload(conversation_context),
             },
             extraction_hash=self._compute_consequence_hash(
                 signal.outcome_description,
@@ -462,6 +484,16 @@ class ConsequenceChainBuilder:
             platform_locked=self._platform_locked(conversation_context),
             platform_id_lock=self._platform_id_lock(conversation_context),
             scope_canonical=action_scope.value,
+            active_presence_id=conversation_context.active_presence_id,
+            source_presence_id=conversation_context.source_presence_id,
+            space_id=conversation_context.active_space_id,
+            space_boundary_mode=conversation_context.active_space_boundary_mode.value
+            if conversation_context.active_space_id is not None
+            else None,
+            memory_owner_id=conversation_context.active_mind_id,
+            source_mind_id=conversation_context.source_mind_id or conversation_context.active_mind_id,
+            embodiment_id=conversation_context.active_embodiment_id,
+            realm_id=conversation_context.active_realm_id,
             commit=False,
         )
 
@@ -505,6 +537,9 @@ class ConsequenceChainBuilder:
                     conversation_context,
                     scope=tendency_scope,
                 ),
+                "space_boundary": self._space_boundary_payload(conversation_context),
+                "mind_perspective": self._mind_perspective_payload(conversation_context),
+                "embodiment": self._embodiment_payload(conversation_context),
             },
             extraction_hash=self._compute_consequence_hash(
                 tendency_text,
@@ -519,6 +554,16 @@ class ConsequenceChainBuilder:
             platform_locked=self._platform_locked(conversation_context),
             platform_id_lock=self._platform_id_lock(conversation_context),
             scope_canonical=tendency_scope.value,
+            active_presence_id=conversation_context.active_presence_id,
+            source_presence_id=conversation_context.source_presence_id,
+            space_id=conversation_context.active_space_id,
+            space_boundary_mode=conversation_context.active_space_boundary_mode.value
+            if conversation_context.active_space_id is not None
+            else None,
+            memory_owner_id=conversation_context.active_mind_id,
+            source_mind_id=conversation_context.source_mind_id or conversation_context.active_mind_id,
+            embodiment_id=conversation_context.active_embodiment_id,
+            realm_id=conversation_context.active_realm_id,
             commit=False,
         )
 
@@ -589,7 +634,7 @@ class ConsequenceChainBuilder:
     def _context_visibility_clauses(
         conversation_context: ExtractionConversationContext,
     ) -> tuple[list[str], list[Any]]:
-        return MemoryObjectRepository.namespace_visibility_clauses(
+        clauses, parameters = MemoryObjectRepository.namespace_visibility_clauses(
             [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
             user_persona_id=conversation_context.user_persona_id,
             platform_id=conversation_context.platform_id,
@@ -599,6 +644,36 @@ class ConsequenceChainBuilder:
             remember_across_devices=conversation_context.remember_across_devices,
             incognito=conversation_context.incognito or conversation_context.isolated_mode,
             table_alias="mo",
+        )
+        if not clauses:
+            return [], []
+        space_clause, space_parameters = space_visibility_sql_clause_for_context(
+            active_space_id=conversation_context.active_space_id,
+            active_space_boundary_mode=conversation_context.active_space_boundary_mode,
+            alias="mo",
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=conversation_context.active_mind_id,
+            mind_topology=conversation_context.mind_topology,
+            alias="mo",
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=conversation_context.active_embodiment_id,
+            alias="mo",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=conversation_context.active_realm_id,
+            alias="mo",
+        )
+        return (
+            [*clauses, space_clause, mind_clause, embodiment_clause, realm_clause],
+            [
+                *parameters,
+                *space_parameters,
+                *mind_parameters,
+                *embodiment_parameters,
+                *realm_parameters,
+            ],
         )
 
     @staticmethod
@@ -677,6 +752,13 @@ class ConsequenceChainBuilder:
             "user_persona_id": conversation_context.user_persona_id,
             "platform_id": conversation_context.platform_id,
             "character_id": ConsequenceChainBuilder._context_character_id(conversation_context),
+            "active_mind_id": conversation_context.active_mind_id,
+            "source_mind_id": conversation_context.source_mind_id or conversation_context.active_mind_id,
+            "mind_topology": conversation_context.mind_topology.value,
+            "active_embodiment_id": conversation_context.active_embodiment_id,
+            "cross_embodiment_mode": conversation_context.cross_embodiment_mode.value,
+            "active_realm_id": conversation_context.active_realm_id,
+            "cross_realm_mode": conversation_context.cross_realm_mode.value,
             "conversation_id": conversation_context.conversation_id,
             "mode": conversation_context.mode or conversation_context.assistant_mode_id,
             "incognito": conversation_context.incognito or conversation_context.isolated_mode,
@@ -688,6 +770,39 @@ class ConsequenceChainBuilder:
             "auto_expires": conversation_context.temporary or conversation_context.purge_on_close,
             "platform_locked": platform_locked,
             "platform_id_lock": conversation_context.platform_id if platform_locked else None,
+        }
+
+    @staticmethod
+    def _space_boundary_payload(conversation_context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "active_space_id": conversation_context.active_space_id,
+            "boundary_mode": conversation_context.active_space_boundary_mode.value,
+            "display_name": conversation_context.active_space_display_name,
+        }
+
+    @staticmethod
+    def _mind_perspective_payload(conversation_context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "memory_owner_id": conversation_context.active_mind_id,
+            "source_mind_id": conversation_context.source_mind_id or conversation_context.active_mind_id,
+            "mind_topology": conversation_context.mind_topology.value,
+            "display_name": conversation_context.active_mind_display_name,
+        }
+
+    @staticmethod
+    def _embodiment_payload(conversation_context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "active_embodiment_id": conversation_context.active_embodiment_id,
+            "cross_embodiment_mode": conversation_context.cross_embodiment_mode.value,
+            "display_name": conversation_context.active_embodiment_display_name,
+        }
+
+    @staticmethod
+    def _realm_payload(conversation_context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "active_realm_id": conversation_context.active_realm_id,
+            "cross_realm_mode": conversation_context.cross_realm_mode.value,
+            "display_name": conversation_context.active_realm_display_name,
         }
 
     @staticmethod

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from pathlib import Path
 
 import pytest
 
 from atagia.app import AppRuntime, initialize_runtime
+from atagia.core.canonical import canonical_json_bytes
 from atagia.core.config import Settings
 from atagia.core.repositories import ConversationRepository, UserRepository
 from atagia.memory.policy_manifest import compute_effective_policy_hash
@@ -18,7 +20,10 @@ from atagia.services.chat_support import (
     resolve_operational_profile,
     resolve_policy,
 )
-from atagia.services.context_cache_service import ContextCacheService
+from atagia.services.context_cache_service import (
+    CONTEXT_CACHE_KEY_VERSION,
+    ContextCacheService,
+)
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -176,8 +181,30 @@ def _normal_cache_key(
         assistant_mode_id=str(conversation["assistant_mode_id"]),
         conversation_id=str(conversation["id"]),
         workspace_id=conversation.get("workspace_id"),
+        active_presence_id=conversation.get("active_presence_id"),
+        active_space_id=conversation.get("active_space_id"),
         operational_profile_token=snapshot.token,
     )
+
+
+def _legacy_v4_cache_key(
+    runtime: AppRuntime,
+    conversation: dict[str, object],
+) -> str:
+    snapshot = default_operational_profile_snapshot(
+        loader=runtime.operational_profile_loader,
+        settings=runtime.settings,
+    )
+    cache_subject = {
+        "v": 4,
+        "active_presence_id": conversation.get("active_presence_id"),
+        "assistant_mode_id": str(conversation["assistant_mode_id"]),
+        "conversation_id": str(conversation["id"]),
+        "operational_profile_token": snapshot.token,
+        "user_id": str(conversation["user_id"]),
+        "workspace_id": conversation.get("workspace_id"),
+    }
+    return "ctx:v4:" + hashlib.sha256(canonical_json_bytes(cache_subject)).hexdigest()
 
 
 def _cache_entry_payload(
@@ -311,6 +338,42 @@ async def test_context_cache_service_cache_hit_skips_need_detection(
         assert second.need_detection_skipped is True
         assert second.pending_cache_entry is None
         assert need_count_after == need_count_before
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_ignores_legacy_v4_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+        legacy_cache_key = _legacy_v4_cache_key(runtime, conversation)
+        await runtime.storage_backend.set_context_view(
+            legacy_cache_key,
+            _cache_entry_payload(runtime, cache_key=legacy_cache_key),
+            ttl_seconds=30,
+        )
+
+        connection = await runtime.open_connection()
+        try:
+            resolution = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="continue",
+            )
+        finally:
+            await connection.close()
+
+        assert resolution.from_cache is False
+        assert resolution.cache_key is not None
+        assert str(resolution.cache_key).startswith(f"ctx:v{CONTEXT_CACHE_KEY_VERSION}:")
+        assert resolution.cache_key != legacy_cache_key
+        assert resolution.pending_cache_entry is not None
     finally:
         await runtime.close()
 
@@ -594,5 +657,123 @@ async def test_context_cache_service_budgeted_composer_strategy_disables_cache(
         assert resolution.from_cache is False
         assert resolution.pending_cache_entry is None
         assert resolution.cache_key is not None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_active_presence_changes_cache_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+        snapshot = default_operational_profile_snapshot(
+            loader=runtime.operational_profile_loader,
+            settings=runtime.settings,
+        )
+
+        first = service.build_cache_key(
+            user_id=str(conversation["user_id"]),
+            assistant_mode_id=str(conversation["assistant_mode_id"]),
+            conversation_id=str(conversation["id"]),
+            workspace_id=conversation.get("workspace_id"),
+            active_presence_id="presence_alpha",
+            operational_profile_token=snapshot.token,
+        )
+        second = service.build_cache_key(
+            user_id=str(conversation["user_id"]),
+            assistant_mode_id=str(conversation["assistant_mode_id"]),
+            conversation_id=str(conversation["id"]),
+            workspace_id=conversation.get("workspace_id"),
+            active_presence_id="presence_beta",
+            operational_profile_token=snapshot.token,
+        )
+
+        assert first != second
+        assert first.startswith(f"ctx:v{CONTEXT_CACHE_KEY_VERSION}:")
+        assert second.startswith(f"ctx:v{CONTEXT_CACHE_KEY_VERSION}:")
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_active_space_changes_cache_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+        snapshot = default_operational_profile_snapshot(
+            loader=runtime.operational_profile_loader,
+            settings=runtime.settings,
+        )
+
+        first = service.build_cache_key(
+            user_id=str(conversation["user_id"]),
+            assistant_mode_id=str(conversation["assistant_mode_id"]),
+            conversation_id=str(conversation["id"]),
+            workspace_id=conversation.get("workspace_id"),
+            active_presence_id=conversation.get("active_presence_id"),
+            active_space_id="space_alpha",
+            operational_profile_token=snapshot.token,
+        )
+        second = service.build_cache_key(
+            user_id=str(conversation["user_id"]),
+            assistant_mode_id=str(conversation["assistant_mode_id"]),
+            conversation_id=str(conversation["id"]),
+            workspace_id=conversation.get("workspace_id"),
+            active_presence_id=conversation.get("active_presence_id"),
+            active_space_id="space_beta",
+            operational_profile_token=snapshot.token,
+        )
+
+        assert first != second
+        assert first.startswith(f"ctx:v{CONTEXT_CACHE_KEY_VERSION}:")
+        assert second.startswith(f"ctx:v{CONTEXT_CACHE_KEY_VERSION}:")
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_context_cache_service_retrieval_overrides_disable_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        service = ContextCacheService(runtime)
+        cache_key = _normal_cache_key(runtime, service, conversation)
+        await runtime.storage_backend.set_context_view(
+            cache_key,
+            _cache_entry_payload(runtime, cache_key=cache_key),
+            ttl_seconds=30,
+        )
+
+        connection = await runtime.open_connection()
+        try:
+            resolution = await service.resolve_with_connection(
+                connection,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="continue",
+                ablation=AblationConfig(
+                    override_retrieval_params={
+                        "privacy_ceiling": 3,
+                        "allow_private_sensitivity": True,
+                    }
+                ),
+            )
+        finally:
+            await connection.close()
+
+        assert resolution.from_cache is False
+        assert resolution.pending_cache_entry is None
+        assert resolution.cache_key == cache_key
     finally:
         await runtime.close()

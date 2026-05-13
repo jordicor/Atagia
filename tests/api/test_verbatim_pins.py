@@ -10,6 +10,8 @@ import pytest
 from atagia.app import create_app
 from atagia.core.config import Settings
 from atagia.core.repositories import ConversationRepository, UserRepository
+from atagia.core.space_repository import SpaceRepository
+from atagia.models.schemas_memory import SpaceBoundaryMode
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -227,3 +229,159 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
         )
         assert reloaded.status_code == 200
         assert reloaded.json()[0]["deleted_at"] is not None
+
+
+@pytest.mark.parametrize(
+    ("space_id", "boundary_mode"),
+    [
+        ("space_vault", SpaceBoundaryMode.PRIVACY_VAULT),
+        ("space_severed", SpaceBoundaryMode.SEVERANCE),
+    ],
+)
+def test_verbatim_pin_routes_enforce_space_boundaries_for_crud(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    space_id: str,
+    boundary_mode: SpaceBoundaryMode,
+) -> None:
+    provider = NoopProvider()
+    monkeypatch.setattr(
+        "atagia.app.build_llm_client",
+        lambda _settings: LLMClient(provider_name=provider.name, providers=[provider]),
+    )
+    app = create_app(_settings(tmp_path))
+    headers = {
+        "Authorization": "Bearer service-key",
+        "X-Atagia-User-Id": "usr_1",
+    }
+
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime
+        connection = client.portal.call(runtime.open_connection)
+        try:
+            users = UserRepository(connection, runtime.clock)
+            conversations = ConversationRepository(connection, runtime.clock)
+            spaces = SpaceRepository(connection, runtime.clock)
+            client.portal.call(users.create_user, "usr_1")
+            client.portal.call(
+                lambda: spaces.resolve_space(
+                    owner_user_id="usr_1",
+                    space_id=space_id,
+                    boundary_mode=boundary_mode,
+                    display_name=space_id,
+                    source_kind="explicit",
+                    source_id=space_id,
+                )
+            )
+            client.portal.call(
+                lambda: conversations.create_conversation(
+                    "cnv_outside",
+                    "usr_1",
+                    None,
+                    "coding_debug",
+                    "Outside",
+                    platform_id="web",
+                )
+            )
+            client.portal.call(
+                lambda: conversations.create_conversation(
+                    "cnv_inside",
+                    "usr_1",
+                    None,
+                    "coding_debug",
+                    "Inside",
+                    platform_id="web",
+                    active_space_id=space_id,
+                )
+            )
+        finally:
+            client.portal.call(connection.close)
+
+        pin_ids = {}
+        for operation in ("get", "edit", "delete"):
+            created = client.post(
+                "/v1/verbatim-pins",
+                json={
+                    "user_id": "usr_1",
+                    "scope": "global_user",
+                    "target_kind": "text_span",
+                    "target_id": f"{operation}_{space_id}",
+                    "conversation_id": "cnv_inside",
+                    "platform_id": "web",
+                    "canonical_text": f"{operation} pin text in {space_id}",
+                    "index_text": f"{operation} pin text",
+                    "privacy_level": 0,
+                    "created_by": "usr_1",
+                },
+                headers=headers,
+            )
+            assert created.status_code == 200
+            assert created.json()["space_id"] == space_id
+            assert created.json()["space_boundary_mode"] == boundary_mode.value
+            pin_ids[operation] = created.json()["id"]
+
+        outside_params = {
+            "user_id": "usr_1",
+            "conversation_id": "cnv_outside",
+            "platform_id": "web",
+        }
+        inside_params = {
+            "user_id": "usr_1",
+            "conversation_id": "cnv_inside",
+            "platform_id": "web",
+        }
+
+        outside_list = client.get(
+            "/v1/verbatim-pins",
+            params=outside_params,
+            headers=headers,
+        )
+        assert outside_list.status_code == 200
+        assert outside_list.json() == []
+
+        outside_get = client.get(
+            f"/v1/verbatim-pins/{pin_ids['get']}",
+            params=outside_params,
+            headers=headers,
+        )
+        assert outside_get.status_code == 404
+
+        outside_edit = client.patch(
+            f"/v1/verbatim-pins/{pin_ids['edit']}",
+            params=outside_params,
+            json={"canonical_text": "outside edit must not land"},
+            headers=headers,
+        )
+        assert outside_edit.status_code == 404
+
+        outside_delete = client.delete(
+            f"/v1/verbatim-pins/{pin_ids['delete']}",
+            params=outside_params,
+            headers=headers,
+        )
+        assert outside_delete.status_code == 404
+
+        inside_get = client.get(
+            f"/v1/verbatim-pins/{pin_ids['get']}",
+            params=inside_params,
+            headers=headers,
+        )
+        assert inside_get.status_code == 200
+        assert inside_get.json()["canonical_text"] == f"get pin text in {space_id}"
+
+        inside_edit = client.patch(
+            f"/v1/verbatim-pins/{pin_ids['edit']}",
+            params=inside_params,
+            json={"canonical_text": "inside edit is allowed"},
+            headers=headers,
+        )
+        assert inside_edit.status_code == 200
+        assert inside_edit.json()["canonical_text"] == "inside edit is allowed"
+
+        inside_delete = client.delete(
+            f"/v1/verbatim-pins/{pin_ids['delete']}",
+            params=inside_params,
+            headers=headers,
+        )
+        assert inside_delete.status_code == 200
+        assert inside_delete.json()["status"] == "deleted"

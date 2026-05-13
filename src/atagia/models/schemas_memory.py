@@ -48,6 +48,63 @@ class MemorySensitivity(str, Enum):
     SECRET = "secret"
 
 
+class PresenceKind(str, Enum):
+    HUMAN = "human"
+    OWNED_AI = "owned_ai"
+    OWNED_FACET = "owned_facet"
+    EXTERNAL_ACTOR = "external_actor"
+    OVERSEER = "overseer"
+    UNKNOWN = "unknown"
+
+
+class MindKind(str, Enum):
+    HUMAN = "human"
+    OWNED_AI = "owned_ai"
+    OWNED_FACET = "owned_facet"
+    EXTERNAL_ACTOR = "external_actor"
+    OVERSEER = "overseer"
+    UNKNOWN = "unknown"
+
+
+class MindTopology(str, Enum):
+    UNIMIND = "unimind"
+    MULTI_MIND = "multi_mind"
+    OJOCENTAURI = "ojocentauri"
+
+
+class OverseerGrantKind(str, Enum):
+    READ = "read"
+    SUMMARIZE = "summarize"
+    COORDINATE = "coordinate"
+    AUDIT = "audit"
+    RESCOPE = "rescope"
+
+
+class OverseerGrantTargetKind(str, Enum):
+    MIND = "mind"
+    SPACE = "space"
+    REALM = "realm"
+
+
+class SpaceBoundaryMode(str, Enum):
+    FOCUS = "focus"
+    SEVERANCE = "severance"
+    PRIVACY_VAULT = "privacy_vault"
+    TAGGED = "tagged"
+
+
+class EmbodimentBoundaryMode(str, Enum):
+    NONE = "none"
+    ATTRIBUTED = "attributed"
+    DIRECT_IF_SAME_BODY = "direct_if_same_body"
+
+
+class CrossRealmMode(str, Enum):
+    NONE = "none"
+    ATTRIBUTED = "attributed"
+    APPLICABLE = "applicable"
+
+
 # Canonical post-redesign scopes (retrieval/extraction work after the cutover).
 CANONICAL_SCOPES: frozenset[MemoryScope] = frozenset(
     {MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER}
@@ -561,6 +618,27 @@ class ExtractionConversationContext(BaseModel):
     user_persona_id: str | None = None
     platform_id: str = "default"
     character_id: str | None = None
+    active_presence_id: str | None = None
+    active_presence_kind: PresenceKind = PresenceKind.UNKNOWN
+    active_presence_display_name: str | None = None
+    source_presence_id: str | None = None
+    source_presence_kind: PresenceKind = PresenceKind.UNKNOWN
+    source_presence_display_name: str | None = None
+    active_space_id: str | None = None
+    active_space_boundary_mode: SpaceBoundaryMode = SpaceBoundaryMode.FOCUS
+    active_space_display_name: str | None = None
+    active_mind_id: str | None = None
+    source_mind_id: str | None = None
+    active_mind_display_name: str | None = None
+    mind_topology: MindTopology = MindTopology.UNIMIND
+    active_embodiment_id: str | None = None
+    active_embodiment_display_name: str | None = None
+    cross_embodiment_mode: EmbodimentBoundaryMode = (
+        EmbodimentBoundaryMode.DIRECT_IF_SAME_BODY
+    )
+    active_realm_id: str | None = None
+    active_realm_display_name: str | None = None
+    cross_realm_mode: CrossRealmMode = CrossRealmMode.NONE
     mode: str | None = None
     recent_messages: list[ExtractionContextMessage] = Field(default_factory=list)
     temporary: bool = False
@@ -609,6 +687,7 @@ class ExtractedMemoryBase(BaseModel):
     intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     preserve_verbatim: bool = False
     informational_mention: bool | None = None
+    subject_presence_ids: list[str] = Field(default_factory=list)
     payload: dict[str, Any] = Field(default_factory=dict)
     temporal_type: TemporalType = "unknown"
     valid_from_iso: str | None = None
@@ -689,6 +768,19 @@ class ExtractedMemoryBase(BaseModel):
             return None
         normalized = value.strip()
         return normalized or None
+
+    @field_validator("subject_presence_ids")
+    @classmethod
+    def normalize_subject_presence_ids(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            cleaned = str(value).strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            normalized.append(cleaned)
+        return normalized
 
     @field_validator("valid_from_iso", "valid_to_iso")
     @classmethod
@@ -1238,6 +1330,17 @@ class RetrievalPlan(BaseModel):
     user_persona_id: str | None = None
     platform_id: str = "default"
     character_id: str | None = None
+    active_presence_id: str | None = None
+    active_space_id: str | None = None
+    active_space_boundary_mode: SpaceBoundaryMode | None = None
+    active_mind_id: str | None = None
+    mind_topology: MindTopology = MindTopology.UNIMIND
+    active_embodiment_id: str | None = None
+    cross_embodiment_mode: EmbodimentBoundaryMode = (
+        EmbodimentBoundaryMode.DIRECT_IF_SAME_BODY
+    )
+    active_realm_id: str | None = None
+    cross_realm_mode: CrossRealmMode = CrossRealmMode.NONE
     incognito: bool = False
     remember_across_chats: bool = True
     remember_across_devices: bool = True
@@ -1252,7 +1355,9 @@ class RetrievalPlan(BaseModel):
     max_candidates: int = Field(ge=0)
     max_context_items: int = Field(gt=0)
     privacy_ceiling: int = Field(ge=0, le=3)
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
     allow_intimacy_context: bool = False
+    allow_private_sensitivity: bool = False
     retrieval_levels: list[int] = Field(default_factory=lambda: [0])
     temporal_query_range: TemporalQueryRange | None = None
     consequence_search_enabled: bool = False
@@ -1364,6 +1469,15 @@ class MemoryObject(BaseModel):
     user_persona_id: str | None = None
     platform_id: str | None = None
     character_id: str | None = None
+    active_presence_id: str | None = None
+    source_presence_id: str | None = None
+    presence_cluster_id: str | None = None
+    space_id: str | None = None
+    space_boundary_mode: SpaceBoundaryMode | None = None
+    memory_owner_id: str | None = None
+    source_mind_id: str | None = None
+    embodiment_id: str | None = None
+    realm_id: str | None = None
     object_type: MemoryObjectType
     scope: MemoryScope
     canonical_text: str
@@ -1523,6 +1637,7 @@ class ScoringTrace(BaseModel):
     candidates_scored: int = Field(ge=0, default=0)
     candidates_rejected: int = Field(ge=0, default=0)
     rejection_reasons: dict[str, int] = Field(default_factory=dict)
+    policy_audit_reason_counts: dict[str, int] = Field(default_factory=dict)
     top_score: float = 0.0
     median_score: float = 0.0
     min_score: float = 0.0
@@ -1701,6 +1816,8 @@ class RetrievalTrace(BaseModel):
     small_corpus_mode: bool = False
     degraded_mode: bool = False
     raw_context_access_mode: str = "normal"
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
+    policy_filter_audit: dict[str, Any] = Field(default_factory=dict)
     topic_snapshot: TopicWorkingSetTrace = Field(default_factory=TopicWorkingSetTrace)
     need_detection: NeedDetectionTrace | None = None
     candidate_search: CandidateSearchTrace | None = None

@@ -21,6 +21,7 @@ from atagia.memory.intimacy_boundary_policy import (
 )
 from atagia.models.schemas_api import AttachmentInput
 from atagia.services.artifact_blob_store import ArtifactBlobStore
+from atagia.services.artifact_payload_service import ArtifactPayloadService
 
 _ATTACHMENT_PROMPT_HEADER = "[Attachments omitted]"
 _ATTACHMENT_PLACEHOLDER_HEADER = "[Artifact omitted]"
@@ -157,10 +158,18 @@ class ArtifactService:
         commit: bool = True,
     ) -> list[dict[str, Any]]:
         repository = ArtifactRepository(self._connection, self._clock)
+        payload_service = ArtifactPayloadService(
+            self._connection,
+            self._clock,
+            blob_store=self._blob_store,
+        )
         created: list[dict[str, Any]] = []
         for prepared in bundle.artifacts:
             artifact = prepared.artifact
-            blob = self._blob_for_persistence(prepared.blob, user_id=str(artifact["user_id"]))
+            payload_blob = await payload_service.get_or_create_payload_blob(
+                prepared.blob,
+                user_id=str(artifact["user_id"]),
+            )
             created_artifact = await repository.create_artifact(
                 artifact_id=str(artifact["id"]),
                 user_id=str(artifact["user_id"]),
@@ -186,11 +195,7 @@ class ArtifactService:
                 metadata_json=dict(artifact.get("metadata_json") or {}),
                 summary_text=artifact.get("summary_text"),
                 index_text=artifact.get("index_text"),
-                storage_kind=blob.get("storage_kind") if blob else None,
-                blob_bytes=blob.get("blob_bytes") if blob else None,
-                storage_uri=blob.get("storage_uri") if blob else None,
-                blob_byte_size=blob.get("byte_size") if blob else None,
-                blob_sha256=blob.get("sha256") if blob else None,
+                payload_blob_id=str(payload_blob["id"]) if payload_blob is not None else None,
                 user_persona_id=artifact.get("user_persona_id"),
                 platform_id=artifact.get("platform_id"),
                 character_id=artifact.get("character_id"),
@@ -205,6 +210,10 @@ class ArtifactService:
                     artifact.get("remember_across_devices_snapshot", True)
                 ),
                 policy_snapshot=dict(artifact.get("policy_snapshot_json") or {}),
+                memory_owner_id=artifact.get("memory_owner_id"),
+                source_mind_id=artifact.get("source_mind_id"),
+                embodiment_id=artifact.get("embodiment_id"),
+                realm_id=artifact.get("realm_id"),
                 commit=False,
             )
             artifact_id = str(created_artifact["id"])
@@ -260,7 +269,7 @@ class ArtifactService:
             return None
         blob = await repository.get_artifact_blob(artifact_id, user_id)
         storage_kind = str(blob["storage_kind"]) if blob is not None else None
-        raw_available = blob is not None and (
+        raw_available = blob is not None and storage_kind != "external_ref" and (
             blob.get("blob_bytes") is not None or blob.get("storage_uri") is not None
         )
         raw_block_reason = self._raw_block_reason(
@@ -277,6 +286,7 @@ class ArtifactService:
                     raw_block_reason = "local_file_store_unavailable"
                 else:
                     content_bytes = self._blob_store.read_bytes(str(blob["storage_uri"]))
+                    storage_uri = str(blob["storage_uri"])
             else:
                 content_bytes = blob.get("blob_bytes")
                 storage_uri = blob.get("storage_uri")
@@ -344,10 +354,21 @@ class ArtifactService:
         remember_across_devices = conversation.get("remember_across_devices", True) is not False
         incognito = bool(conversation.get("incognito") or conversation.get("isolated_mode"))
         platform_locked = not remember_across_devices
+        memory_owner_id = conversation.get("active_mind_id")
+        source_mind_id = memory_owner_id
+        active_embodiment_id = conversation.get("active_embodiment_id")
+        active_realm_id = conversation.get("active_realm_id")
         policy_snapshot = {
             "user_persona_id": conversation.get("user_persona_id"),
             "platform_id": platform_id,
             "character_id": character_id,
+            "active_mind_id": memory_owner_id,
+            "source_mind_id": source_mind_id,
+            "mind_topology": conversation.get("mind_topology") or "unimind",
+            "active_embodiment_id": active_embodiment_id,
+            "cross_embodiment_mode": conversation.get("cross_embodiment_mode") or "direct_if_same_body",
+            "active_realm_id": active_realm_id,
+            "cross_realm_mode": conversation.get("cross_realm_mode") or "none",
             "conversation_id": conversation.get("id"),
             "mode": conversation.get("mode") or conversation.get("assistant_mode_id"),
             "incognito": incognito,
@@ -395,6 +416,10 @@ class ArtifactService:
                 "remember_across_chats_snapshot": remember_across_chats,
                 "remember_across_devices_snapshot": remember_across_devices,
                 "policy_snapshot_json": policy_snapshot,
+                "memory_owner_id": memory_owner_id,
+                "source_mind_id": source_mind_id,
+                "embodiment_id": active_embodiment_id,
+                "realm_id": active_realm_id,
             },
             blob={
                 "storage_kind": storage_kind,

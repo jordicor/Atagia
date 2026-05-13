@@ -121,6 +121,10 @@ async def create_memory_feedback(
             incognito=namespace.incognito,
             remember_across_chats=namespace.remember_across_chats,
             remember_across_devices=namespace.remember_across_devices,
+            active_mind_id=namespace.active_mind_id,
+            mind_topology=namespace.mind_topology,
+            active_embodiment_id=namespace.active_embodiment_id,
+            active_realm_id=namespace.active_realm_id,
             mode=namespace.mode or namespace.assistant_mode_id,
         )
     except MemoryFeedbackOwnershipError as exc:
@@ -162,7 +166,12 @@ async def get_memory_object(
     memory = await MemoryObjectRepository(connection, clock).get_visible_memory_object(
         memory_id,
         user_id,
-        **namespace.memory_kwargs(),
+        **namespace.memory_kwargs(
+            include_space=True,
+            include_mind=True,
+            include_embodiment=True,
+            include_realm=True,
+        ),
     )
     if memory is None:
         raise HTTPException(
@@ -199,7 +208,12 @@ async def edit_memory_object(
             memory_id=memory_id,
             new_text=payload.canonical_text,
             edit_source="api",
-            **namespace.memory_kwargs(),
+            **namespace.memory_kwargs(
+                include_space=True,
+                include_mind=True,
+                include_embodiment=True,
+                include_realm=True,
+            ),
         )
         return _public_memory_object(edited)
     except MemoryNotFoundError as exc:
@@ -238,7 +252,12 @@ async def delete_memory_object(
                 memory_id=memory_id,
                 hard=payload.hard,
                 confirmation=payload.confirmation,
-                **namespace.memory_kwargs(),
+                **namespace.memory_kwargs(
+                    include_space=True,
+                    include_mind=True,
+                    include_embodiment=True,
+                    include_realm=True,
+                ),
             )
     except MemoryNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -291,6 +310,12 @@ async def get_user_contract(
             incognito=namespace.incognito,
             remember_across_chats=namespace.remember_across_chats,
             remember_across_devices=namespace.remember_across_devices,
+            active_space_id=namespace.active_space_id,
+            active_space_boundary_mode=namespace.active_space_boundary_mode,
+            active_mind_id=namespace.active_mind_id,
+            mind_topology=namespace.mind_topology,
+            active_embodiment_id=namespace.active_embodiment_id,
+            active_realm_id=namespace.active_realm_id,
         )
     except KeyError as exc:
         raise HTTPException(
@@ -333,4 +358,10 @@ async def get_user_state(
         incognito=namespace.incognito,
         remember_across_chats=namespace.remember_across_chats,
         remember_across_devices=namespace.remember_across_devices,
+        active_space_id=namespace.active_space_id,
+        active_space_boundary_mode=namespace.active_space_boundary_mode,
+        active_mind_id=namespace.active_mind_id,
+        mind_topology=namespace.mind_topology,
+        active_embodiment_id=namespace.active_embodiment_id,
+        active_realm_id=namespace.active_realm_id,
     )

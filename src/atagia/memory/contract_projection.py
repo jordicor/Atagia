@@ -220,6 +220,10 @@ class ContractProjector:
                     "dimension_name": signal.dimension_name,
                     "value_json": signal.value_json,
                     "source_message_ids": [context.source_message_id],
+                    "space_boundary": self._space_boundary_payload(context),
+                    "mind_perspective": self._mind_perspective_payload(context),
+                    "embodiment": self._embodiment_payload(context),
+                    "realm": self._realm_payload(context),
                     "source_turn_policy": self._source_turn_policy_snapshot(
                         context,
                         scope=signal.scope,
@@ -244,6 +248,14 @@ class ContractProjector:
                     else None
                 ),
                 scope_canonical=signal.scope.value,
+                space_id=context.active_space_id,
+                space_boundary_mode=context.active_space_boundary_mode.value
+                if context.active_space_id is not None
+                else None,
+                memory_owner_id=context.active_mind_id,
+                source_mind_id=context.source_mind_id or context.active_mind_id,
+                embodiment_id=context.active_embodiment_id,
+                realm_id=context.active_realm_id,
             )
             if memory_object is None:
                 raise RuntimeError("Failed to create interaction_contract memory object")
@@ -314,6 +326,14 @@ class ContractProjector:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        sensitivity_gates_enabled: bool = False,
+        allow_private_sensitivity: bool = False,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, dict[str, Any]]:
         rows = await self._contract_repository.list_for_context(
             user_id=user_id,
@@ -326,15 +346,38 @@ class ContractProjector:
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            sensitivity_gates_enabled=sensitivity_gates_enabled,
+            allow_private_sensitivity=allow_private_sensitivity,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
         )
         merged: dict[str, tuple[int, str, dict[str, Any]]] = {}
         for row in rows:
             dimension_name = str(row["dimension_name"])
             scope_rank = self._scope_rank(MemoryScope(row["scope"]))
             updated_at = str(row["updated_at"])
+            value_json = dict(row["value_json"])
+            row_realm_id = row.get("realm_id")
+            if (
+                active_realm_id is not None
+                and row_realm_id is not None
+                and str(row_realm_id) != str(active_realm_id)
+            ):
+                value_json.setdefault(
+                    "realm",
+                    {
+                        "active_realm_id": str(row_realm_id),
+                        "active_request_realm_id": str(active_realm_id),
+                        "cross_realm_mode": "applicable",
+                    },
+                )
             current = merged.get(dimension_name)
             if current is None or (scope_rank, updated_at) > (current[0], current[1]):
-                merged[dimension_name] = (scope_rank, updated_at, dict(row["value_json"]))
+                merged[dimension_name] = (scope_rank, updated_at, value_json)
 
         current_contract = {dimension_name: value for dimension_name, (_, _, value) in merged.items()}
         for dimension_name in await self._contract_repository.get_mode_contract_dimensions_priority(
@@ -358,8 +401,47 @@ class ContractProjector:
             incognito=context.incognito or context.isolated_mode,
             remember_across_chats=context.remember_across_chats,
             remember_across_devices=context.remember_across_devices,
+            active_space_id=context.active_space_id,
+            active_space_boundary_mode=context.active_space_boundary_mode,
+            active_mind_id=context.active_mind_id,
+            mind_topology=context.mind_topology,
+            active_embodiment_id=context.active_embodiment_id,
+            active_realm_id=context.active_realm_id,
         )
         return count == 0
+
+    @staticmethod
+    def _space_boundary_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "active_space_id": context.active_space_id,
+            "boundary_mode": context.active_space_boundary_mode.value,
+            "display_name": context.active_space_display_name,
+        }
+
+    @staticmethod
+    def _mind_perspective_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "memory_owner_id": context.active_mind_id,
+            "source_mind_id": context.source_mind_id or context.active_mind_id,
+            "mind_topology": context.mind_topology.value,
+            "display_name": context.active_mind_display_name,
+        }
+
+    @staticmethod
+    def _embodiment_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "active_embodiment_id": context.active_embodiment_id,
+            "cross_embodiment_mode": context.cross_embodiment_mode.value,
+            "display_name": context.active_embodiment_display_name,
+        }
+
+    @staticmethod
+    def _realm_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+        return {
+            "active_realm_id": context.active_realm_id,
+            "cross_realm_mode": context.cross_realm_mode.value,
+            "display_name": context.active_realm_display_name,
+        }
 
     def _build_prompt(
         self,
@@ -518,6 +600,13 @@ class ContractProjector:
             "user_persona_id": context.user_persona_id,
             "platform_id": context.platform_id,
             "character_id": context.character_id if context.character_id is not None else context.workspace_id,
+            "active_mind_id": context.active_mind_id,
+            "source_mind_id": context.source_mind_id or context.active_mind_id,
+            "mind_topology": context.mind_topology.value,
+            "active_embodiment_id": context.active_embodiment_id,
+            "cross_embodiment_mode": context.cross_embodiment_mode.value,
+            "active_realm_id": context.active_realm_id,
+            "cross_realm_mode": context.cross_realm_mode.value,
             "conversation_id": context.conversation_id,
             "mode": context.mode or context.assistant_mode_id,
             "incognito": context.incognito or context.isolated_mode,

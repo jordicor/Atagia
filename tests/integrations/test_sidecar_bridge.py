@@ -40,20 +40,27 @@ class FakeAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
     ) -> str:
-        self.created_conversations.append(
-            {
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "user_persona_id": user_persona_id,
-                "platform_id": platform_id,
-                "character_id": character_id,
-                "mode": mode,
-                "incognito": incognito,
-            }
-        )
+        call = {
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "user_persona_id": user_persona_id,
+            "platform_id": platform_id,
+            "character_id": character_id,
+            "active_presence_id": active_presence_id,
+            "mode": mode,
+            "incognito": incognito,
+        }
+        if embodiment_id is not None:
+            call["embodiment_id"] = embodiment_id
+        if realm_id is not None:
+            call["realm_id"] = realm_id
+        self.created_conversations.append(call)
         return conversation_id or "generated_conversation"
 
     async def get_context(
@@ -72,6 +79,9 @@ class FakeAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -79,27 +89,31 @@ class FakeAtagiaClient:
     ) -> object:
         if self.fail_context:
             raise RuntimeError("context failure")
-        self.context_calls.append(
-            {
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "message": message,
-                "mode": mode,
-                "user_persona_id": user_persona_id,
-                "platform_id": platform_id,
-                "character_id": character_id,
-                "occurred_at": occurred_at,
-                "attachments": attachments,
-                "message_id": message_id,
-                "source_seq": source_seq,
-                "operational_profile": operational_profile,
-                "operational_signals": operational_signals,
-                "incognito": incognito,
-                "ingest_origin": ingest_origin,
-                "confirmation_strategy": confirmation_strategy,
-                "memory_privacy_mode": memory_privacy_mode,
-            }
-        )
+        call = {
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "message": message,
+            "mode": mode,
+            "user_persona_id": user_persona_id,
+            "platform_id": platform_id,
+            "character_id": character_id,
+            "active_presence_id": active_presence_id,
+            "occurred_at": occurred_at,
+            "attachments": attachments,
+            "message_id": message_id,
+            "source_seq": source_seq,
+            "operational_profile": operational_profile,
+            "operational_signals": operational_signals,
+            "incognito": incognito,
+            "ingest_origin": ingest_origin,
+            "confirmation_strategy": confirmation_strategy,
+            "memory_privacy_mode": memory_privacy_mode,
+        }
+        if embodiment_id is not None:
+            call["embodiment_id"] = embodiment_id
+        if realm_id is not None:
+            call["realm_id"] = realm_id
+        self.context_calls.append(call)
         return self.context_result
 
     async def ingest_message(
@@ -119,6 +133,9 @@ class FakeAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -126,28 +143,32 @@ class FakeAtagiaClient:
     ) -> None:
         if self.fail_ingest:
             raise RuntimeError("ingest failure")
-        self.ingest_calls.append(
-            {
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "role": role,
-                "text": text,
-                "mode": mode,
-                "user_persona_id": user_persona_id,
-                "platform_id": platform_id,
-                "character_id": character_id,
-                "occurred_at": occurred_at,
-                "attachments": attachments,
-                "message_id": message_id,
-                "source_seq": source_seq,
-                "operational_profile": operational_profile,
-                "operational_signals": operational_signals,
-                "incognito": incognito,
-                "ingest_origin": ingest_origin,
-                "confirmation_strategy": confirmation_strategy,
-                "memory_privacy_mode": memory_privacy_mode,
-            }
-        )
+        call = {
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "role": role,
+            "text": text,
+            "mode": mode,
+            "user_persona_id": user_persona_id,
+            "platform_id": platform_id,
+            "character_id": character_id,
+            "active_presence_id": active_presence_id,
+            "occurred_at": occurred_at,
+            "attachments": attachments,
+            "message_id": message_id,
+            "source_seq": source_seq,
+            "operational_profile": operational_profile,
+            "operational_signals": operational_signals,
+            "incognito": incognito,
+            "ingest_origin": ingest_origin,
+            "confirmation_strategy": confirmation_strategy,
+            "memory_privacy_mode": memory_privacy_mode,
+        }
+        if embodiment_id is not None:
+            call["embodiment_id"] = embodiment_id
+        if realm_id is not None:
+            call["realm_id"] = realm_id
+        self.ingest_calls.append(call)
 
     async def add_response(
         self,
@@ -163,6 +184,9 @@ class FakeAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
@@ -171,26 +195,30 @@ class FakeAtagiaClient:
     ) -> None:
         if self.fail_response:
             raise RuntimeError("response failure")
-        self.response_calls.append(
-            {
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "text": text,
-                "occurred_at": occurred_at,
-                "message_id": message_id,
-                "source_seq": source_seq,
-                "operational_profile": operational_profile,
-                "operational_signals": operational_signals,
-                "user_persona_id": user_persona_id,
-                "platform_id": platform_id,
-                "character_id": character_id,
-                "mode": mode,
-                "incognito": incognito,
-                "ingest_origin": ingest_origin,
-                "confirmation_strategy": confirmation_strategy,
-                "memory_privacy_mode": memory_privacy_mode,
-            }
-        )
+        call = {
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "text": text,
+            "occurred_at": occurred_at,
+            "message_id": message_id,
+            "source_seq": source_seq,
+            "operational_profile": operational_profile,
+            "operational_signals": operational_signals,
+            "user_persona_id": user_persona_id,
+            "platform_id": platform_id,
+            "character_id": character_id,
+            "active_presence_id": active_presence_id,
+            "mode": mode,
+            "incognito": incognito,
+            "ingest_origin": ingest_origin,
+            "confirmation_strategy": confirmation_strategy,
+            "memory_privacy_mode": memory_privacy_mode,
+        }
+        if embodiment_id is not None:
+            call["embodiment_id"] = embodiment_id
+        if realm_id is not None:
+            call["realm_id"] = realm_id
+        self.response_calls.append(call)
 
     async def list_pending_memory_confirmations(self, user_id: str, **filters: Any) -> object:
         return {"items": [], "user_id": user_id, "filters": filters}
@@ -266,6 +294,8 @@ def test_config_from_env_parses_sidecar_settings(
     monkeypatch.setenv("ATAGIA_USER_PERSONA_ID", "persona-1")
     monkeypatch.setenv("ATAGIA_PLATFORM_ID", "platform-1")
     monkeypatch.setenv("ATAGIA_CHARACTER_ID", "character-1")
+    monkeypatch.setenv("ATAGIA_EMBODIMENT_ID", "body-1")
+    monkeypatch.setenv("ATAGIA_REALM_ID", "realm-1")
     monkeypatch.setenv("ATAGIA_OPERATIONAL_PROFILE", "normal")
     monkeypatch.setenv("ATAGIA_TIMEOUT_SECONDS", "12.5")
     monkeypatch.setenv("ATAGIA_INCOGNITO", "true")
@@ -282,6 +312,8 @@ def test_config_from_env_parses_sidecar_settings(
     assert config.user_persona_id == "persona-1"
     assert config.platform_id == "platform-1"
     assert config.character_id == "character-1"
+    assert config.embodiment_id == "body-1"
+    assert config.realm_id == "realm-1"
     assert config.operational_profile == "normal"
     assert config.timeout_seconds == 12.5
     assert config.incognito is True
@@ -333,6 +365,7 @@ async def test_bridge_maps_ids_and_context_options_to_client() -> None:
                 "user_persona_id": None,
                 "platform_id": "platform-1",
                 "character_id": "character-1",
+                "active_presence_id": None,
                 "mode": "personal_assistant",
                 "incognito": False,
             }
@@ -346,6 +379,7 @@ async def test_bridge_maps_ids_and_context_options_to_client() -> None:
             "user_persona_id": None,
             "platform_id": "platform-1",
             "character_id": "character-1",
+            "active_presence_id": None,
             "occurred_at": "2026-04-16T04:00:00+00:00",
             "attachments": [{"kind": "document", "name": "brief.pdf"}],
             "message_id": None,
@@ -358,6 +392,80 @@ async def test_bridge_maps_ids_and_context_options_to_client() -> None:
             "memory_privacy_mode": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_bridge_propagates_embodiment_id_to_client_surfaces() -> None:
+    factory = FakeFactory()
+    bridge = SidecarBridge(
+        SidecarBridgeConfig(
+            enabled=True,
+            transport="local",
+            platform_id="platform-1",
+            embodiment_id="body-config",
+        ),
+        client_factory=factory,
+    )
+
+    conversation_id = await bridge.ensure_user_and_conversation(129, 1892)
+    context = await bridge.get_context_for_turn(129, 1892, "remember this")
+    ingested = await bridge.ingest_message(129, 1892, "user", "hello")
+    recorded = await bridge.record_assistant_response(129, 1892, "got it")
+
+    assert conversation_id == "1892"
+    assert context is factory.client.context_result
+    assert ingested is True
+    assert recorded is True
+    assert factory.client.created_conversations[0]["embodiment_id"] == "body-config"
+    assert factory.client.context_calls[0]["embodiment_id"] == "body-config"
+    assert factory.client.ingest_calls[0]["embodiment_id"] == "body-config"
+    assert factory.client.response_calls[0]["embodiment_id"] == "body-config"
+
+    await bridge.get_context_for_turn(
+        129,
+        1892,
+        "override",
+        embodiment_id="body-override",
+    )
+
+    assert factory.client.context_calls[-1]["embodiment_id"] == "body-override"
+
+
+@pytest.mark.asyncio
+async def test_bridge_propagates_realm_id_to_client_surfaces() -> None:
+    factory = FakeFactory()
+    bridge = SidecarBridge(
+        SidecarBridgeConfig(
+            enabled=True,
+            transport="local",
+            platform_id="platform-1",
+            realm_id="realm-config",
+        ),
+        client_factory=factory,
+    )
+
+    conversation_id = await bridge.ensure_user_and_conversation(129, 1892)
+    context = await bridge.get_context_for_turn(129, 1892, "remember this")
+    ingested = await bridge.ingest_message(129, 1892, "user", "hello")
+    recorded = await bridge.record_assistant_response(129, 1892, "got it")
+
+    assert conversation_id == "1892"
+    assert context is factory.client.context_result
+    assert ingested is True
+    assert recorded is True
+    assert factory.client.created_conversations[0]["realm_id"] == "realm-config"
+    assert factory.client.context_calls[0]["realm_id"] == "realm-config"
+    assert factory.client.ingest_calls[0]["realm_id"] == "realm-config"
+    assert factory.client.response_calls[0]["realm_id"] == "realm-config"
+
+    await bridge.get_context_for_turn(
+        129,
+        1892,
+        "override",
+        realm_id="realm-override",
+    )
+
+    assert factory.client.context_calls[-1]["realm_id"] == "realm-override"
 
 
 @pytest.mark.asyncio
@@ -386,6 +494,7 @@ async def test_bridge_accepts_aurvek_platform_id() -> None:
             "user_persona_id": None,
             "platform_id": "aurvek",
             "character_id": "prompt:3",
+            "active_presence_id": None,
             "occurred_at": None,
             "attachments": None,
             "message_id": "aurvek:msg:4",

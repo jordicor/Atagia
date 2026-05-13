@@ -56,6 +56,18 @@ _TRUNCATION_STOP_REASONS = frozenset({"max_tokens", "model_context_window_exceed
 _BLOCKED_STOP_REASONS = frozenset({"refusal"})
 _TRANSIENT_STOP_REASONS = frozenset({"pause_turn"})
 _SUCCESS_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "tool_use"})
+_ANTHROPIC_NO_TEMPERATURE_MODELS = frozenset({"claude-opus-4-7"})
+
+
+def _canonical_model_name(model: str) -> str:
+    normalized = model.strip().lower()
+    if normalized.startswith("anthropic/"):
+        return normalized.split("/", 1)[1]
+    return normalized
+
+
+def _model_accepts_temperature(model: str) -> bool:
+    return _canonical_model_name(model) not in _ANTHROPIC_NO_TEMPERATURE_MODELS
 
 
 def _stop_reason_label(value: Any) -> str | None:
@@ -230,15 +242,24 @@ def _sanitize_schema(node: Any) -> Any:
     return cleaned
 
 
+def _anthropic_output_effort(request: LLMCompletionRequest) -> str | None:
+    effort = request.metadata.get("anthropic_output_effort")
+    if isinstance(effort, str) and effort in {"low", "medium", "high", "xhigh", "max"}:
+        return effort
+    return None
+
+
 def _completion_output_config(request: LLMCompletionRequest) -> dict[str, Any] | None:
-    if request.response_schema is None:
-        return None
-    return {
-        "format": {
+    config: dict[str, Any] = {}
+    if request.response_schema is not None:
+        config["format"] = {
             "type": "json_schema",
             "schema": _sanitize_schema(request.response_schema),
         }
-    }
+    effort = _anthropic_output_effort(request)
+    if effort is not None:
+        config["effort"] = effort
+    return config or None
 
 
 def _stream_output_format(request: LLMCompletionRequest) -> dict[str, Any] | None:
@@ -279,7 +300,7 @@ class AnthropicProvider(LLMProvider):
         }
         if system_blocks:
             kwargs["system"] = system_blocks
-        if request.temperature is not None:
+        if request.temperature is not None and _model_accepts_temperature(request.model):
             kwargs["temperature"] = request.temperature
         if request.tools:
             kwargs["tools"] = [
@@ -356,7 +377,7 @@ class AnthropicProvider(LLMProvider):
         }
         if system_blocks:
             kwargs["system"] = system_blocks
-        if request.temperature is not None:
+        if request.temperature is not None and _model_accepts_temperature(request.model):
             kwargs["temperature"] = request.temperature
         if request.tools:
             kwargs["tools"] = [
@@ -370,6 +391,9 @@ class AnthropicProvider(LLMProvider):
         output_format = _stream_output_format(request)
         if output_format is not None:
             kwargs["output_format"] = output_format
+        effort = _anthropic_output_effort(request)
+        if effort is not None:
+            kwargs["output_config"] = {"effort": effort}
         thinking = _thinking_config(request, max_tokens)
         if thinking is not None:
             kwargs["thinking"] = thinking

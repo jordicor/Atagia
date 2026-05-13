@@ -20,12 +20,12 @@ from atagia.memory.candidate_search import CandidateSearch
 from atagia.memory.candidate_diversity import early_diversity_select
 from atagia.memory.context_composer import ContextComposer
 from atagia.memory.contract_projection import ContractProjector
-from atagia.memory.intimacy_boundary_policy import candidate_allows_intimacy_boundary
+from atagia.memory.coverage_expander import CoverageExpansionPlan, CoverageExpander
 from atagia.memory.need_detector import NeedDetector
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.memory.retrieval_diagnostics import build_retrieval_sufficiency_diagnostic
 from atagia.memory.retrieval_custody import build_candidate_custody
-from atagia.memory.retrieval_planner import RetrievalPlanner
+from atagia.memory.retrieval_planner import RetrievalPlanner, build_retrieval_fts_queries
 from atagia.models.schemas_memory import (
     CandidateSearchTrace,
     ComposedContext,
@@ -33,8 +33,10 @@ from atagia.models.schemas_memory import (
     ExtractionConversationContext,
     MemoryObjectType,
     MemoryScope,
+    MemoryStatus,
     NeedTrigger,
     NeedDetectionTrace,
+    PlannedSubQuery,
     QueryIntelligenceResult,
     RetrievalParams,
     RetrievalPlan,
@@ -57,6 +59,13 @@ COVERAGE_CANDIDATES_PER_SOURCE_MESSAGE: Final[int] = 3
 COVERAGE_CANDIDATE_LIMIT: Final[int] = 12
 COVERAGE_INHERITED_SCORE_CAP: Final[float] = 0.70
 COVERAGE_INHERITED_SCORE_FLOOR: Final[float] = 0.05
+LLM_COVERAGE_CANDIDATE_LIMIT: Final[int] = 12
+LLM_COVERAGE_MAX_SUBQUERIES: Final[int] = 3
+PRIVACY_OFF_RETRIEVAL_STATUSES: Final[tuple[MemoryStatus, ...]] = (
+    MemoryStatus.ACTIVE,
+    MemoryStatus.REVIEW_REQUIRED,
+    MemoryStatus.PENDING_USER_CONFIRMATION,
+)
 
 
 def _default_query_intelligence(message_text: str) -> QueryIntelligenceResult:
@@ -100,6 +109,7 @@ class RetrievalPipeline:
         self._contract_repository = ContractDimensionRepository(connection, clock)
         self._summary_repository = SummaryRepository(connection, clock)
         self._need_detector = NeedDetector(llm_client=llm_client, clock=clock, settings=self._settings)
+        self._coverage_expander = CoverageExpander(llm_client=llm_client, settings=self._settings)
         self._planner = RetrievalPlanner()
         self._candidate_search = CandidateSearch(
             connection,
@@ -131,11 +141,27 @@ class RetrievalPipeline:
         trace: RetrievalTrace | None = None,
     ) -> PipelineResult:
         effective_ablation = ablation or AblationConfig()
-        effective_policy = self._override_policy(resolved_policy, effective_ablation)
+        configured_policy = self._override_policy(resolved_policy, effective_ablation)
+        effective_policy = self._policy_for_sql_privacy_mode(
+            configured_policy,
+            effective_ablation,
+        )
+        effective_cold_start = False if effective_policy.allow_private_sensitivity else cold_start
         transcript = conversation_messages or []
         stage_timings: dict[str, float] = {}
         pipeline_start = perf_counter() if trace is not None else 0.0
         character_id = _effective_character_id(conversation_context)
+        if trace is not None:
+            trace.privacy_enforcement = effective_ablation.privacy_enforcement
+        if effective_ablation.privacy_enforcement != "enforce":
+            logger.warning(
+                "retrieval_privacy_enforcement_not_enforced_for_benchmark",
+                extra={
+                    "user_id": conversation_context.user_id,
+                    "conversation_id": conversation_context.conversation_id,
+                    "privacy_enforcement": effective_ablation.privacy_enforcement,
+                },
+            )
 
         # Wave 1-A: Small-corpus shortcut. When the full eligible corpus fits
         # inside the context budget there is nothing to rank, so we build the
@@ -149,6 +175,7 @@ class RetrievalPipeline:
                 message_text=message_text,
                 conversation_context=conversation_context,
                 resolved_policy=effective_policy,
+                audit_policy=configured_policy,
                 effective_ablation=effective_ablation,
                 transcript=transcript,
                 workspace_rollup=workspace_rollup,
@@ -168,7 +195,7 @@ class RetrievalPipeline:
                 query_intelligence=_default_query_intelligence(message_text),
                 conversation_context=conversation_context,
                 resolved_policy=effective_policy,
-                cold_start=cold_start,
+                cold_start=effective_cold_start,
                 ablation=effective_ablation,
             ),
         )
@@ -277,7 +304,7 @@ class RetrievalPipeline:
                     query_intelligence=query_intelligence,
                     conversation_context=conversation_context,
                     resolved_policy=effective_policy,
-                    cold_start=cold_start,
+                    cold_start=effective_cold_start,
                     ablation=effective_ablation,
                 ),
             )
@@ -302,20 +329,39 @@ class RetrievalPipeline:
             ),
         )
         raw_candidates = self._merge_candidates(raw_candidates, coverage_candidates)
+        llm_coverage_candidates = await self._measure_stage(
+            stage_timings,
+            "llm_coverage_expansion",
+            self._llm_coverage_expansion_candidates(
+                message_text=message_text,
+                raw_candidates=raw_candidates,
+                conversation_context=conversation_context,
+                retrieval_plan=retrieval_plan,
+                ablation=effective_ablation,
+            ),
+        )
+        raw_candidates = self._merge_candidates(raw_candidates, llm_coverage_candidates)
         # Regrounding is decided by the winning plan (enriched when available)
         # so the base search does not inject derived memories when high-stakes
         # needs require direct evidence.
         pre_regrounding_candidates = list(raw_candidates)
         raw_candidates = self._apply_regrounding_requirements(raw_candidates, retrieval_plan)
-        filter_reasons_by_id = {
-            **self._regrounding_filter_reasons(pre_regrounding_candidates, raw_candidates),
-            **self._candidate_filter_reasons(
-                raw_candidates,
-                effective_policy,
-                detected_needs,
-                retrieval_plan,
-            ),
-        }
+        regrounding_filter_reasons = self._regrounding_filter_reasons(
+            pre_regrounding_candidates,
+            raw_candidates,
+        )
+        audit_plan = self._plan_for_policy_audit(retrieval_plan, configured_policy)
+        candidate_policy_filter_reasons = self._candidate_filter_reasons(
+            raw_candidates,
+            configured_policy,
+            detected_needs,
+            audit_plan,
+        )
+        filter_reasons_by_id = self._actual_filter_reasons(
+            regrounding_filter_reasons,
+            candidate_policy_filter_reasons,
+            privacy_enforcement=effective_ablation.privacy_enforcement,
+        )
         # Aggregate the two lanes into single "planning" and "candidate_search"
         # keys so downstream telemetry stays consistent across pipeline variants.
         stage_timings["planning"] = stage_timings.get("base_planning", 0.0) + stage_timings.get(
@@ -325,6 +371,7 @@ class RetrievalPipeline:
             stage_timings.get("base_candidate_search", 0.0)
             + stage_timings.get("enriched_candidate_search", 0.0)
             + stage_timings.get("coverage_candidate_expansion", 0.0)
+            + stage_timings.get("llm_coverage_expansion", 0.0)
         )
         stage_timings["candidate_search"] = candidate_total_ms
         if trace is not None:
@@ -334,11 +381,18 @@ class RetrievalPipeline:
                 candidate_total_ms,
             )
 
-        filtered_candidates = self._scorer.filter_candidates(
+        if trace is not None:
+            trace.policy_filter_audit = self._build_policy_filter_audit(
+                effective_ablation.privacy_enforcement,
+                candidate_policy_filter_reasons,
+            )
+
+        filtered_candidates = self._filter_candidates_for_policy_mode(
             raw_candidates,
             effective_policy,
             detected_needs,
             retrieval_plan=retrieval_plan,
+            privacy_enforcement=effective_ablation.privacy_enforcement,
         )
         scoring_policy = self._expand_recall_or_recovery_scoring_budget(
             effective_policy,
@@ -346,6 +400,10 @@ class RetrievalPipeline:
             degraded_mode=degraded_mode,
             detected_needs=detected_needs,
             item_count=len(filtered_candidates),
+        )
+        scoring_policy = self._policy_for_late_privacy_mode(
+            scoring_policy,
+            effective_ablation,
         )
         shortlist = early_diversity_select(
             filtered_candidates,
@@ -392,6 +450,9 @@ class RetrievalPipeline:
                 scored_candidates,
                 scoring_elapsed,
                 rejection_reasons=self._rejection_reason_counts(filter_reasons_by_id),
+                policy_audit_reason_counts=self._rejection_reason_counts(
+                    candidate_policy_filter_reasons
+                ),
             )
 
         retrieval_sufficiency = build_retrieval_sufficiency_diagnostic(
@@ -423,6 +484,19 @@ class RetrievalPipeline:
                     incognito=conversation_context.incognito,
                     remember_across_chats=conversation_context.remember_across_chats,
                     remember_across_devices=conversation_context.remember_across_devices,
+                    sensitivity_gates_enabled=self._privacy_sql_filters_disabled(
+                        effective_ablation,
+                    ),
+                    allow_private_sensitivity=self._effective_allow_private_for_sql_repository(
+                        effective_policy,
+                        effective_ablation,
+                    ),
+                    active_space_id=conversation_context.active_space_id,
+                    active_space_boundary_mode=conversation_context.active_space_boundary_mode,
+                    active_mind_id=conversation_context.active_mind_id,
+                    mind_topology=conversation_context.mind_topology,
+                    active_embodiment_id=conversation_context.active_embodiment_id,
+                    active_realm_id=conversation_context.active_realm_id,
                 ),
             )
 
@@ -441,6 +515,15 @@ class RetrievalPipeline:
                 incognito=conversation_context.incognito,
                 remember_across_chats=conversation_context.remember_across_chats,
                 remember_across_devices=conversation_context.remember_across_devices,
+                sensitivity_gates_enabled=self._privacy_sql_filters_disabled(
+                    effective_ablation,
+                ),
+                active_space_id=conversation_context.active_space_id,
+                active_space_boundary_mode=conversation_context.active_space_boundary_mode,
+                active_mind_id=conversation_context.active_mind_id,
+                mind_topology=conversation_context.mind_topology,
+                active_embodiment_id=conversation_context.active_embodiment_id,
+                active_realm_id=conversation_context.active_realm_id,
             ),
         )
 
@@ -459,6 +542,7 @@ class RetrievalPipeline:
             scoring_policy,
             retrieval_plan,
             degraded_mode=degraded_mode,
+            detected_needs=detected_needs,
             item_count=len(scored_candidates),
         )
         composition_start = perf_counter() if trace is not None else 0.0
@@ -473,7 +557,10 @@ class RetrievalPipeline:
                 current_contract=current_contract,
                 workspace_rollup=effective_workspace_rollup,
                 user_state=user_state,
-                resolved_policy=composition_policy,
+                resolved_policy=self._policy_for_late_privacy_mode(
+                    composition_policy,
+                    effective_ablation,
+                ),
                 conversation_messages=transcript,
                 composer_strategy=effective_ablation.composer_strategy,
             ),
@@ -528,6 +615,8 @@ class RetrievalPipeline:
         resolved_policy: ResolvedRetrievalPolicy,
     ) -> bool:
         """Return True if the full eligible corpus fits the small-corpus budget."""
+        if resolved_policy.allow_private_sensitivity:
+            return False
         threshold_ratio = self._settings.small_corpus_token_threshold_ratio
         if threshold_ratio <= 0.0:
             return False
@@ -549,6 +638,13 @@ class RetrievalPipeline:
             incognito=conversation_context.incognito,
             remember_across_chats=conversation_context.remember_across_chats,
             remember_across_devices=conversation_context.remember_across_devices,
+            sensitivity_gates_enabled=resolved_policy.allow_private_sensitivity,
+            active_space_id=conversation_context.active_space_id,
+            active_space_boundary_mode=conversation_context.active_space_boundary_mode,
+            active_mind_id=conversation_context.active_mind_id,
+            mind_topology=conversation_context.mind_topology,
+            active_embodiment_id=conversation_context.active_embodiment_id,
+            active_realm_id=conversation_context.active_realm_id,
         )
         message_chars = await self._message_repository.sum_text_length_for_context(
             conversation_context.user_id,
@@ -566,6 +662,7 @@ class RetrievalPipeline:
         message_text: str,
         conversation_context: ExtractionConversationContext,
         resolved_policy: ResolvedRetrievalPolicy,
+        audit_policy: ResolvedRetrievalPolicy,
         effective_ablation: AblationConfig,
         transcript: list[dict[str, Any]],
         workspace_rollup: dict[str, Any] | None,
@@ -695,14 +792,29 @@ class RetrievalPipeline:
                 workspace_id=conversation_context.workspace_id,
                 conversation_id=conversation_context.conversation_id,
                 assistant_mode_id=conversation_context.assistant_mode_id,
-                privacy_ceiling=resolved_policy.privacy_ceiling,
-                allow_intimacy_context=resolved_policy.allow_intimacy_context,
+                privacy_ceiling=self._effective_privacy_ceiling(
+                    resolved_policy,
+                    effective_ablation,
+                ),
+                allow_intimacy_context=self._effective_allow_intimacy_context(
+                    resolved_policy,
+                    effective_ablation,
+                ),
                 user_persona_id=conversation_context.user_persona_id,
                 platform_id=conversation_context.platform_id,
                 character_id=character_id,
                 incognito=conversation_context.incognito,
                 remember_across_chats=conversation_context.remember_across_chats,
                 remember_across_devices=conversation_context.remember_across_devices,
+                sensitivity_gates_enabled=self._privacy_sql_filters_disabled(
+                    effective_ablation,
+                ),
+                active_space_id=conversation_context.active_space_id,
+                active_space_boundary_mode=conversation_context.active_space_boundary_mode,
+                active_mind_id=conversation_context.active_mind_id,
+                mind_topology=conversation_context.mind_topology,
+                active_embodiment_id=conversation_context.active_embodiment_id,
+                active_realm_id=conversation_context.active_realm_id,
             ),
         )
         if retrieval_plan.exact_recall_mode or retrieval_plan.raw_context_access_mode in {"verbatim", "artifact"}:
@@ -717,15 +829,22 @@ class RetrievalPipeline:
             raw_candidates = self._merge_candidates(raw_candidates, searched_candidates)
         pre_regrounding_candidates = list(raw_candidates)
         raw_candidates = self._apply_regrounding_requirements(raw_candidates, retrieval_plan)
-        filter_reasons_by_id = {
-            **self._regrounding_filter_reasons(pre_regrounding_candidates, raw_candidates),
-            **self._candidate_filter_reasons(
-                raw_candidates,
-                resolved_policy,
-                detected_needs,
-                retrieval_plan,
-            ),
-        }
+        regrounding_filter_reasons = self._regrounding_filter_reasons(
+            pre_regrounding_candidates,
+            raw_candidates,
+        )
+        audit_plan = self._plan_for_policy_audit(retrieval_plan, audit_policy)
+        candidate_policy_filter_reasons = self._candidate_filter_reasons(
+            raw_candidates,
+            audit_policy,
+            detected_needs,
+            audit_plan,
+        )
+        filter_reasons_by_id = self._actual_filter_reasons(
+            regrounding_filter_reasons,
+            candidate_policy_filter_reasons,
+            privacy_enforcement=effective_ablation.privacy_enforcement,
+        )
         if trace is not None:
             candidate_elapsed = (perf_counter() - candidate_start) * 1000.0
             trace.candidate_search = self._build_candidate_search_trace(
@@ -733,16 +852,25 @@ class RetrievalPipeline:
                 retrieval_plan,
                 candidate_elapsed,
             )
+            trace.policy_filter_audit = self._build_policy_filter_audit(
+                effective_ablation.privacy_enforcement,
+                candidate_policy_filter_reasons,
+            )
 
-        filtered_candidates = self._scorer.filter_candidates(
+        filtered_candidates = self._filter_candidates_for_policy_mode(
             raw_candidates,
             resolved_policy,
             detected_needs,
             retrieval_plan=retrieval_plan,
+            privacy_enforcement=effective_ablation.privacy_enforcement,
         )
         scoring_policy = self._expand_candidate_budget(
             resolved_policy,
             item_count=len(filtered_candidates),
+        )
+        scoring_policy = self._policy_for_late_privacy_mode(
+            scoring_policy,
+            effective_ablation,
         )
         shortlist = early_diversity_select(
             filtered_candidates,
@@ -786,6 +914,9 @@ class RetrievalPipeline:
                 scored_candidates,
                 (perf_counter() - scoring_start) * 1000.0,
                 rejection_reasons=self._rejection_reason_counts(filter_reasons_by_id),
+                policy_audit_reason_counts=self._rejection_reason_counts(
+                    candidate_policy_filter_reasons
+                ),
             )
 
         retrieval_sufficiency = build_retrieval_sufficiency_diagnostic(
@@ -817,6 +948,19 @@ class RetrievalPipeline:
                     incognito=conversation_context.incognito,
                     remember_across_chats=conversation_context.remember_across_chats,
                     remember_across_devices=conversation_context.remember_across_devices,
+                    sensitivity_gates_enabled=self._privacy_sql_filters_disabled(
+                        effective_ablation,
+                    ),
+                    allow_private_sensitivity=self._effective_allow_private_for_sql_repository(
+                        resolved_policy,
+                        effective_ablation,
+                    ),
+                    active_space_id=conversation_context.active_space_id,
+                    active_space_boundary_mode=conversation_context.active_space_boundary_mode,
+                    active_mind_id=conversation_context.active_mind_id,
+                    mind_topology=conversation_context.mind_topology,
+                    active_embodiment_id=conversation_context.active_embodiment_id,
+                    active_realm_id=conversation_context.active_realm_id,
                 ),
             )
 
@@ -835,6 +979,15 @@ class RetrievalPipeline:
                 incognito=conversation_context.incognito,
                 remember_across_chats=conversation_context.remember_across_chats,
                 remember_across_devices=conversation_context.remember_across_devices,
+                sensitivity_gates_enabled=self._privacy_sql_filters_disabled(
+                    effective_ablation,
+                ),
+                active_space_id=conversation_context.active_space_id,
+                active_space_boundary_mode=conversation_context.active_space_boundary_mode,
+                active_mind_id=conversation_context.active_mind_id,
+                mind_topology=conversation_context.mind_topology,
+                active_embodiment_id=conversation_context.active_embodiment_id,
+                active_realm_id=conversation_context.active_realm_id,
             ),
         )
 
@@ -861,7 +1014,10 @@ class RetrievalPipeline:
                 current_contract=current_contract,
                 workspace_rollup=effective_workspace_rollup,
                 user_state=user_state,
-                resolved_policy=scoring_policy,
+                resolved_policy=self._policy_for_late_privacy_mode(
+                    scoring_policy,
+                    effective_ablation,
+                ),
                 conversation_messages=transcript,
                 composer_strategy=effective_ablation.composer_strategy,
             ),
@@ -952,16 +1108,30 @@ class RetrievalPipeline:
         retrieval_plan: RetrievalPlan,
         *,
         degraded_mode: bool,
+        detected_needs: list[Any],
         item_count: int,
     ) -> ResolvedRetrievalPolicy:
         """Use already-scored recall/recovery candidates when token budget permits."""
-        if not retrieval_plan.exact_recall_mode and not degraded_mode:
+        recovery_needs = {
+            NeedTrigger.AMBIGUITY,
+            NeedTrigger.FOLLOW_UP_FAILURE,
+            NeedTrigger.UNDER_SPECIFIED_REQUEST,
+        }
+        need_expansion = any(getattr(need, "need_type", None) in recovery_needs for need in detected_needs)
+        if not retrieval_plan.exact_recall_mode and not degraded_mode and not need_expansion:
             return resolved_policy
+        if retrieval_plan.exact_recall_mode or degraded_mode:
+            target_ceiling = resolved_policy.retrieval_params.rerank_top_k
+        else:
+            target_ceiling = min(
+                resolved_policy.retrieval_params.rerank_top_k,
+                resolved_policy.retrieval_params.final_context_items + 4,
+            )
         target_items = min(
             item_count,
             max(
                 resolved_policy.retrieval_params.final_context_items,
-                resolved_policy.retrieval_params.rerank_top_k,
+                target_ceiling,
             ),
         )
         if target_items <= resolved_policy.retrieval_params.final_context_items:
@@ -1079,6 +1249,186 @@ class RetrievalPipeline:
             if len(expanded) >= COVERAGE_CANDIDATE_LIMIT:
                 break
         return expanded
+
+    async def _llm_coverage_expansion_candidates(
+        self,
+        *,
+        message_text: str,
+        raw_candidates: list[dict[str, Any]],
+        conversation_context: ExtractionConversationContext,
+        retrieval_plan: RetrievalPlan,
+        ablation: AblationConfig,
+    ) -> list[dict[str, Any]]:
+        """Run the default-off LLM coverage experiment and search its subqueries."""
+        if not self._should_attempt_llm_coverage_expansion(
+            retrieval_plan=retrieval_plan,
+            raw_candidates=raw_candidates,
+            ablation=ablation,
+        ):
+            return []
+        try:
+            expansion_plan = await self._coverage_expander.plan(
+                message_text=message_text,
+                conversation_context=conversation_context,
+                retrieval_plan=retrieval_plan,
+                raw_candidates=raw_candidates,
+            )
+        except Exception as exc:
+            logger.warning(
+                "llm_coverage_expansion_failed",
+                extra={
+                    "user_id": conversation_context.user_id,
+                    "conversation_id": conversation_context.conversation_id,
+                    "error": str(exc),
+                },
+            )
+            return []
+        if not expansion_plan.should_expand:
+            return []
+
+        coverage_plan = self._build_llm_coverage_retrieval_plan(
+            retrieval_plan=retrieval_plan,
+            expansion_plan=expansion_plan,
+            ablation=ablation,
+        )
+        if coverage_plan is None:
+            return []
+
+        candidates = await self._candidate_search.search(
+            coverage_plan,
+            conversation_context.user_id,
+        )
+        existing_ids = {str(candidate.get("id") or "") for candidate in raw_candidates}
+        expanded: list[dict[str, Any]] = []
+        for candidate in candidates:
+            memory_id = str(candidate.get("id") or "")
+            if not memory_id or memory_id in existing_ids:
+                continue
+            expanded.append(
+                self._annotate_llm_coverage_candidate(
+                    candidate,
+                    expansion_plan=expansion_plan,
+                )
+            )
+            existing_ids.add(memory_id)
+            if len(expanded) >= coverage_plan.max_candidates:
+                break
+        return expanded
+
+    @staticmethod
+    def _should_attempt_llm_coverage_expansion(
+        *,
+        retrieval_plan: RetrievalPlan,
+        raw_candidates: list[dict[str, Any]],
+        ablation: AblationConfig,
+    ) -> bool:
+        if not ablation.enable_llm_coverage_expansion:
+            return False
+        if retrieval_plan.skip_retrieval or retrieval_plan.max_candidates <= 0:
+            return False
+        if not retrieval_plan.sub_query_plans:
+            return False
+        if not raw_candidates:
+            return True
+        if retrieval_plan.query_type == "broad_list":
+            return True
+        if retrieval_plan.exact_recall_mode:
+            return True
+        if retrieval_plan.raw_context_access_mode in {"artifact", "verbatim", "skipped_raw"}:
+            return True
+        matched_subqueries = {
+            str(sub_query)
+            for candidate in raw_candidates
+            for sub_query in candidate.get("matched_sub_queries", [])
+            if str(sub_query).strip()
+        }
+        return len(matched_subqueries) < len(retrieval_plan.sub_query_plans)
+
+    @classmethod
+    def _build_llm_coverage_retrieval_plan(
+        cls,
+        *,
+        retrieval_plan: RetrievalPlan,
+        expansion_plan: CoverageExpansionPlan,
+        ablation: AblationConfig,
+    ) -> RetrievalPlan | None:
+        sub_query_plans: list[PlannedSubQuery] = []
+        for sub_query in expansion_plan.sub_queries[: cls._llm_coverage_max_subqueries(ablation)]:
+            sparse_phrase = sub_query.fts_phrase or sub_query.sub_query_text
+            fts_queries = build_retrieval_fts_queries(
+                sparse_phrase,
+                quoted_phrases=sub_query.quoted_phrases,
+                must_keep_terms=sub_query.must_keep_terms,
+            )
+            if not fts_queries:
+                continue
+            sub_query_plans.append(
+                PlannedSubQuery(
+                    text=sub_query.sub_query_text,
+                    sparse_phrase=sparse_phrase,
+                    quoted_phrases=list(sub_query.quoted_phrases),
+                    must_keep_terms=list(sub_query.must_keep_terms),
+                    fts_queries=fts_queries,
+                )
+            )
+        if not sub_query_plans:
+            return None
+        candidate_limit = min(
+            retrieval_plan.max_candidates,
+            cls._llm_coverage_candidate_limit(ablation),
+        )
+        if candidate_limit <= 0:
+            return None
+        fts_queries: list[str] = []
+        seen_queries: set[str] = set()
+        for sub_query in sub_query_plans:
+            for fts_query in sub_query.fts_queries:
+                if fts_query in seen_queries:
+                    continue
+                seen_queries.add(fts_query)
+                fts_queries.append(fts_query)
+        vector_limit = min(retrieval_plan.vector_limit, candidate_limit)
+        return retrieval_plan.model_copy(
+            update={
+                "fts_queries": fts_queries,
+                "sub_query_plans": sub_query_plans,
+                "max_candidates": candidate_limit,
+                "vector_limit": vector_limit,
+                "skip_retrieval": False,
+            }
+        )
+
+    @staticmethod
+    def _annotate_llm_coverage_candidate(
+        candidate: dict[str, Any],
+        *,
+        expansion_plan: CoverageExpansionPlan,
+    ) -> dict[str, Any]:
+        annotated = dict(candidate)
+        retrieval_sources = list(annotated.get("retrieval_sources") or [])
+        if "llm_coverage_expansion" not in retrieval_sources:
+            retrieval_sources.append("llm_coverage_expansion")
+        annotated["retrieval_sources"] = retrieval_sources
+        annotated["retrieval_source"] = "+".join(retrieval_sources)
+        annotated["coverage_expansion_sub_queries"] = [
+            sub_query.sub_query_text for sub_query in expansion_plan.sub_queries
+        ]
+        annotated["coverage_expansion_missing_facets"] = list(expansion_plan.missing_facets)
+        return annotated
+
+    @staticmethod
+    def _llm_coverage_candidate_limit(ablation: AblationConfig) -> int:
+        override_params = ablation.override_retrieval_params or {}
+        if "llm_coverage_candidate_limit" not in override_params:
+            return LLM_COVERAGE_CANDIDATE_LIMIT
+        return max(1, int(override_params["llm_coverage_candidate_limit"]))
+
+    @staticmethod
+    def _llm_coverage_max_subqueries(ablation: AblationConfig) -> int:
+        override_params = ablation.override_retrieval_params or {}
+        if "llm_coverage_max_subqueries" not in override_params:
+            return LLM_COVERAGE_MAX_SUBQUERIES
+        return max(1, min(3, int(override_params["llm_coverage_max_subqueries"])))
 
     @staticmethod
     def _should_expand_source_message_coverage(
@@ -1227,6 +1577,9 @@ class RetrievalPipeline:
             resolved_policy=resolved_policy,
             cold_start=cold_start,
         )
+        plan.privacy_enforcement = ablation.privacy_enforcement
+        if self._privacy_sql_filters_disabled(ablation):
+            plan.status_filter = self._privacy_off_status_filter(plan.status_filter)
         if ablation.force_all_scopes:
             plan.scope_filter = list(MemoryScope)
         override_params = ablation.override_retrieval_params or {}
@@ -1238,6 +1591,8 @@ class RetrievalPipeline:
             plan.vector_limit = max(0, int(override_params["vector_limit"]))
         if "privacy_ceiling" in override_params:
             plan.privacy_ceiling = max(0, min(3, int(override_params["privacy_ceiling"])))
+        if "allow_private_sensitivity" in override_params:
+            plan.allow_private_sensitivity = bool(override_params["allow_private_sensitivity"])
         return plan
 
     async def _score_without_llm(
@@ -1299,7 +1654,10 @@ class RetrievalPipeline:
             return None
         if str(row.get("scope_canonical") or "") != MemoryScope.CHARACTER.value:
             return None
-        if str(row.get("sensitivity") or "unknown") != "public":
+        if (
+            str(row.get("sensitivity") or "unknown") != "public"
+            and not self._privacy_sql_filters_disabled(ablation)
+        ):
             return None
         if row.get("user_persona_id") != conversation_context.user_persona_id:
             return None
@@ -1365,6 +1723,146 @@ class RetrievalPipeline:
         return reasons
 
     @staticmethod
+    def _policy_filters_enforced(privacy_enforcement: str) -> bool:
+        return privacy_enforcement == "enforce"
+
+    @staticmethod
+    def _privacy_sql_filters_disabled(ablation: AblationConfig) -> bool:
+        return ablation.privacy_enforcement == "off"
+
+    @staticmethod
+    def _privacy_off_status_filter(
+        statuses: list[MemoryStatus],
+    ) -> list[MemoryStatus]:
+        return list(dict.fromkeys([*statuses, *PRIVACY_OFF_RETRIEVAL_STATUSES]))
+
+    @staticmethod
+    def _privacy_relaxed_policy(
+        policy: ResolvedRetrievalPolicy,
+    ) -> ResolvedRetrievalPolicy:
+        return policy.model_copy(
+            update={
+                "privacy_ceiling": 3,
+                "allow_intimacy_context": True,
+                "allow_private_sensitivity": True,
+            }
+        )
+
+    @staticmethod
+    def _policy_for_sql_privacy_mode(
+        policy: ResolvedRetrievalPolicy,
+        ablation: AblationConfig,
+    ) -> ResolvedRetrievalPolicy:
+        if RetrievalPipeline._privacy_sql_filters_disabled(ablation):
+            return RetrievalPipeline._privacy_relaxed_policy(policy)
+        return policy
+
+    @staticmethod
+    def _policy_for_late_privacy_mode(
+        policy: ResolvedRetrievalPolicy,
+        ablation: AblationConfig,
+    ) -> ResolvedRetrievalPolicy:
+        if not RetrievalPipeline._policy_filters_enforced(ablation.privacy_enforcement):
+            return RetrievalPipeline._privacy_relaxed_policy(policy)
+        return policy
+
+    @staticmethod
+    def _plan_for_policy_audit(
+        plan: RetrievalPlan,
+        policy: ResolvedRetrievalPolicy,
+    ) -> RetrievalPlan:
+        return plan.model_copy(
+            update={
+                "privacy_ceiling": policy.privacy_ceiling,
+                "allow_intimacy_context": policy.allow_intimacy_context,
+                "allow_private_sensitivity": policy.allow_private_sensitivity,
+                "privacy_enforcement": "enforce",
+            }
+        )
+
+    @staticmethod
+    def _actual_filter_reasons(
+        regrounding_filter_reasons: dict[str, str],
+        candidate_policy_filter_reasons: dict[str, str],
+        *,
+        privacy_enforcement: str,
+    ) -> dict[str, str]:
+        if RetrievalPipeline._policy_filters_enforced(privacy_enforcement):
+            return {
+                **regrounding_filter_reasons,
+                **candidate_policy_filter_reasons,
+            }
+        return dict(regrounding_filter_reasons)
+
+    @staticmethod
+    def _build_policy_filter_audit(
+        privacy_enforcement: str,
+        candidate_policy_filter_reasons: dict[str, str],
+    ) -> dict[str, Any]:
+        return {
+            "privacy_enforcement": privacy_enforcement,
+            "enforced": RetrievalPipeline._policy_filters_enforced(privacy_enforcement),
+            "high_risk_secret_literal_redaction_enforced": (
+                privacy_enforcement != "off"
+            ),
+            "high_risk_secret_literal_redaction_disabled": (
+                privacy_enforcement == "off"
+            ),
+            "would_filter_count": len(candidate_policy_filter_reasons),
+            "would_filter_reason_counts": RetrievalPipeline._rejection_reason_counts(
+                candidate_policy_filter_reasons
+            ),
+            "would_filter_by_candidate_id": dict(
+                sorted(candidate_policy_filter_reasons.items())
+            ),
+        }
+
+    def _filter_candidates_for_policy_mode(
+        self,
+        candidates: list[dict[str, Any]],
+        resolved_policy: ResolvedRetrievalPolicy,
+        detected_needs: list[Any],
+        *,
+        retrieval_plan: RetrievalPlan,
+        privacy_enforcement: str,
+    ) -> list[dict[str, Any]]:
+        if not self._policy_filters_enforced(privacy_enforcement):
+            return list(candidates)
+        return self._scorer.filter_candidates(
+            candidates,
+            resolved_policy,
+            detected_needs,
+            retrieval_plan=retrieval_plan,
+        )
+
+    @staticmethod
+    def _effective_privacy_ceiling(
+        resolved_policy: ResolvedRetrievalPolicy,
+        ablation: AblationConfig,
+    ) -> int:
+        if RetrievalPipeline._privacy_sql_filters_disabled(ablation):
+            return 3
+        return resolved_policy.privacy_ceiling
+
+    @staticmethod
+    def _effective_allow_intimacy_context(
+        resolved_policy: ResolvedRetrievalPolicy,
+        ablation: AblationConfig,
+    ) -> bool:
+        if RetrievalPipeline._privacy_sql_filters_disabled(ablation):
+            return True
+        return resolved_policy.allow_intimacy_context
+
+    @staticmethod
+    def _effective_allow_private_for_sql_repository(
+        resolved_policy: ResolvedRetrievalPolicy,
+        ablation: AblationConfig,
+    ) -> bool:
+        if RetrievalPipeline._privacy_sql_filters_disabled(ablation):
+            return False
+        return resolved_policy.allow_private_sensitivity
+
+    @staticmethod
     def _rejection_reason_counts(
         filter_reasons_by_id: dict[str, str],
     ) -> dict[str, int]:
@@ -1406,11 +1904,20 @@ class RetrievalPipeline:
         """
         if not shortlist:
             return shortlist
-        if retrieval_plan.query_type != "slot_fill" and not retrieval_plan.exact_recall_mode:
+        recovery_needs = {
+            NeedTrigger.AMBIGUITY,
+            NeedTrigger.UNDER_SPECIFIED_REQUEST,
+        }
+        need_expansion = any(getattr(need, "need_type", None) in recovery_needs for need in detected_needs)
+        if (
+            retrieval_plan.query_type != "slot_fill"
+            and not retrieval_plan.exact_recall_mode
+            and not need_expansion
+        ):
             return shortlist
 
-        per_summary_cap = 2
-        total_cap = 4
+        per_summary_cap = 4 if need_expansion else 2
+        total_cap = 6 if need_expansion else 4
         shortlisted_ids = {str(candidate["id"]) for candidate in shortlist}
         promoted_ids: set[str] = set()
         promoted: list[dict[str, Any]] = []
@@ -1419,7 +1926,10 @@ class RetrievalPipeline:
         for candidate in shortlist:
             if len(promoted) >= total_cap:
                 break
-            if not self._is_hierarchical_summary_candidate(candidate):
+            if not self._is_hierarchical_summary_candidate(candidate) and not (
+                need_expansion
+                and str(candidate.get("object_type")) == MemoryObjectType.SUMMARY_VIEW.value
+            ):
                 continue
             source_ids = self._candidate_source_ids(candidate)
             if not source_ids:
@@ -1603,17 +2113,28 @@ class RetrievalPipeline:
                 existing_messages=conversation_messages,
                 active_conversation_id=retrieval_plan.conversation_id,
             )
+        context_policy = (
+            self._privacy_relaxed_policy(resolved_policy)
+            if not self._policy_filters_enforced(retrieval_plan.privacy_enforcement)
+            else resolved_policy
+        )
         return self._context_composer.compose(
             scored_candidates=scored_candidates,
             current_contract=current_contract,
             workspace_rollup=workspace_rollup,
             user_state=user_state,
-            resolved_policy=resolved_policy,
+            resolved_policy=context_policy,
             conversation_messages=source_messages,
             query_text=message_text,
             query_type=retrieval_plan.query_type,
             exact_recall_mode=retrieval_plan.exact_recall_mode,
             composer_strategy=composer_strategy,
+            active_presence_id=retrieval_plan.active_presence_id,
+            active_space_id=retrieval_plan.active_space_id,
+            active_realm_id=retrieval_plan.active_realm_id,
+            redact_high_risk_secret_literals=(
+                retrieval_plan.privacy_enforcement != "off"
+            ),
         )
 
     async def _source_messages_for_candidates(
@@ -1686,6 +2207,10 @@ class RetrievalPipeline:
         updates: dict[str, Any] = {"retrieval_params": retrieval_params}
         if "privacy_ceiling" in override_params:
             updates["privacy_ceiling"] = max(0, min(3, int(override_params["privacy_ceiling"])))
+        if "allow_private_sensitivity" in override_params:
+            updates["allow_private_sensitivity"] = bool(
+                override_params["allow_private_sensitivity"]
+            )
         return resolved_policy.model_copy(update=updates)
 
     async def _measure_stage(self, stage_timings: dict[str, float], name: str, awaitable: Any) -> Any:
@@ -1789,6 +2314,7 @@ class RetrievalPipeline:
         scored_candidates: list[ScoredCandidate],
         duration_ms: float,
         rejection_reasons: dict[str, int] | None = None,
+        policy_audit_reason_counts: dict[str, int] | None = None,
     ) -> ScoringTrace:
         candidates_received = len(raw_candidates)
         candidates_rejected = candidates_received - len(filtered_candidates)
@@ -1810,6 +2336,7 @@ class RetrievalPipeline:
             candidates_scored=len(scored_candidates),
             candidates_rejected=candidates_rejected,
             rejection_reasons=rejection_reasons or {},
+            policy_audit_reason_counts=policy_audit_reason_counts or {},
             top_score=top_score,
             median_score=median_score,
             min_score=min_passing,

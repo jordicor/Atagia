@@ -65,7 +65,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--answer-model",
-        help="Model override for answer generation, e.g. openrouter/google/gemini-3.1-flash-lite-preview,medium",
+        help="Model override for answer generation, e.g. openrouter/google/gemini-3.1-flash-lite,medium",
     )
     parser.add_argument("--forced-global-model", help="Force one model for every Atagia internal LLM component")
     parser.add_argument("--ingest-model", help="Model for Atagia ingest components")

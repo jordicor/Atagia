@@ -200,6 +200,34 @@ async def create_openai_proxy_chat_completion(
         default=None,
         alias="X-Atagia-Cross-Chat-Memory",
     ),
+    x_atagia_message_id: str | None = Header(
+        default=None,
+        alias="X-Atagia-Message-Id",
+    ),
+    x_atagia_source_seq: str | None = Header(
+        default=None,
+        alias="X-Atagia-Source-Seq",
+    ),
+    x_atagia_response_message_id: str | None = Header(
+        default=None,
+        alias="X-Atagia-Response-Message-Id",
+    ),
+    x_atagia_response_source_seq: str | None = Header(
+        default=None,
+        alias="X-Atagia-Response-Source-Seq",
+    ),
+    x_atagia_ingest_origin: str | None = Header(
+        default=None,
+        alias="X-Atagia-Ingest-Origin",
+    ),
+    x_atagia_confirmation_strategy: str | None = Header(
+        default=None,
+        alias="X-Atagia-Confirmation-Strategy",
+    ),
+    x_atagia_memory_privacy_mode: str | None = Header(
+        default=None,
+        alias="X-Atagia-Memory-Privacy-Mode",
+    ),
 ):
     try:
         auth = _authenticate_proxy(request, authorization, x_atagia_user_id)
@@ -220,6 +248,13 @@ async def create_openai_proxy_chat_completion(
                 character_id_header=x_atagia_character_id,
                 incognito_header=x_atagia_incognito,
                 cross_chat_memory_header=x_atagia_cross_chat_memory,
+                message_id_header=x_atagia_message_id,
+                source_seq_header=x_atagia_source_seq,
+                response_message_id_header=x_atagia_response_message_id,
+                response_source_seq_header=x_atagia_response_source_seq,
+                ingest_origin_header=x_atagia_ingest_origin,
+                confirmation_strategy_header=x_atagia_confirmation_strategy,
+                memory_privacy_mode_header=x_atagia_memory_privacy_mode,
             )
             return StreamingResponse(
                 stream,
@@ -241,6 +276,13 @@ async def create_openai_proxy_chat_completion(
             character_id_header=x_atagia_character_id,
             incognito_header=x_atagia_incognito,
             cross_chat_memory_header=x_atagia_cross_chat_memory,
+            message_id_header=x_atagia_message_id,
+            source_seq_header=x_atagia_source_seq,
+            response_message_id_header=x_atagia_response_message_id,
+            response_source_seq_header=x_atagia_response_source_seq,
+            ingest_origin_header=x_atagia_ingest_origin,
+            confirmation_strategy_header=x_atagia_confirmation_strategy,
+            memory_privacy_mode_header=x_atagia_memory_privacy_mode,
         )
     except ValueError as exc:
         return _openai_error_response(

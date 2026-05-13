@@ -11,6 +11,7 @@ import pytest
 
 from atagia import Atagia
 from atagia.core.clock import FrozenClock
+from atagia.core.mind_repository import DEFAULT_MIND_ID
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.repositories import (
     ConversationRepository,
@@ -188,6 +189,77 @@ def test_engine_build_settings_preserves_llm_debug_io_env(
     assert settings.llm_debug_io_purposes == ("applicability_scoring",)
     assert settings.llm_debug_io_raw is True
     assert settings.llm_debug_io_max_chars == 12345
+
+
+def test_engine_build_settings_preserves_memory_bm25_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ATAGIA_MEMORY_FTS_CANONICAL_BM25_WEIGHT", "9.0")
+    monkeypatch.setenv("ATAGIA_MEMORY_FTS_INDEX_BM25_WEIGHT", "0.2")
+    engine = Atagia(db_path=tmp_path / "bm25-settings.db")
+
+    settings = engine._build_settings()
+
+    assert settings.memory_fts_canonical_bm25_weight == 9.0
+    assert settings.memory_fts_index_bm25_weight == 0.2
+
+
+def test_engine_build_settings_preserves_embedding_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ATAGIA_EMBEDDING_BACKEND", "sqlite_vec")
+    monkeypatch.setenv("ATAGIA_EMBEDDING_MODEL", "openai/text-embedding-3-small")
+    monkeypatch.setenv("ATAGIA_EMBEDDING_DIMENSION", "1536")
+    monkeypatch.setenv("ATAGIA_EMBEDDING_VECTOR_LIMIT_CAP", "17")
+    monkeypatch.setenv("ATAGIA_EMBEDDING_SEARCH_OVERFETCH_MULTIPLIER", "3")
+    engine = Atagia(db_path=tmp_path / "embedding-settings.db")
+
+    settings = engine._build_settings()
+
+    assert settings.embedding_backend == "sqlite_vec"
+    assert settings.embedding_model == "openai/text-embedding-3-small"
+    assert settings.embedding_dimension == 1536
+    assert settings.embedding_vector_limit_cap == 17
+    assert settings.embedding_search_overfetch_multiplier == 3
+
+
+def test_engine_build_settings_preserves_topic_working_set_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ATAGIA_TOPIC_WORKING_SET_ENABLED", "false")
+    monkeypatch.setenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_MESSAGE_LAG", "11")
+    monkeypatch.setenv("ATAGIA_TOPIC_WORKING_SET_STALE_MESSAGE_LAG", "13")
+    monkeypatch.setenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_TOKEN_LAG", "1700")
+    monkeypatch.setenv("ATAGIA_TOPIC_WORKING_SET_STALE_TOKEN_LAG", "2300")
+    monkeypatch.setenv("ATAGIA_TOPIC_WORKING_SET_REFRESH_BATCH_MESSAGES", "5")
+    engine = Atagia(db_path=tmp_path / "topic-settings.db")
+
+    settings = engine._build_settings()
+
+    assert settings.topic_working_set_enabled is False
+    assert settings.topic_working_set_refresh_message_lag == 11
+    assert settings.topic_working_set_stale_message_lag == 13
+    assert settings.topic_working_set_refresh_token_lag == 1700
+    assert settings.topic_working_set_stale_token_lag == 2300
+    assert settings.topic_working_set_refresh_batch_messages == 5
+
+
+def test_engine_build_settings_allows_explicit_embedding_backend_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ATAGIA_EMBEDDING_BACKEND", "sqlite_vec")
+    engine = Atagia(
+        db_path=tmp_path / "embedding-settings.db",
+        embedding_backend="none",
+    )
+
+    settings = engine._build_settings()
+
+    assert settings.embedding_backend == "none"
 
 
 def test_engine_build_settings_resolves_resource_env_from_external_cwd(
@@ -475,6 +547,9 @@ async def test_lifecycle_deletes_only_targeted_retrieval_events(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_del_2",
             workspace_id=None,
+            active_presence_id="default_assistant",
+            active_mind_id=DEFAULT_MIND_ID,
+            mind_topology="unimind",
             operational_profile_token=_normal_operational_profile_token(engine),
         )
         await engine.runtime.storage_backend.set_context_view(
@@ -923,6 +998,9 @@ async def test_engine_add_response_invalidates_stable_context_cache(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             workspace_id=None,
+            active_presence_id="default_assistant",
+            active_mind_id=DEFAULT_MIND_ID,
+            mind_topology="unimind",
             operational_profile_token=_normal_operational_profile_token(engine),
         )
         assert await engine.runtime.storage_backend.get_context_view(cache_key) is not None
@@ -965,6 +1043,9 @@ async def test_engine_ingest_message_invalidates_stable_context_cache(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             workspace_id=None,
+            active_presence_id="default_assistant",
+            active_mind_id=DEFAULT_MIND_ID,
+            mind_topology="unimind",
             operational_profile_token=_normal_operational_profile_token(engine),
         )
         assert await engine.runtime.storage_backend.get_context_view(cache_key) is not None

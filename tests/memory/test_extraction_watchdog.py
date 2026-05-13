@@ -56,7 +56,7 @@ def test_watchdog_provider_policy_rejects_different_provider_without_opt_in() ->
     with pytest.raises(ValueError, match="different provider"):
         validate_watchdog_provider_policy(
             extractor_model="openai/gpt-5-mini",
-            watchdog_model="openrouter/google/gemini-3.1-flash-lite-preview",
+            watchdog_model="openrouter/google/gemini-3.1-flash-lite",
             allow_different_provider=False,
         )
 
@@ -72,6 +72,6 @@ def test_watchdog_provider_policy_allows_matching_provider() -> None:
 def test_watchdog_provider_policy_allows_different_provider_with_opt_in() -> None:
     validate_watchdog_provider_policy(
         extractor_model="openai/gpt-5-mini",
-        watchdog_model="openrouter/google/gemini-3.1-flash-lite-preview",
+        watchdog_model="openrouter/google/gemini-3.1-flash-lite",
         allow_different_provider=True,
     )

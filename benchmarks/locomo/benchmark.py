@@ -8,6 +8,7 @@ import logging
 import subprocess
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -128,6 +129,20 @@ _TECHNICAL_FAILURE_REASON_PREFIX_BY_STAGE = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class AnswerGenerationResult:
+    """Answer text plus exact prompt/context payload for future replay."""
+
+    output_text: str
+    model: str
+    max_output_tokens: int
+    system_prompt: str
+    contract_block: str
+    workspace_block: str
+    memory_block: str
+    state_block: str
+
+
 def _apply_corrections(
     questions: list[BenchmarkQuestion],
     corrections: dict[str, Any],
@@ -144,6 +159,13 @@ def _apply_corrections(
             )
         result.append(question)
     return result
+
+
+def _model_thinking_level(model: str) -> str | None:
+    if model.count(",") != 1:
+        return None
+    raw_level = model.rsplit(",", 1)[1].strip()
+    return raw_level or None
 
 
 class LoCoMoBenchmark(BenchmarkRunner):
@@ -163,6 +185,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
         chat_model_override: str | None = None,
         component_models: dict[str, str] | None = None,
         answer_prompt_variant: str = _ANSWER_PROMPT_VARIANT_DEFAULT,
+        answer_max_output_tokens: int | None = None,
         manifests_dir: str | Path | None = None,
         embedding_backend: str = "none",
         embedding_model: str | None = None,
@@ -199,6 +222,11 @@ class LoCoMoBenchmark(BenchmarkRunner):
             component_id: provider_qualified_model(llm_provider, model) or model
             for component_id, model in (component_models or {}).items()
         }
+        if answer_max_output_tokens is not None and answer_max_output_tokens < 1:
+            raise ValueError("answer_max_output_tokens must be positive")
+        self._answer_max_output_tokens = (
+            answer_max_output_tokens or LOCOMO_ANSWER_MAX_OUTPUT_TOKENS
+        )
         if answer_prompt_variant not in _ANSWER_PROMPT_VARIANTS:
             valid = ", ".join(sorted(_ANSWER_PROMPT_VARIANTS))
             raise ValueError(
@@ -1318,14 +1346,16 @@ class LoCoMoBenchmark(BenchmarkRunner):
                     },
                 )
             retrieval_time_ms = (perf_counter() - retrieval_started_at) * 1000.0
+            answer_generation: AnswerGenerationResult | None = None
             try:
-                prediction = await self._generate_answer(
+                answer_generation = await self._generate_answer(
                     runtime=runtime,
                     assistant_mode_id=retrieval_profile_id,
                     pipeline_result=pipeline_result,
                     question_text=question.question_text,
                     trusted_evaluation=trusted_evaluation,
                 )
+                prediction = answer_generation.output_text
             except (LLMError, StructuredOutputError) as exc:
                 trace_payload = await self._build_question_trace(
                     engine,
@@ -1344,6 +1374,10 @@ class LoCoMoBenchmark(BenchmarkRunner):
                     conversation_id=conversation.conversation_id,
                     question_id=question.question_id,
                 )
+                if answer_generation is not None:
+                    trace_payload["answer_generation"] = self._answer_generation_trace(
+                        answer_generation
+                    )
                 return self._technical_failure_result(
                     question=question,
                     stage="answer_generation",
@@ -1408,6 +1442,9 @@ class LoCoMoBenchmark(BenchmarkRunner):
         trace_payload["llm_calls"] = llm_recorder.records_for_context(
             conversation_id=conversation.conversation_id,
             question_id=question.question_id,
+        )
+        trace_payload["answer_generation"] = self._answer_generation_trace(
+            answer_generation
         )
         return QuestionResult(
             question=question,
@@ -1639,41 +1676,74 @@ class LoCoMoBenchmark(BenchmarkRunner):
         pipeline_result: PipelineResult,
         question_text: str,
         trusted_evaluation: bool = False,
-    ) -> str:
+    ) -> AnswerGenerationResult:
         resolved_policy = resolve_policy(
             runtime.manifests,
             assistant_mode_id,
             runtime.policy_resolver,
         )
+        context = pipeline_result.composed_context
         system_prompt = build_system_prompt(
             assistant_mode_id,
             resolved_policy,
-            pipeline_result.composed_context.contract_block,
-            pipeline_result.composed_context.workspace_block,
-            pipeline_result.composed_context.memory_block,
-            pipeline_result.composed_context.state_block,
+            context.contract_block,
+            context.workspace_block,
+            context.memory_block,
+            context.state_block,
         )
         if trusted_evaluation:
             system_prompt = f"{system_prompt}\n\n{TRUSTED_EVALUATION_PROMPT_NOTE}"
         variant_note = _ANSWER_PROMPT_VARIANT_NOTES.get(self._answer_prompt_variant)
         if variant_note:
             system_prompt = f"{system_prompt}\n\n{variant_note}"
+        model = self._answer_model or chat_model(runtime.settings)
         response = await runtime.llm_client.complete(
             LLMCompletionRequest(
-                model=self._answer_model or chat_model(runtime.settings),
+                model=model,
                 messages=[
                     LLMMessage(role="system", content=system_prompt),
                     LLMMessage(role="user", content=question_text),
                 ],
                 temperature=0.0,
-                max_output_tokens=LOCOMO_ANSWER_MAX_OUTPUT_TOKENS,
+                max_output_tokens=self._answer_max_output_tokens,
                 metadata={
                     "purpose": "benchmark_answer_generation",
                     "question": question_text,
                 },
             )
         )
-        return response.output_text
+        return AnswerGenerationResult(
+            output_text=response.output_text,
+            model=model,
+            max_output_tokens=self._answer_max_output_tokens,
+            system_prompt=system_prompt,
+            contract_block=context.contract_block,
+            workspace_block=context.workspace_block,
+            memory_block=context.memory_block,
+            state_block=context.state_block,
+        )
+
+    @staticmethod
+    def _answer_generation_trace(result: AnswerGenerationResult) -> dict[str, Any]:
+        return {
+            "model": result.model,
+            "thinking_level": _model_thinking_level(result.model),
+            "max_output_tokens": result.max_output_tokens,
+            "system_prompt": result.system_prompt,
+            "system_prompt_chars": len(result.system_prompt),
+            "context": {
+                "contract_block": result.contract_block,
+                "workspace_block": result.workspace_block,
+                "memory_block": result.memory_block,
+                "state_block": result.state_block,
+            },
+            "context_chars": {
+                "contract_block": len(result.contract_block),
+                "workspace_block": len(result.workspace_block),
+                "memory_block": len(result.memory_block),
+                "state_block": len(result.state_block),
+            },
+        }
 
     @staticmethod
     def _select_conversations(
@@ -1765,6 +1835,12 @@ class LoCoMoBenchmark(BenchmarkRunner):
             return "missing_raw_evidence"
         if diagnosis_bucket in {"composition_selected_none", "retrieval_or_ranking_miss"}:
             return "retrieval_insufficient"
+        if diagnosis_bucket in {
+            "retrieval_failed",
+            "answer_generation_failed",
+            "judge_failed",
+        }:
+            return diagnosis_bucket
         return "answer_or_judge_issue"
 
     @staticmethod
@@ -1812,6 +1888,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
             "chat_model": self._chat_model,
             "component_models": dict(sorted(self._component_models.items())),
             "answer_prompt_variant": self._answer_prompt_variant,
+            "answer_max_output_tokens": self._answer_max_output_tokens,
             "mode": _DEFAULT_RETRIEVAL_PROFILE_ID,
             "retrieval_profile_id": _DEFAULT_RETRIEVAL_PROFILE_ID,
             "platform_id": _BENCHMARK_PLATFORM_ID,
@@ -1839,6 +1916,10 @@ class LoCoMoBenchmark(BenchmarkRunner):
         model_info.setdefault(
             "warning_counts",
             self._aggregate_warning_counts(conversation_reports),
+        )
+        model_info.setdefault(
+            "failure_stage_counts",
+            self._aggregate_failure_stage_counts(conversation_reports),
         )
         model_info.setdefault(
             "retrieval_custody_summary",
@@ -1968,6 +2049,19 @@ class LoCoMoBenchmark(BenchmarkRunner):
             for report in conversation_reports
             for result in report.results
         )
+
+    @staticmethod
+    def _aggregate_failure_stage_counts(
+        conversation_reports: Sequence[ConversationReport],
+    ) -> dict[str, int]:
+        counts: Counter[str] = Counter()
+        for report in conversation_reports:
+            for result in report.results:
+                trace = result.trace if isinstance(result.trace, dict) else {}
+                value = str(trace.get("failure_stage") or "").strip()
+                if value:
+                    counts[value] += 1
+        return dict(sorted(counts.items()))
 
     @staticmethod
     def _aggregate_llm_call_summary(
@@ -2107,6 +2201,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
             "selection": _manifest_selection_summary(report),
             "retained_db_paths": retained_db_paths,
             "warning_counts": report.model_info.get("warning_counts", {}),
+            "failure_stage_counts": report.model_info.get("failure_stage_counts", {}),
             "retrieval_custody_summary": report.model_info.get(
                 "retrieval_custody_summary",
                 {},

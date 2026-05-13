@@ -17,6 +17,9 @@ def test_copyable_python_platform_scaffolds_compile(tmp_path: Path) -> None:
         "integrations/open-webui/atagia_memory_filter.py",
         "integrations/openclaw/atagia_adapter.py",
         "integrations/hermes/atagia_provider.py",
+        "integrations/hermes/plugins/memory/atagia/provider.py",
+        "integrations/hermes/plugins/memory/atagia/cli.py",
+        "integrations/importers/atagia_importers.py",
     ):
         output = tmp_path / f"{Path(relative_path).stem}.pyc"
         py_compile.compile(str(ROOT / relative_path), cfile=str(output), doraise=True)
@@ -28,6 +31,9 @@ def test_copyable_python_platform_scaffolds_import() -> None:
         "atagia_memory_filter": ROOT / "integrations/open-webui/atagia_memory_filter.py",
         "atagia_adapter": ROOT / "integrations/openclaw/atagia_adapter.py",
         "atagia_provider": ROOT / "integrations/hermes/atagia_provider.py",
+        "hermes_atagia_plugin": ROOT
+        / "integrations/hermes/plugins/memory/atagia/provider.py",
+        "atagia_importers": ROOT / "integrations/importers/atagia_importers.py",
     }
 
     loaded = {name: _load_module(name, path) for name, path in modules.items()}
@@ -36,6 +42,8 @@ def test_copyable_python_platform_scaffolds_import() -> None:
     assert hasattr(loaded["atagia_memory_filter"], "Filter")
     assert hasattr(loaded["atagia_adapter"], "AtagiaOpenClawAdapter")
     assert hasattr(loaded["atagia_provider"], "AtagiaHermesProvider")
+    assert hasattr(loaded["hermes_atagia_plugin"], "AtagiaMemoryProvider")
+    assert hasattr(loaded["atagia_importers"], "import_sillytavern_jsonl")
 
 
 def test_open_webui_filter_encodes_conversation_path_segments() -> None:
@@ -74,9 +82,10 @@ def test_sillytavern_extension_uses_injective_chat_id_encoding() -> None:
     assert "atagia_conversation_id" in source
     assert "context.saveMetadata?.()" in source
     assert "replace(/[^A-Za-z0-9_.:-]/g, '_')" not in source
-    assert "context.characterId" not in source
     assert "default-chat" not in source
     assert "${transportId(current.conversationPrefix || 'sillytavern')}-${transportId(raw)}" not in source
+    assert "chat.splice" not in source
+    assert "setExtensionPrompt" in source
 
 
 def _load_module(name: str, path: Path) -> ModuleType:

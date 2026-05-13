@@ -22,6 +22,7 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         thinking_level_map={
             "none": "minimal",
             "minimal": "minimal",
+            "low": "low",
             "medium": "medium",
             "high": "high",
         },
@@ -31,8 +32,21 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         thinking_level_map={
             "none": "none",
             "minimal": "low",
+            "low": "low",
             "medium": "medium",
             "high": "high",
+        },
+        default_thinking_level="none",
+    ),
+    "anthropic/claude-opus-4-7": ModelProfile(
+        thinking_level_map={
+            "none": None,
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
         },
         default_thinking_level="none",
     ),
@@ -40,6 +54,7 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         thinking_level_map={
             "none": None,
             "minimal": 1024,
+            "low": 1024,
             "medium": 4096,
             "high": 16384,
         },
@@ -49,6 +64,7 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         thinking_level_map={
             "none": None,
             "minimal": 1024,
+            "low": 1024,
             "medium": 4096,
             "high": -1,
         },
@@ -58,26 +74,30 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         thinking_level_map={
             "none": "MINIMAL",
             "minimal": "MINIMAL",
+            "low": "LOW",
             "medium": "MEDIUM",
             "high": "HIGH",
         },
         default_thinking_level="minimal",
     ),
-    "google/gemini-3.1-flash-lite-preview": ModelProfile(
+    "google/gemini-3.1-flash-lite": ModelProfile(
         thinking_level_map={
             "none": "MINIMAL",
             "minimal": "MINIMAL",
+            "low": "LOW",
             "medium": "MEDIUM",
             "high": "HIGH",
         },
         default_thinking_level="minimal",
     ),
-    "openrouter/google/gemini-3.1-flash-lite-preview": ModelProfile(
+    "openrouter/google/gemini-3.1-flash-lite": ModelProfile(
         thinking_level_map={
             "none": "minimal",
             "minimal": "minimal",
+            "low": "low",
             "medium": "medium",
             "high": "high",
+            "xhigh": "high",
         },
         default_thinking_level="minimal",
         extra_body={"reasoning": {}},
@@ -86,8 +106,22 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         thinking_level_map={
             "none": "none",
             "minimal": "low",
+            "low": "low",
             "medium": "medium",
             "high": "high",
+            "xhigh": "xhigh",
+        },
+        default_thinking_level="none",
+        extra_body={"reasoning": {}},
+    ),
+    "openrouter/openai/gpt-5.5": ModelProfile(
+        thinking_level_map={
+            "none": "none",
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
         },
         default_thinking_level="none",
         extra_body={"reasoning": {}},

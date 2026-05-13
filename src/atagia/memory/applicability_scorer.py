@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 _HIGH_STAKES_TYPES = {MemoryObjectType.EVIDENCE.value, MemoryObjectType.BELIEF.value}
 _AMBIGUITY_TYPES = {
     MemoryObjectType.EVIDENCE.value,
+    MemoryObjectType.SUMMARY_VIEW.value,
     MemoryObjectType.STATE_SNAPSHOT.value,
 }
 _FOLLOW_UP_FAILURE_TYPES = {
@@ -330,7 +331,11 @@ class ApplicabilityScorer:
         allowed_scopes: set[str] | None = None,
     ) -> str | None:
         """Return the deterministic pre-scoring filter reason for a candidate."""
-        if str(candidate.get("sensitivity") or "unknown") != "public":
+        sensitivity = str(candidate.get("sensitivity") or "unknown")
+        if sensitivity != "public" and not (
+            sensitivity == "private"
+            and getattr(resolved_policy, "allow_private_sensitivity", False)
+        ):
             return "policy_filtered_sensitivity"
         if retrieval_plan is not None and not self._candidate_matches_platform(candidate, retrieval_plan):
             return "policy_filtered_platform"
@@ -1048,6 +1053,11 @@ class ApplicabilityScorer:
                 and object_type == MemoryObjectType.CONSEQUENCE_CHAIN.value
             ):
                 total += 0.04
+            elif (
+                need.need_type is NeedTrigger.UNDER_SPECIFIED_REQUEST
+                and object_type == MemoryObjectType.SUMMARY_VIEW.value
+            ):
+                total += 0.08
             elif need.need_type is NeedTrigger.UNDER_SPECIFIED_REQUEST and object_type in _UNDER_SPECIFIED_TYPES:
                 total += 0.04
         return min(total, 0.2)

@@ -41,6 +41,9 @@ class AtagiaOpenClawAdapter:
         mode: str = "general_qa",
         user_persona_id: str | None = None,
         incognito: bool | None = None,
+        message_id: str | None = None,
+        source_seq: int | None = None,
+        memory_privacy_mode: str | None = None,
     ) -> OpenClawPromptResult:
         context = await self.bridge.get_context_for_turn(
             user_id=user_id,
@@ -52,6 +55,11 @@ class AtagiaOpenClawAdapter:
             platform_id=platform_id,
             character_id=agent_id,
             incognito=incognito,
+            message_id=message_id,
+            source_seq=source_seq,
+            ingest_origin="live_turn",
+            confirmation_strategy="live_prompt_allowed",
+            memory_privacy_mode=memory_privacy_mode,
         )
         decision = build_injection_decision(system_prompt, context)
         return OpenClawPromptResult(
@@ -71,6 +79,9 @@ class AtagiaOpenClawAdapter:
         mode: str = "general_qa",
         user_persona_id: str | None = None,
         incognito: bool | None = None,
+        message_id: str | None = None,
+        source_seq: int | None = None,
+        memory_privacy_mode: str | None = None,
     ) -> bool:
         return await self.bridge.record_assistant_response(
             user_id=user_id,
@@ -81,6 +92,11 @@ class AtagiaOpenClawAdapter:
             platform_id=platform_id,
             character_id=agent_id,
             incognito=incognito,
+            message_id=message_id,
+            source_seq=source_seq,
+            ingest_origin="live_turn",
+            confirmation_strategy="live_prompt_allowed",
+            memory_privacy_mode=memory_privacy_mode,
         )
 
     async def close(self) -> None:

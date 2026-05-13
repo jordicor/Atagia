@@ -201,6 +201,7 @@ async def _build_runtime(
     workspace_id: str | None = None,
     extra_messages: int = 0,
     settings: Settings | None = None,
+    structured_output_retry_attempts: int = 1,
 ):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc))
@@ -208,7 +209,11 @@ async def _build_runtime(
     await sync_assistant_modes(connection, manifest_loader.load_all(), clock)
     backend = InProcessBackend()
     provider = QueueProvider(outputs)
-    client = LLMClient(provider_name=provider.name, providers=[provider])
+    client = LLMClient(
+        provider_name=provider.name,
+        providers=[provider],
+        structured_output_retry_attempts=structured_output_retry_attempts,
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -500,7 +505,8 @@ async def test_ingest_worker_dead_letter_includes_structured_error_details_after
         }
     )
     connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
-        [invalid_payload] * 9
+        [invalid_payload] * 9,
+        structured_output_retry_attempts=0,
     )
     try:
         await backend.stream_add(EXTRACT_STREAM_NAME, _extract_job(str(message["id"])).model_dump(mode="json"))
@@ -1144,7 +1150,8 @@ async def test_contract_worker_reclaims_failed_pending_job_and_retries_successfu
         }
     )
     connection, _clock, backend, provider, memories, _ingest_worker, contract_worker, message = await _build_runtime(
-        ["not-json", "still-not-json", payload]
+        ["not-json", "still-not-json", payload],
+        structured_output_retry_attempts=0,
     )
     try:
         await backend.stream_add(CONTRACT_STREAM_NAME, _contract_job(str(message["id"])).model_dump(mode="json"))

@@ -118,6 +118,7 @@ class ResolvedRetrievalPolicy(BaseModel):
     need_triggers: list[NeedTrigger]
     contract_dimensions_priority: list[str]
     privacy_ceiling: int
+    allow_private_sensitivity: bool = False
     context_budget_tokens: int
     transcript_budget_tokens: int
     retrieval_params: RetrievalParams

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from benchmarks.atagia_bench.__main__ import _format_report_summary
 from benchmarks.atagia_bench.graders import GradeResult
-from benchmarks.atagia_bench.report_diff import build_diff, format_diff_summary
+from benchmarks.atagia_bench.report_diff import (
+    build_diff,
+    format_diff_summary,
+    load_atagia_bench_report,
+)
 from benchmarks.atagia_bench.runner import (
     AtagiaBenchReport,
     AtagiaQuestionResult,
@@ -58,7 +63,7 @@ def _report(
         total_passed=1 if result.grade.passed else 0,
         pass_rate=pass_rate,
         avg_score=result.grade.score,
-        critical_error_count=0,
+        priority_failure_count=0,
         per_question=[result],
         per_category=[
             CategoryStats(
@@ -83,6 +88,7 @@ def test_atagia_bench_diff_carries_diagnostics_and_selected_ids() -> None:
             trace={
                 "diagnosis_bucket": "retrieval_or_ranking_miss",
                 "sufficiency_diagnostic": "retrieval_insufficient",
+                "failure_stage": "answer_generation",
                 "selected_memory_ids": ["mem_old"],
                 "selected_evidence_memory_ids": [],
                 "retrieval_custody": [
@@ -155,6 +161,9 @@ def test_atagia_bench_diff_carries_diagnostics_and_selected_ids() -> None:
         "retrieval_insufficient": -1,
         "retrieval_sufficient": 1,
     }
+    assert diff.before_failure_stage_counts == {"answer_generation": 1}
+    assert diff.after_failure_stage_counts == {}
+    assert diff.failure_stage_count_deltas == {"answer_generation": -1}
     assert diff.before_retrieval_custody_summary == {
         "candidate_count": 1,
         "selected_count": 0,
@@ -175,6 +184,7 @@ def test_atagia_bench_diff_carries_diagnostics_and_selected_ids() -> None:
     }
     summary = format_diff_summary(diff)
     assert "Retrieval custody:" in summary
+    assert "Priority failures:" in summary
     assert "Before: candidates=1 selected=0" in summary
     assert "After:  candidates=1 selected=1" in summary
     assert question_diff.status == "improved"
@@ -222,6 +232,8 @@ def test_atagia_bench_diff_carries_diagnostics_and_selected_ids() -> None:
     assert question_diff.after_diagnosis_bucket == "passed"
     assert question_diff.before_sufficiency_diagnostic == "retrieval_insufficient"
     assert question_diff.after_sufficiency_diagnostic == "retrieval_sufficient"
+    assert question_diff.before_failure_stage == "answer_generation"
+    assert question_diff.after_failure_stage is None
     assert question_diff.before_selected_memory_ids == ["mem_old"]
     assert question_diff.after_selected_evidence_memory_ids == ["mem_new"]
 
@@ -268,5 +280,22 @@ def test_format_atagia_bench_report_summary_includes_retrieval_custody(
     )
 
     assert "Atagia-bench v0 Results" in summary
+    assert "Priority failures:" in summary
     assert "Retrieval custody: candidates=2 selected=1" in summary
     assert "channels=fts=2" in summary
+
+
+def test_load_atagia_bench_report_accepts_legacy_critical_error_count(
+    tmp_path: Path,
+) -> None:
+    report = _report(
+        result=_result(question_id="q1", passed=True, score=1.0),
+        pass_rate=1.0,
+    ).model_dump(mode="json")
+    report["critical_error_count"] = report.pop("priority_failure_count")
+    report_path = tmp_path / "legacy-report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    loaded = load_atagia_bench_report(report_path)
+
+    assert loaded.priority_failure_count == 0

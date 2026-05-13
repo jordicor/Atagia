@@ -95,7 +95,7 @@ def test_save_run_manifest_records_dataset_hash_and_question_ids(tmp_path: Path)
         total_passed=1,
         pass_rate=1.0,
         avg_score=1.0,
-        critical_error_count=0,
+        priority_failure_count=0,
         per_question=[
             AtagiaQuestionResult(
                 question_id="q1",
@@ -160,6 +160,7 @@ def test_save_run_manifest_records_dataset_hash_and_question_ids(tmp_path: Path)
     }
     assert manifest["diagnosis_bucket_counts"] == {"unknown": 1}
     assert manifest["sufficiency_diagnostic_counts"] == {"unknown": 1}
+    assert manifest["result_summary"]["priority_failure_count"] == 0
     assert manifest["retrieval_custody_summary"] == {
         "candidate_count": 1,
         "selected_count": 1,
@@ -178,3 +179,60 @@ def test_save_run_manifest_records_dataset_hash_and_question_ids(tmp_path: Path)
     }
     assert manifest["question_ids"] == ["q1"]
     assert manifest["benchmark_questions_persisted_as_messages"] is False
+
+
+def test_runner_role_specific_model_config_uses_base_as_role_fallback(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "personas.json").write_text("[]", encoding="utf-8")
+    manifests_dir = tmp_path / "manifests"
+    manifests_dir.mkdir()
+    runner = AtagiaBenchRunner(
+        llm_provider="openai",
+        llm_api_key=None,
+        llm_model="gpt-5.5-instant",
+        judge_model="gpt-5.4-mini",
+        retrieval_model="gpt-5.4-nano",
+        component_models={"need_detector": "gpt-5.4-mini"},
+        manifests_dir=manifests_dir,
+        data_dir=data_dir,
+    )
+
+    assert runner._model_config_summary() == {
+        "model_mode": "role_specific",
+        "base_model": "openai/gpt-5.5-instant",
+        "forced_global_model": "",
+        "ingest_model": "openai/gpt-5.5-instant",
+        "retrieval_model": "openai/gpt-5.4-nano",
+        "answer_model": "openai/gpt-5.5-instant",
+        "component_models": {"need_detector": "openai/gpt-5.4-mini"},
+        "judge_model": "openai/gpt-5.4-mini",
+    }
+    assert runner._atagia_model_kwargs() == {
+        "llm_ingest_model": "openai/gpt-5.5-instant",
+        "llm_retrieval_model": "openai/gpt-5.4-nano",
+        "llm_chat_model": "openai/gpt-5.5-instant",
+        "llm_component_models": {"need_detector": "openai/gpt-5.4-mini"},
+    }
+
+
+def test_benchmark_db_helpers_resolve_directory_and_copy_sidecars(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_db = source_dir / "benchmark.db"
+    source_db.write_bytes(b"db")
+    (source_dir / "benchmark.db-wal").write_bytes(b"wal")
+    (source_dir / "benchmark.db-shm").write_bytes(b"shm")
+
+    resolved = AtagiaBenchRunner._resolve_reuse_db(source_dir)
+    destination = tmp_path / "copy" / "benchmark.db"
+    AtagiaBenchRunner._copy_sqlite_db(resolved, destination)
+
+    assert resolved == source_db
+    assert destination.read_bytes() == b"db"
+    assert destination.with_name("benchmark.db-wal").read_bytes() == b"wal"
+    assert destination.with_name("benchmark.db-shm").read_bytes() == b"shm"

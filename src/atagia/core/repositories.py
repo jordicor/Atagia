@@ -18,16 +18,32 @@ from atagia.core.storage_backend import StorageBackend
 from atagia.core.timestamps import normalize_optional_timestamp
 from atagia.models.schemas_memory import (
     ConversationStatus,
+    EmbodimentBoundaryMode,
     IntimacyBoundary,
     MemoryCategory,
+    MindTopology,
     MemoryObjectType,
     MemoryScope,
     MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
+    SpaceBoundaryMode,
     SummaryViewKind,
 )
+from atagia.memory.embodiment_policy import (
+    embodiment_visibility_sql_clause_for_context,
+)
 from atagia.memory.intimacy_boundary_policy import memory_object_intimacy_sql_clause
+from atagia.memory.mind_policy import (
+    annotate_overseer_grants_for_rows,
+    mind_visibility_sql_clause_for_context,
+)
+from atagia.memory.realm_policy import (
+    APPLICABLE_REALM_BRIDGE_MODES,
+    annotate_realm_bridge_modes_for_rows,
+    realm_visibility_sql_clause_for_context,
+)
+from atagia.memory.space_policy import space_visibility_sql_clause_for_context
 from atagia.services.errors import ConversationNotActiveError, UserDeletedError
 
 RETRIEVAL_ELIGIBLE_MEMORY_STATUSES: tuple[MemoryStatus, ...] = (MemoryStatus.ACTIVE,)
@@ -565,6 +581,12 @@ class ConversationRepository(BaseRepository):
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        active_space_id: str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str = MindTopology.UNIMIND,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
     ) -> dict[str, Any]:
@@ -587,6 +609,7 @@ class ConversationRepository(BaseRepository):
         else:
             resolved_incognito = int(bool(incognito))
             resolved_isolated_mode = resolved_incognito
+        resolved_mind_topology = MindTopology(mind_topology).value
         await self._connection.execute(
             """
             INSERT INTO conversations(
@@ -608,10 +631,16 @@ class ConversationRepository(BaseRepository):
                 user_persona_id,
                 platform_id,
                 character_id,
+                active_presence_id,
+                active_space_id,
+                active_mind_id,
+                mind_topology,
+                active_embodiment_id,
+                active_realm_id,
                 mode,
                 incognito
             )
-            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 resolved_conversation_id,
@@ -630,12 +659,126 @@ class ConversationRepository(BaseRepository):
                 user_persona_id,
                 platform_id,
                 resolved_character_id,
+                active_presence_id,
+                active_space_id,
+                active_mind_id,
+                resolved_mind_topology,
+                active_embodiment_id,
+                active_realm_id,
                 resolved_mode,
                 resolved_incognito,
             ),
         )
         await self._connection.commit()
         return await self.get_conversation(resolved_conversation_id, user_id)
+
+    async def set_active_presence(
+        self,
+        conversation_id: str,
+        user_id: str,
+        active_presence_id: str,
+    ) -> dict[str, Any] | None:
+        timestamp = self._timestamp()
+        await self._connection.execute(
+            """
+            UPDATE conversations
+            SET active_presence_id = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (active_presence_id, timestamp, conversation_id, user_id),
+        )
+        await self._connection.commit()
+        return await self.get_conversation(conversation_id, user_id)
+
+    async def set_active_space(
+        self,
+        conversation_id: str,
+        user_id: str,
+        active_space_id: str,
+    ) -> dict[str, Any] | None:
+        timestamp = self._timestamp()
+        await self._connection.execute(
+            """
+            UPDATE conversations
+            SET active_space_id = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (active_space_id, timestamp, conversation_id, user_id),
+        )
+        await self._connection.commit()
+        return await self.get_conversation(conversation_id, user_id)
+
+    async def set_active_mind(
+        self,
+        conversation_id: str,
+        user_id: str,
+        active_mind_id: str,
+        mind_topology: MindTopology | str,
+    ) -> dict[str, Any] | None:
+        timestamp = self._timestamp()
+        await self._connection.execute(
+            """
+            UPDATE conversations
+            SET active_mind_id = ?,
+                mind_topology = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (
+                active_mind_id,
+                MindTopology(mind_topology).value,
+                timestamp,
+                conversation_id,
+                user_id,
+            ),
+        )
+        await self._connection.commit()
+        return await self.get_conversation(conversation_id, user_id)
+
+    async def set_active_embodiment(
+        self,
+        conversation_id: str,
+        user_id: str,
+        active_embodiment_id: str,
+    ) -> dict[str, Any] | None:
+        timestamp = self._timestamp()
+        await self._connection.execute(
+            """
+            UPDATE conversations
+            SET active_embodiment_id = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (active_embodiment_id, timestamp, conversation_id, user_id),
+        )
+        await self._connection.commit()
+        return await self.get_conversation(conversation_id, user_id)
+
+    async def set_active_realm(
+        self,
+        conversation_id: str,
+        user_id: str,
+        active_realm_id: str,
+    ) -> dict[str, Any] | None:
+        timestamp = self._timestamp()
+        await self._connection.execute(
+            """
+            UPDATE conversations
+            SET active_realm_id = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (active_realm_id, timestamp, conversation_id, user_id),
+        )
+        await self._connection.commit()
+        return await self.get_conversation(conversation_id, user_id)
 
     async def get_conversation(self, conversation_id: str, user_id: str) -> dict[str, Any] | None:
         return await self._fetch_one(
@@ -902,6 +1045,13 @@ class MessageRepository(BaseRepository):
         metadata: dict[str, Any] | None = None,
         occurred_at: str | None = None,
         *,
+        active_presence_id: str | None = None,
+        source_presence_id: str | None = None,
+        space_id: str | None = None,
+        active_mind_id: str | None = None,
+        source_mind_id: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_message_id = message_id or generate_prefixed_id("msg")
@@ -935,6 +1085,13 @@ class MessageRepository(BaseRepository):
                     requires_explicit_request,
                     context_placeholder,
                     policy_reason,
+                    active_presence_id,
+                    source_presence_id,
+                    space_id,
+                    active_mind_id,
+                    source_mind_id,
+                    active_embodiment_id,
+                    active_realm_id,
                     created_at,
                     occurred_at
                 )
@@ -963,6 +1120,13 @@ class MessageRepository(BaseRepository):
                     ?,
                     ?,
                     ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
                     ?
                 FROM conversations AS c
                 WHERE c.id = ?
@@ -983,6 +1147,13 @@ class MessageRepository(BaseRepository):
                     message_policy["requires_explicit_request"],
                     message_policy["context_placeholder"],
                     message_policy["policy_reason"],
+                    active_presence_id,
+                    source_presence_id,
+                    space_id,
+                    active_mind_id,
+                    source_mind_id,
+                    active_embodiment_id,
+                    active_realm_id,
                     timestamp,
                     resolved_occurred_at,
                     conversation_id,
@@ -1008,12 +1179,26 @@ class MessageRepository(BaseRepository):
                     requires_explicit_request,
                     context_placeholder,
                     policy_reason,
+                    active_presence_id,
+                    source_presence_id,
+                    space_id,
+                    active_mind_id,
+                    source_mind_id,
+                    active_embodiment_id,
+                    active_realm_id,
                     created_at,
                     occurred_at
                 )
                 SELECT
                     ?,
                     c.id,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
                     ?,
                     ?,
                     ?,
@@ -1050,6 +1235,13 @@ class MessageRepository(BaseRepository):
                     message_policy["requires_explicit_request"],
                     message_policy["context_placeholder"],
                     message_policy["policy_reason"],
+                    active_presence_id,
+                    source_presence_id,
+                    space_id,
+                    active_mind_id,
+                    source_mind_id,
+                    active_embodiment_id,
+                    active_realm_id,
                     timestamp,
                     resolved_occurred_at,
                     conversation_id,
@@ -1202,9 +1394,14 @@ class MessageRepository(BaseRepository):
     ) -> list[dict[str, Any]]:
         return await self._fetch_all(
             """
-            SELECT m.*
+            SELECT
+                m.*,
+                sp.boundary_mode AS message_space_boundary_mode
             FROM messages AS m
             JOIN conversations AS c ON c.id = m.conversation_id
+            LEFT JOIN spaces AS sp
+              ON sp.owner_user_id = c.user_id
+             AND sp.id = m.space_id
             WHERE m.conversation_id = ?
               AND c.user_id = ?
               AND m.seq BETWEEN ? AND ?
@@ -1324,6 +1521,7 @@ class MessageRepository(BaseRepository):
         limit: int,
         allow_conversation_id: str | None = None,
         active_conversation_only: bool = False,
+        include_pending_confirmation_sources: bool = False,
     ) -> list[dict[str, Any]]:
         """Wave 1 batch 2 (1-C): privacy-filtered FTS search on messages.
 
@@ -1349,19 +1547,23 @@ class MessageRepository(BaseRepository):
                 m.*,
                 c.assistant_mode_id AS conversation_assistant_mode_id,
                 am.privacy_ceiling AS mode_privacy_ceiling,
+                sp.boundary_mode AS message_space_boundary_mode,
                 bm25(messages_fts) AS rank,
                 snippet(messages_fts, 0, '', '', ' ... ', 64) AS fts_snippet
             FROM messages_fts
             JOIN messages AS m ON m._rowid = messages_fts.rowid
             JOIN conversations AS c ON c.id = m.conversation_id
             JOIN assistant_modes AS am ON am.id = c.assistant_mode_id
+            LEFT JOIN spaces AS sp
+              ON sp.owner_user_id = c.user_id
+             AND sp.id = m.space_id
             WHERE c.user_id = ?
               AND (am.privacy_ceiling <= ? OR (? IS NOT NULL AND c.id = ?))
               AND c.status = 'active'
               AND {visibility_clause}
               AND (? = 0 OR c.id = ?)
               AND (? = 0 OR c.id = ?)
-              AND NOT EXISTS (
+              AND (? = 1 OR NOT EXISTS (
                   SELECT 1
                   FROM memory_objects AS pending
                   JOIN json_each(
@@ -1369,7 +1571,7 @@ class MessageRepository(BaseRepository):
                   ) AS pending_src ON pending_src.value = m.id
                   WHERE pending.user_id = ?
                     AND pending.status = 'pending_user_confirmation'
-              )
+              ))
               AND messages_fts MATCH ?
             ORDER BY rank ASC, m.seq ASC
             LIMIT ?
@@ -1386,6 +1588,7 @@ class MessageRepository(BaseRepository):
                 allow_conversation_id,
                 int(active_conversation_only),
                 allow_conversation_id,
+                int(include_pending_confirmation_sources),
                 user_id,
                 query,
                 limit,
@@ -1435,9 +1638,14 @@ class MessageRepository(BaseRepository):
         end_seq = center_seq + (window_size - 1 - half)
         return await self._fetch_all(
             """
-            SELECT m.*
+            SELECT
+                m.*,
+                sp.boundary_mode AS message_space_boundary_mode
             FROM messages AS m
             JOIN conversations AS c ON c.id = m.conversation_id
+            LEFT JOIN spaces AS sp
+              ON sp.owner_user_id = c.user_id
+             AND sp.id = m.space_id
             WHERE m.conversation_id = ?
               AND c.user_id = ?
               AND m.seq BETWEEN ? AND ?
@@ -1594,6 +1802,12 @@ class MemoryObjectRepository(BaseRepository):
         remember_across_chats: bool,
         remember_across_devices: bool,
         sensitivity_gates_enabled: bool = False,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Return a memory only if it is visible in the active namespace."""
 
@@ -1611,6 +1825,24 @@ class MemoryObjectRepository(BaseRepository):
         )
         if not clauses:
             return None
+        space_clause, space_parameters = space_visibility_sql_clause_for_context(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            alias="mo",
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="mo",
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="mo",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="mo",
+        )
         return await self._fetch_one(
             """
             SELECT mo.*
@@ -1621,9 +1853,17 @@ class MemoryObjectRepository(BaseRepository):
               AND mo.archived_by_conversation_id IS NULL
               AND {visibility_clause}
               AND {namespace_clauses}
+              AND {space_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
             """.format(
                 visibility_clause=conversation_visibility_clause("mo"),
                 namespace_clauses=" AND ".join(clauses),
+                space_clause=space_clause,
+                mind_clause=mind_clause,
+                embodiment_clause=embodiment_clause,
+                realm_clause=realm_clause,
             ),
             (
                 memory_id,
@@ -1631,6 +1871,10 @@ class MemoryObjectRepository(BaseRepository):
                 MemoryStatus.DELETED.value,
                 conversation_id,
                 *parameters,
+                *space_parameters,
+                *mind_parameters,
+                *embodiment_parameters,
+                *realm_parameters,
             ),
         )
 
@@ -1933,6 +2177,15 @@ class MemoryObjectRepository(BaseRepository):
         platform_locked: bool = False,
         platform_id_lock: str | None = None,
         scope_canonical: str | None = None,
+        active_presence_id: str | None = None,
+        source_presence_id: str | None = None,
+        presence_cluster_id: str | None = None,
+        space_id: str | None = None,
+        space_boundary_mode: str | None = None,
+        memory_owner_id: str | None = None,
+        source_mind_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
     ) -> dict[str, Any]:
         created, _was_created = await self._create_memory_object_impl(
             user_id=user_id,
@@ -1971,6 +2224,15 @@ class MemoryObjectRepository(BaseRepository):
             platform_locked=platform_locked,
             platform_id_lock=platform_id_lock,
             scope_canonical=scope_canonical,
+            active_presence_id=active_presence_id,
+            source_presence_id=source_presence_id,
+            presence_cluster_id=presence_cluster_id,
+            space_id=space_id,
+            space_boundary_mode=space_boundary_mode,
+            memory_owner_id=memory_owner_id,
+            source_mind_id=source_mind_id,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
         )
         return created
 
@@ -2013,6 +2275,15 @@ class MemoryObjectRepository(BaseRepository):
         platform_locked: bool = False,
         platform_id_lock: str | None = None,
         scope_canonical: str | None = None,
+        active_presence_id: str | None = None,
+        source_presence_id: str | None = None,
+        presence_cluster_id: str | None = None,
+        space_id: str | None = None,
+        space_boundary_mode: str | None = None,
+        memory_owner_id: str | None = None,
+        source_mind_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         return await self._create_memory_object_impl(
             user_id=user_id,
@@ -2051,6 +2322,15 @@ class MemoryObjectRepository(BaseRepository):
             platform_locked=platform_locked,
             platform_id_lock=platform_id_lock,
             scope_canonical=scope_canonical,
+            active_presence_id=active_presence_id,
+            source_presence_id=source_presence_id,
+            presence_cluster_id=presence_cluster_id,
+            space_id=space_id,
+            space_boundary_mode=space_boundary_mode,
+            memory_owner_id=memory_owner_id,
+            source_mind_id=source_mind_id,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
         )
 
     async def _create_memory_object_impl(
@@ -2095,6 +2375,15 @@ class MemoryObjectRepository(BaseRepository):
         platform_locked: bool = False,
         platform_id_lock: str | None = None,
         scope_canonical: str | None = None,
+        active_presence_id: str | None = None,
+        source_presence_id: str | None = None,
+        presence_cluster_id: str | None = None,
+        space_id: str | None = None,
+        space_boundary_mode: str | None = None,
+        memory_owner_id: str | None = None,
+        source_mind_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         resolved_memory_id = memory_id or new_memory_id()
         timestamp = self._timestamp()
@@ -2152,6 +2441,15 @@ class MemoryObjectRepository(BaseRepository):
             int(platform_locked),
             platform_id_lock,
             resolved_scope_canonical,
+            active_presence_id,
+            source_presence_id,
+            presence_cluster_id,
+            space_id,
+            space_boundary_mode,
+            memory_owner_id,
+            source_mind_id,
+            embodiment_id,
+            realm_id,
         )
         try:
             await self._connection.execute(
@@ -2193,9 +2491,18 @@ class MemoryObjectRepository(BaseRepository):
                     auto_expires,
                     platform_locked,
                     platform_id_lock,
-                    scope_canonical
+                    scope_canonical,
+                    active_presence_id,
+                    source_presence_id,
+                    presence_cluster_id,
+                    space_id,
+                    space_boundary_mode,
+                    memory_owner_id,
+                    source_mind_id,
+                    embodiment_id,
+                    realm_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 parameters,
             )
@@ -2231,6 +2538,83 @@ class MemoryObjectRepository(BaseRepository):
             (user_id, extraction_hash),
         )
 
+    async def filter_owned_presence_ids(
+        self,
+        *,
+        user_id: str,
+        presence_ids: list[str],
+    ) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for presence_id in presence_ids:
+            value = str(presence_id).strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        if not normalized:
+            return []
+        placeholders = ", ".join("?" for _ in normalized)
+        rows = await self._fetch_all(
+            f"""
+            SELECT id
+            FROM presences
+            WHERE owner_user_id = ?
+              AND id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            (user_id, *normalized),
+        )
+        allowed = {str(row["id"]) for row in rows}
+        return [presence_id for presence_id in normalized if presence_id in allowed]
+
+    async def add_memory_object_subjects(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        subject_presence_ids: list[str],
+        relation: str = "subject",
+        commit: bool = True,
+    ) -> None:
+        allowed_ids = await self.filter_owned_presence_ids(
+            user_id=user_id,
+            presence_ids=subject_presence_ids,
+        )
+        if not allowed_ids:
+            return
+        timestamp = self._timestamp()
+        for subject_presence_id in allowed_ids:
+            await self._connection.execute(
+                """
+                INSERT OR IGNORE INTO memory_object_subjects(
+                    memory_object_id,
+                    owner_user_id,
+                    subject_presence_id,
+                    relation,
+                    created_at
+                )
+                SELECT ?, ?, ?, ?, ?
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM memory_objects
+                    WHERE id = ?
+                      AND user_id = ?
+                )
+                """,
+                (
+                    memory_id,
+                    user_id,
+                    subject_presence_id,
+                    relation,
+                    timestamp,
+                    memory_id,
+                    user_id,
+                ),
+            )
+        if commit:
+            await self._connection.commit()
+
     async def find_memory_object_for_extraction_merge(
         self,
         *,
@@ -2241,6 +2625,13 @@ class MemoryObjectRepository(BaseRepository):
         user_persona_id: str | None,
         character_id: str | None,
         conversation_id: str | None,
+        active_presence_id: str | None = None,
+        source_presence_id: str | None = None,
+        space_id: str | None = None,
+        memory_owner_id: str | None = None,
+        source_mind_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Find an existing same-namespace row when hashes differ by locks.
 
@@ -2260,6 +2651,13 @@ class MemoryObjectRepository(BaseRepository):
               AND user_persona_id IS ?
               AND character_id IS ?
               AND conversation_id IS ?
+              AND active_presence_id IS ?
+              AND source_presence_id IS ?
+              AND space_id IS ?
+              AND memory_owner_id IS ?
+              AND source_mind_id IS ?
+              AND embodiment_id IS ?
+              AND realm_id IS ?
             ORDER BY platform_locked DESC, updated_at DESC, _rowid DESC
             LIMIT 1
             """,
@@ -2271,6 +2669,13 @@ class MemoryObjectRepository(BaseRepository):
                 user_persona_id,
                 character_id,
                 conversation_id,
+                active_presence_id,
+                source_presence_id,
+                space_id,
+                memory_owner_id,
+                source_mind_id,
+                embodiment_id,
+                realm_id,
             ),
         )
 
@@ -2283,6 +2688,15 @@ class MemoryObjectRepository(BaseRepository):
         workspace_id: str | None,
         conversation_id: str | None,
         source_message_ids: list[str],
+        active_presence_id: str | None = None,
+        source_presence_id: str | None = None,
+        presence_cluster_id: str | None = None,
+        space_id: str | None = None,
+        space_boundary_mode: str | None = None,
+        memory_owner_id: str | None = None,
+        source_mind_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
         touch: bool = True,
         commit: bool = True,
     ) -> dict[str, Any]:
@@ -2309,6 +2723,33 @@ class MemoryObjectRepository(BaseRepository):
                 "assistant_mode_id": assistant_mode_id,
                 "workspace_id": workspace_id,
                 "conversation_id": conversation_id,
+                "active_presence_id": active_presence_id
+                if existing.get("active_presence_id") is None
+                else existing.get("active_presence_id"),
+                "source_presence_id": source_presence_id
+                if existing.get("source_presence_id") is None
+                else existing.get("source_presence_id"),
+                "presence_cluster_id": presence_cluster_id
+                if existing.get("presence_cluster_id") is None
+                else existing.get("presence_cluster_id"),
+                "space_id": space_id
+                if existing.get("space_id") is None
+                else existing.get("space_id"),
+                "space_boundary_mode": space_boundary_mode
+                if existing.get("space_boundary_mode") is None
+                else existing.get("space_boundary_mode"),
+                "memory_owner_id": memory_owner_id
+                if existing.get("memory_owner_id") is None
+                else existing.get("memory_owner_id"),
+                "source_mind_id": source_mind_id
+                if existing.get("source_mind_id") is None
+                else existing.get("source_mind_id"),
+                "embodiment_id": embodiment_id
+                if existing.get("embodiment_id") is None
+                else existing.get("embodiment_id"),
+                "realm_id": realm_id
+                if existing.get("realm_id") is None
+                else existing.get("realm_id"),
             }.items()
         )
         payload_changed = normalized_payload != payload
@@ -2322,6 +2763,15 @@ class MemoryObjectRepository(BaseRepository):
             SET assistant_mode_id = ?,
                 workspace_id = ?,
                 conversation_id = ?,
+                active_presence_id = COALESCE(active_presence_id, ?),
+                source_presence_id = COALESCE(source_presence_id, ?),
+                presence_cluster_id = COALESCE(presence_cluster_id, ?),
+                space_id = COALESCE(space_id, ?),
+                space_boundary_mode = COALESCE(space_boundary_mode, ?),
+                memory_owner_id = COALESCE(memory_owner_id, ?),
+                source_mind_id = COALESCE(source_mind_id, ?),
+                embodiment_id = COALESCE(embodiment_id, ?),
+                realm_id = COALESCE(realm_id, ?),
                 payload_json = ?,
                 updated_at = ?
             WHERE id = ?
@@ -2331,6 +2781,15 @@ class MemoryObjectRepository(BaseRepository):
                 assistant_mode_id,
                 workspace_id,
                 conversation_id,
+                active_presence_id,
+                source_presence_id,
+                presence_cluster_id,
+                space_id,
+                space_boundary_mode,
+                memory_owner_id,
+                source_mind_id,
+                embodiment_id,
+                realm_id,
                 _encode_json(normalized_payload),
                 timestamp,
                 memory_id,
@@ -2478,6 +2937,10 @@ class MemoryObjectRepository(BaseRepository):
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
         sensitivity_gates_enabled: bool = False,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> int:
         if platform_id is not None and conversation_id is not None:
             clauses, parameters = self.namespace_visibility_clauses(
@@ -2503,6 +2966,19 @@ class MemoryObjectRepository(BaseRepository):
             clause_joiner = " OR "
         if not clauses:
             return 0
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="memory_objects",
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="memory_objects",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="memory_objects",
+        )
 
         cursor = await self._connection.execute(
             """
@@ -2515,10 +2991,16 @@ class MemoryObjectRepository(BaseRepository):
               AND status IN ({status_placeholders})
               AND archived_by_conversation_id IS NULL
               AND {visibility_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
             """.format(
                 clauses=clause_joiner.join(clauses),
                 status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
                 visibility_clause=conversation_visibility_clause("memory_objects"),
+                mind_clause=mind_clause,
+                embodiment_clause=embodiment_clause,
+                realm_clause=realm_clause,
             ),
             tuple(
                 [
@@ -2526,6 +3008,9 @@ class MemoryObjectRepository(BaseRepository):
                     *parameters,
                     *(status.value for status in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
                     conversation_id,
+                    *mind_parameters,
+                    *embodiment_parameters,
+                    *realm_parameters,
                 ]
             ),
         )
@@ -2549,6 +3034,12 @@ class MemoryObjectRepository(BaseRepository):
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
         sensitivity_gates_enabled: bool = False,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> int:
         """Return the total canonical_text length for eligible active memories.
 
@@ -2580,6 +3071,24 @@ class MemoryObjectRepository(BaseRepository):
             clause_joiner = " OR "
         if not clauses:
             return 0
+        space_clause, space_parameters = space_visibility_sql_clause_for_context(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            alias="memory_objects",
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="memory_objects",
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="memory_objects",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="memory_objects",
+        )
 
         cursor = await self._connection.execute(
             """
@@ -2592,12 +3101,20 @@ class MemoryObjectRepository(BaseRepository):
               AND status IN ({status_placeholders})
               AND archived_by_conversation_id IS NULL
               AND {visibility_clause}
+              AND {space_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
               AND privacy_level <= ?
               AND {intimacy_filter}
             """.format(
                 clauses=clause_joiner.join(clauses),
                 status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
                 visibility_clause=conversation_visibility_clause("memory_objects"),
+                space_clause=space_clause,
+                mind_clause=mind_clause,
+                embodiment_clause=embodiment_clause,
+                realm_clause=realm_clause,
                 intimacy_filter=memory_object_intimacy_sql_clause(
                     "memory_objects",
                     allow_intimacy_context=allow_intimacy_context,
@@ -2609,6 +3126,10 @@ class MemoryObjectRepository(BaseRepository):
                     *parameters,
                     *(status.value for status in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
                     conversation_id,
+                    *space_parameters,
+                    *mind_parameters,
+                    *embodiment_parameters,
+                    *realm_parameters,
                     privacy_ceiling,
                 ]
             ),
@@ -2633,6 +3154,12 @@ class MemoryObjectRepository(BaseRepository):
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
         sensitivity_gates_enabled: bool = False,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return eligible active memory objects for small-corpus composition."""
         if platform_id is not None and conversation_id is not None:
@@ -2659,8 +3186,26 @@ class MemoryObjectRepository(BaseRepository):
             clause_joiner = " OR "
         if not clauses:
             return []
+        space_clause, space_parameters = space_visibility_sql_clause_for_context(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            alias="memory_objects",
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="memory_objects",
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="memory_objects",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="memory_objects",
+        )
 
-        return await self._fetch_all(
+        rows = await self._fetch_all(
             """
             SELECT *
             FROM memory_objects
@@ -2671,6 +3216,10 @@ class MemoryObjectRepository(BaseRepository):
               AND status IN ({status_placeholders})
               AND archived_by_conversation_id IS NULL
               AND {visibility_clause}
+              AND {space_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
               AND privacy_level <= ?
               AND {intimacy_filter}
             ORDER BY updated_at DESC, id ASC
@@ -2678,6 +3227,10 @@ class MemoryObjectRepository(BaseRepository):
                 clauses=clause_joiner.join(clauses),
                 status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
                 visibility_clause=conversation_visibility_clause("memory_objects"),
+                space_clause=space_clause,
+                mind_clause=mind_clause,
+                embodiment_clause=embodiment_clause,
+                realm_clause=realm_clause,
                 intimacy_filter=memory_object_intimacy_sql_clause(
                     "memory_objects",
                     allow_intimacy_context=allow_intimacy_context,
@@ -2689,10 +3242,26 @@ class MemoryObjectRepository(BaseRepository):
                     *parameters,
                     *(status.value for status in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
                     conversation_id,
+                    *space_parameters,
+                    *mind_parameters,
+                    *embodiment_parameters,
+                    *realm_parameters,
                     privacy_ceiling,
                 ]
             ),
         )
+        await annotate_realm_bridge_modes_for_rows(
+            self._connection,
+            rows,
+            active_realm_id=active_realm_id,
+        )
+        await annotate_overseer_grants_for_rows(
+            self._connection,
+            rows,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+        )
+        return rows
 
     @staticmethod
     def namespace_scope_clauses(
@@ -2704,6 +3273,7 @@ class MemoryObjectRepository(BaseRepository):
         remember_across_chats: bool,
         incognito: bool,
         table_alias: str = "memory_objects",
+        allow_cross_conversation_chat: bool = False,
     ) -> tuple[list[str], list[Any]]:
         """Build namespace-aware scope filters for the canonical scopes.
 
@@ -2726,12 +3296,19 @@ class MemoryObjectRepository(BaseRepository):
         parameters: list[Any] = []
         for scope in scopes:
             if scope is MemoryScope.CHAT:
-                clauses.append(
-                    f"({prefix}scope_canonical = 'chat' "
-                    f"AND {prefix}user_persona_id IS ? "
-                    f"AND {prefix}conversation_id = ?)"
-                )
-                parameters.extend([user_persona_id, conversation_id])
+                if allow_cross_conversation_chat and cross_chat:
+                    clauses.append(
+                        f"({prefix}scope_canonical = 'chat' "
+                        f"AND {prefix}user_persona_id IS ?)"
+                    )
+                    parameters.append(user_persona_id)
+                else:
+                    clauses.append(
+                        f"({prefix}scope_canonical = 'chat' "
+                        f"AND {prefix}user_persona_id IS ? "
+                        f"AND {prefix}conversation_id = ?)"
+                    )
+                    parameters.extend([user_persona_id, conversation_id])
             elif scope is MemoryScope.CHARACTER and cross_chat and character_id is not None:
                 clauses.append(
                     f"({prefix}scope_canonical = 'character' "
@@ -2785,7 +3362,9 @@ class MemoryObjectRepository(BaseRepository):
         remember_across_devices: bool,
         incognito: bool,
         sensitivity_gates_enabled: bool = False,
+        allow_private_sensitivity: bool = False,
         table_alias: str = "memory_objects",
+        allow_cross_conversation_chat: bool = False,
     ) -> tuple[list[str], list[Any]]:
         """Build the Phase 7 namespace/platform/sensitivity reader filters."""
 
@@ -2797,6 +3376,7 @@ class MemoryObjectRepository(BaseRepository):
             remember_across_chats=remember_across_chats,
             incognito=incognito,
             table_alias=table_alias,
+            allow_cross_conversation_chat=allow_cross_conversation_chat,
         )
         if not scope_clauses:
             return [], []
@@ -2810,6 +3390,7 @@ class MemoryObjectRepository(BaseRepository):
                 "(" + " OR ".join(scope_clauses) + ")",
                 MemoryObjectRepository.sensitivity_filter_clause(
                     gates_enabled=sensitivity_gates_enabled,
+                    allow_private_sensitivity=allow_private_sensitivity,
                     table_alias=table_alias,
                 ),
                 platform_clause,
@@ -2821,6 +3402,7 @@ class MemoryObjectRepository(BaseRepository):
     def sensitivity_filter_clause(
         *,
         gates_enabled: bool,
+        allow_private_sensitivity: bool = False,
         table_alias: str = "memory_objects",
     ) -> str:
         """SQL fragment that gates retrieval by sensitivity.
@@ -2834,9 +3416,14 @@ class MemoryObjectRepository(BaseRepository):
         ``private`` and ``secret`` rows become candidates that the
         retrieval pipeline must run through the LLM theme gate and the
         explicit-reference gate respectively.
+
+        ``allow_private_sensitivity`` is narrower: it admits private rows
+        while keeping secret rows excluded at SQL time.
         """
 
         prefix = f"{table_alias}." if table_alias else ""
+        if allow_private_sensitivity:
+            return f"({prefix}sensitivity IN ('public', 'private'))"
         if gates_enabled:
             return f"({prefix}sensitivity IN ('public', 'private', 'secret'))"
         return f"({prefix}sensitivity = 'public')"
@@ -2915,6 +3502,12 @@ class MemoryObjectRepository(BaseRepository):
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
         sensitivity_gates_enabled: bool = False,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any]:
         if platform_id is not None and conversation_id is not None:
             clauses, parameters = self.namespace_visibility_clauses(
@@ -2943,6 +3536,26 @@ class MemoryObjectRepository(BaseRepository):
             clause_joiner = " OR "
         if not clauses:
             return {}
+        space_clause, space_parameters = space_visibility_sql_clause_for_context(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            alias="memory_objects",
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="memory_objects",
+            allow_overseer_grants=False,
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="memory_objects",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="memory_objects",
+            allowed_bridge_modes=APPLICABLE_REALM_BRIDGE_MODES,
+        )
 
         rows = await self._fetch_all(
             """
@@ -2952,12 +3565,20 @@ class MemoryObjectRepository(BaseRepository):
               AND object_type = ?
               AND status = ?
               AND ({clauses})
+              AND {space_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
               AND archived_by_conversation_id IS NULL
               AND {visibility_clause}
               AND {intimacy_filter}
             ORDER BY updated_at DESC, id ASC
             """.format(
                 clauses=clause_joiner.join(clauses),
+                space_clause=space_clause,
+                mind_clause=mind_clause,
+                embodiment_clause=embodiment_clause,
+                realm_clause=realm_clause,
                 visibility_clause=conversation_visibility_clause("memory_objects"),
                 intimacy_filter=memory_object_intimacy_sql_clause(
                     "memory_objects",
@@ -2969,6 +3590,10 @@ class MemoryObjectRepository(BaseRepository):
                 MemoryObjectType.STATE_SNAPSHOT.value,
                 MemoryStatus.ACTIVE.value,
                 *parameters,
+                *space_parameters,
+                *mind_parameters,
+                *embodiment_parameters,
+                *realm_parameters,
                 conversation_id,
             ),
         )
@@ -2985,10 +3610,29 @@ class MemoryObjectRepository(BaseRepository):
             payload = row.get("payload_json") or {}
             if not isinstance(payload, dict):
                 continue
+            row_realm_id = (
+                str(row["realm_id"])
+                if row.get("realm_id") is not None
+                else None
+            )
             for key, value in payload.items():
                 current = resolved.get(key)
+                resolved_value = value
+                if (
+                    active_realm_id is not None
+                    and row_realm_id is not None
+                    and row_realm_id != active_realm_id
+                ):
+                    resolved_value = {
+                        "value": value,
+                        "realm": {
+                            "active_realm_id": row_realm_id,
+                            "active_request_realm_id": active_realm_id,
+                            "cross_realm_mode": "applicable",
+                        },
+                    }
                 if current is None or (scope_rank, updated_at) > (current[0], current[1]):
-                    resolved[key] = (scope_rank, updated_at, value)
+                    resolved[key] = (scope_rank, updated_at, resolved_value)
         return {key: value for key, (_, _, value) in resolved.items()}
 
     async def has_memory_for_source_message(

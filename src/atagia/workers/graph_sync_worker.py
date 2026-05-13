@@ -200,6 +200,60 @@ class GraphSyncWorker:
                     if job_payload.character_id is not None
                     else conversation.get("character_id") or conversation.get("workspace_id")
                 ),
+                active_presence_id=(
+                    job_payload.active_presence_id or conversation.get("active_presence_id")
+                ),
+                active_presence_kind=job_payload.active_presence_kind,
+                active_presence_display_name=job_payload.active_presence_display_name,
+                source_presence_id=job_payload.source_presence_id,
+                source_presence_kind=job_payload.source_presence_kind,
+                source_presence_display_name=job_payload.source_presence_display_name,
+                active_space_id=(
+                    job_payload.active_space_id or conversation.get("active_space_id")
+                ),
+                active_space_boundary_mode=(
+                    job_payload.active_space_boundary_mode
+                    or conversation.get("active_space_boundary_mode")
+                    or "focus"
+                ),
+                active_space_display_name=(
+                    job_payload.active_space_display_name
+                    or conversation.get("active_space_display_name")
+                ),
+                active_mind_id=(
+                    job_payload.active_mind_id or conversation.get("active_mind_id")
+                ),
+                source_mind_id=(
+                    job_payload.source_mind_id
+                    or job_payload.active_mind_id
+                    or conversation.get("active_mind_id")
+                ),
+                active_mind_display_name=job_payload.active_mind_display_name,
+                mind_topology=(
+                    job_payload.mind_topology
+                    or conversation.get("mind_topology")
+                    or "unimind"
+                ),
+                active_embodiment_id=(
+                    job_payload.active_embodiment_id
+                    or conversation.get("active_embodiment_id")
+                ),
+                active_embodiment_display_name=job_payload.active_embodiment_display_name,
+                cross_embodiment_mode=(
+                    job_payload.cross_embodiment_mode
+                    or conversation.get("cross_embodiment_mode")
+                    or "direct_if_same_body"
+                ),
+                active_realm_id=(
+                    job_payload.active_realm_id
+                    or conversation.get("active_realm_id")
+                ),
+                active_realm_display_name=job_payload.active_realm_display_name,
+                cross_realm_mode=(
+                    job_payload.cross_realm_mode
+                    or conversation.get("cross_realm_mode")
+                    or "none"
+                ),
                 mode=str(job_payload.mode or conversation.get("mode") or job_payload.assistant_mode_id),
                 recent_messages=[
                     ExtractionContextMessage.model_validate(item)

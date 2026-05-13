@@ -187,6 +187,10 @@ class MemoryFeedbackRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
         mode: str | None = None,
     ) -> dict[str, Any]:
         selected_memory_ids: set[str] | None = None
@@ -235,6 +239,10 @@ class MemoryFeedbackRepository(BaseRepository):
                     incognito=incognito,
                     remember_across_chats=remember_across_chats,
                     remember_across_devices=remember_across_devices,
+                    active_mind_id=active_mind_id,
+                    mind_topology=mind_topology,
+                    active_embodiment_id=active_embodiment_id,
+                    active_realm_id=active_realm_id,
                     sensitivity_gates_enabled=True,
                 )
                 if memory is None:

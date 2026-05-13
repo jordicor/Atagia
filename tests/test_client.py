@@ -174,6 +174,80 @@ def _settings(tmp_path: Path, *, workers_enabled: bool = False) -> Settings:
     )
 
 
+async def _conversation_and_message_embodiments(
+    runtime: object,
+    *,
+    user_id: str,
+    conversation_id: str,
+) -> tuple[str | None, list[str | None]]:
+    connection = await runtime.open_connection()
+    try:
+        cursor = await connection.execute(
+            """
+            SELECT active_embodiment_id
+            FROM conversations
+            WHERE user_id = ?
+              AND id = ?
+            """,
+            (user_id, conversation_id),
+        )
+        conversation = await cursor.fetchone()
+        if conversation is None:
+            raise AssertionError("Conversation should exist")
+        cursor = await connection.execute(
+            """
+            SELECT active_embodiment_id
+            FROM messages
+            WHERE conversation_id = ?
+            ORDER BY seq ASC, id ASC
+            """,
+            (conversation_id,),
+        )
+        messages = await cursor.fetchall()
+        return conversation["active_embodiment_id"], [
+            message["active_embodiment_id"] for message in messages
+        ]
+    finally:
+        await connection.close()
+
+
+async def _conversation_and_message_realms(
+    runtime: object,
+    *,
+    user_id: str,
+    conversation_id: str,
+) -> tuple[str | None, list[str | None]]:
+    connection = await runtime.open_connection()
+    try:
+        cursor = await connection.execute(
+            """
+            SELECT active_realm_id
+            FROM conversations
+            WHERE user_id = ?
+              AND id = ?
+            """,
+            (user_id, conversation_id),
+        )
+        conversation = await cursor.fetchone()
+        if conversation is None:
+            raise AssertionError("Conversation should exist")
+        cursor = await connection.execute(
+            """
+            SELECT active_realm_id
+            FROM messages
+            WHERE conversation_id = ?
+            ORDER BY seq ASC, id ASC
+            """,
+            (conversation_id,),
+        )
+        messages = await cursor.fetchall()
+        return conversation["active_realm_id"], [
+            message["active_realm_id"] for message in messages
+        ]
+    finally:
+        await connection.close()
+
+
 @pytest.mark.asyncio
 async def test_connect_atagia_local_sidecar_round_trip(
     monkeypatch: pytest.MonkeyPatch,
@@ -232,6 +306,148 @@ async def test_connect_atagia_local_sidecar_round_trip(
         status = await client.get_processing_status("usr_1", conversation_id)
         assert status.workers_enabled is True
         assert status.processing is False
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_local_client_propagates_embodiment_id_to_engine_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ClientProvider()
+    _install_stub_client(monkeypatch, provider)
+    client = await connect_atagia(
+        transport="local",
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+    try:
+        assert isinstance(client, LocalAtagiaClient)
+        await client.create_user("usr_1")
+        conversation_id = await client.create_conversation(
+            "usr_1",
+            "cnv_body",
+            assistant_mode_id="coding_debug",
+            platform_id="client_local",
+            embodiment_id="body_local",
+        )
+        await client.get_context(
+            user_id="usr_1",
+            conversation_id=conversation_id,
+            message="Please remember the retry guard.",
+            mode="coding_debug",
+            platform_id="client_local",
+            embodiment_id="body_local",
+        )
+        await client.add_response(
+            user_id="usr_1",
+            conversation_id=conversation_id,
+            text="I will keep the retry guard in mind.",
+            platform_id="client_local",
+            embodiment_id="body_local",
+        )
+        await client.ingest_message(
+            user_id="usr_1",
+            conversation_id=conversation_id,
+            role="user",
+            text="Historical note: retry loops need a guard.",
+            mode="coding_debug",
+            platform_id="client_local",
+            embodiment_id="body_local",
+        )
+        await client.chat(
+            user_id="usr_1",
+            conversation_id=conversation_id,
+            message="Why is the retry loop failing?",
+            mode="coding_debug",
+            platform_id="client_local",
+            embodiment_id="body_local",
+        )
+
+        runtime = client._engine.runtime
+        if runtime is None:
+            raise AssertionError("Engine runtime should remain initialized")
+        conversation_embodiment, message_embodiments = await _conversation_and_message_embodiments(
+            runtime,
+            user_id="usr_1",
+            conversation_id=conversation_id,
+        )
+
+        assert conversation_embodiment == "body_local"
+        assert len(message_embodiments) >= 5
+        assert set(message_embodiments) == {"body_local"}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_local_client_propagates_realm_id_to_engine_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ClientProvider()
+    _install_stub_client(monkeypatch, provider)
+    client = await connect_atagia(
+        transport="local",
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+    try:
+        assert isinstance(client, LocalAtagiaClient)
+        await client.create_user("usr_1")
+        conversation_id = await client.create_conversation(
+            "usr_1",
+            "cnv_realm",
+            assistant_mode_id="coding_debug",
+            platform_id="client_local",
+            realm_id="realm_local",
+        )
+        await client.get_context(
+            user_id="usr_1",
+            conversation_id=conversation_id,
+            message="Please remember the retry guard.",
+            mode="coding_debug",
+            platform_id="client_local",
+            realm_id="realm_local",
+        )
+        await client.add_response(
+            user_id="usr_1",
+            conversation_id=conversation_id,
+            text="I will keep the retry guard in mind.",
+            platform_id="client_local",
+            realm_id="realm_local",
+        )
+        await client.ingest_message(
+            user_id="usr_1",
+            conversation_id=conversation_id,
+            role="user",
+            text="Historical note: retry loops need a guard.",
+            mode="coding_debug",
+            platform_id="client_local",
+            realm_id="realm_local",
+        )
+        await client.chat(
+            user_id="usr_1",
+            conversation_id=conversation_id,
+            message="Why is the retry loop failing?",
+            mode="coding_debug",
+            platform_id="client_local",
+            realm_id="realm_local",
+        )
+
+        runtime = client._engine.runtime
+        if runtime is None:
+            raise AssertionError("Engine runtime should remain initialized")
+        conversation_realm, message_realms = await _conversation_and_message_realms(
+            runtime,
+            user_id="usr_1",
+            conversation_id=conversation_id,
+        )
+
+        assert conversation_realm == "realm_local"
+        assert len(message_realms) >= 5
+        assert set(message_realms) == {"realm_local"}
     finally:
         await client.close()
 
@@ -306,6 +522,148 @@ async def test_connect_atagia_http_sidecar_round_trip(tmp_path: Path) -> None:
             assert status.workers_enabled is False
             assert status.status == "blocked"
             assert status.pending_jobs > 0
+
+
+@pytest.mark.asyncio
+async def test_http_client_propagates_embodiment_id_to_api_rows(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    provider = ClientProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as http_client:
+            client = HttpAtagiaClient(
+                base_url="http://testserver",
+                api_key="service-key",
+                http_client=http_client,
+            )
+            await client.create_user("usr_1")
+            conversation_id = await client.create_conversation(
+                "usr_1",
+                "cnv_body",
+                assistant_mode_id="coding_debug",
+                platform_id="client_http",
+                embodiment_id="body_http",
+            )
+            await client.get_context(
+                user_id="usr_1",
+                conversation_id=conversation_id,
+                message="Please remember the retry guard.",
+                mode="coding_debug",
+                platform_id="client_http",
+                embodiment_id="body_http",
+            )
+            await client.add_response(
+                user_id="usr_1",
+                conversation_id=conversation_id,
+                text="I will keep the retry guard in mind.",
+                platform_id="client_http",
+                embodiment_id="body_http",
+            )
+            await client.ingest_message(
+                user_id="usr_1",
+                conversation_id=conversation_id,
+                role="user",
+                text="Historical note: retry loops need a guard.",
+                mode="coding_debug",
+                platform_id="client_http",
+                embodiment_id="body_http",
+            )
+            await client.chat(
+                user_id="usr_1",
+                conversation_id=conversation_id,
+                message="Why is the retry loop failing?",
+                mode="coding_debug",
+                platform_id="client_http",
+                embodiment_id="body_http",
+            )
+
+        conversation_embodiment, message_embodiments = await _conversation_and_message_embodiments(
+            app.state.runtime,
+            user_id="usr_1",
+            conversation_id=conversation_id,
+        )
+
+    assert conversation_embodiment == "body_http"
+    assert len(message_embodiments) >= 5
+    assert set(message_embodiments) == {"body_http"}
+
+
+@pytest.mark.asyncio
+async def test_http_client_propagates_realm_id_to_api_rows(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    provider = ClientProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as http_client:
+            client = HttpAtagiaClient(
+                base_url="http://testserver",
+                api_key="service-key",
+                http_client=http_client,
+            )
+            await client.create_user("usr_1")
+            conversation_id = await client.create_conversation(
+                "usr_1",
+                "cnv_realm",
+                assistant_mode_id="coding_debug",
+                platform_id="client_http",
+                realm_id="realm_http",
+            )
+            await client.get_context(
+                user_id="usr_1",
+                conversation_id=conversation_id,
+                message="Please remember the retry guard.",
+                mode="coding_debug",
+                platform_id="client_http",
+                realm_id="realm_http",
+            )
+            await client.add_response(
+                user_id="usr_1",
+                conversation_id=conversation_id,
+                text="I will keep the retry guard in mind.",
+                platform_id="client_http",
+                realm_id="realm_http",
+            )
+            await client.ingest_message(
+                user_id="usr_1",
+                conversation_id=conversation_id,
+                role="user",
+                text="Historical note: retry loops need a guard.",
+                mode="coding_debug",
+                platform_id="client_http",
+                realm_id="realm_http",
+            )
+            await client.chat(
+                user_id="usr_1",
+                conversation_id=conversation_id,
+                message="Why is the retry loop failing?",
+                mode="coding_debug",
+                platform_id="client_http",
+                realm_id="realm_http",
+            )
+
+        conversation_realm, message_realms = await _conversation_and_message_realms(
+            app.state.runtime,
+            user_id="usr_1",
+            conversation_id=conversation_id,
+        )
+
+    assert conversation_realm == "realm_http"
+    assert len(message_realms) >= 5
+    assert set(message_realms) == {"realm_http"}
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,10 @@ from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
 )
+from atagia.core.embodiment_repository import EmbodimentRepository, embodiment_snapshot
+from atagia.core.mind_repository import MindRepository, mind_snapshot
+from atagia.core.presence_repository import PresenceRepository, presence_snapshot
+from atagia.core.realm_repository import RealmRepository, realm_snapshot
 from atagia.core.topic_repository import TopicRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
@@ -23,6 +27,7 @@ from atagia.models.schemas_memory import (
     ConversationStatus,
     IngestOrigin,
     MemoryPrivacyMode,
+    MindTopology,
     resolve_confirmation_strategy,
     resolve_memory_privacy_mode,
 )
@@ -47,6 +52,27 @@ from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.job_tracking_service import (
     JobTrackingService,
     render_memory_processing_status_block,
+)
+from atagia.services.presence_resolution import (
+    ensure_conversation_active_presence,
+    resolve_active_presence_snapshot,
+    resolve_source_presence_for_role,
+)
+from atagia.services.embodiment_resolution import (
+    ensure_conversation_active_embodiment,
+    resolve_active_embodiment_snapshot,
+)
+from atagia.services.mind_resolution import (
+    ensure_conversation_active_mind,
+    resolve_active_mind_snapshot,
+)
+from atagia.services.realm_resolution import (
+    ensure_conversation_active_realm,
+    resolve_active_realm_snapshot,
+)
+from atagia.services.space_resolution import (
+    ensure_conversation_active_space,
+    resolve_active_space_snapshot,
 )
 from atagia.services.worker_control_service import WorkerControlService
 from atagia.services.errors import (
@@ -95,6 +121,12 @@ class SidecarService:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: IngestOrigin | str | None = None,
         confirmation_strategy: ConfirmationStrategy | str | None = None,
@@ -121,8 +153,56 @@ class SidecarService:
                     user_persona_id=user_persona_id,
                     platform_id=platform_id,
                     character_id=character_id,
+                    active_presence_id=active_presence_id,
+                    mind_id=mind_id,
+                    mind_topology=mind_topology,
+                    embodiment_id=embodiment_id,
+                    realm_id=realm_id,
+                    space_id=space_id,
                     mode=mode,
                     incognito=incognito,
+                )
+                conversation, active_presence = await ensure_conversation_active_presence(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    active_presence_id=active_presence_id,
+                    character_id=character_id,
+                )
+                source_presence = await resolve_source_presence_for_role(
+                    connection,
+                    self.runtime.clock,
+                    owner_user_id=user_id,
+                    role="user",
+                    active_presence=active_presence,
+                )
+                conversation, active_mind = await ensure_conversation_active_mind(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    mind_id=mind_id,
+                    mind_topology=mind_topology,
+                    active_presence=active_presence,
+                    character_id=character_id,
+                )
+                conversation, active_embodiment = await ensure_conversation_active_embodiment(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    embodiment_id=embodiment_id,
+                )
+                conversation, active_realm = await ensure_conversation_active_realm(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    realm_id=realm_id,
+                )
+                conversation, active_space = await ensure_conversation_active_space(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    space_id=space_id,
+                    workspace_id=workspace_id,
                 )
                 users = UserRepository(connection, self.runtime.clock)
                 memory_preferences = await users.get_memory_preferences(user_id)
@@ -186,7 +266,7 @@ class SidecarService:
                 if existing_user_message is not None:
                     user_message = existing_user_message
                 else:
-                    await connection.execute("BEGIN")
+                    await connection.execute("BEGIN IMMEDIATE")
                     try:
                         await self._ensure_source_seq_available(
                             messages,
@@ -213,6 +293,23 @@ class SidecarService:
                                 memory_privacy_mode=resolved_memory_privacy_mode,
                             ),
                             occurred_at=resolved_user_occurred_at,
+                            active_presence_id=active_presence.presence_id,
+                            source_presence_id=source_presence.presence_id,
+                            active_mind_id=active_mind.mind_id,
+                            source_mind_id=active_mind.mind_id,
+                            active_embodiment_id=(
+                                active_embodiment.embodiment_id
+                                if active_embodiment is not None
+                                else None
+                            ),
+                            active_realm_id=(
+                                active_realm.realm_id
+                                if active_realm is not None
+                                else None
+                            ),
+                            space_id=(
+                                active_space.space_id if active_space is not None else None
+                            ),
                             commit=False,
                         )
                         if attachment_bundle.artifacts:
@@ -346,6 +443,12 @@ class SidecarService:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: IngestOrigin | str | None = None,
         confirmation_strategy: ConfirmationStrategy | str | None = None,
@@ -384,8 +487,56 @@ class SidecarService:
                     user_persona_id=user_persona_id,
                     platform_id=platform_id,
                     character_id=character_id,
+                    active_presence_id=active_presence_id,
+                    mind_id=mind_id,
+                    mind_topology=mind_topology,
+                    embodiment_id=embodiment_id,
+                    realm_id=realm_id,
+                    space_id=space_id,
                     mode=mode,
                     incognito=incognito,
+                )
+                conversation, active_presence = await ensure_conversation_active_presence(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    active_presence_id=active_presence_id,
+                    character_id=character_id,
+                )
+                source_presence = await resolve_source_presence_for_role(
+                    connection,
+                    self.runtime.clock,
+                    owner_user_id=user_id,
+                    role=role,
+                    active_presence=active_presence,
+                )
+                conversation, active_mind = await ensure_conversation_active_mind(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    mind_id=mind_id,
+                    mind_topology=mind_topology,
+                    active_presence=active_presence,
+                    character_id=character_id,
+                )
+                conversation, active_embodiment = await ensure_conversation_active_embodiment(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    embodiment_id=embodiment_id,
+                )
+                conversation, active_realm = await ensure_conversation_active_realm(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    realm_id=realm_id,
+                )
+                conversation, active_space = await ensure_conversation_active_space(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    space_id=space_id,
+                    workspace_id=workspace_id,
                 )
                 users = UserRepository(connection, self.runtime.clock)
                 memory_preferences = await users.get_memory_preferences(user_id)
@@ -427,7 +578,7 @@ class SidecarService:
                 if existing_message is not None:
                     stored_message = existing_message
                 else:
-                    await connection.execute("BEGIN")
+                    await connection.execute("BEGIN IMMEDIATE")
                     try:
                         await self._ensure_source_seq_available(
                             messages,
@@ -454,6 +605,23 @@ class SidecarService:
                                 memory_privacy_mode=resolved_memory_privacy_mode,
                             ),
                             occurred_at=resolved_occurred_at,
+                            active_presence_id=active_presence.presence_id,
+                            source_presence_id=source_presence.presence_id,
+                            active_mind_id=active_mind.mind_id,
+                            source_mind_id=active_mind.mind_id,
+                            active_embodiment_id=(
+                                active_embodiment.embodiment_id
+                                if active_embodiment is not None
+                                else None
+                            ),
+                            active_realm_id=(
+                                active_realm.realm_id
+                                if active_realm is not None
+                                else None
+                            ),
+                            space_id=(
+                                active_space.space_id if active_space is not None else None
+                            ),
                             commit=False,
                         )
                         if attachment_bundle.artifacts:
@@ -503,6 +671,12 @@ class SidecarService:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
         ingest_origin: IngestOrigin | str | None = None,
@@ -545,6 +719,47 @@ class SidecarService:
                     user_persona_id=user_persona_id,
                     platform_id=platform_id,
                     character_id=character_id,
+                    active_presence_id=active_presence_id,
+                    mind_id=mind_id,
+                    mind_topology=mind_topology,
+                    embodiment_id=embodiment_id,
+                    realm_id=realm_id,
+                    space_id=space_id,
+                )
+                conversation, active_presence = await ensure_conversation_active_presence(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    active_presence_id=active_presence_id,
+                    character_id=character_id,
+                )
+                conversation, active_mind = await ensure_conversation_active_mind(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    mind_id=mind_id,
+                    mind_topology=mind_topology,
+                    active_presence=active_presence,
+                    character_id=character_id,
+                )
+                conversation, active_embodiment = await ensure_conversation_active_embodiment(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    embodiment_id=embodiment_id,
+                )
+                conversation, active_realm = await ensure_conversation_active_realm(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    realm_id=realm_id,
+                )
+                conversation, active_space = await ensure_conversation_active_space(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    space_id=space_id,
+                    workspace_id=conversation.get("workspace_id"),
                 )
                 if str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
                     raise ConversationNotActiveError("Conversation is not active")
@@ -580,7 +795,7 @@ class SidecarService:
                 if existing_message is not None:
                     assistant_message = existing_message
                 else:
-                    await connection.execute("BEGIN")
+                    await connection.execute("BEGIN IMMEDIATE")
                     try:
                         await self._ensure_source_seq_available(
                             messages,
@@ -607,6 +822,23 @@ class SidecarService:
                                 memory_privacy_mode=resolved_memory_privacy_mode,
                             ),
                             occurred_at=resolved_assistant_occurred_at,
+                            active_presence_id=active_presence.presence_id,
+                            source_presence_id=active_presence.presence_id,
+                            active_mind_id=active_mind.mind_id,
+                            source_mind_id=active_mind.mind_id,
+                            active_embodiment_id=(
+                                active_embodiment.embodiment_id
+                                if active_embodiment is not None
+                                else None
+                            ),
+                            active_realm_id=(
+                                active_realm.realm_id
+                                if active_realm is not None
+                                else None
+                            ),
+                            space_id=(
+                                active_space.space_id if active_space is not None else None
+                            ),
                             commit=False,
                         )
                         await cache_service.invalidate_conversation_cache_for_conversation(conversation)
@@ -709,7 +941,7 @@ class SidecarService:
                     platform_id=platform_id,
                     character_id=character_id,
                 )
-                await connection.execute("BEGIN")
+                await connection.execute("BEGIN IMMEDIATE")
                 try:
                     updated = await conversations.set_conversation_incognito(
                         conversation_id,
@@ -754,6 +986,12 @@ class SidecarService:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
     ) -> dict[str, Any]:
         """Return an explicit review manifest for an incognito rescue request.
@@ -778,6 +1016,12 @@ class SidecarService:
                 user_persona_id=user_persona_id,
                 platform_id=platform_id,
                 character_id=character_id,
+                active_presence_id=active_presence_id,
+                mind_id=mind_id,
+                mind_topology=mind_topology,
+                embodiment_id=embodiment_id,
+                realm_id=realm_id,
+                space_id=space_id,
             )
             if str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
                 raise ConversationNotActiveError("Conversation is not active")
@@ -995,6 +1239,12 @@ class SidecarService:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
     ) -> dict[str, Any]:
@@ -1015,6 +1265,12 @@ class SidecarService:
                 user_persona_id=user_persona_id,
                 platform_id=platform_id,
                 character_id=character_id,
+                active_presence_id=active_presence_id,
+                mind_id=mind_id,
+                mind_topology=mind_topology,
+                embodiment_id=embodiment_id,
+                realm_id=realm_id,
+                space_id=space_id,
             )
             if str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
                 raise ConversationNotActiveError("Conversation is not active")
@@ -1038,6 +1294,41 @@ class SidecarService:
                         updated
                     )
                     conversation = updated
+            conversation, active_presence = await ensure_conversation_active_presence(
+                connection,
+                self.runtime.clock,
+                conversation=conversation,
+                active_presence_id=active_presence_id,
+                character_id=character_id,
+            )
+            conversation, _active_mind = await ensure_conversation_active_mind(
+                connection,
+                self.runtime.clock,
+                conversation=conversation,
+                mind_id=mind_id,
+                mind_topology=mind_topology,
+                active_presence=active_presence,
+                character_id=character_id,
+            )
+            conversation, _active_embodiment = await ensure_conversation_active_embodiment(
+                connection,
+                self.runtime.clock,
+                conversation=conversation,
+                embodiment_id=embodiment_id,
+            )
+            conversation, _active_realm = await ensure_conversation_active_realm(
+                connection,
+                self.runtime.clock,
+                conversation=conversation,
+                realm_id=realm_id,
+            )
+            conversation, _active_space = await ensure_conversation_active_space(
+                connection,
+                self.runtime.clock,
+                conversation=conversation,
+                space_id=space_id,
+                workspace_id=workspace_id,
+            )
             return conversation
 
         if workspace_id is not None:
@@ -1073,6 +1364,42 @@ class SidecarService:
         resolved_incognito = (
             bool(incognito) if incognito is not None else (not cross_chat_memory)
         )
+        presences_character_id = character_id if character_id is not None else workspace_id
+        active_presence = await resolve_active_presence_snapshot(
+            connection,
+            self.runtime.clock,
+            owner_user_id=user_id,
+            active_presence_id=active_presence_id,
+            character_id=presences_character_id,
+        )
+        active_space_snapshot = await resolve_active_space_snapshot(
+            connection,
+            self.runtime.clock,
+            owner_user_id=user_id,
+            space_id=space_id,
+            workspace_id=workspace_id,
+        )
+        active_mind = await resolve_active_mind_snapshot(
+            connection,
+            self.runtime.clock,
+            owner_user_id=user_id,
+            mind_id=mind_id,
+            active_presence=active_presence,
+            character_id=presences_character_id,
+            topology=mind_topology,
+        )
+        active_embodiment = await resolve_active_embodiment_snapshot(
+            connection,
+            self.runtime.clock,
+            owner_user_id=user_id,
+            embodiment_id=embodiment_id,
+        )
+        active_realm = await resolve_active_realm_snapshot(
+            connection,
+            self.runtime.clock,
+            owner_user_id=user_id,
+            realm_id=realm_id,
+        )
         try:
             return await conversations.create_conversation(
                 conversation_id=conversation_id,
@@ -1088,6 +1415,22 @@ class SidecarService:
                 user_persona_id=user_persona_id,
                 platform_id=platform_id,
                 character_id=character_id,
+                active_presence_id=active_presence.presence_id,
+                active_space_id=(
+                    active_space_snapshot.space_id
+                    if active_space_snapshot is not None
+                    else None
+                ),
+                active_mind_id=active_mind.mind_id,
+                mind_topology=active_mind.topology,
+                active_embodiment_id=(
+                    active_embodiment.embodiment_id
+                    if active_embodiment is not None
+                    else None
+                ),
+                active_realm_id=(
+                    active_realm.realm_id if active_realm is not None else None
+                ),
                 mode=mode or resolved_mode,
                 incognito=resolved_incognito,
             )
@@ -1102,6 +1445,12 @@ class SidecarService:
         user_persona_id: str | None,
         platform_id: str | None,
         character_id: str | None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
     ) -> None:
         checks = {
             "user_persona_id": user_persona_id,
@@ -1113,6 +1462,53 @@ class SidecarService:
             actual_text = None if actual is None else str(actual)
             if actual_text != expected:
                 raise ConversationNotFoundError("Conversation not found for user")
+        if active_presence_id is not None:
+            actual_presence = conversation.get("active_presence_id")
+            actual_presence_text = None if actual_presence is None else str(actual_presence)
+            if actual_presence_text is not None and actual_presence_text != active_presence_id:
+                raise ConversationNotFoundError("Conversation not found for user")
+        if mind_id is not None:
+            actual_mind = conversation.get("active_mind_id")
+            actual_mind_text = None if actual_mind is None else str(actual_mind)
+            if actual_mind_text is not None and actual_mind_text != mind_id:
+                raise ConversationNotFoundError("Conversation not found for user")
+        expected_topology = SidecarService._normalize_optional_text(mind_topology)
+        if expected_topology is not None:
+            actual_topology = conversation.get("mind_topology")
+            actual_topology_text = (
+                None if actual_topology is None else str(actual_topology)
+            )
+            if (
+                actual_topology_text is not None
+                and actual_topology_text != expected_topology
+            ):
+                raise ConversationNotFoundError("Conversation not found for user")
+        if space_id is not None:
+            actual_space = conversation.get("active_space_id")
+            actual_space_text = None if actual_space is None else str(actual_space)
+            if actual_space_text is not None and actual_space_text != space_id:
+                raise ConversationNotFoundError("Conversation not found for user")
+        if embodiment_id is not None:
+            actual_embodiment = conversation.get("active_embodiment_id")
+            actual_embodiment_text = (
+                None if actual_embodiment is None else str(actual_embodiment)
+            )
+            if actual_embodiment_text is not None and actual_embodiment_text != embodiment_id:
+                raise ConversationNotFoundError("Conversation not found for user")
+        if realm_id is not None:
+            actual_realm = conversation.get("active_realm_id")
+            actual_realm_text = None if actual_realm is None else str(actual_realm)
+            if actual_realm_text is not None and actual_realm_text != realm_id:
+                raise ConversationNotFoundError("Conversation not found for user")
+
+    @staticmethod
+    def _normalize_optional_text(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, MindTopology):
+            value = value.value
+        normalized = str(value).strip()
+        return normalized or None
 
     @staticmethod
     async def _mark_broad_conversation_rows_review_only(
@@ -1206,6 +1602,86 @@ class SidecarService:
         try:
             users = UserRepository(connection, self.runtime.clock)
             memory_preferences = await users.get_memory_preferences(str(conversation["user_id"]))
+            owner_user_id = str(conversation["user_id"])
+            presences = PresenceRepository(connection, self.runtime.clock)
+            minds = MindRepository(connection, self.runtime.clock)
+            embodiments = EmbodimentRepository(connection, self.runtime.clock)
+            realms = RealmRepository(connection, self.runtime.clock)
+            active_presence_id = message.get("active_presence_id") or conversation.get(
+                "active_presence_id"
+            )
+            source_presence_id = message.get("source_presence_id")
+            active_mind_id = message.get("active_mind_id") or conversation.get(
+                "active_mind_id"
+            )
+            source_mind_id = message.get("source_mind_id") or active_mind_id
+            active_embodiment_id = message.get("active_embodiment_id") or conversation.get(
+                "active_embodiment_id"
+            )
+            active_realm_id = message.get("active_realm_id") or conversation.get(
+                "active_realm_id"
+            )
+            mind_topology = (
+                self._normalize_optional_text(conversation.get("mind_topology"))
+                or MindTopology.UNIMIND.value
+            )
+            active_row = (
+                await presences.get_presence(
+                    owner_user_id=owner_user_id,
+                    presence_id=str(active_presence_id),
+                )
+                if active_presence_id is not None
+                else None
+            )
+            source_row = (
+                await presences.get_presence(
+                    owner_user_id=owner_user_id,
+                    presence_id=str(source_presence_id),
+                )
+                if source_presence_id is not None
+                else None
+            )
+            active_snapshot = presence_snapshot(active_row) if active_row is not None else None
+            source_snapshot = presence_snapshot(source_row) if source_row is not None else None
+            active_mind_row = (
+                await minds.get_mind(
+                    owner_user_id=owner_user_id,
+                    mind_id=str(active_mind_id),
+                )
+                if active_mind_id is not None
+                else None
+            )
+            active_mind_snapshot = (
+                mind_snapshot(active_mind_row, mind_topology)
+                if active_mind_row is not None
+                else None
+            )
+            active_embodiment_row = (
+                await embodiments.get_embodiment(
+                    owner_user_id=owner_user_id,
+                    embodiment_id=str(active_embodiment_id),
+                )
+                if active_embodiment_id is not None
+                else None
+            )
+            active_embodiment_snapshot = (
+                embodiment_snapshot(active_embodiment_row)
+                if active_embodiment_row is not None
+                else None
+            )
+            active_realm_row = (
+                await realms.get_realm(
+                    owner_user_id=owner_user_id,
+                    realm_id=str(active_realm_id),
+                )
+                if active_realm_id is not None
+                else None
+            )
+            active_realm_snapshot = (
+                realm_snapshot(active_realm_row)
+                if active_realm_row is not None
+                else None
+            )
             jobs = build_message_jobs(
                 clock=self.runtime.clock,
                 conversation=conversation,
@@ -1219,6 +1695,55 @@ class SidecarService:
                 ingest_origin=ingest_origin,
                 confirmation_strategy=confirmation_strategy,
                 memory_privacy_mode=memory_privacy_mode,
+                active_presence_id=active_presence_id,
+                active_presence_kind=(
+                    active_snapshot.kind.value if active_snapshot is not None else None
+                ),
+                active_presence_display_name=(
+                    active_snapshot.display_name if active_snapshot is not None else None
+                ),
+                source_presence_id=source_presence_id,
+                source_presence_kind=(
+                    source_snapshot.kind.value if source_snapshot is not None else None
+                ),
+                source_presence_display_name=(
+                    source_snapshot.display_name if source_snapshot is not None else None
+                ),
+                active_space_id=message.get("space_id") or conversation.get("active_space_id"),
+                active_space_boundary_mode=(
+                    conversation.get("active_space_boundary_mode") or "focus"
+                ),
+                active_space_display_name=conversation.get("active_space_display_name"),
+                active_mind_id=active_mind_id,
+                source_mind_id=source_mind_id,
+                active_mind_display_name=(
+                    active_mind_snapshot.display_name
+                    if active_mind_snapshot is not None
+                    else None
+                ),
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_embodiment_display_name=(
+                    active_embodiment_snapshot.display_name
+                    if active_embodiment_snapshot is not None
+                    else None
+                ),
+                cross_embodiment_mode=(
+                    active_embodiment_snapshot.cross_embodiment_mode.value
+                    if active_embodiment_snapshot is not None
+                    else None
+                ),
+                active_realm_id=active_realm_id,
+                active_realm_display_name=(
+                    active_realm_snapshot.display_name
+                    if active_realm_snapshot is not None
+                    else None
+                ),
+                cross_realm_mode=(
+                    active_realm_snapshot.cross_realm_mode.value
+                    if active_realm_snapshot is not None
+                    else None
+                ),
             )
             job_tracking = JobTrackingService(
                 connection,

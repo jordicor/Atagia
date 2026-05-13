@@ -32,6 +32,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     max_completion_tokens: int | None = Field(default=None, ge=1)
     tools: list[dict[str, Any]] = Field(default_factory=list)
     tool_choice: Any | None = None
+    stream_options: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
     user: str | None = None
 

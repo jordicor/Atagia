@@ -341,6 +341,145 @@ async def test_openai_proxy_reads_redesign_metadata_identity(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_openai_proxy_propagates_sidecar_control_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, dict] = {}
+
+    async def capture_context(self, **kwargs):
+        captured["context"] = kwargs
+        return None
+
+    async def capture_response(self, **kwargs):
+        captured["response"] = kwargs
+        return None
+
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.SidecarService.get_context",
+        capture_context,
+    )
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.SidecarService.add_response",
+        capture_response,
+    )
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": "cnv_proxy_controls",
+                    "X-Atagia-Message-Id": "host-user-1",
+                    "X-Atagia-Source-Seq": "7",
+                    "X-Atagia-Response-Message-Id": "host-assistant-1",
+                    "X-Atagia-Response-Source-Seq": "8",
+                    "X-Atagia-Ingest-Origin": "live_turn",
+                    "X-Atagia-Confirmation-Strategy": "live_prompt_allowed",
+                    "X-Atagia-Memory-Privacy-Mode": "trusted_private",
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "messages": [{"role": "user", "content": "Hello controls"}],
+                },
+            )
+
+    assert response.status_code == 200
+    assert captured["context"]["message_id"] == "host-user-1"
+    assert captured["context"]["source_seq"] == 7
+    assert captured["context"]["ingest_origin"] == "live_turn"
+    assert captured["context"]["confirmation_strategy"] == "live_prompt_allowed"
+    assert captured["context"]["memory_privacy_mode"] == "trusted_private"
+    assert captured["response"]["message_id"] == "host-assistant-1"
+    assert captured["response"]["source_seq"] == 8
+    assert captured["response"]["ingest_origin"] == "live_turn"
+    chat_requests = [
+        request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+    ]
+    assert chat_requests[-1].metadata["message_id"] == "host-user-1"
+    assert chat_requests[-1].metadata["response_message_id"] == "host-assistant-1"
+    assert chat_requests[-1].metadata["memory_privacy_mode"] == "trusted_private"
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_accepts_control_fields_from_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, dict] = {}
+
+    async def capture_context(self, **kwargs):
+        captured["context"] = kwargs
+        return None
+
+    async def capture_response(self, **kwargs):
+        captured["response"] = kwargs
+        return None
+
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.SidecarService.get_context",
+        capture_context,
+    )
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.SidecarService.add_response",
+        capture_response,
+    )
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "messages": [{"role": "user", "content": "Hello metadata controls"}],
+                    "metadata": {
+                        "conversation_id": "cnv_proxy_metadata_controls",
+                        "platform_id": "proxy_metadata",
+                        "message_id": "meta-user-1",
+                        "source_seq": 3,
+                        "response_message_id": "meta-assistant-1",
+                        "response_source_seq": "4",
+                        "ingest_origin": "live_turn",
+                        "confirmation_strategy": "live_prompt_allowed",
+                        "memory_privacy_mode": "balanced",
+                    },
+                },
+            )
+
+    assert response.status_code == 200
+    assert captured["context"]["message_id"] == "meta-user-1"
+    assert captured["context"]["source_seq"] == 3
+    assert captured["response"]["message_id"] == "meta-assistant-1"
+    assert captured["response"]["source_seq"] == 4
+    assert captured["response"]["memory_privacy_mode"] == "balanced"
+
+
+@pytest.mark.asyncio
 async def test_openai_proxy_streaming_completion(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     provider = ProxyProvider()
@@ -379,6 +518,45 @@ async def test_openai_proxy_streaming_completion(tmp_path: Path) -> None:
     assert "Proxy " in text
     assert "stream." in text
     assert "data: [DONE]" in text
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_streaming_include_usage_chunk(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": "cnv_proxy_stream_usage",
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            ) as response:
+                body = await response.aread()
+
+    assert response.status_code == 200
+    text = body.decode("utf-8")
+    assert '"choices": []' in text
+    assert '"usage":' in text
+    assert text.rfind('"usage":') < text.rfind("data: [DONE]")
 
 
 @pytest.mark.asyncio

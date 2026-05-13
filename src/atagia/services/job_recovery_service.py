@@ -143,6 +143,24 @@ class JobRecoveryService:
             include_contract_projection=include_contract_projection,
             operational_profile=operational_profile,
             memory_preferences=preferences,
+            active_presence_id=message.get("active_presence_id"),
+            source_presence_id=message.get("source_presence_id"),
+            active_space_id=message.get("space_id") or conversation.get("active_space_id"),
+            active_mind_id=message.get("active_mind_id") or conversation.get("active_mind_id"),
+            source_mind_id=(
+                message.get("source_mind_id")
+                or message.get("active_mind_id")
+                or conversation.get("active_mind_id")
+            ),
+            mind_topology=conversation.get("mind_topology") or "unimind",
+            active_embodiment_id=(
+                message.get("active_embodiment_id")
+                or conversation.get("active_embodiment_id")
+            ),
+            active_realm_id=(
+                message.get("active_realm_id")
+                or conversation.get("active_realm_id")
+            ),
         )
         matching_job = next(
             (

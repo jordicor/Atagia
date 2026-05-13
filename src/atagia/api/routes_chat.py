@@ -17,6 +17,7 @@ from atagia.api.dependencies import (
 )
 from atagia.api.namespace_context import require_route_namespace_context
 from atagia.core.clock import Clock
+from atagia.core.mind_repository import MindNotFoundError
 from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
@@ -162,6 +163,12 @@ async def create_conversation(
             user_persona_id=payload.user_persona_id,
             platform_id=payload.platform_id,
             character_id=payload.character_id,
+            active_presence_id=payload.active_presence_id,
+            mind_id=payload.mind_id,
+            mind_topology=payload.mind_topology,
+            embodiment_id=payload.embodiment_id,
+            realm_id=payload.realm_id,
+            space_id=payload.space_id,
             mode=payload.mode,
             incognito=payload.incognito,
         )
@@ -176,6 +183,11 @@ async def create_conversation(
             detail=str(exc),
         ) from exc
     except UnknownAssistantModeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except MindNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
@@ -612,6 +624,12 @@ async def chat_reply(
             user_persona_id=payload.user_persona_id,
             platform_id=payload.platform_id,
             character_id=payload.character_id,
+            active_presence_id=payload.active_presence_id,
+            mind_id=payload.mind_id,
+            mind_topology=payload.mind_topology,
+            embodiment_id=payload.embodiment_id,
+            realm_id=payload.realm_id,
+            space_id=payload.space_id,
             mode=payload.mode,
             incognito=payload.incognito,
         )
@@ -633,6 +651,11 @@ async def chat_reply(
     except OperationalProfileNotAuthorizedError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except MindNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
     except AssistantModeMismatchError as exc:
@@ -756,6 +779,12 @@ async def get_sidecar_context(
             user_persona_id=payload.user_persona_id,
             platform_id=payload.platform_id,
             character_id=payload.character_id,
+            active_presence_id=payload.active_presence_id,
+            mind_id=payload.mind_id,
+            mind_topology=payload.mind_topology,
+            embodiment_id=payload.embodiment_id,
+            realm_id=payload.realm_id,
+            space_id=payload.space_id,
             incognito=payload.incognito,
             ingest_origin=payload.ingest_origin,
             confirmation_strategy=payload.confirmation_strategy,
@@ -784,6 +813,11 @@ async def get_sidecar_context(
     except OperationalProfileNotAuthorizedError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except MindNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
     except AssistantModeMismatchError as exc:
@@ -843,6 +877,12 @@ async def ingest_sidecar_message(
             user_persona_id=payload.user_persona_id,
             platform_id=payload.platform_id,
             character_id=payload.character_id,
+            active_presence_id=payload.active_presence_id,
+            mind_id=payload.mind_id,
+            mind_topology=payload.mind_topology,
+            embodiment_id=payload.embodiment_id,
+            realm_id=payload.realm_id,
+            space_id=payload.space_id,
             incognito=payload.incognito,
             ingest_origin=payload.ingest_origin,
             confirmation_strategy=payload.confirmation_strategy,
@@ -871,6 +911,11 @@ async def ingest_sidecar_message(
     except OperationalProfileNotAuthorizedError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except MindNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
     except AssistantModeMismatchError as exc:
@@ -929,6 +974,12 @@ async def add_sidecar_response(
             user_persona_id=payload.user_persona_id,
             platform_id=payload.platform_id,
             character_id=payload.character_id,
+            active_presence_id=payload.active_presence_id,
+            mind_id=payload.mind_id,
+            mind_topology=payload.mind_topology,
+            embodiment_id=payload.embodiment_id,
+            realm_id=payload.realm_id,
+            space_id=payload.space_id,
             mode=payload.mode,
             incognito=payload.incognito,
             ingest_origin=payload.ingest_origin,
@@ -948,6 +999,11 @@ async def add_sidecar_response(
     except OperationalProfileNotAuthorizedError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except MindNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
     except (MessageIdConflictError, SourceSequenceConflictError) as exc:

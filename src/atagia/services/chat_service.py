@@ -19,7 +19,7 @@ from atagia.memory.intimacy_boundary_policy import (
     strongest_intimacy_boundary,
 )
 from atagia.models.schemas_api import ChatResult
-from atagia.models.schemas_memory import ConversationStatus
+from atagia.models.schemas_memory import ConversationStatus, MindTopology
 from atagia.services.artifact_service import ArtifactService
 from atagia.services.chat_support import (
     CONTEXT_VIEW_TTL_SECONDS,
@@ -47,6 +47,14 @@ from atagia.services.job_tracking_service import (
     JobTrackingService,
     render_memory_processing_status_block,
 )
+from atagia.services.presence_resolution import (
+    ensure_conversation_active_presence,
+    resolve_source_presence_for_role,
+)
+from atagia.services.embodiment_resolution import ensure_conversation_active_embodiment
+from atagia.services.mind_resolution import ensure_conversation_active_mind
+from atagia.services.realm_resolution import ensure_conversation_active_realm
+from atagia.services.space_resolution import ensure_conversation_active_space
 from atagia.services.worker_control_service import WorkerControlService
 from atagia.services.errors import (
     ConversationNotActiveError,
@@ -88,6 +96,12 @@ class ChatService:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        mind_id: str | None = None,
+        mind_topology: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
     ) -> ChatResult:
@@ -130,6 +144,12 @@ class ChatService:
                     user_persona_id=user_persona_id,
                     platform_id=platform_id,
                     character_id=character_id,
+                    active_presence_id=active_presence_id,
+                    mind_id=mind_id,
+                    mind_topology=mind_topology,
+                    embodiment_id=embodiment_id,
+                    realm_id=realm_id,
+                    space_id=space_id,
                 )
                 if await users.get_active_user(user_id) is None:
                     raise UserDeletedError("User has been erased or does not exist")
@@ -156,6 +176,49 @@ class ChatService:
                             updated
                         )
                         conversation = updated
+
+                conversation, active_presence = await ensure_conversation_active_presence(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    active_presence_id=active_presence_id,
+                    character_id=character_id,
+                )
+                user_source_presence = await resolve_source_presence_for_role(
+                    connection,
+                    self.runtime.clock,
+                    owner_user_id=user_id,
+                    role="user",
+                    active_presence=active_presence,
+                )
+                conversation, active_mind = await ensure_conversation_active_mind(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    mind_id=mind_id,
+                    mind_topology=mind_topology,
+                    active_presence=active_presence,
+                    character_id=character_id,
+                )
+                conversation, active_embodiment = await ensure_conversation_active_embodiment(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    embodiment_id=embodiment_id,
+                )
+                conversation, active_realm = await ensure_conversation_active_realm(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    realm_id=realm_id,
+                )
+                conversation, active_space = await ensure_conversation_active_space(
+                    connection,
+                    self.runtime.clock,
+                    conversation=conversation,
+                    space_id=space_id,
+                    workspace_id=conversation.get("workspace_id"),
+                )
 
                 resolved_mode_id = resolve_retrieval_profile_id(
                     str(conversation["assistant_mode_id"]),
@@ -214,6 +277,18 @@ class ChatService:
                         or bool(conversation.get("isolated_mode")),
                         remember_across_chats=bool(conversation.get("remember_across_chats", 1)),
                         remember_across_devices=bool(conversation.get("remember_across_devices", 1)),
+                        active_mind_id=active_mind.mind_id,
+                        mind_topology=active_mind.topology,
+                        active_embodiment_id=(
+                            active_embodiment.embodiment_id
+                            if active_embodiment is not None
+                            else None
+                        ),
+                        active_realm_id=(
+                            active_realm.realm_id
+                            if active_realm is not None
+                            else None
+                        ),
                     )
                     == 0
                 )
@@ -346,7 +421,7 @@ class ChatService:
                 )
                 assistant_occurred_at = self.runtime.clock.now().isoformat()
 
-                await connection.execute("BEGIN")
+                await connection.execute("BEGIN IMMEDIATE")
                 try:
                     user_message = await messages.create_message(
                         message_id=None,
@@ -357,6 +432,19 @@ class ChatService:
                         token_count=None,
                         metadata=attachment_bundle.message_metadata(metadata),
                         occurred_at=resolved_user_occurred_at,
+                        active_presence_id=active_presence.presence_id,
+                        source_presence_id=user_source_presence.presence_id,
+                        space_id=active_space.space_id if active_space is not None else None,
+                        active_mind_id=active_mind.mind_id,
+                        source_mind_id=active_mind.mind_id,
+                        active_embodiment_id=(
+                            active_embodiment.embodiment_id
+                            if active_embodiment is not None
+                            else None
+                        ),
+                        active_realm_id=(
+                            active_realm.realm_id if active_realm is not None else None
+                        ),
                         commit=False,
                     )
                     if attachment_bundle.artifacts:
@@ -374,6 +462,19 @@ class ChatService:
                         token_count=None,
                         metadata={"thinking": llm_response.thinking} if llm_response.thinking else {},
                         occurred_at=assistant_occurred_at,
+                        active_presence_id=active_presence.presence_id,
+                        source_presence_id=active_presence.presence_id,
+                        space_id=active_space.space_id if active_space is not None else None,
+                        active_mind_id=active_mind.mind_id,
+                        source_mind_id=active_mind.mind_id,
+                        active_embodiment_id=(
+                            active_embodiment.embodiment_id
+                            if active_embodiment is not None
+                            else None
+                        ),
+                        active_realm_id=(
+                            active_realm.realm_id if active_realm is not None else None
+                        ),
                         commit=False,
                     )
                     retrieval_event = await events.create_event(
@@ -517,6 +618,49 @@ class ChatService:
                     role="user",
                     operational_profile=resolution.resolved_operational_profile.snapshot,
                     memory_preferences=memory_preferences,
+                    active_presence_id=active_presence.presence_id,
+                    active_presence_kind=active_presence.kind.value,
+                    active_presence_display_name=active_presence.display_name,
+                    source_presence_id=user_source_presence.presence_id,
+                    source_presence_kind=user_source_presence.kind.value,
+                    source_presence_display_name=user_source_presence.display_name,
+                    active_space_id=active_space.space_id if active_space is not None else None,
+                    active_space_boundary_mode=(
+                        active_space.boundary_mode.value if active_space is not None else None
+                    ),
+                    active_space_display_name=(
+                        active_space.display_name if active_space is not None else None
+                    ),
+                    active_mind_id=active_mind.mind_id,
+                    source_mind_id=active_mind.mind_id,
+                    active_mind_display_name=active_mind.display_name,
+                    mind_topology=active_mind.topology.value,
+                    active_embodiment_id=(
+                        active_embodiment.embodiment_id
+                        if active_embodiment is not None
+                        else None
+                    ),
+                    active_embodiment_display_name=(
+                        active_embodiment.display_name
+                        if active_embodiment is not None
+                        else None
+                    ),
+                    cross_embodiment_mode=(
+                        active_embodiment.cross_embodiment_mode.value
+                        if active_embodiment is not None
+                        else None
+                    ),
+                    active_realm_id=(
+                        active_realm.realm_id if active_realm is not None else None
+                    ),
+                    active_realm_display_name=(
+                        active_realm.display_name if active_realm is not None else None
+                    ),
+                    cross_realm_mode=(
+                        active_realm.cross_realm_mode.value
+                        if active_realm is not None
+                        else None
+                    ),
                 )
                 assistant_jobs = build_message_jobs(
                     clock=self.runtime.clock,
@@ -528,6 +672,49 @@ class ChatService:
                     role="assistant",
                     operational_profile=resolution.resolved_operational_profile.snapshot,
                     memory_preferences=memory_preferences,
+                    active_presence_id=active_presence.presence_id,
+                    active_presence_kind=active_presence.kind.value,
+                    active_presence_display_name=active_presence.display_name,
+                    source_presence_id=active_presence.presence_id,
+                    source_presence_kind=active_presence.kind.value,
+                    source_presence_display_name=active_presence.display_name,
+                    active_space_id=active_space.space_id if active_space is not None else None,
+                    active_space_boundary_mode=(
+                        active_space.boundary_mode.value if active_space is not None else None
+                    ),
+                    active_space_display_name=(
+                        active_space.display_name if active_space is not None else None
+                    ),
+                    active_mind_id=active_mind.mind_id,
+                    source_mind_id=active_mind.mind_id,
+                    active_mind_display_name=active_mind.display_name,
+                    mind_topology=active_mind.topology.value,
+                    active_embodiment_id=(
+                        active_embodiment.embodiment_id
+                        if active_embodiment is not None
+                        else None
+                    ),
+                    active_embodiment_display_name=(
+                        active_embodiment.display_name
+                        if active_embodiment is not None
+                        else None
+                    ),
+                    cross_embodiment_mode=(
+                        active_embodiment.cross_embodiment_mode.value
+                        if active_embodiment is not None
+                        else None
+                    ),
+                    active_realm_id=(
+                        active_realm.realm_id if active_realm is not None else None
+                    ),
+                    active_realm_display_name=(
+                        active_realm.display_name if active_realm is not None else None
+                    ),
+                    cross_realm_mode=(
+                        active_realm.cross_realm_mode.value
+                        if active_realm is not None
+                        else None
+                    ),
                 )
                 try:
                     enqueued_job_ids = await enqueue_message_jobs(
@@ -672,6 +859,12 @@ def _validate_optional_identity(
     user_persona_id: str | None,
     platform_id: str | None,
     character_id: str | None,
+    active_presence_id: str | None = None,
+    mind_id: str | None = None,
+    mind_topology: str | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
+    space_id: str | None = None,
 ) -> None:
     for field_name, expected in (
         ("user_persona_id", user_persona_id),
@@ -682,3 +875,45 @@ def _validate_optional_identity(
         actual_text = None if actual is None else str(actual)
         if actual_text != expected:
             raise ConversationNotFoundError("Conversation not found for user")
+    if active_presence_id is not None:
+        actual_presence = conversation.get("active_presence_id")
+        actual_presence_text = None if actual_presence is None else str(actual_presence)
+        if actual_presence_text is not None and actual_presence_text != active_presence_id:
+            raise ConversationNotFoundError("Conversation not found for user")
+    if mind_id is not None:
+        actual_mind = conversation.get("active_mind_id")
+        actual_mind_text = None if actual_mind is None else str(actual_mind)
+        if actual_mind_text is not None and actual_mind_text != mind_id:
+            raise ConversationNotFoundError("Conversation not found for user")
+    expected_topology = _normalize_optional_text(mind_topology)
+    if expected_topology is not None:
+        actual_topology = conversation.get("mind_topology")
+        actual_topology_text = None if actual_topology is None else str(actual_topology)
+        if actual_topology_text is not None and actual_topology_text != expected_topology:
+            raise ConversationNotFoundError("Conversation not found for user")
+    if space_id is not None:
+        actual_space = conversation.get("active_space_id")
+        actual_space_text = None if actual_space is None else str(actual_space)
+        if actual_space_text is not None and actual_space_text != space_id:
+            raise ConversationNotFoundError("Conversation not found for user")
+    if embodiment_id is not None:
+        actual_embodiment = conversation.get("active_embodiment_id")
+        actual_embodiment_text = (
+            None if actual_embodiment is None else str(actual_embodiment)
+        )
+        if actual_embodiment_text is not None and actual_embodiment_text != embodiment_id:
+            raise ConversationNotFoundError("Conversation not found for user")
+    if realm_id is not None:
+        actual_realm = conversation.get("active_realm_id")
+        actual_realm_text = None if actual_realm is None else str(actual_realm)
+        if actual_realm_text is not None and actual_realm_text != realm_id:
+            raise ConversationNotFoundError("Conversation not found for user")
+
+
+def _normalize_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, MindTopology):
+        value = value.value
+    normalized = str(value).strip()
+    return normalized or None

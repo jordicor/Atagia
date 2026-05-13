@@ -22,9 +22,15 @@ TRUSTED_EVALUATION_PROMPT_NOTE = (
 def trusted_evaluation_ablation(ablation: AblationConfig | None) -> AblationConfig:
     """Return retrieval settings for a trusted benchmark run."""
     if ablation is None:
-        return AblationConfig(override_retrieval_params={"privacy_ceiling": 3})
+        return AblationConfig(
+            override_retrieval_params={
+                "privacy_ceiling": 3,
+                "allow_private_sensitivity": True,
+            }
+        )
     override_params = dict(ablation.override_retrieval_params or {})
     override_params["privacy_ceiling"] = 3
+    override_params["allow_private_sensitivity"] = True
     return ablation.model_copy(update={"override_retrieval_params": override_params})
 
 

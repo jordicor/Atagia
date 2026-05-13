@@ -22,11 +22,17 @@ from atagia.memory.intimacy_boundary_policy import (
     minimum_privacy_for_intimacy_boundary,
     normalize_intimacy_boundary,
 )
+from atagia.memory.embodiment_policy import embodiment_visibility_sql_clause_for_context
+from atagia.memory.mind_policy import mind_visibility_sql_clause_for_context
+from atagia.memory.realm_policy import realm_visibility_sql_clause_for_context
+from atagia.memory.space_policy import space_visibility_sql_clause_for_context
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
     MemoryCategory,
     MemoryScope,
     MemorySensitivity,
+    MindTopology,
+    SpaceBoundaryMode,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
@@ -52,6 +58,17 @@ def _canonical_pin_scope(scope: MemoryScope) -> str:
     if scope in {MemoryScope.WORKSPACE, MemoryScope.CHARACTER}:
         return MemoryScope.CHARACTER.value
     return MemoryScope.USER.value
+
+
+def _normalize_optional_space_boundary_mode(value: SpaceBoundaryMode | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, SpaceBoundaryMode):
+        return value.value
+    try:
+        return SpaceBoundaryMode(str(value)).value
+    except ValueError as exc:
+        raise ValueError(f"Unsupported space boundary mode: {value!r}") from exc
 
 
 class VerbatimPinRepository(BaseRepository):
@@ -100,6 +117,12 @@ class VerbatimPinRepository(BaseRepository):
         remember_across_chats_snapshot: bool = True,
         remember_across_devices_snapshot: bool = True,
         policy_snapshot: dict[str, Any] | None = None,
+        space_id: str | None = None,
+        space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        memory_owner_id: str | None = None,
+        source_mind_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_pin_id = pin_id or generate_prefixed_id("vbp")
@@ -118,6 +141,12 @@ class VerbatimPinRepository(BaseRepository):
         resolved_scope_canonical = scope_canonical or _canonical_pin_scope(scope)
         resolved_storage_scope = resolved_scope_canonical
         resolved_character_id = character_id if character_id is not None else workspace_id
+        resolved_space_id = _normalize_optional_text(space_id)
+        resolved_space_boundary_mode = (
+            _normalize_optional_space_boundary_mode(space_boundary_mode)
+            if resolved_space_id is not None
+            else None
+        )
         timestamp = self._timestamp()
         normalized_expires_at = normalize_optional_timestamp(expires_at)
         parameters = (
@@ -156,6 +185,12 @@ class VerbatimPinRepository(BaseRepository):
             int(remember_across_chats_snapshot),
             int(remember_across_devices_snapshot),
             _encode_json(policy_snapshot or {}),
+            resolved_space_id,
+            resolved_space_boundary_mode,
+            _normalize_optional_text(memory_owner_id),
+            _normalize_optional_text(source_mind_id),
+            _normalize_optional_text(embodiment_id),
+            _normalize_optional_text(realm_id),
         )
         await self._connection.execute(
             """
@@ -194,15 +229,30 @@ class VerbatimPinRepository(BaseRepository):
                 incognito_snapshot,
                 remember_across_chats_snapshot,
                 remember_across_devices_snapshot,
-                policy_snapshot_json
+                policy_snapshot_json,
+                space_id,
+                space_boundary_mode,
+                memory_owner_id,
+                source_mind_id,
+                embodiment_id,
+                realm_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             parameters,
         )
         if commit:
             await self._connection.commit()
-        created = await self.get_verbatim_pin(resolved_pin_id, user_id)
+        created = await self.get_verbatim_pin(
+            resolved_pin_id,
+            user_id,
+            active_space_id=resolved_space_id,
+            active_space_boundary_mode=resolved_space_boundary_mode,
+            active_mind_id=_normalize_optional_text(memory_owner_id),
+            mind_topology=MindTopology.UNIMIND,
+            active_embodiment_id=_normalize_optional_text(embodiment_id),
+            active_realm_id=_normalize_optional_text(realm_id),
+        )
         if created is None:
             raise RuntimeError(f"Failed to create verbatim pin {resolved_pin_id}")
         return created
@@ -219,6 +269,12 @@ class VerbatimPinRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any] | None:
         visibility_clause, visibility_parameters = self._namespace_crud_sql(
             conversation_id=conversation_id,
@@ -229,6 +285,24 @@ class VerbatimPinRepository(BaseRepository):
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
         )
+        space_clause, space_parameters = space_visibility_sql_clause_for_context(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            alias="vp",
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="vp",
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="vp",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="vp",
+        )
         return self._strip_rowid(await self._fetch_one(
             f"""
             SELECT *
@@ -236,8 +310,20 @@ class VerbatimPinRepository(BaseRepository):
             WHERE id = ?
               AND user_id = ?
               {visibility_clause}
+              AND {space_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
             """,
-            (pin_id, user_id, *visibility_parameters),
+            (
+                pin_id,
+                user_id,
+                *visibility_parameters,
+                *space_parameters,
+                *mind_parameters,
+                *embodiment_parameters,
+                *realm_parameters,
+            ),
         ))
 
     async def list_verbatim_pins(
@@ -260,6 +346,12 @@ class VerbatimPinRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> list[dict[str, Any]]:
         clauses = ["user_id = ?"]
         parameters: list[Any] = [user_id]
@@ -309,6 +401,32 @@ class VerbatimPinRepository(BaseRepository):
         if visibility_clause:
             clauses.append(visibility_clause.removeprefix(" AND "))
             parameters.extend(visibility_parameters)
+        space_clause, space_parameters = space_visibility_sql_clause_for_context(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            alias="vp",
+        )
+        clauses.append(space_clause)
+        parameters.extend(space_parameters)
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="vp",
+        )
+        clauses.append(mind_clause)
+        parameters.extend(mind_parameters)
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="vp",
+        )
+        clauses.append(embodiment_clause)
+        parameters.extend(embodiment_parameters)
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="vp",
+        )
+        clauses.append(realm_clause)
+        parameters.extend(realm_parameters)
 
         resolved_limit = max(1, min(500, int(limit)))
         resolved_offset = max(0, int(offset))
@@ -348,6 +466,13 @@ class VerbatimPinRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        allow_private_sensitivity: bool = False,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -365,6 +490,7 @@ class VerbatimPinRepository(BaseRepository):
                 remember_across_devices=remember_across_devices,
                 incognito=incognito,
                 sensitivity_gates_enabled=allow_intimacy_context,
+                allow_private_sensitivity=allow_private_sensitivity,
                 table_alias="vp",
             )
             visibility_joiner = " AND "
@@ -379,6 +505,24 @@ class VerbatimPinRepository(BaseRepository):
         if not visibility_clauses:
             return []
         resolved_as_of = normalize_optional_timestamp(as_of) or self._timestamp()
+        space_clause, space_parameters = space_visibility_sql_clause_for_context(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            alias="vp",
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="vp",
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="vp",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="vp",
+        )
         cursor = await self._connection.execute(
             """
             SELECT
@@ -392,6 +536,10 @@ class VerbatimPinRepository(BaseRepository):
               AND vp.privacy_level <= ?
               AND {intimacy_filter}
               AND {visibility_clause}
+              AND {space_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
               AND (vp.expires_at IS NULL OR datetime(vp.expires_at) > datetime(?))
               AND verbatim_pins_fts MATCH ?
             ORDER BY rank ASC, vp.updated_at DESC, vp.created_at DESC, vp.id ASC
@@ -403,6 +551,10 @@ class VerbatimPinRepository(BaseRepository):
                     allow_intimacy_context=allow_intimacy_context,
                 ),
                 visibility_clause=conversation_visibility_clause("vp"),
+                space_clause=space_clause,
+                mind_clause=mind_clause,
+                embodiment_clause=embodiment_clause,
+                realm_clause=realm_clause,
             ),
             (
                 user_id,
@@ -410,6 +562,10 @@ class VerbatimPinRepository(BaseRepository):
                 VerbatimPinStatus.ACTIVE.value,
                 privacy_ceiling,
                 conversation_id,
+                *space_parameters,
+                *mind_parameters,
+                *embodiment_parameters,
+                *realm_parameters,
                 resolved_as_of,
                 normalized_query,
                 limit,
@@ -446,6 +602,12 @@ class VerbatimPinRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any] | None:
         existing = await self.get_verbatim_pin(
@@ -458,6 +620,12 @@ class VerbatimPinRepository(BaseRepository):
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
         )
         if existing is None:
             return None
@@ -535,7 +703,35 @@ class VerbatimPinRepository(BaseRepository):
                 remember_across_devices=remember_across_devices,
                 table_alias="",
             )
-            parameters.extend([pin_id, user_id, *visibility_parameters])
+            space_clause, space_parameters = space_visibility_sql_clause_for_context(
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                alias="",
+            )
+            mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                alias="",
+            )
+            embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+                active_embodiment_id=active_embodiment_id,
+                alias="",
+            )
+            realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+                active_realm_id=active_realm_id,
+                alias="",
+            )
+            parameters.extend(
+                [
+                    pin_id,
+                    user_id,
+                    *visibility_parameters,
+                    *space_parameters,
+                    *mind_parameters,
+                    *embodiment_parameters,
+                    *realm_parameters,
+                ]
+            )
             await self._connection.execute(
                 """
                 UPDATE verbatim_pins
@@ -543,7 +739,18 @@ class VerbatimPinRepository(BaseRepository):
                 WHERE id = ?
                   AND user_id = ?
                   {visibility_clause}
-                """.format(updates=", ".join(updates), visibility_clause=visibility_clause),
+                  AND {space_clause}
+                  AND {mind_clause}
+                  AND {embodiment_clause}
+                  AND {realm_clause}
+                """.format(
+                    updates=", ".join(updates),
+                    visibility_clause=visibility_clause,
+                    space_clause=space_clause,
+                    mind_clause=mind_clause,
+                    embodiment_clause=embodiment_clause,
+                    realm_clause=realm_clause,
+                ),
                 tuple(parameters),
             )
             if commit:
@@ -560,6 +767,12 @@ class VerbatimPinRepository(BaseRepository):
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
         )
 
     async def archive_verbatim_pin(
@@ -574,6 +787,12 @@ class VerbatimPinRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any] | None:
         return await self.update_verbatim_pin(
@@ -587,6 +806,12 @@ class VerbatimPinRepository(BaseRepository):
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
             commit=commit,
         )
 
@@ -602,6 +827,12 @@ class VerbatimPinRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any] | None:
         return await self.update_verbatim_pin(
@@ -616,6 +847,12 @@ class VerbatimPinRepository(BaseRepository):
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
             commit=commit,
         )
 

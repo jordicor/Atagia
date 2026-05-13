@@ -62,6 +62,7 @@ class ContextComposer:
 
     CONTRACT_BLOCK_RATIO = 0.35
     WORKSPACE_BLOCK_RATIO = 0.08
+    EXACT_DIRECT_USER_SOURCE_BOOST = 0.03
 
     def __init__(self, clock: Clock) -> None:
         self._clock = clock
@@ -78,7 +79,12 @@ class ContextComposer:
         query_type: QueryType = "default",
         exact_recall_mode: bool = False,
         composer_strategy: ComposerStrategy | None = None,
+        active_presence_id: str | None = None,
+        active_space_id: str | None = None,
+        active_realm_id: str | None = None,
+        redact_high_risk_secret_literals: bool = True,
     ) -> ComposedContext:
+        del active_space_id
         coerced_candidates = [
             candidate
             for candidate in (
@@ -86,6 +92,7 @@ class ContextComposer:
                 for candidate in scored_candidates
             )
             if str(candidate.memory_object.get("canonical_text", "")).strip()
+            and self._presence_boundary_allowed(candidate, active_presence_id)
             and candidate_allows_intimacy_boundary(
                 candidate.memory_object,
                 allow_intimacy_context=resolved_policy.allow_intimacy_context,
@@ -167,6 +174,8 @@ class ContextComposer:
                 query_text=query_text,
                 source_messages_by_id=source_messages_by_id,
                 source_quote_options=source_quote_options,
+                active_realm_id=active_realm_id,
+                redact_high_risk_secret_literals=redact_high_risk_secret_literals,
             )
         elif strategy == "budgeted_marginal":
             selection = self._select_budgeted_marginal(
@@ -179,6 +188,8 @@ class ContextComposer:
                 exact_recall_mode=exact_recall_mode,
                 source_messages_by_id=source_messages_by_id,
                 source_quote_options=source_quote_options,
+                active_realm_id=active_realm_id,
+                redact_high_risk_secret_literals=redact_high_risk_secret_literals,
             )
         else:
             raise ValueError(f"Unsupported composer strategy: {strategy}")
@@ -222,6 +233,8 @@ class ContextComposer:
         query_text: str | None,
         source_messages_by_id: dict[str, dict[str, Any]],
         source_quote_options: _SourceQuoteOptions,
+        active_realm_id: str | None,
+        redact_high_risk_secret_literals: bool,
     ) -> _MemorySelection:
         selected: list[ScoredCandidate] = []
         selected_ids: set[str] = set()
@@ -249,6 +262,8 @@ class ContextComposer:
                         query_text=query_text,
                         source_messages_by_id=source_messages_by_id,
                         source_quote_options=source_quote_options,
+                        active_realm_id=active_realm_id,
+                        redact_high_risk_secret_literals=redact_high_risk_secret_literals,
                     )
                     continue
 
@@ -262,9 +277,19 @@ class ContextComposer:
                 if supporting_l0.memory_id not in selected_ids:
                     required_items = 2
                     required_tokens = cls.estimate_tokens(
-                        cls._format_memory_entry(len(selected) + 1, supporting_l0)
+                        cls._format_memory_entry(
+                            len(selected) + 1,
+                            supporting_l0,
+                            active_realm_id=active_realm_id,
+                            redact_high_risk_secret_literals=redact_high_risk_secret_literals,
+                        )
                     ) + cls.estimate_tokens(
-                        cls._format_memory_entry(len(selected) + 2, candidate)
+                        cls._format_memory_entry(
+                            len(selected) + 2,
+                            candidate,
+                            active_realm_id=active_realm_id,
+                            redact_high_risk_secret_literals=redact_high_risk_secret_literals,
+                        )
                     )
                     if (
                         len(selected) + required_items > max_items
@@ -281,6 +306,8 @@ class ContextComposer:
                         query_text=query_text,
                         source_messages_by_id=source_messages_by_id,
                         source_quote_options=source_quote_options,
+                        active_realm_id=active_realm_id,
+                        redact_high_risk_secret_literals=redact_high_risk_secret_literals,
                     )
                 remaining_budget = cls._append_candidate_if_possible(
                     candidate,
@@ -292,6 +319,8 @@ class ContextComposer:
                     query_text=query_text,
                     source_messages_by_id=source_messages_by_id,
                     source_quote_options=source_quote_options,
+                    active_realm_id=active_realm_id,
+                    redact_high_risk_secret_literals=redact_high_risk_secret_literals,
                 )
                 continue
 
@@ -305,6 +334,8 @@ class ContextComposer:
                 query_text=query_text,
                 source_messages_by_id=source_messages_by_id,
                 source_quote_options=source_quote_options,
+                active_realm_id=active_realm_id,
+                redact_high_risk_secret_literals=redact_high_risk_secret_literals,
             )
         return _MemorySelection(
             selected=selected,
@@ -324,6 +355,8 @@ class ContextComposer:
         exact_recall_mode: bool,
         source_messages_by_id: dict[str, dict[str, Any]],
         source_quote_options: _SourceQuoteOptions,
+        active_realm_id: str | None,
+        redact_high_risk_secret_literals: bool,
     ) -> _MemorySelection:
         selected: list[ScoredCandidate] = []
         selected_ids: set[str] = set()
@@ -359,6 +392,8 @@ class ContextComposer:
                     profile=profile,
                     exact_recall_mode=exact_recall_mode,
                     order_by_id=order_by_id,
+                    active_realm_id=active_realm_id,
+                    redact_high_risk_secret_literals=redact_high_risk_secret_literals,
                 )
                 if action is None:
                     continue
@@ -389,6 +424,8 @@ class ContextComposer:
                     query_text=query_text,
                     source_messages_by_id=source_messages_by_id,
                     source_quote_options=source_quote_options,
+                    active_realm_id=active_realm_id,
+                    redact_high_risk_secret_literals=redact_high_risk_secret_literals,
                 )
             blocked_ids.update(best_action.blocked_ids)
 
@@ -409,6 +446,8 @@ class ContextComposer:
         source_messages_by_id: dict[str, dict[str, Any]],
     ) -> list[ScoredCandidate]:
         if len(candidates) <= 1 or not query_text or max_items <= 0:
+            return candidates
+        if exact_recall_mode and query_type != "broad_list":
             return candidates
 
         profile = cls._selection_profile(query_type)
@@ -563,6 +602,8 @@ class ContextComposer:
         profile: _SelectionProfile,
         exact_recall_mode: bool,
         order_by_id: dict[str, int],
+        active_realm_id: str | None,
+        redact_high_risk_secret_literals: bool,
     ) -> _SelectionAction | None:
         action_items: tuple[ScoredCandidate, ...]
         action_blocked_ids: frozenset[str] = frozenset()
@@ -610,7 +651,12 @@ class ContextComposer:
         if len(selected) + len(new_items) > max_items:
             return None
 
-        token_cost = cls._action_token_cost(new_items, selected_count=len(selected))
+        token_cost = cls._action_token_cost(
+            new_items,
+            selected_count=len(selected),
+            active_realm_id=active_realm_id,
+            redact_high_risk_secret_literals=redact_high_risk_secret_literals,
+        )
         if token_cost > remaining_budget:
             return None
 
@@ -646,9 +692,18 @@ class ContextComposer:
         items: tuple[ScoredCandidate, ...],
         *,
         selected_count: int,
+        active_realm_id: str | None = None,
+        redact_high_risk_secret_literals: bool = True,
     ) -> int:
         return sum(
-            cls.estimate_tokens(cls._format_memory_entry(selected_count + offset, item))
+            cls.estimate_tokens(
+                cls._format_memory_entry(
+                    selected_count + offset,
+                    item,
+                    active_realm_id=active_realm_id,
+                    redact_high_risk_secret_literals=redact_high_risk_secret_literals,
+                )
+            )
             for offset, item in enumerate(items, start=1)
         )
 
@@ -968,7 +1023,7 @@ class ContextComposer:
             source_messages_by_id,
             query_text=query_text,
         ):
-            score += 0.35
+            score += cls.EXACT_DIRECT_USER_SOURCE_BOOST
         return score
 
     @classmethod
@@ -1036,7 +1091,35 @@ class ContextComposer:
         confidence = value.get("confidence", value.get("score"))
         if isinstance(confidence, (int, float)):
             rendered += f" (confidence: {float(confidence):.2f})"
+        realm_note = ContextComposer._contract_realm_note(value)
+        if realm_note:
+            rendered += f" [{realm_note}]"
         return rendered
+
+    @staticmethod
+    def _contract_realm_note(value: dict[str, Any]) -> str | None:
+        realm_payload = value.get("realm")
+        if not isinstance(realm_payload, dict):
+            return None
+        realm_id = ContextComposer._optional_text(
+            realm_payload.get("realm_id") or realm_payload.get("active_realm_id")
+        )
+        if realm_id is None:
+            return None
+        display_name = ContextComposer._optional_text(
+            realm_payload.get("display_name")
+            or realm_payload.get("active_realm_display_name")
+        )
+        active_id = ContextComposer._optional_text(
+            realm_payload.get("active_request_realm_id")
+        )
+        mode = ContextComposer._optional_text(
+            realm_payload.get("cross_realm_mode") or realm_payload.get("bridge_mode")
+        )
+        label = display_name or realm_id
+        if active_id is not None and mode in {"attributed", "applicable"}:
+            return f"realm: in Realm {label} [cross_realm: {mode}; active={active_id}]"
+        return f"realm: in Realm {label}"
 
     @classmethod
     def _format_workspace_block(
@@ -1061,6 +1144,204 @@ class ContextComposer:
         )
 
     @staticmethod
+    def _presence_boundary_allowed(
+        candidate: ScoredCandidate,
+        active_presence_id: str | None,
+    ) -> bool:
+        if active_presence_id is None:
+            return True
+        memory_presence_id = ContextComposer._optional_text(
+            candidate.memory_object.get("active_presence_id")
+        )
+        if memory_presence_id is None or memory_presence_id == active_presence_id:
+            return True
+        kind = ContextComposer._presence_payload_kind(candidate.memory_object, "active")
+        return kind is not None and kind != "unknown"
+
+    @staticmethod
+    def _presence_payload_kind(memory_object: dict[str, Any], role: str) -> str | None:
+        payload_json = memory_object.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            return None
+        attribution = payload_json.get("presence_attribution") or {}
+        if not isinstance(attribution, dict):
+            return None
+        presence = attribution.get(role) or {}
+        if not isinstance(presence, dict):
+            return None
+        return ContextComposer._optional_text(presence.get("kind"))
+
+    @staticmethod
+    def _presence_attribution_note(memory_object: dict[str, Any]) -> str | None:
+        payload_json = memory_object.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            return None
+        attribution = payload_json.get("presence_attribution") or {}
+        if not isinstance(attribution, dict):
+            return None
+        active = attribution.get("active") or {}
+        source = attribution.get("source") or {}
+        if not isinstance(active, dict):
+            active = {}
+        if not isinstance(source, dict):
+            source = {}
+        active_id = ContextComposer._optional_text(
+            memory_object.get("active_presence_id") or active.get("presence_id")
+        )
+        source_id = ContextComposer._optional_text(
+            memory_object.get("source_presence_id") or source.get("presence_id")
+        )
+        parts: list[str] = []
+        if active_id is not None:
+            active_label = ContextComposer._presence_label(active, active_id)
+            parts.append(f"active={active_label}")
+        if source_id is not None and source_id != active_id:
+            source_label = ContextComposer._presence_label(source, source_id)
+            parts.append(f"source={source_label}")
+        return "; ".join(parts) if parts else None
+
+    @staticmethod
+    def _presence_label(presence: dict[str, Any], fallback_id: str) -> str:
+        display_name = ContextComposer._optional_text(presence.get("display_name"))
+        kind = ContextComposer._optional_text(presence.get("kind"))
+        label = display_name or fallback_id
+        if kind is not None:
+            return f"{label} [{kind}]"
+        return label
+
+    @staticmethod
+    def _space_boundary_note(memory_object: dict[str, Any]) -> str | None:
+        payload_json = memory_object.get("payload_json") or {}
+        space_payload = (
+            payload_json.get("space_boundary")
+            if isinstance(payload_json, dict)
+            else None
+        )
+        space_id = ContextComposer._optional_text(memory_object.get("space_id"))
+        boundary_mode = ContextComposer._optional_text(
+            memory_object.get("space_boundary_mode")
+        )
+        display_name: str | None = None
+        if isinstance(space_payload, dict):
+            space_id = space_id or ContextComposer._optional_text(
+                space_payload.get("active_space_id")
+            )
+            boundary_mode = boundary_mode or ContextComposer._optional_text(
+                space_payload.get("boundary_mode")
+            )
+            display_name = ContextComposer._optional_text(space_payload.get("display_name"))
+        if space_id is None:
+            return None
+        label = display_name or space_id
+        if boundary_mode is not None:
+            return f"{label} [{boundary_mode}]"
+        return label
+
+    @staticmethod
+    def _mind_perspective_note(memory_object: dict[str, Any]) -> str | None:
+        payload_json = memory_object.get("payload_json") or {}
+        mind_payload = (
+            payload_json.get("mind_perspective")
+            if isinstance(payload_json, dict)
+            else None
+        )
+        owner_id = ContextComposer._optional_text(memory_object.get("memory_owner_id"))
+        source_id = ContextComposer._optional_text(memory_object.get("source_mind_id"))
+        relation = ContextComposer._optional_text(memory_object.get("mind_relation"))
+        grant_kind = ContextComposer._optional_text(memory_object.get("mind_grant_kind"))
+        grant_target_kind = ContextComposer._optional_text(
+            memory_object.get("mind_grant_target_kind")
+        )
+        grant_target_id = ContextComposer._optional_text(
+            memory_object.get("mind_grant_target_id")
+        )
+        if isinstance(mind_payload, dict):
+            owner_id = owner_id or ContextComposer._optional_text(
+                mind_payload.get("memory_owner_id")
+            )
+            source_id = source_id or ContextComposer._optional_text(
+                mind_payload.get("source_mind_id")
+            )
+            relation = relation or ContextComposer._optional_text(
+                mind_payload.get("mind_relation")
+            )
+            grant_kind = grant_kind or ContextComposer._optional_text(
+                mind_payload.get("grant_kind")
+            )
+            grant_target_kind = grant_target_kind or ContextComposer._optional_text(
+                mind_payload.get("grant_target_kind")
+            )
+            grant_target_id = grant_target_id or ContextComposer._optional_text(
+                mind_payload.get("grant_target_id")
+            )
+        if owner_id is None:
+            return None
+        parts = [f"owned by {owner_id}"]
+        if relation == "granted" and grant_kind is not None:
+            grant = f"granted: {grant_kind}"
+            if grant_target_kind is not None and grant_target_id is not None:
+                grant = f"{grant}; target={grant_target_kind}:{grant_target_id}"
+            parts.append(f"[{grant}]")
+        elif relation == "same":
+            parts.append("[same]")
+        if source_id is not None and source_id != owner_id:
+            parts.append(f"source={source_id}")
+        return " ".join(parts)
+
+    @staticmethod
+    def _realm_note(
+        memory_object: dict[str, Any],
+        *,
+        active_realm_id: str | None,
+    ) -> str | None:
+        payload_json = memory_object.get("payload_json") or {}
+        realm_payload = (
+            payload_json.get("realm")
+            if isinstance(payload_json, dict)
+            else None
+        )
+        realm_id = ContextComposer._optional_text(memory_object.get("realm_id"))
+        display_name: str | None = None
+        bridge_mode = ContextComposer._optional_text(
+            memory_object.get("realm_bridge_mode")
+            or memory_object.get("cross_realm_mode")
+        )
+        if isinstance(realm_payload, dict):
+            realm_id = realm_id or ContextComposer._optional_text(
+                realm_payload.get("realm_id")
+                or realm_payload.get("active_realm_id")
+            )
+            display_name = ContextComposer._optional_text(
+                realm_payload.get("display_name")
+                or realm_payload.get("active_realm_display_name")
+            )
+            bridge_mode = bridge_mode or ContextComposer._optional_text(
+                realm_payload.get("cross_realm_mode")
+                or realm_payload.get("bridge_mode")
+            )
+        if realm_id is None:
+            return None
+        active_id = ContextComposer._optional_text(active_realm_id)
+        label = display_name or realm_id
+        if active_id is None:
+            return f"in Realm {label}"
+        if realm_id == active_id:
+            return f"in Realm {label} [same]"
+        if bridge_mode in {"attributed", "applicable"}:
+            return (
+                f"in Realm {label} "
+                f"[cross_realm: {bridge_mode}; active={active_id}]"
+            )
+        return f"in Realm {label} [cross_realm: unknown; active={active_id}]"
+
+    @staticmethod
+    def _optional_text(value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
+
+    @staticmethod
     def _format_memory_entry(
         index: int,
         candidate: ScoredCandidate,
@@ -1068,6 +1349,8 @@ class ContextComposer:
         source_messages_by_id: dict[str, dict[str, Any]] | None = None,
         source_quote_options: _SourceQuoteOptions | None = None,
         query_text: str | None = None,
+        active_realm_id: str | None = None,
+        redact_high_risk_secret_literals: bool = True,
     ) -> str:
         memory_object = candidate.memory_object
         confidence = float(memory_object.get("confidence", 0.0))
@@ -1093,6 +1376,21 @@ class ContextComposer:
             metadata_parts.append(f"intimacy_boundary: {intimacy_boundary}")
         if bool(memory_object.get("preserve_verbatim")):
             metadata_parts.append("preserve_verbatim: true")
+        presence_note = ContextComposer._presence_attribution_note(memory_object)
+        if presence_note:
+            metadata_parts.append(f"presence: {presence_note}")
+        space_note = ContextComposer._space_boundary_note(memory_object)
+        if space_note:
+            metadata_parts.append(f"space: {space_note}")
+        mind_note = ContextComposer._mind_perspective_note(memory_object)
+        if mind_note:
+            metadata_parts.append(f"mind: {mind_note}")
+        realm_note = ContextComposer._realm_note(
+            memory_object,
+            active_realm_id=active_realm_id,
+        )
+        if realm_note:
+            metadata_parts.append(f"realm: {realm_note}")
         temporal_type = str(memory_object.get("temporal_type") or "unknown")
         valid_from = memory_object.get("valid_from")
         valid_to = memory_object.get("valid_to")
@@ -1114,9 +1412,16 @@ class ContextComposer:
         if candidate.resolved_date:
             metadata_parts.append(f"resolved_date: {candidate.resolved_date}")
         disclosure = ContextComposer._disclosure_action(memory_object)
-        withhold_literal = disclosure is HighRiskDisclosureAction.WITHHOLD_SECRET_LITERAL
+        withhold_literal = (
+            redact_high_risk_secret_literals
+            and disclosure is HighRiskDisclosureAction.WITHHOLD_SECRET_LITERAL
+        )
         if withhold_literal:
             metadata_parts.append(f"disclosure_action: {disclosure.value}")
+        elif disclosure is HighRiskDisclosureAction.WITHHOLD_SECRET_LITERAL:
+            metadata_parts.append(
+                "benchmark_disclosure: high_risk_secret_literal_unredacted"
+            )
         memory_text = (
             "Protected high-risk memory present; raw value withheld. "
             "Use a host-managed secure reveal or verification flow."
@@ -1165,7 +1470,12 @@ class ContextComposer:
             return ""
         lines = ["[Current User State]"]
         for key, value in sorted(user_state.items()):
-            if isinstance(value, (dict, list)):
+            if isinstance(value, dict) and "value" in value and "realm" in value:
+                rendered = str(value.get("value"))
+                realm_note = ContextComposer._contract_realm_note(value)
+                if realm_note:
+                    rendered += f" [{realm_note}]"
+            elif isinstance(value, (dict, list)):
                 rendered = json_utils.dumps(value, sort_keys=True)
             else:
                 rendered = str(value)
@@ -1233,6 +1543,8 @@ class ContextComposer:
         query_text: str | None,
         source_messages_by_id: dict[str, dict[str, Any]],
         source_quote_options: _SourceQuoteOptions,
+        active_realm_id: str | None = None,
+        redact_high_risk_secret_literals: bool = True,
     ) -> int:
         if (
             candidate.memory_id in selected_ids
@@ -1240,7 +1552,12 @@ class ContextComposer:
             or len(selected) >= max_items
         ):
             return remaining_budget
-        candidate_block = cls._format_memory_entry(len(selected) + 1, candidate)
+        candidate_block = cls._format_memory_entry(
+            len(selected) + 1,
+            candidate,
+            active_realm_id=active_realm_id,
+            redact_high_risk_secret_literals=redact_high_risk_secret_literals,
+        )
         candidate_tokens = cls.estimate_tokens(candidate_block)
         if candidate_tokens > remaining_budget:
             return remaining_budget
@@ -1254,6 +1571,8 @@ class ContextComposer:
             source_messages_by_id=source_messages_by_id,
             source_quote_options=ranked_source_quote_options,
             query_text=query_text,
+            active_realm_id=active_realm_id,
+            redact_high_risk_secret_literals=redact_high_risk_secret_literals,
         )
         candidate_tokens_with_source = cls.estimate_tokens(candidate_block_with_source)
         if candidate_tokens_with_source <= remaining_budget:
@@ -1270,6 +1589,8 @@ class ContextComposer:
                     source_messages_by_id=source_messages_by_id,
                     source_quote_options=compact_source_options,
                     query_text=query_text,
+                    active_realm_id=active_realm_id,
+                    redact_high_risk_secret_literals=redact_high_risk_secret_literals,
                 )
                 compact_candidate_tokens = cls.estimate_tokens(compact_candidate_block)
                 if compact_candidate_tokens <= remaining_budget:

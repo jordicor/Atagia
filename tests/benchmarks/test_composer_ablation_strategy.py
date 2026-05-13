@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from benchmarks.atagia_bench.__main__ import _parse_ablation as parse_atagia_bench_ablation
+from benchmarks.atagia_bench.__main__ import (
+    _benchmark_ablation as build_atagia_bench_ablation,
+    _parse_ablation as parse_atagia_bench_ablation,
+)
 from benchmarks.atagia_bench.adapter import AtagiaBenchDataset
 from benchmarks.atagia_bench.runner import AtagiaBenchRunner
 from benchmarks.locomo.__main__ import _parse_ablation as parse_locomo_ablation
@@ -15,6 +18,15 @@ def test_composer_budgeted_marginal_benchmark_presets_parse() -> None:
 
     assert locomo == AblationConfig(composer_strategy="budgeted_marginal")
     assert atagia_bench == AblationConfig(composer_strategy="budgeted_marginal")
+
+
+def test_atagia_bench_privacy_enforcement_flag_builds_benchmark_ablation() -> None:
+    ablation = build_atagia_bench_ablation("composer_budgeted_marginal", "off")
+
+    assert ablation == AblationConfig(
+        privacy_enforcement="off",
+        composer_strategy="budgeted_marginal",
+    )
 
 
 def test_atagia_bench_report_config_records_composer_strategy_ablation() -> None:
@@ -40,4 +52,3 @@ def test_atagia_bench_report_config_records_composer_strategy_ablation() -> None
     )
 
     assert report.config["ablation_config"]["composer_strategy"] == "budgeted_marginal"
-

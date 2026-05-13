@@ -6,14 +6,16 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from atagia.app import create_app
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
+from atagia.core.space_repository import SpaceRepository
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
+from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, SpaceBoundaryMode
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -364,3 +366,145 @@ def test_memory_lifecycle_routes_edit_archive_and_hard_delete(tmp_path: Path) ->
             assert hard_delete_response.status_code == 200
             assert hard_delete_response.json()["deleted_memories"] == 1
             assert client.portal.call(memories.get_memory_object, "mem_delete", "usr_1") is None
+
+
+@pytest.mark.parametrize(
+    ("space_id", "boundary_mode"),
+    [
+        ("space_vault", SpaceBoundaryMode.PRIVACY_VAULT),
+        ("space_severed", SpaceBoundaryMode.SEVERANCE),
+    ],
+)
+def test_memory_routes_enforce_space_boundaries_for_broader_scope_memories(
+    tmp_path: Path,
+    space_id: str,
+    boundary_mode: SpaceBoundaryMode,
+) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime
+        runtime.clock = FrozenClock(datetime(2026, 4, 2, 1, 0, tzinfo=timezone.utc))
+        with _connection(client) as connection:
+            users = UserRepository(connection, runtime.clock)
+            conversations = ConversationRepository(connection, runtime.clock)
+            memories = MemoryObjectRepository(connection, runtime.clock)
+            spaces = SpaceRepository(connection, runtime.clock)
+
+            client.portal.call(users.create_user, "usr_1")
+            client.portal.call(
+                lambda: spaces.resolve_space(
+                    owner_user_id="usr_1",
+                    space_id=space_id,
+                    boundary_mode=boundary_mode,
+                    display_name=space_id,
+                    source_kind="explicit",
+                    source_id=space_id,
+                )
+            )
+            client.portal.call(
+                lambda: conversations.create_conversation(
+                    "cnv_outside",
+                    "usr_1",
+                    None,
+                    "coding_debug",
+                    "Outside",
+                    platform_id="web",
+                )
+            )
+            client.portal.call(
+                lambda: conversations.create_conversation(
+                    "cnv_inside",
+                    "usr_1",
+                    None,
+                    "coding_debug",
+                    "Inside",
+                    platform_id="web",
+                    active_space_id=space_id,
+                )
+            )
+
+            memory_ids = {
+                "get": f"mem_{space_id}_get",
+                "edit": f"mem_{space_id}_edit",
+                "delete": f"mem_{space_id}_delete",
+            }
+            for operation, memory_id in memory_ids.items():
+                client.portal.call(
+                    lambda operation=operation, memory_id=memory_id: memories.create_memory_object(
+                        user_id="usr_1",
+                        conversation_id=None,
+                        assistant_mode_id="coding_debug",
+                        object_type=MemoryObjectType.EVIDENCE,
+                        scope=MemoryScope.GLOBAL_USER,
+                        canonical_text=f"{operation} memory inside {space_id}.",
+                        source_kind=MemorySourceKind.EXTRACTED,
+                        confidence=0.9,
+                        privacy_level=0,
+                        memory_id=memory_id,
+                        platform_id="web",
+                        scope_canonical=MemoryScope.USER.value,
+                        space_id=space_id,
+                        space_boundary_mode=boundary_mode.value,
+                    )
+                )
+
+            outside_params = {
+                "user_id": "usr_1",
+                "conversation_id": "cnv_outside",
+                "platform_id": "web",
+            }
+            inside_params = {
+                "user_id": "usr_1",
+                "conversation_id": "cnv_inside",
+                "platform_id": "web",
+            }
+
+            outside_get = client.get(
+                f"/v1/memory/objects/{memory_ids['get']}",
+                params=outside_params,
+            )
+            assert outside_get.status_code == 404
+
+            outside_edit = client.patch(
+                f"/v1/memories/{memory_ids['edit']}",
+                json={
+                    **outside_params,
+                    "canonical_text": "Outside edit must not land.",
+                },
+            )
+            assert outside_edit.status_code == 404
+            stored_edit = client.portal.call(memories.get_memory_object, memory_ids["edit"], "usr_1")
+            assert stored_edit["canonical_text"] == f"edit memory inside {space_id}."
+
+            outside_delete = client.post(
+                f"/v1/memories/{memory_ids['delete']}/delete",
+                json=outside_params,
+            )
+            assert outside_delete.status_code == 404
+            stored_delete = client.portal.call(memories.get_memory_object, memory_ids["delete"], "usr_1")
+            assert stored_delete["status"] == "active"
+
+            inside_get = client.get(
+                f"/v1/memory/objects/{memory_ids['get']}",
+                params=inside_params,
+            )
+            assert inside_get.status_code == 200
+            assert inside_get.json()["canonical_text"] == f"get memory inside {space_id}."
+
+            inside_edit = client.patch(
+                f"/v1/memories/{memory_ids['edit']}",
+                json={
+                    **inside_params,
+                    "canonical_text": "Inside edit is allowed.",
+                },
+            )
+            assert inside_edit.status_code == 200
+            assert inside_edit.json()["canonical_text"] == "Inside edit is allowed."
+
+            inside_delete = client.post(
+                f"/v1/memories/{memory_ids['delete']}/delete",
+                json=inside_params,
+            )
+            assert inside_delete.status_code == 200
+            archived_delete = client.portal.call(memories.get_memory_object, memory_ids["delete"], "usr_1")
+            assert archived_delete["status"] == "archived"

@@ -27,6 +27,7 @@ from atagia.models.schemas_memory import (
     MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
+    SpaceBoundaryMode,
     SummaryViewKind,
 )
 from atagia.services.errors import ConversationNotActiveError
@@ -962,6 +963,113 @@ async def test_get_state_snapshot_excludes_expired_ephemeral_rows() -> None:
         )
 
         assert snapshot == {"status": "working"}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_get_state_snapshot_applies_space_boundaries() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation(
+            "cnv_a",
+            "usr_a",
+            None,
+            "coding_debug",
+            "Chat A",
+            platform_id="default",
+        )
+
+        await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.STATE_SNAPSHOT,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="User is in normal work mode.",
+            payload={"status": "global"},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            memory_id="mem_state_global",
+            user_persona_id=None,
+            platform_id="default",
+            sensitivity=MemorySensitivity.PUBLIC,
+            scope_canonical=MemoryScope.USER.value,
+        )
+        clock.advance(seconds=1)
+        await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.STATE_SNAPSHOT,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="User is inside a private vault.",
+            payload={"status": "vault"},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            memory_id="mem_state_vault",
+            user_persona_id=None,
+            platform_id="default",
+            sensitivity=MemorySensitivity.PUBLIC,
+            scope_canonical=MemoryScope.USER.value,
+            space_id="space_vault",
+            space_boundary_mode=SpaceBoundaryMode.PRIVACY_VAULT.value,
+        )
+        clock.advance(seconds=1)
+        await memories.create_memory_object(
+            user_id="usr_a",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.STATE_SNAPSHOT,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="User is inside a severed room.",
+            payload={"status": "severed"},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            privacy_level=0,
+            memory_id="mem_state_severed",
+            user_persona_id=None,
+            platform_id="default",
+            sensitivity=MemorySensitivity.PUBLIC,
+            scope_canonical=MemoryScope.USER.value,
+            space_id="space_severed",
+            space_boundary_mode=SpaceBoundaryMode.SEVERANCE.value,
+        )
+
+        outside = await memories.get_state_snapshot(
+            "usr_a",
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_a",
+            platform_id="default",
+        )
+        inside_vault = await memories.get_state_snapshot(
+            "usr_a",
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_a",
+            platform_id="default",
+            active_space_id="space_vault",
+            active_space_boundary_mode=SpaceBoundaryMode.PRIVACY_VAULT,
+        )
+        inside_severance = await memories.get_state_snapshot(
+            "usr_a",
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_a",
+            platform_id="default",
+            active_space_id="space_severed",
+            active_space_boundary_mode=SpaceBoundaryMode.SEVERANCE,
+        )
+
+        assert outside == {"status": "global"}
+        assert inside_vault == {"status": "vault"}
+        assert inside_severance == {"status": "severed"}
     finally:
         await connection.close()
 

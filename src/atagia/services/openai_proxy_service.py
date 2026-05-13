@@ -73,6 +73,13 @@ class OpenAIProxyIdentity:
     operational_profile: str | None = None
     operational_signals: dict[str, Any] | None = None
     cross_chat_memory: bool = True
+    message_id: str | None = None
+    source_seq: int | None = None
+    response_message_id: str | None = None
+    response_source_seq: int | None = None
+    ingest_origin: str | None = None
+    confirmation_strategy: str | None = None
+    memory_privacy_mode: str | None = None
 
 
 @dataclass(slots=True)
@@ -106,6 +113,13 @@ class OpenAIProxyService:
         character_id_header: str | None = None,
         incognito_header: str | None = None,
         cross_chat_memory_header: str | None = None,
+        message_id_header: str | None = None,
+        source_seq_header: str | None = None,
+        response_message_id_header: str | None = None,
+        response_source_seq_header: str | None = None,
+        ingest_origin_header: str | None = None,
+        confirmation_strategy_header: str | None = None,
+        memory_privacy_mode_header: str | None = None,
     ) -> dict[str, Any]:
         self._validate_model(request)
         completion_id = _completion_id()
@@ -122,6 +136,13 @@ class OpenAIProxyService:
             character_id_header=character_id_header,
             incognito_header=incognito_header,
             cross_chat_memory_header=cross_chat_memory_header,
+            message_id_header=message_id_header,
+            source_seq_header=source_seq_header,
+            response_message_id_header=response_message_id_header,
+            response_source_seq_header=response_source_seq_header,
+            ingest_origin_header=ingest_origin_header,
+            confirmation_strategy_header=confirmation_strategy_header,
+            memory_privacy_mode_header=memory_privacy_mode_header,
         )
         latest_user_text = _latest_user_text(request.messages)
         context = await self._context_for_turn_fail_open(identity, latest_user_text)
@@ -150,6 +171,13 @@ class OpenAIProxyService:
         character_id_header: str | None = None,
         incognito_header: str | None = None,
         cross_chat_memory_header: str | None = None,
+        message_id_header: str | None = None,
+        source_seq_header: str | None = None,
+        response_message_id_header: str | None = None,
+        response_source_seq_header: str | None = None,
+        ingest_origin_header: str | None = None,
+        confirmation_strategy_header: str | None = None,
+        memory_privacy_mode_header: str | None = None,
     ) -> AsyncIterator[str]:
         self._validate_model(request)
         completion_id = _completion_id()
@@ -166,6 +194,13 @@ class OpenAIProxyService:
             character_id_header=character_id_header,
             incognito_header=incognito_header,
             cross_chat_memory_header=cross_chat_memory_header,
+            message_id_header=message_id_header,
+            source_seq_header=source_seq_header,
+            response_message_id_header=response_message_id_header,
+            response_source_seq_header=response_source_seq_header,
+            ingest_origin_header=ingest_origin_header,
+            confirmation_strategy_header=confirmation_strategy_header,
+            memory_privacy_mode_header=memory_privacy_mode_header,
         )
         latest_user_text = _latest_user_text(request.messages)
         context = await self._context_for_turn_fail_open(identity, latest_user_text)
@@ -247,6 +282,15 @@ class OpenAIProxyService:
         )
         if accumulated:
             await self._record_response_fail_open(identity, accumulated)
+        if _include_stream_usage(request):
+            yield _sse(
+                _usage_chunk_payload(
+                    completion_id=completion_id,
+                    created=created,
+                    model=request.model,
+                    usage=_estimated_usage(accumulated),
+                )
+            )
         yield "data: [DONE]\n\n"
 
     def _validate_model(self, request: OpenAIChatCompletionRequest) -> None:
@@ -275,6 +319,11 @@ class OpenAIProxyService:
                 platform_id=identity.platform_id,
                 character_id=identity.character_id,
                 incognito=identity.incognito,
+                message_id=identity.message_id,
+                source_seq=identity.source_seq,
+                ingest_origin=identity.ingest_origin,
+                confirmation_strategy=identity.confirmation_strategy,
+                memory_privacy_mode=identity.memory_privacy_mode,
             )
         except _HARD_CONTEXT_ERRORS:
             raise
@@ -299,6 +348,13 @@ class OpenAIProxyService:
         character_id_header: str | None,
         incognito_header: str | None,
         cross_chat_memory_header: str | None,
+        message_id_header: str | None,
+        source_seq_header: str | None,
+        response_message_id_header: str | None,
+        response_source_seq_header: str | None,
+        ingest_origin_header: str | None,
+        confirmation_strategy_header: str | None,
+        memory_privacy_mode_header: str | None,
     ) -> OpenAIProxyIdentity:
         metadata = request.metadata or {}
         user_id = _first_text(
@@ -374,6 +430,41 @@ class OpenAIProxyService:
             metadata.get("atagia_cross_chat_memory"),
             metadata.get("cross_chat_memory"),
         )
+        message_id = _first_text(
+            message_id_header,
+            metadata.get("atagia_message_id"),
+            metadata.get("message_id"),
+        )
+        source_seq = _first_int(
+            source_seq_header,
+            metadata.get("atagia_source_seq"),
+            metadata.get("source_seq"),
+        )
+        response_message_id = _first_text(
+            response_message_id_header,
+            metadata.get("atagia_response_message_id"),
+            metadata.get("response_message_id"),
+        )
+        response_source_seq = _first_int(
+            response_source_seq_header,
+            metadata.get("atagia_response_source_seq"),
+            metadata.get("response_source_seq"),
+        )
+        ingest_origin = _first_text(
+            ingest_origin_header,
+            metadata.get("atagia_ingest_origin"),
+            metadata.get("ingest_origin"),
+        )
+        confirmation_strategy = _first_text(
+            confirmation_strategy_header,
+            metadata.get("atagia_confirmation_strategy"),
+            metadata.get("confirmation_strategy"),
+        )
+        memory_privacy_mode = _first_text(
+            memory_privacy_mode_header,
+            metadata.get("atagia_memory_privacy_mode"),
+            metadata.get("memory_privacy_mode"),
+        )
         resolved_cross_chat_memory = (
             not incognito
             if incognito is not None
@@ -396,6 +487,13 @@ class OpenAIProxyService:
                 else None
             ),
             cross_chat_memory=resolved_cross_chat_memory,
+            message_id=message_id,
+            source_seq=source_seq,
+            response_message_id=response_message_id,
+            response_source_seq=response_source_seq,
+            ingest_origin=ingest_origin,
+            confirmation_strategy=confirmation_strategy,
+            memory_privacy_mode=memory_privacy_mode,
         )
 
     def _llm_request(
@@ -430,6 +528,13 @@ class OpenAIProxyService:
                 "character_id": identity.character_id,
                 "incognito": identity.incognito,
                 "cross_chat_memory": identity.cross_chat_memory,
+                "message_id": identity.message_id,
+                "source_seq": identity.source_seq,
+                "response_message_id": identity.response_message_id,
+                "response_source_seq": identity.response_source_seq,
+                "ingest_origin": identity.ingest_origin,
+                "confirmation_strategy": identity.confirmation_strategy,
+                "memory_privacy_mode": identity.memory_privacy_mode,
                 "atagia_openai_proxy_model": request.model,
                 "openai_tool_choice": request.tool_choice,
             },
@@ -466,6 +571,11 @@ class OpenAIProxyService:
             character_id=identity.character_id,
             mode=identity.mode,
             incognito=identity.incognito,
+            message_id=identity.response_message_id,
+            source_seq=identity.response_source_seq,
+            ingest_origin=identity.ingest_origin,
+            confirmation_strategy=identity.confirmation_strategy,
+            memory_privacy_mode=identity.memory_privacy_mode,
         )
 
 
@@ -595,6 +705,20 @@ def _first_bool(*values: Any) -> bool | None:
     return None
 
 
+def _first_int(*values: Any) -> int | None:
+    for value in values:
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(value.strip())
+            except ValueError as exc:
+                raise ValueError("OpenAI proxy source_seq values must be integers") from exc
+    return None
+
+
 def _completion_id() -> str:
     return f"chatcmpl-atagia-{uuid.uuid4().hex}"
 
@@ -652,6 +776,30 @@ def _chunk_payload(
             }
         ],
     }
+
+
+def _usage_chunk_payload(
+    *,
+    completion_id: str,
+    created: int,
+    model: str,
+    usage: dict[str, int],
+) -> dict[str, Any]:
+    return {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": usage,
+    }
+
+
+def _include_stream_usage(request: OpenAIChatCompletionRequest) -> bool:
+    stream_options = request.stream_options
+    if not isinstance(stream_options, dict):
+        return False
+    return _first_bool(stream_options.get("include_usage")) is True
 
 
 async def _first_output_stream_event(

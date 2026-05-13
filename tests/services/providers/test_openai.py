@@ -19,6 +19,7 @@ from atagia.services.llm_client import (
     TransientLLMError,
 )
 from atagia.services.providers.openai import OpenAIProvider
+from atagia.services.providers.openrouter import OpenRouterProvider
 
 
 class FakeChatCompletions:
@@ -45,6 +46,22 @@ class FakeStream:
     async def _iterator(self):
         for chunk in self._chunks:
             yield chunk
+
+    async def aclose(self):
+        self.closed = True
+
+
+class FakeRaisingStream:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.closed = False
+
+    def __aiter__(self):
+        return self._iterator()
+
+    async def _iterator(self):
+        raise self.error
+        yield
 
     async def aclose(self):
         self.closed = True
@@ -89,6 +106,14 @@ def _request(model: str = "gpt-5-mini") -> LLMCompletionRequest:
         },
         tools=[LLMToolSpec(name="lookup", description="Lookup data", input_schema={"type": "object"})],
         metadata={"user_id": "usr_1"},
+    )
+
+
+def _api_error(message: str) -> openai.APIError:
+    return openai.APIError(
+        message,
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        body=None,
     )
 
 
@@ -231,6 +256,55 @@ async def test_openai_complete_forwards_provider_extra_body_from_metadata() -> N
 
     call = completions.calls[0]
     assert call["extra_body"] == {"reasoning": {"effort": "none"}}
+
+
+@pytest.mark.asyncio
+async def test_openrouter_openai_reasoning_model_omits_temperature() -> None:
+    response = SimpleNamespace(
+        model="openai/gpt-5.5",
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+        usage=None,
+        model_dump=lambda: {},
+    )
+    completions = FakeChatCompletions(create_result=response)
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://example.test",
+        app_name="Atagia",
+        client=FakeOpenAIClient(completions, FakeEmbeddings()),
+    )
+    request = _request(model="openai/gpt-5.5").model_copy(
+        update={
+            "metadata": {"provider_extra_body": {"reasoning": {"effort": "high"}}},
+        }
+    )
+
+    await provider.complete(request)
+
+    call = completions.calls[0]
+    assert "temperature" not in call
+    assert call["max_tokens"] == 256
+    assert "max_completion_tokens" not in call
+    assert call["extra_body"] == {"reasoning": {"effort": "high"}}
+
+
+@pytest.mark.asyncio
+async def test_openai_chat_latest_uses_completion_tokens_and_omits_temperature() -> None:
+    response = SimpleNamespace(
+        model="chat-latest",
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+        usage=None,
+        model_dump=lambda: {},
+    )
+    completions = FakeChatCompletions(create_result=response)
+    provider = OpenAIProvider(api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()))
+
+    await provider.complete(_request(model="chat-latest"))
+
+    call = completions.calls[0]
+    assert "temperature" not in call
+    assert call["max_completion_tokens"] == 256
+    assert "max_tokens" not in call
 
 
 @pytest.mark.asyncio
@@ -513,6 +587,38 @@ async def test_openai_maps_retryable_and_permanent_errors() -> None:
         await rate_limit_provider.complete(_request())
     with pytest.raises(LLMError):
         await permanent_provider.complete(_request())
+
+
+@pytest.mark.asyncio
+async def test_openai_maps_injected_sse_api_error_as_transient() -> None:
+    provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(
+            FakeChatCompletions(
+                error=_api_error("JSON error injected into SSE stream")
+            ),
+            FakeEmbeddings(),
+        ),
+    )
+
+    with pytest.raises(TransientLLMError, match="JSON error injected"):
+        await provider.complete(_request())
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_maps_injected_sse_api_error_as_transient() -> None:
+    stream = FakeRaisingStream(_api_error("JSON error injected into SSE stream"))
+    provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(FakeChatCompletions(stream), FakeEmbeddings()),
+    )
+
+    received, raised = await _collect_stream_events_and_error(provider)
+
+    assert received == []
+    assert isinstance(raised, TransientLLMError)
+    assert "JSON error injected" in str(raised)
+    assert stream.closed is True
 
 
 @pytest.mark.asyncio

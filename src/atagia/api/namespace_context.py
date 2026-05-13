@@ -16,6 +16,7 @@ from fastapi import HTTPException, status
 
 from atagia.core.clock import Clock
 from atagia.core.repositories import ConversationRepository, UserRepository
+from atagia.core.space_repository import SpaceRepository, space_snapshot
 from atagia.models.schemas_memory import ConversationStatus
 
 
@@ -58,9 +59,22 @@ class RouteNamespaceContext:
     incognito: bool
     remember_across_chats: bool
     remember_across_devices: bool
+    active_space_id: str | None
+    active_space_boundary_mode: str | None
+    active_mind_id: str | None
+    mind_topology: str
+    active_embodiment_id: str | None
+    active_realm_id: str | None
 
-    def memory_kwargs(self) -> dict[str, Any]:
-        return {
+    def memory_kwargs(
+        self,
+        *,
+        include_space: bool = False,
+        include_mind: bool = False,
+        include_embodiment: bool = False,
+        include_realm: bool = False,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
             "conversation_id": self.conversation_id,
             "user_persona_id": self.user_persona_id,
             "platform_id": self.platform_id,
@@ -69,6 +83,33 @@ class RouteNamespaceContext:
             "remember_across_chats": self.remember_across_chats,
             "remember_across_devices": self.remember_across_devices,
         }
+        if include_space:
+            kwargs.update(
+                {
+                    "active_space_id": self.active_space_id,
+                    "active_space_boundary_mode": self.active_space_boundary_mode,
+                }
+            )
+        if include_mind:
+            kwargs.update(
+                {
+                    "active_mind_id": self.active_mind_id,
+                    "mind_topology": self.mind_topology,
+                }
+            )
+        if include_embodiment:
+            kwargs.update(
+                {
+                    "active_embodiment_id": self.active_embodiment_id,
+                }
+            )
+        if include_realm:
+            kwargs.update(
+                {
+                    "active_realm_id": self.active_realm_id,
+                }
+            )
+        return kwargs
 
 
 async def require_route_namespace_context(
@@ -139,6 +180,15 @@ async def require_route_namespace_context(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
+    active_space_id = _row_optional(conversation, "active_space_id")
+    active_space_boundary_mode = None
+    if active_space_id is not None:
+        space_row = await SpaceRepository(connection, clock).get_space(
+            owner_user_id=user_id,
+            space_id=active_space_id,
+        )
+        if space_row is not None:
+            active_space_boundary_mode = space_snapshot(space_row).boundary_mode.value
 
     return RouteNamespaceContext(
         user_id=user_id,
@@ -152,6 +202,12 @@ async def require_route_namespace_context(
         incognito=expected_incognito,
         remember_across_chats=bool(preferences["remember_across_chats"]),
         remember_across_devices=bool(preferences["remember_across_devices"]),
+        active_space_id=active_space_id,
+        active_space_boundary_mode=active_space_boundary_mode,
+        active_mind_id=_row_optional(conversation, "active_mind_id"),
+        mind_topology=_row_optional(conversation, "mind_topology") or "unimind",
+        active_embodiment_id=_row_optional(conversation, "active_embodiment_id"),
+        active_realm_id=_row_optional(conversation, "active_realm_id"),
     )
 
 

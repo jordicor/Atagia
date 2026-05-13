@@ -35,7 +35,7 @@ from atagia.services.llm_client import (
     LLMError,
     LLMProvider,
 )
-from atagia.services.model_resolution import COMPONENTS_BY_ID
+from atagia.services.model_resolution import COMPONENTS_BY_ID, resolve_component_model
 
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
@@ -468,6 +468,31 @@ def test_atagia_constructor_accepts_phase_model_overrides(
     assert settings.llm_component_models["extractor"] == "openai/extractor-model,none"
 
 
+def test_atagia_constructor_phase_overrides_shadow_ambient_component_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_ambient_llm_model_env(monkeypatch)
+    monkeypatch.setenv("ATAGIA_LLM_MODEL__EXTRACTOR", "openai/env-extractor")
+    monkeypatch.setenv("ATAGIA_LLM_MODEL__NEED_DETECTOR", "openai/env-need")
+    monkeypatch.setenv(
+        "ATAGIA_LLM_MODEL__APPLICABILITY_SCORER",
+        "openai/env-scorer",
+    )
+
+    engine = Atagia(
+        llm_retrieval_model="openai/retrieval-model,none",
+        llm_component_models={"applicability_scorer": "openai/explicit-scorer"},
+    )
+
+    settings = engine._build_settings()
+
+    assert settings.llm_component_models["extractor"] == "openai/env-extractor"
+    assert "need_detector" not in settings.llm_component_models
+    assert settings.llm_component_models["applicability_scorer"] == "openai/explicit-scorer"
+    assert resolve_component_model(settings, "need_detector") == "openai/retrieval-model,none"
+    assert resolve_component_model(settings, "applicability_scorer") == "openai/explicit-scorer"
+
+
 def test_locomo_cli_accepts_answer_model_and_component_overrides() -> None:
     args = _build_parser().parse_args(
         [
@@ -476,24 +501,27 @@ def test_locomo_cli_accepts_answer_model_and_component_overrides() -> None:
             "--provider",
             "openrouter",
             "--answer-model",
-            "openrouter/google/gemini-3.1-flash-lite-preview,medium",
+            "openrouter/google/gemini-3.1-flash-lite,medium",
             "--ingest-model",
-            "openrouter/google/gemini-3.1-flash-lite-preview,none",
+            "openrouter/google/gemini-3.1-flash-lite,none",
             "--retrieval-model",
-            "openrouter/google/gemini-3.1-flash-lite-preview,minimal",
+            "openrouter/google/gemini-3.1-flash-lite,minimal",
             "--component-model",
             "extractor=openai/gpt-4o-mini",
             "--answer-prompt-variant",
             "grounded_connect",
+            "--answer-max-output-tokens",
+            "32768",
         ]
     )
 
     assert args.model is None
-    assert args.answer_model == "openrouter/google/gemini-3.1-flash-lite-preview,medium"
-    assert args.ingest_model == "openrouter/google/gemini-3.1-flash-lite-preview,none"
-    assert args.retrieval_model == "openrouter/google/gemini-3.1-flash-lite-preview,minimal"
+    assert args.answer_model == "openrouter/google/gemini-3.1-flash-lite,medium"
+    assert args.ingest_model == "openrouter/google/gemini-3.1-flash-lite,none"
+    assert args.retrieval_model == "openrouter/google/gemini-3.1-flash-lite,minimal"
     assert args.component_model == ["extractor=openai/gpt-4o-mini"]
     assert args.answer_prompt_variant == "grounded_connect"
+    assert args.answer_max_output_tokens == 32768
 
 
 @pytest.mark.asyncio
@@ -579,6 +607,7 @@ async def test_benchmark_routes_models_by_phase_and_component(
         chat_model_override="chat-model",
         component_models={"extractor": "extractor-model,minimal"},
         answer_prompt_variant="grounded_connect",
+        answer_max_output_tokens=32768,
         manifests_dir=MANIFESTS_DIR,
     )
 
@@ -606,12 +635,20 @@ async def test_benchmark_routes_models_by_phase_and_component(
         "extractor": "openai/extractor-model,minimal"
     }
     assert report.model_info["answer_prompt_variant"] == "grounded_connect"
+    assert report.model_info["answer_max_output_tokens"] == 32768
     answer_request = next(
         request
         for request in provider.requests
         if request.metadata.get("purpose") == "benchmark_answer_generation"
     )
     assert "Benchmark answer variant" in answer_request.messages[0].content
+    assert answer_request.max_output_tokens == 32768
+    answer_generation = report.conversations[0].results[0].trace["answer_generation"]
+    assert answer_generation["model"] == "openai/answer-model,high"
+    assert answer_generation["thinking_level"] == "high"
+    assert answer_generation["max_output_tokens"] == 32768
+    assert answer_generation["system_prompt"] == answer_request.messages[0].content
+    assert "memory_block" in answer_generation["context"]
     llm_calls = report.conversations[0].results[0].trace["llm_calls"]
     assert {call["purpose"] for call in llm_calls} >= {
         "need_detection",
@@ -835,6 +872,7 @@ async def test_score_question_labels_retrieval_error_without_cancelling_siblings
     assert failed.trace["sufficiency_diagnostic"] == "retrieval_failed"
     assert failed.trace["retrieval_failure"]["exception_class"] == "LLMError"
     assert report.model_info["warning_counts"]["retrieval_failed"] == 1
+    assert report.model_info["failure_stage_counts"] == {"retrieval": 1}
     surviving_results = [
         result
         for result in report.conversations[0].results
@@ -877,6 +915,7 @@ async def test_score_question_labels_answer_generation_error(
     assert failed.trace["answer_generation_failure"]["exception_class"] == "LLMError"
     assert "retrieval_trace" in failed.trace
     assert report.model_info["warning_counts"]["answer_generation_failed"] == 1
+    assert report.model_info["failure_stage_counts"] == {"answer_generation": 1}
 
 
 @pytest.mark.asyncio
@@ -921,6 +960,7 @@ async def test_score_question_tolerates_judge_error(
     assert failed.trace["sufficiency_diagnostic"] == "judge_failed"
     assert failed.trace.get("judge_failure", {}).get("exception_class") == "LLMError"
     assert report.model_info["warning_counts"]["judge_failed"] == 1
+    assert report.model_info["failure_stage_counts"] == {"judge": 1}
     surviving_results = [
         result
         for result in results

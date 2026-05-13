@@ -35,6 +35,7 @@ def _settings(
     backend: str,
     model: str | None = None,
     dimension: int = 2,
+    vector_limit_cap: int = 50,
     service_mode: bool = False,
 ) -> Settings:
     return Settings(
@@ -57,6 +58,7 @@ def _settings(
         embedding_backend=backend,
         embedding_model=model,
         embedding_dimension=dimension,
+        embedding_vector_limit_cap=vector_limit_cap,
     )
 
 
@@ -90,6 +92,26 @@ async def test_create_embedding_index_with_sqlite_vec_returns_backend(monkeypatc
         )
 
         assert isinstance(index, SQLiteVecBackend)
+        assert index.vector_limit == 50
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_vec_backend_reports_configured_vector_limit_cap() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    try:
+        backend = SQLiteVecBackend(
+            connection,
+            LLMClient(provider_name="embedding-factory-tests", providers=[StubProvider()]),
+            _settings(
+                backend="sqlite_vec",
+                model="embed-test-model",
+                vector_limit_cap=7,
+            ),
+        )
+
+        assert backend.vector_limit == 7
     finally:
         await connection.close()
 

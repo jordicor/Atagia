@@ -5,6 +5,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from atagia.memory.embodiment_policy import candidate_allows_embodiment_boundary
+from atagia.memory.mind_policy import candidate_allows_mind_boundary
+from atagia.memory.realm_policy import candidate_allows_realm_boundary
+from atagia.memory.space_policy import candidate_allows_space_boundary
 from atagia.models.schemas_memory import RetrievalPlan, ScoredCandidate
 
 
@@ -87,6 +91,7 @@ def build_candidate_custody(
             "retrieval_level": _safe_int(candidate.get("retrieval_level")),
             "source_kind": _safe_optional_str(candidate.get("source_kind")),
             "temporal_type": _safe_optional_str(candidate.get("temporal_type")),
+            "coordinate_trace_v1": build_coordinate_trace(candidate, retrieval_plan),
             "filter_reason": filter_reason,
             "shortlisted": shortlisted,
             "shortlist_rank": shortlist_ranks.get(candidate_id),
@@ -268,7 +273,241 @@ def _safe_bool(value: Any) -> bool | None:
 
 
 def _safe_optional_str(value: Any) -> str | None:
-    return None if value is None else str(value)
+    return None if value is None else str(getattr(value, "value", value))
+
+
+def build_coordinate_trace(candidate: dict[str, Any], retrieval_plan: RetrievalPlan) -> dict[str, Any]:
+    """Return text-free coordinate diagnostics for inspector surfaces."""
+
+    return {
+        "hard_partition": {
+            "user_id": "request_user",
+            "allowed": True,
+            "decision": "allowed",
+            "reason": "required_user_match",
+        },
+        "presence": {
+            "active_presence_id": _safe_optional_str(retrieval_plan.active_presence_id),
+            "candidate_active_presence_id": _safe_optional_str(candidate.get("active_presence_id")),
+            "candidate_source_presence_id": _safe_optional_str(candidate.get("source_presence_id")),
+            "candidate_presence_cluster_id": _safe_optional_str(candidate.get("presence_cluster_id")),
+            **_presence_gate(candidate, retrieval_plan),
+        },
+        "space": {
+            "active_space_id": _safe_optional_str(retrieval_plan.active_space_id),
+            "active_space_boundary_mode": _safe_optional_str(retrieval_plan.active_space_boundary_mode),
+            "candidate_space_id": _safe_optional_str(candidate.get("space_id")),
+            "candidate_space_boundary_mode": _safe_optional_str(candidate.get("space_boundary_mode")),
+            **_space_gate(candidate, retrieval_plan),
+        },
+        "mind": {
+            "active_mind_id": _safe_optional_str(retrieval_plan.active_mind_id),
+            "mind_topology": _safe_optional_str(retrieval_plan.mind_topology),
+            "candidate_memory_owner_id": _safe_optional_str(candidate.get("memory_owner_id")),
+            "candidate_source_mind_id": _safe_optional_str(candidate.get("source_mind_id")),
+            "relation": _safe_optional_str(candidate.get("mind_relation")),
+            "grant_kind": _safe_optional_str(candidate.get("mind_grant_kind")),
+            "grant_target_kind": _safe_optional_str(candidate.get("mind_grant_target_kind")),
+            "grant_target_id": _safe_optional_str(candidate.get("mind_grant_target_id")),
+            **_mind_gate(candidate, retrieval_plan),
+        },
+        "embodiment": {
+            "active_embodiment_id": _safe_optional_str(retrieval_plan.active_embodiment_id),
+            "cross_embodiment_mode": _safe_optional_str(retrieval_plan.cross_embodiment_mode),
+            "candidate_embodiment_id": _safe_optional_str(
+                candidate.get("embodiment_id") or candidate.get("active_embodiment_id")
+            ),
+            **_embodiment_gate(candidate, retrieval_plan),
+        },
+        "realm": {
+            "active_realm_id": _safe_optional_str(retrieval_plan.active_realm_id),
+            "cross_realm_mode": _safe_optional_str(retrieval_plan.cross_realm_mode),
+            "candidate_realm_id": _safe_optional_str(
+                candidate.get("realm_id") or candidate.get("active_realm_id")
+            ),
+            "relation": _safe_optional_str(candidate.get("realm_relation")),
+            "bridge_mode": _safe_optional_str(candidate.get("realm_bridge_mode")),
+            **_realm_gate(candidate, retrieval_plan),
+        },
+        "policy": {
+            "scope_filter": _enum_values(retrieval_plan.scope_filter),
+            "status_filter": _enum_values(retrieval_plan.status_filter),
+            "privacy_ceiling": retrieval_plan.privacy_ceiling,
+            "retrieval_levels": list(retrieval_plan.retrieval_levels),
+            "raw_context_access_mode": str(retrieval_plan.raw_context_access_mode),
+        },
+    }
+
+
+def _presence_gate(candidate: dict[str, Any], retrieval_plan: RetrievalPlan) -> dict[str, Any]:
+    return _gate_result(
+        True,
+        _presence_reason(
+            active_value=retrieval_plan.active_presence_id,
+            candidate_value=candidate.get("active_presence_id") or candidate.get("source_presence_id"),
+        ),
+    )
+
+
+def _presence_reason(*, active_value: Any, candidate_value: Any) -> str:
+    return _coordinate_reason(
+        active_value,
+        candidate_value,
+        scoped_label="allowed_same_presence",
+        unscoped_label="allowed_unscoped_presence",
+        cross_label="allowed_cross_presence_attributed",
+        missing_active_label="allowed_without_active_presence",
+    )
+
+
+def _space_gate(candidate: dict[str, Any], retrieval_plan: RetrievalPlan) -> dict[str, Any]:
+    allowed = candidate_allows_space_boundary(candidate, retrieval_plan)
+    candidate_space_id = _safe_optional_str(candidate.get("space_id"))
+    candidate_mode = _space_mode(candidate.get("space_boundary_mode"))
+    active_space_id = _safe_optional_str(retrieval_plan.active_space_id)
+    active_mode = _space_mode(retrieval_plan.active_space_boundary_mode)
+    if allowed:
+        if candidate_space_id is None:
+            reason = "allowed_unscoped_space"
+        elif active_space_id is None:
+            reason = "allowed_without_active_space_focus_or_tagged"
+        elif candidate_space_id == active_space_id:
+            reason = "allowed_same_space"
+        elif active_mode == "tagged" and candidate_mode in {"focus", "tagged"}:
+            reason = "allowed_by_active_tagged_space"
+        elif candidate_mode == "tagged":
+            reason = "allowed_by_tagged_space_visibility"
+        else:
+            reason = "allowed_by_space_boundary"
+        return _gate_result(True, reason)
+
+    if active_space_id is None:
+        reason = "blocked_without_active_space"
+    elif active_mode == "severance":
+        reason = "blocked_by_space_severance"
+    elif candidate_mode == "privacy_vault":
+        reason = "blocked_by_space_privacy_vault"
+    else:
+        reason = "blocked_by_space_boundary"
+    return _gate_result(False, reason)
+
+
+def _mind_gate(candidate: dict[str, Any], retrieval_plan: RetrievalPlan) -> dict[str, Any]:
+    allowed = candidate_allows_mind_boundary(candidate, retrieval_plan)
+    candidate_owner_id = _safe_optional_str(
+        candidate.get("memory_owner_id") or candidate.get("active_mind_id")
+    )
+    active_mind_id = _safe_optional_str(retrieval_plan.active_mind_id)
+    topology = _safe_optional_str(retrieval_plan.mind_topology) or "unimind"
+    if allowed:
+        if candidate_owner_id is None:
+            reason = "allowed_unowned_mind"
+        elif active_mind_id is not None and candidate_owner_id == active_mind_id:
+            reason = "allowed_same_mind"
+        elif _safe_optional_str(candidate.get("mind_relation")) == "granted":
+            reason = "allowed_by_overseer_grant"
+        else:
+            reason = "allowed_by_mind_boundary"
+        return _gate_result(True, reason)
+
+    if active_mind_id is None:
+        reason = "blocked_without_active_mind"
+    elif topology == "ojocentauri":
+        reason = "blocked_missing_overseer_grant"
+    else:
+        reason = "blocked_by_mind_boundary"
+    return _gate_result(False, reason)
+
+
+def _embodiment_gate(candidate: dict[str, Any], retrieval_plan: RetrievalPlan) -> dict[str, Any]:
+    allowed = candidate_allows_embodiment_boundary(candidate, retrieval_plan)
+    candidate_embodiment_id = _safe_optional_str(
+        candidate.get("embodiment_id") or candidate.get("active_embodiment_id")
+    )
+    active_embodiment_id = _safe_optional_str(retrieval_plan.active_embodiment_id)
+    if allowed:
+        if candidate_embodiment_id is None:
+            reason = "allowed_unscoped_embodiment"
+        elif active_embodiment_id is not None and candidate_embodiment_id == active_embodiment_id:
+            reason = "allowed_same_embodiment"
+        else:
+            reason = "allowed_by_embodiment_boundary"
+        return _gate_result(True, reason)
+
+    if active_embodiment_id is None:
+        reason = "blocked_without_active_embodiment"
+    else:
+        reason = "blocked_by_embodiment_boundary"
+    return _gate_result(False, reason)
+
+
+def _realm_gate(candidate: dict[str, Any], retrieval_plan: RetrievalPlan) -> dict[str, Any]:
+    allowed = candidate_allows_realm_boundary(candidate, retrieval_plan)
+    candidate_realm_id = _safe_optional_str(
+        candidate.get("realm_id") or candidate.get("active_realm_id")
+    )
+    active_realm_id = _safe_optional_str(retrieval_plan.active_realm_id)
+    bridge_relation = _safe_optional_str(candidate.get("realm_relation"))
+    bridge_mode = _safe_optional_str(candidate.get("realm_bridge_mode"))
+    if allowed:
+        if candidate_realm_id is None:
+            reason = "allowed_unscoped_realm"
+        elif active_realm_id is not None and candidate_realm_id == active_realm_id:
+            reason = "allowed_same_realm"
+        elif bridge_relation == "cross" and bridge_mode is not None:
+            reason = f"allowed_by_realm_bridge_{bridge_mode}"
+        else:
+            reason = "allowed_by_realm_boundary"
+        return _gate_result(True, reason)
+
+    if active_realm_id is None:
+        reason = "blocked_without_active_realm"
+    elif bridge_relation == "cross":
+        reason = "blocked_by_realm_bridge_missing_or_invalid"
+    else:
+        reason = "blocked_by_realm_no_bridge"
+    return _gate_result(False, reason)
+
+
+def _gate_result(allowed: bool, reason: str) -> dict[str, Any]:
+    return {
+        "allowed": allowed,
+        "decision": "allowed" if allowed else "blocked",
+        "reason": reason,
+    }
+
+
+def _coordinate_reason(
+    active_value: Any,
+    candidate_value: Any,
+    *,
+    scoped_label: str,
+    unscoped_label: str,
+    cross_label: str,
+    missing_active_label: str,
+) -> str:
+    active = _safe_optional_str(active_value)
+    candidate = _safe_optional_str(candidate_value)
+    if candidate is None:
+        return unscoped_label
+    if active is not None and candidate == active:
+        return scoped_label
+    if active is None:
+        return missing_active_label
+    return cross_label
+
+
+def _space_mode(value: Any) -> str:
+    normalized = _safe_optional_str(value) or "focus"
+    if normalized in {"focus", "severance", "privacy_vault", "tagged"}:
+        return normalized
+    return "focus"
+
+
+def _enum_values(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [str(getattr(value, "value", value)) for value in values]
 
 
 def _shortlist_status(

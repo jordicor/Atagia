@@ -257,6 +257,60 @@ class AdminRebuildService:
                                     else None
                                 )
                             ),
+                            active_presence_id=(
+                                str(message["active_presence_id"])
+                                if message.get("active_presence_id") is not None
+                                else conversation.get("active_presence_id")
+                            ),
+                            source_presence_id=(
+                                str(message["source_presence_id"])
+                                if message.get("source_presence_id") is not None
+                                else None
+                            ),
+                            active_space_id=(
+                                str(message["space_id"])
+                                if message.get("space_id") is not None
+                                else conversation.get("active_space_id")
+                            ),
+                            active_space_boundary_mode=(
+                                conversation.get("active_space_boundary_mode") or "focus"
+                            ),
+                            active_space_display_name=conversation.get(
+                                "active_space_display_name"
+                            ),
+                            active_mind_id=(
+                                str(message["active_mind_id"])
+                                if message.get("active_mind_id") is not None
+                                else conversation.get("active_mind_id")
+                            ),
+                            source_mind_id=(
+                                str(message["source_mind_id"])
+                                if message.get("source_mind_id") is not None
+                                else (
+                                    str(message["active_mind_id"])
+                                    if message.get("active_mind_id") is not None
+                                    else conversation.get("active_mind_id")
+                                )
+                            ),
+                            mind_topology=conversation.get("mind_topology") or "unimind",
+                            active_embodiment_id=(
+                                str(message["active_embodiment_id"])
+                                if message.get("active_embodiment_id") is not None
+                                else conversation.get("active_embodiment_id")
+                            ),
+                            cross_embodiment_mode=(
+                                conversation.get("cross_embodiment_mode")
+                                or "direct_if_same_body"
+                            ),
+                            active_realm_id=(
+                                str(message["active_realm_id"])
+                                if message.get("active_realm_id") is not None
+                                else conversation.get("active_realm_id")
+                            ),
+                            cross_realm_mode=(
+                                conversation.get("cross_realm_mode")
+                                or "none"
+                            ),
                             mode=str(conversation.get("mode") or conversation["assistant_mode_id"]),
                             incognito=bool(conversation.get("incognito")) or bool(conversation.get("isolated_mode")),
                             remember_across_chats=bool(memory_preferences["remember_across_chats"]),

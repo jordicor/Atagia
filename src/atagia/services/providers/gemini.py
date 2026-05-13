@@ -2,8 +2,8 @@
 
 Current Gemini model families documented by Google AI for Developers include
 Gemini 3.1 Pro Preview (`gemini-3.1-pro-preview`), Gemini 3 Flash Preview
-(`gemini-3-flash-preview`), Gemini 3.1 Flash-Lite Preview
-(`gemini-3.1-flash-lite-preview`), and Gemini Embedding
+(`gemini-3-flash-preview`), stable Gemini 3.1 Flash-Lite
+(`gemini-3.1-flash-lite`), and Gemini Embedding
 (`gemini-embedding-2`). The adapter accepts any model string supplied by the
 caller and does not gate requests to a hardcoded model list.
 """

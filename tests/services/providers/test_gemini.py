@@ -699,6 +699,39 @@ def test_settings_loads_google_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.google_api_key == "google-key"
 
 
+@pytest.mark.parametrize(
+    ("env_name", "expected"),
+    [
+        ("GEMINI_API_KEY", "gemini-api-key"),
+        ("GEMINI_KEY", "gemini-key"),
+        ("GOOGLE_API_KEY", "google-api-key"),
+    ],
+)
+def test_settings_loads_common_gemini_api_key_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    expected: str,
+) -> None:
+    monkeypatch.delenv("ATAGIA_GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv(env_name, expected)
+
+    assert Settings.from_env().google_api_key == expected
+
+
+def test_atagia_google_api_key_takes_precedence_over_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_GOOGLE_API_KEY", "atagia-google-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-api-key")
+    monkeypatch.setenv("GEMINI_KEY", "gemini-key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-api-key")
+
+    assert Settings.from_env().google_api_key == "atagia-google-key"
+
+
 @pytest.mark.asyncio
 async def test_build_llm_client_registers_gemini_and_uses_gemini_embeddings(
     monkeypatch: pytest.MonkeyPatch,
@@ -741,7 +774,7 @@ async def test_build_llm_client_registers_gemini_and_uses_gemini_embeddings(
         workers_enabled=False,
         debug=False,
         google_api_key="google-key",
-        llm_forced_global_model="google/gemini-3.1-flash-lite-preview",
+        llm_forced_global_model="google/gemini-3.1-flash-lite",
         embedding_backend="sqlite_vec",
         embedding_model="google/gemini-embedding-2",
     )
@@ -880,7 +913,7 @@ def test_build_llm_client_requires_gemini_credentials() -> None:
         admin_api_key=None,
         workers_enabled=False,
         debug=False,
-        llm_forced_global_model="google/gemini-3.1-flash-lite-preview",
+        llm_forced_global_model="google/gemini-3.1-flash-lite",
     )
 
     with pytest.raises(ConfigurationError, match="Missing API key"):

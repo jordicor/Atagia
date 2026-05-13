@@ -265,6 +265,7 @@ def summarize_llm_calls(records: list[dict[str, Any]]) -> dict[str, Any]:
         "token_totals": _sum_token_counts(records),
         "cost_totals": _sum_cost_counts(records),
         "model_call_counts": dict(sorted(model_counter.items())),
+        "structured_output_repair": _structured_output_repair_summary(records),
         "by_purpose": {
             purpose: _summarize_group(group)
             for purpose, group in sorted(purpose_records.items())
@@ -342,6 +343,7 @@ def merge_llm_call_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(summary.get("cost_totals"), dict)
         ),
         "model_call_counts": _merge_model_counts(summaries),
+        "structured_output_repair": _merge_structured_output_repair_summaries(summaries),
         "by_purpose": dict(sorted(by_purpose.items())),
     }
 
@@ -355,6 +357,80 @@ def _summarize_group(records: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_latency_ms": total_latency_ms / len(records) if records else None,
         "token_totals": _sum_token_counts(records),
         "cost_totals": _sum_cost_counts(records),
+        "structured_output_repair": _structured_output_repair_summary(records),
+    }
+
+
+def _structured_output_repair_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    retry_calls = 0
+    rescue_calls = 0
+    rescue_model_counts: Counter[str] = Counter()
+    by_purpose: dict[str, dict[str, int]] = {}
+    for record in records:
+        metadata = record.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        purpose = str(record.get("purpose") or "unknown")
+        purpose_counts = by_purpose.setdefault(
+            purpose,
+            {"retry_calls": 0, "rescue_calls": 0},
+        )
+        if _truthy(metadata.get("atagia_structured_output_retry")):
+            retry_calls += 1
+            purpose_counts["retry_calls"] += 1
+        if _truthy(metadata.get("atagia_structured_output_rescue")):
+            rescue_calls += 1
+            purpose_counts["rescue_calls"] += 1
+            rescue_model = metadata.get("atagia_structured_output_rescue_model")
+            if isinstance(rescue_model, str) and rescue_model:
+                rescue_model_counts[rescue_model] += 1
+    by_purpose = {
+        purpose: counts
+        for purpose, counts in sorted(by_purpose.items())
+        if counts["retry_calls"] or counts["rescue_calls"]
+    }
+    return {
+        "retry_calls": retry_calls,
+        "rescue_calls": rescue_calls,
+        "rescue_model_call_counts": dict(sorted(rescue_model_counts.items())),
+        "by_purpose": by_purpose,
+    }
+
+
+def _merge_structured_output_repair_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    retry_calls = 0
+    rescue_calls = 0
+    rescue_model_counts: Counter[str] = Counter()
+    by_purpose: dict[str, dict[str, int]] = {}
+    for summary in summaries:
+        repair = summary.get("structured_output_repair")
+        if not isinstance(repair, dict):
+            continue
+        retry_calls += int(repair.get("retry_calls") or 0)
+        rescue_calls += int(repair.get("rescue_calls") or 0)
+        model_counts = repair.get("rescue_model_call_counts")
+        if isinstance(model_counts, dict):
+            for model, amount in model_counts.items():
+                try:
+                    rescue_model_counts[str(model)] += int(amount)
+                except (TypeError, ValueError):
+                    continue
+        purpose_counts = repair.get("by_purpose")
+        if isinstance(purpose_counts, dict):
+            for purpose, counts in purpose_counts.items():
+                if not isinstance(counts, dict):
+                    continue
+                merged = by_purpose.setdefault(
+                    str(purpose),
+                    {"retry_calls": 0, "rescue_calls": 0},
+                )
+                merged["retry_calls"] += int(counts.get("retry_calls") or 0)
+                merged["rescue_calls"] += int(counts.get("rescue_calls") or 0)
+    return {
+        "retry_calls": retry_calls,
+        "rescue_calls": rescue_calls,
+        "rescue_model_call_counts": dict(sorted(rescue_model_counts.items())),
+        "by_purpose": dict(sorted(by_purpose.items())),
     }
 
 
@@ -527,12 +603,28 @@ def _metadata_summary(metadata: dict[str, Any]) -> dict[str, Any]:
         "atagia_model_spec",
         "atagia_canonical_model",
         "atagia_provider_slug",
+        "atagia_structured_output_failure_class",
+        "atagia_structured_output_retry",
+        "atagia_structured_output_retry_attempt",
+        "atagia_structured_output_retry_primary_model",
+        "atagia_structured_output_rescue",
+        "atagia_structured_output_rescue_model",
+        "atagia_structured_output_rescue_original_model",
+        "atagia_structured_output_rescue_retry_attempts",
     }
     return {
         key: _truncate(value, 300) if isinstance(value, str) else _json_safe(value)
         for key, value in metadata.items()
         if key in allowed
     }
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
 
 
 def _json_safe(value: Any) -> Any:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 import aiosqlite
@@ -17,7 +18,7 @@ from atagia.core.repositories import (
 )
 from atagia.memory.lifecycle_runner import cache_generation_key
 from atagia.models.schemas_api import DeletionReport, ErasureReport
-from atagia.models.schemas_memory import ConversationStatus, MemoryObjectType, MemoryStatus
+from atagia.models.schemas_memory import ConversationStatus, MemoryObjectType, MemoryStatus, SpaceBoundaryMode
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.errors import (
     ConversationAlreadyClosedError,
@@ -27,6 +28,7 @@ from atagia.services.errors import (
     MemoryNotEditableError,
     MemoryNotFoundError,
 )
+from atagia.services.artifact_blob_store import ArtifactBlobStore
 
 if TYPE_CHECKING:
     from atagia.app import AppRuntime
@@ -328,6 +330,12 @@ class ConversationLifecycleService:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any]:
         normalized_text = " ".join(new_text.split()).strip()
         if not normalized_text:
@@ -346,6 +354,12 @@ class ConversationLifecycleService:
                 incognito=incognito,
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
             )
             if memory is None:
                 raise MemoryNotFoundError("Memory object not found for user")
@@ -405,6 +419,12 @@ class ConversationLifecycleService:
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
         )
         if refreshed is None:
             raise MemoryNotFoundError("Memory object not found after edit")
@@ -425,6 +445,12 @@ class ConversationLifecycleService:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> DeletionReport:
         if not hard:
             return await self._archive_memory(
@@ -438,6 +464,12 @@ class ConversationLifecycleService:
                 incognito=incognito,
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
             )
         if confirmation != HARD_DELETE_MEMORY_CONFIRMATION:
             raise DeletionConfirmationError("Missing HARD_DELETE_MEMORY confirmation")
@@ -452,6 +484,12 @@ class ConversationLifecycleService:
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
         )
 
     async def erase_user_data(
@@ -714,6 +752,12 @@ class ConversationLifecycleService:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> DeletionReport:
         timestamp = self.runtime.clock.now().isoformat()
         await connection.execute("BEGIN IMMEDIATE")
@@ -729,6 +773,12 @@ class ConversationLifecycleService:
                 incognito=incognito,
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
             )
             if memory is None:
                 raise MemoryNotFoundError("Memory object not found for user")
@@ -764,8 +814,13 @@ class ConversationLifecycleService:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> DeletionReport:
-        timestamp = self.runtime.clock.now().isoformat()
         await connection.execute("BEGIN IMMEDIATE")
         try:
             memory = await self._get_memory(
@@ -779,6 +834,12 @@ class ConversationLifecycleService:
                 incognito=incognito,
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
             )
             if memory is None:
                 raise MemoryNotFoundError("Memory object not found for user")
@@ -964,6 +1025,7 @@ class ConversationLifecycleService:
             "DELETE FROM artifact_chunks WHERE user_id = ?",
             "DELETE FROM artifact_blobs WHERE artifact_id IN (SELECT id FROM artifacts WHERE user_id = ?)",
             "DELETE FROM artifacts WHERE user_id = ?",
+            "DELETE FROM artifact_payload_blobs WHERE user_id = ?",
             "DELETE FROM verbatim_pins WHERE user_id = ?",
             "DELETE FROM retrieval_events WHERE user_id = ?",
             "DELETE FROM summary_views WHERE user_id = ?",
@@ -1010,6 +1072,12 @@ class ConversationLifecycleService:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any] | None:
         if conversation_id is not None and platform_id is not None:
             return await MemoryObjectRepository(
@@ -1026,6 +1094,12 @@ class ConversationLifecycleService:
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
                 sensitivity_gates_enabled=True,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
             )
         return await self._fetch_one(
             connection,
@@ -1372,6 +1446,17 @@ class ConversationLifecycleService:
         if not artifact_ids:
             return
         placeholders = self._placeholders(artifact_ids)
+        cursor = await connection.execute(
+            f"""
+            SELECT DISTINCT payload_blob_id
+            FROM artifacts
+            WHERE user_id = ?
+              AND id IN ({placeholders})
+              AND payload_blob_id IS NOT NULL
+            """,
+            (user_id, *artifact_ids),
+        )
+        payload_blob_ids = [str(row["payload_blob_id"]) for row in await cursor.fetchall()]
         await connection.execute(
             f"DELETE FROM artifact_links WHERE user_id = ? AND artifact_id IN ({placeholders})",
             (user_id, *artifact_ids),
@@ -1388,6 +1473,23 @@ class ConversationLifecycleService:
             f"DELETE FROM artifacts WHERE user_id = ? AND id IN ({placeholders})",
             (user_id, *artifact_ids),
         )
+        if payload_blob_ids:
+            payload_placeholders = self._placeholders(payload_blob_ids)
+            await connection.execute(
+                f"""
+                DELETE FROM artifact_payload_blobs
+                WHERE user_id = ?
+                  AND id IN ({payload_placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM artifacts
+                      WHERE user_id = ?
+                        AND payload_blob_id = artifact_payload_blobs.id
+                        AND status NOT IN ('deleted', 'purged')
+                  )
+                """,
+                (user_id, *payload_blob_ids, user_id),
+            )
 
     async def _queue_file_deletions_for_artifacts(
         self,
@@ -1402,43 +1504,114 @@ class ConversationLifecycleService:
         if not artifact_ids:
             return
         placeholders = self._placeholders(artifact_ids)
+        queued_storage_uris: set[str] = set()
         cursor = await connection.execute(
             f"""
-            SELECT ab.storage_uri, ab.sha256
+            SELECT DISTINCT ab.storage_uri, ab.sha256
             FROM artifact_blobs AS ab
             JOIN artifacts AS a ON a.id = ab.artifact_id
             WHERE a.user_id = ?
               AND a.id IN ({placeholders})
               AND ab.storage_kind = 'local_file'
               AND ab.storage_uri IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM artifact_blobs AS live_ab
+                  JOIN artifacts AS live_a ON live_a.id = live_ab.artifact_id
+                  WHERE live_a.user_id = a.user_id
+                    AND live_a.id NOT IN ({placeholders})
+                    AND live_a.status NOT IN ('deleted', 'purged')
+                    AND live_ab.storage_kind = 'local_file'
+                    AND live_ab.storage_uri = ab.storage_uri
+              )
             """,
-            (user_id, *artifact_ids),
+            (user_id, *artifact_ids, *artifact_ids),
         )
         storage_root = str(self.runtime.settings.artifact_blobs_dir())
         for row in await cursor.fetchall():
-            await connection.execute(
-                """
-                INSERT INTO pending_file_deletions(
-                    id,
-                    storage_uri,
-                    storage_root,
-                    sha256,
-                    reason,
-                    tombstone_id,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    generate_prefixed_id("pfd"),
-                    str(row["storage_uri"]),
-                    storage_root,
-                    row["sha256"],
-                    reason,
-                    tombstone_id,
-                    timestamp,
-                ),
+            await self._insert_pending_file_deletion(
+                connection,
+                storage_uri=str(row["storage_uri"]),
+                sha256=row["sha256"],
+                storage_root=storage_root,
+                reason=reason,
+                tombstone_id=tombstone_id,
+                timestamp=timestamp,
+                queued_storage_uris=queued_storage_uris,
             )
+        cursor = await connection.execute(
+            f"""
+            SELECT DISTINCT apb.storage_key AS storage_uri, apb.content_sha256 AS sha256
+            FROM artifacts AS a
+            JOIN artifact_payload_blobs AS apb
+              ON apb.id = a.payload_blob_id
+             AND apb.user_id = a.user_id
+            WHERE a.user_id = ?
+              AND a.id IN ({placeholders})
+              AND apb.storage_kind = 'local_file'
+              AND apb.storage_key IS NOT NULL
+              AND apb.status IN ('pending', 'ready', 'gc_pending', 'quarantined')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM artifacts AS live_a
+                  WHERE live_a.user_id = a.user_id
+                    AND live_a.payload_blob_id = apb.id
+                    AND live_a.id NOT IN ({placeholders})
+                    AND live_a.status NOT IN ('deleted', 'purged')
+              )
+            """,
+            (user_id, *artifact_ids, *artifact_ids),
+        )
+        for row in await cursor.fetchall():
+            await self._insert_pending_file_deletion(
+                connection,
+                storage_uri=str(row["storage_uri"]),
+                sha256=row["sha256"],
+                storage_root=storage_root,
+                reason=reason,
+                tombstone_id=tombstone_id,
+                timestamp=timestamp,
+                queued_storage_uris=queued_storage_uris,
+            )
+
+    async def _insert_pending_file_deletion(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        storage_uri: str,
+        sha256: str | None,
+        storage_root: str,
+        reason: str,
+        tombstone_id: str,
+        timestamp: str,
+        queued_storage_uris: set[str],
+    ) -> None:
+        if storage_uri in queued_storage_uris:
+            return
+        queued_storage_uris.add(storage_uri)
+        await connection.execute(
+            """
+            INSERT INTO pending_file_deletions(
+                id,
+                storage_uri,
+                storage_root,
+                sha256,
+                reason,
+                tombstone_id,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                generate_prefixed_id("pfd"),
+                storage_uri,
+                storage_root,
+                sha256,
+                reason,
+                tombstone_id,
+                timestamp,
+            ),
+        )
 
     async def _process_pending_file_deletions(
         self,
@@ -1472,11 +1645,19 @@ class ConversationLifecycleService:
             error: str | None = None
             deleted_at: str | None = timestamp
             try:
-                if self.runtime.artifact_blob_store is None:
-                    error = "No local artifact blob store configured"
+                storage_root = str(row["storage_root"] or "").strip()
+                if not storage_root:
+                    error = "No storage root recorded for pending artifact blob deletion"
+                    deleted_at = None
+                elif await self._storage_uri_has_live_references(
+                    connection,
+                    str(row["storage_uri"]),
+                    storage_root=storage_root,
+                ):
+                    error = "Artifact blob still has live references"
                     deleted_at = None
                 else:
-                    self.runtime.artifact_blob_store.delete_storage_uri(str(row["storage_uri"]))
+                    ArtifactBlobStore(storage_root).delete_storage_uri(str(row["storage_uri"]))
             except Exception as exc:
                 error = str(exc)
                 deleted_at = None
@@ -1493,6 +1674,65 @@ class ConversationLifecycleService:
             processed += 1
         await connection.commit()
         return processed
+
+    async def _storage_uri_has_live_references(
+        self,
+        connection: aiosqlite.Connection,
+        storage_uri: str,
+        *,
+        storage_root: str,
+    ) -> bool:
+        candidates: list[str] = []
+        legacy_cursor = await connection.execute(
+            """
+            SELECT DISTINCT ab.storage_uri
+            FROM artifact_blobs AS ab
+            JOIN artifacts AS a ON a.id = ab.artifact_id
+            WHERE ab.storage_kind = 'local_file'
+              AND ab.storage_uri IS NOT NULL
+              AND a.status NOT IN ('deleted', 'purged')
+            """
+        )
+        candidates.extend(str(row["storage_uri"]) for row in await legacy_cursor.fetchall())
+        payload_cursor = await connection.execute(
+            """
+            SELECT DISTINCT apb.storage_key AS storage_uri
+            FROM artifact_payload_blobs AS apb
+            WHERE apb.storage_kind = 'local_file'
+              AND apb.storage_key IS NOT NULL
+              AND apb.status IN ('pending', 'ready', 'gc_pending', 'quarantined')
+              AND EXISTS (
+                  SELECT 1
+                  FROM artifacts AS a
+                  WHERE a.user_id = apb.user_id
+                    AND a.payload_blob_id = apb.id
+                    AND a.status NOT IN ('deleted', 'purged')
+              )
+            """
+        )
+        candidates.extend(str(row["storage_uri"]) for row in await payload_cursor.fetchall())
+        if Path(storage_uri).expanduser().is_absolute() and storage_uri in candidates:
+            return True
+        target_store = ArtifactBlobStore(storage_root)
+        try:
+            target_path = target_store.path_for_storage_uri(storage_uri, strict=False)
+        except Exception:
+            return False
+        current_store = self.runtime.artifact_blob_store or target_store
+        for candidate in candidates:
+            try:
+                if self._resolve_live_storage_uri(candidate, current_store=current_store) == target_path:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _resolve_live_storage_uri(storage_uri: str, *, current_store: ArtifactBlobStore) -> Path:
+        raw_path = Path(storage_uri).expanduser()
+        if raw_path.is_absolute():
+            return raw_path.resolve(strict=False)
+        return current_store.path_for_storage_uri(storage_uri, strict=False)
 
     async def _delete_embeddings_for_ids(
         self,

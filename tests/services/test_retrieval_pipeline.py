@@ -14,6 +14,7 @@ from atagia.core.config import Settings
 from atagia.core.contract_repository import ContractDimensionRepository
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository, WorkspaceRepository
+from atagia.core.space_repository import SpaceRepository
 from atagia.core.summary_repository import SummaryRepository
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
@@ -22,14 +23,17 @@ from atagia.models.schemas_memory import (
     DetectedNeed,
     ExtractionConversationContext,
     IntimacyBoundary,
+    MemoryCategory,
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
     NeedTrigger,
     PlannedSubQuery,
     RetrievalPlan,
     RetrievalTrace,
+    SpaceBoundaryMode,
     SummaryViewKind,
     VerbatimPinTargetKind,
 )
@@ -75,6 +79,37 @@ def _scores_for_prompt(
     ]
 
 
+def test_policy_filter_audit_separates_actual_and_would_filter_reasons() -> None:
+    regrounding_reasons = {"mem_1": "regrounding_filtered"}
+    policy_reasons = {"mem_2": "policy_filtered_sensitivity"}
+
+    assert RetrievalPipeline._actual_filter_reasons(
+        regrounding_reasons,
+        policy_reasons,
+        privacy_enforcement="enforce",
+    ) == {
+        "mem_1": "regrounding_filtered",
+        "mem_2": "policy_filtered_sensitivity",
+    }
+    assert RetrievalPipeline._actual_filter_reasons(
+        regrounding_reasons,
+        policy_reasons,
+        privacy_enforcement="off",
+    ) == {"mem_1": "regrounding_filtered"}
+
+    audit = RetrievalPipeline._build_policy_filter_audit("off", policy_reasons)
+
+    assert audit == {
+        "privacy_enforcement": "off",
+        "enforced": False,
+        "high_risk_secret_literal_redaction_enforced": False,
+        "high_risk_secret_literal_redaction_disabled": True,
+        "would_filter_count": 1,
+        "would_filter_reason_counts": {"policy_filtered_sensitivity": 1},
+        "would_filter_by_candidate_id": {"mem_2": "policy_filtered_sensitivity"},
+    }
+
+
 class PipelineProvider(LLMProvider):
     name = "retrieval-pipeline-tests"
 
@@ -82,6 +117,7 @@ class PipelineProvider(LLMProvider):
         self,
         *,
         need_response: dict[str, object] | None = None,
+        coverage_response: dict[str, object] | None = None,
         score_map: dict[str, float] | None = None,
     ) -> None:
         self.need_response = need_response or {
@@ -96,6 +132,11 @@ class PipelineProvider(LLMProvider):
             ],
             "query_type": "default",
             "retrieval_levels": [0],
+        }
+        self.coverage_response = coverage_response or {
+            "should_expand": False,
+            "missing_facets": [],
+            "sub_queries": [],
         }
         self.score_map = dict(score_map or {})
         self.requests: list[LLMCompletionRequest] = []
@@ -117,6 +158,12 @@ class PipelineProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(payload),
+            )
+        if purpose == "coverage_expansion":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(self.coverage_response),
             )
         raise AssertionError(f"Unexpected purpose: {purpose}")
 
@@ -285,8 +332,23 @@ async def _build_runtime(
     conversations = ConversationRepository(connection, clock)
     memories = MemoryObjectRepository(connection, clock)
     contracts = ContractDimensionRepository(connection, clock)
+    spaces = SpaceRepository(connection, clock)
     await users.create_user("usr_1")
     await workspaces.create_workspace("wrk_1", "usr_1", "Workspace")
+    for space_id, boundary_mode in (
+        ("space_focus", SpaceBoundaryMode.FOCUS),
+        ("space_vault", SpaceBoundaryMode.PRIVACY_VAULT),
+        ("space_severed", SpaceBoundaryMode.SEVERANCE),
+        ("space_tagged", SpaceBoundaryMode.TAGGED),
+    ):
+        await spaces.resolve_space(
+            owner_user_id="usr_1",
+            space_id=space_id,
+            boundary_mode=boundary_mode,
+            display_name=space_id,
+            source_kind="explicit",
+            source_id=space_id,
+        )
     await conversations.create_conversation("cnv_1", "usr_1", "wrk_1", mode_id, "Chat")
     llm_provider = provider or PipelineProvider()
     resolved_settings = settings or _settings()
@@ -319,6 +381,8 @@ async def _seed_memory(
     object_type: MemoryObjectType = MemoryObjectType.EVIDENCE,
     assistant_mode_id: str = "coding_debug",
     status: MemoryStatus = MemoryStatus.ACTIVE,
+    space_id: str | None = None,
+    space_boundary_mode: SpaceBoundaryMode | None = None,
 ) -> dict[str, object]:
     scope_canonical = {
         MemoryScope.CONVERSATION: MemoryScope.CHAT.value,
@@ -342,6 +406,8 @@ async def _seed_memory(
         platform_id="default",
         character_id="wrk_1" if scope is MemoryScope.WORKSPACE else None,
         scope_canonical=scope_canonical,
+        space_id=space_id,
+        space_boundary_mode=space_boundary_mode.value if space_boundary_mode is not None else None,
     )
 
 
@@ -604,6 +670,145 @@ async def test_pipeline_expands_broad_list_candidates_from_retrieved_source_mess
 
 
 @pytest.mark.asyncio
+async def test_llm_coverage_expansion_is_default_off() -> None:
+    message_text = "Which rollout details are in memory?"
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["rollout store opening"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "rollout store opening",
+                    "fts_phrase": "rollout store opening",
+                    "must_keep_terms": ["rollout", "store"],
+                }
+            ],
+            "query_type": "broad_list",
+            "retrieval_levels": [0],
+        },
+        coverage_response={
+            "should_expand": True,
+            "missing_facets": ["visual detail"],
+            "sub_queries": [
+                {
+                    "sub_query_text": "red hoodie video frame",
+                    "fts_phrase": "red hoodie video frame",
+                    "must_keep_terms": ["red", "hoodie", "frame"],
+                }
+            ],
+        },
+        score_map={"mem_rollout": 0.82, "mem_visual": 0.95},
+    )
+    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
+        provider=provider
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_rollout",
+            canonical_text="The rollout notes mention the store-opening announcement.",
+            scope=MemoryScope.CONVERSATION,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_visual",
+            canonical_text="The red hoodie video frame showed the demo lead.",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        result = await pipeline.execute(
+            message_text=message_text,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": message_text}],
+        )
+
+        assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_rollout"]
+        assert "coverage_expansion" not in {
+            str(request.metadata.get("purpose")) for request in provider.requests
+        }
+        assert result.stage_timings["llm_coverage_expansion"] >= 0.0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_adds_llm_coverage_expansion_candidates_when_enabled() -> None:
+    message_text = "Which rollout details are in memory?"
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["rollout store opening"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "rollout store opening",
+                    "fts_phrase": "rollout store opening",
+                    "must_keep_terms": ["rollout", "store"],
+                }
+            ],
+            "query_type": "broad_list",
+            "retrieval_levels": [0],
+        },
+        coverage_response={
+            "should_expand": True,
+            "missing_facets": ["visual detail"],
+            "sub_queries": [
+                {
+                    "sub_query_text": "red hoodie video frame",
+                    "fts_phrase": "red hoodie video frame",
+                    "must_keep_terms": ["red", "hoodie", "frame"],
+                }
+            ],
+        },
+        score_map={"mem_rollout": 0.82, "mem_visual": 0.95},
+    )
+    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
+        provider=provider
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_rollout",
+            canonical_text="The rollout notes mention the store-opening announcement.",
+            scope=MemoryScope.CONVERSATION,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_visual",
+            canonical_text="The red hoodie video frame showed the demo lead.",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        result = await pipeline.execute(
+            message_text=message_text,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": message_text}],
+            ablation=AblationConfig(enable_llm_coverage_expansion=True),
+        )
+
+        raw_ids = [candidate["id"] for candidate in result.raw_candidates]
+        assert raw_ids == ["mem_rollout", "mem_visual"]
+        visual_candidate = next(
+            candidate for candidate in result.raw_candidates if candidate["id"] == "mem_visual"
+        )
+        assert "llm_coverage_expansion" in visual_candidate["retrieval_sources"]
+        assert visual_candidate["coverage_expansion_sub_queries"] == ["red hoodie video frame"]
+        assert "mem_visual" in _score_request_memory_ids(provider)
+        assert "coverage_expansion" in {
+            str(request.metadata.get("purpose")) for request in provider.requests
+        }
+        assert result.stage_timings["llm_coverage_expansion"] >= 0.0
+        assert result.stage_timings["candidate_search"] >= result.stage_timings["llm_coverage_expansion"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_pipeline_filters_intimacy_boundary_during_source_message_expansion() -> None:
     message_text = "Which details were part of the campaign?"
     provider = PipelineProvider(
@@ -668,6 +873,301 @@ async def test_pipeline_filters_intimacy_boundary_during_source_message_expansio
 
         assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_matched"]
         assert "mem_private_sibling" not in _score_request_memory_ids(provider)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_privacy_enforcement_off_reaches_composer_for_restricted_candidates() -> None:
+    provider = PipelineProvider(score_map={"mem_restricted_budget": 0.99})
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        provider=provider,
+    )
+    try:
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="retry loop websocket backoff apartment budget was $2,800.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=3,
+            memory_id="mem_restricted_budget",
+            sensitivity=MemorySensitivity.SECRET,
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+            intimacy_boundary_confidence=0.9,
+            platform_id="default",
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+        trace = RetrievalTrace(
+            query_text="retry loop websocket backoff",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-09T12:00:00Z",
+        )
+
+        result = await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(privacy_enforcement="off"),
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"},
+            ],
+            trace=trace,
+        )
+
+        assert "mem_restricted_budget" in {
+            candidate["id"] for candidate in result.raw_candidates
+        }
+        assert "mem_restricted_budget" in {
+            candidate.memory_id for candidate in result.scored_candidates
+        }
+        assert "mem_restricted_budget" in result.composed_context.selected_memory_ids
+        assert "$2,800" in result.composed_context.memory_block
+        assert trace.policy_filter_audit["would_filter_by_candidate_id"][
+            "mem_restricted_budget"
+        ] == "policy_filtered_sensitivity"
+        assert (
+            trace.policy_filter_audit["high_risk_secret_literal_redaction_enforced"]
+            is False
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_privacy_enforcement_off_includes_review_and_pending_statuses() -> None:
+    provider = PipelineProvider(
+        score_map={
+            "mem_review": 0.99,
+            "mem_pending": 0.98,
+            "mem_declined": 1.0,
+        }
+    )
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        provider=provider,
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_review",
+            canonical_text="retry loop websocket backoff review-required diagnostic fact",
+            scope=MemoryScope.CONVERSATION,
+            status=MemoryStatus.REVIEW_REQUIRED,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_pending",
+            canonical_text="retry loop websocket backoff pending-confirmation diagnostic fact",
+            scope=MemoryScope.CONVERSATION,
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_declined",
+            canonical_text="retry loop websocket backoff declined fact",
+            scope=MemoryScope.CONVERSATION,
+            status=MemoryStatus.DECLINED,
+        )
+        trace = RetrievalTrace(
+            query_text="retry loop websocket backoff",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-09T12:00:00Z",
+        )
+
+        result = await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(privacy_enforcement="off"),
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"},
+            ],
+            trace=trace,
+        )
+
+        assert result.retrieval_plan.status_filter == [
+            MemoryStatus.ACTIVE,
+            MemoryStatus.REVIEW_REQUIRED,
+            MemoryStatus.PENDING_USER_CONFIRMATION,
+        ]
+        assert {candidate["id"] for candidate in result.raw_candidates} == {
+            "mem_review",
+            "mem_pending",
+        }
+        assert {candidate.memory_id for candidate in result.scored_candidates} == {
+            "mem_review",
+            "mem_pending",
+        }
+        assert set(result.composed_context.selected_memory_ids) == {
+            "mem_review",
+            "mem_pending",
+        }
+        assert trace.scoring is not None
+        assert trace.scoring.rejection_reasons == {}
+        assert trace.policy_filter_audit["would_filter_reason_counts"] == {
+            "policy_filtered_status": 2,
+        }
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_privacy_enforcement_off_can_search_cross_conversation_chat_memory() -> None:
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["therapy sessions"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "therapy sessions",
+                    "fts_phrase": "therapy sessions",
+                }
+            ],
+            "query_type": "slot_fill",
+            "retrieval_levels": [0],
+        },
+        score_map={"mem_cross_chat_secret": 0.99},
+    )
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        provider=provider,
+    )
+    conversations = ConversationRepository(
+        connection,
+        FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)),
+    )
+    try:
+        await conversations.create_conversation(
+            "cnv_2",
+            "usr_1",
+            "wrk_1",
+            "coding_debug",
+            "Earlier personal chat",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_2",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Therapy sessions with Dr. Reeves happen Mondays at 5 PM.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=3,
+            status=MemoryStatus.ACTIVE,
+            memory_id="mem_cross_chat_secret",
+            sensitivity=MemorySensitivity.SECRET,
+            platform_id="default",
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+
+        enforced = await pipeline.execute(
+            message_text="therapy sessions",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "therapy sessions"},
+            ],
+        )
+        diagnostic = await pipeline.execute(
+            message_text="therapy sessions",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(privacy_enforcement="off"),
+            conversation_messages=[
+                {"role": "user", "text": "therapy sessions"},
+            ],
+        )
+
+        assert "mem_cross_chat_secret" not in {
+            candidate["id"] for candidate in enforced.raw_candidates
+        }
+        assert "mem_cross_chat_secret" in {
+            candidate["id"] for candidate in diagnostic.raw_candidates
+        }
+        assert "mem_cross_chat_secret" in diagnostic.composed_context.selected_memory_ids
+        assert "Dr. Reeves" in diagnostic.composed_context.memory_block
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_privacy_enforcement_off_disables_high_risk_redaction_in_context() -> None:
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["deployment pin"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "deployment pin",
+                    "fts_phrase": "deployment pin",
+                }
+            ],
+            "query_type": "default",
+            "retrieval_levels": [0],
+        },
+        score_map={"mem_deployment_pin": 0.99},
+    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
+    try:
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="The deployment PIN is 1234.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=3,
+            status=MemoryStatus.ACTIVE,
+            memory_category=MemoryCategory.PIN_OR_PASSWORD,
+            preserve_verbatim=True,
+            memory_id="mem_deployment_pin",
+            sensitivity=MemorySensitivity.SECRET,
+            platform_id="default",
+            scope_canonical=MemoryScope.CHAT.value,
+        )
+
+        result = await pipeline.execute(
+            message_text="deployment pin",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(privacy_enforcement="off"),
+            conversation_messages=[
+                {"role": "user", "text": "deployment pin"},
+            ],
+        )
+
+        assert "mem_deployment_pin" in result.composed_context.selected_memory_ids
+        assert "The deployment PIN is 1234." in result.composed_context.memory_block
+        assert "raw value withheld" not in result.composed_context.memory_block
+        assert (
+            "benchmark_disclosure: high_risk_secret_literal_unredacted"
+            in result.composed_context.memory_block
+        )
     finally:
         await connection.close()
 
@@ -1283,6 +1783,91 @@ async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None
         await connection.close()
 
 
+@pytest.mark.parametrize(
+    ("active_space_id", "boundary_mode", "expected_ids"),
+    [
+        (None, None, {"mem_unscoped", "mem_focus", "mem_tagged"}),
+        ("space_focus", SpaceBoundaryMode.FOCUS, {"mem_unscoped", "mem_focus", "mem_tagged"}),
+        ("space_vault", SpaceBoundaryMode.PRIVACY_VAULT, {"mem_unscoped", "mem_vault", "mem_tagged"}),
+        ("space_severed", SpaceBoundaryMode.SEVERANCE, {"mem_severed"}),
+        ("space_tagged", SpaceBoundaryMode.TAGGED, {"mem_unscoped", "mem_focus", "mem_tagged"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pipeline_small_corpus_shortcut_enforces_space_boundaries(
+    active_space_id: str | None,
+    boundary_mode: SpaceBoundaryMode | None,
+    expected_ids: set[str],
+) -> None:
+    provider = PipelineProvider()
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        provider=provider,
+        settings=_settings(small_corpus_token_threshold_ratio=0.7),
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_unscoped",
+            canonical_text="unscoped broader preference",
+            scope=MemoryScope.GLOBAL_USER,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_focus",
+            canonical_text="focus space broader preference",
+            scope=MemoryScope.GLOBAL_USER,
+            space_id="space_focus",
+            space_boundary_mode=SpaceBoundaryMode.FOCUS,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_vault",
+            canonical_text="vault space broader preference",
+            scope=MemoryScope.GLOBAL_USER,
+            space_id="space_vault",
+            space_boundary_mode=SpaceBoundaryMode.PRIVACY_VAULT,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_severed",
+            canonical_text="severed space broader preference",
+            scope=MemoryScope.GLOBAL_USER,
+            space_id="space_severed",
+            space_boundary_mode=SpaceBoundaryMode.SEVERANCE,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_tagged",
+            canonical_text="tagged space broader preference",
+            scope=MemoryScope.GLOBAL_USER,
+            space_id="space_tagged",
+            space_boundary_mode=SpaceBoundaryMode.TAGGED,
+        )
+
+        active_context = context.model_copy(
+            update={
+                "active_space_id": active_space_id,
+                "active_space_boundary_mode": boundary_mode or SpaceBoundaryMode.FOCUS,
+            }
+        )
+        result = await pipeline.execute(
+            message_text="Which broader preferences apply?",
+            conversation_context=active_context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "Which broader preferences apply?"},
+            ],
+        )
+
+        assert result.small_corpus_mode is True
+        returned_ids = {str(candidate["id"]) for candidate in result.raw_candidates}
+        assert returned_ids == expected_ids
+        assert set(result.composed_context.selected_memory_ids) == expected_ids
+    finally:
+        await connection.close()
+
+
 @pytest.mark.asyncio
 async def test_pipeline_small_corpus_shortcut_composes_all_eligible_memories() -> None:
     provider = PipelineProvider()
@@ -1639,6 +2224,52 @@ async def test_pipeline_small_corpus_shortcut_enforces_privacy_ceiling() -> None
         returned_ids = {candidate["id"] for candidate in result.raw_candidates}
         assert "mem_public" in returned_ids
         assert "mem_private" not in returned_ids
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_trusted_private_retrieval_bypasses_public_only_cold_start_and_small_corpus() -> None:
+    provider = PipelineProvider(score_map={"mem_private": 0.95})
+    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        provider=provider,
+        settings=_settings(small_corpus_token_threshold_ratio=1.0),
+    )
+    try:
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="retry loop websocket backoff private note",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=2,
+            sensitivity=MemorySensitivity.PRIVATE,
+            memory_id="mem_private",
+        )
+
+        result = await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=True,
+            ablation=AblationConfig(
+                override_retrieval_params={
+                    "privacy_ceiling": 3,
+                    "allow_private_sensitivity": True,
+                }
+            ),
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"},
+            ],
+        )
+
+        assert result.small_corpus_mode is False
+        assert "mem_private" in {candidate["id"] for candidate in result.raw_candidates}
+        assert "mem_private" in result.composed_context.selected_memory_ids
     finally:
         await connection.close()
 
@@ -2155,6 +2786,59 @@ def test_ambiguity_recovery_expands_scoring_budget() -> None:
     assert expanded.retrieval_params.rerank_top_k == 32
 
 
+def test_under_specified_recovery_expands_context_items_with_low_cap() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    scoring_policy = policy.model_copy(
+        update={
+            "retrieval_params": policy.retrieval_params.model_copy(
+                update={"rerank_top_k": 32}
+            )
+        }
+    )
+    plan = _slot_fill_plan(exact_recall_mode=False)
+
+    expanded = RetrievalPipeline._expand_recall_or_recovery_context_items(
+        scoring_policy,
+        plan,
+        degraded_mode=False,
+        detected_needs=[
+            DetectedNeed(
+                need_type=NeedTrigger.UNDER_SPECIFIED_REQUEST,
+                confidence=0.8,
+                reasoning="The query needs a few complementary memories.",
+            )
+        ],
+        item_count=32,
+    )
+
+    assert policy.retrieval_params.final_context_items == 8
+    assert expanded.retrieval_params.final_context_items == 12
+
+
+def test_default_queries_do_not_expand_context_items_without_recovery_need() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    scoring_policy = policy.model_copy(
+        update={
+            "retrieval_params": policy.retrieval_params.model_copy(
+                update={"rerank_top_k": 32}
+            )
+        }
+    )
+    plan = _slot_fill_plan(exact_recall_mode=False)
+
+    expanded = RetrievalPipeline._expand_recall_or_recovery_context_items(
+        scoring_policy,
+        plan,
+        degraded_mode=False,
+        detected_needs=[],
+        item_count=32,
+    )
+
+    assert expanded.retrieval_params.final_context_items == 8
+
+
 @pytest.mark.asyncio
 async def test_pipeline_verbatim_evidence_search_enabled_contributes_to_exact_recall_trace() -> None:
     """End-to-end Wave 1 batch 2 (1-C + 1-D): raw evidence reaches the trace.
@@ -2356,6 +3040,58 @@ async def test_summary_support_regrounding_promotes_existing_filtered_support() 
             resolved_policy=resolved_policy,
             detected_needs=[],
             retrieval_plan=_slot_fill_plan(),
+        )
+
+        assert [candidate["id"] for candidate in updated_shortlist] == [
+            "sum_episode",
+            "mem_support",
+        ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_summary_support_regrounding_runs_for_under_specified_requests() -> None:
+    connection, _memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+        mode_id="general_qa"
+    )
+    try:
+        summary = _candidate_record(
+            memory_id="sum_episode",
+            canonical_text="Abstract shared-history summary.",
+            object_type=MemoryObjectType.SUMMARY_VIEW,
+            rrf_score=1.0,
+            payload_json={
+                "summary_kind": SummaryViewKind.CONVERSATION_CHUNK.value,
+                "hierarchy_level": 0,
+                "source_object_ids": ["mem_support"],
+            },
+        )
+        support = _candidate_record(
+            memory_id="mem_support",
+            canonical_text="Concrete source memory for the shared history.",
+            rrf_score=0.01,
+        )
+        default_plan = _slot_fill_plan().model_copy(
+            update={
+                "query_type": "default",
+                "exact_recall_mode": False,
+            }
+        )
+
+        updated_shortlist = await pipeline._reground_summary_support_shortlist(
+            shortlist=[summary],
+            filtered_candidates=[summary, support],
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            detected_needs=[
+                DetectedNeed(
+                    need_type=NeedTrigger.UNDER_SPECIFIED_REQUEST,
+                    confidence=0.8,
+                    reasoning="The query needs broad shared context.",
+                )
+            ],
+            retrieval_plan=default_plan,
         )
 
         assert [candidate["id"] for candidate in updated_shortlist] == [

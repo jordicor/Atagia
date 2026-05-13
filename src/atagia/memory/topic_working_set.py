@@ -35,38 +35,102 @@ class TopicUpdateActionType(StrEnum):
     NOOP = "noop"
 
 
+_TOPIC_STRING_SENTINEL = ""
+_TOPIC_FLOAT_SENTINEL = -1.0
+_TOPIC_INT_SENTINEL = -1
+_TOPIC_BOUNDARY_SENTINEL = ""
+_INTIMACY_BOUNDARY_VALUES = {boundary.value for boundary in IntimacyBoundary}
+
+
 class TopicUpdateAction(BaseModel):
     """One structured mutation proposed by the topic updater model."""
 
     model_config = ConfigDict(extra="ignore")
 
     action: TopicUpdateActionType
-    topic_id: str | None = None
-    parent_topic_id: str | None = None
-    title: str | None = None
-    summary: str | None = None
-    active_goal: str | None = None
+    topic_id: str = _TOPIC_STRING_SENTINEL
+    parent_topic_id: str = _TOPIC_STRING_SENTINEL
+    title: str = _TOPIC_STRING_SENTINEL
+    summary: str = _TOPIC_STRING_SENTINEL
+    active_goal: str = _TOPIC_STRING_SENTINEL
     open_questions: list[str] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
     artifact_ids: list[str] = Field(default_factory=list)
     source_message_ids: list[str] = Field(default_factory=list)
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
-    privacy_level: int | None = Field(default=None, ge=0, le=3)
-    intimacy_boundary: IntimacyBoundary | None = None
-    intimacy_boundary_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    confidence: float = _TOPIC_FLOAT_SENTINEL
+    privacy_level: int = _TOPIC_INT_SENTINEL
+    intimacy_boundary: str = _TOPIC_BOUNDARY_SENTINEL
+    intimacy_boundary_confidence: float = _TOPIC_FLOAT_SENTINEL
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_wire_sentinels(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        for field_name in (
+            "topic_id",
+            "parent_topic_id",
+            "title",
+            "summary",
+            "active_goal",
+            "intimacy_boundary",
+        ):
+            if normalized.get(field_name) is None:
+                normalized[field_name] = _TOPIC_STRING_SENTINEL
+        for field_name in ("confidence", "intimacy_boundary_confidence"):
+            if normalized.get(field_name) is None:
+                normalized[field_name] = _TOPIC_FLOAT_SENTINEL
+        if normalized.get("privacy_level") is None:
+            normalized["privacy_level"] = _TOPIC_INT_SENTINEL
+        return normalized
 
     @model_validator(mode="after")
     def validate_action_shape(self) -> "TopicUpdateAction":
-        if self.action is TopicUpdateActionType.CREATE and not self.title:
+        if self.action is TopicUpdateActionType.CREATE and not self.title.strip():
             raise ValueError("create actions require a title")
         if self.action in {
             TopicUpdateActionType.UPDATE,
             TopicUpdateActionType.PARK,
             TopicUpdateActionType.REOPEN,
             TopicUpdateActionType.CLOSE,
-        } and not self.topic_id:
+        } and not self.topic_id.strip():
             raise ValueError(f"{self.action.value} actions require topic_id")
+        if self.confidence != _TOPIC_FLOAT_SENTINEL and not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be -1.0 or between 0.0 and 1.0")
+        if self.privacy_level != _TOPIC_INT_SENTINEL and not 0 <= self.privacy_level <= 3:
+            raise ValueError("privacy_level must be -1 or between 0 and 3")
+        boundary = self.intimacy_boundary.strip()
+        if boundary and boundary not in _INTIMACY_BOUNDARY_VALUES:
+            raise ValueError("intimacy_boundary is not recognized")
+        if (
+            self.intimacy_boundary_confidence != _TOPIC_FLOAT_SENTINEL
+            and not 0.0 <= self.intimacy_boundary_confidence <= 1.0
+        ):
+            raise ValueError(
+                "intimacy_boundary_confidence must be -1.0 or between 0.0 and 1.0"
+            )
         return self
+
+
+def _wire_string_to_none(value: str) -> str | None:
+    stripped = value.strip()
+    return stripped or None
+
+
+def _wire_float_to_none(value: float) -> float | None:
+    return None if value == _TOPIC_FLOAT_SENTINEL else value
+
+
+def _wire_int_to_none(value: int) -> int | None:
+    return None if value == _TOPIC_INT_SENTINEL else value
+
+
+def _wire_boundary_to_none(value: str) -> IntimacyBoundary | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return IntimacyBoundary(stripped)
 
 
 class TopicWorkingSetPlan(BaseModel):
@@ -190,6 +254,7 @@ class TopicWorkingSetUpdater:
         snapshot: dict[str, Any],
         messages: list[dict[str, Any]],
     ) -> str:
+        boundary_values = ", ".join(boundary.value for boundary in IntimacyBoundary)
         message_payload = [
             {
                 "id": str(message["id"]),
@@ -213,6 +278,17 @@ class TopicWorkingSetUpdater:
                 "Do not create dataset-specific or benchmark-specific topics.",
                 "Prefer updating existing topics when the new messages continue the same thread.",
                 "Use source_message_ids only from the provided message IDs.",
+                (
+                    "Use wire sentinels when a field is not applicable or should "
+                    "not be changed: omit any field other than action, or use "
+                    '"" for absent string fields; -1.0 for absent confidence '
+                    "fields; -1 for absent privacy_level."
+                ),
+                (
+                    'intimacy_boundary="" means not provided/no boundary change; '
+                    'intimacy_boundary="ordinary" means explicitly ordinary.'
+                ),
+                f"Valid intimacy_boundary values are exactly: {boundary_values}.",
                 (
                     "For each created or updated topic, set intimacy_boundary "
                     "semantically. Use ordinary unless the topic itself is private "
@@ -429,36 +505,46 @@ class TopicWorkingSetUpdater:
         source_start_seq: int | None,
         source_end_seq: int | None,
     ) -> dict[str, Any] | None:
+        parent_topic_id_value = _wire_string_to_none(action.parent_topic_id)
+        topic_id_value = _wire_string_to_none(action.topic_id)
+        title_value = _wire_string_to_none(action.title)
+        summary_value = _wire_string_to_none(action.summary)
+        active_goal_value = _wire_string_to_none(action.active_goal)
+        confidence_value = _wire_float_to_none(action.confidence)
+        privacy_level_value = _wire_int_to_none(action.privacy_level)
+        boundary_value = _wire_boundary_to_none(action.intimacy_boundary)
+        boundary_confidence_value = _wire_float_to_none(action.intimacy_boundary_confidence)
+
         parent_topic_id = await self._valid_parent_topic_id(
             user_id=user_id,
             conversation_id=conversation_id,
-            parent_topic_id=action.parent_topic_id,
+            parent_topic_id=parent_topic_id_value,
         )
-        action_boundary = action.intimacy_boundary or IntimacyBoundary.ORDINARY
-        create_privacy_level = action.privacy_level if action.privacy_level is not None else 0
-        if action_boundary is not IntimacyBoundary.ORDINARY:
-            create_privacy_level = max(create_privacy_level, 2)
         if action.action is TopicUpdateActionType.CREATE:
+            if title_value is None:
+                raise ValueError("create actions require a title")
+            create_boundary = boundary_value or IntimacyBoundary.ORDINARY
+            create_privacy_level = privacy_level_value if privacy_level_value is not None else 0
+            if create_boundary is not IntimacyBoundary.ORDINARY:
+                create_privacy_level = max(create_privacy_level, 2)
             return await self._topic_repository.create_topic(
                 user_id=user_id,
                 conversation_id=conversation_id,
                 parent_topic_id=parent_topic_id,
-                title=str(action.title),
-                summary=action.summary or "",
-                active_goal=action.active_goal,
+                title=title_value,
+                summary=summary_value or "",
+                active_goal=active_goal_value,
                 open_questions=action.open_questions,
                 decisions=action.decisions,
                 artifact_ids=artifact_ids,
                 source_message_start_seq=source_start_seq,
                 source_message_end_seq=source_end_seq,
                 last_touched_seq=source_end_seq,
-                confidence=action.confidence if action.confidence is not None else 0.5,
+                confidence=confidence_value if confidence_value is not None else 0.5,
                 privacy_level=create_privacy_level,
-                intimacy_boundary=action_boundary,
+                intimacy_boundary=create_boundary,
                 intimacy_boundary_confidence=(
-                    action.intimacy_boundary_confidence
-                    if action.intimacy_boundary_confidence is not None
-                    else 0.0
+                    boundary_confidence_value if boundary_confidence_value is not None else 0.0
                 ),
                 last_touched_at=self._clock.now().isoformat(),
                 commit=False,
@@ -466,26 +552,26 @@ class TopicWorkingSetUpdater:
 
         status = _status_for_action(action.action)
         existing = (
-            await self._topic_repository.get_topic(str(action.topic_id), user_id)
-            if action.topic_id is not None
+            await self._topic_repository.get_topic(topic_id_value, user_id)
+            if topic_id_value is not None
             else None
         )
         if existing is None or str(existing["conversation_id"]) != conversation_id:
             return None
-        update_privacy_level = action.privacy_level
-        if action.intimacy_boundary is not None and action.intimacy_boundary is not IntimacyBoundary.ORDINARY:
+        update_privacy_level = privacy_level_value
+        if boundary_value is not None and boundary_value is not IntimacyBoundary.ORDINARY:
             update_privacy_level = max(
                 int(existing.get("privacy_level") or 0),
-                int(action.privacy_level or 0),
+                int(privacy_level_value or 0),
                 2,
             )
         return await self._topic_repository.update_topic(
-            topic_id=str(action.topic_id),
+            topic_id=str(topic_id_value),
             user_id=user_id,
             status=status,
-            title=action.title,
-            summary=action.summary,
-            active_goal=action.active_goal,
+            title=title_value,
+            summary=summary_value,
+            active_goal=active_goal_value,
             open_questions=action.open_questions if action.open_questions else None,
             decisions=action.decisions if action.decisions else None,
             artifact_ids=artifact_ids if artifact_ids else None,
@@ -496,10 +582,10 @@ class TopicWorkingSetUpdater:
             ),
             source_message_end_seq=source_end_seq,
             last_touched_seq=source_end_seq,
-            confidence=action.confidence,
+            confidence=confidence_value,
             privacy_level=update_privacy_level,
-            intimacy_boundary=action.intimacy_boundary,
-            intimacy_boundary_confidence=action.intimacy_boundary_confidence,
+            intimacy_boundary=boundary_value,
+            intimacy_boundary_confidence=boundary_confidence_value,
             last_touched_at=self._clock.now().isoformat(),
             event_type=_event_type_for_action(action.action),
             event_payload={

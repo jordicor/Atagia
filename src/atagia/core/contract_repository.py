@@ -18,7 +18,16 @@ from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
     MemoryStatus,
+    MindTopology,
+    SpaceBoundaryMode,
 )
+from atagia.memory.embodiment_policy import embodiment_visibility_sql_clause_for_context
+from atagia.memory.mind_policy import mind_visibility_sql_clause_for_context
+from atagia.memory.realm_policy import (
+    APPLICABLE_REALM_BRIDGE_MODES,
+    realm_visibility_sql_clause_for_context,
+)
+from atagia.memory.space_policy import space_visibility_sql_clause_for_context
 
 
 class ContractDimensionRepository(BaseRepository):
@@ -37,6 +46,14 @@ class ContractDimensionRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        sensitivity_gates_enabled: bool = False,
+        allow_private_sensitivity: bool = False,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> int:
         if platform_id is not None and conversation_id is not None:
             source_clauses, source_parameters = MemoryObjectRepository.namespace_visibility_clauses(
@@ -48,6 +65,8 @@ class ContractDimensionRepository(BaseRepository):
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
                 incognito=incognito,
+                sensitivity_gates_enabled=sensitivity_gates_enabled,
+                allow_private_sensitivity=allow_private_sensitivity,
                 table_alias="source",
             )
             row_clauses, row_parameters = MemoryObjectRepository.namespace_visibility_clauses(
@@ -59,10 +78,56 @@ class ContractDimensionRepository(BaseRepository):
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
                 incognito=incognito,
+                sensitivity_gates_enabled=sensitivity_gates_enabled,
+                allow_private_sensitivity=allow_private_sensitivity,
                 table_alias="cdc",
             )
             if not source_clauses or not row_clauses:
                 return 0
+            source_space_clause, source_space_parameters = space_visibility_sql_clause_for_context(
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                alias="source",
+            )
+            row_space_clause, row_space_parameters = space_visibility_sql_clause_for_context(
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                alias="cdc",
+            )
+            source_mind_clause, source_mind_parameters = mind_visibility_sql_clause_for_context(
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                alias="source",
+                allow_overseer_grants=False,
+            )
+            row_mind_clause, row_mind_parameters = mind_visibility_sql_clause_for_context(
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                alias="cdc",
+                allow_overseer_grants=False,
+            )
+            source_embodiment_clause, source_embodiment_parameters = (
+                embodiment_visibility_sql_clause_for_context(
+                    active_embodiment_id=active_embodiment_id,
+                    alias="source",
+                )
+            )
+            row_embodiment_clause, row_embodiment_parameters = (
+                embodiment_visibility_sql_clause_for_context(
+                    active_embodiment_id=active_embodiment_id,
+                    alias="cdc",
+                )
+            )
+            source_realm_clause, source_realm_parameters = realm_visibility_sql_clause_for_context(
+                active_realm_id=active_realm_id,
+                alias="source",
+                allowed_bridge_modes=APPLICABLE_REALM_BRIDGE_MODES,
+            )
+            row_realm_clause, row_realm_parameters = realm_visibility_sql_clause_for_context(
+                active_realm_id=active_realm_id,
+                alias="cdc",
+                allowed_bridge_modes=APPLICABLE_REALM_BRIDGE_MODES,
+            )
             cursor = await self._connection.execute(
                 """
                 SELECT COUNT(*) AS count
@@ -76,9 +141,25 @@ class ContractDimensionRepository(BaseRepository):
                   AND {visibility_clause}
                   AND {source_clauses}
                   AND {row_clauses}
+                  AND {source_space_clause}
+                  AND {row_space_clause}
+                  AND {source_mind_clause}
+                  AND {row_mind_clause}
+                  AND {source_embodiment_clause}
+                  AND {row_embodiment_clause}
+                  AND {source_realm_clause}
+                  AND {row_realm_clause}
                 """.format(
                     source_clauses=" AND ".join(source_clauses),
                     row_clauses=" AND ".join(row_clauses),
+                    source_space_clause=source_space_clause,
+                    row_space_clause=row_space_clause,
+                    source_mind_clause=source_mind_clause,
+                    row_mind_clause=row_mind_clause,
+                    source_embodiment_clause=source_embodiment_clause,
+                    row_embodiment_clause=row_embodiment_clause,
+                    source_realm_clause=source_realm_clause,
+                    row_realm_clause=row_realm_clause,
                     visibility_clause=conversation_visibility_clause("source"),
                 ),
                 (
@@ -87,6 +168,14 @@ class ContractDimensionRepository(BaseRepository):
                     conversation_id,
                     *source_parameters,
                     *row_parameters,
+                    *source_space_parameters,
+                    *row_space_parameters,
+                    *source_mind_parameters,
+                    *row_mind_parameters,
+                    *source_embodiment_parameters,
+                    *row_embodiment_parameters,
+                    *source_realm_parameters,
+                    *row_realm_parameters,
                 ),
             )
             row = await cursor.fetchone()
@@ -98,14 +187,44 @@ class ContractDimensionRepository(BaseRepository):
             workspace_id=workspace_id,
             conversation_id=conversation_id,
         )
+        space_clause, space_parameters = space_visibility_sql_clause_for_context(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            alias="contract_dimensions_current",
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="contract_dimensions_current",
+            allow_overseer_grants=False,
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="contract_dimensions_current",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="contract_dimensions_current",
+            allowed_bridge_modes=APPLICABLE_REALM_BRIDGE_MODES,
+        )
         cursor = await self._connection.execute(
             """
             SELECT COUNT(*) AS count
             FROM contract_dimensions_current
             WHERE user_id = ?
               AND ({clauses})
-            """.format(clauses=" OR ".join(clauses)),
-            tuple(parameters),
+              AND {space_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
+            """.format(
+                clauses=" OR ".join(clauses),
+                space_clause=space_clause,
+                mind_clause=mind_clause,
+                embodiment_clause=embodiment_clause,
+                realm_clause=realm_clause,
+            ),
+            (*parameters, *space_parameters, *mind_parameters, *embodiment_parameters, *realm_parameters),
         )
         row = await cursor.fetchone()
         return int(row["count"])
@@ -123,6 +242,14 @@ class ContractDimensionRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        sensitivity_gates_enabled: bool = False,
+        allow_private_sensitivity: bool = False,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if platform_id is not None and conversation_id is not None:
             source_clauses, source_parameters = MemoryObjectRepository.namespace_visibility_clauses(
@@ -134,6 +261,8 @@ class ContractDimensionRepository(BaseRepository):
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
                 incognito=incognito,
+                sensitivity_gates_enabled=sensitivity_gates_enabled,
+                allow_private_sensitivity=allow_private_sensitivity,
                 table_alias="source",
             )
             row_clauses, row_parameters = MemoryObjectRepository.namespace_visibility_clauses(
@@ -145,10 +274,56 @@ class ContractDimensionRepository(BaseRepository):
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
                 incognito=incognito,
+                sensitivity_gates_enabled=sensitivity_gates_enabled,
+                allow_private_sensitivity=allow_private_sensitivity,
                 table_alias="cdc",
             )
             if not source_clauses or not row_clauses:
                 return []
+            source_space_clause, source_space_parameters = space_visibility_sql_clause_for_context(
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                alias="source",
+            )
+            row_space_clause, row_space_parameters = space_visibility_sql_clause_for_context(
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                alias="cdc",
+            )
+            source_mind_clause, source_mind_parameters = mind_visibility_sql_clause_for_context(
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                alias="source",
+                allow_overseer_grants=False,
+            )
+            row_mind_clause, row_mind_parameters = mind_visibility_sql_clause_for_context(
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                alias="cdc",
+                allow_overseer_grants=False,
+            )
+            source_embodiment_clause, source_embodiment_parameters = (
+                embodiment_visibility_sql_clause_for_context(
+                    active_embodiment_id=active_embodiment_id,
+                    alias="source",
+                )
+            )
+            row_embodiment_clause, row_embodiment_parameters = (
+                embodiment_visibility_sql_clause_for_context(
+                    active_embodiment_id=active_embodiment_id,
+                    alias="cdc",
+                )
+            )
+            source_realm_clause, source_realm_parameters = realm_visibility_sql_clause_for_context(
+                active_realm_id=active_realm_id,
+                alias="source",
+                allowed_bridge_modes=APPLICABLE_REALM_BRIDGE_MODES,
+            )
+            row_realm_clause, row_realm_parameters = realm_visibility_sql_clause_for_context(
+                active_realm_id=active_realm_id,
+                alias="cdc",
+                allowed_bridge_modes=APPLICABLE_REALM_BRIDGE_MODES,
+            )
             return await self._fetch_all(
                 """
                 SELECT cdc.*
@@ -162,10 +337,26 @@ class ContractDimensionRepository(BaseRepository):
                   AND {visibility_clause}
                   AND {source_clauses}
                   AND {row_clauses}
+                  AND {source_space_clause}
+                  AND {row_space_clause}
+                  AND {source_mind_clause}
+                  AND {row_mind_clause}
+                  AND {source_embodiment_clause}
+                  AND {row_embodiment_clause}
+                  AND {source_realm_clause}
+                  AND {row_realm_clause}
                 ORDER BY cdc.updated_at DESC, cdc.id ASC
                 """.format(
                     source_clauses=" AND ".join(source_clauses),
                     row_clauses=" AND ".join(row_clauses),
+                    source_space_clause=source_space_clause,
+                    row_space_clause=row_space_clause,
+                    source_mind_clause=source_mind_clause,
+                    row_mind_clause=row_mind_clause,
+                    source_embodiment_clause=source_embodiment_clause,
+                    row_embodiment_clause=row_embodiment_clause,
+                    source_realm_clause=source_realm_clause,
+                    row_realm_clause=row_realm_clause,
                     visibility_clause=conversation_visibility_clause("source"),
                 ),
                 (
@@ -174,6 +365,14 @@ class ContractDimensionRepository(BaseRepository):
                     conversation_id,
                     *source_parameters,
                     *row_parameters,
+                    *source_space_parameters,
+                    *row_space_parameters,
+                    *source_mind_parameters,
+                    *row_mind_parameters,
+                    *source_embodiment_parameters,
+                    *row_embodiment_parameters,
+                    *source_realm_parameters,
+                    *row_realm_parameters,
                 ),
             )
 
@@ -183,15 +382,45 @@ class ContractDimensionRepository(BaseRepository):
             workspace_id=workspace_id,
             conversation_id=conversation_id,
         )
+        space_clause, space_parameters = space_visibility_sql_clause_for_context(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            alias="contract_dimensions_current",
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="contract_dimensions_current",
+            allow_overseer_grants=False,
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="contract_dimensions_current",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="contract_dimensions_current",
+            allowed_bridge_modes=APPLICABLE_REALM_BRIDGE_MODES,
+        )
         return await self._fetch_all(
             """
             SELECT *
             FROM contract_dimensions_current
             WHERE user_id = ?
               AND ({clauses})
+              AND {space_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
             ORDER BY updated_at DESC, id ASC
-            """.format(clauses=" OR ".join(clauses)),
-            tuple(parameters),
+            """.format(
+                clauses=" OR ".join(clauses),
+                space_clause=space_clause,
+                mind_clause=mind_clause,
+                embodiment_clause=embodiment_clause,
+                realm_clause=realm_clause,
+            ),
+            (*parameters, *space_parameters, *mind_parameters, *embodiment_parameters, *realm_parameters),
         )
 
     async def get_mode_contract_dimensions_priority(self, assistant_mode_id: str) -> list[str]:
@@ -234,6 +463,12 @@ class ContractDimensionRepository(BaseRepository):
                 platform_locked,
                 platform_id_lock,
                 scope_canonical,
+                space_id,
+                space_boundary_mode,
+                memory_owner_id,
+                source_mind_id,
+                embodiment_id,
+                realm_id,
                 payload_json
             FROM memory_objects
             WHERE id = ?
@@ -287,15 +522,25 @@ class ContractDimensionRepository(BaseRepository):
                 temporary_snapshot,
                 purge_on_close_snapshot,
                 policy_snapshot_json,
+                space_id,
+                space_boundary_mode,
+                memory_owner_id,
+                source_mind_id,
+                embodiment_id,
+                realm_id,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(
                 user_id,
                 user_persona_key,
                 character_key,
                 conversation_key,
                 scope_canonical_key,
+                space_key,
+                memory_owner_key,
+                embodiment_key,
+                realm_key,
                 dimension_name
             )
             DO UPDATE SET
@@ -316,6 +561,12 @@ class ContractDimensionRepository(BaseRepository):
                 platform_locked = MAX(contract_dimensions_current.platform_locked, excluded.platform_locked),
                 platform_id_lock = COALESCE(contract_dimensions_current.platform_id_lock, excluded.platform_id_lock),
                 scope_canonical = excluded.scope_canonical,
+                space_id = excluded.space_id,
+                space_boundary_mode = excluded.space_boundary_mode,
+                memory_owner_id = excluded.memory_owner_id,
+                source_mind_id = excluded.source_mind_id,
+                embodiment_id = excluded.embodiment_id,
+                realm_id = excluded.realm_id,
                 incognito_snapshot = MAX(
                     contract_dimensions_current.incognito_snapshot,
                     excluded.incognito_snapshot
@@ -366,6 +617,12 @@ class ContractDimensionRepository(BaseRepository):
                 int(bool(source_policy.get("temporary"))),
                 int(bool(source_policy.get("purge_on_close"))),
                 _encode_json(source_policy),
+                source_memory.get("space_id"),
+                source_memory.get("space_boundary_mode"),
+                source_memory.get("memory_owner_id"),
+                source_memory.get("source_mind_id"),
+                source_memory.get("embodiment_id"),
+                source_memory.get("realm_id"),
                 timestamp,
             ),
         )
@@ -385,6 +642,10 @@ class ContractDimensionRepository(BaseRepository):
             character_id=source_memory.get("character_id"),
             conversation_id=conversation_id,
             scope_canonical=resolved_scope_canonical,
+            space_id=source_memory.get("space_id"),
+            memory_owner_id=source_memory.get("memory_owner_id"),
+            embodiment_id=source_memory.get("embodiment_id"),
+            realm_id=source_memory.get("realm_id"),
             dimension_name=dimension_name,
         )
         if existing is None:
@@ -406,6 +667,12 @@ class ContractDimensionRepository(BaseRepository):
                 user_persona_id,
                 character_id,
                 scope_canonical,
+                space_id,
+                space_boundary_mode,
+                memory_owner_id,
+                source_mind_id,
+                embodiment_id,
+                realm_id,
                 dimension_name
             FROM contract_dimensions_current
             WHERE source_memory_id IN ({placeholders})
@@ -425,6 +692,10 @@ class ContractDimensionRepository(BaseRepository):
         dimension_name: str,
         user_persona_id: str | None = None,
         character_id: str | None = None,
+        space_id: str | None = None,
+        memory_owner_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
         scope_canonical: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any] | None:
@@ -436,6 +707,10 @@ class ContractDimensionRepository(BaseRepository):
               AND COALESCE(conversation_id, '') = COALESCE(?, '')
               AND user_persona_id IS ?
               AND character_id IS ?
+              AND space_id IS ?
+              AND memory_owner_id IS ?
+              AND embodiment_id IS ?
+              AND realm_id IS ?
               AND scope_canonical = ?
               AND dimension_name = ?
             """,
@@ -444,6 +719,10 @@ class ContractDimensionRepository(BaseRepository):
                 conversation_id,
                 user_persona_id,
                 character_id,
+                space_id,
+                memory_owner_id,
+                embodiment_id,
+                realm_id,
                 resolved_scope_canonical,
                 dimension_name,
             ),
@@ -458,6 +737,10 @@ class ContractDimensionRepository(BaseRepository):
               AND COALESCE(conversation_id, '') = COALESCE(?, '')
               AND user_persona_id IS ?
               AND character_id IS ?
+              AND space_id IS ?
+              AND memory_owner_id IS ?
+              AND embodiment_id IS ?
+              AND realm_id IS ?
               AND COALESCE(scope_canonical, scope) = ?
               AND json_extract(payload_json, '$.dimension_name') = ?
             ORDER BY confidence DESC, updated_at DESC, id ASC
@@ -470,6 +753,10 @@ class ContractDimensionRepository(BaseRepository):
                 conversation_id,
                 user_persona_id,
                 character_id,
+                space_id,
+                memory_owner_id,
+                embodiment_id,
+                realm_id,
                 resolved_scope_canonical,
                 dimension_name,
             ),
@@ -508,6 +795,10 @@ class ContractDimensionRepository(BaseRepository):
         character_id: str | None,
         conversation_id: str | None,
         scope_canonical: str,
+        space_id: str | None,
+        memory_owner_id: str | None,
+        embodiment_id: str | None,
+        realm_id: str | None,
         dimension_name: str,
     ) -> dict[str, Any] | None:
         cursor = await self._connection.execute(
@@ -518,6 +809,10 @@ class ContractDimensionRepository(BaseRepository):
               AND COALESCE(conversation_id, '') = COALESCE(?, '')
               AND user_persona_id IS ?
               AND character_id IS ?
+              AND space_id IS ?
+              AND memory_owner_id IS ?
+              AND embodiment_id IS ?
+              AND realm_id IS ?
               AND scope_canonical = ?
               AND dimension_name = ?
             """,
@@ -526,6 +821,10 @@ class ContractDimensionRepository(BaseRepository):
                 conversation_id,
                 user_persona_id,
                 character_id,
+                space_id,
+                memory_owner_id,
+                embodiment_id,
+                realm_id,
                 scope_canonical,
                 dimension_name,
             ),

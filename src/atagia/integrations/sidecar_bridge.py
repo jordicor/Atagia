@@ -40,6 +40,10 @@ class AtagiaClientProtocol(Protocol):
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
     ) -> str:
@@ -61,6 +65,10 @@ class AtagiaClientProtocol(Protocol):
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -82,6 +90,10 @@ class AtagiaClientProtocol(Protocol):
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
@@ -107,6 +119,10 @@ class AtagiaClientProtocol(Protocol):
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -177,6 +193,10 @@ class SidecarBridgeConfig:
     user_persona_id: str | None = None
     platform_id: str | None = None
     character_id: str | None = None
+    active_presence_id: str | None = None
+    embodiment_id: str | None = None
+    realm_id: str | None = None
+    space_id: str | None = None
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     operational_profile: str | None = None
     operational_signals: dict[str, Any] = field(default_factory=dict)
@@ -203,6 +223,10 @@ class SidecarBridgeConfig:
             user_persona_id=_clean_optional(env.get("ATAGIA_USER_PERSONA_ID")),
             platform_id=_clean_optional(env.get("ATAGIA_PLATFORM_ID")),
             character_id=_clean_optional(env.get("ATAGIA_CHARACTER_ID")),
+            active_presence_id=_clean_optional(env.get("ATAGIA_ACTIVE_PRESENCE_ID")),
+            embodiment_id=_clean_optional(env.get("ATAGIA_EMBODIMENT_ID")),
+            realm_id=_clean_optional(env.get("ATAGIA_REALM_ID")),
+            space_id=_clean_optional(env.get("ATAGIA_SPACE_ID")),
             timeout_seconds=_parse_timeout(env.get("ATAGIA_TIMEOUT_SECONDS")),
             operational_profile=_clean_optional(
                 env.get("ATAGIA_OPERATIONAL_PROFILE")
@@ -258,6 +282,10 @@ class SidecarBridge:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
     ) -> str | None:
@@ -278,6 +306,10 @@ class SidecarBridge:
                 user_persona_id=user_persona_id or config.user_persona_id,
                 platform_id=resolved_platform_id,
                 character_id=character_id or config.character_id,
+                active_presence_id=active_presence_id or config.active_presence_id,
+                **_embodiment_kwargs(embodiment_id, config),
+                **_realm_kwargs(realm_id, config),
+                **_space_kwargs(space_id, config),
                 mode=mode or config.mode,
                 incognito=_resolve_incognito(incognito, config),
             )
@@ -303,6 +335,10 @@ class SidecarBridge:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
@@ -338,6 +374,10 @@ class SidecarBridge:
                 user_persona_id=user_persona_id or config.user_persona_id,
                 platform_id=resolved_platform_id,
                 character_id=character_id or config.character_id,
+                active_presence_id=active_presence_id or config.active_presence_id,
+                **_embodiment_kwargs(embodiment_id, config),
+                **_realm_kwargs(realm_id, config),
+                **_space_kwargs(space_id, config),
                 incognito=_resolve_incognito(incognito, config),
                 ingest_origin=_to_optional_ingest_origin(ingest_origin),
                 confirmation_strategy=_to_optional_confirmation_strategy(
@@ -369,6 +409,10 @@ class SidecarBridge:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
@@ -405,6 +449,10 @@ class SidecarBridge:
                 user_persona_id=user_persona_id or config.user_persona_id,
                 platform_id=resolved_platform_id,
                 character_id=character_id or config.character_id,
+                active_presence_id=active_presence_id or config.active_presence_id,
+                **_embodiment_kwargs(embodiment_id, config),
+                **_realm_kwargs(realm_id, config),
+                **_space_kwargs(space_id, config),
                 incognito=_resolve_incognito(incognito, config),
                 ingest_origin=_to_optional_ingest_origin(ingest_origin),
                 confirmation_strategy=_to_optional_confirmation_strategy(
@@ -434,6 +482,10 @@ class SidecarBridge:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
@@ -467,6 +519,10 @@ class SidecarBridge:
                 user_persona_id=user_persona_id or config.user_persona_id,
                 platform_id=resolved_platform_id,
                 character_id=character_id or config.character_id,
+                active_presence_id=active_presence_id or config.active_presence_id,
+                **_embodiment_kwargs(embodiment_id, config),
+                **_realm_kwargs(realm_id, config),
+                **_space_kwargs(space_id, config),
                 mode=mode or config.mode,
                 incognito=_resolve_incognito(incognito, config),
                 ingest_origin=_to_optional_ingest_origin(ingest_origin),
@@ -504,6 +560,10 @@ class SidecarBridge:
                 user_persona_id=config.user_persona_id,
                 platform_id=_resolve_platform_id(None, config),
                 character_id=config.character_id,
+                active_presence_id=config.active_presence_id,
+                **_embodiment_kwargs(None, config),
+                **_realm_kwargs(None, config),
+                **_space_kwargs(None, config),
                 mode=config.mode,
                 incognito=config.incognito,
             )
@@ -843,6 +903,36 @@ def _resolve_incognito(
     config: SidecarBridgeConfig,
 ) -> bool:
     return config.incognito if explicit is None else bool(explicit)
+
+
+def _space_kwargs(
+    explicit: str | None,
+    config: SidecarBridgeConfig,
+) -> dict[str, str]:
+    space_id = _clean_optional(explicit) or config.space_id
+    if space_id is None:
+        return {}
+    return {"space_id": space_id}
+
+
+def _embodiment_kwargs(
+    explicit: str | None,
+    config: SidecarBridgeConfig,
+) -> dict[str, str]:
+    embodiment_id = _clean_optional(explicit) or config.embodiment_id
+    if embodiment_id is None:
+        return {}
+    return {"embodiment_id": embodiment_id}
+
+
+def _realm_kwargs(
+    explicit: str | None,
+    config: SidecarBridgeConfig,
+) -> dict[str, str]:
+    realm_id = _clean_optional(explicit) or config.realm_id
+    if realm_id is None:
+        return {}
+    return {"realm_id": realm_id}
 
 
 def _parse_transport(value: str | None) -> TransportName:

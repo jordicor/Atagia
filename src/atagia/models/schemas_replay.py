@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
@@ -48,6 +47,7 @@ class AblationConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
     skip_need_detection: bool = False
     skip_applicability_scoring: bool = False
     skip_contract_memory: bool = False
@@ -56,6 +56,7 @@ class AblationConfig(BaseModel):
     skip_belief_revision: bool = False
     skip_compaction: bool = False
     disable_context_cache: bool = False
+    enable_llm_coverage_expansion: bool = False
     composer_strategy: Literal["score_first", "budgeted_marginal"] | None = None
     override_retrieval_params: dict[str, Any] | None = None
 

@@ -62,6 +62,22 @@ def _is_transient_status_error(exc: APIStatusError) -> bool:
     return status_code == 429 or (isinstance(status_code, int) and status_code >= 500)
 
 
+_TRANSIENT_API_ERROR_MESSAGE_FRAGMENTS = frozenset(
+    {
+        "json error injected into sse stream",
+        "upstream provider",
+    }
+)
+
+
+def _is_transient_api_error(exc: APIError) -> bool:
+    message = str(exc).lower()
+    return any(
+        fragment in message
+        for fragment in _TRANSIENT_API_ERROR_MESSAGE_FRAGMENTS
+    )
+
+
 def _stringify_content(content: Any) -> str:
     if content is None:
         return ""
@@ -75,9 +91,20 @@ def _stringify_content(content: Any) -> str:
     return str(content)
 
 
-def _uses_max_completion_tokens(model: str) -> bool:
+def _openai_reasoning_model_id(model: str) -> str:
     model_lower = model.lower()
-    return model_lower.startswith(("gpt-5", "o1", "o3", "o4"))
+    if model_lower.startswith("openai/"):
+        return model_lower.split("/", 1)[1]
+    return model_lower
+
+
+def _is_openai_reasoning_model(model: str) -> bool:
+    model_id = _openai_reasoning_model_id(model)
+    return model_id == "chat-latest" or model_id.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def _uses_max_completion_tokens(model: str, *, provider_name: str) -> bool:
+    return provider_name == "openai" and _is_openai_reasoning_model(model)
 
 
 _TRUNCATION_FINISH_REASONS = frozenset({"length"})
@@ -310,7 +337,7 @@ class OpenAICompatibleProvider(LLMProvider):
         if request.tools:
             kwargs["tools"] = _openai_tools(request)
             kwargs["tool_choice"] = request.metadata.get("openai_tool_choice") or "auto"
-        response_format = _response_format(request.response_schema)
+        response_format = self._completion_response_format(request)
         if response_format is not None:
             kwargs["response_format"] = response_format
         if request.metadata.get("user_id"):
@@ -322,15 +349,25 @@ class OpenAICompatibleProvider(LLMProvider):
             kwargs["extra_body"] = provider_extra_body
         if request.metadata.get("verbosity"):
             kwargs["verbosity"] = request.metadata["verbosity"]
-        if request.temperature is not None and not _uses_max_completion_tokens(request.model):
+        if request.temperature is not None and not _is_openai_reasoning_model(request.model):
             kwargs["temperature"] = request.temperature
         max_tokens = request.max_output_tokens
         if max_tokens is not None:
-            token_field = "max_completion_tokens" if _uses_max_completion_tokens(request.model) else "max_tokens"
+            token_field = (
+                "max_completion_tokens"
+                if _uses_max_completion_tokens(request.model, provider_name=self.name)
+                else "max_tokens"
+            )
             kwargs[token_field] = max_tokens
         if stream:
             kwargs["stream_options"] = {"include_usage": True}
         return kwargs
+
+    def _completion_response_format(
+        self,
+        request: LLMCompletionRequest,
+    ) -> dict[str, Any] | None:
+        return _response_format(request.response_schema)
 
     def _map_completion_response(
         self,
@@ -388,6 +425,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise TransientLLMError(str(exc)) from exc
             raise LLMError(str(exc)) from exc
         except APIError as exc:
+            if _is_transient_api_error(exc):
+                raise TransientLLMError(str(exc)) from exc
             raise LLMError(str(exc)) from exc
         return self._map_completion_response(request, response)
 
@@ -413,6 +452,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise TransientLLMError(str(exc)) from exc
             raise LLMError(str(exc)) from exc
         except APIError as exc:
+            if _is_transient_api_error(exc):
+                raise TransientLLMError(str(exc)) from exc
             raise LLMError(str(exc)) from exc
 
         vectors = [
@@ -440,6 +481,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise TransientLLMError(str(exc)) from exc
             raise LLMError(str(exc)) from exc
         except APIError as exc:
+            if _is_transient_api_error(exc):
+                raise TransientLLMError(str(exc)) from exc
             raise LLMError(str(exc)) from exc
 
         usage: dict[str, Any] = {}
@@ -514,6 +557,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise TransientLLMError(str(exc)) from exc
             raise LLMError(str(exc)) from exc
         except APIError as exc:
+            if _is_transient_api_error(exc):
+                raise TransientLLMError(str(exc)) from exc
             raise LLMError(str(exc)) from exc
         finally:
             await _close_provider_stream(stream)

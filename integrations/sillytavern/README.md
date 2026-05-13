@@ -1,18 +1,41 @@
 # SillyTavern Integration
 
-Status: native extension scaffold available; proxy path requires explicit host IDs.
+Status: implemented, mock-verified, live smoke pending.
 
-SillyTavern is a high-value first native adapter because users already manage
-long-running personas, lorebooks, summaries, and vector/RAG extensions. Atagia
-fits as an external memory sidecar that can reduce manual memory stacking.
+SillyTavern is a high-value native adapter because users already manage
+long-running characters, personas, lorebooks, summaries, and RAG extensions.
+Atagia fits as an external memory sidecar that retrieves continuity context and
+stores long-horizon conversation memory.
 
-## Best First Path
+## Recommended Path
 
 1. Run Atagia as an HTTP service.
-2. Use the native extension so SillyTavern sends stable user, platform,
-   character, and chat IDs to Atagia.
-3. Use the OpenAI-compatible proxy only with a host setup that can send Atagia
-   headers or request metadata.
+2. Install the native extension in `extension/`.
+3. Configure stable user, platform, persona, character, and chat IDs.
+4. Use the OpenAI-compatible proxy only when a SillyTavern/OpenAI-compatible
+   setup can send Atagia headers or request `metadata`.
+
+## Native Extension
+
+The extension:
+
+- persists an Atagia conversation ID in `chatMetadata.atagia_conversation_id`,
+- maps SillyTavern chat/persona/character identity into Atagia identity,
+- calls `/v1/conversations/{id}/context` before generation,
+- injects memory through `setExtensionPrompt` rather than mutating persisted chat
+  history,
+- records assistant responses from `MESSAGE_RECEIVED`,
+- derives deterministic IDs/source sequences that are rerunnable and tolerate
+  edits/regenerations,
+- exposes last request, resolved message ID, injected preview, status, and
+  fail-open errors in the settings panel.
+
+Because it runs in the browser, Atagia needs CORS enabled for the SillyTavern
+origin:
+
+```bash
+ATAGIA_CORS_ALLOWED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000
+```
 
 ## Proxy Setup
 
@@ -26,7 +49,7 @@ ATAGIA_PROXY_DEFAULT_MODE=companion \
 atagia-api --host 127.0.0.1 --port 8100
 ```
 
-In SillyTavern, configure an OpenAI-compatible source:
+OpenAI-compatible settings:
 
 ```text
 API base URL: http://127.0.0.1:8100/v1
@@ -35,44 +58,25 @@ Model: atagia-memory-proxy
 Streaming: enabled
 ```
 
-The proxy requires explicit Atagia identity. A SillyTavern profile must send
-`X-Atagia-User-Id`, `X-Atagia-Platform-Id`, and
-`X-Atagia-Conversation-Id`, or equivalent `metadata.atagia_*` fields. Use the
-native extension path for per-chat memory separation when the profile cannot
-set those values.
+The proxy still requires explicit Atagia identity:
 
-## Supported Proxy ID Mapping
+- `X-Atagia-User-Id`
+- `X-Atagia-Platform-Id`
+- `X-Atagia-Conversation-Id`
 
-Atagia resolves IDs in this order:
+or equivalent `metadata.atagia_*` fields.
 
-- User: `X-Atagia-User-Id`, `metadata.atagia_user_id`, request `user`.
-- Platform: `X-Atagia-Platform-Id`, `metadata.atagia_platform_id`.
-- Conversation: `X-Atagia-Conversation-Id`,
-  `metadata.atagia_conversation_id`, `metadata.conversation_id`,
-  `metadata.chat_id`.
-- Mode: `X-Atagia-Mode`, `metadata.atagia_mode`,
-  `ATAGIA_PROXY_DEFAULT_MODE`.
+## Importers
 
-## Native Extension Shape
+Use `integrations/importers/atagia_importers.py` for SillyTavern `.jsonl` chat
+exports and plain text lorebook imports. These backfills are admin-review-only
+and rerunnable.
 
-The scaffold in `extension/`:
+## Smoke Checklist
 
-- map SillyTavern user/character/chat IDs to stable Atagia IDs,
-- calls Atagia before generation through a prompt interceptor,
-- inject Atagia context as an internal system block,
-- records assistant responses through the `MESSAGE_RECEIVED` event,
-- expose enable/disable, base URL, API key, platform, mode, and debug options,
-- show an injection/context preview for troubleshooting.
-
-Because it runs in the browser, Atagia needs CORS enabled for the SillyTavern
-origin:
-
-```bash
-ATAGIA_CORS_ALLOWED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000
-```
-
-## Missing Atagia Pieces
-
-- Live SillyTavern smoke validation against a current install.
-- End-user memory review/edit affordances.
-- Importer for existing SillyTavern chats/lorebooks/summaries.
+- Extension loads and settings persist.
+- First generation calls Atagia and uses `setExtensionPrompt`.
+- Chat history length does not change from Atagia context injection.
+- Assistant responses persist once per generated message/swipe.
+- Atagia down/API error leaves generation working with visible fail-open status.
+- JSONL/lorebook importer can replay the same file without duplicate messages.

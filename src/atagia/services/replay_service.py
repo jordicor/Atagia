@@ -115,6 +115,12 @@ class ReplayService:
             user_persona_id=replay_user_persona_id,
             platform_id=replay_platform_id,
             character_id=replay_character_id,
+            active_mind_id=conversation.get("active_mind_id"),
+            mind_topology=conversation.get("mind_topology") or "unimind",
+            active_embodiment_id=conversation.get("active_embodiment_id"),
+            cross_embodiment_mode=conversation.get("cross_embodiment_mode") or "direct_if_same_body",
+            active_realm_id=conversation.get("active_realm_id"),
+            cross_realm_mode=conversation.get("cross_realm_mode") or "none",
             mode=replay_mode,
             temporary=bool(conversation.get("temporary")),
             temporary_ttl_seconds=conversation.get("temporary_ttl_seconds"),
@@ -139,6 +145,10 @@ class ReplayService:
             incognito=conversation_context.incognito,
             remember_across_chats=conversation_context.remember_across_chats,
             remember_across_devices=conversation_context.remember_across_devices,
+            active_mind_id=conversation_context.active_mind_id,
+            mind_topology=conversation_context.mind_topology,
+            active_embodiment_id=conversation_context.active_embodiment_id,
+            active_realm_id=conversation_context.active_realm_id,
             resolved_policy=resolved_policy,
         )
         replay_pipeline_result = await self._retrieval_pipeline.execute(
@@ -207,6 +217,12 @@ class ReplayService:
         user_persona_id: str | None = None,
         platform_id: str = "default",
         character_id: str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        cross_embodiment_mode: str | None = None,
+        active_realm_id: str | None = None,
+        cross_realm_mode: str | None = None,
         mode: str | None = None,
         temporary: bool = False,
         temporary_ttl_seconds: int | None = None,
@@ -232,6 +248,26 @@ class ReplayService:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_mind_id=(
+                request_message.get("active_mind_id")
+                or active_mind_id
+            ),
+            source_mind_id=(
+                request_message.get("source_mind_id")
+                or request_message.get("active_mind_id")
+                or active_mind_id
+            ),
+            mind_topology=mind_topology or "unimind",
+            active_embodiment_id=(
+                request_message.get("active_embodiment_id")
+                or active_embodiment_id
+            ),
+            cross_embodiment_mode=cross_embodiment_mode or "direct_if_same_body",
+            active_realm_id=(
+                request_message.get("active_realm_id")
+                or active_realm_id
+            ),
+            cross_realm_mode=cross_realm_mode or "none",
             mode=mode,
             recent_messages=[
                 ExtractionContextMessage(
@@ -267,6 +303,10 @@ class ReplayService:
         incognito: bool,
         remember_across_chats: bool,
         remember_across_devices: bool,
+        active_mind_id: str | None,
+        mind_topology: str | None,
+        active_embodiment_id: str | None,
+        active_realm_id: str | None,
         resolved_policy: Any,
     ) -> bool:
         return (
@@ -282,6 +322,10 @@ class ReplayService:
                 incognito=incognito,
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
             )
             == 0
         )

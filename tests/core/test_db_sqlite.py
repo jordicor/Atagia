@@ -39,6 +39,7 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "artifact_chunks",
             "artifact_chunks_fts",
             "artifact_links",
+            "artifact_payload_blobs",
             "artifacts",
             "belief_versions",
             "conversation_activity_stats",
@@ -47,6 +48,7 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "conversation_topics",
             "contract_dimensions_current",
             "conversations",
+            "embodiments",
             "evaluation_metrics",
             "graph_entities",
             "graph_entity_aliases",
@@ -61,13 +63,20 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "memory_edit_history",
             "memory_objects",
             "memory_objects_fts",
+            "memory_object_subjects",
             "messages",
             "messages_fts",
+            "minds",
+            "overseer_grants",
             "deletion_tombstones",
             "pending_file_deletions",
             "pending_memory_confirmations",
+            "presences",
+            "realm_bridges",
+            "realms",
             "retrieval_events",
             "schema_migrations",
+            "spaces",
             "summary_views",
             "verbatim_pins",
             "verbatim_pins_fts",
@@ -105,6 +114,13 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "requires_explicit_request",
             "context_placeholder",
             "policy_reason",
+            "active_presence_id",
+            "source_presence_id",
+            "space_id",
+            "active_mind_id",
+            "source_mind_id",
+            "active_embodiment_id",
+            "active_realm_id",
         }.issubset(message_columns)
         memory_columns_cursor = await connection.execute("PRAGMA table_info(memory_objects);")
         memory_columns = {row["name"] for row in await memory_columns_cursor.fetchall()}
@@ -116,6 +132,15 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
         assert "tension_score" in memory_columns
         assert "tension_updated_at" in memory_columns
         assert "archived_by_conversation_id" in memory_columns
+        assert "active_presence_id" in memory_columns
+        assert "source_presence_id" in memory_columns
+        assert "presence_cluster_id" in memory_columns
+        assert "space_id" in memory_columns
+        assert "space_boundary_mode" in memory_columns
+        assert "memory_owner_id" in memory_columns
+        assert "source_mind_id" in memory_columns
+        assert "embodiment_id" in memory_columns
+        assert "realm_id" in memory_columns
         conversation_columns_cursor = await connection.execute("PRAGMA table_info(conversations);")
         conversation_columns = {row["name"] for row in await conversation_columns_cursor.fetchall()}
         assert {
@@ -125,7 +150,49 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "isolated_mode",
             "last_activity_at",
             "closed_at",
+            "active_presence_id",
+            "active_space_id",
+            "active_mind_id",
+            "mind_topology",
+            "active_embodiment_id",
+            "active_realm_id",
         }.issubset(conversation_columns)
+        await connection.execute(
+            """
+            INSERT INTO users(id, external_ref, created_at, updated_at, deleted_at)
+            VALUES ('usr_schema', NULL, '2026-05-12T00:00:00+00:00', '2026-05-12T00:00:00+00:00', NULL)
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+            VALUES ('schema_mode', 'Schema Mode', 'hash_schema', '{}', '2026-05-12T00:00:00+00:00', '2026-05-12T00:00:00+00:00')
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO conversations(
+                id,
+                user_id,
+                assistant_mode_id,
+                status,
+                metadata_json,
+                created_at,
+                updated_at,
+                mind_topology
+                )
+            VALUES (
+                'cnv_ojocentauri',
+                'usr_schema',
+                'schema_mode',
+                'active',
+                '{}',
+                '2026-05-12T00:00:00+00:00',
+                '2026-05-12T00:00:00+00:00',
+                'ojocentauri'
+            )
+            """
+        )
         worker_job_columns_cursor = await connection.execute("PRAGMA table_info(worker_job_runs);")
         worker_job_columns = {row["name"] for row in await worker_job_columns_cursor.fetchall()}
         assert {
@@ -197,6 +264,12 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "created_at",
             "updated_at",
             "payload_json",
+            "space_id",
+            "space_boundary_mode",
+            "memory_owner_id",
+            "source_mind_id",
+            "embodiment_id",
+            "realm_id",
         }.issubset(pin_columns)
         pin_fts_columns_cursor = await connection.execute("PRAGMA table_info(verbatim_pins_fts);")
         pin_fts_columns = {row["name"] for row in await pin_fts_columns_cursor.fetchall()}
@@ -227,10 +300,31 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "metadata_json",
             "summary_text",
             "index_text",
+            "payload_blob_id",
             "created_at",
             "updated_at",
             "deleted_at",
+            "memory_owner_id",
+            "source_mind_id",
+            "embodiment_id",
+            "realm_id",
         }.issubset(artifact_columns)
+        artifact_payload_columns_cursor = await connection.execute("PRAGMA table_info(artifact_payload_blobs);")
+        artifact_payload_columns = {row["name"] for row in await artifact_payload_columns_cursor.fetchall()}
+        assert {
+            "id",
+            "user_id",
+            "storage_kind",
+            "identity_kind",
+            "content_sha256",
+            "byte_size",
+            "blob_bytes",
+            "storage_key",
+            "external_uri",
+            "status",
+            "created_at",
+            "updated_at",
+        }.issubset(artifact_payload_columns)
         artifact_chunks_columns_cursor = await connection.execute("PRAGMA table_info(artifact_chunks);")
         artifact_chunks_columns = {row["name"] for row in await artifact_chunks_columns_cursor.fetchall()}
         assert {
@@ -844,6 +938,15 @@ async def test_migration_0012_backfills_summary_view_user_ids_and_drops_orphans(
             34,
             35,
             36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
         ]
         assert [row["id"] for row in rows] == ["sum_conv", "sum_rollup"]
         assert all(row["user_id"] == "usr_1" for row in rows)
@@ -1305,6 +1408,8 @@ async def test_migration_0031_adds_redesign_identity_columns() -> None:
             "character_id",
             "mode",
             "incognito",
+            "active_mind_id",
+            "mind_topology",
         }.issubset(conversations_columns)
 
         memory_columns = await column_names("memory_objects")
@@ -1318,6 +1423,8 @@ async def test_migration_0031_adds_redesign_identity_columns() -> None:
             "platform_locked",
             "platform_id_lock",
             "scope_canonical",
+            "memory_owner_id",
+            "source_mind_id",
         }.issubset(memory_columns)
 
         message_columns = await column_names("messages")
@@ -1337,6 +1444,9 @@ async def test_migration_0031_adds_redesign_identity_columns() -> None:
             "themes_json",
             "platform_locked",
             "platform_id_lock",
+            "active_mind_id",
+            "source_mind_id",
+            "active_embodiment_id",
         }.issubset(message_columns)
 
         consent_columns = await column_names("memory_consent_profile")
@@ -1351,6 +1461,14 @@ async def test_migration_0031_adds_redesign_identity_columns() -> None:
             "character_key",
             "conversation_key",
             "scope_canonical_key",
+            "space_id",
+            "space_boundary_mode",
+            "space_key",
+            "memory_owner_id",
+            "source_mind_id",
+            "memory_owner_key",
+            "embodiment_id",
+            "embodiment_key",
             "policy_snapshot_json",
         }.issubset(contract_columns)
 
@@ -1364,6 +1482,9 @@ async def test_migration_0031_adds_redesign_identity_columns() -> None:
             "platform_id_lock",
             "scope_canonical",
             "policy_snapshot_json",
+            "memory_owner_id",
+            "source_mind_id",
+            "embodiment_id",
         }.issubset(artifact_columns)
 
         pending_columns = await column_names("pending_memory_confirmations")

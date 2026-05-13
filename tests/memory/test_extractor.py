@@ -25,6 +25,7 @@ from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
 )
+from atagia.core.presence_repository import PresenceRepository
 from atagia.core.storage_backend import InProcessBackend
 from atagia.memory.extractor import EXTRACTION_PROMPT_TEMPLATE, MemoryExtractor
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
@@ -37,6 +38,7 @@ from atagia.models.schemas_memory import (
     MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
+    PresenceKind,
 )
 from atagia.services.llm_client import (
     LLMClient,
@@ -400,6 +402,15 @@ def _context(
     temporary: bool = False,
     temporary_ttl_seconds: int | None = None,
     purge_on_close: bool = False,
+    active_presence_id: str | None = None,
+    active_presence_kind: str = "unknown",
+    active_presence_display_name: str | None = None,
+    source_presence_id: str | None = None,
+    source_presence_kind: str = "unknown",
+    source_presence_display_name: str | None = None,
+    active_space_id: str | None = None,
+    active_space_boundary_mode: str = "focus",
+    active_space_display_name: str | None = None,
 ) -> ExtractionConversationContext:
     return ExtractionConversationContext(
         user_id="usr_1",
@@ -410,6 +421,15 @@ def _context(
         user_persona_id=user_persona_id,
         platform_id=platform_id,
         character_id=character_id,
+        active_presence_id=active_presence_id,
+        active_presence_kind=active_presence_kind,
+        active_presence_display_name=active_presence_display_name,
+        source_presence_id=source_presence_id,
+        source_presence_kind=source_presence_kind,
+        source_presence_display_name=source_presence_display_name,
+        active_space_id=active_space_id,
+        active_space_boundary_mode=active_space_boundary_mode,
+        active_space_display_name=active_space_display_name,
         recent_messages=[],
         temporary=temporary,
         temporary_ttl_seconds=temporary_ttl_seconds,
@@ -496,7 +516,7 @@ async def test_normal_extraction_persists_grounded_items() -> None:
         by_type = {item["object_type"]: item for item in persisted}
         assert result.nothing_durable is False
         assert len(persisted) == 4
-        assert provider.requests[0].model == "openrouter/google/gemini-3.1-flash-lite-preview"
+        assert provider.requests[0].model == "openrouter/google/gemini-3.1-flash-lite"
         assert provider.requests[0].max_output_tokens == MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS
         assert "<message_timestamp>2023-05-08T13:56:00</message_timestamp>" in provider.requests[0].messages[1].content
         assert "<user_message>" in provider.requests[0].messages[1].content
@@ -671,7 +691,7 @@ async def test_disabled_extraction_watchdog_allows_different_provider_override()
         extraction_watchdog_enabled=False,
         llm_component_models={
             "extractor": "openai/gpt-5-mini",
-            "extraction_watchdog": "openrouter/google/gemini-3.1-flash-lite-preview",
+            "extraction_watchdog": "openrouter/google/gemini-3.1-flash-lite",
         },
     )
 
@@ -933,6 +953,232 @@ async def test_temporal_type_accepts_ephemeral() -> None:
 
         assert result.evidences[0].temporal_type == "ephemeral"
         assert await memories.list_for_user("usr_1") == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_extraction_persists_presence_attribution_and_subjects() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "I prefer Vim for quick edits",
+                "scope": "user",
+                "confidence": 0.91,
+                "source_kind": "extracted",
+                "privacy_level": 1,
+                "subject_presence_ids": [
+                    "human_owner",
+                    "character_alpha",
+                    "external_unknown",
+                ],
+                "payload": {"kind": "preference"},
+                "language_codes": ["en"],
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    (
+        connection,
+        clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
+    try:
+        presences = PresenceRepository(connection, clock)
+        await presences.resolve_presence(
+            owner_user_id="usr_1",
+            presence_id="character_alpha",
+            kind=PresenceKind.OWNED_FACET,
+            display_name="Character Alpha",
+            source_kind="explicit",
+            source_id="character_alpha",
+        )
+        await presences.resolve_human_owner_presence(owner_user_id="usr_1")
+        source_message = await _create_source_message(
+            messages,
+            text="I prefer Vim for quick edits.",
+        )
+
+        _result, persisted = await extractor.extract_with_persistence_details(
+            message_text=str(source_message["text"]),
+            role="user",
+            conversation_context=_context(
+                str(source_message["id"]),
+                active_presence_id="character_alpha",
+                active_presence_kind="owned_facet",
+                active_presence_display_name="Character Alpha",
+                source_presence_id="human_owner",
+                source_presence_kind="human",
+                source_presence_display_name="User",
+            ),
+            resolved_policy=resolved_policy,
+        )
+
+        assert len(persisted) == 1
+        memory = await memories.get_memory_object(str(persisted[0]["id"]), "usr_1")
+        assert memory is not None
+        assert memory["active_presence_id"] == "character_alpha"
+        assert memory["source_presence_id"] == "human_owner"
+        assert memory["payload_json"]["presence_attribution"]["active"] == {
+            "presence_id": "character_alpha",
+            "kind": "owned_facet",
+            "display_name": "Character Alpha",
+        }
+        assert memory["payload_json"]["presence_attribution"]["source"] == {
+            "presence_id": "human_owner",
+            "kind": "human",
+            "display_name": "User",
+        }
+
+        cursor = await connection.execute(
+            """
+            SELECT subject_presence_id
+            FROM memory_object_subjects
+            WHERE memory_object_id = ?
+            ORDER BY subject_presence_id ASC
+            """,
+            (memory["id"],),
+        )
+        subject_ids = [str(row["subject_presence_id"]) for row in await cursor.fetchall()]
+        assert subject_ids == ["character_alpha", "human_owner"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_extraction_preserves_empty_subject_presence_ids() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "The handoff checklist should stay concise",
+                "scope": "user",
+                "confidence": 0.91,
+                "source_kind": "extracted",
+                "privacy_level": 1,
+                "subject_presence_ids": [],
+                "payload": {"kind": "preference"},
+                "language_codes": ["en"],
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="The handoff checklist should stay concise.",
+        )
+
+        _result, persisted = await extractor.extract_with_persistence_details(
+            message_text=str(source_message["text"]),
+            role="user",
+            conversation_context=_context(
+                str(source_message["id"]),
+                active_presence_id="character_alpha",
+                active_presence_kind="owned_facet",
+                active_presence_display_name="Character Alpha",
+                source_presence_id="human_owner",
+                source_presence_kind="human",
+                source_presence_display_name="User",
+            ),
+            resolved_policy=resolved_policy,
+        )
+
+        assert len(persisted) == 1
+        memory = await memories.get_memory_object(str(persisted[0]["id"]), "usr_1")
+        assert memory is not None
+        cursor = await connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM memory_object_subjects
+            WHERE memory_object_id = ?
+            """,
+            (memory["id"],),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_extraction_persists_active_space_boundary() -> None:
+    payload = {
+        "evidences": [
+            {
+                "canonical_text": "Alpha launch checklist lives in the vault",
+                "scope": "user",
+                "confidence": 0.91,
+                "source_kind": "extracted",
+                "privacy_level": 1,
+                "payload": {"kind": "project_note"},
+                "language_codes": ["en"],
+            }
+        ],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="Alpha launch checklist lives in the vault.",
+        )
+
+        _result, persisted = await extractor.extract_with_persistence_details(
+            message_text=str(source_message["text"]),
+            role="user",
+            conversation_context=_context(
+                str(source_message["id"]),
+                active_space_id="space_vault",
+                active_space_boundary_mode="privacy_vault",
+                active_space_display_name="Alpha Vault",
+            ),
+            resolved_policy=resolved_policy,
+        )
+
+        assert len(persisted) == 1
+        memory = await memories.get_memory_object(str(persisted[0]["id"]), "usr_1")
+        assert memory is not None
+        assert memory["space_id"] == "space_vault"
+        assert memory["space_boundary_mode"] == "privacy_vault"
+        assert memory["payload_json"]["space_boundary"] == {
+            "active_space_id": "space_vault",
+            "boundary_mode": "privacy_vault",
+            "display_name": "Alpha Vault",
+        }
     finally:
         await connection.close()
 

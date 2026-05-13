@@ -439,6 +439,36 @@ class ConversationActivityService:
                 if conversation.get("workspace_id") is not None
                 else None
             ),
+            active_presence_id=(
+                str(conversation["active_presence_id"])
+                if conversation.get("active_presence_id") is not None
+                else None
+            ),
+            active_space_id=(
+                str(conversation["active_space_id"])
+                if conversation.get("active_space_id") is not None
+                else None
+            ),
+            active_mind_id=(
+                str(conversation["active_mind_id"])
+                if conversation.get("active_mind_id") is not None
+                else None
+            ),
+            mind_topology=(
+                str(conversation["mind_topology"])
+                if conversation.get("mind_topology") is not None
+                else None
+            ),
+            active_embodiment_id=(
+                str(conversation["active_embodiment_id"])
+                if conversation.get("active_embodiment_id") is not None
+                else None
+            ),
+            active_realm_id=(
+                str(conversation["active_realm_id"])
+                if conversation.get("active_realm_id") is not None
+                else None
+            ),
             operational_profile_token=default_operational_profile_snapshot(
                 loader=self.runtime.operational_profile_loader,
                 settings=self.runtime.settings,

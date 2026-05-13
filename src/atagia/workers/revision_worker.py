@@ -222,6 +222,24 @@ class RevisionWorker:
                     "purge_on_close": bool(payload.purge_on_close) or bool(conversation.get("purge_on_close")),
                     "isolated_mode": bool(payload.isolated_mode) or bool(conversation.get("isolated_mode")),
                     "incognito": bool(payload.incognito) or bool(conversation.get("incognito")),
+                    "active_embodiment_id": (
+                        payload.active_embodiment_id
+                        or conversation.get("active_embodiment_id")
+                    ),
+                    "cross_embodiment_mode": (
+                        payload.cross_embodiment_mode
+                        or conversation.get("cross_embodiment_mode")
+                        or "direct_if_same_body"
+                    ),
+                    "active_realm_id": (
+                        payload.active_realm_id
+                        or conversation.get("active_realm_id")
+                    ),
+                    "cross_realm_mode": (
+                        payload.cross_realm_mode
+                        or conversation.get("cross_realm_mode")
+                        or "none"
+                    ),
                 }
             )
         return payload.model_copy(update=updates)
@@ -242,6 +260,12 @@ class RevisionWorker:
         belief: dict[str, Any],
         payload: RevisionJobPayload,
     ) -> bool:
+        if not RevisionWorker._belief_matches_payload_mind(belief, payload):
+            return False
+        if not RevisionWorker._belief_matches_payload_embodiment(belief, payload):
+            return False
+        if not RevisionWorker._belief_matches_payload_realm(belief, payload):
+            return False
         if belief.get("user_persona_id") != payload.user_persona_id:
             return False
         if str(belief.get("sensitivity") or "unknown") != str(payload.sensitivity or "unknown"):
@@ -270,6 +294,44 @@ class RevisionWorker:
         }:
             return True
         return False
+
+    @staticmethod
+    def _belief_matches_payload_mind(
+        belief: dict[str, Any],
+        payload: RevisionJobPayload,
+    ) -> bool:
+        belief_owner = belief.get("memory_owner_id")
+        belief_owner_id = None if belief_owner is None else str(belief_owner)
+        if payload.active_mind_id is None:
+            return belief_owner_id is None
+        if str(payload.mind_topology or "unimind") == "unimind":
+            return belief_owner_id is None or belief_owner_id == payload.active_mind_id
+        return belief_owner_id == payload.active_mind_id
+
+    @staticmethod
+    def _belief_matches_payload_embodiment(
+        belief: dict[str, Any],
+        payload: RevisionJobPayload,
+    ) -> bool:
+        belief_embodiment = belief.get("embodiment_id")
+        belief_embodiment_id = None if belief_embodiment is None else str(belief_embodiment)
+        if payload.active_embodiment_id is None:
+            return belief_embodiment_id is None
+        return (
+            belief_embodiment_id is None
+            or belief_embodiment_id == payload.active_embodiment_id
+        )
+
+    @staticmethod
+    def _belief_matches_payload_realm(
+        belief: dict[str, Any],
+        payload: RevisionJobPayload,
+    ) -> bool:
+        belief_realm = belief.get("realm_id")
+        belief_realm_id = None if belief_realm is None else str(belief_realm)
+        if payload.active_realm_id is None:
+            return belief_realm_id is None
+        return belief_realm_id is None or belief_realm_id == payload.active_realm_id
 
     async def _revise_existing_belief(
         self,
@@ -515,6 +577,8 @@ class RevisionWorker:
             incognito=payload.incognito or payload.isolated_mode,
             remember_across_chats=payload.remember_across_chats,
             remember_across_devices=payload.remember_across_devices,
+            active_embodiment_id=payload.active_embodiment_id,
+            active_realm_id=payload.active_realm_id,
         )
         target_scope = self._promotion_target_scope(payload, active_beliefs, stats)
         if target_scope is None:
@@ -563,6 +627,8 @@ class RevisionWorker:
                 payload.claim_key,
                 str(candidate["claim_key"]),
             ):
+                if not self._belief_matches_payload_namespace(candidate, payload):
+                    continue
                 matches.append(candidate)
         return matches
 
@@ -656,6 +722,19 @@ class RevisionWorker:
                     "claim_value": claim_value,
                     "source_message_ids": [payload.source_message_id],
                     "promotion_stats": stats,
+                    "mind_perspective": {
+                        "memory_owner_id": payload.active_mind_id,
+                        "source_mind_id": payload.source_mind_id or payload.active_mind_id,
+                        "mind_topology": payload.mind_topology,
+                    },
+                    "embodiment": {
+                        "active_embodiment_id": payload.active_embodiment_id,
+                        "cross_embodiment_mode": payload.cross_embodiment_mode,
+                    },
+                    "realm": {
+                        "active_realm_id": payload.active_realm_id,
+                        "cross_realm_mode": payload.cross_realm_mode,
+                    },
                 },
                 extraction_hash=None,
                 source_kind=MemorySourceKind.INFERRED,
@@ -674,6 +753,10 @@ class RevisionWorker:
                     payload.platform_id if bool(payload.platform_locked) or not payload.remember_across_devices else None
                 ),
                 scope_canonical=self._canonical_scope_for_storage(target_scope).value,
+                memory_owner_id=payload.active_mind_id,
+                source_mind_id=payload.source_mind_id or payload.active_mind_id,
+                embodiment_id=payload.active_embodiment_id,
+                realm_id=payload.active_realm_id,
                 commit=False,
             )
             await self._belief_repository.create_first_version(

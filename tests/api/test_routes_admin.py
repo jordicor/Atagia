@@ -14,8 +14,10 @@ from atagia.app import create_app
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.core.consequence_repository import ConsequenceRepository
+from atagia.core.mind_repository import MindRepository
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
+from atagia.core.space_repository import SpaceRepository
 from atagia.core.summary_repository import SummaryRepository
 from atagia.models.schemas_memory import (
     MemoryCategory,
@@ -23,6 +25,8 @@ from atagia.models.schemas_memory import (
     MemoryScope,
     MemorySourceKind,
     MemoryStatus,
+    MindKind,
+    SpaceBoundaryMode,
 )
 from atagia.services.llm_client import (
     LLMClient,
@@ -404,6 +408,121 @@ def test_admin_routes_require_admin_key_and_can_inspect_retrieval_event(tmp_path
                 "user_id": "usr_2",
                 "conversation_id": "cnv_2",
             }
+
+
+def test_admin_memory_coordinate_inspector_and_correction_invalidate_cache(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    headers = {"Authorization": "Bearer admin-key"}
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime
+        with _connection(client) as connection:
+            clock = runtime.clock
+            users = UserRepository(connection, clock)
+            conversations = ConversationRepository(connection, clock)
+            memories = MemoryObjectRepository(connection, clock)
+            spaces = SpaceRepository(connection, clock)
+            minds = MindRepository(connection, clock)
+
+            client.portal.call(users.create_user, "usr_1")
+            client.portal.call(
+                conversations.create_conversation,
+                "cnv_1",
+                "usr_1",
+                None,
+                "coding_debug",
+                "Inspector Chat",
+            )
+            client.portal.call(
+                lambda: spaces.resolve_space(
+                    owner_user_id="usr_1",
+                    space_id="space_focus",
+                    boundary_mode=SpaceBoundaryMode.FOCUS,
+                    display_name="Focus",
+                    source_kind="explicit",
+                    source_id="space_focus",
+                )
+            )
+            client.portal.call(
+                lambda: spaces.resolve_space(
+                    owner_user_id="usr_1",
+                    space_id="space_vault",
+                    boundary_mode=SpaceBoundaryMode.PRIVACY_VAULT,
+                    display_name="Vault",
+                    source_kind="explicit",
+                    source_id="space_vault",
+                )
+            )
+            client.portal.call(
+                lambda: minds.resolve_mind(
+                    owner_user_id="usr_1",
+                    mind_id="mind_alpha",
+                    kind=MindKind.OWNED_AI,
+                    display_name="Alpha",
+                    source_kind="explicit",
+                    source_id="mind_alpha",
+                )
+            )
+            client.portal.call(
+                lambda: memories.create_memory_object(
+                    memory_id="mem_route_coordinate",
+                    user_id="usr_1",
+                    conversation_id="cnv_1",
+                    assistant_mode_id="coding_debug",
+                    object_type=MemoryObjectType.EVIDENCE,
+                    scope=MemoryScope.USER,
+                    canonical_text="Route coordinate memory.",
+                    source_kind=MemorySourceKind.EXTRACTED,
+                    confidence=0.8,
+                    privacy_level=0,
+                    space_id="space_focus",
+                    space_boundary_mode=SpaceBoundaryMode.FOCUS.value,
+                )
+            )
+            client.portal.call(
+                runtime.storage_backend.set_context_view,
+                "ctx:coordinates",
+                {"user_id": "usr_1", "conversation_id": "cnv_1"},
+                60,
+            )
+
+            inspected = client.get(
+                "/v1/admin/memory-coordinates/usr_1/mem_route_coordinate",
+                headers=headers,
+            )
+            assert inspected.status_code == 200
+            assert inspected.json()["coordinates"]["space"]["space_id"] == "space_focus"
+
+            corrected = client.post(
+                "/v1/admin/memory-coordinates/usr_1/mem_route_coordinate/correct",
+                headers=headers,
+                json={
+                    "coordinates": {
+                        "space_id": "space_vault",
+                        "memory_owner_id": "mind_alpha",
+                    },
+                    "reason": "admin route test",
+                },
+            )
+            assert corrected.status_code == 200
+            payload = corrected.json()
+            assert payload["coordinates"]["space"]["space_id"] == "space_vault"
+            assert payload["coordinates"]["space"]["space_boundary_mode"] == "privacy_vault"
+            assert payload["coordinates"]["mind"]["memory_owner_id"] == "mind_alpha"
+            assert client.portal.call(runtime.storage_backend.get_context_view, "ctx:coordinates") is None
+
+            history = client.get(
+                "/v1/admin/memory-coordinates/usr_1/mem_route_coordinate/corrections",
+                headers=headers,
+            )
+            assert history.status_code == 200
+            assert history.json()[0]["metadata_json"]["after"]["space_id"] == "space_vault"
+
+            rejected = client.post(
+                "/v1/admin/memory-coordinates/usr_1/mem_route_coordinate/correct",
+                headers=headers,
+                json={"coordinates": {"memory_owner_id": "ghost_mind"}},
+            )
+            assert rejected.status_code == 422
 
 
 def test_admin_lifecycle_route_supports_dry_run(tmp_path: Path) -> None:

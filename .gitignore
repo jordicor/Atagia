@@ -30,6 +30,7 @@ benchmarks/results/
 benchmarks/results/.DS_Store
 benchmarks/results/**/.DS_Store
 !benchmarks/atagia_bench/data/
+!benchmarks/graph_stress/data/
 
 # Internal work process docs (not public)
 CLAUDE.md
@@ -44,11 +45,27 @@ docs/*
 !docs/MEMORY_NAMESPACES_AND_SCOPES.md
 !docs/MEMORY_REDESIGN_IMPLEMENTATION_PLAN.md
 !docs/PROPOSAL_lightweight_sqlite_graph.md
+!docs/PROPOSAL_memory_coordinate_system.md
+!docs/PROPOSAL_memory_coordinate_system_phase1_presence.md
+!docs/PROPOSAL_memory_coordinate_system_phase2_spaces.md
+!docs/PROPOSAL_memory_coordinate_system_phase3_minds.md
+!docs/PROPOSAL_memory_coordinate_system_phase4_embodiments.md
+!docs/PROPOSAL_memory_coordinate_system_phase5_realms.md
+!docs/PROPOSAL_memory_coordinate_system_phase6_ojocentauri.md
+!docs/PROPOSAL_memory_coordinate_system_phase7_inspector.md
+!docs/PROPOSAL_retrieval_breakthrough_experiments.md
 !docs/BEYOND_HUMAN_MEMORY.md
 !docs/Beyond_Similarity_Applicability_Governed_Memory.md
+!docs/API.md
+!docs/CONFIGURATION_REFERENCE.md
+!docs/MODEL_ROUTING_NOTES.md
 !docs/tmp/
 docs/tmp/*
 !docs/tmp/README.md
+!docs/tmp/2026-05-08-retrieval-wave0-graph-stress-set.md
+!docs/tmp/2026-05-08-retrieval-wave0-graph-stress-baseline.md
+!docs/tmp/2026-05-08-retrieval-wave0-5-graph-stress-validation.md
+!docs/tmp/2026-05-11-evaluation-diagnostics-infra-consolidation.md
 !docs/archive/
 docs/archive/*
 !docs/archive/2026-05-doc-cleanup/

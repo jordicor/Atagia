@@ -33,6 +33,8 @@ _STRICT_JSON_FALLBACK_INSTRUCTION = (
     "outside the JSON value. Anything outside the first JSON value will be ignored. "
     "Every item you want Atagia to consider must be represented inside the JSON fields."
 )
+_STRUCTURED_OUTPUT_REPAIR_MAX_DETAILS = 8
+_STRUCTURED_OUTPUT_REPAIR_MAX_OUTPUT_CHARS = 4000
 
 
 def known_intimacy_context_metadata(
@@ -154,6 +156,8 @@ class StructuredCompletionResult(Generic[T]):
     value: T
     response: LLMCompletionResponse
     used_schema_fallback: bool = False
+    used_structured_output_retry: bool = False
+    used_structured_output_rescue: bool = False
 
 
 class LLMEmbeddingRequest(BaseModel):
@@ -203,6 +207,7 @@ class LLMProvider:
     name: str
     supports_embeddings: bool = True
     supports_embedding_dimensions: bool = False
+    supports_native_structured_output: bool = True
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         raise NotImplementedError
@@ -241,6 +246,9 @@ class LLMClient(Generic[T]):
         allow_unqualified_single_provider_models: bool = False,
         intimacy_fallback_models: dict[str, str] | None = None,
         intimacy_proactive_routing_enabled: bool = False,
+        structured_output_retry_attempts: int = 1,
+        structured_output_rescue_enabled: bool = False,
+        structured_output_rescue_model: str | None = None,
     ) -> None:
         self._provider_name = provider_name.strip().lower() if provider_name is not None else None
         self._providers = {provider.name.strip().lower(): provider for provider in (providers or [])}
@@ -248,6 +256,12 @@ class LLMClient(Generic[T]):
         self._allow_unqualified_single_provider_models = allow_unqualified_single_provider_models
         self._intimacy_fallback_models = dict(intimacy_fallback_models or {})
         self._intimacy_proactive_routing_enabled = intimacy_proactive_routing_enabled
+        if structured_output_retry_attempts < 0:
+            raise ValueError("structured_output_retry_attempts must be non-negative")
+        self._structured_output_retry_attempts = structured_output_retry_attempts
+        self._structured_output_rescue_enabled = structured_output_rescue_enabled
+        rescue_model = structured_output_rescue_model.strip() if structured_output_rescue_model else None
+        self._structured_output_rescue_model = rescue_model or None
 
     def register_provider(self, provider: LLMProvider) -> None:
         self._providers[provider.name.strip().lower()] = provider
@@ -708,6 +722,11 @@ class LLMClient(Generic[T]):
             elif isinstance(provider_value, int) and provider_value > 0:
                 metadata["thinking_budget_tokens"] = provider_value
                 metadata.pop("anthropic_thinking_adaptive", None)
+                metadata.pop("anthropic_output_effort", None)
+            elif isinstance(provider_value, str):
+                metadata["anthropic_thinking_adaptive"] = True
+                metadata["anthropic_output_effort"] = provider_value
+                metadata.pop("thinking_budget_tokens", None)
             return metadata
 
         if parsed.provider_slug == "google":
@@ -753,27 +772,79 @@ class LLMClient(Generic[T]):
         request: LLMCompletionRequest,
         schema: type[T],
     ) -> StructuredCompletionResult[T]:
-        used_schema_fallback = False
         try:
-            response = await self.complete(request)
+            return await self._complete_structured_once(request, schema)
+        except StructuredOutputError as exc:
+            initial_error = exc
+            last_error = exc
+
+        retry_used = False
+
+        for retry_attempt in range(1, self._structured_output_retry_attempts + 1):
+            retry_used = True
+            retry_request = self._structured_output_repair_request(
+                request,
+                schema,
+                last_error,
+                retry_attempt=retry_attempt,
+            )
+            try:
+                result = await self._complete_structured_once(retry_request, schema)
+            except StructuredOutputError as exc:
+                last_error = exc
+                continue
+            return StructuredCompletionResult(
+                value=result.value,
+                response=self._structured_output_repair_response(
+                    result.response,
+                    repair_kind="retry",
+                    primary_model=request.model,
+                    repair_model=retry_request.model,
+                    retry_attempts=retry_attempt,
+                ),
+                used_schema_fallback=result.used_schema_fallback,
+                used_structured_output_retry=True,
+            )
+
+        rescue_request = self._structured_output_rescue_request(request, schema, last_error)
+        if rescue_request is None:
+            raise last_error from initial_error
+
+        try:
+            result = await self._complete_structured_once(rescue_request, schema)
+        except StructuredOutputError as exc:
+            raise exc from last_error
+        return StructuredCompletionResult(
+            value=result.value,
+            response=self._structured_output_repair_response(
+                result.response,
+                repair_kind="rescue",
+                primary_model=request.model,
+                repair_model=rescue_request.model,
+                retry_attempts=self._structured_output_retry_attempts,
+            ),
+            used_schema_fallback=result.used_schema_fallback,
+            used_structured_output_retry=retry_used,
+            used_structured_output_rescue=True,
+        )
+
+    async def _complete_structured_once(
+        self,
+        request: LLMCompletionRequest,
+        schema: type[T],
+    ) -> StructuredCompletionResult[T]:
+        completion_request = request
+        used_schema_fallback = False
+        if self._should_prompt_for_structured_json(request):
+            completion_request = self._schema_prompt_fallback_request(request)
+            used_schema_fallback = True
+        try:
+            response = await self.complete(completion_request)
         except LLMError as exc:
-            if not self._should_retry_without_schema(exc, request):
+            if not self._should_retry_without_schema(exc, completion_request):
                 raise
             used_schema_fallback = True
-            response = await self.complete(
-                request.model_copy(
-                    update={
-                        "response_schema": None,
-                        "messages": [
-                            *request.messages,
-                            LLMMessage(
-                                role="user",
-                                content=_STRICT_JSON_FALLBACK_INSTRUCTION,
-                            ),
-                        ],
-                    }
-                )
-            )
+            response = await self.complete(self._schema_prompt_fallback_request(request))
         value = self._validate_structured_response(response, schema, used_schema_fallback)
         return StructuredCompletionResult(
             value=value,
@@ -788,29 +859,245 @@ class LLMClient(Generic[T]):
         *,
         observer: Any | None = None,
     ) -> T:
-        used_schema_fallback = False
         try:
-            response = await self.complete_streamed(request, observer=observer)
+            return await self._complete_structured_streamed_once(
+                request,
+                schema,
+                observer=observer,
+            )
+        except StructuredOutputError as exc:
+            initial_error = exc
+            last_error = exc
+
+        for retry_attempt in range(1, self._structured_output_retry_attempts + 1):
+            retry_request = self._structured_output_repair_request(
+                request,
+                schema,
+                last_error,
+                retry_attempt=retry_attempt,
+            )
+            try:
+                return await self._complete_structured_streamed_once(
+                    retry_request,
+                    schema,
+                    observer=observer,
+                )
+            except StructuredOutputError as exc:
+                last_error = exc
+
+        rescue_request = self._structured_output_rescue_request(request, schema, last_error)
+        if rescue_request is None:
+            raise last_error from initial_error
+        try:
+            return (await self._complete_structured_once(rescue_request, schema)).value
+        except StructuredOutputError as exc:
+            raise exc from last_error
+
+    async def _complete_structured_streamed_once(
+        self,
+        request: LLMCompletionRequest,
+        schema: type[T],
+        *,
+        observer: Any | None = None,
+    ) -> T:
+        completion_request = request
+        used_schema_fallback = False
+        if self._should_prompt_for_structured_json(request):
+            completion_request = self._schema_prompt_fallback_request(request)
+            used_schema_fallback = True
+        try:
+            response = await self.complete_streamed(completion_request, observer=observer)
         except LLMError as exc:
-            if not self._should_retry_without_schema(exc, request):
+            if not self._should_retry_without_schema(exc, completion_request):
                 raise
             used_schema_fallback = True
             response = await self.complete_streamed(
-                request.model_copy(
-                    update={
-                        "response_schema": None,
-                        "messages": [
-                            *request.messages,
-                            LLMMessage(
-                                role="user",
-                                content=_STRICT_JSON_FALLBACK_INSTRUCTION,
-                            ),
-                        ],
-                    }
-                ),
+                self._schema_prompt_fallback_request(request),
                 observer=observer,
             )
         return self._validate_structured_response(response, schema, used_schema_fallback)
+
+    def _structured_output_repair_request(
+        self,
+        request: LLMCompletionRequest,
+        schema: type[T],
+        error: StructuredOutputError,
+        *,
+        retry_attempt: int,
+    ) -> LLMCompletionRequest:
+        metadata = copy.deepcopy(request.metadata)
+        metadata.update(
+            {
+                "atagia_structured_output_retry": True,
+                "atagia_structured_output_retry_attempt": retry_attempt,
+                "atagia_structured_output_retry_primary_model": request.model,
+                "atagia_structured_output_failure_class": error.__class__.__name__,
+            }
+        )
+        return request.model_copy(
+            update={
+                "messages": [
+                    *request.messages,
+                    LLMMessage(
+                        role="user",
+                        content=self._structured_output_repair_instruction(
+                            error,
+                            phase="retry",
+                        ),
+                    ),
+                ],
+                "metadata": metadata,
+                "response_schema": request.response_schema or self._json_schema_for(schema),
+            }
+        )
+
+    def _structured_output_rescue_request(
+        self,
+        request: LLMCompletionRequest,
+        schema: type[T],
+        error: StructuredOutputError,
+    ) -> LLMCompletionRequest | None:
+        if not self._structured_output_rescue_enabled:
+            return None
+        if self._structured_output_rescue_model is None:
+            return None
+
+        metadata = copy.deepcopy(request.metadata)
+        metadata.update(
+            {
+                "atagia_structured_output_rescue": True,
+                "atagia_structured_output_rescue_model": self._structured_output_rescue_model,
+                "atagia_structured_output_rescue_original_model": request.model,
+                "atagia_structured_output_rescue_retry_attempts": self._structured_output_retry_attempts,
+                "atagia_structured_output_failure_class": error.__class__.__name__,
+            }
+        )
+        logger.warning(
+            "Escalating structured-output repair to rescue model purpose=%s primary_model=%s rescue_model=%s retry_attempts=%s",
+            request.metadata.get("purpose") or "<unset>",
+            request.model,
+            self._structured_output_rescue_model,
+            self._structured_output_retry_attempts,
+        )
+        return request.model_copy(
+            update={
+                "model": self._structured_output_rescue_model,
+                "messages": [
+                    *request.messages,
+                    LLMMessage(
+                        role="user",
+                        content=self._structured_output_repair_instruction(
+                            error,
+                            phase="rescue",
+                        ),
+                    ),
+                ],
+                "metadata": metadata,
+                "response_schema": request.response_schema or self._json_schema_for(schema),
+            }
+        )
+
+    @staticmethod
+    def _json_schema_for(schema: type[Any]) -> dict[str, Any]:
+        return TypeAdapter(schema).json_schema()
+
+    @classmethod
+    def _structured_output_repair_instruction(
+        cls,
+        error: StructuredOutputError,
+        *,
+        phase: str,
+    ) -> str:
+        if phase == "rescue":
+            opening = (
+                "The primary model and its corrective retry failed this structured-output task. "
+                "You are the configured rescue model for the same original task."
+            )
+        else:
+            opening = (
+                "Your previous response for this structured-output task did not satisfy "
+                "Atagia's JSON contract."
+            )
+        details = cls._structured_output_error_details_for_prompt(error)
+        output_excerpt = cls._structured_output_excerpt_for_prompt(error.output_text)
+        parts = [
+            opening,
+            "Regenerate the complete answer for the original task. Do not only patch the broken JSON.",
+            "Validation errors:",
+            details,
+        ]
+        if output_excerpt:
+            parts.extend(
+                [
+                    "Previous output excerpt:",
+                    output_excerpt,
+                ]
+            )
+        parts.append(_STRICT_JSON_FALLBACK_INSTRUCTION)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _structured_output_error_details_for_prompt(error: StructuredOutputError) -> str:
+        if not error.details:
+            return "- Structured output validation failed."
+        lines = [
+            f"- {detail}"
+            for detail in error.details[:_STRUCTURED_OUTPUT_REPAIR_MAX_DETAILS]
+        ]
+        remaining = len(error.details) - len(lines)
+        if remaining > 0:
+            lines.append(f"- ... {remaining} additional validation issue(s) omitted.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _structured_output_excerpt_for_prompt(output_text: str | None) -> str:
+        if not output_text:
+            return ""
+        text = output_text.strip()
+        if not text:
+            return ""
+        if len(text) > _STRUCTURED_OUTPUT_REPAIR_MAX_OUTPUT_CHARS:
+            text = text[:_STRUCTURED_OUTPUT_REPAIR_MAX_OUTPUT_CHARS] + "\n...[truncated]"
+        return text
+
+    @staticmethod
+    def _structured_output_repair_response(
+        response: LLMCompletionResponse,
+        *,
+        repair_kind: str,
+        primary_model: str,
+        repair_model: str,
+        retry_attempts: int,
+    ) -> LLMCompletionResponse:
+        raw_response = copy.deepcopy(response.raw_response)
+        raw_response["atagia_structured_output_repair"] = {
+            "kind": repair_kind,
+            "primary_model": primary_model,
+            "repair_model": repair_model,
+            "retry_attempts": retry_attempts,
+        }
+        return response.model_copy(update={"raw_response": raw_response})
+
+    def _should_prompt_for_structured_json(self, request: LLMCompletionRequest) -> bool:
+        if request.response_schema is None:
+            return False
+        provider, _ = self._completion_provider_request(request)
+        return not provider.supports_native_structured_output
+
+    @staticmethod
+    def _schema_prompt_fallback_request(request: LLMCompletionRequest) -> LLMCompletionRequest:
+        return request.model_copy(
+            update={
+                "response_schema": None,
+                "messages": [
+                    *request.messages,
+                    LLMMessage(
+                        role="user",
+                        content=_STRICT_JSON_FALLBACK_INSTRUCTION,
+                    ),
+                ],
+            }
+        )
 
     async def _with_retries(self, operation: Any) -> Any:
         delay = self._retry_policy.base_delay_seconds
@@ -835,10 +1122,26 @@ class LLMClient(Generic[T]):
         message = str(exc).lower()
         return (
             "compiled grammar is too large" in message
-            or "additionalproperties" in message
-            and "must be explicitly set to false" in message
-            or "maxitems" in message
-            and "not supported" in message
+            or "schema is too complex" in message
+            or "grammar compilation timed out" in message
+            or (
+                "additionalproperties" in message
+                and "must be explicitly set to false" in message
+            )
+            or ("maxitems" in message and "not supported" in message)
+            or (
+                "output_config.format.schema" in message
+                and "not supported" in message
+            )
+            or (
+                "maximum" in message
+                and "minimum" in message
+                and "not supported" in message
+            )
+            or (
+                "output_config.format" in message
+                and "extra inputs are not permitted" in message
+            )
         )
 
     @staticmethod

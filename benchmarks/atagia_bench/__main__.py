@@ -32,11 +32,12 @@ from benchmarks.failure_taxonomy import (
     save_failure_taxonomy_report,
 )
 from atagia.models.schemas_replay import AblationConfig
+from atagia.services.model_resolution import COMPONENTS_BY_ID
 
 _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 _DEFAULT_HOLDOUT_FILE = Path(__file__).resolve().parent / "data" / "holdout_v0.json"
-_DEFAULT_ANTHROPIC_JUDGE_MODEL = "claude-opus-4-6"
+_DEFAULT_JUDGE_MODEL = "anthropic/claude-opus-4-7"
 
 
 def _parse_csv_list(raw_value: str | None) -> list[str] | None:
@@ -63,6 +64,18 @@ def _parse_ablation(raw_value: str | None) -> AblationConfig | None:
     return AblationConfig.model_validate(json.loads(raw_value))
 
 
+def _benchmark_ablation(
+    raw_ablation: str | None,
+    privacy_enforcement: str | None,
+) -> AblationConfig | None:
+    ablation = _parse_ablation(raw_ablation)
+    if privacy_enforcement is None:
+        return ablation
+    return (ablation or AblationConfig()).model_copy(
+        update={"privacy_enforcement": privacy_enforcement}
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the Atagia-bench v0 pilot benchmark."
@@ -74,8 +87,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        required=True,
-        help="LLM model for answer generation",
+        default=None,
+        help=(
+            "Legacy one-model baseline. Without role-specific model flags this "
+            "forces every Atagia LLM component to the same model; with role "
+            "flags it is the fallback for unspecified roles."
+        ),
     )
     parser.add_argument(
         "--api-key",
@@ -86,8 +103,33 @@ def _build_parser() -> argparse.ArgumentParser:
         "--judge-model",
         default=None,
         help=(
-            "LLM model for scoring; defaults to claude-opus-4-6 for "
-            "Anthropic, otherwise the answer model"
+            "LLM model for scoring; defaults to direct Anthropic "
+            "claude-opus-4-7 for benchmark stability"
+        ),
+    )
+    parser.add_argument(
+        "--ingest-model",
+        default=None,
+        help="Model for Atagia ingest components unless overridden by --component-model.",
+    )
+    parser.add_argument(
+        "--retrieval-model",
+        default=None,
+        help="Model for Atagia retrieval components unless overridden by --component-model.",
+    )
+    parser.add_argument(
+        "--answer-model",
+        default=None,
+        help="Model for benchmark answer generation.",
+    )
+    parser.add_argument(
+        "--component-model",
+        action="append",
+        default=[],
+        metavar="COMPONENT=MODEL",
+        help=(
+            "Override one Atagia LLM component model. Repeatable. "
+            "Example: need_detector=openrouter/google/gemini-3.1-flash-lite"
         ),
     )
     parser.add_argument(
@@ -148,6 +190,19 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--privacy-enforcement",
+        choices=("enforce", "audit_only", "off"),
+        default=None,
+        help=(
+            "Benchmark diagnostic privacy mode. Defaults to enforce. "
+            "audit_only keeps SQL privacy gates but audits/skips the late "
+            "candidate/composer policy filters; off also disables retrieval SQL "
+            "privacy/intimacy/sensitivity gates and related context gates, and "
+            "grades privacy_check questions as private-fact retrieval diagnostics "
+            "while preserving user isolation."
+        ),
+    )
+    parser.add_argument(
         "--diff-against",
         default=None,
         help="Baseline Atagia-bench report JSON to diff against",
@@ -171,15 +226,69 @@ def _build_parser() -> argparse.ArgumentParser:
             "preserving ordinary high-risk secret disclosure refusals"
         ),
     )
+    parser.add_argument(
+        "--parallel-personas",
+        type=int,
+        default=1,
+        help=(
+            "Number of Atagia-bench personas to run concurrently. Each persona "
+            "uses its own temporary SQLite DB."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-db-dir",
+        default=None,
+        help="Directory where --keep-db stores reusable benchmark databases.",
+    )
+    parser.add_argument(
+        "--keep-db",
+        action="store_true",
+        help="Keep the ingested benchmark SQLite DB and write reuse metadata.",
+    )
+    parser.add_argument(
+        "--reuse-db",
+        default=None,
+        help=(
+            "Existing benchmark DB file or directory containing benchmark.db. "
+            "Requires exactly one selected persona and skips ingestion."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-only",
+        action="store_true",
+        help="Run retrieval/answer/judge only against --reuse-db.",
+    )
     return parser
 
 
 def _resolve_judge_model(args: argparse.Namespace) -> str | None:
     if args.judge_model is not None:
         return args.judge_model
-    if args.provider == "anthropic":
-        return _DEFAULT_ANTHROPIC_JUDGE_MODEL
-    return None
+    return _DEFAULT_JUDGE_MODEL
+
+
+def _parse_component_model_overrides(raw_values: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for raw_value in raw_values or []:
+        if "=" not in raw_value:
+            raise ValueError(
+                "--component-model must use COMPONENT=MODEL, "
+                f"got {raw_value!r}"
+            )
+        component_id, model = (part.strip() for part in raw_value.split("=", 1))
+        if not component_id or not model:
+            raise ValueError(
+                "--component-model must include both COMPONENT and MODEL, "
+                f"got {raw_value!r}"
+            )
+        if component_id not in COMPONENTS_BY_ID:
+            valid = ", ".join(sorted(COMPONENTS_BY_ID))
+            raise ValueError(
+                f"Unknown component id for --component-model: {component_id}. "
+                f"Valid component ids: {valid}"
+            )
+        overrides[component_id] = model
+    return overrides
 
 
 def _default_diff_output_path(report_path: Path) -> Path:
@@ -222,11 +331,20 @@ async def _run_async(
         benchmark_split=args.benchmark_split,
         holdout_ids=holdout_ids,
     )
+    component_models = getattr(args, "component_models", None)
+    if component_models is None:
+        component_models = _parse_component_model_overrides(
+            getattr(args, "component_model", []),
+        )
     runner = AtagiaBenchRunner(
         llm_provider=args.provider,
         llm_api_key=args.api_key,
         llm_model=args.model,
         judge_model=_resolve_judge_model(args),
+        ingest_model=args.ingest_model,
+        retrieval_model=args.retrieval_model,
+        answer_model=args.answer_model,
+        component_models=component_models,
         manifests_dir=args.manifests_dir,
         embedding_backend=args.embedding_backend,
         embedding_model=args.embedding_model,
@@ -239,8 +357,16 @@ async def _run_async(
         exclude_question_ids=exclude_question_ids,
         benchmark_split=args.benchmark_split,
         holdout_question_ids=holdout_ids,
-        ablation=_parse_ablation(args.ablation),
+        ablation=_benchmark_ablation(
+            args.ablation,
+            getattr(args, "privacy_enforcement", None),
+        ),
         trusted_evaluation=args.trusted_evaluation,
+        parallel_personas=args.parallel_personas,
+        benchmark_db_dir=args.benchmark_db_dir,
+        keep_db=args.keep_db,
+        reuse_db=args.reuse_db,
+        evaluate_only=args.evaluate_only,
     )
     report_path = runner.save_report(report, args.output)
 
@@ -311,11 +437,14 @@ def _format_report_summary(
         "=" * 50,
         f"Pass rate: {report.pass_rate:.1%} ({report.total_passed}/{report.total_questions})",
         f"Avg score: {report.avg_score:.3f}",
-        f"Critical errors: {report.critical_error_count}",
+        f"Priority failures: {report.priority_failure_count}",
         f"Duration: {_format_duration(report.run_duration_seconds)}",
         f"Personas: {', '.join(report.personas_used)}",
-        f"Model: {report.config.get('provider', '')} / {report.config.get('answer_model', '')}",
+        f"Model mode: {report.config.get('model_mode', 'forced_global')}",
+        f"Answer model: {report.config.get('provider', '')} / {report.config.get('answer_model', '')}",
+        f"Judge model: {report.config.get('judge_model', '')}",
         f"Trusted evaluation: {bool(report.config.get('trusted_evaluation', False))}",
+        f"Evaluate only: {bool(report.config.get('evaluate_only', False))}",
         f"Benchmark split: {report.config.get('benchmark_split', 'all')}",
         format_retrieval_custody_summary(
             report.config.get("retrieval_custody_summary")
@@ -350,6 +479,11 @@ def _format_report_summary(
     lines.extend([
         "",
         f"Report saved to: {report_path}",
+        *[
+            f"Benchmark DB: {entry.get('db_path')}"
+            for entry in (report.config.get("benchmark_databases") or [])
+            if isinstance(entry, dict) and entry.get("db_path")
+        ],
         *(
             [f"Run manifest saved to: {manifest_path}"]
             if manifest_path is not None
@@ -379,11 +513,24 @@ def main() -> None:
     """Parse CLI args, run the benchmark, and print results."""
     parser = _build_parser()
     args = parser.parse_args()
+    try:
+        args.component_models = _parse_component_model_overrides(args.component_model)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.embedding_backend == "sqlite_vec" and not args.embedding_model:
         parser.error(
             "--embedding-model is required when --embedding-backend is sqlite_vec"
         )
+    if args.parallel_personas < 1:
+        parser.error("--parallel-personas must be at least 1")
+    if args.evaluate_only and args.reuse_db is None:
+        parser.error("--evaluate-only requires --reuse-db")
+    selected_personas = _parse_csv_list(args.personas)
+    if args.reuse_db is not None and (
+        selected_personas is None or len(selected_personas) != 1
+    ):
+        parser.error("--reuse-db requires --personas with exactly one persona id")
 
     (
         report,

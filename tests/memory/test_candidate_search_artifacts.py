@@ -16,16 +16,19 @@ from atagia.core.repositories import (
     MessageRepository,
     UserRepository,
 )
+from atagia.core.space_repository import SpaceRepository
 from atagia.memory.candidate_search import CandidateSearch
 from atagia.models.schemas_api import AttachmentInput
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
     PlannedSubQuery,
     RetrievalPlan,
+    SpaceBoundaryMode,
 )
 from atagia.services.artifact_service import ArtifactService
 from atagia.services.embeddings import EmbeddingMatch
@@ -59,6 +62,9 @@ def _artifact_plan(
     vector_limit: int = 0,
     privacy_ceiling: int = 1,
     allow_intimacy_context: bool = False,
+    allow_private_sensitivity: bool = False,
+    active_space_id: str | None = None,
+    active_space_boundary_mode: SpaceBoundaryMode | None = None,
 ) -> RetrievalPlan:
     resolved_fts_queries = fts_queries or ["theta"]
     return RetrievalPlan(
@@ -77,7 +83,10 @@ def _artifact_plan(
         max_context_items=5,
         privacy_ceiling=privacy_ceiling,
         allow_intimacy_context=allow_intimacy_context,
+        allow_private_sensitivity=allow_private_sensitivity,
         exact_recall_mode=exact_recall_mode,
+        active_space_id=active_space_id,
+        active_space_boundary_mode=active_space_boundary_mode,
     )
 
 
@@ -174,6 +183,115 @@ async def test_candidate_search_surfaces_artifact_chunks_in_artifact_mode() -> N
 
 
 @pytest.mark.asyncio
+async def test_candidate_search_keeps_own_severance_space_artifact_chunks() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc))
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        artifacts = ArtifactService(connection, clock)
+        search = CandidateSearch(connection, clock)
+
+        await users.create_user("usr_a")
+        await connection.execute(
+            """
+            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+            VALUES ('coding_debug', 'Coding Debug', 'hash_1', '{}', '2026-03-30T12:00:00+00:00', '2026-03-30T12:00:00+00:00')
+            """
+        )
+        await SpaceRepository(connection, clock).resolve_space(
+            owner_user_id="usr_a",
+            space_id="space_severed",
+            boundary_mode=SpaceBoundaryMode.SEVERANCE,
+            display_name="Severed",
+            source_kind="explicit",
+            source_id="space_severed",
+        )
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Artifact Chat")
+
+        bundle = artifacts.prepare_attachments(
+            message_text="Please inspect this note.",
+            attachments=[
+                AttachmentInput(
+                    kind="pasted_text",
+                    content_text="theta severance artifact detail",
+                    title="Severed Artifact Note",
+                    filename="severed-note.txt",
+                    mime_type="text/plain",
+                    preserve_verbatim=True,
+                )
+            ],
+            user_id="usr_a",
+            conversation={
+                "id": "cnv_a",
+                "workspace_id": None,
+                "assistant_mode_id": "coding_debug",
+            },
+        )
+
+        await connection.execute("BEGIN")
+        try:
+            user_message = await messages.create_message(
+                message_id=None,
+                conversation_id="cnv_a",
+                role="user",
+                seq=None,
+                text=bundle.prompt_text,
+                token_count=None,
+                metadata={
+                    "attachments": bundle.attachments,
+                    "attachment_count": len(bundle.artifacts),
+                    "attachment_artifact_ids": [
+                        str(prepared.artifact["id"]) for prepared in bundle.artifacts
+                    ],
+                    "artifact_backed": True,
+                    "skip_by_default": True,
+                    "include_raw": False,
+                    "requires_explicit_request": True,
+                    "content_kind": "artifact",
+                    "context_placeholder": bundle.context_placeholder,
+                },
+                occurred_at="2026-03-30T12:00:00+00:00",
+                space_id="space_severed",
+                commit=False,
+            )
+            await artifacts.persist_prepared_attachments(
+                bundle=bundle,
+                message_id=str(user_message["id"]),
+                commit=False,
+            )
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
+
+        outside_candidates = await search.search(_artifact_plan(), "usr_a")
+        inside_candidates = await search.search(
+            _artifact_plan(
+                active_space_id="space_severed",
+                active_space_boundary_mode=SpaceBoundaryMode.SEVERANCE,
+                exact_recall_mode=True,
+            ),
+            "usr_a",
+        )
+
+        outside_chunks = [
+            candidate for candidate in outside_candidates if candidate.get("is_artifact_chunk")
+        ]
+        inside_chunks = [
+            candidate for candidate in inside_candidates if candidate.get("is_artifact_chunk")
+        ]
+        assert outside_chunks == []
+        assert inside_chunks
+        assert inside_chunks[0]["space_id"] == "space_severed"
+        assert inside_chunks[0]["space_boundary_mode"] == SpaceBoundaryMode.SEVERANCE.value
+        assert "theta" in inside_chunks[0]["canonical_text"].lower()
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_candidate_search_filters_intimacy_bound_artifacts_until_authorized() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc))
@@ -254,6 +372,7 @@ async def test_candidate_search_filters_intimacy_bound_artifacts_until_authorize
                 fts_queries=["theta"],
                 privacy_ceiling=3,
                 allow_intimacy_context=True,
+                allow_private_sensitivity=True,
             ),
             "usr_a",
         )
@@ -264,6 +383,86 @@ async def test_candidate_search_filters_intimacy_bound_artifacts_until_authorize
         ]
         assert artifact_candidates
         assert artifact_candidates[0]["intimacy_boundary"] == "romantic_private"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_artifact_chunk_search_allows_private_sensitivity_only_when_plan_allows_it() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc))
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        artifacts = ArtifactRepository(connection, clock)
+        search = CandidateSearch(connection, clock)
+
+        await users.create_user("usr_a")
+        await connection.execute(
+            """
+            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+            VALUES ('coding_debug', 'Coding Debug', 'hash_1', '{}', '2026-03-30T12:00:00+00:00', '2026-03-30T12:00:00+00:00')
+            """
+        )
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Artifact Chat")
+        message = await messages.create_message(
+            message_id="msg_private_artifacts",
+            conversation_id="cnv_a",
+            role="user",
+            seq=None,
+            text="Please keep these private attachment notes.",
+            token_count=None,
+            metadata={"artifact_backed": True},
+            occurred_at="2026-03-30T12:00:00+00:00",
+        )
+
+        for artifact_id, sensitivity, privacy_level in (
+            ("art_public", MemorySensitivity.PUBLIC, 0),
+            ("art_private", MemorySensitivity.PRIVATE, 2),
+            ("art_secret", MemorySensitivity.SECRET, 3),
+        ):
+            artifact = await artifacts.create_artifact(
+                artifact_id=artifact_id,
+                user_id="usr_a",
+                workspace_id=None,
+                conversation_id="cnv_a",
+                message_id=str(message["id"]),
+                artifact_type="pasted_text",
+                source_kind="pasted_text",
+                title=f"{artifact_id} note",
+                privacy_level=privacy_level,
+                sensitivity=sensitivity,
+                index_text="private attachment signal",
+                platform_id="default",
+                scope_canonical=MemoryScope.CHAT.value,
+            )
+            await artifacts.create_artifact_chunk(
+                artifact_id=str(artifact["id"]),
+                user_id="usr_a",
+                chunk_index=0,
+                text=f"{artifact_id} private attachment signal",
+                token_count=6,
+                kind="extracted",
+                chunk_id=f"arc_{artifact_id}",
+            )
+
+        base_plan = _artifact_plan(
+            fts_queries=["private attachment signal"],
+            privacy_ceiling=3,
+        ).model_copy(update={"platform_id": "default"})
+        normal_candidates = await search.search(base_plan, "usr_a")
+        trusted_candidates = await search.search(
+            base_plan.model_copy(update={"allow_private_sensitivity": True}),
+            "usr_a",
+        )
+
+        assert {
+            candidate["artifact_id"] for candidate in normal_candidates if candidate.get("is_artifact_chunk")
+        } == {"art_public"}
+        assert {
+            candidate["artifact_id"] for candidate in trusted_candidates if candidate.get("is_artifact_chunk")
+        } == {"art_public", "art_private"}
     finally:
         await connection.close()
 

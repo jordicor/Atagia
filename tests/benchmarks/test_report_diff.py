@@ -88,6 +88,7 @@ def test_build_benchmark_diff_tracks_question_flips() -> None:
                 trace={
                     "diagnosis_bucket": "retrieval_or_ranking_miss",
                     "sufficiency_diagnostic": "retrieval_insufficient",
+                    "failure_stage": "judge",
                     "selected_memory_ids": ["mem_old"],
                     "selected_evidence_memory_ids": [],
                     "retrieval_custody": [
@@ -197,6 +198,9 @@ def test_build_benchmark_diff_tracks_question_flips() -> None:
         "retrieval_sufficient": 1,
         "unknown": 0,
     }
+    assert diff.before_failure_stage_counts == {"judge": 1}
+    assert diff.after_failure_stage_counts == {}
+    assert diff.failure_stage_count_deltas == {"judge": -1}
     assert diff.before_retrieval_custody_summary == {
         "candidate_count": 1,
         "selected_count": 0,
@@ -265,6 +269,8 @@ def test_build_benchmark_diff_tracks_question_flips() -> None:
     first_diff = diff.conversations[0].question_diffs[0]
     assert first_diff.before_diagnosis_bucket == "retrieval_or_ranking_miss"
     assert first_diff.after_diagnosis_bucket == "passed"
+    assert first_diff.before_failure_stage == "judge"
+    assert first_diff.after_failure_stage is None
     assert first_diff.after_selected_evidence_memory_ids == ["mem_new"]
     assert diff.conversations[0].retrieval_time_delta_ms.model_dump() == {
         "count": 2,
@@ -350,6 +356,7 @@ def test_format_diff_summary_includes_observability_sections() -> None:
                 trace={
                     "diagnosis_bucket": "retrieval_or_ranking_miss",
                     "sufficiency_diagnostic": "retrieval_insufficient",
+                    "failure_stage": "answer_generation",
                     "retrieval_custody": [
                         {
                             "candidate_id": "mem_old",
@@ -413,6 +420,7 @@ def test_format_diff_summary_includes_observability_sections() -> None:
     assert "Warning deltas: failed_questions=-1" in summary
     assert "Diagnosis deltas: passed=+1, retrieval_or_ranking_miss=-1" in summary
     assert "Sufficiency deltas: retrieval_insufficient=-1, retrieval_sufficient=+1" in summary
+    assert "Failure stage deltas: answer_generation=-1" in summary
     assert "Category changes (>=1% delta):" in summary
     assert "  Cat 1: +100.0%" in summary
     assert "[PASS] conv-test-1:q1: 0 -> 1 (cat 1)" in summary

@@ -49,6 +49,10 @@ class AtagiaClient(Protocol):
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
     ) -> str:
@@ -72,6 +76,10 @@ class AtagiaClient(Protocol):
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -93,6 +101,10 @@ class AtagiaClient(Protocol):
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
@@ -120,6 +132,10 @@ class AtagiaClient(Protocol):
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -143,6 +159,10 @@ class AtagiaClient(Protocol):
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
     ) -> ChatResult:
         """Run the full Atagia chat flow."""
@@ -261,6 +281,10 @@ class LocalAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
     ) -> str:
@@ -273,6 +297,10 @@ class LocalAtagiaClient:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             mode=mode,
             incognito=incognito,
         )
@@ -295,6 +323,10 @@ class LocalAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -316,6 +348,10 @@ class LocalAtagiaClient:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             incognito=incognito,
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
@@ -336,6 +372,10 @@ class LocalAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
@@ -354,6 +394,10 @@ class LocalAtagiaClient:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             mode=mode,
             incognito=incognito,
             ingest_origin=ingest_origin,
@@ -380,6 +424,10 @@ class LocalAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -402,6 +450,10 @@ class LocalAtagiaClient:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             incognito=incognito,
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
@@ -424,6 +476,10 @@ class LocalAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
     ) -> ChatResult:
         return await self._engine.chat(
@@ -440,6 +496,10 @@ class LocalAtagiaClient:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             incognito=incognito,
         )
 
@@ -611,6 +671,10 @@ class HttpAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
     ) -> str:
@@ -628,6 +692,10 @@ class HttpAtagiaClient:
                 "user_persona_id": user_persona_id,
                 "platform_id": platform_id,
                 "character_id": character_id if character_id is not None else workspace_id,
+                "active_presence_id": active_presence_id,
+                "embodiment_id": embodiment_id,
+                "realm_id": realm_id,
+                "space_id": space_id,
                 "mode": mode,
                 "incognito": incognito,
             },
@@ -654,6 +722,10 @@ class HttpAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -662,7 +734,8 @@ class HttpAtagiaClient:
         response = await self._post(
             f"/v1/conversations/{_path_segment(conversation_id)}/context",
             user_id=user_id,
-            json={
+            json=_omit_none(
+                {
                 "user_id": user_id,
                 "message_text": message,
                 "message_id": message_id,
@@ -677,12 +750,17 @@ class HttpAtagiaClient:
                 "user_persona_id": user_persona_id,
                 "platform_id": platform_id,
                 "character_id": character_id if character_id is not None else workspace_id,
+                "active_presence_id": active_presence_id,
+                "embodiment_id": embodiment_id,
+                "realm_id": realm_id,
+                "space_id": space_id,
                 "mode": mode,
                 "incognito": incognito,
                 "ingest_origin": ingest_origin,
                 "confirmation_strategy": confirmation_strategy,
                 "memory_privacy_mode": memory_privacy_mode,
-            },
+                }
+            ),
         )
         return ContextResult.model_validate(response.json())
 
@@ -700,6 +778,10 @@ class HttpAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
@@ -709,7 +791,8 @@ class HttpAtagiaClient:
         await self._post(
             f"/v1/conversations/{_path_segment(conversation_id)}/responses",
             user_id=user_id,
-            json={
+            json=_omit_none(
+                {
                 "user_id": user_id,
                 "message_id": message_id,
                 "source_seq": source_seq,
@@ -720,12 +803,17 @@ class HttpAtagiaClient:
                 "user_persona_id": user_persona_id,
                 "platform_id": platform_id,
                 "character_id": character_id,
+                "active_presence_id": active_presence_id,
+                "embodiment_id": embodiment_id,
+                "realm_id": realm_id,
+                "space_id": space_id,
                 "mode": mode,
                 "incognito": incognito,
                 "ingest_origin": ingest_origin,
                 "confirmation_strategy": confirmation_strategy,
                 "memory_privacy_mode": memory_privacy_mode,
-            },
+                }
+            ),
         )
 
     async def ingest_message(
@@ -747,6 +835,10 @@ class HttpAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
@@ -755,7 +847,8 @@ class HttpAtagiaClient:
         await self._post(
             f"/v1/conversations/{_path_segment(conversation_id)}/messages",
             user_id=user_id,
-            json={
+            json=_omit_none(
+                {
                 "user_id": user_id,
                 "message_id": message_id,
                 "source_seq": source_seq,
@@ -771,12 +864,17 @@ class HttpAtagiaClient:
                 "user_persona_id": user_persona_id,
                 "platform_id": platform_id,
                 "character_id": character_id if character_id is not None else workspace_id,
+                "active_presence_id": active_presence_id,
+                "embodiment_id": embodiment_id,
+                "realm_id": realm_id,
+                "space_id": space_id,
                 "mode": mode,
                 "incognito": incognito,
                 "ingest_origin": ingest_origin,
                 "confirmation_strategy": confirmation_strategy,
                 "memory_privacy_mode": memory_privacy_mode,
-            },
+                }
+            ),
         )
 
     async def chat(
@@ -795,6 +893,10 @@ class HttpAtagiaClient:
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
+        active_presence_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
+        space_id: str | None = None,
         incognito: bool | None = None,
     ) -> ChatResult:
         await self.create_conversation(
@@ -806,6 +908,10 @@ class HttpAtagiaClient:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             mode=mode,
             incognito=incognito,
         )
@@ -826,6 +932,10 @@ class HttpAtagiaClient:
                 "user_persona_id": user_persona_id,
                 "platform_id": platform_id,
                 "character_id": character_id if character_id is not None else workspace_id,
+                "active_presence_id": active_presence_id,
+                "embodiment_id": embodiment_id,
+                "realm_id": realm_id,
+                "space_id": space_id,
                 "mode": mode,
                 "incognito": incognito,
             },
@@ -1084,6 +1194,11 @@ class HttpAtagiaClient:
         return None
 
 
+def _omit_none(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a JSON payload with absent optional fields omitted."""
+    return {key: value for key, value in payload.items() if value is not None}
+
+
 async def connect_atagia(
     *,
     transport: TransportName = "auto",
@@ -1099,7 +1214,7 @@ async def connect_atagia(
     openai_api_key: str | None = None,
     google_api_key: str | None = None,
     openrouter_api_key: str | None = None,
-    embedding_backend: str = "none",
+    embedding_backend: str | None = None,
     embedding_model: str | None = None,
     context_cache_enabled: bool | None = None,
     disable_chunking_extraction: bool | None = None,

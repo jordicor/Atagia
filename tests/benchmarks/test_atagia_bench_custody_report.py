@@ -71,7 +71,7 @@ def test_atagia_bench_failed_question_custody_report_extracts_context(tmp_path: 
         total_passed=1,
         pass_rate=0.5,
         avg_score=0.5,
-        critical_error_count=0,
+        priority_failure_count=0,
         per_question=[failed, passed],
         per_category=[],
     )

@@ -245,6 +245,7 @@ async def test_replay_event_with_ablation_changes_result() -> None:
         assert result.comparison.memories_only_original == ["mem_2"]
         assert result.comparison.memories_only_replay == ["mem_1"]
         assert result.ablation_config == {
+            "privacy_enforcement": "enforce",
             "skip_need_detection": False,
             "skip_applicability_scoring": True,
             "skip_contract_memory": False,
@@ -253,6 +254,7 @@ async def test_replay_event_with_ablation_changes_result() -> None:
             "skip_belief_revision": False,
             "skip_compaction": False,
             "disable_context_cache": False,
+            "enable_llm_coverage_expansion": False,
             "composer_strategy": "budgeted_marginal",
             "override_retrieval_params": {
                 "final_context_items": 1,

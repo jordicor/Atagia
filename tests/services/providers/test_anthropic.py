@@ -142,6 +142,79 @@ async def test_anthropic_complete_falls_back_to_request_model_when_response_mode
 
 
 @pytest.mark.asyncio
+async def test_anthropic_complete_omits_temperature_for_opus_4_7() -> None:
+    response = SimpleNamespace(
+        model="claude-opus-4-7",
+        content=[SimpleNamespace(type="text", text="judged")],
+        usage=None,
+        model_dump=lambda: {"id": "msg_1"},
+    )
+    messages = FakeAnthropicMessages(completion_response=response)
+    provider = AnthropicProvider(api_key="test", client=FakeAnthropicClient(messages))
+    request = _request().model_copy(
+        update={
+            "model": "claude-opus-4-7",
+            "temperature": 0.0,
+        }
+    )
+
+    completion = await provider.complete(request)
+
+    assert completion.output_text == "judged"
+    assert "temperature" not in messages.create_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_sends_adaptive_effort_for_opus_4_7() -> None:
+    response = SimpleNamespace(
+        model="claude-opus-4-7",
+        content=[SimpleNamespace(type="text", text="judged")],
+        usage=None,
+        model_dump=lambda: {"id": "msg_1"},
+    )
+    messages = FakeAnthropicMessages(completion_response=response)
+    provider = AnthropicProvider(api_key="test", client=FakeAnthropicClient(messages))
+    request = _request().model_copy(
+        update={
+            "model": "claude-opus-4-7",
+            "metadata": {
+                "anthropic_thinking_adaptive": True,
+                "anthropic_output_effort": "xhigh",
+            },
+        }
+    )
+
+    completion = await provider.complete(request)
+
+    assert completion.output_text == "judged"
+    create_call = messages.create_calls[0]
+    assert create_call["thinking"] == {"type": "adaptive"}
+    assert create_call["output_config"]["effort"] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_omits_temperature_for_opus_4_7() -> None:
+    final_message = SimpleNamespace(stop_reason="end_turn", usage=None)
+    stream_manager = FakeStreamManager(
+        events=[SimpleNamespace(type="text", text="judged")],
+        final_message=final_message,
+    )
+    messages = FakeAnthropicMessages(stream_manager=stream_manager)
+    provider = AnthropicProvider(api_key="test", client=FakeAnthropicClient(messages))
+    request = _request().model_copy(
+        update={
+            "model": "anthropic/claude-opus-4-7",
+            "temperature": 0.0,
+        }
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == ["text", "done"]
+    assert "temperature" not in messages.stream_calls[0]
+
+
+@pytest.mark.asyncio
 async def test_anthropic_complete_raises_non_transient_on_max_tokens() -> None:
     response = SimpleNamespace(
         model="claude-opus-4-6",

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository
+from atagia.core.space_repository import SpaceRepository, space_snapshot
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
 from atagia.memory.intimacy_boundary_policy import (
     constrained_scope_for_intimacy_boundary,
@@ -17,6 +18,8 @@ from atagia.models.schemas_memory import (
     IntimacyBoundary,
     MemoryScope,
     MemorySensitivity,
+    MindTopology,
+    SpaceBoundaryMode,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
@@ -30,6 +33,28 @@ def _normalize_text(value: Any) -> str | None:
         return None
     normalized = " ".join(str(value).split())
     return normalized or None
+
+
+def _normalize_space_boundary_mode(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, SpaceBoundaryMode):
+        return value.value
+    try:
+        return SpaceBoundaryMode(str(value)).value
+    except ValueError:
+        return SpaceBoundaryMode.FOCUS.value
+
+
+def _normalize_mind_topology(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, MindTopology):
+        return value.value
+    try:
+        return MindTopology(str(value)).value
+    except ValueError:
+        return MindTopology.UNIMIND.value
 
 
 class VerbatimPinService:
@@ -55,6 +80,12 @@ class VerbatimPinService:
         incognito: bool | None = None,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
         canonical_text: str | None = None,
         index_text: str | None = None,
         target_span_start: int | None = None,
@@ -70,6 +101,32 @@ class VerbatimPinService:
         resolved_target_id = _normalize_text(target_id)
         if resolved_target_id is None:
             raise ValueError("target_id must be provided")
+        active_space_context = await self._active_space_context(
+            connection,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+        )
+        active_mind_context = await self._active_mind_context(
+            connection,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+        )
+        active_embodiment_context = await self._active_embodiment_context(
+            connection,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            active_embodiment_id=active_embodiment_id,
+        )
+        active_realm_context = await self._active_realm_context(
+            connection,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            active_realm_id=active_realm_id,
+        )
 
         namespace_payload = self._payload_with_namespace(
             payload_json,
@@ -79,6 +136,10 @@ class VerbatimPinService:
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_mind_id=active_mind_context["active_mind_id"],
+            mind_topology=active_mind_context["mind_topology"],
+            active_embodiment_id=active_embodiment_context["active_embodiment_id"],
+            active_realm_id=active_realm_context["active_realm_id"],
         )
         source_row = await self._load_source_row(
             connection,
@@ -92,6 +153,12 @@ class VerbatimPinService:
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_space_id=active_space_context["space_id"],
+            active_space_boundary_mode=active_space_context["space_boundary_mode"],
+            active_mind_id=active_mind_context["active_mind_id"],
+            mind_topology=active_mind_context["mind_topology"],
+            active_embodiment_id=active_embodiment_context["active_embodiment_id"],
+            active_realm_id=active_realm_context["active_realm_id"],
         )
         resolved_intimacy_boundary = self._resolve_intimacy_boundary(
             explicit_boundary=intimacy_boundary,
@@ -129,6 +196,31 @@ class VerbatimPinService:
             payload_json=namespace_payload,
             scope_anchors=scope_anchors,
             scope=scope,
+        )
+        source_space = await self._source_space_snapshot(
+            connection,
+            user_id=user_id,
+            source_row=source_row,
+            payload_json=namespace_payload,
+            active_space_id=active_space_context["space_id"],
+            active_space_boundary_mode=active_space_context["space_boundary_mode"],
+            conversation_id=scope_anchors["conversation_id"],
+        )
+        source_mind = self._source_mind_snapshot(
+            source_row=source_row,
+            payload_json=namespace_payload,
+            active_mind_id=active_mind_context["active_mind_id"],
+            mind_topology=active_mind_context["mind_topology"],
+        )
+        source_embodiment = self._source_embodiment_snapshot(
+            source_row=source_row,
+            payload_json=namespace_payload,
+            active_embodiment_id=active_embodiment_context["active_embodiment_id"],
+        )
+        source_realm = self._source_realm_snapshot(
+            source_row=source_row,
+            payload_json=namespace_payload,
+            active_realm_id=active_realm_context["active_realm_id"],
         )
         source_text = self._source_text_for_kind(source_row, target_kind)
 
@@ -173,6 +265,28 @@ class VerbatimPinService:
                 "source_snapshot",
                 self._source_snapshot_metadata(source_row, target_kind, resolved_target_id),
             )
+        if source_space["space_id"] is not None:
+            space_payload = {
+                "active_space_id": source_space["space_id"],
+                "boundary_mode": source_space["space_boundary_mode"],
+            }
+            if source_space.get("display_name") is not None:
+                space_payload["display_name"] = source_space["display_name"]
+            resolved_payload["space_boundary"] = space_payload
+        if source_mind["memory_owner_id"] is not None:
+            resolved_payload["mind_perspective"] = {
+                "memory_owner_id": source_mind["memory_owner_id"],
+                "source_mind_id": source_mind["source_mind_id"],
+                "mind_topology": source_mind["mind_topology"],
+            }
+        if source_embodiment["embodiment_id"] is not None:
+            resolved_payload["embodiment"] = {
+                "active_embodiment_id": source_embodiment["embodiment_id"],
+            }
+        if source_realm["realm_id"] is not None:
+            resolved_payload["realm"] = {
+                "active_realm_id": source_realm["realm_id"],
+            }
         if span_start is not None:
             resolved_payload.setdefault("target_span_start", span_start)
         if span_end is not None:
@@ -224,6 +338,12 @@ class VerbatimPinService:
                     source_namespace["remember_across_devices_snapshot"]
                 ),
                 policy_snapshot=source_namespace["policy_snapshot"],
+                space_id=source_space["space_id"],
+                space_boundary_mode=source_space["space_boundary_mode"],
+                memory_owner_id=source_mind["memory_owner_id"],
+                source_mind_id=source_mind["source_mind_id"],
+                embodiment_id=source_embodiment["embodiment_id"],
+                realm_id=source_realm["realm_id"],
                 commit=False,
             )
             await connection.commit()
@@ -245,6 +365,12 @@ class VerbatimPinService:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any] | None:
         return await VerbatimPinRepository(connection, self.runtime.clock).get_verbatim_pin(
             pin_id,
@@ -256,6 +382,12 @@ class VerbatimPinService:
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
         )
 
     async def list_verbatim_pins(
@@ -279,6 +411,12 @@ class VerbatimPinService:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> list[dict[str, Any]]:
         return await VerbatimPinRepository(connection, self.runtime.clock).list_verbatim_pins(
             user_id,
@@ -298,6 +436,12 @@ class VerbatimPinService:
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
         )
 
     async def update_verbatim_pin(
@@ -324,6 +468,12 @@ class VerbatimPinService:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any] | None:
         repository = VerbatimPinRepository(connection, self.runtime.clock)
         await connection.execute("BEGIN")
@@ -349,6 +499,12 @@ class VerbatimPinService:
                 incognito=incognito,
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
                 commit=False,
             )
             await connection.commit()
@@ -370,6 +526,12 @@ class VerbatimPinService:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any] | None:
         repository = VerbatimPinRepository(connection, self.runtime.clock)
         await connection.execute("BEGIN")
@@ -384,6 +546,12 @@ class VerbatimPinService:
                 incognito=incognito,
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
                 commit=False,
             )
             await connection.commit()
@@ -412,6 +580,12 @@ class VerbatimPinService:
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> list[dict[str, Any]]:
         return await VerbatimPinRepository(connection, self.runtime.clock).search_active_verbatim_pins(
             user_id=user_id,
@@ -430,6 +604,12 @@ class VerbatimPinService:
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
         )
 
     @staticmethod
@@ -482,6 +662,12 @@ class VerbatimPinService:
         incognito: bool | None = None,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any] | None:
         memories = MemoryObjectRepository(connection, self.runtime.clock)
 
@@ -495,6 +681,12 @@ class VerbatimPinService:
                 platform_id=platform_id,
                 character_id=character_id,
                 incognito=incognito,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
             )
         if target_kind is VerbatimPinTargetKind.MEMORY_OBJECT:
             if platform_id is not None and conversation_id is not None:
@@ -509,6 +701,12 @@ class VerbatimPinService:
                     remember_across_chats=remember_across_chats,
                     remember_across_devices=remember_across_devices,
                     sensitivity_gates_enabled=True,
+                    active_space_id=active_space_id,
+                    active_space_boundary_mode=active_space_boundary_mode,
+                    active_mind_id=active_mind_id,
+                    mind_topology=mind_topology,
+                    active_embodiment_id=active_embodiment_id,
+                    active_realm_id=active_realm_id,
                 )
             return await memories.get_memory_object(target_id, user_id)
         message = await self._load_message_source_row(
@@ -520,6 +718,12 @@ class VerbatimPinService:
             platform_id=platform_id,
             character_id=character_id,
             incognito=incognito,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
         )
         if message is not None:
             return message
@@ -535,6 +739,12 @@ class VerbatimPinService:
                 remember_across_chats=remember_across_chats,
                 remember_across_devices=remember_across_devices,
                 sensitivity_gates_enabled=True,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
             )
         return await memories.get_memory_object(target_id, user_id)
 
@@ -549,6 +759,12 @@ class VerbatimPinService:
         platform_id: str | None,
         character_id: str | None,
         incognito: bool | None,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any] | None:
         clauses = ["m.id = ?", "c.user_id = ?"]
         parameters: list[Any] = [message_id, user_id]
@@ -565,6 +781,28 @@ class VerbatimPinService:
             if incognito is not None:
                 clauses.append("c.incognito = ?")
                 parameters.append(1 if incognito else 0)
+        space_clause, space_parameters = self._message_space_visibility_clause(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+        )
+        clauses.append(space_clause)
+        parameters.extend(space_parameters)
+        mind_clause, mind_parameters = self._message_mind_visibility_clause(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+        )
+        clauses.append(mind_clause)
+        parameters.extend(mind_parameters)
+        embodiment_clause, embodiment_parameters = self._message_embodiment_visibility_clause(
+            active_embodiment_id=active_embodiment_id,
+        )
+        clauses.append(embodiment_clause)
+        parameters.extend(embodiment_parameters)
+        realm_clause, realm_parameters = self._message_realm_visibility_clause(
+            active_realm_id=active_realm_id,
+        )
+        clauses.append(realm_clause)
+        parameters.extend(realm_parameters)
         cursor = await connection.execute(
             """
             SELECT
@@ -575,9 +813,16 @@ class VerbatimPinService:
                 c.platform_id AS platform_id,
                 c.character_id AS character_id,
                 c.mode AS mode,
-                c.incognito AS incognito_snapshot
+                c.incognito AS incognito_snapshot,
+                sp.boundary_mode AS space_boundary_mode,
+                sp.display_name AS space_display_name,
+                m.active_embodiment_id AS embodiment_id,
+                m.active_realm_id AS realm_id
             FROM messages AS m
             JOIN conversations AS c ON c.id = m.conversation_id
+            LEFT JOIN spaces AS sp
+              ON sp.owner_user_id = c.user_id
+             AND sp.id = m.space_id
             WHERE {where_clause}
             """.format(where_clause=" AND ".join(clauses)),
             tuple(parameters),
@@ -595,6 +840,10 @@ class VerbatimPinService:
         incognito: bool | None,
         remember_across_chats: bool,
         remember_across_devices: bool,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> dict[str, Any]:
         payload = dict(payload_json or {})
         if user_persona_id is not None:
@@ -608,6 +857,9 @@ class VerbatimPinService:
             or user_persona_id is not None
             or platform_id is not None
             or character_id is not None
+            or active_mind_id is not None
+            or active_embodiment_id is not None
+            or active_realm_id is not None
         ):
             raw_policy = payload.get("source_turn_policy") or payload.get("policy_snapshot_json")
             policy = dict(raw_policy) if isinstance(raw_policy, dict) else {}
@@ -615,6 +867,16 @@ class VerbatimPinService:
                 policy["incognito"] = bool(incognito)
             policy["remember_across_chats"] = bool(remember_across_chats)
             policy["remember_across_devices"] = bool(remember_across_devices)
+            if active_mind_id is not None:
+                policy["active_mind_id"] = active_mind_id
+                policy["source_mind_id"] = active_mind_id
+                policy["mind_topology"] = mind_topology or MindTopology.UNIMIND.value
+            if active_embodiment_id is not None:
+                policy["active_embodiment_id"] = active_embodiment_id
+                policy["cross_embodiment_mode"] = "direct_if_same_body"
+            if active_realm_id is not None:
+                policy["active_realm_id"] = active_realm_id
+                policy["cross_realm_mode"] = "none"
             payload["source_turn_policy"] = policy
         return payload
 
@@ -744,6 +1006,347 @@ class VerbatimPinService:
             "policy_snapshot": source_policy,
         }
 
+    async def _active_space_context(
+        self,
+        connection: Any,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        active_space_id: str | None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None,
+    ) -> dict[str, str | None]:
+        resolved_space_id = _normalize_text(active_space_id)
+        resolved_boundary_mode = _normalize_space_boundary_mode(active_space_boundary_mode)
+
+        if resolved_space_id is None and conversation_id is not None:
+            conversation = await ConversationRepository(
+                connection,
+                self.runtime.clock,
+            ).get_conversation(conversation_id, user_id)
+            if conversation is not None:
+                resolved_space_id = _normalize_text(conversation.get("active_space_id"))
+
+        if resolved_space_id is not None and resolved_boundary_mode is None:
+            space_row = await SpaceRepository(connection, self.runtime.clock).get_space(
+                owner_user_id=user_id,
+                space_id=resolved_space_id,
+            )
+            if space_row is not None:
+                resolved_boundary_mode = space_snapshot(space_row).boundary_mode.value
+
+        return {
+            "space_id": resolved_space_id,
+            "space_boundary_mode": resolved_boundary_mode,
+        }
+
+    async def _source_space_snapshot(
+        self,
+        connection: Any,
+        *,
+        user_id: str,
+        source_row: dict[str, Any] | None,
+        payload_json: dict[str, Any] | None,
+        active_space_id: str | None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None,
+        conversation_id: str | None,
+    ) -> dict[str, str | None]:
+        payload = payload_json or {}
+        payload_boundary = payload.get("space_boundary")
+        if not isinstance(payload_boundary, dict):
+            payload_boundary = {}
+
+        resolved_space_id = (
+            _normalize_text(self._source_value(source_row, payload, "space_id", "space_id"))
+            or _normalize_text(payload_boundary.get("active_space_id"))
+            or _normalize_text(payload_boundary.get("space_id"))
+            or _normalize_text(active_space_id)
+        )
+        resolved_boundary_mode = (
+            _normalize_space_boundary_mode(
+                self._source_value(
+                    source_row,
+                    payload,
+                    "space_boundary_mode",
+                    "space_boundary_mode",
+                )
+            )
+            or _normalize_space_boundary_mode(payload_boundary.get("boundary_mode"))
+            or _normalize_space_boundary_mode(active_space_boundary_mode)
+        )
+        resolved_display_name = (
+            _normalize_text(
+                self._source_value(source_row, payload, "space_display_name", "space_display_name")
+            )
+            or _normalize_text(payload_boundary.get("display_name"))
+        )
+
+        if resolved_space_id is None and conversation_id is not None:
+            conversation = await ConversationRepository(
+                connection,
+                self.runtime.clock,
+            ).get_conversation(conversation_id, user_id)
+            if conversation is not None:
+                resolved_space_id = _normalize_text(conversation.get("active_space_id"))
+
+        if resolved_space_id is not None and (
+            resolved_boundary_mode is None or resolved_display_name is None
+        ):
+            space_row = await SpaceRepository(connection, self.runtime.clock).get_space(
+                owner_user_id=user_id,
+                space_id=resolved_space_id,
+            )
+            if space_row is not None:
+                snapshot = space_snapshot(space_row)
+                resolved_boundary_mode = resolved_boundary_mode or snapshot.boundary_mode.value
+                resolved_display_name = resolved_display_name or snapshot.display_name
+
+        if resolved_space_id is None:
+            return {"space_id": None, "space_boundary_mode": None, "display_name": None}
+        return {
+            "space_id": resolved_space_id,
+            "space_boundary_mode": resolved_boundary_mode or SpaceBoundaryMode.FOCUS.value,
+            "display_name": resolved_display_name,
+        }
+
+    async def _active_mind_context(
+        self,
+        connection: Any,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        active_mind_id: str | None,
+        mind_topology: MindTopology | str | None,
+    ) -> dict[str, str | None]:
+        resolved_mind_id = _normalize_text(active_mind_id)
+        resolved_topology = _normalize_mind_topology(mind_topology)
+
+        if conversation_id is not None and (resolved_mind_id is None or resolved_topology is None):
+            conversation = await ConversationRepository(
+                connection,
+                self.runtime.clock,
+            ).get_conversation(conversation_id, user_id)
+            if conversation is not None:
+                resolved_mind_id = resolved_mind_id or _normalize_text(
+                    conversation.get("active_mind_id")
+                )
+                resolved_topology = resolved_topology or _normalize_mind_topology(
+                    conversation.get("mind_topology")
+                )
+
+        return {
+            "active_mind_id": resolved_mind_id,
+            "mind_topology": resolved_topology or MindTopology.UNIMIND.value,
+        }
+
+    async def _active_embodiment_context(
+        self,
+        connection: Any,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        active_embodiment_id: str | None,
+    ) -> dict[str, str | None]:
+        resolved_embodiment_id = _normalize_text(active_embodiment_id)
+        if resolved_embodiment_id is None and conversation_id is not None:
+            conversation = await ConversationRepository(
+                connection,
+                self.runtime.clock,
+            ).get_conversation(conversation_id, user_id)
+            if conversation is not None:
+                resolved_embodiment_id = _normalize_text(
+                    conversation.get("active_embodiment_id")
+                )
+        return {"active_embodiment_id": resolved_embodiment_id}
+
+    async def _active_realm_context(
+        self,
+        connection: Any,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        active_realm_id: str | None,
+    ) -> dict[str, str | None]:
+        resolved_realm_id = _normalize_text(active_realm_id)
+        if resolved_realm_id is None and conversation_id is not None:
+            conversation = await ConversationRepository(
+                connection,
+                self.runtime.clock,
+            ).get_conversation(conversation_id, user_id)
+            if conversation is not None:
+                resolved_realm_id = _normalize_text(
+                    conversation.get("active_realm_id")
+                )
+        return {"active_realm_id": resolved_realm_id}
+
+    @staticmethod
+    def _source_mind_snapshot(
+        *,
+        source_row: dict[str, Any] | None,
+        payload_json: dict[str, Any] | None,
+        active_mind_id: str | None,
+        mind_topology: str | None,
+    ) -> dict[str, str | None]:
+        payload = payload_json or {}
+        mind_payload = payload.get("mind_perspective")
+        if not isinstance(mind_payload, dict):
+            mind_payload = {}
+        memory_owner_id = (
+            _normalize_text(
+                VerbatimPinService._source_value(
+                    source_row,
+                    payload,
+                    "memory_owner_id",
+                    "memory_owner_id",
+                )
+            )
+            or _normalize_text(
+                VerbatimPinService._source_value(
+                    source_row,
+                    payload,
+                    "active_mind_id",
+                    "active_mind_id",
+                )
+            )
+            or _normalize_text(mind_payload.get("memory_owner_id"))
+            or _normalize_text(active_mind_id)
+        )
+        source_mind_id = (
+            _normalize_text(
+                VerbatimPinService._source_value(
+                    source_row,
+                    payload,
+                    "source_mind_id",
+                    "source_mind_id",
+                )
+            )
+            or _normalize_text(mind_payload.get("source_mind_id"))
+            or memory_owner_id
+        )
+        return {
+            "memory_owner_id": memory_owner_id,
+            "source_mind_id": source_mind_id,
+            "mind_topology": (
+                _normalize_mind_topology(mind_payload.get("mind_topology"))
+                or _normalize_mind_topology(mind_topology)
+                or MindTopology.UNIMIND.value
+            ),
+        }
+
+    @staticmethod
+    def _source_embodiment_snapshot(
+        *,
+        source_row: dict[str, Any] | None,
+        payload_json: dict[str, Any] | None,
+        active_embodiment_id: str | None,
+    ) -> dict[str, str | None]:
+        payload = payload_json or {}
+        embodiment_payload = payload.get("embodiment")
+        if not isinstance(embodiment_payload, dict):
+            embodiment_payload = {}
+        embodiment_id = (
+            _normalize_text(
+                VerbatimPinService._source_value(
+                    source_row,
+                    payload,
+                    "embodiment_id",
+                    "active_embodiment_id",
+                )
+            )
+            or _normalize_text(embodiment_payload.get("active_embodiment_id"))
+            or _normalize_text(active_embodiment_id)
+        )
+        return {"embodiment_id": embodiment_id}
+
+    @staticmethod
+    def _source_realm_snapshot(
+        *,
+        source_row: dict[str, Any] | None,
+        payload_json: dict[str, Any] | None,
+        active_realm_id: str | None,
+    ) -> dict[str, str | None]:
+        payload = payload_json or {}
+        realm_payload = payload.get("realm")
+        if not isinstance(realm_payload, dict):
+            realm_payload = {}
+        realm_id = (
+            _normalize_text(
+                VerbatimPinService._source_value(
+                    source_row,
+                    payload,
+                    "realm_id",
+                    "active_realm_id",
+                )
+            )
+            or _normalize_text(realm_payload.get("active_realm_id"))
+            or _normalize_text(active_realm_id)
+        )
+        return {"realm_id": realm_id}
+
+    @staticmethod
+    def _message_space_visibility_clause(
+        *,
+        active_space_id: str | None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None,
+    ) -> tuple[str, list[Any]]:
+        if active_space_id is None:
+            return (
+                "(m.space_id IS NULL OR COALESCE(sp.boundary_mode, 'focus') IN ('focus', 'tagged'))",
+                [],
+            )
+
+        active_mode = _normalize_space_boundary_mode(active_space_boundary_mode)
+        if active_mode == SpaceBoundaryMode.SEVERANCE.value:
+            return "(m.space_id = ?)", [active_space_id]
+        if active_mode == SpaceBoundaryMode.TAGGED.value:
+            return (
+                "(m.space_id IS NULL OR m.space_id = ? OR COALESCE(sp.boundary_mode, 'focus') IN ('focus', 'tagged'))",
+                [active_space_id],
+            )
+        return (
+            "(m.space_id IS NULL OR m.space_id = ? OR COALESCE(sp.boundary_mode, 'focus') = 'tagged')",
+            [active_space_id],
+        )
+
+    @staticmethod
+    def _message_mind_visibility_clause(
+        *,
+        active_mind_id: str | None,
+        mind_topology: MindTopology | str | None,
+    ) -> tuple[str, list[Any]]:
+        normalized_active_mind = _normalize_text(active_mind_id)
+        if normalized_active_mind is None:
+            return "(m.active_mind_id IS NULL)", []
+        topology = _normalize_mind_topology(mind_topology) or MindTopology.UNIMIND.value
+        if topology == MindTopology.UNIMIND.value:
+            return "(m.active_mind_id IS NULL OR m.active_mind_id = ?)", [normalized_active_mind]
+        return "(m.active_mind_id = ?)", [normalized_active_mind]
+
+    @staticmethod
+    def _message_embodiment_visibility_clause(
+        *,
+        active_embodiment_id: str | None,
+    ) -> tuple[str, list[Any]]:
+        normalized_active_embodiment = _normalize_text(active_embodiment_id)
+        if normalized_active_embodiment is None:
+            return "(m.active_embodiment_id IS NULL)", []
+        return (
+            "(m.active_embodiment_id IS NULL OR m.active_embodiment_id = ?)",
+            [normalized_active_embodiment],
+        )
+
+    @staticmethod
+    def _message_realm_visibility_clause(
+        *,
+        active_realm_id: str | None,
+    ) -> tuple[str, list[Any]]:
+        normalized_active_realm = _normalize_text(active_realm_id)
+        if normalized_active_realm is None:
+            return "(m.active_realm_id IS NULL)", []
+        return (
+            "(m.active_realm_id IS NULL OR m.active_realm_id = ?)",
+            [normalized_active_realm],
+        )
+
     @staticmethod
     def _source_value(
         source_row: dict[str, Any] | None,
@@ -822,6 +1425,14 @@ class VerbatimPinService:
                 "role": source_row.get("role"),
                 "seq": source_row.get("seq"),
                 "occurred_at": source_row.get("occurred_at"),
+                "space_id": source_row.get("space_id"),
+                "space_boundary_mode": source_row.get("space_boundary_mode"),
+                "active_mind_id": source_row.get("active_mind_id"),
+                "source_mind_id": source_row.get("source_mind_id"),
+                "active_embodiment_id": source_row.get("embodiment_id")
+                or source_row.get("active_embodiment_id"),
+                "active_realm_id": source_row.get("realm_id")
+                or source_row.get("active_realm_id"),
             }
         if target_kind is VerbatimPinTargetKind.MEMORY_OBJECT:
             return {
@@ -831,6 +1442,12 @@ class VerbatimPinService:
                 "assistant_mode_id": source_row.get("assistant_mode_id"),
                 "workspace_id": source_row.get("workspace_id"),
                 "conversation_id": source_row.get("conversation_id"),
+                "space_id": source_row.get("space_id"),
+                "space_boundary_mode": source_row.get("space_boundary_mode"),
+                "memory_owner_id": source_row.get("memory_owner_id"),
+                "source_mind_id": source_row.get("source_mind_id"),
+                "embodiment_id": source_row.get("embodiment_id"),
+                "realm_id": source_row.get("realm_id"),
             }
         return {
             "source_id": str(source_row.get("id") or target_id),

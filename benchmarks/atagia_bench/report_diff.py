@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from benchmarks.atagia_bench.runner import AtagiaBenchReport, AtagiaQuestionResult
 from benchmarks.custody_summary import (
@@ -48,6 +48,8 @@ class QuestionDiff(BaseModel):
     after_diagnosis_bucket: str | None = None
     before_sufficiency_diagnostic: str | None = None
     after_sufficiency_diagnostic: str | None = None
+    before_failure_stage: str | None = None
+    after_failure_stage: str | None = None
     before_selected_memory_ids: list[str] = Field(default_factory=list)
     after_selected_memory_ids: list[str] = Field(default_factory=list)
     before_selected_evidence_memory_ids: list[str] = Field(default_factory=list)
@@ -71,7 +73,7 @@ class CategoryDelta(BaseModel):
 class AtagiaBenchDiffReport(BaseModel):
     """Structured diff between two Atagia-bench reports."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     before_label: str
     after_label: str
@@ -93,8 +95,20 @@ class AtagiaBenchDiffReport(BaseModel):
     net_unchanged: int = Field(ge=0)
     net_added: int = Field(ge=0)
     net_removed: int = Field(ge=0)
-    before_critical_errors: int = Field(ge=0)
-    after_critical_errors: int = Field(ge=0)
+    before_priority_failures: int = Field(
+        ge=0,
+        validation_alias=AliasChoices(
+            "before_priority_failures",
+            "before_critical_errors",
+        ),
+    )
+    after_priority_failures: int = Field(
+        ge=0,
+        validation_alias=AliasChoices(
+            "after_priority_failures",
+            "after_critical_errors",
+        ),
+    )
     before_warning_counts: dict[str, int] = Field(default_factory=dict)
     after_warning_counts: dict[str, int] = Field(default_factory=dict)
     warning_count_deltas: dict[str, int] = Field(default_factory=dict)
@@ -104,6 +118,9 @@ class AtagiaBenchDiffReport(BaseModel):
     before_sufficiency_diagnostic_counts: dict[str, int] = Field(default_factory=dict)
     after_sufficiency_diagnostic_counts: dict[str, int] = Field(default_factory=dict)
     sufficiency_diagnostic_count_deltas: dict[str, int] = Field(default_factory=dict)
+    before_failure_stage_counts: dict[str, int] = Field(default_factory=dict)
+    after_failure_stage_counts: dict[str, int] = Field(default_factory=dict)
+    failure_stage_count_deltas: dict[str, int] = Field(default_factory=dict)
     before_retrieval_custody_summary: dict[str, object] = Field(
         default_factory=lambda: summarize_retrieval_custody([])
     )
@@ -130,6 +147,16 @@ class AtagiaBenchDiffReport(BaseModel):
     )
     category_deltas: list[CategoryDelta] = Field(default_factory=list)
     question_diffs: list[QuestionDiff] = Field(default_factory=list)
+
+    @property
+    def before_critical_errors(self) -> int:
+        """Legacy compatibility for diffs emitted before the terminology rename."""
+        return self.before_priority_failures
+
+    @property
+    def after_critical_errors(self) -> int:
+        """Legacy compatibility for diffs emitted before the terminology rename."""
+        return self.after_priority_failures
 
 
 def load_atagia_bench_report(path: str | Path) -> AtagiaBenchReport:
@@ -210,6 +237,16 @@ def build_diff(
     after_diagnosis_counts = _trace_field_counts(after, "diagnosis_bucket")
     before_sufficiency_counts = _trace_field_counts(before, "sufficiency_diagnostic")
     after_sufficiency_counts = _trace_field_counts(after, "sufficiency_diagnostic")
+    before_failure_stage_counts = _trace_field_counts(
+        before,
+        "failure_stage",
+        include_unknown=False,
+    )
+    after_failure_stage_counts = _trace_field_counts(
+        after,
+        "failure_stage",
+        include_unknown=False,
+    )
     before_retrieval_custody_summary = _retrieval_custody_summary(before)
     after_retrieval_custody_summary = _retrieval_custody_summary(after)
 
@@ -234,8 +271,8 @@ def build_diff(
         net_unchanged=unchanged,
         net_added=added,
         net_removed=removed,
-        before_critical_errors=before.critical_error_count,
-        after_critical_errors=after.critical_error_count,
+        before_priority_failures=before.priority_failure_count,
+        after_priority_failures=after.priority_failure_count,
         before_warning_counts=before_warning_counts,
         after_warning_counts=after_warning_counts,
         warning_count_deltas=_count_deltas(before_warning_counts, after_warning_counts),
@@ -250,6 +287,12 @@ def build_diff(
         sufficiency_diagnostic_count_deltas=_count_deltas(
             before_sufficiency_counts,
             after_sufficiency_counts,
+        ),
+        before_failure_stage_counts=before_failure_stage_counts,
+        after_failure_stage_counts=after_failure_stage_counts,
+        failure_stage_count_deltas=_count_deltas(
+            before_failure_stage_counts,
+            after_failure_stage_counts,
         ),
         before_retrieval_custody_summary=before_retrieval_custody_summary,
         after_retrieval_custody_summary=after_retrieval_custody_summary,
@@ -304,7 +347,8 @@ def format_diff_summary(diff: AtagiaBenchDiffReport) -> str:
         f"({diff.pass_rate_delta:+.1%})",
         f"Avg score: {diff.before_avg_score:.3f} -> {diff.after_avg_score:.3f} "
         f"({diff.avg_score_delta:+.3f})",
-        f"Critical errors: {diff.before_critical_errors} -> {diff.after_critical_errors}",
+        "Priority failures: "
+        f"{diff.before_priority_failures} -> {diff.after_priority_failures}",
         "",
         "Retrieval custody:",
         f"  Before: {_format_custody_summary_for_diff(diff.before_retrieval_custody_summary)}",
@@ -314,6 +358,12 @@ def format_diff_summary(diff: AtagiaBenchDiffReport) -> str:
         f"Unchanged: {diff.net_unchanged}",
         f"Added: {diff.net_added}  Removed: {diff.net_removed}",
     ]
+    failure_stage_delta_line = _format_count_deltas(
+        "Failure stage deltas",
+        diff.failure_stage_count_deltas,
+    )
+    if failure_stage_delta_line is not None:
+        lines.append(failure_stage_delta_line)
 
     # Show flipped questions
     flipped = [
@@ -410,6 +460,8 @@ def _build_question_diff(
         after_diagnosis_bucket=_trace_text(after, "diagnosis_bucket"),
         before_sufficiency_diagnostic=_trace_text(before, "sufficiency_diagnostic"),
         after_sufficiency_diagnostic=_trace_text(after, "sufficiency_diagnostic"),
+        before_failure_stage=_trace_text(before, "failure_stage"),
+        after_failure_stage=_trace_text(after, "failure_stage"),
         before_selected_memory_ids=_trace_list(before, "selected_memory_ids"),
         after_selected_memory_ids=_trace_list(after, "selected_memory_ids"),
         before_selected_evidence_memory_ids=_trace_list(
@@ -506,12 +558,19 @@ def _warning_counts(report: AtagiaBenchReport) -> dict[str, int]:
     return counts
 
 
-def _trace_field_counts(report: AtagiaBenchReport, field_name: str) -> dict[str, int]:
+def _trace_field_counts(
+    report: AtagiaBenchReport,
+    field_name: str,
+    *,
+    include_unknown: bool = True,
+) -> dict[str, int]:
     counts: dict[str, int] = {}
     for result in report.per_question:
         trace = result.trace if isinstance(result.trace, dict) else {}
         raw_value = trace.get(field_name)
         value = str(raw_value).strip() if raw_value is not None else ""
+        if not value and not include_unknown:
+            continue
         key = value or "unknown"
         counts[key] = counts.get(key, 0) + 1
     return dict(sorted(counts.items()))
@@ -530,3 +589,14 @@ def _count_deltas(before_counts: dict[str, int], after_counts: dict[str, int]) -
         key: after_counts.get(key, 0) - before_counts.get(key, 0)
         for key in sorted(set(before_counts) | set(after_counts))
     }
+
+
+def _format_count_deltas(label: str, value: dict[str, int]) -> str | None:
+    parts = [
+        f"{key}={amount:+d}"
+        for key, amount in sorted(value.items())
+        if amount != 0
+    ]
+    if not parts:
+        return None
+    return f"{label}: " + ", ".join(parts)

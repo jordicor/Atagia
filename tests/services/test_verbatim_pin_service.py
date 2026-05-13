@@ -11,11 +11,13 @@ from atagia.app import AppRuntime, initialize_runtime
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
+from atagia.core.space_repository import SpaceRepository
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
     MemoryObjectType,
     MemoryScope,
     MemorySourceKind,
+    SpaceBoundaryMode,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
@@ -229,6 +231,201 @@ async def test_verbatim_pin_service_search_respects_conversation_scope(
 
             assert [row["target_id"] for row in same_conversation] == ["msg_1"]
             assert other_conversation == []
+        finally:
+            await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("space_id", "boundary_mode"),
+    [
+        ("space_vault", SpaceBoundaryMode.PRIVACY_VAULT),
+        ("space_severed", SpaceBoundaryMode.SEVERANCE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_verbatim_pin_service_enforces_space_boundaries_for_crud_and_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    space_id: str,
+    boundary_mode: SpaceBoundaryMode,
+) -> None:
+    runtime = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        connection = await runtime.open_connection()
+        try:
+            users = UserRepository(connection, runtime.clock)
+            conversations = ConversationRepository(connection, runtime.clock)
+            spaces = SpaceRepository(connection, runtime.clock)
+            service = VerbatimPinService(runtime)
+
+            await users.create_user("usr_1")
+            await spaces.resolve_space(
+                owner_user_id="usr_1",
+                space_id=space_id,
+                boundary_mode=boundary_mode,
+                display_name=space_id,
+                source_kind="explicit",
+                source_id=space_id,
+            )
+            await conversations.create_conversation(
+                "cnv_outside",
+                "usr_1",
+                None,
+                "coding_debug",
+                "Outside",
+                platform_id="web",
+            )
+            await conversations.create_conversation(
+                "cnv_inside",
+                "usr_1",
+                None,
+                "coding_debug",
+                "Inside",
+                platform_id="web",
+                active_space_id=space_id,
+            )
+
+            created_by_operation = {}
+            for operation in ("get", "edit", "delete"):
+                created_by_operation[operation] = await service.create_verbatim_pin(
+                    connection,
+                    user_id="usr_1",
+                    scope=MemoryScope.GLOBAL_USER,
+                    target_kind=VerbatimPinTargetKind.TEXT_SPAN,
+                    target_id=f"{operation}_{space_id}",
+                    conversation_id="cnv_inside",
+                    platform_id="web",
+                    active_space_id=space_id,
+                    active_space_boundary_mode=boundary_mode,
+                    canonical_text=f"{operation} boundary pin phrase for {space_id}",
+                    index_text=f"{operation} boundary pin phrase",
+                    privacy_level=0,
+                    created_by="usr_1",
+                )
+                assert created_by_operation[operation]["space_id"] == space_id
+                assert created_by_operation[operation]["space_boundary_mode"] == boundary_mode.value
+
+            derived = await service.create_verbatim_pin(
+                connection,
+                user_id="usr_1",
+                scope=MemoryScope.GLOBAL_USER,
+                target_kind=VerbatimPinTargetKind.TEXT_SPAN,
+                target_id=f"derived_{space_id}",
+                conversation_id="cnv_inside",
+                platform_id="web",
+                canonical_text=f"derived boundary pin phrase for {space_id}",
+                index_text="derived boundary pin phrase",
+                privacy_level=0,
+                created_by="usr_1",
+            )
+            assert derived["space_id"] == space_id
+            assert derived["space_boundary_mode"] == boundary_mode.value
+            expected_visible_ids = {
+                row["id"] for row in created_by_operation.values()
+            } | {derived["id"]}
+
+            outside_context = {
+                "conversation_id": "cnv_outside",
+                "platform_id": "web",
+                "active_space_id": None,
+                "active_space_boundary_mode": None,
+            }
+            inside_context = {
+                "conversation_id": "cnv_inside",
+                "platform_id": "web",
+                "active_space_id": space_id,
+                "active_space_boundary_mode": boundary_mode,
+            }
+
+            outside_list = await service.list_verbatim_pins(
+                connection,
+                user_id="usr_1",
+                **outside_context,
+            )
+            assert outside_list == []
+
+            outside_search = await service.search_active_verbatim_pins(
+                connection,
+                user_id="usr_1",
+                query="boundary pin phrase",
+                privacy_ceiling=0,
+                scope_filter=[MemoryScope.GLOBAL_USER],
+                assistant_mode_id="coding_debug",
+                workspace_id=None,
+                limit=10,
+                **outside_context,
+            )
+            assert outside_search == []
+
+            assert await service.get_verbatim_pin(
+                connection,
+                user_id="usr_1",
+                pin_id=created_by_operation["get"]["id"],
+                **outside_context,
+            ) is None
+            assert await service.update_verbatim_pin(
+                connection,
+                user_id="usr_1",
+                pin_id=created_by_operation["edit"]["id"],
+                canonical_text="outside edit must not land",
+                **outside_context,
+            ) is None
+            assert await service.delete_verbatim_pin(
+                connection,
+                user_id="usr_1",
+                pin_id=created_by_operation["delete"]["id"],
+                **outside_context,
+            ) is None
+
+            inside_list = await service.list_verbatim_pins(
+                connection,
+                user_id="usr_1",
+                **inside_context,
+            )
+            assert {row["id"] for row in inside_list} == expected_visible_ids
+
+            inside_search = await service.search_active_verbatim_pins(
+                connection,
+                user_id="usr_1",
+                query="boundary pin phrase",
+                privacy_ceiling=0,
+                scope_filter=[MemoryScope.GLOBAL_USER],
+                assistant_mode_id="coding_debug",
+                workspace_id=None,
+                limit=10,
+                **inside_context,
+            )
+            assert {row["id"] for row in inside_search} == expected_visible_ids
+
+            inside_get = await service.get_verbatim_pin(
+                connection,
+                user_id="usr_1",
+                pin_id=created_by_operation["get"]["id"],
+                **inside_context,
+            )
+            assert inside_get is not None
+            assert inside_get["canonical_text"] == f"get boundary pin phrase for {space_id}"
+
+            inside_edit = await service.update_verbatim_pin(
+                connection,
+                user_id="usr_1",
+                pin_id=created_by_operation["edit"]["id"],
+                canonical_text="inside edit is allowed",
+                **inside_context,
+            )
+            assert inside_edit is not None
+            assert inside_edit["canonical_text"] == "inside edit is allowed"
+
+            inside_delete = await service.delete_verbatim_pin(
+                connection,
+                user_id="usr_1",
+                pin_id=created_by_operation["delete"]["id"],
+                **inside_context,
+            )
+            assert inside_delete is not None
+            assert inside_delete["status"] == VerbatimPinStatus.DELETED.value
         finally:
             await connection.close()
     finally:

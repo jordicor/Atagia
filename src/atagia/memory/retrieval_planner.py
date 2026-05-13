@@ -231,6 +231,15 @@ class RetrievalPlanner:
                 if conversation_context.character_id is not None
                 else conversation_context.workspace_id
             ),
+            active_presence_id=conversation_context.active_presence_id,
+            active_space_id=conversation_context.active_space_id,
+            active_space_boundary_mode=conversation_context.active_space_boundary_mode,
+            active_mind_id=conversation_context.active_mind_id,
+            mind_topology=conversation_context.mind_topology,
+            active_embodiment_id=conversation_context.active_embodiment_id,
+            cross_embodiment_mode=conversation_context.cross_embodiment_mode,
+            active_realm_id=conversation_context.active_realm_id,
+            cross_realm_mode=conversation_context.cross_realm_mode,
             incognito=conversation_context.incognito or conversation_context.isolated_mode,
             remember_across_chats=conversation_context.remember_across_chats,
             remember_across_devices=conversation_context.remember_across_devices,
@@ -246,6 +255,7 @@ class RetrievalPlanner:
             max_context_items=resolved_policy.retrieval_params.final_context_items,
             privacy_ceiling=resolved_policy.privacy_ceiling,
             allow_intimacy_context=resolved_policy.allow_intimacy_context,
+            allow_private_sensitivity=resolved_policy.allow_private_sensitivity,
             retrieval_levels=list(query_intelligence.retrieval_levels),
             temporal_query_range=query_intelligence.temporal_range,
             consequence_search_enabled=False,

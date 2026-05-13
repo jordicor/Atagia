@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Iterable
 
+from atagia.core.artifact_payload_repository import ArtifactPayloadRepository
 from atagia.core.ids import generate_prefixed_id
 from atagia.core.repositories import (
     BaseRepository,
@@ -18,11 +19,16 @@ from atagia.memory.intimacy_boundary_policy import (
     memory_object_intimacy_sql_clause,
     normalize_intimacy_boundary,
 )
+from atagia.memory.embodiment_policy import embodiment_visibility_sql_clause_for_context
+from atagia.memory.mind_policy import mind_visibility_sql_clause_for_context
+from atagia.memory.realm_policy import realm_visibility_sql_clause_for_context
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
     MemoryCategory,
     MemoryScope,
     MemorySensitivity,
+    MindTopology,
+    SpaceBoundaryMode,
 )
 
 
@@ -36,6 +42,47 @@ def _canonical_artifact_scope(
     if workspace_id is not None:
         return MemoryScope.CHARACTER.value
     return MemoryScope.USER.value
+
+
+def _artifact_source_space_visibility_clause(
+    *,
+    active_space_id: str | None,
+    active_space_boundary_mode: SpaceBoundaryMode | str | None,
+) -> tuple[str, list[Any]]:
+    """Return Space visibility SQL for artifacts via their source message."""
+
+    space_expr = "source_message.space_id"
+    boundary_expr = "COALESCE(source_space.boundary_mode, 'focus')"
+    if active_space_id is None:
+        return (
+            f"({space_expr} IS NULL OR {boundary_expr} IN ('focus', 'tagged'))",
+            [],
+        )
+
+    mode = _space_boundary_mode(active_space_boundary_mode)
+    if mode is SpaceBoundaryMode.SEVERANCE:
+        return f"({space_expr} = ?)", [active_space_id]
+
+    if mode is SpaceBoundaryMode.TAGGED:
+        return (
+            f"({space_expr} IS NULL OR {space_expr} = ? "
+            f"OR {boundary_expr} IN ('focus', 'tagged'))",
+            [active_space_id],
+        )
+
+    return (
+        f"({space_expr} IS NULL OR {space_expr} = ? OR {boundary_expr} = 'tagged')",
+        [active_space_id],
+    )
+
+
+def _space_boundary_mode(value: SpaceBoundaryMode | str | None) -> SpaceBoundaryMode:
+    if isinstance(value, SpaceBoundaryMode):
+        return value
+    try:
+        return SpaceBoundaryMode(str(value or SpaceBoundaryMode.FOCUS.value))
+    except ValueError:
+        return SpaceBoundaryMode.FOCUS
 
 
 class ArtifactRepository(BaseRepository):
@@ -73,6 +120,7 @@ class ArtifactRepository(BaseRepository):
         storage_uri: str | None = None,
         blob_byte_size: int | None = None,
         blob_sha256: str | None = None,
+        payload_blob_id: str | None = None,
         user_persona_id: str | None = None,
         platform_id: str | None = None,
         character_id: str | None = None,
@@ -85,6 +133,10 @@ class ArtifactRepository(BaseRepository):
         remember_across_chats_snapshot: bool = True,
         remember_across_devices_snapshot: bool = True,
         policy_snapshot: dict[str, Any] | None = None,
+        memory_owner_id: str | None = None,
+        source_mind_id: str | None = None,
+        embodiment_id: str | None = None,
+        realm_id: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_artifact_id = artifact_id or generate_prefixed_id("art")
@@ -99,6 +151,13 @@ class ArtifactRepository(BaseRepository):
             conversation_id=conversation_id,
         )
         timestamp = self._timestamp()
+        if payload_blob_id is not None:
+            payload = await ArtifactPayloadRepository(self._connection, self._clock).get_payload_blob(
+                payload_blob_id,
+                user_id,
+            )
+            if payload is None:
+                raise ValueError("Artifact payload blob does not exist for user")
         await self._connection.execute(
             """
             INSERT INTO artifacts(
@@ -126,6 +185,7 @@ class ArtifactRepository(BaseRepository):
                 metadata_json,
                 summary_text,
                 index_text,
+                payload_blob_id,
                 user_persona_id,
                 platform_id,
                 character_id,
@@ -138,11 +198,15 @@ class ArtifactRepository(BaseRepository):
                 remember_across_chats_snapshot,
                 remember_across_devices_snapshot,
                 policy_snapshot_json,
+                memory_owner_id,
+                source_mind_id,
+                embodiment_id,
+                realm_id,
                 created_at,
                 updated_at,
                 deleted_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """,
             (
                 resolved_artifact_id,
@@ -169,6 +233,7 @@ class ArtifactRepository(BaseRepository):
                 _encode_json(metadata_json),
                 summary_text,
                 index_text,
+                payload_blob_id,
                 user_persona_id,
                 platform_id or "default",
                 character_id if character_id is not None else workspace_id,
@@ -181,6 +246,10 @@ class ArtifactRepository(BaseRepository):
                 int(remember_across_chats_snapshot),
                 int(remember_across_devices_snapshot),
                 _encode_json(policy_snapshot or {}),
+                memory_owner_id,
+                source_mind_id,
+                embodiment_id,
+                realm_id,
                 timestamp,
                 timestamp,
             ),
@@ -239,9 +308,28 @@ class ArtifactRepository(BaseRepository):
         )
 
     async def get_artifact_blob(self, artifact_id: str, user_id: str) -> dict[str, Any] | None:
+        payload = await ArtifactPayloadRepository(self._connection, self._clock).get_payload_for_artifact(
+            artifact_id,
+            user_id,
+        )
+        if payload is not None:
+            return payload
+        artifact = await self.get_artifact(artifact_id, user_id)
+        if artifact is not None and artifact.get("payload_blob_id") is not None:
+            return None
         return await self._fetch_one(
             """
-            SELECT ab.*
+            SELECT
+                ab.artifact_id,
+                NULL AS payload_blob_id,
+                ab.storage_kind,
+                ab.blob_bytes,
+                ab.storage_uri,
+                ab.byte_size,
+                ab.sha256,
+                ab.sha256 AS content_sha256,
+                ab.created_at,
+                ab.updated_at
             FROM artifact_blobs AS ab
             JOIN artifacts AS a ON a.id = ab.artifact_id
             WHERE ab.artifact_id = ?
@@ -320,6 +408,23 @@ class ArtifactRepository(BaseRepository):
             """,
             ("purged" if purge else "deleted", timestamp, timestamp, artifact_id, user_id),
         )
+        if purge and existing.get("payload_blob_id") is not None:
+            payload_blob_id = str(existing["payload_blob_id"])
+            await self._connection.execute(
+                """
+                DELETE FROM artifact_payload_blobs
+                WHERE id = ?
+                  AND user_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM artifacts
+                      WHERE user_id = ?
+                        AND payload_blob_id = ?
+                        AND status NOT IN ('deleted', 'purged')
+                  )
+                """,
+                (payload_blob_id, user_id, user_id, payload_blob_id),
+            )
         if commit:
             await self._connection.commit()
         return await self.get_artifact(artifact_id, user_id)
@@ -448,6 +553,13 @@ class ArtifactRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        allow_private_sensitivity: bool = False,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -471,9 +583,27 @@ class ArtifactRepository(BaseRepository):
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
             allow_sensitive=allow_intimacy_context,
+            allow_private_sensitivity=allow_private_sensitivity,
         )
         if not visibility_clauses:
             return []
+        space_clause, space_parameters = _artifact_source_space_visibility_clause(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="a",
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="a",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="a",
+        )
         requested_values = ", ".join("(?, ?)" for _ in deduped_message_ids)
         query_text = """
             WITH requested(message_id, message_order) AS (
@@ -493,9 +623,20 @@ class ArtifactRepository(BaseRepository):
                 a.content_hash,
                 a.size_bytes,
                 a.page_count,
+                a.memory_owner_id AS artifact_memory_owner_id,
+                a.source_mind_id AS artifact_source_mind_id,
+                a.embodiment_id AS artifact_embodiment_id,
+                a.realm_id AS artifact_realm_id,
                 c.assistant_mode_id AS conversation_assistant_mode_id,
+                source_message.space_id AS source_message_space_id,
+                source_space.boundary_mode AS source_message_space_boundary_mode,
+                source_message.active_mind_id AS source_message_active_mind_id,
+                source_message.source_mind_id AS source_message_source_mind_id,
+                source_message.active_embodiment_id AS source_message_active_embodiment_id,
+                source_message.active_realm_id AS source_message_active_realm_id,
                 a.status,
                 a.privacy_level,
+                a.sensitivity AS artifact_sensitivity,
                 a.intimacy_boundary AS artifact_intimacy_boundary,
                 a.intimacy_boundary_confidence AS artifact_intimacy_boundary_confidence,
                 a.preserve_verbatim,
@@ -513,6 +654,10 @@ class ArtifactRepository(BaseRepository):
             JOIN artifacts AS a ON a.id = ac.artifact_id
             JOIN requested ON requested.message_id = a.message_id
             LEFT JOIN conversations AS c ON c.id = a.conversation_id
+            LEFT JOIN messages AS source_message ON source_message.id = a.message_id
+            LEFT JOIN spaces AS source_space
+              ON source_space.owner_user_id = a.user_id
+             AND source_space.id = source_message.space_id
             WHERE a.user_id = ?
               AND a.status = 'ready'
               AND a.deleted_at IS NULL
@@ -520,6 +665,10 @@ class ArtifactRepository(BaseRepository):
               AND {intimacy_filter}
               AND ({visibility_clauses})
               AND {visibility_clause}
+              AND {space_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
             ORDER BY
                 requested.message_order ASC,
                 CASE WHEN ac.kind = 'summary' THEN 1 ELSE 0 END ASC,
@@ -530,6 +679,10 @@ class ArtifactRepository(BaseRepository):
             requested_values=requested_values,
             visibility_clauses=visibility_joiner.join(visibility_clauses),
             visibility_clause=conversation_visibility_clause("a"),
+            space_clause=space_clause,
+            mind_clause=mind_clause,
+            embodiment_clause=embodiment_clause,
+            realm_clause=realm_clause,
             intimacy_filter=(
                 f"{memory_object_intimacy_sql_clause('ac', allow_intimacy_context=allow_intimacy_context)} "
                 f"AND {memory_object_intimacy_sql_clause('a', allow_intimacy_context=allow_intimacy_context)}"
@@ -546,6 +699,10 @@ class ArtifactRepository(BaseRepository):
                 privacy_ceiling,
                 *visibility_parameters,
                 conversation_id,
+                *space_parameters,
+                *mind_parameters,
+                *embodiment_parameters,
+                *realm_parameters,
                 limit,
             ),
         )
@@ -639,6 +796,13 @@ class ArtifactRepository(BaseRepository):
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
+        allow_private_sensitivity: bool = False,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -654,9 +818,27 @@ class ArtifactRepository(BaseRepository):
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
             allow_sensitive=allow_intimacy_context,
+            allow_private_sensitivity=allow_private_sensitivity,
         )
         if not visibility_clauses:
             return []
+        space_clause, space_parameters = _artifact_source_space_visibility_clause(
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+        )
+        mind_clause, mind_parameters = mind_visibility_sql_clause_for_context(
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology,
+            alias="a",
+        )
+        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="a",
+        )
+        realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
+            active_realm_id=active_realm_id,
+            alias="a",
+        )
         query_text = """
             SELECT
                 ac.*,
@@ -672,9 +854,20 @@ class ArtifactRepository(BaseRepository):
                 a.content_hash,
                 a.size_bytes,
                 a.page_count,
+                a.memory_owner_id AS artifact_memory_owner_id,
+                a.source_mind_id AS artifact_source_mind_id,
+                a.embodiment_id AS artifact_embodiment_id,
+                a.realm_id AS artifact_realm_id,
                 c.assistant_mode_id AS conversation_assistant_mode_id,
+                source_message.space_id AS source_message_space_id,
+                source_space.boundary_mode AS source_message_space_boundary_mode,
+                source_message.active_mind_id AS source_message_active_mind_id,
+                source_message.source_mind_id AS source_message_source_mind_id,
+                source_message.active_embodiment_id AS source_message_active_embodiment_id,
+                source_message.active_realm_id AS source_message_active_realm_id,
                 a.status,
                 a.privacy_level,
+                a.sensitivity AS artifact_sensitivity,
                 a.intimacy_boundary AS artifact_intimacy_boundary,
                 a.intimacy_boundary_confidence AS artifact_intimacy_boundary_confidence,
                 a.preserve_verbatim,
@@ -690,6 +883,10 @@ class ArtifactRepository(BaseRepository):
             JOIN artifact_chunks AS ac ON ac._rowid = artifact_chunks_fts.rowid
             JOIN artifacts AS a ON a.id = ac.artifact_id
             LEFT JOIN conversations AS c ON c.id = a.conversation_id
+            LEFT JOIN messages AS source_message ON source_message.id = a.message_id
+            LEFT JOIN spaces AS source_space
+              ON source_space.owner_user_id = a.user_id
+             AND source_space.id = source_message.space_id
             WHERE a.user_id = ?
               AND a.status = 'ready'
               AND a.deleted_at IS NULL
@@ -697,6 +894,10 @@ class ArtifactRepository(BaseRepository):
               AND {intimacy_filter}
               AND ({visibility_clauses})
               AND {visibility_clause}
+              AND {space_clause}
+              AND {mind_clause}
+              AND {embodiment_clause}
+              AND {realm_clause}
               AND artifact_chunks_fts MATCH ?
             ORDER BY
                 CASE WHEN ac.kind = 'summary' THEN 1 ELSE 0 END ASC,
@@ -708,6 +909,10 @@ class ArtifactRepository(BaseRepository):
         """.format(
             visibility_clauses=visibility_joiner.join(visibility_clauses),
             visibility_clause=conversation_visibility_clause("a"),
+            space_clause=space_clause,
+            mind_clause=mind_clause,
+            embodiment_clause=embodiment_clause,
+            realm_clause=realm_clause,
             intimacy_filter=(
                 f"{memory_object_intimacy_sql_clause('ac', allow_intimacy_context=allow_intimacy_context)} "
                 f"AND {memory_object_intimacy_sql_clause('a', allow_intimacy_context=allow_intimacy_context)}"
@@ -720,6 +925,10 @@ class ArtifactRepository(BaseRepository):
                 privacy_ceiling,
                 *visibility_parameters,
                 conversation_id,
+                *space_parameters,
+                *mind_parameters,
+                *embodiment_parameters,
+                *realm_parameters,
                 query,
                 limit,
             ),
@@ -741,6 +950,7 @@ class ArtifactRepository(BaseRepository):
         remember_across_chats: bool,
         remember_across_devices: bool,
         allow_sensitive: bool = False,
+        allow_private_sensitivity: bool = False,
     ) -> tuple[list[str], list[Any], str]:
         if platform_id is None:
             clauses, parameters = ArtifactRepository._scope_clauses(
@@ -760,6 +970,7 @@ class ArtifactRepository(BaseRepository):
             remember_across_devices=remember_across_devices,
             incognito=incognito,
             sensitivity_gates_enabled=allow_sensitive,
+            allow_private_sensitivity=allow_private_sensitivity,
             table_alias="a",
         )
         return clauses, parameters, " AND "

@@ -20,6 +20,7 @@ from atagia.models.schemas_memory import (
     MemoryPrivacyMode,
     MemoryScope,
     MemorySensitivity,
+    MindTopology,
     OperationalSignals,
     TopicWorkingSetTrace,
     VerbatimPinStatus,
@@ -69,6 +70,12 @@ class CreateConversationRequest(BaseModel):
     user_persona_id: str | None = None
     platform_id: str | None = None
     character_id: str | None = None
+    active_presence_id: str | None = None
+    mind_id: str | None = None
+    mind_topology: MindTopology = MindTopology.UNIMIND
+    embodiment_id: str | None = None
+    realm_id: str | None = None
+    space_id: str | None = None
     mode: str | None = None
     incognito: bool | None = None
 
@@ -226,6 +233,15 @@ class EraseUserDataRequest(BaseModel):
     confirmation: str
 
 
+class AdminMemoryCoordinateCorrectionRequest(BaseModel):
+    """Admin/dev correction request for memory coordinate metadata."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    coordinates: dict[str, str | None] = Field(min_length=1)
+    reason: str | None = Field(default=None, max_length=500)
+
+
 class DeletionReport(BaseModel):
     """Count-only report for a conversation or memory deletion."""
 
@@ -287,6 +303,12 @@ class ChatReplyRequest(BaseModel):
     user_persona_id: str | None = None
     platform_id: str | None = None
     character_id: str | None = None
+    active_presence_id: str | None = None
+    mind_id: str | None = None
+    mind_topology: MindTopology = MindTopology.UNIMIND
+    embodiment_id: str | None = None
+    realm_id: str | None = None
+    space_id: str | None = None
     mode: str | None = None
     incognito: bool | None = None
 
@@ -407,6 +429,12 @@ class SidecarContextRequest(BaseModel):
     user_persona_id: str | None = None
     platform_id: str | None = None
     character_id: str | None = None
+    active_presence_id: str | None = None
+    mind_id: str | None = None
+    mind_topology: MindTopology = MindTopology.UNIMIND
+    embodiment_id: str | None = None
+    realm_id: str | None = None
+    space_id: str | None = None
     mode: str | None = None
     incognito: bool | None = None
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
@@ -456,6 +484,12 @@ class SidecarIngestMessageRequest(BaseModel):
     user_persona_id: str | None = None
     platform_id: str | None = None
     character_id: str | None = None
+    active_presence_id: str | None = None
+    mind_id: str | None = None
+    mind_topology: MindTopology = MindTopology.UNIMIND
+    embodiment_id: str | None = None
+    realm_id: str | None = None
+    space_id: str | None = None
     mode: str | None = None
     incognito: bool | None = None
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
@@ -500,6 +534,12 @@ class SidecarAddResponseRequest(BaseModel):
     user_persona_id: str | None = None
     platform_id: str | None = None
     character_id: str | None = None
+    active_presence_id: str | None = None
+    mind_id: str | None = None
+    mind_topology: MindTopology = MindTopology.UNIMIND
+    embodiment_id: str | None = None
+    realm_id: str | None = None
+    space_id: str | None = None
     mode: str | None = None
     incognito: bool | None = None
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
@@ -1284,6 +1324,12 @@ class VerbatimPinRecord(BaseModel):
     remember_across_chats_snapshot: bool = True
     remember_across_devices_snapshot: bool = True
     policy_snapshot_json: dict[str, Any] = Field(default_factory=dict)
+    space_id: str | None = None
+    space_boundary_mode: str | None = None
+    memory_owner_id: str | None = None
+    source_mind_id: str | None = None
+    embodiment_id: str | None = None
+    realm_id: str | None = None
     user_persona_key: str | None = None
     character_key: str | None = None
     conversation_key: str | None = None
@@ -1321,6 +1367,10 @@ class VerbatimPinRecord(BaseModel):
         "updated_at",
         "expires_at",
         "deleted_at",
+        "memory_owner_id",
+        "source_mind_id",
+        "embodiment_id",
+        "realm_id",
     )
     @classmethod
     def validate_text_fields(cls, value: str | None) -> str | None:

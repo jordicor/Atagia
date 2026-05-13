@@ -109,6 +109,7 @@ def test_failure_taxonomy_maps_technical_execution_failures(tmp_path) -> None:
                         trace={
                             "diagnosis_bucket": "retrieval_failed",
                             "sufficiency_diagnostic": "retrieval_failed",
+                            "failure_stage": "retrieval",
                         },
                     )
                 ],
@@ -128,7 +129,9 @@ def test_failure_taxonomy_maps_technical_execution_failures(tmp_path) -> None:
 
     assert taxonomy.taxonomy_counts == {"execution_failure": 1}
     assert taxonomy.items[0].diagnosis_bucket == "retrieval_failed"
+    assert taxonomy.items[0].failure_stage == "retrieval"
     assert taxonomy.items[0].taxonomy_bucket == "execution_failure"
+    assert taxonomy.failure_stage_counts == {"retrieval": 1}
 
 
 def test_failure_taxonomy_uses_exact_mappings_and_sanitizes_free_form_diagnostics(tmp_path) -> None:
@@ -141,7 +144,7 @@ def test_failure_taxonomy_uses_exact_mappings_and_sanitizes_free_form_diagnostic
         total_passed=0,
         pass_rate=0.0,
         avg_score=0.0,
-        critical_error_count=0,
+        priority_failure_count=0,
         per_question=[
             AtagiaQuestionResult(
                 question_id="q1",
@@ -191,6 +194,7 @@ def test_failure_taxonomy_uses_exact_mappings_and_sanitizes_free_form_diagnostic
         "taxonomy_counts": {"unknown": 1},
         "diagnosis_counts": {"unknown": 1},
         "sufficiency_counts": {"unknown": 1},
+        "failure_stage_counts": {},
     }
     assert format_failure_taxonomy_summary(taxonomy) == (
         "Failure taxonomy: failed=1 buckets=unknown=1"

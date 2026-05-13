@@ -1,0 +1,94 @@
+{
+  "questions": [
+    {
+      "question_id": "conv-30:q25",
+      "required_items": [
+        {"label": "fair"},
+        {"label": "networking events", "aliases": ["networking event"]},
+        {"label": "dance competition"}
+      ],
+      "notes": "Primary broad-list answer-side omission case from Wave 4.10."
+    },
+    {
+      "question_id": "conv-30:q24",
+      "required_items": [
+        {
+          "label": "artist collaboration / unique fashion pieces",
+          "aliases": [
+            "artist collaboration",
+            "local artist",
+            "unique fashion pieces",
+            "unique pieces"
+          ]
+        },
+        {
+          "label": "limited-edition sweatshirts",
+          "aliases": ["limited edition sweatshirts", "limited-edition sweatshirt"]
+        },
+        {
+          "label": "offers/promotions",
+          "aliases": ["offers", "promotions", "discounts"]
+        },
+        {
+          "label": "video presentation showing how to style pieces",
+          "aliases": [
+            "video presentation",
+            "how to style",
+            "style my fashion pieces",
+            "styling video"
+          ]
+        }
+      ],
+      "notes": "Legacy judge passed despite a missing enumerated item."
+    },
+    {
+      "question_id": "conv-30:q1",
+      "required_items": [
+        {
+          "label": "January 19, 2023",
+          "aliases": ["19 January, 2023", "19 January 2023", "January 19 2023"]
+        }
+      ],
+      "notes": "Positive temporal control, not a broad-list lift metric."
+    },
+    {
+      "question_id": "conv-26:q20",
+      "required_items": [
+        {"label": "dinosaurs", "aliases": ["dinosaur"]},
+        {"label": "nature"}
+      ],
+      "notes": "Already identified Wave 2 broad-list retained hard case."
+    },
+    {
+      "question_id": "conv-26:q35",
+      "required_items": [
+        {"label": "mentoring program", "aliases": ["mentor program"]},
+        {"label": "school speech", "aliases": ["speech at school"]}
+      ],
+      "notes": "Already identified Wave 2 broad-list/exact-source retained hard case."
+    },
+    {
+      "question_id": "conv-42:q59",
+      "required_items": [
+        {"label": "pet", "aliases": ["a pet"]},
+        {
+          "label": "The Lord of the Rings movies",
+          "aliases": ["Lord of the Rings", "LOTR"]
+        },
+        {"label": "fantasy book series"},
+        {"label": "coconut flavoring", "aliases": ["coconut flavouring"]},
+        {"label": "book series with battles and characters"},
+        {"label": "Xenoblade Chronicles", "aliases": ["Xenoblade"]},
+        {
+          "label": "dairy-free margarine or coconut oil",
+          "aliases": [
+            "dairy-free margarine",
+            "dairy free margarine",
+            "coconut oil"
+          ]
+        }
+      ],
+      "notes": "Already identified Wave 2 broad-list artifact/source-neighbor retained hard case."
+    }
+  ]
+}

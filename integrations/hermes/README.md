@@ -1,27 +1,44 @@
 # Hermes Integration
 
-Status: provider shape scaffolded; concrete API validation pending.
+Status: implemented, mock-verified, live smoke pending.
 
-Hermes-style stacks often already have a memory-provider abstraction. Atagia can
-fit either as a provider adapter or as an upstream sidecar proxy.
+Hermes-style stacks often expose a memory-provider abstraction. Atagia now ships
+a copyable provider bundle at `plugins/memory/atagia/`, plus the older
+`atagia_provider.py` facade over `SidecarBridge` for direct Python integration.
 
-## Target Shape
+## Provider Bundle
 
-- If Hermes exposes a memory provider API, implement an Atagia provider that
-  delegates to `SidecarBridge`.
-- If Hermes only exposes model-provider configuration, use the planned
-  OpenAI-compatible memory proxy.
-- Preserve Hermes' own session/task state as host state; use Atagia for
-  long-horizon relationship, preference, belief, and project memory.
+`plugins/memory/atagia/` implements a minimal `MemoryProvider`:
 
-## Missing Atagia Pieces
+- `is_available`
+- `initialize`
+- `get_config_schema`
+- `save_config`
+- `prefetch`
+- `sync_turn`
+- `on_session_end`
+- `on_memory_write` no-op
+- `shutdown`
 
-- Concrete Hermes adapter API validation against a real install.
-- Provider package or plugin wrapper around `atagia_provider.py` once the target
-  provider interface is confirmed.
-- Import/export mapping between Hermes memory records and Atagia objects.
+`sync_turn` and `on_session_end` enqueue work on a daemon thread, so Hermes
+generation does not block on Atagia persistence.
 
-## Files
+`on_memory_write` intentionally does nothing for now. Curated Hermes memory
+records should not be converted into fake chat turns until there is a clear
+semantic mapping.
 
-- `atagia_provider.py` is a copyable retrieve/record/ingest facade over
-  `SidecarBridge`. Wrap it in the host's concrete memory-provider interface.
+## Importer
+
+Use `integrations/importers/atagia_importers.py` for Hermes exports shaped as
+`messages`, `transcript`, or `memories` with text fields.
+
+## Smoke Checklist
+
+- Provider imports against a real Hermes install and sees
+  `agent.memory_provider.MemoryProvider`.
+- `initialize(config)` returns available with the local Atagia URL.
+- `prefetch()` returns a `system_prompt` and stores the user message.
+- `sync_turn()` queues assistant persistence without blocking generation.
+- `on_session_end()` can backfill session transcript messages rerunnably.
+- `on_memory_write()` remains a documented no-op.
+- Atagia down/API error fails open.

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from atagia.core.clock import FrozenClock
+from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository, WorkspaceRepository
+from atagia.core.verbatim_pin_repository import VerbatimPinRepository
 from atagia.memory.candidate_search import CandidateSearch
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import (
@@ -19,6 +22,7 @@ from atagia.models.schemas_memory import (
     MemorySourceKind,
     MemoryStatus,
     RetrievalPlan,
+    VerbatimPinTargetKind,
 )
 from atagia.services.embeddings import EmbeddingMatch
 
@@ -27,11 +31,14 @@ MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 
 
 class FakeEmbeddingIndex:
-    vector_limit = 1
-
-    def __init__(self, matches: list[EmbeddingMatch]) -> None:
+    def __init__(self, matches: list[EmbeddingMatch], vector_limit: int = 100) -> None:
         self.matches = list(matches)
         self.calls: list[tuple[str, str, int]] = []
+        self._vector_limit = vector_limit
+
+    @property
+    def vector_limit(self) -> int:
+        return self._vector_limit
 
     async def upsert(self, memory_id: str, text: str, metadata: dict[str, object]) -> None:
         raise AssertionError("upsert() is not used in candidate search tests")
@@ -44,7 +51,12 @@ class FakeEmbeddingIndex:
         raise AssertionError("delete() is not used in candidate search tests")
 
 
-async def _build_runtime(matches: list[EmbeddingMatch]):
+async def _build_runtime(
+    matches: list[EmbeddingMatch],
+    settings: Settings | None = None,
+    *,
+    embedding_vector_limit: int = 100,
+):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc))
     await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
@@ -52,8 +64,8 @@ async def _build_runtime(matches: list[EmbeddingMatch]):
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     memories = MemoryObjectRepository(connection, clock)
-    embedding_index = FakeEmbeddingIndex(matches)
-    search = CandidateSearch(connection, clock, embedding_index=embedding_index)
+    embedding_index = FakeEmbeddingIndex(matches, vector_limit=embedding_vector_limit)
+    search = CandidateSearch(connection, clock, embedding_index=embedding_index, settings=settings)
     await users.create_user("usr_1")
     await users.create_user("usr_2")
     await workspaces.create_workspace("wrk_1", "usr_1", "Workspace")
@@ -85,6 +97,7 @@ async def _seed_memory(
     platform_locked: bool = False,
     platform_id_lock: str | None = None,
     scope_canonical: str | None = None,
+    index_text: str | None = None,
 ) -> None:
     await memories.create_memory_object(
         user_id=user_id,
@@ -94,6 +107,7 @@ async def _seed_memory(
         object_type=MemoryObjectType.EVIDENCE,
         scope=scope,
         canonical_text=canonical_text,
+        index_text=index_text,
         source_kind=MemorySourceKind.EXTRACTED,
         confidence=0.8,
         privacy_level=0,
@@ -280,6 +294,128 @@ async def test_search_by_embedding_applies_phase7_namespace_platform_and_sensiti
             "mem_character",
             "mem_user",
         ]
+
+        trusted_candidates = await search.search_by_embedding(
+            query_text="namespace",
+            user_id="usr_1",
+            plan=_plan(vector_limit=10, max_candidates=10).model_copy(
+                update={"allow_private_sensitivity": True}
+            ),
+            embedding_index=embedding_index,
+        )
+
+        assert [candidate["id"] for candidate in trusted_candidates] == [
+            "mem_chat",
+            "mem_character",
+            "mem_user",
+            "mem_private",
+        ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_search_allows_private_sensitivity_only_when_plan_allows_it() -> None:
+    connection, memories, search, _embedding_index = await _build_runtime([])
+    try:
+        for memory_id, sensitivity in (
+            ("mem_public", MemorySensitivity.PUBLIC),
+            ("mem_private", MemorySensitivity.PRIVATE),
+            ("mem_secret", MemorySensitivity.SECRET),
+        ):
+            await _seed_memory(
+                memories,
+                memory_id=memory_id,
+                user_id="usr_1",
+                canonical_text=f"{memory_id} sensitivity signal",
+                index_text="sensitivity signal",
+                scope=MemoryScope.CONVERSATION,
+                workspace_id="wrk_1",
+                conversation_id="cnv_1",
+                sensitivity=sensitivity,
+                scope_canonical=MemoryScope.CHAT.value,
+            )
+
+        normal_candidates = await search.search(
+            _plan(vector_limit=0, fts_queries=["sensitivity signal"]).model_copy(
+                update={"privacy_ceiling": 3}
+            ),
+            "usr_1",
+        )
+        trusted_candidates = await search.search(
+            _plan(vector_limit=0, fts_queries=["sensitivity signal"]).model_copy(
+                update={
+                    "privacy_ceiling": 3,
+                    "allow_private_sensitivity": True,
+                }
+            ),
+            "usr_1",
+        )
+
+        assert {candidate["id"] for candidate in normal_candidates} == {"mem_public"}
+        assert {candidate["id"] for candidate in trusted_candidates} == {
+            "mem_public",
+            "mem_private",
+        }
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_verbatim_pin_search_allows_private_sensitivity_only_when_plan_allows_it() -> None:
+    connection, _memories, search, _embedding_index = await _build_runtime([])
+    try:
+        pins = VerbatimPinRepository(connection, FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)))
+        for pin_id, sensitivity, privacy_level in (
+            ("pin_public", MemorySensitivity.PUBLIC, 0),
+            ("pin_private", MemorySensitivity.PRIVATE, 2),
+            ("pin_secret", MemorySensitivity.SECRET, 3),
+        ):
+            await pins.create_verbatim_pin(
+                user_id="usr_1",
+                scope=MemoryScope.CONVERSATION,
+                target_kind=VerbatimPinTargetKind.MESSAGE,
+                target_id=f"msg_{pin_id}",
+                pin_id=pin_id,
+                workspace_id="wrk_1",
+                conversation_id="cnv_1",
+                assistant_mode_id="coding_debug",
+                canonical_text=f"{pin_id} exact recall token",
+                index_text="exact recall token",
+                privacy_level=privacy_level,
+                sensitivity=sensitivity,
+                created_by="usr_1",
+                scope_canonical=MemoryScope.CHAT.value,
+                platform_id="default",
+            )
+
+        normal_candidates = await search.search(
+            _plan(vector_limit=0, fts_queries=["exact recall token"]).model_copy(
+                update={
+                    "privacy_ceiling": 3,
+                    "raw_context_access_mode": "verbatim",
+                    "scope_filter": [MemoryScope.CONVERSATION],
+                }
+            ),
+            "usr_1",
+        )
+        trusted_candidates = await search.search(
+            _plan(vector_limit=0, fts_queries=["exact recall token"]).model_copy(
+                update={
+                    "privacy_ceiling": 3,
+                    "raw_context_access_mode": "verbatim",
+                    "scope_filter": [MemoryScope.CONVERSATION],
+                    "allow_private_sensitivity": True,
+                }
+            ),
+            "usr_1",
+        )
+
+        assert {candidate["id"] for candidate in normal_candidates} == {"pin_public"}
+        assert {candidate["id"] for candidate in trusted_candidates} == {
+            "pin_public",
+            "pin_private",
+        }
     finally:
         await connection.close()
 
@@ -541,6 +677,41 @@ async def test_search_by_embedding_enforces_vector_limit_after_overfetch() -> No
 
 
 @pytest.mark.asyncio
+async def test_search_by_embedding_respects_backend_vector_limit_cap() -> None:
+    connection, memories, search, embedding_index = await _build_runtime(
+        [
+            EmbeddingMatch(memory_id="mem_1", score=0.95, position_rank=1),
+            EmbeddingMatch(memory_id="mem_2", score=0.91, position_rank=2),
+            EmbeddingMatch(memory_id="mem_3", score=0.90, position_rank=3),
+        ],
+        embedding_vector_limit=2,
+    )
+    try:
+        for index in range(1, 4):
+            await _seed_memory(
+                memories,
+                memory_id=f"mem_{index}",
+                user_id="usr_1",
+                canonical_text=f"retry loop candidate {index}",
+                scope=MemoryScope.CONVERSATION,
+                workspace_id="wrk_1",
+                conversation_id="cnv_1",
+            )
+
+        candidates = await search.search_by_embedding(
+            query_text="retry loop",
+            user_id="usr_1",
+            plan=_plan(vector_limit=5),
+            embedding_index=search._embedding_index,  # noqa: SLF001
+        )
+
+        assert [candidate["id"] for candidate in candidates] == ["mem_1", "mem_2"]
+        assert embedding_index.calls == [("retry loop", "usr_1", 8)]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_search_by_embedding_overfetches_and_demotes_stale_ephemeral_hits() -> None:
     connection, memories, search, embedding_index = await _build_runtime(
         [
@@ -580,6 +751,24 @@ async def test_search_by_embedding_overfetches_and_demotes_stale_ephemeral_hits(
 
         assert [candidate["id"] for candidate in candidates] == ["mem_current"]
         assert embedding_index.calls == [("retry loop", "usr_1", 4)]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_search_by_embedding_uses_configured_overfetch_multiplier() -> None:
+    settings = replace(Settings.from_env(), embedding_search_overfetch_multiplier=2)
+    connection, _memories, search, embedding_index = await _build_runtime([], settings=settings)
+    try:
+        candidates = await search.search_by_embedding(
+            query_text="retry loop",
+            user_id="usr_1",
+            plan=_plan(vector_limit=3),
+            embedding_index=embedding_index,
+        )
+
+        assert candidates == []
+        assert embedding_index.calls == [("retry loop", "usr_1", 6)]
     finally:
         await connection.close()
 
@@ -705,6 +894,44 @@ async def test_rrf_uses_best_fts_rank_once_across_query_rewrites() -> None:
         await connection.close()
 
 
+@pytest.mark.asyncio
+async def test_memory_fts_bm25_column_weights_prefer_canonical_text_matches() -> None:
+    settings = replace(
+        Settings.from_env(),
+        memory_fts_canonical_bm25_weight=5.0,
+        memory_fts_index_bm25_weight=0.1,
+    )
+    connection, memories, search, _embedding_index = await _build_runtime([], settings=settings)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_canonical",
+            user_id="usr_1",
+            canonical_text="quasar",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            index_text="unrelated",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_index",
+            user_id="usr_1",
+            canonical_text="unrelated",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            index_text="quasar",
+        )
+
+        candidates = await search.search(_plan(fts_queries=["quasar"], vector_limit=0), "usr_1")
+
+        assert [candidate["id"] for candidate in candidates[:2]] == ["mem_canonical", "mem_index"]
+        assert candidates[0]["fts_rank"] < candidates[1]["fts_rank"]
+    finally:
+        await connection.close()
+
+
 def test_rank_fusion_prefers_exact_single_hit_for_default_queries() -> None:
     search = CandidateSearch(None, FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)))
 
@@ -737,3 +964,37 @@ def test_rank_fusion_keeps_coverage_bias_for_broad_list_queries() -> None:
     )
 
     assert generic_score > exact_score
+
+
+def test_rank_fusion_applies_query_type_channel_weighting() -> None:
+    search = CandidateSearch(None, FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)))
+
+    _raw_fts, exact_fts_score = search._compute_rank_fusion_scores(  # noqa: SLF001
+        [1],
+        max_lists=1,
+        query_type="slot_fill",
+        exact_recall_mode=True,
+        channel_ranks={"fts": 1},
+    )
+    _raw_embedding, exact_embedding_score = search._compute_rank_fusion_scores(  # noqa: SLF001
+        [1],
+        max_lists=1,
+        query_type="slot_fill",
+        exact_recall_mode=True,
+        channel_ranks={"embedding": 1},
+    )
+    _raw_broad_embedding, broad_embedding_score = search._compute_rank_fusion_scores(  # noqa: SLF001
+        [1],
+        max_lists=1,
+        query_type="broad_list",
+        channel_ranks={"embedding": 1},
+    )
+    _raw_broad_verbatim, broad_verbatim_score = search._compute_rank_fusion_scores(  # noqa: SLF001
+        [1],
+        max_lists=1,
+        query_type="broad_list",
+        channel_ranks={"verbatim_evidence_search": 1},
+    )
+
+    assert exact_fts_score > exact_embedding_score
+    assert broad_embedding_score > broad_verbatim_score

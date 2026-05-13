@@ -55,6 +55,8 @@ class QuestionDiff(BaseModel):
     after_diagnosis_bucket: str | None = None
     before_sufficiency_diagnostic: str | None = None
     after_sufficiency_diagnostic: str | None = None
+    before_failure_stage: str | None = None
+    after_failure_stage: str | None = None
     before_selected_memory_ids: list[str] = Field(default_factory=list)
     after_selected_memory_ids: list[str] = Field(default_factory=list)
     before_selected_evidence_memory_ids: list[str] = Field(default_factory=list)
@@ -115,6 +117,9 @@ class BenchmarkDiffReport(BaseModel):
     before_sufficiency_diagnostic_counts: dict[str, int] = Field(default_factory=dict)
     after_sufficiency_diagnostic_counts: dict[str, int] = Field(default_factory=dict)
     sufficiency_diagnostic_count_deltas: dict[str, int] = Field(default_factory=dict)
+    before_failure_stage_counts: dict[str, int] = Field(default_factory=dict)
+    after_failure_stage_counts: dict[str, int] = Field(default_factory=dict)
+    failure_stage_count_deltas: dict[str, int] = Field(default_factory=dict)
     before_retrieval_custody_summary: dict[str, object] = Field(
         default_factory=lambda: summarize_retrieval_custody([])
     )
@@ -230,6 +235,16 @@ def build_benchmark_diff(
     after_diagnosis_counts = _trace_field_counts(after, "diagnosis_bucket")
     before_sufficiency_counts = _trace_field_counts(before, "sufficiency_diagnostic")
     after_sufficiency_counts = _trace_field_counts(after, "sufficiency_diagnostic")
+    before_failure_stage_counts = _trace_field_counts(
+        before,
+        "failure_stage",
+        include_unknown=False,
+    )
+    after_failure_stage_counts = _trace_field_counts(
+        after,
+        "failure_stage",
+        include_unknown=False,
+    )
     before_retrieval_custody_summary = _retrieval_custody_summary(before)
     after_retrieval_custody_summary = _retrieval_custody_summary(after)
 
@@ -265,6 +280,12 @@ def build_benchmark_diff(
         sufficiency_diagnostic_count_deltas=_count_deltas(
             before_sufficiency_counts,
             after_sufficiency_counts,
+        ),
+        before_failure_stage_counts=before_failure_stage_counts,
+        after_failure_stage_counts=after_failure_stage_counts,
+        failure_stage_count_deltas=_count_deltas(
+            before_failure_stage_counts,
+            after_failure_stage_counts,
         ),
         before_retrieval_custody_summary=before_retrieval_custody_summary,
         after_retrieval_custody_summary=after_retrieval_custody_summary,
@@ -350,6 +371,12 @@ def format_diff_summary(diff_report: BenchmarkDiffReport) -> str:
     )
     if sufficiency_delta_line is not None:
         lines.append(sufficiency_delta_line)
+    failure_stage_delta_line = _format_count_deltas(
+        "Failure stage deltas",
+        diff_report.failure_stage_count_deltas,
+    )
+    if failure_stage_delta_line is not None:
+        lines.append(failure_stage_delta_line)
 
     significant_category_deltas = [
         (category, delta)
@@ -454,6 +481,8 @@ def _question_diffs(
                     after_result,
                     "sufficiency_diagnostic",
                 ),
+                before_failure_stage=_trace_text(before_result, "failure_stage"),
+                after_failure_stage=_trace_text(after_result, "failure_stage"),
                 before_selected_memory_ids=_trace_list(before_result, "selected_memory_ids"),
                 after_selected_memory_ids=_trace_list(after_result, "selected_memory_ids"),
                 before_selected_evidence_memory_ids=_trace_list(
@@ -573,13 +602,20 @@ def _warning_counts(report: BenchmarkReport) -> dict[str, int]:
     return counts
 
 
-def _trace_field_counts(report: BenchmarkReport, field_name: str) -> dict[str, int]:
+def _trace_field_counts(
+    report: BenchmarkReport,
+    field_name: str,
+    *,
+    include_unknown: bool = True,
+) -> dict[str, int]:
     counts: dict[str, int] = {}
     for conversation in report.conversations:
         for result in conversation.results:
             trace = result.trace if isinstance(result.trace, dict) else {}
             raw_value = trace.get(field_name)
             value = str(raw_value).strip() if raw_value is not None else ""
+            if not value and not include_unknown:
+                continue
             key = value or "unknown"
             counts[key] = counts.get(key, 0) + 1
     return dict(sorted(counts.items()))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import os
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from dotenv import load_dotenv
 
 from atagia.services.model_resolution import (
     DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_STRUCTURED_OUTPUT_RESCUE_MODEL,
     component_env_models_from_env,
     intimacy_component_env_models_from_env,
 )
@@ -159,6 +161,9 @@ class Settings:
     llm_intimacy_retrieval_model: str | None = None
     llm_intimacy_component_models: dict[str, str] = field(default_factory=dict)
     llm_intimacy_proactive_routing_enabled: bool = False
+    llm_structured_output_retry_attempts: int = 1
+    llm_structured_output_rescue_enabled: bool = False
+    llm_structured_output_rescue_model: str | None = DEFAULT_STRUCTURED_OUTPUT_RESCUE_MODEL
     llm_debug_io_enabled: bool = False
     llm_debug_io_dir: str = "./docs/tmp/llm_debug"
     llm_debug_io_purposes: tuple[str, ...] = ()
@@ -172,7 +177,11 @@ class Settings:
     embedding_backend: str = "none"
     embedding_model: str | None = None
     embedding_dimension: int = 1536
+    embedding_vector_limit_cap: int = 50
+    embedding_search_overfetch_multiplier: int = 4
     rrf_k: int = 60
+    memory_fts_canonical_bm25_weight: float = 1.2
+    memory_fts_index_bm25_weight: float = 0.8
     lifecycle_decay_days: int = 7
     lifecycle_decay_rate: float = 0.9
     lifecycle_archive_vitality: float = 0.05
@@ -289,6 +298,20 @@ class Settings:
             raise ValueError("extraction_watchdog_bounded_retry_max_output_tokens must be greater than 512")
         if self.rrf_k <= 0:
             raise ValueError("rrf_k must be positive")
+        if self.embedding_vector_limit_cap <= 0:
+            raise ValueError("embedding_vector_limit_cap must be positive")
+        if self.embedding_search_overfetch_multiplier <= 0:
+            raise ValueError("embedding_search_overfetch_multiplier must be positive")
+        if (
+            not math.isfinite(self.memory_fts_canonical_bm25_weight)
+            or self.memory_fts_canonical_bm25_weight <= 0.0
+        ):
+            raise ValueError("memory_fts_canonical_bm25_weight must be a finite positive number")
+        if (
+            not math.isfinite(self.memory_fts_index_bm25_weight)
+            or self.memory_fts_index_bm25_weight <= 0.0
+        ):
+            raise ValueError("memory_fts_index_bm25_weight must be a finite positive number")
         if self.lifecycle_min_interval_seconds <= 0:
             raise ValueError("lifecycle_min_interval_seconds must be positive")
         if self.lifecycle_worker_enabled and self.lifecycle_worker_interval_seconds <= 0:
@@ -313,6 +336,15 @@ class Settings:
             raise ValueError("operational_allowed_profiles must contain at least one profile")
         if any(not profile_id.strip() for profile_id in self.operational_allowed_profiles):
             raise ValueError("operational_allowed_profiles cannot contain blank profile ids")
+        if self.llm_structured_output_retry_attempts < 0:
+            raise ValueError("llm_structured_output_retry_attempts must be non-negative")
+        if (
+            self.llm_structured_output_rescue_enabled
+            and not (self.llm_structured_output_rescue_model or "").strip()
+        ):
+            raise ValueError(
+                "llm_structured_output_rescue_model is required when structured-output rescue is enabled"
+            )
         if not self.llm_debug_io_dir.strip():
             raise ValueError("llm_debug_io_dir cannot be blank")
         if self.llm_debug_io_max_chars < 0:
@@ -399,6 +431,17 @@ class Settings:
                 "ATAGIA_LLM_INTIMACY_PROACTIVE_ROUTING_ENABLED",
                 False,
             ),
+            llm_structured_output_retry_attempts=int(
+                os.getenv("ATAGIA_LLM_STRUCTURED_OUTPUT_RETRY_ATTEMPTS", "1")
+            ),
+            llm_structured_output_rescue_enabled=_env_bool(
+                "ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_ENABLED",
+                False,
+            ),
+            llm_structured_output_rescue_model=(
+                _env_optional_str("ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_MODEL")
+                or DEFAULT_STRUCTURED_OUTPUT_RESCUE_MODEL
+            ),
             llm_debug_io_enabled=_env_bool("ATAGIA_DEBUG_LLM_IO", False),
             llm_debug_io_dir=os.getenv(
                 "ATAGIA_DEBUG_LLM_IO_DIR",
@@ -429,12 +472,28 @@ class Settings:
             worker_circuit_breaker_min_failure_ratio=float(
                 os.getenv("ATAGIA_WORKER_CIRCUIT_BREAKER_MIN_FAILURE_RATIO", "0.8")
             ),
-            google_api_key=os.getenv("ATAGIA_GOOGLE_API_KEY") or None,
+            google_api_key=(
+                os.getenv("ATAGIA_GOOGLE_API_KEY")
+                or os.getenv("GEMINI_API_KEY")
+                or os.getenv("GEMINI_KEY")
+                or os.getenv("GOOGLE_API_KEY")
+                or None
+            ),
             allow_insecure_http=_env_bool("ATAGIA_ALLOW_INSECURE_HTTP", False),
             embedding_backend=os.getenv("ATAGIA_EMBEDDING_BACKEND", "none").strip().lower(),
             embedding_model=os.getenv("ATAGIA_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL,
             embedding_dimension=int(os.getenv("ATAGIA_EMBEDDING_DIMENSION", "1536")),
+            embedding_vector_limit_cap=int(os.getenv("ATAGIA_EMBEDDING_VECTOR_LIMIT_CAP", "50")),
+            embedding_search_overfetch_multiplier=int(
+                os.getenv("ATAGIA_EMBEDDING_SEARCH_OVERFETCH_MULTIPLIER", "4")
+            ),
             rrf_k=int(os.getenv("ATAGIA_RRF_K", "60")),
+            memory_fts_canonical_bm25_weight=float(
+                os.getenv("ATAGIA_MEMORY_FTS_CANONICAL_BM25_WEIGHT", "1.2")
+            ),
+            memory_fts_index_bm25_weight=float(
+                os.getenv("ATAGIA_MEMORY_FTS_INDEX_BM25_WEIGHT", "0.8")
+            ),
             lifecycle_decay_days=int(os.getenv("ATAGIA_LIFECYCLE_DECAY_DAYS", "7")),
             lifecycle_decay_rate=float(os.getenv("ATAGIA_LIFECYCLE_DECAY_RATE", "0.9")),
             lifecycle_archive_vitality=float(os.getenv("ATAGIA_LIFECYCLE_ARCHIVE_VITALITY", "0.05")),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import aiosqlite
 
@@ -220,6 +221,24 @@ class IngestWorker:
                 "purge_on_close": bool(conversation.get("purge_on_close")) or bool(job_payload.purge_on_close),
                 "isolated_mode": bool(conversation.get("isolated_mode")) or bool(job_payload.isolated_mode),
                 "incognito": bool(conversation.get("incognito")) or bool(job_payload.incognito),
+                "active_embodiment_id": (
+                    job_payload.active_embodiment_id
+                    or conversation.get("active_embodiment_id")
+                ),
+                "cross_embodiment_mode": (
+                    job_payload.cross_embodiment_mode
+                    or conversation.get("cross_embodiment_mode")
+                    or "direct_if_same_body"
+                ),
+                "active_realm_id": (
+                    job_payload.active_realm_id
+                    or conversation.get("active_realm_id")
+                ),
+                "cross_realm_mode": (
+                    job_payload.cross_realm_mode
+                    or conversation.get("cross_realm_mode")
+                    or "none"
+                ),
                 "remember_across_chats": (
                     bool(job_payload.remember_across_chats)
                     and bool(active_user["remember_across_chats"])
@@ -246,6 +265,60 @@ class IngestWorker:
             ),
             platform_id=str(job_payload.platform_id or conversation.get("platform_id") or "default"),
             character_id=character_id,
+            active_presence_id=(
+                job_payload.active_presence_id or conversation.get("active_presence_id")
+            ),
+            active_presence_kind=job_payload.active_presence_kind,
+            active_presence_display_name=job_payload.active_presence_display_name,
+            source_presence_id=job_payload.source_presence_id,
+            source_presence_kind=job_payload.source_presence_kind,
+            source_presence_display_name=job_payload.source_presence_display_name,
+            active_space_id=(
+                job_payload.active_space_id or conversation.get("active_space_id")
+            ),
+            active_space_boundary_mode=(
+                job_payload.active_space_boundary_mode
+                or conversation.get("active_space_boundary_mode")
+                or "focus"
+            ),
+            active_space_display_name=(
+                job_payload.active_space_display_name
+                or conversation.get("active_space_display_name")
+            ),
+            active_mind_id=(
+                job_payload.active_mind_id or conversation.get("active_mind_id")
+            ),
+            source_mind_id=(
+                job_payload.source_mind_id
+                or job_payload.active_mind_id
+                or conversation.get("active_mind_id")
+            ),
+            active_mind_display_name=job_payload.active_mind_display_name,
+            mind_topology=(
+                job_payload.mind_topology
+                or conversation.get("mind_topology")
+                or "unimind"
+            ),
+            active_embodiment_id=(
+                job_payload.active_embodiment_id
+                or conversation.get("active_embodiment_id")
+            ),
+            active_embodiment_display_name=job_payload.active_embodiment_display_name,
+            cross_embodiment_mode=(
+                job_payload.cross_embodiment_mode
+                or conversation.get("cross_embodiment_mode")
+                or "direct_if_same_body"
+            ),
+            active_realm_id=(
+                job_payload.active_realm_id
+                or conversation.get("active_realm_id")
+            ),
+            active_realm_display_name=job_payload.active_realm_display_name,
+            cross_realm_mode=(
+                job_payload.cross_realm_mode
+                or conversation.get("cross_realm_mode")
+                or "none"
+            ),
             mode=str(job_payload.mode or conversation.get("mode") or job_payload.assistant_mode_id),
             recent_messages=[
                 ExtractionContextMessage.model_validate(item)
@@ -359,6 +432,10 @@ class IngestWorker:
                 remember_across_chats=bool(job_payload.remember_across_chats),
                 remember_across_devices=bool(job_payload.remember_across_devices),
                 isolated_mode=bool(job_payload.isolated_mode),
+                active_mind_id=job_payload.active_mind_id,
+                mind_topology=job_payload.mind_topology,
+                active_embodiment_id=job_payload.active_embodiment_id,
+                active_realm_id=job_payload.active_realm_id,
             )
             await self._enqueue_revision_job(
                 envelope=envelope,
@@ -382,6 +459,29 @@ class IngestWorker:
                         if belief_row.get("character_id") is not None
                         else job_payload.character_id
                     ),
+                    active_mind_id=(
+                        str(belief_row["memory_owner_id"])
+                        if belief_row.get("memory_owner_id") is not None
+                        else job_payload.active_mind_id
+                    ),
+                    source_mind_id=(
+                        str(belief_row["source_mind_id"])
+                        if belief_row.get("source_mind_id") is not None
+                        else job_payload.source_mind_id
+                    ),
+                    mind_topology=job_payload.mind_topology,
+                    active_embodiment_id=(
+                        str(belief_row["embodiment_id"])
+                        if belief_row.get("embodiment_id") is not None
+                        else job_payload.active_embodiment_id
+                    ),
+                    cross_embodiment_mode=job_payload.cross_embodiment_mode,
+                    active_realm_id=(
+                        str(belief_row["realm_id"])
+                        if belief_row.get("realm_id") is not None
+                        else job_payload.active_realm_id
+                    ),
+                    cross_realm_mode=job_payload.cross_realm_mode,
                     mode=job_payload.mode,
                     incognito=bool(job_payload.incognito),
                     remember_across_chats=bool(job_payload.remember_across_chats),
@@ -436,6 +536,29 @@ class IngestWorker:
                         if evidence_row.get("character_id") is not None
                         else job_payload.character_id
                     ),
+                    active_mind_id=(
+                        str(evidence_row["memory_owner_id"])
+                        if evidence_row.get("memory_owner_id") is not None
+                        else job_payload.active_mind_id
+                    ),
+                    source_mind_id=(
+                        str(evidence_row["source_mind_id"])
+                        if evidence_row.get("source_mind_id") is not None
+                        else job_payload.source_mind_id
+                    ),
+                    mind_topology=job_payload.mind_topology,
+                    active_embodiment_id=(
+                        str(evidence_row["embodiment_id"])
+                        if evidence_row.get("embodiment_id") is not None
+                        else job_payload.active_embodiment_id
+                    ),
+                    cross_embodiment_mode=job_payload.cross_embodiment_mode,
+                    active_realm_id=(
+                        str(evidence_row["realm_id"])
+                        if evidence_row.get("realm_id") is not None
+                        else job_payload.active_realm_id
+                    ),
+                    cross_realm_mode=job_payload.cross_realm_mode,
                     mode=job_payload.mode,
                     incognito=bool(job_payload.incognito),
                     remember_across_chats=bool(job_payload.remember_across_chats),
@@ -766,6 +889,10 @@ class IngestWorker:
         remember_across_chats: bool,
         remember_across_devices: bool,
         isolated_mode: bool = False,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
     ) -> str | None:
         candidates = await self._belief_repository.find_active_belief_candidates_by_claim_key(
             user_id,
@@ -792,6 +919,22 @@ class IngestWorker:
                 continue
             if isolated_mode and candidate.get("conversation_id") != conversation_id:
                 continue
+            if not self._candidate_matches_active_mind(
+                candidate,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+            ):
+                continue
+            if not self._candidate_matches_active_embodiment(
+                candidate,
+                active_embodiment_id=active_embodiment_id,
+            ):
+                continue
+            if not self._candidate_matches_active_realm(
+                candidate,
+                active_realm_id=active_realm_id,
+            ):
+                continue
             payload_json = candidate.get("payload_json")
             source_ids = payload_json.get("source_message_ids", []) if isinstance(payload_json, dict) else []
             if source_message_id in source_ids:
@@ -810,6 +953,50 @@ class IngestWorker:
             return None
         ranked.sort(key=lambda item: (-item[0], item[1]))
         return ranked[0][1]
+
+    @staticmethod
+    def _candidate_matches_active_mind(
+        candidate: dict[str, Any],
+        *,
+        active_mind_id: str | None,
+        mind_topology: str | None,
+    ) -> bool:
+        candidate_owner = candidate.get("memory_owner_id")
+        candidate_owner_id = None if candidate_owner is None else str(candidate_owner)
+        if active_mind_id is None:
+            return candidate_owner_id is None
+        if str(mind_topology or "unimind") == "unimind":
+            return candidate_owner_id is None or candidate_owner_id == active_mind_id
+        return candidate_owner_id == active_mind_id
+
+    @staticmethod
+    def _candidate_matches_active_embodiment(
+        candidate: dict[str, Any],
+        *,
+        active_embodiment_id: str | None,
+    ) -> bool:
+        candidate_embodiment = candidate.get("embodiment_id")
+        candidate_embodiment_id = (
+            None if candidate_embodiment is None else str(candidate_embodiment)
+        )
+        if active_embodiment_id is None:
+            return candidate_embodiment_id is None
+        return (
+            candidate_embodiment_id is None
+            or candidate_embodiment_id == active_embodiment_id
+        )
+
+    @staticmethod
+    def _candidate_matches_active_realm(
+        candidate: dict[str, Any],
+        *,
+        active_realm_id: str | None,
+    ) -> bool:
+        candidate_realm = candidate.get("realm_id")
+        candidate_realm_id = None if candidate_realm is None else str(candidate_realm)
+        if active_realm_id is None:
+            return candidate_realm_id is None
+        return candidate_realm_id is None or candidate_realm_id == active_realm_id
 
     async def _conversation_message_count(self, *, user_id: str, conversation_id: str) -> int:
         cursor = await self._connection.execute(

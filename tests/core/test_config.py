@@ -90,6 +90,38 @@ def test_workers_can_be_enabled_explicitly(monkeypatch) -> None:
     assert settings.workers_enabled is True
 
 
+def test_embedding_retrieval_settings_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_EMBEDDING_BACKEND", "sqlite_vec")
+    monkeypatch.setenv("ATAGIA_EMBEDDING_VECTOR_LIMIT_CAP", "23")
+    monkeypatch.setenv("ATAGIA_EMBEDDING_SEARCH_OVERFETCH_MULTIPLIER", "5")
+
+    settings = Settings.from_env()
+
+    assert settings.embedding_backend == "sqlite_vec"
+    assert settings.embedding_vector_limit_cap == 23
+    assert settings.embedding_search_overfetch_multiplier == 5
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("ATAGIA_EMBEDDING_VECTOR_LIMIT_CAP", "0"),
+        ("ATAGIA_EMBEDDING_SEARCH_OVERFETCH_MULTIPLIER", "0"),
+    ],
+)
+def test_embedding_retrieval_settings_reject_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(env_name, value)
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
 def test_worker_circuit_breaker_settings_use_defaults(monkeypatch) -> None:
     monkeypatch.delenv("ATAGIA_WORKER_CIRCUIT_BREAKER_ENABLED", raising=False)
     monkeypatch.delenv("ATAGIA_WORKER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", raising=False)
@@ -133,7 +165,7 @@ def test_intimacy_model_settings_can_be_overridden(monkeypatch) -> None:
     )
     monkeypatch.setenv(
         "ATAGIA_LLM_INTIMACY_MODEL__EXTRACTOR",
-        "google/gemini-3.1-flash-lite-preview",
+        "google/gemini-3.1-flash-lite",
     )
     monkeypatch.setenv("ATAGIA_LLM_INTIMACY_PROACTIVE_ROUTING_ENABLED", "true")
 
@@ -141,8 +173,33 @@ def test_intimacy_model_settings_can_be_overridden(monkeypatch) -> None:
 
     assert settings.llm_intimacy_ingest_model == "openrouter/z-ai/glm-4.6"
     assert settings.llm_intimacy_retrieval_model == "openrouter/x-ai/grok-4.1-fast"
-    assert settings.llm_intimacy_component_models == {"extractor": "google/gemini-3.1-flash-lite-preview"}
+    assert settings.llm_intimacy_component_models == {"extractor": "google/gemini-3.1-flash-lite"}
     assert settings.llm_intimacy_proactive_routing_enabled is True
+
+
+def test_structured_output_repair_settings_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_LLM_STRUCTURED_OUTPUT_RETRY_ATTEMPTS", "2")
+    monkeypatch.setenv("ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_ENABLED", "true")
+    monkeypatch.setenv(
+        "ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_MODEL",
+        "anthropic/claude-opus-4-7",
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.llm_structured_output_retry_attempts == 2
+    assert settings.llm_structured_output_rescue_enabled is True
+    assert settings.llm_structured_output_rescue_model == "anthropic/claude-opus-4-7"
+
+
+def test_structured_output_rescue_uses_default_model_when_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_ENABLED", "true")
+    monkeypatch.delenv("ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_MODEL", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.llm_structured_output_rescue_enabled is True
+    assert settings.llm_structured_output_rescue_model == "anthropic/claude-opus-4-7"
 
 
 def test_context_cache_settings_use_defaults(monkeypatch) -> None:

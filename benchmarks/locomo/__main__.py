@@ -47,7 +47,7 @@ from atagia.services.model_resolution import COMPONENTS_BY_ID
 
 _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
-_DEFAULT_ANTHROPIC_JUDGE_MODEL = "claude-opus-4-6"
+_DEFAULT_JUDGE_MODEL = "anthropic/claude-opus-4-7"
 _BENCHMARK_DB_FILENAME = "benchmark.db"
 _BENCHMARK_DB_METADATA_FILENAME = "run_metadata.json"
 _BENCHMARK_INGESTION_PROGRESS_FILENAME = "ingestion_progress.json"
@@ -110,7 +110,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--answer-model",
         default=None,
-        help="Model spec for benchmark answer generation, e.g. openrouter/google/gemini-3.1-flash-lite-preview,medium.",
+        help="Model spec for benchmark answer generation, e.g. openrouter/google/gemini-3.1-flash-lite,medium.",
     )
     parser.add_argument(
         "--answer-prompt-variant",
@@ -123,11 +123,20 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--answer-max-output-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Benchmark-only max output token budget for answer generation. "
+            "Defaults to the LoCoMo benchmark answer limit."
+        ),
+    )
+    parser.add_argument(
         "--judge-model",
         default=None,
         help=(
-            "Optional LLM model for scoring; defaults to claude-opus-4-6 for "
-            "Anthropic, otherwise the answer model"
+            "Optional LLM model for scoring; defaults to direct Anthropic "
+            "claude-opus-4-7 for benchmark stability"
         ),
     )
     parser.add_argument(
@@ -162,7 +171,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Override one Atagia LLM component model. Repeatable. "
             "Examples: extractor=openai/gpt-4o-mini, "
-            "need_detector=openrouter/google/gemini-3.1-flash-lite-preview,medium"
+            "need_detector=openrouter/google/gemini-3.1-flash-lite,medium"
         ),
     )
     parser.add_argument(
@@ -347,9 +356,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _resolve_judge_model(args: argparse.Namespace) -> str | None:
     if args.judge_model is not None:
         return args.judge_model
-    if args.provider == "anthropic":
-        return _DEFAULT_ANTHROPIC_JUDGE_MODEL
-    return None
+    return _DEFAULT_JUDGE_MODEL
 
 
 def _resolve_answer_model(args: argparse.Namespace) -> str | None:
@@ -415,6 +422,7 @@ async def _run_async(
         chat_model_override=args.chat_model,
         component_models=_parse_component_model_overrides(args.component_model),
         answer_prompt_variant=args.answer_prompt_variant,
+        answer_max_output_tokens=args.answer_max_output_tokens,
         manifests_dir=args.manifests_dir,
         embedding_backend=args.embedding_backend,
         embedding_model=args.embedding_model,
@@ -1593,6 +1601,8 @@ def main() -> None:
         parser.error("--provider is required unless a list-benchmark-dbs option is used")
     if args.model is not None and args.answer_model is not None:
         parser.error("--model is a legacy alias; use either --model or --answer-model, not both")
+    if args.answer_max_output_tokens is not None and args.answer_max_output_tokens < 1:
+        parser.error("--answer-max-output-tokens must be positive")
     if (
         _resolve_answer_model(args) is None
         and args.chat_model is None

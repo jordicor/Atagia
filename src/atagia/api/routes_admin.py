@@ -39,6 +39,7 @@ from atagia.memory.policy_manifest import ManifestLoader
 from atagia.models.schemas_api import AdminMetricsComputeRequest
 from atagia.models.schemas_api import (
     AdminEmbeddingBackfillRequest,
+    AdminMemoryCoordinateCorrectionRequest,
     AdminReviewActionResponse,
     AdminReviewMemoryListResponse,
 )
@@ -62,6 +63,7 @@ from atagia.services.embedding_backfill_service import EmbeddingBackfillResult, 
 from atagia.services.admin_rebuild_service import AdminRebuildService, RebuildResult
 from atagia.services.errors import DeletionConfirmationError, MemoryNotFoundError
 from atagia.services.job_tracking_service import JobTrackingService
+from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.lifecycle_service import (
     HARD_DELETE_MEMORY_CONFIRMATION,
     ConversationLifecycleService,
@@ -410,7 +412,7 @@ async def backfill_embeddings(
         )
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
     await _audit_admin_action(
@@ -629,6 +631,101 @@ async def inspect_retrieval_event(
             detail="Retrieval event not found",
         )
     return event
+
+
+@router.get("/memory-coordinates/{user_id}/{memory_id}")
+async def inspect_memory_coordinates(
+    user_id: str,
+    memory_id: str,
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+) -> dict[str, object]:
+    inspector = MemoryInspector(connection, clock)
+    inspection = await inspector.inspect_memory_coordinates(
+        memory_id,
+        user_id,
+        admin_user_id=auth_context.actor_id,
+    )
+    if inspection is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Memory object not found for user",
+        )
+    return inspection
+
+
+@router.post("/memory-coordinates/{user_id}/{memory_id}/correct")
+async def correct_memory_coordinates(
+    user_id: str,
+    memory_id: str,
+    payload: AdminMemoryCoordinateCorrectionRequest,
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+    runtime: Any = Depends(get_runtime),
+) -> dict[str, object]:
+    inspector = MemoryInspector(connection, clock)
+    try:
+        inspection = await inspector.correct_memory_coordinates(
+            memory_id,
+            user_id,
+            admin_user_id=auth_context.actor_id,
+            updates=payload.coordinates,
+            reason=payload.reason,
+            invalidate_user_cache=ContextCacheService(runtime).invalidate_user_cache,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    if inspection is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Memory object not found for user",
+        )
+    return inspection
+
+
+@router.get("/memory-coordinates/{user_id}/{memory_id}/corrections")
+async def inspect_memory_coordinate_corrections(
+    user_id: str,
+    memory_id: str,
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+) -> list[dict[str, object]]:
+    inspector = MemoryInspector(connection, clock)
+    return await inspector.inspect_coordinate_correction_history(
+        memory_id,
+        user_id,
+        admin_user_id=auth_context.actor_id,
+    )
+
+
+@router.get("/retrieval-events/{event_id}/memory-decisions/{user_id}/{memory_id}")
+async def inspect_retrieval_memory_decision(
+    event_id: str,
+    user_id: str,
+    memory_id: str,
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+) -> dict[str, object]:
+    inspector = MemoryInspector(connection, clock)
+    decision = await inspector.inspect_retrieval_memory_decision(
+        event_id,
+        memory_id,
+        user_id,
+        admin_user_id=auth_context.actor_id,
+    )
+    if decision is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Retrieval event not found for user",
+        )
+    return decision
 
 
 @router.get("/consequence-chains/{user_id}")

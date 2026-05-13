@@ -9,7 +9,7 @@ from pathlib import Path
 
 @dataclass(frozen=True, slots=True)
 class StoredArtifactBlob:
-    """Stored artifact payload metadata ready for artifact_blobs."""
+    """Stored artifact payload metadata ready for artifact payload rows."""
 
     storage_kind: str
     blob_bytes: bytes | None
@@ -30,18 +30,19 @@ class ArtifactBlobStore:
 
     def store_bytes(self, *, user_id: str, content_bytes: bytes) -> StoredArtifactBlob:
         sha256 = hashlib.sha256(content_bytes).hexdigest()
-        blob_path = self._path_for(user_id=user_id, sha256=sha256)
+        storage_key = self.storage_key_for(user_id=user_id, sha256=sha256)
+        blob_path = self._path_for(storage_key)
         blob_path.parent.mkdir(parents=True, exist_ok=True)
         if blob_path.exists():
             existing_sha256 = hashlib.sha256(blob_path.read_bytes()).hexdigest()
             if existing_sha256 != sha256:
-                blob_path.write_bytes(content_bytes)
+                raise ValueError("Artifact blob hash collision at storage key")
         else:
             blob_path.write_bytes(content_bytes)
         return StoredArtifactBlob(
             storage_kind="local_file",
             blob_bytes=None,
-            storage_uri=str(blob_path),
+            storage_uri=storage_key,
             byte_size=len(content_bytes),
             sha256=sha256,
         )
@@ -50,6 +51,9 @@ class ArtifactBlobStore:
         blob_path = self._resolve_storage_uri(storage_uri)
         return blob_path.read_bytes()
 
+    def path_for_storage_uri(self, storage_uri: str, *, strict: bool = True) -> Path:
+        return self._resolve_storage_uri(storage_uri, strict=strict)
+
     def delete_storage_uri(self, storage_uri: str) -> bool:
         blob_path = self._resolve_storage_uri(storage_uri, strict=False)
         if not blob_path.exists():
@@ -57,9 +61,12 @@ class ArtifactBlobStore:
         blob_path.unlink()
         return True
 
-    def _path_for(self, *, user_id: str, sha256: str) -> Path:
+    def storage_key_for(self, *, user_id: str, sha256: str) -> str:
         safe_user_id = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
-        return self._base_dir / safe_user_id / sha256[:2] / sha256
+        return str(Path("users") / safe_user_id[:2] / safe_user_id / sha256[:2] / sha256[2:4] / sha256)
+
+    def _path_for(self, storage_key: str) -> Path:
+        return self._base_dir / storage_key
 
     def _resolve_storage_uri(self, storage_uri: str, *, strict: bool = True) -> Path:
         raw_path = Path(storage_uri).expanduser()

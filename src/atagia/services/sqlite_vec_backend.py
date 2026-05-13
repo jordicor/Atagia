@@ -58,7 +58,7 @@ class SQLiteVecBackend(EmbeddingIndex):
 
     @property
     def vector_limit(self) -> int:
-        return 1
+        return self._settings.embedding_vector_limit_cap
 
     async def initialize(self) -> None:
         try:

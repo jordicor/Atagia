@@ -73,6 +73,29 @@ class JsonProvider(LLMProvider):
         )
 
 
+class SequentialJsonProvider(LLMProvider):
+    def __init__(self, name: str, payloads: list[str]) -> None:
+        self.name = name
+        self.payloads = list(payloads)
+        self.requests: list[LLMCompletionRequest] = []
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.requests.append(request)
+        output_text = self.payloads.pop(0) if self.payloads else "{}"
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text=output_text,
+        )
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        return LLMEmbeddingResponse(
+            provider=self.name,
+            model=request.model,
+            vectors=[LLMEmbeddingVector(index=0, values=[0.3, 0.4])],
+        )
+
+
 class GrammarFallbackProvider(LLMProvider):
     name = "grammar-fallback"
 
@@ -113,6 +136,33 @@ class SchemaFallbackProvider(LLMProvider):
             provider=self.name,
             model=request.model,
             output_text='{"label":"ok","score":8}',
+        )
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        return LLMEmbeddingResponse(
+            provider=self.name,
+            model=request.model,
+            vectors=[LLMEmbeddingVector(index=0, values=[0.3, 0.4])],
+        )
+
+
+class PromptStructuredProvider(LLMProvider):
+    name = "prompt-structured"
+    supports_native_structured_output = False
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.seen_response_schema: list[bool] = []
+        self.seen_messages: list[list[LLMMessage]] = []
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.calls += 1
+        self.seen_response_schema.append(request.response_schema is not None)
+        self.seen_messages.append(request.messages)
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text='{"label":"ok","score":10}',
         )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -554,6 +604,148 @@ async def test_complete_structured_falls_back_when_provider_rejects_schema_contr
 
 
 @pytest.mark.asyncio
+async def test_complete_structured_prompts_json_for_provider_without_native_schema() -> None:
+    provider = PromptStructuredProvider()
+    client = LLMClient(provider_name="prompt-structured", providers=[provider])
+
+    result = await client.complete_structured_with_response(
+        _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()}),
+        StructuredPayload,
+    )
+
+    assert result.value == StructuredPayload(label="ok", score=10)
+    assert result.used_schema_fallback is True
+    assert provider.calls == 1
+    assert provider.seen_response_schema == [False]
+    assert "Return exactly one raw JSON" in provider.seen_messages[0][-1].content
+
+
+@pytest.mark.asyncio
+async def test_complete_structured_retries_same_model_before_rescue() -> None:
+    primary = SequentialJsonProvider(
+        "openrouter",
+        ["not-json", '{"label":"ok","score":7}'],
+    )
+    rescue = SequentialJsonProvider("anthropic", ['{"label":"rescue","score":10}'])
+    client = LLMClient(
+        providers=[primary, rescue],
+        structured_output_retry_attempts=1,
+        structured_output_rescue_enabled=True,
+        structured_output_rescue_model="anthropic/claude-opus-4-7",
+    )
+
+    result = await client.complete_structured_with_response(
+        _request().model_copy(
+            update={
+                "model": "openrouter/deepseek/deepseek-v4-flash",
+                "metadata": {"purpose": "need_detection"},
+                "response_schema": StructuredPayload.model_json_schema(),
+            }
+        ),
+        StructuredPayload,
+    )
+
+    assert result.value == StructuredPayload(label="ok", score=7)
+    assert result.used_structured_output_retry is True
+    assert result.used_structured_output_rescue is False
+    assert result.response.raw_response["atagia_structured_output_repair"] == {
+        "kind": "retry",
+        "primary_model": "openrouter/deepseek/deepseek-v4-flash",
+        "repair_model": "openrouter/deepseek/deepseek-v4-flash",
+        "retry_attempts": 1,
+    }
+    assert [request.model for request in primary.requests] == [
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash",
+    ]
+    assert not rescue.requests
+    assert primary.requests[1].metadata["atagia_structured_output_retry"] is True
+    assert primary.requests[1].metadata["atagia_structured_output_retry_attempt"] == 1
+    assert "Validation errors" in primary.requests[1].messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_complete_structured_uses_rescue_after_same_model_retry_fails() -> None:
+    primary = SequentialJsonProvider(
+        "openrouter",
+        ["not-json", '{"label":"missing score"}'],
+    )
+    rescue = SequentialJsonProvider("anthropic", ['{"label":"rescued","score":11}'])
+    client = LLMClient(
+        providers=[primary, rescue],
+        structured_output_retry_attempts=1,
+        structured_output_rescue_enabled=True,
+        structured_output_rescue_model="anthropic/claude-opus-4-7,high",
+    )
+
+    result = await client.complete_structured_with_response(
+        _request().model_copy(
+            update={
+                "model": "openrouter/deepseek/deepseek-v4-flash",
+                "metadata": {"purpose": "need_detection"},
+            }
+        ),
+        StructuredPayload,
+    )
+
+    assert result.value == StructuredPayload(label="rescued", score=11)
+    assert result.used_structured_output_retry is True
+    assert result.used_structured_output_rescue is True
+    assert result.response.raw_response["atagia_structured_output_repair"] == {
+        "kind": "rescue",
+        "primary_model": "openrouter/deepseek/deepseek-v4-flash",
+        "repair_model": "anthropic/claude-opus-4-7,high",
+        "retry_attempts": 1,
+    }
+    assert len(primary.requests) == 2
+    assert len(rescue.requests) == 1
+    assert rescue.requests[0].model == "claude-opus-4-7"
+    assert rescue.requests[0].response_schema is not None
+    assert rescue.requests[0].metadata["atagia_structured_output_rescue"] is True
+    assert (
+        rescue.requests[0].metadata["atagia_structured_output_rescue_original_model"]
+        == "openrouter/deepseek/deepseek-v4-flash"
+    )
+    assert rescue.requests[0].metadata["anthropic_output_effort"] == "high"
+    assert "configured rescue model" in rescue.requests[0].messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_complete_structured_can_disable_same_model_retry() -> None:
+    primary = SequentialJsonProvider(
+        "openrouter",
+        ["not-json", '{"label":"ok","score":7}'],
+    )
+    client = LLMClient(
+        providers=[primary],
+        structured_output_retry_attempts=0,
+    )
+
+    with pytest.raises(StructuredOutputError):
+        await client.complete_structured(
+            _request().model_copy(update={"model": "openrouter/deepseek/deepseek-v4-flash"}),
+            StructuredPayload,
+        )
+
+    assert len(primary.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "400 invalid_request_error: Schema is too complex.",
+        "Provider grammar compilation timed out before completion.",
+        "output_config.format.schema: For 'number' type, properties maximum, minimum are not supported",
+        "output_config.format: Extra inputs are not permitted",
+    ],
+)
+def test_should_retry_without_schema_for_schema_complexity_errors(message: str) -> None:
+    request = _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()})
+
+    assert LLMClient._should_retry_without_schema(LLMError(message), request)
+
+
+@pytest.mark.asyncio
 async def test_complete_structured_normalizes_legacy_extraction_payload_shapes() -> None:
     client = LLMClient(
         provider_name="json",
@@ -620,14 +812,14 @@ async def test_complete_structured_defaults_legacy_item_confidence_when_missing(
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_still_fails_fast_for_non_extraction_validation_errors() -> None:
+async def test_complete_structured_retries_non_extraction_validation_errors_once() -> None:
     provider = JsonProvider('{"label":"ok"}')
     client = LLMClient(provider_name="json", providers=[provider])
 
     with pytest.raises(StructuredOutputError):
         await client.complete_structured(_request(), StructuredPayload)
 
-    assert provider.calls == 1
+    assert provider.calls == 2
 
 
 @pytest.mark.asyncio
@@ -665,9 +857,9 @@ async def test_complete_applies_gemini_profile_without_exposing_thinking() -> No
     provider = RecordingProvider("gemini")
     client = LLMClient(providers=[provider])
 
-    await client.complete(_request().model_copy(update={"model": "google/gemini-3.1-flash-lite-preview"}))
+    await client.complete(_request().model_copy(update={"model": "google/gemini-3.1-flash-lite"}))
 
-    assert provider.requests[0].model == "gemini-3.1-flash-lite-preview"
+    assert provider.requests[0].model == "gemini-3.1-flash-lite"
     assert provider.requests[0].include_thinking is False
     assert provider.requests[0].metadata["gemini_thinking_level"] == "MINIMAL"
 
@@ -698,10 +890,33 @@ async def test_complete_applies_openrouter_flashlite_profile_after_resolution() 
     provider = RecordingProvider("openrouter")
     client = LLMClient(providers=[provider])
 
-    await client.complete(_request().model_copy(update={"model": "openrouter/google/gemini-3.1-flash-lite-preview"}))
+    await client.complete(_request().model_copy(update={"model": "openrouter/google/gemini-3.1-flash-lite"}))
 
-    assert provider.requests[0].model == "google/gemini-3.1-flash-lite-preview"
+    assert provider.requests[0].model == "google/gemini-3.1-flash-lite"
     assert provider.requests[0].metadata["provider_extra_body"] == {"reasoning": {"effort": "minimal"}}
+
+
+@pytest.mark.asyncio
+async def test_complete_applies_anthropic_opus_47_effort_profile() -> None:
+    provider = RecordingProvider("anthropic")
+    client = LLMClient(providers=[provider])
+
+    await client.complete(_request().model_copy(update={"model": "anthropic/claude-opus-4-7,high"}))
+
+    assert provider.requests[0].model == "claude-opus-4-7"
+    assert provider.requests[0].metadata["anthropic_thinking_adaptive"] is True
+    assert provider.requests[0].metadata["anthropic_output_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_complete_applies_openrouter_gpt55_reasoning_profile() -> None:
+    provider = RecordingProvider("openrouter")
+    client = LLMClient(providers=[provider])
+
+    await client.complete(_request().model_copy(update={"model": "openrouter/openai/gpt-5.5,high"}))
+
+    assert provider.requests[0].model == "openai/gpt-5.5"
+    assert provider.requests[0].metadata["provider_extra_body"] == {"reasoning": {"effort": "high"}}
 
 
 @pytest.mark.asyncio

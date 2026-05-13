@@ -81,6 +81,13 @@ RECENT_TRANSCRIPT_BUDGET_GUIDANCE = (
 )
 
 
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 @dataclass(frozen=True, slots=True)
 class RawMessage:
     """A verbatim message included in the transcript window."""
@@ -1186,6 +1193,25 @@ def build_job_payload(
         user_persona_id=conversation_context.user_persona_id,
         platform_id=conversation_context.platform_id,
         character_id=conversation_context.character_id,
+        active_presence_id=conversation_context.active_presence_id,
+        active_presence_kind=conversation_context.active_presence_kind.value,
+        active_presence_display_name=conversation_context.active_presence_display_name,
+        source_presence_id=conversation_context.source_presence_id,
+        source_presence_kind=conversation_context.source_presence_kind.value,
+        source_presence_display_name=conversation_context.source_presence_display_name,
+        active_space_id=conversation_context.active_space_id,
+        active_space_boundary_mode=conversation_context.active_space_boundary_mode.value,
+        active_space_display_name=conversation_context.active_space_display_name,
+        active_mind_id=conversation_context.active_mind_id,
+        source_mind_id=conversation_context.source_mind_id,
+        active_mind_display_name=conversation_context.active_mind_display_name,
+        mind_topology=conversation_context.mind_topology.value,
+        active_embodiment_id=conversation_context.active_embodiment_id,
+        active_embodiment_display_name=conversation_context.active_embodiment_display_name,
+        cross_embodiment_mode=conversation_context.cross_embodiment_mode.value,
+        active_realm_id=conversation_context.active_realm_id,
+        active_realm_display_name=conversation_context.active_realm_display_name,
+        cross_realm_mode=conversation_context.cross_realm_mode.value,
         mode=conversation_context.mode,
         incognito=conversation_context.incognito,
         remember_across_chats=conversation_context.remember_across_chats,
@@ -1219,6 +1245,25 @@ def build_message_jobs(
     ingest_origin: IngestOrigin | str | None = None,
     confirmation_strategy: ConfirmationStrategy | str | None = None,
     memory_privacy_mode: MemoryPrivacyMode | str | None = None,
+    active_presence_id: str | None = None,
+    active_presence_kind: str | None = None,
+    active_presence_display_name: str | None = None,
+    source_presence_id: str | None = None,
+    source_presence_kind: str | None = None,
+    source_presence_display_name: str | None = None,
+    active_space_id: str | None = None,
+    active_space_boundary_mode: str | None = None,
+    active_space_display_name: str | None = None,
+    active_mind_id: str | None = None,
+    source_mind_id: str | None = None,
+    active_mind_display_name: str | None = None,
+    mind_topology: str | None = None,
+    active_embodiment_id: str | None = None,
+    active_embodiment_display_name: str | None = None,
+    cross_embodiment_mode: str | None = None,
+    active_realm_id: str | None = None,
+    active_realm_display_name: str | None = None,
+    cross_realm_mode: str | None = None,
 ) -> list[tuple[str, JobEnvelope]]:
     """Build stream jobs for one persisted message."""
     preferences = memory_preferences or {}
@@ -1229,6 +1274,24 @@ def build_message_jobs(
     resolved_incognito = bool(conversation.get("incognito")) or bool(
         conversation.get("isolated_mode")
     )
+    resolved_active_presence_id = _optional_text(
+        active_presence_id or conversation.get("active_presence_id")
+    )
+    resolved_source_presence_id = _optional_text(
+        source_presence_id or resolved_active_presence_id
+    )
+    resolved_active_mind_id = _optional_text(
+        active_mind_id or conversation.get("active_mind_id")
+    )
+    resolved_source_mind_id = _optional_text(
+        source_mind_id or resolved_active_mind_id
+    )
+    resolved_active_embodiment_id = _optional_text(
+        active_embodiment_id or conversation.get("active_embodiment_id")
+    )
+    resolved_active_realm_id = _optional_text(
+        active_realm_id or conversation.get("active_realm_id")
+    )
     conversation_context = ExtractionConversationContext(
         user_id=str(conversation["user_id"]),
         conversation_id=str(conversation["id"]),
@@ -1238,6 +1301,47 @@ def build_message_jobs(
         user_persona_id=conversation.get("user_persona_id"),
         platform_id=resolved_platform_id,
         character_id=resolved_character_id,
+        active_presence_id=resolved_active_presence_id,
+        active_presence_kind=active_presence_kind or "unknown",
+        active_presence_display_name=_optional_text(active_presence_display_name),
+        source_presence_id=resolved_source_presence_id,
+        source_presence_kind=source_presence_kind or active_presence_kind or "unknown",
+        source_presence_display_name=_optional_text(
+            source_presence_display_name or active_presence_display_name
+        ),
+        active_space_id=_optional_text(
+            active_space_id or conversation.get("active_space_id")
+        ),
+        active_space_boundary_mode=(
+            active_space_boundary_mode
+            or conversation.get("active_space_boundary_mode")
+            or "focus"
+        ),
+        active_space_display_name=_optional_text(
+            active_space_display_name or conversation.get("active_space_display_name")
+        ),
+        active_mind_id=resolved_active_mind_id,
+        source_mind_id=resolved_source_mind_id,
+        active_mind_display_name=_optional_text(active_mind_display_name),
+        mind_topology=(
+            mind_topology
+            or conversation.get("mind_topology")
+            or "unimind"
+        ),
+        active_embodiment_id=resolved_active_embodiment_id,
+        active_embodiment_display_name=_optional_text(active_embodiment_display_name),
+        cross_embodiment_mode=(
+            cross_embodiment_mode
+            or conversation.get("cross_embodiment_mode")
+            or "direct_if_same_body"
+        ),
+        active_realm_id=resolved_active_realm_id,
+        active_realm_display_name=_optional_text(active_realm_display_name),
+        cross_realm_mode=(
+            cross_realm_mode
+            or conversation.get("cross_realm_mode")
+            or "none"
+        ),
         mode=str(conversation.get("mode") or conversation["assistant_mode_id"]),
         incognito=resolved_incognito,
         remember_across_chats=bool(preferences.get("remember_across_chats", True)),

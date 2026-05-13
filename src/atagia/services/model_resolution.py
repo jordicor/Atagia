@@ -9,7 +9,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_THINKING_LEVELS = frozenset({"none", "minimal", "medium", "high"})
+ALLOWED_THINKING_LEVELS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
 PROVIDER_SLUG_TO_NAME = {
     "anthropic": "anthropic",
     "openai": "openai",
@@ -26,7 +28,9 @@ PROVIDER_NAME_TO_SLUG = {
 SUPPORTED_PROVIDER_SLUGS = tuple(PROVIDER_SLUG_TO_NAME)
 
 DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
-OPENROUTER_FLASH_LITE_MODEL = "openrouter/google/gemini-3.1-flash-lite-preview"
+OPENROUTER_FLASH_LITE_MODEL = "openrouter/google/gemini-3.1-flash-lite"
+OPENROUTER_DEEPSEEK_V4_FLASH_MODEL = "openrouter/deepseek/deepseek-v4-flash"
+DEFAULT_STRUCTURED_OUTPUT_RESCUE_MODEL = "anthropic/claude-opus-4-7"
 
 
 class ModelResolutionError(ValueError):
@@ -81,6 +85,7 @@ class ResolutionSnapshot:
     forced_global_model: str | None
     category_models: dict[str, str | None]
     intimacy_category_models: dict[str, str | None]
+    structured_output_rescue_model: ParsedModelSpec | None
     components: dict[str, ResolvedComponentModel]
     intimacy_components: dict[str, ResolvedComponentModel]
     embedding: ParsedModelSpec
@@ -114,10 +119,11 @@ COMPONENT_SPECS: tuple[ComponentSpec, ...] = (
     ComponentSpec("extraction_watchdog", "ingest", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("export_anonymizer", "ingest", "anthropic/claude-sonnet-4-6"),
     ComponentSpec("need_detector", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("coverage_expander", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("applicability_scorer", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("context_staleness", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("metrics_computer", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
-    ComponentSpec("chat", "chat", "anthropic/claude-sonnet-4-6"),
+    ComponentSpec("chat", "chat", OPENROUTER_DEEPSEEK_V4_FLASH_MODEL),
 )
 COMPONENTS_BY_ID = {spec.component_id: spec for spec in COMPONENT_SPECS}
 
@@ -139,6 +145,7 @@ PURPOSE_TO_COMPONENT_ID = {
     "intent_classifier_explicit": "intent_classifier",
     "memory_extraction": "extractor",
     "need_detection": "need_detector",
+    "coverage_expansion": "coverage_expander",
     "summary_chunk_segmentation": "compactor",
     "summary_privacy_gate_judge": "summary_privacy_judge",
     "summary_privacy_gate_refine": "summary_privacy_refiner",
@@ -222,10 +229,12 @@ def provider_qualified_model(provider: str | None, model: str | None) -> str | N
         return None
     model_part = normalized_model.split(",", 1)[0]
     first_segment = model_part.split("/", 1)[0].strip().lower()
-    if first_segment in PROVIDER_SLUG_TO_NAME:
-        return parse_model_spec(normalized_model).canonical_spec
     normalized_provider = (provider or "").strip().lower()
     provider_slug = PROVIDER_NAME_TO_SLUG.get(normalized_provider)
+    if provider_slug == "openrouter" and first_segment == "google":
+        return parse_model_spec(f"openrouter/{normalized_model}").canonical_spec
+    if first_segment in PROVIDER_SLUG_TO_NAME:
+        return parse_model_spec(normalized_model).canonical_spec
     if provider_slug is None:
         raise ModelResolutionError(
             "A provider-qualified model spec is required when no valid provider "
@@ -396,6 +405,24 @@ def resolve_intimacy_fallback_models(settings: Any) -> dict[str, str]:
     }
 
 
+def resolve_structured_output_rescue_model(settings: Any) -> ParsedModelSpec | None:
+    """Return the optional structured-output rescue model."""
+    if not bool(getattr(settings, "llm_structured_output_rescue_enabled", False)):
+        return None
+    value = normalized_model_value(
+        getattr(settings, "llm_structured_output_rescue_model", None)
+    )
+    if value is None:
+        raise ModelResolutionError(
+            "ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_MODEL is required when "
+            "ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_ENABLED is true."
+        )
+    return parse_model_spec(
+        value,
+        env_name="ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_MODEL",
+    )
+
+
 def component_id_for_llm_purpose(purpose: str | None) -> str | None:
     """Return the component id associated with a stable LLM request purpose."""
     if purpose is None:
@@ -422,6 +449,7 @@ def build_resolution_snapshot(settings: Any) -> ResolutionSnapshot:
                 getattr(settings, "llm_intimacy_retrieval_model", None)
             ),
         },
+        structured_output_rescue_model=resolve_structured_output_rescue_model(settings),
         components=resolve_all_components(settings),
         intimacy_components=resolve_all_intimacy_components(settings),
         embedding=parse_embedding_model_spec(getattr(settings, "embedding_model", None)),
@@ -448,6 +476,9 @@ def required_completion_provider_slugs(settings: Any) -> set[str]:
         resolved.parsed.provider_slug
         for resolved in resolve_all_intimacy_components(settings).values()
     )
+    rescue_model = resolve_structured_output_rescue_model(settings)
+    if rescue_model is not None:
+        providers.add(rescue_model.provider_slug)
     return providers
 
 
@@ -507,6 +538,21 @@ def format_resolution_log(settings: Any) -> str:
     lines.append(
         f"  embedding              : {snapshot.embedding.canonical_model:<45} (env: ATAGIA_EMBEDDING_MODEL)"
     )
+    configured_rescue_model = normalized_model_value(
+        getattr(settings, "llm_structured_output_rescue_model", None)
+    )
+    rescue_model = (
+        snapshot.structured_output_rescue_model.canonical_spec
+        if snapshot.structured_output_rescue_model is not None
+        else f"<disabled; model={configured_rescue_model or '<unset>'}>"
+    )
+    retry_attempts = getattr(settings, "llm_structured_output_retry_attempts", 1)
+    lines.append(
+        f"  structured_retry       : {retry_attempts!s:<45} (env: ATAGIA_LLM_STRUCTURED_OUTPUT_RETRY_ATTEMPTS)"
+    )
+    lines.append(
+        f"  structured_rescue      : {rescue_model:<45} (env: ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_MODEL)"
+    )
     lines.append("  ----")
     for component_id in COMPONENTS_BY_ID:
         resolved = snapshot.components[component_id]
@@ -546,7 +592,7 @@ def _split_thinking(raw: str, *, env_name: str | None) -> tuple[str, str | None]
         source = f" in {env_name}" if env_name else ""
         raise ModelResolutionError(
             f"Invalid thinking level {raw_level.strip()!r}{source}. Atagia accepts "
-            "none, minimal, medium, or high."
+            "none, minimal, low, medium, high, xhigh, or max."
         )
     return model_part.strip(), thinking_level
 
