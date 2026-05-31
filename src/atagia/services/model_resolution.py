@@ -117,18 +117,23 @@ COMPONENT_SPECS: tuple[ComponentSpec, ...] = (
     ComponentSpec("consent_confirmation", "ingest", "anthropic/claude-sonnet-4-6"),
     ComponentSpec("intent_classifier", "ingest", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("extraction_watchdog", "ingest", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("initial_context_package_curation", "ingest", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("export_anonymizer", "ingest", "anthropic/claude-sonnet-4-6"),
     ComponentSpec("need_detector", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("coverage_expander", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("applicability_scorer", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("context_staleness", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("metrics_computer", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("answer_postcondition", "chat", OPENROUTER_DEEPSEEK_V4_FLASH_MODEL),
     ComponentSpec("chat", "chat", OPENROUTER_DEEPSEEK_V4_FLASH_MODEL),
 )
 COMPONENTS_BY_ID = {spec.component_id: spec for spec in COMPONENT_SPECS}
 
 PURPOSE_TO_COMPONENT_ID = {
     "applicability_scoring": "applicability_scorer",
+    "answer_abstention_legitimacy_verification": "answer_postcondition",
+    "answer_evidence_use_verification": "answer_postcondition",
+    "answer_postcondition_verification": "answer_postcondition",
     "belief_revision": "belief_reviser",
     "chat_reply": "chat",
     "consequence_detection": "consequence_detector",
@@ -141,10 +146,15 @@ PURPOSE_TO_COMPONENT_ID = {
     "export_anonymization_verify": "export_anonymizer",
     "extraction_watchdog": "extraction_watchdog",
     "graph_projection": "graph_projection",
+    "initial_context_package_curation": "initial_context_package_curation",
     "intent_classifier_claim_key_equivalence": "intent_classifier",
     "intent_classifier_explicit": "intent_classifier",
     "memory_extraction": "extractor",
     "need_detection": "need_detector",
+    "need_detection_degraded_exact_contract_review": "need_detector",
+    "need_detection_multi_facet_exact_review": "need_detector",
+    "need_detection_unknown_only_contract_review": "need_detector",
+    "retrieval_surface_generation_dry_run": "coverage_expander",
     "coverage_expansion": "coverage_expander",
     "summary_chunk_segmentation": "compactor",
     "summary_privacy_gate_judge": "summary_privacy_judge",
@@ -152,6 +162,7 @@ PURPOSE_TO_COMPONENT_ID = {
     "text_chunking_level1": "text_chunker",
     "thematic_profile_synthesis": "compactor",
     "topic_working_set_update": "topic_working_set",
+    "user_language_profile_update": "extractor",
     "workspace_rollup_synthesis": "compactor",
 }
 

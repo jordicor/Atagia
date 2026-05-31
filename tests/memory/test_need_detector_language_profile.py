@@ -12,7 +12,15 @@ from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.memory.need_detector import NeedDetector
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
-from atagia.models.schemas_memory import ExtractionContextMessage, ExtractionConversationContext
+from atagia.models.schemas_memory import (
+    ExplicitLanguageAbility,
+    ExplicitLanguagePreference,
+    ExtractionContextMessage,
+    ExtractionConversationContext,
+    LanguageProfileSourceRef,
+    ObservedUserLanguage,
+    UserCommunicationProfile,
+)
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -99,7 +107,7 @@ def _hint_for_sub_query(result, sub_query_text: str):
 
 
 @pytest.mark.asyncio
-async def test_need_detector_renders_user_language_profile_block_and_escapes_values() -> None:
+async def test_need_detector_renders_content_language_profile_block_and_escapes_values() -> None:
     provider = CannedNeedProvider(
         {
             "needs": [],
@@ -126,7 +134,7 @@ async def test_need_detector_renders_user_language_profile_block_and_escapes_val
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
-        user_language_profile=[
+        content_language_profile=[
             {
                 "language_code": "en",
                 "memory_count": 14,
@@ -141,16 +149,16 @@ async def test_need_detector_renders_user_language_profile_block_and_escapes_val
     )
 
     prompt = provider.requests[0].messages[1].content
-    assert "<user_language_profile>" in prompt
-    assert "</user_language_profile>" in prompt
-    assert prompt.rfind("<recent_context>") < prompt.rfind("<user_language_profile>")
+    assert "<content_language_profile>" in prompt
+    assert "</content_language_profile>" in prompt
+    assert prompt.rfind("<recent_context>") < prompt.rfind("<content_language_profile>")
     assert "en: 14 memories (last seen 2026-04-10)" in prompt
     assert "es: 3 memories (last seen 2026-04-09)" in prompt
     assert "&lt;tag&gt;" in prompt
 
 
 @pytest.mark.asyncio
-async def test_need_detector_renders_empty_user_language_profile_as_none() -> None:
+async def test_need_detector_renders_empty_content_language_profile_as_none() -> None:
     provider = CannedNeedProvider(
         {
             "needs": [],
@@ -177,12 +185,104 @@ async def test_need_detector_renders_empty_user_language_profile_as_none() -> No
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
-        user_language_profile=[],
+        content_language_profile=[],
     )
 
     prompt = provider.requests[0].messages[1].content
-    assert "<user_language_profile>" in prompt
+    assert "<content_language_profile>" in prompt
     assert "(none)" in prompt
+
+
+@pytest.mark.asyncio
+async def test_need_detector_renders_user_communication_profile_separately_from_content_profile() -> None:
+    provider = CannedNeedProvider(
+        {
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["current user language preference"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "current user language preference",
+                    "fts_phrase": "current user language preference",
+                }
+            ],
+            "query_language": "ca",
+            "answer_language": "es",
+            "query_type": "default",
+            "retrieval_levels": [0],
+        }
+    )
+    detector = NeedDetector(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=_clock(),
+        settings=_settings(),
+    )
+    source_ref = LanguageProfileSourceRef(
+        source_kind="source_message",
+        conversation_id="cnv_1",
+        source_message_id="msg_lang",
+    )
+
+    result = await detector.detect(
+        message_text="Ho podem comentar en castella?",
+        role="user",
+        conversation_context=_context(),
+        resolved_policy=_resolved_policy(),
+        content_language_profile=[
+            {
+                "language_code": "en",
+                "memory_count": 3,
+                "last_seen_at": "2026-04-05T12:00:00+00:00",
+            }
+        ],
+        user_communication_profile=UserCommunicationProfile(
+            observed_user_languages=[
+                ObservedUserLanguage(
+                    language_code="ca",
+                    message_count=4,
+                    source_refs=[source_ref],
+                    confidence=0.82,
+                )
+            ],
+            explicit_language_preferences=[
+                ExplicitLanguagePreference(
+                    language_code="es",
+                    preference_kind="default_answer_language",
+                    context_label="ordinary_chat",
+                    source_refs=[source_ref],
+                    confidence=0.93,
+                )
+            ],
+            explicit_language_abilities=[
+                ExplicitLanguageAbility(
+                    language_code="en",
+                    ability_kind="understands",
+                    source_refs=[source_ref],
+                    confidence=0.91,
+                )
+            ],
+        ),
+    )
+
+    prompt = provider.requests[0].messages[1].content
+    assert "<content_language_profile>" in prompt
+    assert "<user_communication_profile>" in prompt
+    user_profile_block = prompt.split("<user_communication_profile>\n", 1)[1].split(
+        "\n</user_communication_profile>",
+        1,
+    )[0]
+    assert "control_plane_only=true" in user_profile_block
+    assert "not_factual_answer_evidence=true" in user_profile_block
+    assert "observed_user_languages: ca: 4 observed user-authored messages" in user_profile_block
+    assert "explicit_language_preferences: es/default_answer_language/ordinary_chat" in user_profile_block
+    assert "explicit_language_abilities: en/understands" in user_profile_block
+    assert "Use <content_language_profile> for retrieval bridge target decisions." in prompt
+    assert "must not force a bridge target" in prompt
+    assert "from <content_language_profile>" in prompt
+    # query_language/answer_language stay core fields (cheap answer-language
+    # hints), so they flow through the lean plan unchanged.
+    assert result.query_language == "ca"
+    assert result.answer_language == "es"
 
 
 @pytest.mark.asyncio
@@ -213,7 +313,7 @@ async def test_need_detector_prompt_describes_raw_context_access_modes() -> None
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
-        user_language_profile=[],
+        content_language_profile=[],
     )
 
     prompt = provider.requests[0].messages[1].content
@@ -262,7 +362,7 @@ async def test_need_detector_preserves_proper_name_anchor_verbatim_across_bridge
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
-        user_language_profile=[
+        content_language_profile=[
             {
                 "language_code": "en",
                 "memory_count": 4,
@@ -319,7 +419,7 @@ async def test_need_detector_preserves_full_address_verbatim_in_bridge_variant()
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
-        user_language_profile=[
+        content_language_profile=[
             {
                 "language_code": "en",
                 "memory_count": 4,
@@ -372,7 +472,7 @@ async def test_need_detector_translates_common_noun_but_preserves_quantity_verba
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
-        user_language_profile=[
+        content_language_profile=[
             {
                 "language_code": "en",
                 "memory_count": 4,
@@ -436,7 +536,7 @@ async def test_need_detector_translates_only_common_nouns_in_code_switching_quer
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
-        user_language_profile=[
+        content_language_profile=[
             {
                 "language_code": "fr",
                 "memory_count": 4,

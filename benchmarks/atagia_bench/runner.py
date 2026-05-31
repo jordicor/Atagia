@@ -16,6 +16,7 @@ from typing import Any
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from benchmarks.activation_flags import benchmark_activation_flags
 from benchmarks.artifact_hash import (
     sha256_directory,
     sha256_file,
@@ -39,27 +40,34 @@ from benchmarks.llm_metrics import (
 from benchmarks.llm_config import provider_api_key_kwargs
 from benchmarks.migration_metadata import benchmark_migration_metadata
 from benchmarks.numeric_summary import summarize_numeric_values
-from benchmarks.retrieval_custody import build_retrieval_custody
+from benchmarks.retained_db_paths import validate_retained_benchmark_db_dir
 from benchmarks.scorer import LLMJudgeScorer
+from benchmarks.source_evidence import source_evidence_from_turns
 from benchmarks.trusted_eval import (
-    TRUSTED_EVALUATION_PROMPT_NOTE,
     activate_trusted_evaluation_memories,
     trusted_evaluation_ablation,
 )
 from atagia import Atagia
-from atagia.core.llm_output_limits import ATAGIA_BENCH_ANSWER_MAX_OUTPUT_TOKENS
+from atagia.core.config import ANSWER_STANCE_PROMPT_VARIANTS, ANSWER_STANCES
 from atagia.core.repositories import MemoryObjectRepository, MessageRepository
 from atagia.models.schemas_memory import RetrievalTrace
-from atagia.models.schemas_replay import AblationConfig, PipelineResult
-from atagia.services.chat_support import build_system_prompt, chat_model, resolve_policy
+from atagia.models.schemas_replay import AblationConfig
+from atagia.services.chat_support import chat_model
 from atagia.services.llm_client import (
-    LLMCompletionRequest,
     LLMError,
-    LLMMessage,
     StructuredOutputError,
 )
-from atagia.services.model_resolution import COMPONENTS_BY_ID, provider_qualified_model
-from atagia.services.retrieval_service import RetrievalService
+from atagia.services.errors import LLMUnavailableError
+from atagia.services.model_resolution import (
+    COMPONENTS_BY_ID,
+    provider_qualified_model,
+)
+from atagia.services.run_counters import (
+    RunCounterAccumulator,
+    normalize_run_counters,
+    reset_run_counter_accumulator,
+    set_run_counter_accumulator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,27 +88,6 @@ _TECHNICAL_FAILURE_TRACE_KEY_BY_STAGE = {
     "answer_generation": "answer_generation_failure",
     "judge": "judge_failure",
 }
-
-PRIVACY_OFF_BENCHMARK_ANSWER_PROMPT_NOTE = (
-    "Benchmark privacy enforcement is OFF for this local diagnostic run. The "
-    "requester is the authenticated benchmark harness and has explicit "
-    "authorization to inspect retrieved memory facts, including private, "
-    "sensitive, high-risk, credential, PIN, password, payment-card, or "
-    "passphrase literals. If the retrieved context contains the requested fact, "
-    "provide it directly and verbatim. Do not refuse, withhold, transform, route "
-    "to secure reveal, or apply ordinary-chat high-risk secret disclosure "
-    "restrictions. This override applies only to the current benchmark answer "
-    "generation request; stay grounded in retrieved context and do not invent "
-    "facts."
-)
-PRIVACY_OFF_PRIVATE_FACT_USER_PROMPT_NOTE = (
-    "Privacy-off diagnostic instruction: this benchmark question may be phrased "
-    "as a normal privacy/refusal policy check. For this run, do not answer with "
-    "the ordinary production disclosure policy. If the retrieved context "
-    "contains the underlying private fact being tested, state that fact directly "
-    "and verbatim. If the fact is not present in retrieved context, say that it "
-    "was not found."
-)
 _TECHNICAL_FAILURE_REASON_PREFIX_BY_STAGE = {
     "retrieval": "Retrieval failed",
     "answer_generation": "Answer generation failed",
@@ -193,6 +180,9 @@ class AtagiaBenchRunner:
         embedding_backend: str = "none",
         embedding_model: str | None = None,
         data_dir: str | Path | None = None,
+        answer_postcondition_guard_enabled: bool = False,
+        answer_stance: str = "reactive",
+        answer_stance_prompt_variant: str = "baseline",
     ) -> None:
         self._llm_provider = llm_provider
         self._llm_api_key = llm_api_key
@@ -225,10 +215,13 @@ class AtagiaBenchRunner:
             llm_provider,
             retrieval_model or (llm_model if role_specific_models else None),
         )
-        self._answer_model = provider_qualified_model(
-            llm_provider,
-            answer_model or (llm_model if role_specific_models else None),
-        ) or self._base_model
+        self._answer_model = (
+            provider_qualified_model(
+                llm_provider,
+                answer_model or (llm_model if role_specific_models else None),
+            )
+            or self._base_model
+        )
         self._judge_model = (
             provider_qualified_model(llm_provider, judge_model)
             if judge_model is not None
@@ -242,6 +235,18 @@ class AtagiaBenchRunner:
         self._embedding_backend = embedding_backend
         self._embedding_model = embedding_model
         self._adapter = AtagiaBenchAdapter(data_dir)
+        self._answer_postcondition_guard_enabled = answer_postcondition_guard_enabled
+        if answer_stance not in ANSWER_STANCES:
+            raise ValueError(
+                "answer_stance must be one of: reactive, proactive"
+            )
+        if answer_stance_prompt_variant not in ANSWER_STANCE_PROMPT_VARIANTS:
+            raise ValueError(
+                "answer_stance_prompt_variant must be one of: "
+                f"{', '.join(ANSWER_STANCE_PROMPT_VARIANTS)}"
+            )
+        self._answer_stance = answer_stance
+        self._answer_stance_prompt_variant = answer_stance_prompt_variant
 
     async def run(
         self,
@@ -255,9 +260,12 @@ class AtagiaBenchRunner:
         trusted_evaluation: bool = False,
         parallel_personas: int = 1,
         benchmark_db_dir: str | Path | None = None,
+        requested_benchmark_db_dir: str | Path | None = None,
+        allow_temp_benchmark_db_dir: bool = False,
         keep_db: bool = False,
         reuse_db: str | Path | None = None,
         evaluate_only: bool = False,
+        invocation_args: list[str] | None = None,
     ) -> AtagiaBenchReport:
         """Run the benchmark and return a structured report."""
         if parallel_personas < 1:
@@ -269,13 +277,22 @@ class AtagiaBenchRunner:
             evaluate_only = True
             if len(dataset.personas) != 1:
                 raise ValueError("reuse_db requires exactly one selected persona")
+        effective_benchmark_db_dir: Path | None = None
+        if keep_db:
+            effective_benchmark_db_dir = validate_retained_benchmark_db_dir(
+                benchmark_db_dir or _DEFAULT_BENCHMARK_DB_DIR,
+                allow_temp_benchmark_db_dir=allow_temp_benchmark_db_dir,
+            )
         started_at = perf_counter()
         all_results: list[AtagiaQuestionResult] = []
         llm_summaries: list[dict[str, Any]] = []
         benchmark_db_entries: list[dict[str, Any]] = []
+        run_counters = RunCounterAccumulator()
         category_filter = set(category_tags) if category_tags else None
         question_filter = set(question_ids) if question_ids else None
-        exclude_question_filter = set(exclude_question_ids) if exclude_question_ids else None
+        exclude_question_filter = (
+            set(exclude_question_ids) if exclude_question_ids else None
+        )
         parallel_limit = min(parallel_personas, len(dataset.personas) or 1)
 
         if parallel_limit == 1:
@@ -293,10 +310,11 @@ class AtagiaBenchRunner:
                     exclude_question_filter=exclude_question_filter,
                     ablation=ablation,
                     trusted_evaluation=trusted_evaluation,
-                    benchmark_db_dir=benchmark_db_dir,
+                    benchmark_db_dir=effective_benchmark_db_dir,
                     keep_db=keep_db,
                     reuse_db=reuse_db,
                     evaluate_only=evaluate_only,
+                    run_counters=run_counters,
                 )
                 all_results.extend(results)
                 llm_summaries.append(llm_summary)
@@ -311,10 +329,11 @@ class AtagiaBenchRunner:
                 exclude_question_filter=exclude_question_filter,
                 ablation=ablation,
                 trusted_evaluation=trusted_evaluation,
-                benchmark_db_dir=benchmark_db_dir,
+                benchmark_db_dir=effective_benchmark_db_dir,
                 keep_db=keep_db,
                 reuse_db=reuse_db,
                 evaluate_only=evaluate_only,
+                run_counters=run_counters,
             )
             for _persona_index, results, llm_summary, db_entry in persona_reports:
                 all_results.extend(results)
@@ -337,10 +356,16 @@ class AtagiaBenchRunner:
             trusted_evaluation=trusted_evaluation,
             parallel_personas=parallel_limit,
             llm_call_summary=merge_llm_call_summaries(llm_summaries),
+            run_counters=run_counters.snapshot(),
             benchmark_db_entries=benchmark_db_entries,
             keep_db=keep_db,
             reuse_db=reuse_db,
             evaluate_only=evaluate_only,
+            benchmark_db_dir=benchmark_db_dir,
+            effective_benchmark_db_dir=effective_benchmark_db_dir,
+            allow_temp_benchmark_db_dir=allow_temp_benchmark_db_dir,
+            requested_benchmark_db_dir=requested_benchmark_db_dir,
+            invocation_args=invocation_args,
         )
 
     async def _run_personas_parallel(
@@ -357,6 +382,7 @@ class AtagiaBenchRunner:
         keep_db: bool,
         reuse_db: str | Path | None,
         evaluate_only: bool,
+        run_counters: RunCounterAccumulator,
     ) -> list[tuple[int, list[AtagiaQuestionResult], dict[str, Any], dict[str, Any]]]:
         """Run personas concurrently while preserving deterministic report order."""
         semaphore = asyncio.Semaphore(parallel_limit)
@@ -383,6 +409,7 @@ class AtagiaBenchRunner:
                     keep_db=keep_db,
                     reuse_db=reuse_db,
                     evaluate_only=evaluate_only,
+                    run_counters=run_counters,
                 )
                 return persona_index, results, llm_summary, db_entry
 
@@ -407,13 +434,16 @@ class AtagiaBenchRunner:
         keep_db: bool,
         reuse_db: str | Path | None,
         evaluate_only: bool,
+        run_counters: RunCounterAccumulator,
     ) -> tuple[list[AtagiaQuestionResult], dict[str, Any], dict[str, Any]]:
         """Run all conversations and questions for one persona."""
         persona_id = persona_data.persona.persona_id
 
         if reuse_db is not None:
             source_db_path = self._resolve_reuse_db(reuse_db)
-            with TemporaryDirectory(prefix=f"atagia-bench-{persona_id}-reuse-") as temp_dir:
+            with TemporaryDirectory(
+                prefix=f"atagia-bench-{persona_id}-reuse-"
+            ) as temp_dir:
                 db_path = Path(temp_dir) / _BENCHMARK_DB_FILENAME
                 self._copy_sqlite_db(source_db_path, db_path)
                 return await self._run_persona_with_db(
@@ -427,6 +457,7 @@ class AtagiaBenchRunner:
                     metadata_dir=None,
                     source_reuse_db=source_db_path,
                     evaluate_only=True,
+                    run_counters=run_counters,
                 )
 
         if keep_db:
@@ -446,6 +477,7 @@ class AtagiaBenchRunner:
                 metadata_dir=metadata_dir,
                 source_reuse_db=None,
                 evaluate_only=evaluate_only,
+                run_counters=run_counters,
             )
 
         with TemporaryDirectory(prefix=f"atagia-bench-{persona_id}-") as temp_dir:
@@ -460,6 +492,7 @@ class AtagiaBenchRunner:
                 metadata_dir=None,
                 source_reuse_db=None,
                 evaluate_only=False,
+                run_counters=run_counters,
             )
 
     async def _run_persona_with_db(
@@ -475,12 +508,14 @@ class AtagiaBenchRunner:
         metadata_dir: Path | None,
         source_reuse_db: Path | None,
         evaluate_only: bool,
+        run_counters: RunCounterAccumulator,
     ) -> tuple[list[AtagiaQuestionResult], dict[str, Any], dict[str, Any]]:
         persona_id = persona_data.persona.persona_id
         llm_recorder = LLMCallRecorder()
         model_kwargs = self._atagia_model_kwargs()
         results: list[AtagiaQuestionResult] = []
 
+        counter_token = set_run_counter_accumulator(run_counters)
         async with Atagia(
             db_path=db_path,
             manifests_dir=self._manifests_dir,
@@ -490,6 +525,9 @@ class AtagiaBenchRunner:
             embedding_model=self._embedding_model,
             skip_belief_revision=ablation.skip_belief_revision if ablation else False,
             skip_compaction=ablation.skip_compaction if ablation else False,
+            answer_postcondition_guard_enabled=self._answer_postcondition_guard_enabled,
+            answer_stance=self._answer_stance,
+            answer_stance_prompt_variant=self._answer_stance_prompt_variant,
         ) as engine:
             runtime = engine.runtime
             if runtime is None:
@@ -531,6 +569,7 @@ class AtagiaBenchRunner:
                                 engine,
                                 user_id=user_id,
                                 conversation=conversation,
+                                ablation=ablation,
                             )
                         )
 
@@ -544,11 +583,6 @@ class AtagiaBenchRunner:
                     await activate_trusted_evaluation_memories(engine.runtime, user_id)
                     if trusted_evaluation and engine.runtime is not None
                     else 0
-                )
-
-                judge = LLMJudgeScorer(
-                    runtime.llm_client,
-                    self._judge_model or chat_model(runtime.settings),
                 )
 
                 questions = self._filter_questions(
@@ -567,9 +601,8 @@ class AtagiaBenchRunner:
                         persona_id=persona_id,
                         question_id=question.question_id,
                     ):
-                        result = await self._run_question(
-                            engine,
-                            judge=judge,
+                        result = await self._run_question_on_db_snapshot(
+                            base_db_path=db_path,
                             user_id=user_id,
                             persona_data=persona_data,
                             question=question,
@@ -581,8 +614,11 @@ class AtagiaBenchRunner:
                             turn_message_ids=turn_message_ids,
                             trusted_evaluation=trusted_evaluation,
                             trusted_activation_count=trusted_activation_count,
+                            llm_recorder=llm_recorder,
+                            run_counters=run_counters,
                         )
                     results.append(result)
+        reset_run_counter_accumulator(counter_token)
 
         llm_summary = llm_recorder.summary()
         db_entry = self._benchmark_db_metadata(
@@ -599,6 +635,67 @@ class AtagiaBenchRunner:
                 db_entry,
             )
         return results, llm_summary, db_entry
+
+    async def _run_question_on_db_snapshot(
+        self,
+        *,
+        base_db_path: Path,
+        user_id: str,
+        persona_data: AtagiaBenchPersonaData,
+        question: AtagiaBenchQuestion,
+        ablation: AblationConfig | None,
+        turn_message_ids: dict[str, str],
+        trusted_evaluation: bool,
+        trusted_activation_count: int,
+        llm_recorder: LLMCallRecorder,
+        run_counters: RunCounterAccumulator,
+    ) -> AtagiaQuestionResult:
+        """Run one benchmark question against a disposable real Atagia DB."""
+        model_kwargs = self._atagia_model_kwargs()
+        with TemporaryDirectory() as temp_dir:
+            question_db_path = Path(temp_dir) / _BENCHMARK_DB_FILENAME
+            self._copy_sqlite_db(base_db_path, question_db_path)
+            counter_token = set_run_counter_accumulator(run_counters)
+            try:
+                async with Atagia(
+                    db_path=question_db_path,
+                    manifests_dir=self._manifests_dir,
+                    **model_kwargs,
+                    **provider_api_key_kwargs(self._llm_provider, self._llm_api_key),
+                    embedding_backend=self._embedding_backend,
+                    embedding_model=self._embedding_model,
+                    skip_belief_revision=ablation.skip_belief_revision
+                    if ablation
+                    else False,
+                    skip_compaction=ablation.skip_compaction if ablation else False,
+                    answer_postcondition_guard_enabled=(
+                        self._answer_postcondition_guard_enabled
+                    ),
+                    answer_stance=self._answer_stance,
+                    answer_stance_prompt_variant=self._answer_stance_prompt_variant,
+                ) as question_engine:
+                    runtime = question_engine.runtime
+                    if runtime is None:
+                        raise RuntimeError("Atagia runtime unavailable")
+                    install_llm_call_recorder(runtime.llm_client, llm_recorder)
+                    judge = LLMJudgeScorer(
+                        runtime.llm_client,
+                        self._judge_model or chat_model(runtime.settings),
+                    )
+                    result = await self._run_question(
+                        question_engine,
+                        judge=judge,
+                        user_id=user_id,
+                        persona_data=persona_data,
+                        question=question,
+                        ablation=ablation,
+                        turn_message_ids=turn_message_ids,
+                        trusted_evaluation=trusted_evaluation,
+                        trusted_activation_count=trusted_activation_count,
+                    )
+            finally:
+                reset_run_counter_accumulator(counter_token)
+            return result
 
     def _atagia_model_kwargs(self) -> dict[str, Any]:
         if self._forced_global_model is not None:
@@ -672,16 +769,17 @@ class AtagiaBenchRunner:
             "db_path": str(reported_db_path),
             "db_sha256": sha256_file_if_exists(reported_db_path),
             "metadata_dir": str(metadata_dir) if metadata_dir is not None else None,
+            "effective_benchmark_db_dir": (
+                str(metadata_dir.parent) if metadata_dir is not None else None
+            ),
             "source_reuse_db": (
-                str(source_reuse_db)
-                if source_reuse_db is not None
-                else None
+                str(source_reuse_db) if source_reuse_db is not None else None
             ),
             "copied_to_temporary_db": source_reuse_db is not None,
             "evaluate_only": evaluate_only,
             "question_count": question_count,
             "models": self._model_config_summary(),
-            "embedding_backend": self._embedding_backend,
+            "activation_flags": self._activation_flags(),
             "embedding_model": self._embedding_model,
             "dataset": {
                 "path": str(self._adapter.data_dir),
@@ -733,7 +831,9 @@ class AtagiaBenchRunner:
             if sidecar.exists():
                 shutil.copy2(
                     sidecar,
-                    destination_db_path.with_name(f"{destination_db_path.name}{suffix}"),
+                    destination_db_path.with_name(
+                        f"{destination_db_path.name}{suffix}"
+                    ),
                 )
 
     async def _ingest_conversation(
@@ -742,6 +842,7 @@ class AtagiaBenchRunner:
         *,
         user_id: str,
         conversation: AtagiaBenchConversation,
+        ablation: AblationConfig | None,
     ) -> dict[str, str]:
         """Ingest all turns from a single conversation."""
         runtime = engine.runtime
@@ -755,6 +856,15 @@ class AtagiaBenchRunner:
                 role=turn.role,
                 text=turn.text,
                 occurred_at=turn.timestamp or None,
+                privacy_enforcement=self._benchmark_privacy_enforcement(ablation),
+                authenticated_user_privilege_level=(
+                    "atagia_master"
+                    if self._benchmark_privacy_enforcement(ablation) == "off"
+                    else None
+                ),
+                authenticated_user_is_atagia_master=(
+                    self._benchmark_privacy_enforcement(ablation) == "off"
+                ),
             )
             if runtime.settings.workers_enabled:
                 drained = await engine.flush(timeout_seconds=1800.0)
@@ -821,28 +931,35 @@ class AtagiaBenchRunner:
         if runtime is None:
             raise RuntimeError("Atagia runtime unavailable")
         effective_ground_truth = self._ground_truth_for_question(question, ablation)
-        retrieval_trace = RetrievalTrace(
-            query_text=question.question_text,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            timestamp_iso=runtime.clock.now().isoformat(),
-        )
-        retrieval_started_at = perf_counter()
+        chat_started_at = perf_counter()
         try:
-            pipeline_result = await self._retrieve_context(
-                engine,
+            chat_result = await engine.chat(
                 user_id=user_id,
                 conversation_id=conversation_id,
-                question_text=question.question_text,
-                assistant_mode_id=assistant_mode_id,
-                ablation=ablation,
-                trace=retrieval_trace,
+                message=question.question_text,
+                mode=assistant_mode_id,
+                debug=True,
+                privacy_enforcement=self._benchmark_privacy_enforcement(ablation),
+                authenticated_user_privilege_level=(
+                    "atagia_master"
+                    if self._benchmark_privacy_enforcement(ablation) == "off"
+                    else None
+                ),
+                authenticated_user_is_atagia_master=(
+                    self._benchmark_privacy_enforcement(ablation) == "off"
+                ),
             )
-        except (LLMError, StructuredOutputError) as exc:
-            retrieval_time_ms = (perf_counter() - retrieval_started_at) * 1000.0
+            prediction = chat_result.response_text
+        except (LLMError, LLMUnavailableError, StructuredOutputError) as exc:
+            retrieval_time_ms = (perf_counter() - chat_started_at) * 1000.0
             trace_payload = self._basic_question_trace(
                 question=question,
-                retrieval_trace=retrieval_trace,
+                retrieval_trace=RetrievalTrace(
+                    query_text=question.question_text,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    timestamp_iso=runtime.clock.now().isoformat(),
+                ),
                 assistant_mode_id=assistant_mode_id,
                 conversation_id=conversation_id,
                 turn_message_ids=turn_message_ids,
@@ -861,51 +978,20 @@ class AtagiaBenchRunner:
                 persona_id=persona_data.persona.persona_id,
                 trace=trace_payload,
             )
-        retrieval_time_ms = (perf_counter() - retrieval_started_at) * 1000.0
-
-        try:
-            prediction = await self._generate_answer(
-                runtime=runtime,
-                assistant_mode_id=assistant_mode_id,
-                pipeline_result=pipeline_result,
-                question_text=question.question_text,
-                question_id=question.question_id,
-                current_user_display_name=persona_data.persona.display_name,
-                trusted_evaluation=trusted_evaluation,
-                ablation=ablation,
-                privacy_off_private_fact_expected=(
-                    self._privacy_off_private_fact(question, ablation) is not None
-                ),
-            )
-        except (LLMError, StructuredOutputError) as exc:
-            trace_payload = await self._build_question_trace(
-                engine,
-                user_id=user_id,
-                question=question,
-                pipeline_result=pipeline_result,
-                retrieval_trace=retrieval_trace,
-                assistant_mode_id=assistant_mode_id,
-                conversation_id=conversation_id,
-                turn_message_ids=turn_message_ids,
-                passed=False,
-                trusted_evaluation=trusted_evaluation,
-                trusted_activation_count=trusted_activation_count,
-            )
-            self._annotate_benchmark_privacy_mode(trace_payload, ablation)
-            return self._technical_failure_result(
-                question=question,
-                stage="answer_generation",
-                exc=exc,
-                prediction="",
-                memories_used=len(pipeline_result.composed_context.selected_memory_ids),
-                retrieval_time_ms=retrieval_time_ms,
-                conversation_id=conversation_id,
-                persona_id=persona_data.persona.persona_id,
-                trace=trace_payload,
-            )
+        retrieval_time_ms = (perf_counter() - chat_started_at) * 1000.0
+        selected_memory_count = len(
+            chat_result.composed_context.selected_memory_ids
+            if chat_result.composed_context is not None
+            else []
+        )
 
         grader = resolve_grader(question.grader, llm_judge=judge)
-        grader_config = self._grader_config_for_question(question, ablation)
+        grader_config = self._grader_config_for_question(
+            question,
+            ablation,
+            persona_data=persona_data,
+            answer_stance=self._answer_stance,
+        )
         try:
             grade = await grader.grade(
                 prediction=prediction,
@@ -913,12 +999,11 @@ class AtagiaBenchRunner:
                 config=grader_config,
             )
         except (LLMError, StructuredOutputError) as exc:
-            trace_payload = await self._build_question_trace(
+            trace_payload = await self._build_question_trace_from_chat_result(
                 engine,
                 user_id=user_id,
                 question=question,
-                pipeline_result=pipeline_result,
-                retrieval_trace=retrieval_trace,
+                chat_result=chat_result,
                 assistant_mode_id=assistant_mode_id,
                 conversation_id=conversation_id,
                 turn_message_ids=turn_message_ids,
@@ -932,19 +1017,18 @@ class AtagiaBenchRunner:
                 stage="judge",
                 exc=exc,
                 prediction=prediction,
-                memories_used=len(pipeline_result.composed_context.selected_memory_ids),
+                memories_used=selected_memory_count,
                 retrieval_time_ms=retrieval_time_ms,
                 conversation_id=conversation_id,
                 persona_id=persona_data.persona.persona_id,
                 trace=trace_payload,
             )
 
-        trace_payload = await self._build_question_trace(
+        trace_payload = await self._build_question_trace_from_chat_result(
             engine,
             user_id=user_id,
             question=question,
-            pipeline_result=pipeline_result,
-            retrieval_trace=retrieval_trace,
+            chat_result=chat_result,
             assistant_mode_id=assistant_mode_id,
             conversation_id=conversation_id,
             turn_message_ids=turn_message_ids,
@@ -953,6 +1037,10 @@ class AtagiaBenchRunner:
             trusted_activation_count=trusted_activation_count,
         )
         self._annotate_benchmark_privacy_mode(trace_payload, ablation)
+        trace_payload["grade_context"] = self._grade_context_for_question(
+            question,
+            grader_config,
+        )
 
         return AtagiaQuestionResult(
             question_id=question.question_id,
@@ -963,7 +1051,7 @@ class AtagiaBenchRunner:
             category_tags=question.category_tags,
             evidence_turn_ids=question.evidence_turn_ids,
             grade=grade,
-            memories_used=len(pipeline_result.composed_context.selected_memory_ids),
+            memories_used=selected_memory_count,
             retrieval_time_ms=retrieval_time_ms,
             conversation_id=conversation_id,
             persona_id=persona_data.persona.persona_id,
@@ -990,7 +1078,9 @@ class AtagiaBenchRunner:
             stage,
             "technical_failure",
         )
-        trace_key = _TECHNICAL_FAILURE_TRACE_KEY_BY_STAGE.get(stage, "technical_failure")
+        trace_key = _TECHNICAL_FAILURE_TRACE_KEY_BY_STAGE.get(
+            stage, "technical_failure"
+        )
         reason_prefix = _TECHNICAL_FAILURE_REASON_PREFIX_BY_STAGE.get(
             stage,
             "Question execution failed",
@@ -1033,39 +1123,13 @@ class AtagiaBenchRunner:
             trace=trace_payload,
         )
 
-    async def _retrieve_context(
-        self,
-        engine: Atagia,
-        *,
-        user_id: str,
-        conversation_id: str,
-        question_text: str,
-        assistant_mode_id: str,
-        ablation: AblationConfig | None,
-        trace: RetrievalTrace | None = None,
-    ) -> PipelineResult:
-        """Run the retrieval pipeline for a question."""
-        runtime = engine.runtime
-        if runtime is None:
-            raise RuntimeError("Atagia runtime unavailable")
-
-        return await RetrievalService(runtime).retrieve(
-            user_id=user_id,
-            conversation_id=conversation_id,
-            message_text=question_text,
-            mode=assistant_mode_id,
-            ablation=ablation,
-            trace=trace,
-        )
-
-    async def _build_question_trace(
+    async def _build_question_trace_from_chat_result(
         self,
         engine: Atagia,
         *,
         user_id: str,
         question: AtagiaBenchQuestion,
-        pipeline_result: PipelineResult,
-        retrieval_trace: RetrievalTrace,
+        chat_result: Any,
         assistant_mode_id: str,
         conversation_id: str,
         turn_message_ids: dict[str, str],
@@ -1073,10 +1137,18 @@ class AtagiaBenchRunner:
         trusted_evaluation: bool,
         trusted_activation_count: int,
     ) -> dict[str, Any]:
+        """Build benchmark trace data from the real Atagia chat result."""
         runtime = engine.runtime
         if runtime is None:
             raise RuntimeError("Atagia runtime unavailable")
 
+        debug = chat_result.debug if isinstance(chat_result.debug, dict) else {}
+        context = chat_result.composed_context
+        selected_memory_ids = (
+            list(context.selected_memory_ids)
+            if context is not None
+            else list(debug.get("selected_memory_ids") or [])
+        )
         evidence_message_ids = [
             turn_message_ids[turn_id]
             for turn_id in question.evidence_turn_ids
@@ -1087,7 +1159,12 @@ class AtagiaBenchRunner:
             for turn_id in question.evidence_turn_ids
             if turn_id not in turn_message_ids
         ]
-        selected_memory_ids = list(pipeline_result.composed_context.selected_memory_ids)
+        evidence_turn_ids_by_message_id: dict[str, list[str]] = {}
+        for turn_id in question.evidence_turn_ids:
+            message_id = turn_message_ids.get(turn_id)
+            if message_id is None:
+                continue
+            evidence_turn_ids_by_message_id.setdefault(message_id, []).append(turn_id)
 
         connection = await runtime.open_connection()
         try:
@@ -1097,13 +1174,18 @@ class AtagiaBenchRunner:
                 selected_memory_ids,
             )
             evidence_rows_by_id: dict[str, dict[str, Any]] = {}
+            evidence_turn_ids_by_memory_id: dict[str, list[str]] = {}
             for message_id in evidence_message_ids:
                 for row in await memories.list_for_source_message(
                     user_id=user_id,
                     source_message_id=message_id,
                     statuses=None,
                 ):
-                    evidence_rows_by_id[str(row["id"])] = row
+                    memory_id = str(row["id"])
+                    evidence_rows_by_id[memory_id] = row
+                    evidence_turn_ids_by_memory_id.setdefault(memory_id, []).extend(
+                        evidence_turn_ids_by_message_id.get(message_id, [])
+                    )
         finally:
             await connection.close()
 
@@ -1114,37 +1196,40 @@ class AtagiaBenchRunner:
         selected_evidence_ids = sorted(
             set(selected_memory_ids).intersection(evidence_rows_by_id)
         )
-        context = pipeline_result.composed_context
+        retrieval_custody = list(debug.get("retrieval_custody_v2") or [])
+        gold_evidence_diagnostics = self._gold_evidence_diagnostics(
+            evidence_rows=evidence_rows,
+            retrieval_custody=retrieval_custody,
+            selected_memory_ids=selected_memory_ids,
+            evidence_turn_ids_by_message_id=evidence_turn_ids_by_message_id,
+            evidence_turn_ids_by_memory_id=evidence_turn_ids_by_memory_id,
+        )
+        scored_candidates = debug.get("scored_candidates")
+        candidate_count = (
+            len(scored_candidates) if isinstance(scored_candidates, list) else 0
+        )
         diagnosis_bucket = self._diagnosis_bucket(
             passed=passed,
             has_evidence_turns=bool(question.evidence_turn_ids),
             evidence_message_count=len(evidence_message_ids),
             evidence_memory_count=len(evidence_rows),
             active_evidence_count=active_evidence_count,
-            candidate_count=(
-                retrieval_trace.candidate_search.total_after_fusion
-                if retrieval_trace.candidate_search is not None
-                else 0
-            ),
+            candidate_count=candidate_count,
             selected_memory_count=len(selected_memory_ids),
             selected_evidence_count=len(selected_evidence_ids),
         )
+        context_payload = debug.get("context_view") if isinstance(debug, dict) else None
         return {
             "diagnosis_bucket": diagnosis_bucket,
-            "sufficiency_diagnostic": self._sufficiency_diagnostic(
-                diagnosis_bucket,
-                retrieval_trace=retrieval_trace,
-            ),
-            "shadow_sufficiency_diagnostics": (
-                pipeline_result.retrieval_sufficiency.model_dump(mode="json")
-                if pipeline_result.retrieval_sufficiency is not None
-                else None
-            ),
+            "sufficiency_diagnostic": diagnosis_bucket,
+            "shadow_sufficiency_diagnostics": debug.get("retrieval_sufficiency"),
             "trusted_evaluation": trusted_evaluation,
             "trusted_activation_count": trusted_activation_count,
             "mode": assistant_mode_id,
             "retrieval_profile_id": assistant_mode_id,
             "retrieval_conversation_id": conversation_id,
+            "retrieval_event_id": chat_result.retrieval_event_id,
+            "real_chat_path": True,
             "evidence_turn_ids": list(question.evidence_turn_ids),
             "evidence_message_ids": evidence_message_ids,
             "missing_evidence_turn_ids": missing_evidence_turn_ids,
@@ -1157,26 +1242,27 @@ class AtagiaBenchRunner:
             ),
             "evidence_memory_ids": sorted(evidence_rows_by_id),
             "evidence_memory_summaries": self._memory_summaries(evidence_rows),
+            "gold_evidence_diagnostics": gold_evidence_diagnostics,
+            "gold_evidence_diagnostic_summary": (
+                self._gold_evidence_diagnostic_summary(gold_evidence_diagnostics)
+            ),
             "selected_memory_ids": selected_memory_ids,
             "selected_memory_rows_found": len(selected_rows),
             "selected_evidence_memory_ids": selected_evidence_ids,
             "selected_memory_summaries": self._memory_summaries(selected_rows),
-            "context": {
-                "items_included": context.items_included,
-                "items_dropped": context.items_dropped,
-                "budget_tokens": context.budget_tokens,
-                "total_tokens_estimate": context.total_tokens_estimate,
-                "contract_block_chars": len(context.contract_block),
-                "workspace_block_chars": len(context.workspace_block),
-                "memory_block_chars": len(context.memory_block),
-                "state_block_chars": len(context.state_block),
-            },
-            "retrieval_custody": build_retrieval_custody(
-                pipeline_result=pipeline_result,
-                selected_memory_ids=selected_memory_ids,
-                user_id=user_id,
+            "context": self._context_summary_from_chat_context(
+                context, context_payload
             ),
-            "retrieval_trace": retrieval_trace.model_dump(mode="json"),
+            "retrieval_custody": retrieval_custody,
+            "retrieval_trace": {
+                "query_text": question.question_text,
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "timestamp_iso": runtime.clock.now().isoformat(),
+                "source": "real_chat_debug",
+            },
+            "answer_postcondition_guard": debug.get("answer_postcondition_guard"),
+            "debug_authority": debug.get("authority"),
         }
 
     @staticmethod
@@ -1216,15 +1302,87 @@ class AtagiaBenchRunner:
         cls,
         question: AtagiaBenchQuestion,
         ablation: AblationConfig | None,
+        persona_data: AtagiaBenchPersonaData | None = None,
+        answer_stance: str = "reactive",
     ) -> dict[str, Any]:
         config = dict(question.grader_config or {})
         config.setdefault("question_text", question.question_text)
+        if persona_data is not None:
+            source_evidence = cls._source_evidence_for_question(question, persona_data)
+            if source_evidence:
+                config["source_evidence"] = source_evidence
         config["benchmark_privacy_enforcement"] = cls._benchmark_privacy_enforcement(
             ablation,
         )
+        config["answer_stance"] = answer_stance
         if cls._privacy_off_private_fact(question, ablation) is not None:
             config["privacy_off_retrieval_expected"] = True
+        if question.grader == "abstention":
+            config["abstention_kind"] = (
+                "privacy_gated"
+                if str(config.get("private_fact") or "").strip()
+                else "unknown"
+            )
         return config
+
+    @staticmethod
+    def _source_evidence_for_question(
+        question: AtagiaBenchQuestion,
+        persona_data: AtagiaBenchPersonaData,
+    ) -> list[dict[str, str]]:
+        evidence_items: list[dict[str, str]] = []
+        for conversation in persona_data.conversations:
+            evidence_items.extend(
+                source_evidence_from_turns(
+                    evidence_turn_ids=question.evidence_turn_ids,
+                    turns=conversation.turns,
+                    conversation_id=conversation.conversation_id,
+                )
+            )
+        evidence_order = {
+            turn_id: index for index, turn_id in enumerate(question.evidence_turn_ids)
+        }
+        evidence_items.sort(
+            key=lambda item: evidence_order.get(str(item.get("turn_id") or ""), 0)
+        )
+        return evidence_items
+
+    @staticmethod
+    def _grade_context_for_question(
+        question: AtagiaBenchQuestion,
+        grader_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_source_evidence = grader_config.get("source_evidence")
+        source_evidence = (
+            raw_source_evidence
+            if isinstance(raw_source_evidence, list)
+            else []
+        )
+        source_turn_ids = [
+            str(item.get("turn_id") or "")
+            for item in source_evidence
+            if isinstance(item, dict) and item.get("turn_id")
+        ]
+        source_timestamps = [
+            str(item.get("timestamp") or "")
+            for item in source_evidence
+            if isinstance(item, dict) and item.get("timestamp")
+        ]
+        return {
+            "grader": question.grader,
+            "judge_mode": (
+                "source_aware_llm_judge"
+                if question.grader == "llm_judge" and source_evidence
+                else question.grader
+            ),
+            "source_evidence_used": bool(source_evidence),
+            "source_evidence_source": (
+                "official_benchmark_dataset" if source_evidence else None
+            ),
+            "source_turn_ids": source_turn_ids,
+            "source_timestamps": source_timestamps,
+            "abstention_kind": grader_config.get("abstention_kind"),
+        }
 
     @classmethod
     def _annotate_benchmark_privacy_mode(
@@ -1238,21 +1396,6 @@ class AtagiaBenchRunner:
         trace["benchmark_high_risk_secret_redaction_disabled"] = (
             privacy_enforcement == "off"
         )
-
-    @classmethod
-    def _answer_question_text_for_privacy_mode(
-        cls,
-        question_text: str,
-        *,
-        ablation: AblationConfig | None,
-        privacy_off_private_fact_expected: bool = False,
-    ) -> str:
-        if (
-            cls._benchmark_privacy_enforcement(ablation) != "off"
-            or not privacy_off_private_fact_expected
-        ):
-            return question_text
-        return f"{question_text}\n\n{PRIVACY_OFF_PRIVATE_FACT_USER_PROMPT_NOTE}"
 
     @staticmethod
     def _basic_question_trace(
@@ -1285,6 +1428,10 @@ class AtagiaBenchRunner:
             "evidence_message_ids": evidence_message_ids,
             "missing_evidence_turn_ids": missing_evidence_turn_ids,
             "evidence_memory_ids": [],
+            "gold_evidence_diagnostics": [],
+            "gold_evidence_diagnostic_summary": (
+                AtagiaBenchRunner._gold_evidence_diagnostic_summary([])
+            ),
             "selected_memory_ids": [],
             "selected_evidence_memory_ids": [],
             "retrieval_custody": [],
@@ -1320,7 +1467,9 @@ class AtagiaBenchRunner:
         return "answer_policy_or_grading"
 
     @staticmethod
-    def _aggregate_warning_counts(results: list[AtagiaQuestionResult]) -> dict[str, int]:
+    def _aggregate_warning_counts(
+        results: list[AtagiaQuestionResult],
+    ) -> dict[str, int]:
         counts: Counter[str] = Counter(
             {
                 "failed_questions": 0,
@@ -1354,7 +1503,9 @@ class AtagiaBenchRunner:
                 if retrieval_trace.get("degraded_mode"):
                     counts["degraded_retrievals"] += 1
                 need_detection = retrieval_trace.get("need_detection")
-                if isinstance(need_detection, dict) and need_detection.get("degraded_mode"):
+                if isinstance(need_detection, dict) and need_detection.get(
+                    "degraded_mode"
+                ):
                     counts["need_detection_degraded"] += 1
         return dict(counts)
 
@@ -1400,7 +1551,10 @@ class AtagiaBenchRunner:
             if retrieval_trace.raw_context_access_mode == "artifact":
                 return "missing_artifact_support"
             return "missing_raw_evidence"
-        if diagnosis_bucket in {"composition_selected_none", "retrieval_or_ranking_miss"}:
+        if diagnosis_bucket in {
+            "composition_selected_none",
+            "retrieval_or_ranking_miss",
+        }:
             return "retrieval_insufficient"
         if diagnosis_bucket in {
             "retrieval_failed",
@@ -1438,74 +1592,195 @@ class AtagiaBenchRunner:
             )
         return summaries
 
-    async def _generate_answer(
-        self,
+    @staticmethod
+    def _context_summary_from_chat_context(
+        context: Any,
+        context_payload: Any,
+    ) -> dict[str, Any]:
+        if context is not None:
+            return {
+                "items_included": context.items_included,
+                "items_dropped": context.items_dropped,
+                "budget_tokens": context.budget_tokens,
+                "total_tokens_estimate": context.total_tokens_estimate,
+                "contract_block_chars": len(context.contract_block),
+                "workspace_block_chars": len(context.workspace_block),
+                "memory_block_chars": len(context.memory_block),
+                "state_block_chars": len(context.state_block),
+            }
+        if isinstance(context_payload, dict):
+            return {
+                "items_included": context_payload.get("items_included", 0),
+                "items_dropped": context_payload.get("items_dropped", 0),
+                "budget_tokens": context_payload.get("budget_tokens", 0),
+                "total_tokens_estimate": context_payload.get(
+                    "total_tokens_estimate", 0
+                ),
+                "contract_block_chars": len(
+                    str(context_payload.get("contract_block") or "")
+                ),
+                "workspace_block_chars": len(
+                    str(context_payload.get("workspace_block") or "")
+                ),
+                "memory_block_chars": len(
+                    str(context_payload.get("memory_block") or "")
+                ),
+                "state_block_chars": len(str(context_payload.get("state_block") or "")),
+            }
+        return {
+            "items_included": 0,
+            "items_dropped": 0,
+            "budget_tokens": 0,
+            "total_tokens_estimate": 0,
+            "contract_block_chars": 0,
+            "workspace_block_chars": 0,
+            "memory_block_chars": 0,
+            "state_block_chars": 0,
+        }
+
+    @staticmethod
+    def _gold_evidence_diagnostics(
         *,
-        runtime: Any,
-        assistant_mode_id: str,
-        pipeline_result: PipelineResult,
-        question_text: str,
-        question_id: str,
-        current_user_display_name: str | None = None,
-        trusted_evaluation: bool = False,
-        ablation: AblationConfig | None = None,
-        privacy_off_private_fact_expected: bool = False,
-    ) -> str:
-        """Generate an answer from the retrieval context."""
-        resolved_policy = resolve_policy(
-            runtime.manifests,
-            assistant_mode_id,
-            runtime.policy_resolver,
-        )
-        system_prompt = build_system_prompt(
-            assistant_mode_id,
-            resolved_policy,
-            pipeline_result.composed_context.contract_block,
-            pipeline_result.composed_context.workspace_block,
-            pipeline_result.composed_context.memory_block,
-            pipeline_result.composed_context.state_block,
-            current_user_display_name=current_user_display_name,
-        )
-        if trusted_evaluation:
-            system_prompt = f"{system_prompt}\n\n{TRUSTED_EVALUATION_PROMPT_NOTE}"
-        privacy_enforcement = self._benchmark_privacy_enforcement(ablation)
-        answer_privacy_override = privacy_enforcement == "off"
-        if answer_privacy_override:
-            logger.warning(
-                "atagia_bench_answer_privacy_enforcement_not_enforced",
-                extra={
-                    "question_id": question_id,
-                    "privacy_enforcement": privacy_enforcement,
-                },
+        evidence_rows: list[dict[str, Any]],
+        retrieval_custody: list[dict[str, Any]],
+        selected_memory_ids: list[str],
+        evidence_turn_ids_by_message_id: dict[str, list[str]] | None = None,
+        evidence_turn_ids_by_memory_id: dict[str, list[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Summarize where each gold evidence memory reached in retrieval."""
+        custody_by_candidate_id = {
+            str(record.get("candidate_id") or ""): record
+            for record in retrieval_custody
+            if isinstance(record, dict) and str(record.get("candidate_id") or "")
+        }
+        composed_ids = set(selected_memory_ids)
+        turn_ids_by_message = evidence_turn_ids_by_message_id or {}
+        turn_ids_by_memory = evidence_turn_ids_by_memory_id or {}
+        diagnostics: list[dict[str, Any]] = []
+
+        for row in sorted(evidence_rows, key=lambda item: str(item.get("id") or "")):
+            memory_id = str(row.get("id") or "")
+            custody = custody_by_candidate_id.get(memory_id)
+            channels = _safe_trace_str_list(
+                custody.get("channels") if custody is not None else None
             )
-            system_prompt = (
-                f"{system_prompt}\n\n{PRIVACY_OFF_BENCHMARK_ANSWER_PROMPT_NOTE}"
+            source_message_id = str(row.get("source_message_id") or "")
+            found_after_fusion = (
+                custody is not None and custody.get("fusion_position") is not None
             )
-        response = await runtime.llm_client.complete(
-            LLMCompletionRequest(
-                model=self._answer_model or chat_model(runtime.settings),
-                messages=[
-                    LLMMessage(role="system", content=system_prompt),
-                    LLMMessage(
-                        role="user",
-                        content=self._answer_question_text_for_privacy_mode(
-                            question_text,
-                            ablation=ablation,
-                            privacy_off_private_fact_expected=privacy_off_private_fact_expected,
-                        ),
+            source_turn_ids = sorted(
+                set(turn_ids_by_memory.get(memory_id, []))
+                or set(turn_ids_by_message.get(source_message_id, []))
+            )
+            shortlisted = (
+                _safe_trace_bool(custody.get("shortlisted")) if custody else False
+            )
+            scored = _safe_trace_bool(custody.get("scored")) if custody else False
+            selected = _safe_trace_bool(custody.get("selected")) if custody else False
+            composed = memory_id in composed_ids
+            diagnostics.append(
+                {
+                    "memory_id": memory_id,
+                    "source_message_id": source_message_id or None,
+                    "source_turn_ids": source_turn_ids,
+                    "object_type": str(row.get("object_type") or ""),
+                    "scope": str(row.get("scope") or ""),
+                    "status": str(row.get("status") or ""),
+                    "privacy_level": int(row.get("privacy_level") or 0),
+                    "candidate_record_found": custody is not None,
+                    "found_before_fusion": bool(channels),
+                    "found_after_fusion": found_after_fusion,
+                    "channels": channels,
+                    "channel_ranks": _safe_trace_rank_map(
+                        custody.get("channel_ranks") if custody is not None else None
                     ),
-                ],
-                temperature=0.0,
-                max_output_tokens=ATAGIA_BENCH_ANSWER_MAX_OUTPUT_TOKENS,
-                metadata={
-                    "purpose": "atagia_bench_answer_generation",
-                    "question_id": question_id,
-                    "benchmark_privacy_enforcement": privacy_enforcement,
-                    "benchmark_answer_privacy_override": answer_privacy_override,
-                },
+                    "retrieval_sources": _safe_trace_str_list(
+                        custody.get("retrieval_sources")
+                        if custody is not None
+                        else None
+                    ),
+                    "fusion_position": _safe_trace_int(
+                        custody.get("fusion_position") if custody is not None else None
+                    ),
+                    "shortlisted": shortlisted,
+                    "shortlist_rank": _safe_trace_int(
+                        custody.get("shortlist_rank") if custody is not None else None
+                    ),
+                    "shortlist_status": (
+                        str(custody.get("shortlist_status") or "")
+                        if custody is not None
+                        else "not_found"
+                    ),
+                    "scored": scored,
+                    "score_rank": _safe_trace_int(
+                        custody.get("score_rank") if custody is not None else None
+                    ),
+                    "score_status": (
+                        str(custody.get("score_status") or "")
+                        if custody is not None
+                        else "not_found"
+                    ),
+                    "selected": selected,
+                    "selection_rank": _safe_trace_int(
+                        custody.get("selection_rank") if custody is not None else None
+                    ),
+                    "composed": composed,
+                    "composer_decision": (
+                        str(custody.get("composer_decision") or "")
+                        if custody is not None
+                        else "not_found"
+                    ),
+                    "filter_reason": (
+                        str(custody.get("filter_reason") or "")
+                        if (
+                            custody is not None
+                            and custody.get("filter_reason") is not None
+                        )
+                        else None
+                    ),
+                    "last_observed_stage": _gold_evidence_last_observed_stage(
+                        candidate_record_found=custody is not None,
+                        found_after_fusion=found_after_fusion,
+                        shortlisted=shortlisted,
+                        scored=scored,
+                        selected=selected,
+                        composed=composed,
+                    ),
+                }
             )
-        )
-        return response.output_text
+        return diagnostics
+
+    @staticmethod
+    def _gold_evidence_diagnostic_summary(
+        diagnostics: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Aggregate gold-evidence stage coverage for quick report triage."""
+        channel_counts: Counter[str] = Counter()
+        stage_counts: Counter[str] = Counter()
+        for diagnostic in diagnostics:
+            stage_counts[str(diagnostic.get("last_observed_stage") or "unknown")] += 1
+            for channel in diagnostic.get("channels") or []:
+                channel_counts[str(channel)] += 1
+        return {
+            "gold_evidence_count": len(diagnostics),
+            "candidate_record_found_count": sum(
+                1 for item in diagnostics if item.get("candidate_record_found")
+            ),
+            "found_before_fusion_count": sum(
+                1 for item in diagnostics if item.get("found_before_fusion")
+            ),
+            "found_after_fusion_count": sum(
+                1 for item in diagnostics if item.get("found_after_fusion")
+            ),
+            "shortlisted_count": sum(
+                1 for item in diagnostics if item.get("shortlisted")
+            ),
+            "scored_count": sum(1 for item in diagnostics if item.get("scored")),
+            "selected_count": sum(1 for item in diagnostics if item.get("selected")),
+            "composed_count": sum(1 for item in diagnostics if item.get("composed")),
+            "channel_counts": dict(sorted(channel_counts.items())),
+            "last_observed_stage_counts": dict(sorted(stage_counts.items())),
+        }
 
     def _resolve_question_conversation(
         self,
@@ -1578,14 +1853,25 @@ class AtagiaBenchRunner:
         exclude_question_filter: set[str] | None = None,
     ) -> list[AtagiaBenchQuestion]:
         """Filter questions by category tags if a filter is provided."""
-        if category_filter is None and question_filter is None and exclude_question_filter is None:
+        if (
+            category_filter is None
+            and question_filter is None
+            and exclude_question_filter is None
+        ):
             return questions
         return [
-            q for q in questions
+            q
+            for q in questions
             if (
-                (category_filter is None or category_filter.intersection(q.category_tags))
+                (
+                    category_filter is None
+                    or category_filter.intersection(q.category_tags)
+                )
                 and (question_filter is None or q.question_id in question_filter)
-                and (exclude_question_filter is None or q.question_id not in exclude_question_filter)
+                and (
+                    exclude_question_filter is None
+                    or q.question_id not in exclude_question_filter
+                )
             )
         ]
 
@@ -1604,6 +1890,8 @@ class AtagiaBenchRunner:
             "retrieval_model": self._retrieval_model or "",
             "answer_model": self._answer_model or "",
             "component_models": dict(sorted(self._component_models.items())),
+            "answer_stance": self._answer_stance,
+            "answer_stance_prompt_variant": self._answer_stance_prompt_variant,
             "judge_model": (
                 self._judge_model
                 or self._answer_model
@@ -1611,6 +1899,14 @@ class AtagiaBenchRunner:
                 or ""
             ),
         }
+
+    def _activation_flags(self) -> dict[str, Any]:
+        return benchmark_activation_flags(
+            embedding_backend=self._embedding_backend,
+            answer_postcondition_guard_enabled=(
+                self._answer_postcondition_guard_enabled
+            ),
+        )
 
     def _build_report(
         self,
@@ -1632,6 +1928,12 @@ class AtagiaBenchRunner:
         keep_db: bool = False,
         reuse_db: str | Path | None = None,
         evaluate_only: bool = False,
+        benchmark_db_dir: str | Path | None = None,
+        effective_benchmark_db_dir: str | Path | None = None,
+        allow_temp_benchmark_db_dir: bool = False,
+        requested_benchmark_db_dir: str | Path | None = None,
+        invocation_args: list[str] | None = None,
+        run_counters: dict[str, Any] | None = None,
     ) -> AtagiaBenchReport:
         """Build the aggregated benchmark report."""
         total = len(results)
@@ -1642,8 +1944,7 @@ class AtagiaBenchRunner:
 
         # Priority failures are ordinary benchmark misses in high-importance tags.
         priority_failure_count = sum(
-            1 for r in results
-            if not r.grade.passed and _is_priority_failure(r)
+            1 for r in results if not r.grade.passed and _is_priority_failure(r)
         )
 
         # Per-category stats
@@ -1673,7 +1974,7 @@ class AtagiaBenchRunner:
             config={
                 "provider": self._llm_provider,
                 **self._model_config_summary(),
-                "embedding_backend": self._embedding_backend,
+                "activation_flags": self._activation_flags(),
                 "category_filter": category_tags,
                 "question_filter": question_ids,
                 "exclude_question_filter": exclude_question_ids,
@@ -1687,13 +1988,33 @@ class AtagiaBenchRunner:
                 "trusted_evaluation": trusted_evaluation,
                 "parallel_personas": parallel_personas,
                 "keep_db": keep_db,
+                "benchmark_db_dir": (
+                    str(Path(benchmark_db_dir).expanduser())
+                    if benchmark_db_dir is not None
+                    else None
+                ),
+                "requested_benchmark_db_dir": (
+                    str(Path(requested_benchmark_db_dir).expanduser())
+                    if requested_benchmark_db_dir is not None
+                    else None
+                ),
+                "effective_benchmark_db_dir": (
+                    str(Path(effective_benchmark_db_dir).expanduser())
+                    if effective_benchmark_db_dir is not None
+                    else None
+                ),
+                "allow_temp_benchmark_db_dir": allow_temp_benchmark_db_dir,
                 "reuse_db": str(reuse_db) if reuse_db is not None else None,
                 "evaluate_only": evaluate_only,
+                "invocation_args": invocation_args or [],
                 "benchmark_databases": benchmark_db_entries or [],
                 "warning_counts": self._aggregate_warning_counts(results),
                 "failure_stage_counts": self._failure_stage_counts(results),
-                "retrieval_custody_summary": self._aggregate_retrieval_custody_summary(results),
+                "retrieval_custody_summary": self._aggregate_retrieval_custody_summary(
+                    results
+                ),
                 "llm_call_summary": llm_call_summary or {},
+                "run_counters": normalize_run_counters(run_counters),
             },
             personas_used=persona_ids,
             total_questions=total,
@@ -1720,14 +2041,10 @@ class AtagiaBenchRunner:
         report_file = Path(report_path).expanduser()
         diff_file = Path(diff_path).expanduser() if diff_path is not None else None
         custody_file = (
-            Path(custody_path).expanduser()
-            if custody_path is not None
-            else None
+            Path(custody_path).expanduser() if custody_path is not None else None
         )
         taxonomy_file = (
-            Path(taxonomy_path).expanduser()
-            if taxonomy_path is not None
-            else None
+            Path(taxonomy_path).expanduser() if taxonomy_path is not None else None
         )
         resolved_holdout_path = (
             Path(holdout_path).expanduser()
@@ -1743,24 +2060,16 @@ class AtagiaBenchRunner:
             "report_sha256": sha256_file_if_exists(report_file),
             "diff_path": str(diff_file) if diff_file is not None else None,
             "diff_sha256": (
-                sha256_file_if_exists(diff_file)
-                if diff_file is not None
-                else None
+                sha256_file_if_exists(diff_file) if diff_file is not None else None
             ),
-            "custody_path": (
-                str(custody_file)
-                if custody_file is not None
-                else None
-            ),
+            "custody_path": (str(custody_file) if custody_file is not None else None),
             "custody_sha256": (
                 sha256_file_if_exists(custody_file)
                 if custody_file is not None
                 else None
             ),
             "taxonomy_path": (
-                str(taxonomy_file)
-                if taxonomy_file is not None
-                else None
+                str(taxonomy_file) if taxonomy_file is not None else None
             ),
             "taxonomy_sha256": (
                 sha256_file_if_exists(taxonomy_file)
@@ -1783,7 +2092,11 @@ class AtagiaBenchRunner:
             },
             "migrations": benchmark_migration_metadata(),
             "git": _git_state(),
+            "activation_flags": self._activation_flags(),
             "config": report.config,
+            "run_counters": normalize_run_counters(
+                report.config.get("run_counters")
+            ),
             "selection": _selection_summary(report),
             "retrieval_custody_summary": report.config.get(
                 "retrieval_custody_summary",
@@ -1871,7 +2184,9 @@ def load_holdout_question_ids(path: str | Path = _DEFAULT_HOLDOUT_PATH) -> list[
     """Load the frozen Atagia-bench holdout question ID list."""
     payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
     question_ids = payload.get("question_ids")
-    if not isinstance(question_ids, list) or not all(isinstance(item, str) for item in question_ids):
+    if not isinstance(question_ids, list) or not all(
+        isinstance(item, str) for item in question_ids
+    ):
         raise ValueError("Holdout manifest must contain a string question_ids list")
     return sorted(set(question_ids))
 
@@ -1890,9 +2205,7 @@ def _selection_summary(report: AtagiaBenchReport) -> dict[str, object]:
     return {
         "benchmark_split": report.config.get("benchmark_split", "all"),
         "question_filter": (
-            question_filter
-            if isinstance(question_filter, list)
-            else None
+            question_filter if isinstance(question_filter, list) else None
         ),
         "exclude_question_filter": (
             exclude_question_filter
@@ -1900,9 +2213,7 @@ def _selection_summary(report: AtagiaBenchReport) -> dict[str, object]:
             else None
         ),
         "holdout_question_count": (
-            len(holdout_ids)
-            if isinstance(holdout_ids, list)
-            else 0
+            len(holdout_ids) if isinstance(holdout_ids, list) else 0
         ),
         "selected_question_count": len(report.per_question),
     }
@@ -1924,6 +2235,75 @@ def _safe_path_component(value: str) -> str:
             cleaned.append("_")
             previous_was_separator = True
     return "".join(cleaned).strip("_") or "run"
+
+
+def _safe_trace_str_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return sorted({str(item) for item in value if str(item)})
+
+
+def _safe_trace_rank_map(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    ranks: dict[str, int] = {}
+    for key, raw_rank in value.items():
+        rank = _safe_trace_int(raw_rank)
+        if rank is not None:
+            ranks[str(key)] = rank
+    return ranks
+
+
+def _safe_trace_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_trace_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no", ""}:
+            return False
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return bool(value)
+
+
+def _gold_evidence_last_observed_stage(
+    *,
+    candidate_record_found: bool,
+    found_after_fusion: bool,
+    shortlisted: bool,
+    scored: bool,
+    selected: bool,
+    composed: bool,
+) -> str:
+    if composed:
+        return "composed"
+    if selected:
+        return "selected"
+    if scored:
+        return "scored"
+    if shortlisted:
+        return "shortlisted"
+    if found_after_fusion:
+        return "after_fusion"
+    if candidate_record_found:
+        return "candidate_record_only"
+    return "not_found"
 
 
 def _git_state() -> dict[str, Any]:

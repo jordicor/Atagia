@@ -18,10 +18,17 @@ def summarize_retrieval_custody(
     candidate_kind_counts: Counter[str] = Counter()
     composer_decision_counts: Counter[str] = Counter()
     filter_reason_counts: Counter[str] = Counter()
+    eviction_reason_counts: Counter[str] = Counter()
+    high_value_rejected_reason_counts: Counter[str] = Counter()
     scope_counts: Counter[str] = Counter()
     selected_scope_counts: Counter[str] = Counter()
     sensitivity_counts: Counter[str] = Counter()
     selected_sensitivity_counts: Counter[str] = Counter()
+    source_backed_count = 0
+    summary_only_count = 0
+    selected_source_backed_count = 0
+    selected_summary_count = 0
+    high_value_rejected_count = 0
     platform_locked_count = 0
 
     for group in custody_groups:
@@ -41,6 +48,17 @@ def summarize_retrieval_custody(
             filter_reason = record.get("filter_reason")
             if filter_reason is not None:
                 filter_reason_counts[str(filter_reason)] += 1
+            eviction_reason = record.get("eviction_reason")
+            if eviction_reason is not None:
+                eviction_reason_counts[str(eviction_reason)] += 1
+            if record.get("source_backed") is True:
+                source_backed_count += 1
+            if record.get("summary_only") is True:
+                summary_only_count += 1
+            if record.get("high_value_rejected") is True:
+                high_value_rejected_count += 1
+                reason = str(record.get("eviction_reason") or "unknown")
+                high_value_rejected_reason_counts[reason] += 1
             scope = record.get("scope_canonical") or record.get("scope")
             if scope is not None:
                 scope_counts[str(scope)] += 1
@@ -52,6 +70,10 @@ def summarize_retrieval_custody(
             if record.get("selected") is True:
                 selected_count += 1
                 selected_channel_counts.update(normalized_channels)
+                if record.get("source_backed") is True:
+                    selected_source_backed_count += 1
+                if record.get("summary_only") is True:
+                    selected_summary_count += 1
                 if scope is not None:
                     selected_scope_counts[str(scope)] += 1
                 if sensitivity is not None:
@@ -65,6 +87,15 @@ def summarize_retrieval_custody(
         "candidate_kind_counts": dict(sorted(candidate_kind_counts.items())),
         "composer_decision_counts": dict(sorted(composer_decision_counts.items())),
         "filter_reason_counts": dict(sorted(filter_reason_counts.items())),
+        "eviction_reason_counts": dict(sorted(eviction_reason_counts.items())),
+        "source_backed_candidate_count": source_backed_count,
+        "summary_only_candidate_count": summary_only_count,
+        "selected_source_backed_count": selected_source_backed_count,
+        "selected_summary_count": selected_summary_count,
+        "high_value_rejected_candidate_count": high_value_rejected_count,
+        "high_value_rejected_reasons": dict(
+            sorted(high_value_rejected_reason_counts.items())
+        ),
     }
     if scope_counts:
         summary["scope_counts"] = dict(sorted(scope_counts.items()))
@@ -87,6 +118,9 @@ def format_retrieval_custody_summary(value: object) -> str:
         f"Retrieval custody: candidates={candidate_count} selected={selected_count}",
         f"channels={_format_count_mapping(value.get('channel_counts'))}",
         f"selected_channels={_format_count_mapping(value.get('selected_channel_counts'))}",
+        f"source_backed={_int_summary_value(value, 'source_backed_candidate_count')}",
+        f"summary_only={_int_summary_value(value, 'summary_only_candidate_count')}",
+        f"high_value_rejected={_int_summary_value(value, 'high_value_rejected_candidate_count')}",
     ]
     if value.get("scope_counts"):
         parts.append(f"scopes={_format_count_mapping(value.get('scope_counts'))}")
@@ -97,6 +131,7 @@ def format_retrieval_custody_summary(value: object) -> str:
             f"kinds={_format_count_mapping(value.get('candidate_kind_counts'))}",
             f"decisions={_format_count_mapping(value.get('composer_decision_counts'))}",
             f"filters={_format_count_mapping(value.get('filter_reason_counts'))}",
+            f"evictions={_format_count_mapping(value.get('eviction_reason_counts'))}",
         ]
     )
     return " ".join(parts)

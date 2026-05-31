@@ -56,10 +56,41 @@ class QueueProvider(LLMProvider):
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
+        purpose = request.metadata.get("purpose")
+        if purpose == "need_detection_anchor_review":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps({"anchors": []}),
+            )
+        if purpose == "need_detection_unknown_only_contract_review":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "is_exact_value_lookup": False,
+                        "exact_facets": [],
+                        "must_keep_terms": [],
+                        "quoted_phrases": [],
+                    }
+                ),
+            )
+        if purpose == "need_detection_multi_facet_exact_review":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "has_multiple_obligations": False,
+                        "sub_queries": [],
+                    }
+                ),
+            )
         if not self.outputs:
             raise AssertionError("No queued LLM output left for this test")
         output_text = self.outputs.pop(0)
-        if request.metadata.get("purpose") == "need_detection":
+        if purpose == "need_detection":
             payload = json.loads(output_text)
             if isinstance(payload, list):
                 output_text = json.dumps(
@@ -85,6 +116,16 @@ class QueueProvider(LLMProvider):
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError("Embeddings are not used in Step 11 API tests")
+
+
+def _llm_request_by_purpose(
+    provider: QueueProvider,
+    purpose: str,
+) -> LLMCompletionRequest:
+    for request in provider.requests:
+        if request.metadata.get("purpose") == purpose:
+            return request
+    raise AssertionError(f"LLM request with purpose={purpose!r} was not captured")
 
 
 def _settings(
@@ -876,8 +917,9 @@ def test_chat_reply_runs_full_flow_and_returns_response(tmp_path: Path) -> None:
         assert payload["reply_text"] == "Check the retry guard first."
         assert payload["retrieval_event_id"] is not None
         assert payload["debug"]["cold_start"] is True
-        assert len(provider.requests) == 2
-        assert provider.requests[1].model == "openai/reply-test-model"
+        assert _llm_request_by_purpose(provider, "chat_reply").model == (
+            "openai/reply-test-model"
+        )
 
 
 def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base64_leak(
@@ -937,8 +979,8 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
         assert response.status_code == 200
         payload = response.json()
         assert payload["reply_text"] == "Attachment-aware reply."
-        assert len(provider.requests) == 2
-        prompt_text = provider.requests[1].messages[1].content
+        chat_request = _llm_request_by_purpose(provider, "chat_reply")
+        prompt_text = chat_request.messages[1].content
         assert "[Attachments omitted]" in prompt_text
         assert "artifact_id=" in prompt_text
         assert "SGVsbG8sIHdvcmxkIQ==" not in prompt_text
@@ -1060,7 +1102,10 @@ def test_chat_reply_includes_current_user_state_in_system_prompt(tmp_path: Path)
         )
 
         assert response.status_code == 200
-        system_prompt = provider.requests[1].messages[0].content
+        system_prompt = _llm_request_by_purpose(
+            provider,
+            "chat_reply",
+        ).messages[0].content
         assert "[Current User State]" in system_prompt
         assert "focus_topic: websocket retries" in system_prompt
         assert "urgency: high" in system_prompt
@@ -1197,7 +1242,10 @@ def test_chat_reply_uses_character_rollup_and_hides_legacy_workspace_rollup(tmp_
         )
 
         assert response.status_code == 200
-        system_prompt = provider.requests[1].messages[0].content
+        system_prompt = _llm_request_by_purpose(
+            provider,
+            "chat_reply",
+        ).messages[0].content
         assert "[Workspace Context]" in system_prompt
         assert "The character prefers patch-first debugging." in system_prompt
         assert "The workspace prefers patch-first debugging." not in system_prompt

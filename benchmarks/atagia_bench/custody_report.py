@@ -38,6 +38,8 @@ class AtagiaBenchFailedQuestionCustody(BaseModel):
     evidence_memory_ids: list[str] = Field(default_factory=list)
     selected_memory_ids: list[str] = Field(default_factory=list)
     selected_evidence_memory_ids: list[str] = Field(default_factory=list)
+    gold_evidence_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
+    gold_evidence_diagnostic_summary: dict[str, Any] = Field(default_factory=dict)
     retrieval_custody: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -102,6 +104,14 @@ def build_failed_question_custody_report(
                     result,
                     "selected_evidence_memory_ids",
                 ),
+                gold_evidence_diagnostics=_trace_dict_list(
+                    result,
+                    "gold_evidence_diagnostics",
+                ),
+                gold_evidence_diagnostic_summary=_trace_dict(
+                    result,
+                    "gold_evidence_diagnostic_summary",
+                ),
                 retrieval_custody=_trace_dict_list(result, "retrieval_custody"),
             )
         )
@@ -155,3 +165,10 @@ def _trace_dict_list(result: AtagiaQuestionResult, field_name: str) -> list[dict
         for item in value
         if isinstance(item, dict)
     ]
+
+
+def _trace_dict(result: AtagiaQuestionResult, field_name: str) -> dict[str, Any]:
+    value = result.trace.get(field_name)
+    if not isinstance(value, dict):
+        return {}
+    return dict(value)

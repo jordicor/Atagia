@@ -21,10 +21,13 @@ from atagia.memory.operational_profile import OperationalProfileLoader
 from atagia.models.schemas_jobs import (
     CONTRACT_STREAM_NAME,
     EXTRACT_STREAM_NAME,
+    INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
+    InitialContextPackageRefreshJobPayload,
+    InitialContextPackageRefreshReason,
     JobEnvelope,
     JobType,
 )
-from atagia.models.schemas_memory import ConversationStatus
+from atagia.models.schemas_memory import ConversationStatus, OperationalProfileSnapshot
 from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
     build_message_jobs,
@@ -38,6 +41,7 @@ logger = logging.getLogger(__name__)
 _RECOVERABLE_STREAMS: dict[str, str] = {
     JobType.EXTRACT_MEMORY_CANDIDATES.value: EXTRACT_STREAM_NAME,
     JobType.PROJECT_CONTRACT.value: CONTRACT_STREAM_NAME,
+    JobType.REFRESH_INITIAL_CONTEXT_PACKAGE.value: INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
 }
 
 
@@ -100,6 +104,8 @@ class JobRecoveryService:
         stream_name = _RECOVERABLE_STREAMS.get(job_type)
         if stream_name is None:
             return False
+        if job_type == JobType.REFRESH_INITIAL_CONTEXT_PACKAGE.value:
+            return await self._recover_initial_context_package_job(row, stream_name)
         message_ids = row.get("source_message_ids_json")
         if not isinstance(message_ids, list) or len(message_ids) != 1:
             await self._mark_unrecoverable(job_id, "unsupported_source_message_shape")
@@ -199,10 +205,97 @@ class JobRecoveryService:
             raise
         return True
 
+    async def _recover_initial_context_package_job(
+        self,
+        row: dict[str, Any],
+        stream_name: str,
+    ) -> bool:
+        job_id = str(row["job_id"])
+        user_id = str(row["user_id"])
+        conversation_id = (
+            str(row["conversation_id"])
+            if row.get("conversation_id") is not None
+            else None
+        )
+        active_user = await self._users.get_active_user(user_id)
+        if active_user is None:
+            await self._mark_unrecoverable(job_id, "user_not_active")
+            return False
+        if conversation_id is not None:
+            conversation = await self._conversations.get_conversation(
+                conversation_id,
+                user_id,
+            )
+            if (
+                conversation is None
+                or str(conversation.get("status")) != ConversationStatus.ACTIVE.value
+            ):
+                await self._mark_unrecoverable(job_id, "conversation_not_active")
+                return False
+        metadata = row.get("metadata_json")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        message_ids = row.get("source_message_ids_json")
+        source_message_ids = (
+            [str(item) for item in message_ids]
+            if isinstance(message_ids, list)
+            else []
+        )
+        payload = InitialContextPackageRefreshJobPayload(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            package_kind=str(metadata.get("package_kind") or "all"),  # type: ignore[arg-type]
+            retrieval_profile_id=(
+                str(metadata["retrieval_profile_id"])
+                if metadata.get("retrieval_profile_id") is not None
+                else None
+            ),
+            reason=InitialContextPackageRefreshReason(
+                str(metadata.get("reason") or InitialContextPackageRefreshReason.BACKFILL.value)
+            ),
+            source_message_ids=source_message_ids,
+            privacy_enforcement=str(metadata.get("privacy_enforcement") or "enforce"),  # type: ignore[arg-type]
+        )
+        recovered_job = JobEnvelope(
+            job_id=job_id,
+            job_type=JobType.REFRESH_INITIAL_CONTEXT_PACKAGE,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_ids=source_message_ids,
+            payload=payload.model_dump(mode="json"),
+            created_at=_parse_datetime(row.get("queued_at")),
+            operational_profile=self._operational_profile_snapshot(row),
+        )
+        await self._jobs.mark_requeued_for_recovery(
+            job_id,
+            metadata={"inprocess_recovered_at": self._clock.now().isoformat()},
+        )
+        try:
+            await self._storage_backend.stream_add(
+                stream_name,
+                recovered_job.model_dump(mode="json"),
+            )
+        except Exception as exc:
+            await self._jobs.mark_failed(
+                job_id,
+                error_class=exc.__class__.__name__,
+                error_message=str(exc),
+            )
+            raise
+        return True
+
     def _operational_profile_snapshot(self, row: dict[str, Any]):
         metadata = row.get("metadata_json")
         profile_id = None
         if isinstance(metadata, dict):
+            snapshot = metadata.get("operational_profile_snapshot")
+            if isinstance(snapshot, dict):
+                try:
+                    return OperationalProfileSnapshot.model_validate(snapshot)
+                except Exception:
+                    logger.warning(
+                        "Ignoring invalid operational profile snapshot during job recovery",
+                        exc_info=True,
+                    )
             raw_profile_id = metadata.get("operational_profile")
             profile_id = str(raw_profile_id).strip() if raw_profile_id else None
         try:

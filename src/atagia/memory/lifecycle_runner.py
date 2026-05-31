@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import hashlib
 import logging
+import sqlite3
 from typing import TYPE_CHECKING, Any
 
 import aiosqlite
@@ -74,6 +75,26 @@ def cache_generation_key(database_path: str, user_id: str) -> str:
     return f"{_runtime_prefix(database_path)}:{user_id}"
 
 
+def _is_sqlite_busy_error(exc: BaseException) -> bool:
+    """Return True for SQLite writer contention that lazy lifecycle can skip."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    error_name = getattr(exc, "sqlite_errorname", None)
+    if isinstance(error_name, str) and error_name.startswith("SQLITE_BUSY"):
+        return True
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(error_code, int):
+        return (error_code & 0xFF) == sqlite3.SQLITE_BUSY
+    return "database is locked" in str(exc).lower()
+
+
+async def _has_any_dedupe(storage_backend: StorageBackend, keys: tuple[str, ...]) -> bool:
+    for key in keys:
+        if await storage_backend.has_dedupe(key):
+            return True
+    return False
+
+
 async def try_run_lifecycle(
     *,
     database_path: str,
@@ -92,7 +113,13 @@ async def try_run_lifecycle(
     """
     prefix = _runtime_prefix(database_path)
     cooldown_key = f"lifecycle:cooldown:{prefix}"
+    busy_backoff_key = f"lifecycle:busy_backoff:{prefix}"
+    failure_backoff_key = f"lifecycle:failure_backoff:{prefix}"
     lock_key = f"lifecycle:lock:{prefix}"
+    skip_keys = (cooldown_key, busy_backoff_key, failure_backoff_key)
+
+    if await _has_any_dedupe(storage_backend, skip_keys):
+        return False
 
     token = await storage_backend.acquire_lock(lock_key, LOCK_TTL_SECONDS)
     if token is None:
@@ -100,60 +127,79 @@ async def try_run_lifecycle(
 
     connections: list[aiosqlite.Connection] = []
     try:
-        should_run = await storage_backend.remember_dedupe(
-            cooldown_key, settings.lifecycle_min_interval_seconds,
-        )
-        if not should_run:
+        if await _has_any_dedupe(storage_backend, skip_keys):
             return False
 
-        connection = await _open_tracked_connection(database_path, connections)
-        manager = MemoryLifecycleManager(
-            connection, clock,
-            settings=settings,
-            embedding_index=embedding_index,
-        )
-        result = await manager.run_cycle(dry_run=False)
-        result.expired_temporary_conversations_count = await _expire_idle_temporary_conversations(
-            connection,
-            database_path=database_path,
-            clock=clock,
-            settings=settings,
-            embedding_index=embedding_index,
-            storage_backend=storage_backend,
-            artifact_blob_store=artifact_blob_store,
-            llm_client=llm_client,
-            lifecycle_runtime=lifecycle_runtime,
-            dry_run=False,
-        )
-        result.purged_pending_conversations_count = await _purge_pending_deleted_conversations(
-            connection,
-            database_path=database_path,
-            clock=clock,
-            settings=settings,
-            embedding_index=embedding_index,
-            storage_backend=storage_backend,
-            artifact_blob_store=artifact_blob_store,
-            llm_client=llm_client,
-            lifecycle_runtime=lifecycle_runtime,
-            dry_run=False,
-        )
-        result.processed_pending_file_deletions_count = await _process_pending_file_deletions(
-            connection,
-            database_path=database_path,
-            clock=clock,
-            settings=settings,
-            embedding_index=embedding_index,
-            storage_backend=storage_backend,
-            artifact_blob_store=artifact_blob_store,
-            llm_client=llm_client,
-            lifecycle_runtime=lifecycle_runtime,
-            dry_run=False,
-        )
+        try:
+            connection = await _open_tracked_connection(database_path, connections)
+            await connection.execute(
+                f"PRAGMA busy_timeout = {settings.lifecycle_busy_timeout_ms};"
+            )
+            manager = MemoryLifecycleManager(
+                connection, clock,
+                settings=settings,
+                embedding_index=embedding_index,
+            )
+            result = await manager.run_cycle(dry_run=False)
+            result.expired_temporary_conversations_count = await _expire_idle_temporary_conversations(
+                connection,
+                database_path=database_path,
+                clock=clock,
+                settings=settings,
+                embedding_index=embedding_index,
+                storage_backend=storage_backend,
+                artifact_blob_store=artifact_blob_store,
+                llm_client=llm_client,
+                lifecycle_runtime=lifecycle_runtime,
+                dry_run=False,
+            )
+            result.purged_pending_conversations_count = await _purge_pending_deleted_conversations(
+                connection,
+                database_path=database_path,
+                clock=clock,
+                settings=settings,
+                embedding_index=embedding_index,
+                storage_backend=storage_backend,
+                artifact_blob_store=artifact_blob_store,
+                llm_client=llm_client,
+                lifecycle_runtime=lifecycle_runtime,
+                dry_run=False,
+            )
+            result.processed_pending_file_deletions_count = await _process_pending_file_deletions(
+                connection,
+                database_path=database_path,
+                clock=clock,
+                settings=settings,
+                embedding_index=embedding_index,
+                storage_backend=storage_backend,
+                artifact_blob_store=artifact_blob_store,
+                llm_client=llm_client,
+                lifecycle_runtime=lifecycle_runtime,
+                dry_run=False,
+            )
+        except Exception as exc:
+            if _is_sqlite_busy_error(exc):
+                await storage_backend.force_dedupe(
+                    busy_backoff_key,
+                    settings.lifecycle_busy_backoff_seconds,
+                )
+                logger.debug("Lifecycle skipped because SQLite is busy")
+                return False
+            await storage_backend.force_dedupe(
+                failure_backoff_key,
+                settings.lifecycle_failure_backoff_seconds,
+            )
+            raise
+
         for user_id in manager.affected_user_ids:
             await storage_backend.delete_context_views_for_user(user_id)
             await storage_backend.increment_cache_generation(
                 cache_generation_key(database_path, user_id)
             )
+        await storage_backend.force_dedupe(
+            cooldown_key,
+            settings.lifecycle_min_interval_seconds,
+        )
         logger.info(
             "Lifecycle cycle completed: decayed=%d archived=%d deleted=%d",
             result.decayed_count,
@@ -345,8 +391,9 @@ async def _purge_pending_deleted_conversations(
     )
 
 
-async def piggyback_lifecycle(runtime: AppRuntime) -> None:
+async def piggyback_lifecycle(runtime: AppRuntime, *, reason: str | None = None) -> None:
     """Fire-and-forget lifecycle attempt after retrieval."""
+    del reason
     try:
         await try_run_lifecycle(
             database_path=runtime.database_path,
@@ -360,3 +407,14 @@ async def piggyback_lifecycle(runtime: AppRuntime) -> None:
         )
     except Exception:
         logger.exception("Piggyback lifecycle failed")
+
+
+def request_lifecycle_piggyback(runtime: AppRuntime, *, reason: str) -> bool:
+    """Schedule a lazy lifecycle attempt when the runtime can accept background work."""
+    if getattr(runtime, "closed", False):
+        return False
+    runtime.spawn_background_task(
+        piggyback_lifecycle(runtime, reason=reason),
+        name="atagia-lifecycle-piggyback",
+    )
+    return True

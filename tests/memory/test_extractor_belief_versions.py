@@ -23,6 +23,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
+from tests.extraction_payload_support import rich_extraction_payload_to_lean
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -32,19 +33,7 @@ class CannedProvider(LLMProvider):
     name = "canned-belief-versioning"
 
     def __init__(self, payload: dict[str, object]) -> None:
-        normalized_payload = dict(payload)
-        normalized_payload["beliefs"] = [
-            (
-                {
-                    **item,
-                    "language_codes": ["en"],
-                }
-                if isinstance(item, dict) and "canonical_text" in item and "language_codes" not in item
-                else item
-            )
-            for item in normalized_payload.get("beliefs", [])
-        ]
-        self.payload = normalized_payload
+        self.payload = rich_extraction_payload_to_lean(payload)
         self.requests: list[LLMCompletionRequest] = []
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:

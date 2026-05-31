@@ -158,7 +158,6 @@ class StrictCoverageJudge:
                         ),
                     ),
                 ],
-                temperature=0.0,
                 max_output_tokens=GENERIC_JUDGE_MAX_OUTPUT_TOKENS,
                 response_schema=StrictCoverageVerdict.model_json_schema(),
                 metadata={

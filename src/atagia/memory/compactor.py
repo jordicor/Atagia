@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import hashlib
 import html
+import json
 import logging
 from typing import Any, Callable, TypeVar
 
@@ -21,6 +23,7 @@ from atagia.core.llm_output_limits import (
     COMPACTOR_THEMATIC_PROFILE_MAX_OUTPUT_TOKENS,
     COMPACTOR_WORKSPACE_ROLLUP_MAX_OUTPUT_TOKENS,
 )
+from atagia.core.memory_provenance import MemoryProvenanceWriter
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
@@ -33,6 +36,8 @@ from atagia.core.summary_repository import SummaryRepository
 from atagia.models.schemas_memory import (
     ConversationStatus,
     IntimacyBoundary,
+    MemoryEvidenceSpeakerRelation,
+    MemoryEvidenceSupportKind,
     MemoryObjectType,
     MemoryScope,
     MemorySensitivity,
@@ -51,6 +56,7 @@ from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
     LLMMessage,
+    OutputLimitExceededError,
     StructuredOutputError,
     known_intimacy_context_metadata,
 )
@@ -61,6 +67,7 @@ from atagia.services.privacy_filter_client import (
     PrivacyFilterDetection,
     PrivacyFilterError,
 )
+from atagia.services.run_counters import increment_run_counter
 
 SUMMARY_MAYA_SCORE = 1.5
 COMPACTION_VALIDATION_MAX_CORRECTIVE_RETRIES = 2
@@ -73,6 +80,9 @@ CONVERSATION_CHUNK_CONFIDENCE = 0.68  # Below atomic high-confidence but above l
 CONVERSATION_CHUNK_STABILITY = 0.74  # Chunks are moderately stable
 CONVERSATION_CHUNK_VITALITY = 0.18  # More volatile than episodes
 PRIVACY_GATE_AUDIT_KEY = "privacy_validation_gate"
+COMPACTOR_SEGMENTATION_MAX_MESSAGES_PER_REQUEST = 96
+COMPACTOR_SEGMENTATION_MIN_SPLIT_MESSAGES = 4
+COMPACTOR_EPISODE_SYNTHESIS_MIN_SPLIT_CHUNKS = 1
 logger = logging.getLogger(__name__)
 
 _DATA_ONLY_INSTRUCTION = (
@@ -129,6 +139,9 @@ return start_seq, end_seq, and a concise summary capturing the key information,
 decisions, and outcomes.
 
 Use only the messages provided below.
+Valid message seq bounds for this request are {min_seq}-{max_seq}.
+Every start_seq and end_seq must be inside those bounds.
+Return no more than {max_episode_count} episodes.
 Do not create overlapping episodes.
 {absolute_time_instruction}
 
@@ -191,6 +204,7 @@ Anything outside the first JSON object will be ignored.
 Group these conversation chunk summaries into cross-session episodes for a single user.
 Each input chunk has a position. The output must assign each input position to exactly
 one cross-session episode.
+Return no more than {max_episode_count} episodes.
 
 Return:
 - episodes: each episode_key and a concise summary_text for the shared thread,
@@ -382,7 +396,9 @@ class Compactor:
         self._memory_repository = MemoryObjectRepository(connection, clock)
         self._summary_repository = SummaryRepository(connection, clock)
         self._consequence_repository = ConsequenceRepository(connection, clock)
+        self._memory_provenance_writer = MemoryProvenanceWriter(connection, clock)
         resolved_settings = settings or Settings.from_env()
+        self._episode_synthesis_max_episodes = resolved_settings.episode_synthesis_max_episodes
         self._privacy_gate_enabled = resolved_settings.privacy_validation_gate_enabled
         self._opf_enabled = resolved_settings.opf_privacy_filter_enabled
         self._privacy_filter_client = (
@@ -422,6 +438,52 @@ class Compactor:
         self._privacy_gate_max_summaries = (
             resolved_settings.privacy_validation_gate_max_summaries_gated_per_job
         )
+
+    async def _upsert_summary_mirror_with_packet(
+        self,
+        *,
+        user_id: str,
+        commit: bool = True,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        mirror = await self._memory_repository.upsert_summary_mirror(
+            user_id=user_id,
+            commit=False,
+            **kwargs,
+        )
+        payload = mirror.get("payload_json") or {}
+        if isinstance(payload, dict):
+            source_message_ids = self._unique_strings(
+                [
+                    str(item)
+                    for item in payload.get("source_message_ids", [])
+                    if str(item).strip()
+                ]
+            )
+            if source_message_ids:
+                await self._memory_provenance_writer.create_packet_from_source_messages(
+                    user_id=user_id,
+                    memory_id=str(mirror["id"]),
+                    source_message_ids=source_message_ids,
+                    writer_kind="compactor_summary_mirror",
+                    support_kind=MemoryEvidenceSupportKind.INFERRED,
+                    speaker_relation_to_subject=MemoryEvidenceSpeakerRelation.ASSISTANT_INFERENCE,
+                    confidence=min(0.65, float(mirror.get("confidence", 0.5) or 0.5)),
+                    confidence_details={
+                        "summary_kind": payload.get("summary_kind"),
+                        "hierarchy_level": payload.get("hierarchy_level"),
+                        "source_object_ids": payload.get("source_object_ids", []),
+                    },
+                    rationale=(
+                        "Summary mirror is inferred from source messages and is not "
+                        "primary direct evidence."
+                    ),
+                    max_source_spans=2,
+                    commit=False,
+                )
+        if commit:
+            await self._memory_repository.commit()
+        return mirror
 
     async def generate_conversation_chunks(
         self,
@@ -577,6 +639,7 @@ class Compactor:
                         "privacy_level": source_privacy_max,
                         "intimacy_boundary": source_intimacy_boundary,
                         "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "language_codes": self._summary_language_codes(source_rows),
                         "payload": payload,
                     },
                 }
@@ -590,7 +653,7 @@ class Compactor:
                     draft["summary"],
                     commit=False,
                 )
-                await self._memory_repository.upsert_summary_mirror(
+                await self._upsert_summary_mirror_with_packet(
                     user_id=user_id,
                     **draft["mirror"],
                     commit=False,
@@ -687,9 +750,10 @@ class Compactor:
                     privacy_level=privacy_level,
                     intimacy_boundary=source_intimacy_boundary,
                     intimacy_boundary_confidence=source_intimacy_confidence,
+                    language_codes=self._summary_language_codes(source_rows),
                 ):
                     continue
-                await self._memory_repository.upsert_summary_mirror(
+                await self._upsert_summary_mirror_with_packet(
                     user_id=user_id,
                     summary_view_id=summary_id,
                     summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
@@ -722,6 +786,7 @@ class Compactor:
                     privacy_level=privacy_level,
                     intimacy_boundary=source_intimacy_boundary,
                     intimacy_boundary_confidence=source_intimacy_confidence,
+                    language_codes=self._summary_language_codes(source_rows),
                     payload={
                         **self._summary_mirror_payload(
                             summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
@@ -901,6 +966,9 @@ class Compactor:
                         "privacy_level": source_privacy_max,
                         "intimacy_boundary": source_intimacy_boundary,
                         "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "language_codes": self._summary_language_codes(
+                            source_rows_for_namespace
+                        ),
                         "status": MemoryStatus.ARCHIVED,
                         "payload": {**validated.payload_updates, "audit_only_mirror": True},
                     }
@@ -921,7 +989,7 @@ class Compactor:
                 if draft["audit_mirror"] is not None:
                     # Audit-only rollup mirrors exist only for PVG reporting.
                     # status=ARCHIVED + audit_only_mirror=true keeps them out of active retrieval.
-                    await self._memory_repository.upsert_summary_mirror(
+                    await self._upsert_summary_mirror_with_packet(
                         user_id=user_id,
                         **draft["audit_mirror"],
                         commit=False,
@@ -956,6 +1024,19 @@ class Compactor:
                 await self._delete_embeddings([f"sum_mem_{summary_id}" for summary_id in deleted_summary_ids])
             return []
 
+        episode_synthesis_fingerprint = self._episode_synthesis_fingerprint(chunk_rows)
+        latest_episode_payload = await self._memory_repository.latest_summary_mirror_payload(
+            user_id=user_id,
+            summary_kind=SummaryViewKind.EPISODE,
+        )
+        if (
+            deleted_summary_ids
+            and latest_episode_payload is not None
+            and latest_episode_payload.get("episode_synthesis_fingerprint")
+            == episode_synthesis_fingerprint
+        ):
+            return deleted_summary_ids
+
         try:
             episode_groups: list[tuple[str, list[dict[str, Any]]]] = []
             for grouped_chunk_rows in self._partition_rows_by_user_persona(chunk_rows):
@@ -972,6 +1053,7 @@ class Compactor:
                 exc,
                 extra={"user_id": user_id, "error": str(exc)},
             )
+            increment_run_counter("episode_synthesis_failures")
             return deleted_summary_ids
 
         drafts: list[dict[str, Any]] = []
@@ -1014,6 +1096,7 @@ class Compactor:
                 source_rows=source_memory_rows,
                 source_message_ids=source_message_ids,
             )
+            payload["episode_synthesis_fingerprint"] = episode_synthesis_fingerprint
             validated = await self._validate_summary_draft(
                 user_id=user_id,
                 summary_kind=SummaryViewKind.EPISODE,
@@ -1079,6 +1162,9 @@ class Compactor:
                         "privacy_level": source_privacy_max,
                         "intimacy_boundary": source_intimacy_boundary,
                         "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "language_codes": self._summary_language_codes(
+                            source_rows_for_policy
+                        ),
                         "payload": payload,
                     },
                 }
@@ -1093,7 +1179,7 @@ class Compactor:
                     draft["summary"],
                     commit=False,
                 )
-                await self._memory_repository.upsert_summary_mirror(
+                await self._upsert_summary_mirror_with_packet(
                     user_id=user_id,
                     **draft["mirror"],
                     commit=False,
@@ -1241,6 +1327,7 @@ class Compactor:
                         "privacy_level": source_privacy_max,
                         "intimacy_boundary": source_intimacy_boundary,
                         "intimacy_boundary_confidence": source_intimacy_confidence,
+                        "language_codes": self._summary_language_codes(source_rows),
                         "payload": payload,
                     },
                 }
@@ -1255,7 +1342,7 @@ class Compactor:
                     draft["summary"],
                     commit=False,
                 )
-                await self._memory_repository.upsert_summary_mirror(
+                await self._upsert_summary_mirror_with_packet(
                     user_id=user_id,
                     **draft["mirror"],
                     commit=False,
@@ -1276,6 +1363,93 @@ class Compactor:
         conversation_id: str,
         messages: list[dict[str, Any]],
     ) -> _SegmentationResponse:
+        ordered_messages = sorted(messages, key=lambda message: int(message["seq"]))
+        if len(ordered_messages) <= COMPACTOR_SEGMENTATION_MAX_MESSAGES_PER_REQUEST:
+            return await self._segment_message_window_with_output_limit_split(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                messages=ordered_messages,
+            )
+
+        episodes: list[_SegmentedEpisode] = []
+        windows = self._segmentation_message_windows(ordered_messages)
+        logger.info(
+            "conversation_segmentation_windowed conversation_id=%s message_count=%s window_count=%s",
+            conversation_id,
+            len(ordered_messages),
+            len(windows),
+            extra={
+                "conversation_id": conversation_id,
+                "message_count": len(ordered_messages),
+                "window_count": len(windows),
+            },
+        )
+        for window in windows:
+            response = await self._segment_message_window_with_output_limit_split(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                messages=window,
+            )
+            episodes.extend(response.episodes)
+        combined_response = _SegmentationResponse(episodes=episodes)
+        self._validate_segmentation_response(combined_response, ordered_messages)
+        return combined_response
+
+    async def _segment_message_window_with_output_limit_split(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+    ) -> _SegmentationResponse:
+        try:
+            return await self._segment_message_window(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                messages=messages,
+            )
+        except OutputLimitExceededError:
+            if len(messages) <= COMPACTOR_SEGMENTATION_MIN_SPLIT_MESSAGES:
+                raise
+            split_index = max(1, len(messages) // 2)
+            logger.warning(
+                "conversation_segmentation_output_limit_split conversation_id=%s message_count=%s split_index=%s",
+                conversation_id,
+                len(messages),
+                split_index,
+                extra={
+                    "conversation_id": conversation_id,
+                    "message_count": len(messages),
+                    "split_index": split_index,
+                    "min_seq": int(messages[0]["seq"]),
+                    "max_seq": int(messages[-1]["seq"]),
+                },
+            )
+            left_response = await self._segment_message_window_with_output_limit_split(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                messages=messages[:split_index],
+            )
+            right_response = await self._segment_message_window_with_output_limit_split(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                messages=messages[split_index:],
+            )
+            return _SegmentationResponse(
+                episodes=[*left_response.episodes, *right_response.episodes]
+            )
+
+    async def _segment_message_window(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+    ) -> _SegmentationResponse:
+        requested_seqs = sorted(int(message["seq"]) for message in messages)
+        min_seq = requested_seqs[0]
+        max_seq = requested_seqs[-1]
+        max_episode_count = min(len(messages), max(4, (len(messages) + 3) // 4))
         request = LLMCompletionRequest(
             model=self._classifier_model,
             messages=[
@@ -1292,11 +1466,13 @@ class Compactor:
                         reference_time_utc=self._timestamp(),
                         absolute_time_instruction=_ABSOLUTE_TIME_INSTRUCTION,
                         data_only_instruction=_DATA_ONLY_INSTRUCTION,
+                        min_seq=min_seq,
+                        max_seq=max_seq,
+                        max_episode_count=max_episode_count,
                         messages_xml=self._messages_xml(messages),
                     ),
                 ),
             ],
-            temperature=0.0,
             max_output_tokens=COMPACTOR_CONVERSATION_CHUNK_MAX_OUTPUT_TOKENS,
             response_schema=_SegmentationResponse.model_json_schema(),
             metadata={
@@ -1304,6 +1480,9 @@ class Compactor:
                 "conversation_id": conversation_id,
                 "assistant_mode_id": None,
                 "purpose": "summary_chunk_segmentation",
+                "message_count": len(messages),
+                "min_seq": min_seq,
+                "max_seq": max_seq,
             },
         )
         return await self._complete_structured_with_validation_retry(
@@ -1312,6 +1491,13 @@ class Compactor:
             validator=lambda result: self._validate_segmentation_response(result, messages),
             final_repairer=lambda result: self._repair_segmentation_gap_coverage(result, messages),
         )
+
+    @staticmethod
+    def _segmentation_message_windows(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        return [
+            messages[index : index + COMPACTOR_SEGMENTATION_MAX_MESSAGES_PER_REQUEST]
+            for index in range(0, len(messages), COMPACTOR_SEGMENTATION_MAX_MESSAGES_PER_REQUEST)
+        ]
 
     async def _synthesize_workspace_rollup(
         self,
@@ -1345,7 +1531,6 @@ class Compactor:
                     ),
                 ),
             ],
-            temperature=0.0,
             max_output_tokens=COMPACTOR_WORKSPACE_ROLLUP_MAX_OUTPUT_TOKENS,
             response_schema=_WorkspaceRollupResponse.model_json_schema(),
             metadata={
@@ -1368,6 +1553,62 @@ class Compactor:
         user_id: str,
         chunk_rows: list[dict[str, Any]],
     ) -> list[tuple[str, list[dict[str, Any]]]]:
+        return await self._synthesize_episode_chunks_with_output_limit_split(
+            user_id=user_id,
+            chunk_rows=chunk_rows,
+        )
+
+    async def _synthesize_episode_chunks_with_output_limit_split(
+        self,
+        *,
+        user_id: str,
+        chunk_rows: list[dict[str, Any]],
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
+        try:
+            return await self._synthesize_episode_chunk_window(
+                user_id=user_id,
+                chunk_rows=chunk_rows,
+            )
+        except OutputLimitExceededError:
+            if len(chunk_rows) <= COMPACTOR_EPISODE_SYNTHESIS_MIN_SPLIT_CHUNKS:
+                logger.warning(
+                    "episode_synthesis_output_limit_single_chunk_fallback user_id=%s chunk_count=%s",
+                    user_id,
+                    len(chunk_rows),
+                    extra={
+                        "user_id": user_id,
+                        "chunk_count": len(chunk_rows),
+                    },
+                )
+                return self._episode_groups_from_chunk_fallback(chunk_rows)
+            split_index = max(1, len(chunk_rows) // 2)
+            logger.warning(
+                "episode_synthesis_output_limit_split user_id=%s chunk_count=%s split_index=%s",
+                user_id,
+                len(chunk_rows),
+                split_index,
+                extra={
+                    "user_id": user_id,
+                    "chunk_count": len(chunk_rows),
+                    "split_index": split_index,
+                },
+            )
+            left_groups = await self._synthesize_episode_chunks_with_output_limit_split(
+                user_id=user_id,
+                chunk_rows=chunk_rows[:split_index],
+            )
+            right_groups = await self._synthesize_episode_chunks_with_output_limit_split(
+                user_id=user_id,
+                chunk_rows=chunk_rows[split_index:],
+            )
+            return [*left_groups, *right_groups]
+
+    async def _synthesize_episode_chunk_window(
+        self,
+        *,
+        user_id: str,
+        chunk_rows: list[dict[str, Any]],
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
         request = LLMCompletionRequest(
             model=self._scoring_model,
             messages=[
@@ -1385,11 +1626,11 @@ class Compactor:
                         absolute_time_instruction=_ABSOLUTE_TIME_INSTRUCTION,
                         privacy_level_instruction=_PRIVACY_LEVEL_INSTRUCTION,
                         data_only_instruction=_DATA_ONLY_INSTRUCTION,
+                        max_episode_count=self._episode_synthesis_max_episodes,
                         conversation_chunks_xml=self._episode_source_chunks_xml(chunk_rows),
                     ),
                 ),
             ],
-            temperature=0.0,
             max_output_tokens=COMPACTOR_EPISODE_SYNTHESIS_MAX_OUTPUT_TOKENS,
             response_schema=_EpisodeSynthesisResponse.model_json_schema(),
             metadata={
@@ -1397,6 +1638,7 @@ class Compactor:
                 "conversation_id": None,
                 "assistant_mode_id": None,
                 "purpose": "episode_synthesis",
+                "chunk_count": len(chunk_rows),
                 **self._intimacy_metadata_from_rows(
                     chunk_rows,
                     reason="summary_source_intimacy_boundary",
@@ -1406,9 +1648,56 @@ class Compactor:
         response = await self._complete_structured_with_validation_retry(
             request=request,
             schema=_EpisodeSynthesisResponse,
-            validator=lambda result: self._episode_groups_from_assignments(result, chunk_rows),
+            validator=lambda result: self._validated_episode_groups_from_assignments(
+                result,
+                chunk_rows,
+            ),
         )
+        return self._validated_episode_groups_from_assignments(response, chunk_rows)
+
+    def _validated_episode_groups_from_assignments(
+        self,
+        response: _EpisodeSynthesisResponse,
+        chunk_rows: list[dict[str, Any]],
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
+        if len(response.episodes) > self._episode_synthesis_max_episodes:
+            raise ValueError(
+                "Episode synthesis returned "
+                f"{len(response.episodes)} episodes, exceeding configured cap "
+                f"{self._episode_synthesis_max_episodes}"
+            )
         return self._episode_groups_from_assignments(response, chunk_rows)
+
+    @staticmethod
+    def _episode_synthesis_fingerprint(chunk_rows: list[dict[str, Any]]) -> str:
+        fingerprint_input = [
+            {
+                "id": str(row.get("id") or ""),
+                "summary_text": str(row.get("summary_text") or ""),
+            }
+            for row in sorted(chunk_rows, key=lambda item: str(item.get("id") or ""))
+        ]
+        return hashlib.sha256(
+            json.dumps(
+                fingerprint_input,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _episode_groups_from_chunk_fallback(
+        chunk_rows: list[dict[str, Any]],
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
+        groups: list[tuple[str, list[dict[str, Any]]]] = []
+        for row in chunk_rows:
+            summary_text = str(row.get("summary_text") or "").strip()
+            if not summary_text:
+                raise ValueError("Episode synthesis fallback found empty chunk summary_text")
+            groups.append((summary_text, [row]))
+        if not groups:
+            raise ValueError("Episode synthesis fallback received no chunks")
+        return groups
 
     async def _synthesize_thematic_profiles(
         self,
@@ -1440,7 +1729,6 @@ class Compactor:
                     ),
                 ),
             ],
-            temperature=0.0,
             max_output_tokens=COMPACTOR_THEMATIC_PROFILE_MAX_OUTPUT_TOKENS,
             response_schema=_ThematicProfileResponse.model_json_schema(),
             metadata={
@@ -1582,17 +1870,15 @@ class Compactor:
             key=lambda episode: (int(episode.start_seq), int(episode.end_seq)),
         )
 
-        previous_end: int | None = None
         for episode in episodes:
             start_seq = int(episode.start_seq)
             end_seq = int(episode.end_seq)
             if start_seq > end_seq or start_seq < min_seq or end_seq > max_seq:
                 return response
-            if previous_end is not None and start_seq <= previous_end:
-                return response
-            previous_end = end_seq
 
         repaired_episodes: list[_SegmentedEpisode] = []
+        repaired_overlap = False
+        repaired_gap = False
         for index, episode in enumerate(episodes):
             start_seq = int(episode.start_seq)
             end_seq = int(episode.end_seq)
@@ -1600,17 +1886,23 @@ class Compactor:
                 start_seq = min_seq
             else:
                 previous_episode = repaired_episodes[-1]
-                missing_before_current = [
-                    seq
-                    for seq in requested_seqs
-                    if int(previous_episode.end_seq) < seq < start_seq
-                ]
-                if missing_before_current:
+                previous_start = int(previous_episode.start_seq)
+                previous_end = int(previous_episode.end_seq)
+                if start_seq <= previous_end:
+                    overlap_boundary = (start_seq + previous_end) // 2
+                    repaired_previous_end = max(previous_start, overlap_boundary)
                     repaired_episodes[-1] = previous_episode.model_copy(
-                        update={"end_seq": missing_before_current[-1]}
+                        update={"end_seq": repaired_previous_end}
                     )
-            if index == len(episodes) - 1:
-                end_seq = max_seq
+                    start_seq = repaired_previous_end + 1
+                    repaired_overlap = True
+                    if start_seq > end_seq:
+                        continue
+                elif previous_end + 1 < start_seq:
+                    repaired_episodes[-1] = previous_episode.model_copy(
+                        update={"end_seq": start_seq - 1}
+                    )
+                    repaired_gap = True
             repaired_episodes.append(
                 episode.model_copy(
                     update={
@@ -1619,6 +1911,10 @@ class Compactor:
                     }
                 )
             )
+        if repaired_episodes:
+            repaired_episodes[-1] = repaired_episodes[-1].model_copy(
+                update={"end_seq": max_seq}
+            )
 
         repaired_response = response.model_copy(update={"episodes": repaired_episodes})
         try:
@@ -1626,12 +1922,16 @@ class Compactor:
         except ValueError:
             return response
         logger.warning(
-            "conversation_segmentation_gap_coverage_repaired original_episode_count=%s repaired_episode_count=%s",
+            "conversation_segmentation_ranges_repaired original_episode_count=%s repaired_episode_count=%s repaired_gap=%s repaired_overlap=%s",
             len(response.episodes),
             len(repaired_response.episodes),
+            repaired_gap,
+            repaired_overlap,
             extra={
                 "original_episode_count": len(response.episodes),
                 "repaired_episode_count": len(repaired_response.episodes),
+                "repaired_gap": repaired_gap,
+                "repaired_overlap": repaired_overlap,
             },
         )
         return repaired_response
@@ -2077,8 +2377,6 @@ class Compactor:
     ) -> list[tuple[str, list[dict[str, Any]]]]:
         if not response.episodes:
             raise ValueError("Episode synthesis returned no episodes")
-        if len(response.chunk_episode_keys) != len(chunk_rows):
-            raise ValueError("Episode synthesis must assign one episode key per conversation chunk")
 
         episode_text_by_key: dict[str, str] = {}
         for episode in response.episodes:
@@ -2092,11 +2390,25 @@ class Compactor:
                 raise ValueError("Episode synthesis returned duplicate episode_key")
             episode_text_by_key[episode_key] = summary_text
 
+        chunk_episode_keys = [
+            str(episode_key).strip() for episode_key in response.chunk_episode_keys
+        ]
+        if len(chunk_episode_keys) != len(chunk_rows):
+            logger.warning(
+                "episode_synthesis_assignment_count_repaired expected=%s actual=%s",
+                len(chunk_rows),
+                len(chunk_episode_keys),
+            )
+            chunk_episode_keys = Compactor._repair_episode_assignment_count(
+                chunk_episode_keys,
+                episode_keys=list(episode_text_by_key),
+                expected_count=len(chunk_rows),
+            )
+
         chunks_by_episode_key: dict[str, list[dict[str, Any]]] = {
             episode_key: [] for episode_key in episode_text_by_key
         }
-        for chunk_row, episode_key_value in zip(chunk_rows, response.chunk_episode_keys, strict=True):
-            episode_key = str(episode_key_value).strip()
+        for chunk_row, episode_key in zip(chunk_rows, chunk_episode_keys, strict=True):
             if not episode_key:
                 raise ValueError("Episode synthesis returned empty chunk episode key")
             if episode_key not in chunks_by_episode_key:
@@ -2110,6 +2422,24 @@ class Compactor:
                 raise ValueError(f"Episode synthesis returned unused episode_key: {episode_key}")
             episode_groups.append((summary_text, source_chunks))
         return episode_groups
+
+    @staticmethod
+    def _repair_episode_assignment_count(
+        chunk_episode_keys: list[str],
+        *,
+        episode_keys: list[str],
+        expected_count: int,
+    ) -> list[str]:
+        if expected_count <= 0:
+            return []
+        if not episode_keys:
+            return chunk_episode_keys
+        repaired = chunk_episode_keys[:expected_count]
+        if len(repaired) >= expected_count:
+            return repaired
+        fallback_key = next((key for key in reversed(repaired) if key in episode_keys), episode_keys[0])
+        repaired.extend([fallback_key] * (expected_count - len(repaired)))
+        return repaired
 
     @classmethod
     def _validated_thematic_profile_source_ids(
@@ -2761,6 +3091,21 @@ class Compactor:
             return f"{kind_label}: {summary_text.strip()} Constraints: {constraints}".strip()
         return f"{kind_label}: {summary_text.strip()}".strip()
 
+    @staticmethod
+    def _summary_language_codes(source_rows: list[dict[str, Any]]) -> list[str] | None:
+        codes: set[str] = set()
+        for row in source_rows:
+            raw_codes = row.get("language_codes_json")
+            if not isinstance(raw_codes, list):
+                continue
+            for code in raw_codes:
+                normalized = str(code).strip().lower()
+                if normalized:
+                    codes.add(normalized)
+        if not codes:
+            return None
+        return sorted(codes)
+
     @classmethod
     def _summary_mirror_payload(
         cls,
@@ -2822,6 +3167,7 @@ class Compactor:
         privacy_level: int,
         intimacy_boundary: IntimacyBoundary,
         intimacy_boundary_confidence: float,
+        language_codes: list[str] | None,
     ) -> bool:
         if existing_mirror is None:
             return False
@@ -2834,6 +3180,10 @@ class Compactor:
         payload_source_message_ids = payload_json.get("source_message_ids") or []
         if not isinstance(payload_source_message_ids, list):
             return False
+        existing_language_codes = existing_mirror.get("language_codes_json")
+        if not isinstance(existing_language_codes, list):
+            existing_language_codes = []
+        expected_language_codes = list(language_codes or [])
         return (
             str(existing_mirror.get("canonical_text", "")).strip() == summary_text
             and cls._unique_strings([str(item) for item in payload_source_ids if str(item).strip()])
@@ -2847,6 +3197,8 @@ class Compactor:
             == intimacy_boundary.value
             and float(existing_mirror.get("intimacy_boundary_confidence") or 0.0)
             == float(intimacy_boundary_confidence)
+            and sorted(str(code) for code in existing_language_codes)
+            == sorted(str(code) for code in expected_language_codes)
         )
 
     @classmethod

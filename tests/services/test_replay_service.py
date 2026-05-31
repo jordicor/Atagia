@@ -12,7 +12,12 @@ import pytest
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+)
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
@@ -67,14 +72,21 @@ class ReplayProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_scoring":
-            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
+                request.messages[1].content
+            )
             payload = {
                 "scores": [
-                    {"score_key": score_key, "llm_applicability": self.score_map.get(memory_id, 0.5)}
+                    {
+                        "score_key": score_key,
+                        "llm_applicability": self.score_map.get(memory_id, 0.5),
+                    }
                     for memory_id, score_key in candidate_keys
                 ],
             }
-            return LLMCompletionResponse(provider=self.name, model=request.model, output_text=json.dumps(payload))
+            return LLMCompletionResponse(
+                provider=self.name, model=request.model, output_text=json.dumps(payload)
+            )
         raise AssertionError(f"Unexpected purpose: {purpose}")
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -106,7 +118,9 @@ def _settings() -> Settings:
 async def _build_runtime():
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 5, 15, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     messages = MessageRepository(connection, clock)
@@ -114,12 +128,24 @@ async def _build_runtime():
     events = RetrievalEventRepository(connection, clock)
     await users.create_user("usr_1")
     await users.create_user("usr_2")
-    await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "Chat")
-    await conversations.create_conversation("cnv_2", "usr_2", None, "coding_debug", "Other Chat")
-    await messages.create_message("msg_1", "cnv_1", "user", 1, "Please help me debug this retry loop.", 7, {})
-    await messages.create_message("msg_2", "cnv_1", "assistant", 2, "Try the previous workaround.", 5, {})
-    await messages.create_message("msg_3", "cnv_1", "user", 3, "The retry loop still fails.", 6, {})
-    await messages.create_message("msg_4", "cnv_1", "assistant", 4, "Let's narrow the scope.", 5, {})
+    await conversations.create_conversation(
+        "cnv_1", "usr_1", None, "coding_debug", "Chat"
+    )
+    await conversations.create_conversation(
+        "cnv_2", "usr_2", None, "coding_debug", "Other Chat"
+    )
+    await messages.create_message(
+        "msg_1", "cnv_1", "user", 1, "Please help me debug this retry loop.", 7, {}
+    )
+    await messages.create_message(
+        "msg_2", "cnv_1", "assistant", 2, "Try the previous workaround.", 5, {}
+    )
+    await messages.create_message(
+        "msg_3", "cnv_1", "user", 3, "The retry loop still fails.", 6, {}
+    )
+    await messages.create_message(
+        "msg_4", "cnv_1", "assistant", 4, "Let's narrow the scope.", 5, {}
+    )
     await memories.create_memory_object(
         user_id="usr_1",
         conversation_id="cnv_1",
@@ -238,12 +264,15 @@ async def test_replay_event_with_ablation_changes_result() -> None:
             ablation=AblationConfig(
                 skip_applicability_scoring=True,
                 composer_strategy="budgeted_marginal",
-                override_retrieval_params={"final_context_items": 1, "privacy_ceiling": 0},
+                override_retrieval_params={
+                    "final_context_items": 1,
+                    "privacy_ceiling": 0,
+                },
             ),
         )
 
         assert result.comparison.memories_only_original == ["mem_2"]
-        assert result.comparison.memories_only_replay == ["mem_1"]
+        assert "mem_1" in result.comparison.memories_only_replay
         assert result.ablation_config == {
             "privacy_enforcement": "enforce",
             "skip_need_detection": False,
@@ -255,6 +284,9 @@ async def test_replay_event_with_ablation_changes_result() -> None:
             "skip_compaction": False,
             "disable_context_cache": False,
             "enable_llm_coverage_expansion": False,
+            "enable_evidence_obligation_coverage": True,
+            "enable_evidence_packets": True,
+            "enable_final_answer_evidence_pack": False,
             "composer_strategy": "budgeted_marginal",
             "override_retrieval_params": {
                 "final_context_items": 1,

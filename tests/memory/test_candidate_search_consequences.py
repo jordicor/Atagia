@@ -148,7 +148,6 @@ def _plan(
         retrieval_levels=[0],
         consequence_search_enabled=consequence_search_enabled,
         require_evidence_regrounding=False,
-        need_driven_boosts={} if need_type is None else {need_type: 1.0},
         skip_retrieval=False,
     )
 

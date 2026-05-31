@@ -12,6 +12,8 @@ class ModelProfile:
 
     thinking_level_map: dict[str, str | int | None] = field(default_factory=dict)
     default_thinking_level: str | None = None
+    temperature_default: float | None = None
+    temperature_floor: float | None = None
     extra_body: dict[str, Any] | None = None
     extra_kwargs: dict[str, Any] | None = None
 
@@ -79,6 +81,7 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
             "high": "HIGH",
         },
         default_thinking_level="minimal",
+        temperature_floor=1.0,
     ),
     "google/gemini-3.1-flash-lite": ModelProfile(
         thinking_level_map={
@@ -89,6 +92,7 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
             "high": "HIGH",
         },
         default_thinking_level="minimal",
+        temperature_floor=1.0,
     ),
     "openrouter/google/gemini-3.1-flash-lite": ModelProfile(
         thinking_level_map={
@@ -100,6 +104,7 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
             "xhigh": "high",
         },
         default_thinking_level="minimal",
+        temperature_floor=1.0,
         extra_body={"reasoning": {}},
     ),
     "openrouter/deepseek/deepseek-v4-flash": ModelProfile(
@@ -125,6 +130,27 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         },
         default_thinking_level="none",
         extra_body={"reasoning": {}},
+    ),
+    "openai/qwen3-coder:30b": ModelProfile(
+        temperature_default=0.7,
+        extra_body={"top_p": 0.8, "top_k": 20},
+    ),
+    "openai/qwen3-coder-30b-a3b-instruct": ModelProfile(
+        temperature_default=0.7,
+        extra_body={"top_p": 0.8, "top_k": 20},
+    ),
+    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": ModelProfile(
+        temperature_default=0.7,
+        extra_body={"top_p": 0.8, "top_k": 20},
+        extra_kwargs={"openrouter_native_structured_output": True},
+    ),
+    "openrouter/qwen/qwen3-coder-next": ModelProfile(
+        temperature_default=0.7,
+        extra_body={"top_p": 0.8, "top_k": 20},
+        extra_kwargs={"openrouter_native_structured_output": True},
+    ),
+    "openrouter/mistralai/mistral-small-3.2-24b-instruct": ModelProfile(
+        extra_kwargs={"openrouter_native_structured_output": True},
     ),
     "openrouter/z-ai/glm-4.6": ModelProfile(),
     "openrouter/x-ai/grok-4.1-fast": ModelProfile(),

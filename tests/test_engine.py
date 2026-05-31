@@ -16,11 +16,21 @@ from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
+    MemoryRetrievalSurfaceRepository,
     MessageRepository,
     UserRepository,
     WorkspaceRepository,
 )
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
+from atagia.memory.candidate_search import CandidateSearch
+from atagia.models.schemas_memory import (
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    MemoryStatus,
+    PlannedSubQuery,
+    RetrievalPlan,
+)
+from atagia.models.schemas_replay import AblationConfig
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.chat_support import default_operational_profile_snapshot
 from atagia.services.errors import MessageIdConflictError, SourceSequenceConflictError
@@ -37,6 +47,33 @@ from atagia.services.llm_client import (
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
+
+
+def _persisted_surface_exact_plan(
+    fts_query: str,
+    *,
+    conversation_id: str,
+) -> RetrievalPlan:
+    return RetrievalPlan(
+        original_query=fts_query,
+        assistant_mode_id="coding_debug",
+        conversation_id=conversation_id,
+        sub_query_plans=[
+            PlannedSubQuery(
+                text=fts_query,
+                fts_queries=[fts_query],
+                fts_query_kinds=["surface_probe"],
+            )
+        ],
+        scope_filter=[MemoryScope.CONVERSATION],
+        status_filter=[MemoryStatus.ACTIVE],
+        query_type="default",
+        max_candidates=10,
+        max_context_items=5,
+        privacy_ceiling=1,
+        retrieval_levels=[0],
+        exact_recall_mode=True,
+    )
 
 
 class EngineProvider(LLMProvider):
@@ -69,7 +106,9 @@ class EngineProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_scoring":
-            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
+                request.messages[1].content
+            )
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
@@ -152,7 +191,9 @@ class EngineProvider(LLMProvider):
         raise AssertionError(f"Unexpected LLM purpose: {purpose}")
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        raise AssertionError(f"Embeddings are not used in engine tests: {request.model}")
+        raise AssertionError(
+            f"Embeddings are not used in engine tests: {request.model}"
+        )
 
 
 class FailingEngineProvider(EngineProvider):
@@ -189,6 +230,63 @@ def test_engine_build_settings_preserves_llm_debug_io_env(
     assert settings.llm_debug_io_purposes == ("applicability_scoring",)
     assert settings.llm_debug_io_raw is True
     assert settings.llm_debug_io_max_chars == 12345
+
+
+def test_engine_build_settings_preserves_answer_postcondition_guard_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ATAGIA_ANSWER_POSTCONDITION_GUARD_ENABLED", "true")
+    engine = Atagia(db_path=tmp_path / "guard-settings.db")
+
+    settings = engine._build_settings()
+
+    assert settings.answer_postcondition_guard_enabled is True
+
+
+def test_engine_build_settings_allows_explicit_answer_postcondition_guard_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ATAGIA_ANSWER_POSTCONDITION_GUARD_ENABLED", "false")
+    engine = Atagia(
+        db_path=tmp_path / "guard-settings.db",
+        answer_postcondition_guard_enabled=True,
+    )
+
+    settings = engine._build_settings()
+
+    assert settings.answer_postcondition_guard_enabled is True
+
+
+def test_engine_build_settings_allows_explicit_answer_stance_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ATAGIA_ANSWER_STANCE", "reactive")
+    engine = Atagia(
+        db_path=tmp_path / "answer-stance-settings.db",
+        answer_stance="proactive",
+    )
+
+    settings = engine._build_settings()
+
+    assert settings.answer_stance == "proactive"
+
+
+def test_engine_build_settings_allows_explicit_answer_stance_prompt_variant_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ATAGIA_ANSWER_STANCE_PROMPT_VARIANT", "template_v1")
+    engine = Atagia(
+        db_path=tmp_path / "answer-stance-variant-settings.db",
+        answer_stance_prompt_variant="baseline",
+    )
+
+    settings = engine._build_settings()
+
+    assert settings.answer_stance_prompt_variant == "baseline"
 
 
 def test_engine_build_settings_preserves_memory_bm25_env(
@@ -247,6 +345,36 @@ def test_engine_build_settings_preserves_topic_working_set_env(
     assert settings.topic_working_set_refresh_batch_messages == 5
 
 
+def test_engine_build_settings_preserves_evidence_route_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ATAGIA_RETRIEVAL_PACKETS_DRY_RUN_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_RETRIEVAL_PACKETS_WRITE_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_FACT_FACET_SURFACES_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_FACT_FACET_RETRIEVAL_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_FACT_FACET_STRUCTURED_ONLY", "true")
+    monkeypatch.setenv("ATAGIA_FACT_FACET_SPAN_COADMISSION_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_FACT_FACET_RETRIEVAL_LIMIT", "7")
+    monkeypatch.setenv("ATAGIA_FACT_FACET_RETRIEVAL_RRF_WEIGHT", "1.4")
+    monkeypatch.setenv("ATAGIA_APPLICABILITY_GATE_MODE", "shadow")
+    monkeypatch.setenv("ATAGIA_ANSWER_POSTCONDITION_RETRY_MAX_OUTPUT_TOKENS", "12288")
+    engine = Atagia(db_path=tmp_path / "evidence-route-settings.db")
+
+    settings = engine._build_settings()
+
+    assert settings.retrieval_packets_dry_run_enabled is True
+    assert settings.retrieval_packets_write_enabled is True
+    assert settings.fact_facet_surfaces_enabled is True
+    assert settings.fact_facet_retrieval_enabled is True
+    assert settings.fact_facet_structured_only is True
+    assert settings.fact_facet_span_coadmission_enabled is True
+    assert settings.fact_facet_retrieval_limit == 7
+    assert settings.fact_facet_retrieval_rrf_weight == 1.4
+    assert settings.applicability_gate_mode == "shadow"
+    assert settings.answer_postcondition_retry_max_output_tokens == 12288
+
+
 def test_engine_build_settings_allows_explicit_embedding_backend_override(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -279,7 +407,9 @@ def test_engine_build_settings_resolves_resource_env_from_external_cwd(
     assert settings.operational_profiles_dir().exists()
 
 
-def _install_stub_client(monkeypatch: pytest.MonkeyPatch, provider: EngineProvider) -> None:
+def _install_stub_client(
+    monkeypatch: pytest.MonkeyPatch, provider: EngineProvider
+) -> None:
     monkeypatch.setattr(
         "atagia.app.build_llm_client",
         lambda _settings: LLMClient(provider_name=provider.name, providers=[provider]),
@@ -303,7 +433,11 @@ def _normal_operational_profile_token(engine: Atagia) -> str:
 async def test_engine_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     assert engine.runtime is not None
@@ -319,7 +453,11 @@ async def test_engine_setup_respects_env_context_cache_toggle(
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
     monkeypatch.setenv("ATAGIA_CONTEXT_CACHE_ENABLED", "false")
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
@@ -336,7 +474,11 @@ async def test_engine_setup_respects_env_graph_projection_toggle(
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
     monkeypatch.setenv("ATAGIA_GRAPH_PROJECTION_ENABLED", "true")
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
@@ -372,7 +514,11 @@ async def test_engine_setup_respects_chunking_disable_override(
 async def test_engine_create_entities(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
@@ -393,7 +539,10 @@ async def test_engine_create_entities(monkeypatch: pytest.MonkeyPatch) -> None:
             conversations = ConversationRepository(connection, engine.runtime.clock)
             assert await users.get_user("usr_1") is not None
             assert await workspaces.get_workspace("wrk_1", "usr_1") is not None
-            assert await conversations.get_conversation(conversation_id, "usr_1") is not None
+            assert (
+                await conversations.get_conversation(conversation_id, "usr_1")
+                is not None
+            )
         finally:
             await connection.close()
     finally:
@@ -404,7 +553,11 @@ async def test_engine_create_entities(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_engine_lifecycle_methods(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
@@ -420,7 +573,9 @@ async def test_engine_lifecycle_methods(monkeypatch: pytest.MonkeyPatch) -> None
         closed = await engine.close_conversation("usr_1", "cnv_close")
         assert closed["status"] == "closed"
 
-        await engine.create_conversation("usr_1", "cnv_memory", assistant_mode_id="coding_debug")
+        await engine.create_conversation(
+            "usr_1", "cnv_memory", assistant_mode_id="coding_debug"
+        )
         connection = await engine.runtime.open_connection()
         try:
             memories = MemoryObjectRepository(connection, engine.runtime.clock)
@@ -436,13 +591,66 @@ async def test_engine_lifecycle_methods(monkeypatch: pytest.MonkeyPatch) -> None
                 privacy_level=0,
                 memory_id="mem_lifecycle",
             )
+            surfaces = MemoryRetrievalSurfaceRepository(
+                connection, engine.runtime.clock
+            )
+            await surfaces.upsert_surface(
+                user_id="usr_1",
+                memory_id="mem_lifecycle",
+                surface_type="alias",
+                surface_text="lifecycle surface",
+            )
         finally:
             await connection.close()
 
-        edited = await engine.edit_memory("usr_1", "mem_lifecycle", "Updated lifecycle memory.")
+        edited = await engine.edit_memory(
+            "usr_1", "mem_lifecycle", "Updated lifecycle memory."
+        )
         assert edited["canonical_text"] == "Updated lifecycle memory."
-        memory_report = await engine.delete_memory("usr_1", "mem_lifecycle", hard=True, confirmation="HARD_DELETE_MEMORY")
+        connection = await engine.runtime.open_connection()
+        try:
+            surfaces = MemoryRetrievalSurfaceRepository(
+                connection, engine.runtime.clock
+            )
+            surface_rows = await surfaces.list_surfaces_for_memory(
+                user_id="usr_1",
+                memory_id="mem_lifecycle",
+            )
+            assert [row["status"] for row in surface_rows] == ["stale"]
+            assert (
+                await surfaces.search_active_surfaces(
+                    user_id="usr_1",
+                    fts_query="lifecycle",
+                )
+                == []
+            )
+        finally:
+            await connection.close()
+        memory_report = await engine.delete_memory(
+            "usr_1", "mem_lifecycle", hard=True, confirmation="HARD_DELETE_MEMORY"
+        )
         assert memory_report.deleted_memories == 1
+        connection = await engine.runtime.open_connection()
+        try:
+            surfaces = MemoryRetrievalSurfaceRepository(
+                connection, engine.runtime.clock
+            )
+            assert (
+                await surfaces.list_surfaces_for_memory(
+                    user_id="usr_1",
+                    memory_id="mem_lifecycle",
+                )
+                == []
+            )
+            assert (
+                await surfaces.search_active_surfaces(
+                    user_id="usr_1",
+                    fts_query="lifecycle",
+                )
+                == []
+            )
+        finally:
+            await connection.close()
 
         conversation_report = await engine.delete_conversation(
             "usr_1",
@@ -451,9 +659,276 @@ async def test_engine_lifecycle_methods(monkeypatch: pytest.MonkeyPatch) -> None
         )
         assert conversation_report.conversation_id == "cnv_memory"
 
-        await engine.create_conversation("usr_1", "cnv_erase", assistant_mode_id="coding_debug")
-        erase_report = await engine.erase_user_data("usr_1", confirmation="ERASE_ALL_DATA")
+        await engine.create_conversation(
+            "usr_1", "cnv_erase", assistant_mode_id="coding_debug"
+        )
+        erase_report = await engine.erase_user_data(
+            "usr_1", confirmation="ERASE_ALL_DATA"
+        )
         assert erase_report.deleted_conversations == 3
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_conversation_delete_tombstones_retrieval_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_surface_delete",
+            assistant_mode_id="coding_debug",
+        )
+        connection = await engine.runtime.open_connection()
+        try:
+            memories = MemoryObjectRepository(connection, engine.runtime.clock)
+            surfaces = MemoryRetrievalSurfaceRepository(
+                connection, engine.runtime.clock
+            )
+            await memories.create_memory_object(
+                user_id="usr_1",
+                conversation_id="cnv_surface_delete",
+                assistant_mode_id="coding_debug",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.CONVERSATION,
+                canonical_text="Conversation memory whose derived surface should be tombstoned.",
+                source_kind=MemorySourceKind.EXTRACTED,
+                confidence=0.9,
+                privacy_level=0,
+                memory_id="mem_conversation_surface",
+            )
+            await surfaces.upsert_surface(
+                user_id="usr_1",
+                memory_id="mem_conversation_surface",
+                surface_type="alias",
+                surface_text="conversationtombsurface",
+            )
+        finally:
+            await connection.close()
+
+        report = await engine.delete_conversation(
+            "usr_1",
+            "cnv_surface_delete",
+            confirmation="DELETE_CONVERSATION",
+        )
+        assert report.deleted_memories == 1
+
+        connection = await engine.runtime.open_connection()
+        try:
+            memories = MemoryObjectRepository(connection, engine.runtime.clock)
+            surfaces = MemoryRetrievalSurfaceRepository(
+                connection, engine.runtime.clock
+            )
+            memory = await memories.get_memory_object(
+                "mem_conversation_surface", "usr_1"
+            )
+            assert memory is not None
+            assert memory["status"] == MemoryStatus.DELETED.value
+            assert memory["archived_by_conversation_id"] == "cnv_surface_delete"
+
+            surface_rows = await surfaces.list_surfaces_for_memory(
+                user_id="usr_1",
+                memory_id="mem_conversation_surface",
+            )
+            assert [row["status"] for row in surface_rows] == ["deleted"]
+            assert (
+                await surfaces.search_active_surfaces(
+                    user_id="usr_1",
+                    fts_query="conversationtombsurface",
+                )
+                == []
+            )
+
+            search = CandidateSearch(connection, engine.runtime.clock)
+            candidates = await search.search(
+                _persisted_surface_exact_plan(
+                    "conversationtombsurface",
+                    conversation_id="cnv_surface_delete",
+                ),
+                user_id="usr_1",
+                fts_query_audit=[],
+            )
+            assert candidates == []
+
+            cursor = await connection.execute(
+                """
+                SELECT mrs.id
+                FROM memory_retrieval_surfaces_fts
+                JOIN memory_retrieval_surfaces AS mrs
+                  ON mrs._rowid = memory_retrieval_surfaces_fts.rowid
+                JOIN memory_objects AS mo
+                  ON mo.id = mrs.memory_id
+                WHERE memory_retrieval_surfaces_fts MATCH ?
+                  AND mrs.user_id = ?
+                  AND mo.user_id = ?
+                  AND mrs.status = 'active'
+                  AND mo.status = ?
+                """,
+                (
+                    "conversationtombsurface",
+                    "usr_1",
+                    "usr_1",
+                    MemoryStatus.ACTIVE.value,
+                ),
+            )
+            assert await cursor.fetchall() == []
+        finally:
+            await connection.close()
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_user_erasure_deletes_retrieval_surfaces_and_fts_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_surface_erase")
+        await engine.create_conversation(
+            "usr_surface_erase",
+            "cnv_surface_erase",
+            assistant_mode_id="coding_debug",
+        )
+        connection = await engine.runtime.open_connection()
+        try:
+            memories = MemoryObjectRepository(connection, engine.runtime.clock)
+            surfaces = MemoryRetrievalSurfaceRepository(
+                connection, engine.runtime.clock
+            )
+            await memories.create_memory_object(
+                user_id="usr_surface_erase",
+                conversation_id="cnv_surface_erase",
+                assistant_mode_id="coding_debug",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.CONVERSATION,
+                canonical_text="User erasure should remove derived retrieval surfaces.",
+                source_kind=MemorySourceKind.EXTRACTED,
+                confidence=0.9,
+                privacy_level=0,
+                memory_id="mem_user_surface_erase",
+            )
+            await surfaces.upsert_surface(
+                user_id="usr_surface_erase",
+                memory_id="mem_user_surface_erase",
+                surface_type="alias",
+                surface_text="usererasuresurface",
+            )
+
+            before_candidates = await CandidateSearch(
+                connection, engine.runtime.clock
+            ).search(
+                _persisted_surface_exact_plan(
+                    "usererasuresurface",
+                    conversation_id="cnv_surface_erase",
+                ),
+                user_id="usr_surface_erase",
+                fts_query_audit=[],
+            )
+            assert [candidate["id"] for candidate in before_candidates] == [
+                "mem_user_surface_erase"
+            ]
+        finally:
+            await connection.close()
+
+        erase_report = await engine.erase_user_data(
+            "usr_surface_erase",
+            confirmation="ERASE_ALL_DATA",
+        )
+        assert erase_report.deleted_memories == 1
+
+        connection = await engine.runtime.open_connection()
+        try:
+            memories = MemoryObjectRepository(connection, engine.runtime.clock)
+            surfaces = MemoryRetrievalSurfaceRepository(
+                connection, engine.runtime.clock
+            )
+            assert (
+                await memories.get_memory_object(
+                    "mem_user_surface_erase",
+                    "usr_surface_erase",
+                )
+                is None
+            )
+            assert (
+                await surfaces.list_surfaces_for_memory(
+                    user_id="usr_surface_erase",
+                    memory_id="mem_user_surface_erase",
+                )
+                == []
+            )
+            assert (
+                await surfaces.search_active_surfaces(
+                    user_id="usr_surface_erase",
+                    fts_query="usererasuresurface",
+                )
+                == []
+            )
+            assert (
+                await CandidateSearch(connection, engine.runtime.clock).search(
+                    _persisted_surface_exact_plan(
+                        "usererasuresurface",
+                        conversation_id="cnv_surface_erase",
+                    ),
+                    user_id="usr_surface_erase",
+                    fts_query_audit=[],
+                )
+                == []
+            )
+
+            cursor = await connection.execute(
+                """
+                SELECT mrs.id
+                FROM memory_retrieval_surfaces_fts
+                JOIN memory_retrieval_surfaces AS mrs
+                  ON mrs._rowid = memory_retrieval_surfaces_fts.rowid
+                JOIN memory_objects AS mo
+                  ON mo.id = mrs.memory_id
+                WHERE memory_retrieval_surfaces_fts MATCH ?
+                  AND mrs.user_id = ?
+                  AND mo.user_id = ?
+                  AND mrs.status = 'active'
+                  AND mo.status = ?
+                """,
+                (
+                    "usererasuresurface",
+                    "usr_surface_erase",
+                    "usr_surface_erase",
+                    MemoryStatus.ACTIVE.value,
+                ),
+            )
+            assert await cursor.fetchall() == []
+
+            cursor = await connection.execute(
+                """
+                SELECT rowid
+                FROM memory_retrieval_surfaces_fts
+                WHERE memory_retrieval_surfaces_fts MATCH ?
+                """,
+                ("usererasuresurface",),
+            )
+            assert await cursor.fetchall() == []
+        finally:
+            await connection.close()
     finally:
         await engine.close()
 
@@ -464,13 +939,19 @@ async def test_lifecycle_deletes_only_targeted_retrieval_events(
 ) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
         await engine.create_user("usr_1")
         for conversation_id in ("cnv_mem_1", "cnv_mem_2", "cnv_del_1", "cnv_del_2"):
-            await engine.create_conversation("usr_1", conversation_id, assistant_mode_id="coding_debug")
+            await engine.create_conversation(
+                "usr_1", conversation_id, assistant_mode_id="coding_debug"
+            )
 
         connection = await engine.runtime.open_connection()
         try:
@@ -483,7 +964,9 @@ async def test_lifecycle_deletes_only_targeted_retrieval_events(
                 ("cnv_del_1", "msg_del_1"),
                 ("cnv_del_2", "msg_del_2"),
             ):
-                await messages.create_message(message_id, conversation_id, "user", 1, "hello", 1, {})
+                await messages.create_message(
+                    message_id, conversation_id, "user", 1, "hello", 1, {}
+                )
             for conversation_id, memory_id, text in (
                 ("cnv_mem_1", "mem_target", "target memory"),
                 ("cnv_mem_2", "mem_other", "other memory"),
@@ -557,7 +1040,9 @@ async def test_lifecycle_deletes_only_targeted_retrieval_events(
             {"user_id": "usr_1", "conversation_id": "cnv_del_2"},
             ttl_seconds=60,
         )
-        assert await engine.runtime.storage_backend.get_context_view(cache_key) is not None
+        assert (
+            await engine.runtime.storage_backend.get_context_view(cache_key) is not None
+        )
         await engine.delete_conversation(
             "usr_1",
             "cnv_del_1",
@@ -582,7 +1067,12 @@ async def test_lifecycle_deletes_only_targeted_retrieval_events(
 async def test_engine_get_context(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+        answer_stance="proactive",
+    )
 
     await engine.setup()
     try:
@@ -603,16 +1093,22 @@ async def test_engine_get_context(monkeypatch: pytest.MonkeyPatch) -> None:
 
         assert isinstance(context.system_prompt, str)
         assert context.system_prompt
+        assert "Answer stance: proactive" in context.system_prompt
+        assert "related, not the same fact" in context.system_prompt
         assert context.request_message_id == "aurvek:msg:ctx-1"
         assert context.recent_transcript == []
         assert context.recent_transcript_trace is not None
         connection = await engine.runtime.open_connection()
         try:
             messages = MessageRepository(connection, engine.runtime.clock)
-            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
             assert stored_messages[-1]["role"] == "user"
             assert stored_messages[-1]["id"] == "aurvek:msg:ctx-1"
-            assert stored_messages[-1]["text"] == "Please help me debug this retry loop."
+            assert (
+                stored_messages[-1]["text"] == "Please help me debug this retry loop."
+            )
             assert stored_messages[-1]["occurred_at"] == "2023-05-08T13:56:00"
         finally:
             await connection.close()
@@ -629,8 +1125,12 @@ async def test_engine_get_context(monkeypatch: pytest.MonkeyPatch) -> None:
         connection = await engine.runtime.open_connection()
         try:
             messages = MessageRepository(connection, engine.runtime.clock)
-            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
-            assert [message["id"] for message in stored_messages] == ["aurvek:msg:ctx-1"]
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
+            assert [message["id"] for message in stored_messages] == [
+                "aurvek:msg:ctx-1"
+            ]
         finally:
             await connection.close()
     finally:
@@ -680,7 +1180,7 @@ async def test_engine_get_context_includes_recent_transcript_without_fts_overlap
 
 
 @pytest.mark.asyncio
-async def test_engine_get_context_uses_recent_transcript_budget_override(
+async def test_engine_get_context_keeps_recent_transcript_inside_context_envelope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = EngineProvider()
@@ -708,7 +1208,82 @@ async def test_engine_get_context_uses_recent_transcript_budget_override(
         )
 
         assert context.recent_transcript_trace is not None
-        assert context.recent_transcript_trace.budget_tokens == 30000
+        assert context.recent_transcript_trace.budget_tokens == 819
+        assert context.context_envelope_trace is not None
+        assert context.context_envelope_trace["total_budget_tokens"] == 4_096
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_get_context_uses_constructor_context_envelope_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+        context_envelope_budget_tokens=10_000,
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+        )
+
+        context = await engine.get_context(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message="What did we decide?",
+        )
+
+        assert context.recent_transcript_trace is not None
+        assert context.recent_transcript_trace.budget_tokens == 2_000
+        assert context.context_envelope_trace is not None
+        assert context.context_envelope_trace["total_budget_tokens"] == 10_000
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_get_context_uses_context_envelope_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("usr_1")
+        await engine.create_conversation(
+            "usr_1",
+            "cnv_1",
+            assistant_mode_id="coding_debug",
+        )
+
+        context = await engine.get_context(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message="What did we decide?",
+            ablation=AblationConfig(context_envelope_budget_tokens=10_000),
+        )
+
+        assert context.recent_transcript_trace is not None
+        assert context.recent_transcript_trace.budget_tokens == 2_000
+        assert context.context_envelope_trace is not None
+        assert context.context_envelope_trace["total_budget_tokens"] == 10_000
+        assert context.context_envelope_trace["reserve_tokens"] == 0
     finally:
         await engine.close()
 
@@ -803,7 +1378,9 @@ async def test_engine_add_response(
         connection = await engine.runtime.open_connection()
         try:
             messages = MessageRepository(connection, engine.runtime.clock)
-            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
             assert stored_messages[-1]["role"] == "assistant"
             assert stored_messages[-1]["id"] == "aurvek:msg:assistant-1"
             assert stored_messages[-1]["text"] == "Check the retry guard first."
@@ -826,7 +1403,11 @@ async def test_engine_add_response(
 async def test_engine_context_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     async with engine:
         await engine.create_user("usr_1")
@@ -850,11 +1431,17 @@ async def test_engine_context_manager(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_engine_chat(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
-        engine.runtime.clock = FrozenClock(datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc))
+        engine.runtime.clock = FrozenClock(
+            datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc)
+        )
         result = await engine.chat(
             user_id="usr_1",
             conversation_id="cnv_1",
@@ -868,7 +1455,9 @@ async def test_engine_chat(monkeypatch: pytest.MonkeyPatch) -> None:
         connection = await engine.runtime.open_connection()
         try:
             messages = MessageRepository(connection, engine.runtime.clock)
-            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
             assert stored_messages[0]["occurred_at"] == "2023-05-08T13:56:00"
             assert stored_messages[1]["occurred_at"] == "2026-03-31T04:00:00+00:00"
             assert stored_messages[1]["created_at"] == "2026-03-31T04:00:00+00:00"
@@ -931,7 +1520,11 @@ async def test_engine_get_context_cache_hit_exposes_observability_without_retrie
 ) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
@@ -977,7 +1570,11 @@ async def test_engine_add_response_invalidates_stable_context_cache(
 ) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
@@ -1003,7 +1600,9 @@ async def test_engine_add_response_invalidates_stable_context_cache(
             mind_topology="unimind",
             operational_profile_token=_normal_operational_profile_token(engine),
         )
-        assert await engine.runtime.storage_backend.get_context_view(cache_key) is not None
+        assert (
+            await engine.runtime.storage_backend.get_context_view(cache_key) is not None
+        )
 
         await engine.add_response(
             user_id="usr_1",
@@ -1022,7 +1621,11 @@ async def test_engine_ingest_message_invalidates_stable_context_cache(
 ) -> None:
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
@@ -1048,7 +1651,9 @@ async def test_engine_ingest_message_invalidates_stable_context_cache(
             mind_topology="unimind",
             operational_profile_token=_normal_operational_profile_token(engine),
         )
-        assert await engine.runtime.storage_backend.get_context_view(cache_key) is not None
+        assert (
+            await engine.runtime.storage_backend.get_context_view(cache_key) is not None
+        )
 
         await engine.ingest_message(
             user_id="usr_1",
@@ -1138,7 +1743,9 @@ async def test_engine_ingest_message(
             "cnv_1",
             assistant_mode_id="coding_debug",
         )
-        engine.runtime.clock = FrozenClock(datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc))
+        engine.runtime.clock = FrozenClock(
+            datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc)
+        )
         await engine.ingest_message(
             user_id="usr_1",
             conversation_id="cnv_1",
@@ -1155,16 +1762,24 @@ async def test_engine_ingest_message(
 
         assert await engine.flush(timeout_seconds=5.0) is True
         assert not any(
-            request.metadata.get("purpose") in {"need_detection", "applicability_scoring"}
+            request.metadata.get("purpose")
+            in {"need_detection", "applicability_scoring"}
             for request in provider.requests
         )
 
         connection = await engine.runtime.open_connection()
         try:
             messages = MessageRepository(connection, engine.runtime.clock)
-            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
-            assert [message["role"] for message in stored_messages[-2:]] == ["user", "assistant"]
-            assert stored_messages[-2]["text"] == "Please help me debug this retry loop."
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
+            assert [message["role"] for message in stored_messages[-2:]] == [
+                "user",
+                "assistant",
+            ]
+            assert (
+                stored_messages[-2]["text"] == "Please help me debug this retry loop."
+            )
             assert stored_messages[-2]["occurred_at"] == "2023-05-08T13:56:00"
             assert stored_messages[-1]["text"] == "Check the retry guard first."
             assert stored_messages[-1]["occurred_at"] == "2026-03-31T04:00:00+00:00"
@@ -1176,7 +1791,8 @@ async def test_engine_ingest_message(
         assert purposes.count("contract_projection") == 1
         assert any(
             request.metadata.get("purpose") == "memory_extraction"
-            and "<message_timestamp>2023-05-08T13:56:00</message_timestamp>" in request.messages[1].content
+            and "<message_timestamp>2023-05-08T13:56:00</message_timestamp>"
+            in request.messages[1].content
             for request in provider.requests
         )
     finally:
@@ -1309,7 +1925,9 @@ async def test_engine_ingest_message_source_seq_preserves_backfill_order(
             source_seq=2,
         )
 
-        with pytest.raises(SourceSequenceConflictError, match="source_seq already exists"):
+        with pytest.raises(
+            SourceSequenceConflictError, match="source_seq already exists"
+        ):
             await engine.ingest_message(
                 user_id="usr_1",
                 conversation_id="cnv_1",
@@ -1422,7 +2040,9 @@ async def test_engine_ingest_message_marks_large_plain_text_skip_by_default(
         connection = await engine.runtime.open_connection()
         try:
             messages = MessageRepository(connection, engine.runtime.clock)
-            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
             stored = stored_messages[-1]
             assert stored["text"] == huge_text
             assert stored["include_raw"] == 0
@@ -1443,7 +2063,11 @@ async def test_engine_get_context_rolls_back_user_message_when_scoring_fails(
 ) -> None:
     provider = FailingEngineProvider("applicability_scoring")
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
@@ -1484,7 +2108,9 @@ async def test_engine_get_context_rolls_back_user_message_when_scoring_fails(
         connection = await engine.runtime.open_connection()
         try:
             messages = MessageRepository(connection, engine.runtime.clock)
-            assert await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0) == []
+            assert (
+                await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0) == []
+            )
         finally:
             await connection.close()
     finally:
@@ -1497,7 +2123,11 @@ async def test_engine_get_context_degrades_when_need_detector_fails(
 ) -> None:
     provider = FailingEngineProvider("need_detection")
     _install_stub_client(monkeypatch, provider)
-    engine = Atagia(db_path=":memory:", openai_api_key="test-openai-key", llm_forced_global_model="openai/test-model")
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
 
     await engine.setup()
     try:
@@ -1520,9 +2150,7 @@ async def test_engine_get_context_degrades_when_need_detector_fails(
         connection = await engine.runtime.open_connection()
         try:
             messages = MessageRepository(connection, engine.runtime.clock)
-            stored = await messages.get_messages(
-                "cnv_1", "usr_1", limit=10, offset=0
-            )
+            stored = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
             assert [row["text"] for row in stored] == [
                 "Please help me debug this retry loop.",
             ]

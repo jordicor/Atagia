@@ -2,28 +2,25 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
-
-from benchmarks.atagia_bench.adapter import AtagiaBenchDataset, AtagiaBenchQuestion
+from benchmarks.atagia_bench.adapter import (
+    AtagiaBenchAdapter,
+    AtagiaBenchDataset,
+    AtagiaBenchQuestion,
+)
 from benchmarks.atagia_bench.graders import GradeResult
 from benchmarks.atagia_bench.runner import (
-    PRIVACY_OFF_BENCHMARK_ANSWER_PROMPT_NOTE,
-    PRIVACY_OFF_PRIVATE_FACT_USER_PROMPT_NOTE,
     AtagiaBenchRunner,
     AtagiaQuestionResult,
 )
 from benchmarks.trusted_eval import (
     TRUSTED_EVALUATION_PROMPT_NOTE,
+    TRUSTED_EVALUATION_PRIVACY_OFF_PROMPT_NOTE,
     trusted_evaluation_ablation,
+    trusted_evaluation_prompt_note,
 )
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
-from atagia.models.schemas_memory import ComposedContext, RetrievalPlan, RetrievalTrace
-from atagia.models.schemas_replay import AblationConfig, PipelineResult
-from atagia.services.llm_client import LLMCompletionResponse, LLMError
-
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+from atagia.models.schemas_memory import RetrievalTrace
+from atagia.models.schemas_replay import AblationConfig
+from atagia.services.llm_client import LLMError
 
 
 def _bucket(
@@ -159,6 +156,30 @@ def test_privacy_off_question_uses_private_fact_as_expected_answer() -> None:
     assert config["privacy_off_retrieval_expected"] is True
 
 
+def test_context_boundary_question_is_not_privacy_off_retrieval_diagnostic() -> None:
+    dataset = AtagiaBenchAdapter().load(persona_ids=["ben_carter"])
+    questions = {
+        question.question_id: question
+        for persona in dataset.personas
+        for question in persona.questions
+    }
+    question = questions["ben-q07"]
+    ablation = AblationConfig(privacy_enforcement="off")
+
+    config = AtagiaBenchRunner._grader_config_for_question(question, ablation)
+
+    assert question.answer_type == "llm_judge"
+    assert question.grader == "llm_judge"
+    assert (
+        AtagiaBenchRunner._ground_truth_for_question(question, ablation)
+        == question.ground_truth
+    )
+    assert config["benchmark_privacy_enforcement"] == "off"
+    assert config["check_mode"] == "coding_debug"
+    assert "private_fact" not in config
+    assert "privacy_off_retrieval_expected" not in config
+
+
 def test_enforced_privacy_question_keeps_abstention_ground_truth() -> None:
     question = AtagiaBenchQuestion(
         question_id="q-secret",
@@ -196,106 +217,6 @@ def test_privacy_mode_annotation_records_answer_override_and_redaction_state() -
     assert trace["benchmark_privacy_enforcement"] == "off"
     assert trace["benchmark_answer_privacy_override"] is True
     assert trace["benchmark_high_risk_secret_redaction_disabled"] is True
-
-
-def test_privacy_off_private_fact_question_adds_user_prompt_instruction() -> None:
-    question_text = "Should the assistant reveal the safe code?"
-
-    rewritten = AtagiaBenchRunner._answer_question_text_for_privacy_mode(
-        question_text,
-        ablation=AblationConfig(privacy_enforcement="off"),
-        privacy_off_private_fact_expected=True,
-    )
-
-    assert rewritten.startswith(question_text)
-    assert PRIVACY_OFF_PRIVATE_FACT_USER_PROMPT_NOTE in rewritten
-
-
-def test_privacy_off_regular_question_keeps_user_prompt_unchanged() -> None:
-    question_text = "What is the current apartment address?"
-
-    rewritten = AtagiaBenchRunner._answer_question_text_for_privacy_mode(
-        question_text,
-        ablation=AblationConfig(privacy_enforcement="off"),
-        privacy_off_private_fact_expected=False,
-    )
-
-    assert rewritten == question_text
-
-
-class _CaptureAnswerLLM:
-    def __init__(self) -> None:
-        self.request = None
-
-    async def complete(self, request):
-        self.request = request
-        return LLMCompletionResponse(
-            provider="test",
-            model=request.model,
-            output_text="ok",
-        )
-
-
-class _AnswerRuntime:
-    def __init__(self, llm_client: _CaptureAnswerLLM) -> None:
-        self.manifests = ManifestLoader(MANIFESTS_DIR).load_all()
-        self.policy_resolver = PolicyResolver()
-        self.llm_client = llm_client
-
-
-def _pipeline_result_for_answer_prompt() -> PipelineResult:
-    return PipelineResult(
-        retrieval_plan=RetrievalPlan(
-            assistant_mode_id="coding_debug",
-            conversation_id="cnv_1",
-            max_candidates=1,
-            max_context_items=1,
-            privacy_ceiling=3,
-        ),
-        composed_context=ComposedContext(
-            memory_block="[Retrieved Memories]\n1. The account PIN is 1234.",
-            selected_memory_ids=["mem_secret"],
-            total_tokens_estimate=20,
-            budget_tokens=400,
-            items_included=1,
-            items_dropped=0,
-        ),
-    )
-
-
-@pytest.mark.asyncio
-async def test_privacy_off_answer_generation_prompt_authorizes_disclosure() -> None:
-    llm_client = _CaptureAnswerLLM()
-    runtime = _AnswerRuntime(llm_client)
-    runner = AtagiaBenchRunner(
-        llm_provider="openai",
-        llm_api_key=None,
-        llm_model=None,
-        answer_model="test-answer",
-    )
-
-    answer = await runner._generate_answer(
-        runtime=runtime,
-        assistant_mode_id="coding_debug",
-        pipeline_result=_pipeline_result_for_answer_prompt(),
-        question_text="What is the account PIN?",
-        question_id="q-secret",
-        ablation=AblationConfig(privacy_enforcement="off"),
-        privacy_off_private_fact_expected=True,
-    )
-
-    assert answer == "ok"
-    assert llm_client.request is not None
-    system_prompt = llm_client.request.messages[0].content
-    assert PRIVACY_OFF_BENCHMARK_ANSWER_PROMPT_NOTE in system_prompt
-    assert system_prompt.rfind(
-        PRIVACY_OFF_BENCHMARK_ANSWER_PROMPT_NOTE
-    ) > system_prompt.rfind(
-        "High-risk memory policy",
-    )
-    assert PRIVACY_OFF_PRIVATE_FACT_USER_PROMPT_NOTE in llm_client.request.messages[1].content
-    assert llm_client.request.metadata["benchmark_privacy_enforcement"] == "off"
-    assert llm_client.request.metadata["benchmark_answer_privacy_override"] is True
 
 
 def test_technical_failure_result_labels_answer_generation_stage() -> None:
@@ -377,6 +298,120 @@ def test_warning_counts_include_failure_buckets_and_degraded_traces() -> None:
     assert custody_summary["selected_channel_counts"] == {"fts": 1}
 
 
+def test_gold_evidence_diagnostics_tracks_stage_per_evidence_memory() -> None:
+    diagnostics = AtagiaBenchRunner._gold_evidence_diagnostics(
+        evidence_rows=[
+            {
+                "id": "mem_missing",
+                "source_message_id": "msg_1",
+                "object_type": "summary_view",
+                "scope": "chat",
+                "status": "active",
+                "privacy_level": 0,
+            },
+            {
+                "id": "mem_scored",
+                "source_message_id": "msg_2",
+                "object_type": "summary_view",
+                "scope": "chat",
+                "status": "active",
+                "privacy_level": 0,
+            },
+            {
+                "id": "mem_composed",
+                "source_message_id": None,
+                "object_type": "summary_view",
+                "scope": "chat",
+                "status": "active",
+                "privacy_level": 0,
+            },
+        ],
+        retrieval_custody=[
+            {
+                "candidate_id": "mem_scored",
+                "channels": ["fts"],
+                "channel_ranks": {"fts": 2},
+                "retrieval_sources": ["fts"],
+                "fusion_position": 4,
+                "shortlisted": True,
+                "shortlist_rank": 2,
+                "shortlist_status": "shortlisted",
+                "scored": True,
+                "score_rank": 3,
+                "score_status": "scored",
+                "selected": False,
+                "composer_decision": "not_selected_after_scoring",
+            },
+            {
+                "candidate_id": "mem_composed",
+                "channels": ["summary_support", "fts"],
+                "channel_ranks": {"summary_support": 1, "fts": 5},
+                "retrieval_sources": ["summary_support", "fts"],
+                "fusion_position": 1,
+                "shortlisted": True,
+                "shortlist_rank": 1,
+                "shortlist_status": "shortlisted",
+                "scored": True,
+                "score_rank": 1,
+                "score_status": "scored",
+                "selected": True,
+                "selection_rank": 1,
+                "composer_decision": "included",
+            },
+        ],
+        selected_memory_ids=["mem_composed"],
+        evidence_turn_ids_by_message_id={
+            "msg_1": ["turn_1"],
+            "msg_2": ["turn_2"],
+            "msg_3": ["turn_3"],
+        },
+        evidence_turn_ids_by_memory_id={"mem_composed": ["turn_3"]},
+    )
+
+    by_id = {item["memory_id"]: item for item in diagnostics}
+    assert by_id["mem_missing"]["candidate_record_found"] is False
+    assert by_id["mem_missing"]["last_observed_stage"] == "not_found"
+    assert by_id["mem_missing"]["source_turn_ids"] == ["turn_1"]
+    assert by_id["mem_missing"]["object_type"] == "summary_view"
+
+    scored = by_id["mem_scored"]
+    assert scored["channels"] == ["fts"]
+    assert scored["channel_ranks"] == {"fts": 2}
+    assert scored["found_before_fusion"] is True
+    assert scored["found_after_fusion"] is True
+    assert scored["shortlisted"] is True
+    assert scored["scored"] is True
+    assert scored["selected"] is False
+    assert scored["composed"] is False
+    assert scored["last_observed_stage"] == "scored"
+
+    composed = by_id["mem_composed"]
+    assert composed["channels"] == ["fts", "summary_support"]
+    assert composed["source_message_id"] is None
+    assert composed["source_turn_ids"] == ["turn_3"]
+    assert composed["selected"] is True
+    assert composed["composed"] is True
+    assert composed["last_observed_stage"] == "composed"
+
+    summary = AtagiaBenchRunner._gold_evidence_diagnostic_summary(diagnostics)
+    assert summary == {
+        "gold_evidence_count": 3,
+        "candidate_record_found_count": 2,
+        "found_before_fusion_count": 2,
+        "found_after_fusion_count": 2,
+        "shortlisted_count": 2,
+        "scored_count": 2,
+        "selected_count": 1,
+        "composed_count": 1,
+        "channel_counts": {"fts": 2, "summary_support": 1},
+        "last_observed_stage_counts": {
+            "composed": 1,
+            "not_found": 1,
+            "scored": 1,
+        },
+    }
+
+
 def test_privacy_off_retrieval_miss_is_not_a_critical_privacy_error() -> None:
     runner = AtagiaBenchRunner(
         llm_provider="openai",
@@ -452,6 +487,16 @@ def test_trusted_evaluation_prompt_preserves_secret_refusal_policy() -> None:
         TRUSTED_EVALUATION_PROMPT_NOTE
     )
     assert "continue withholding raw secret literals" in TRUSTED_EVALUATION_PROMPT_NOTE
+
+
+def test_trusted_evaluation_prompt_allows_secret_disclosure_when_privacy_off() -> None:
+    note = trusted_evaluation_prompt_note(AblationConfig(privacy_enforcement="off"))
+
+    assert note == TRUSTED_EVALUATION_PRIVACY_OFF_PROMPT_NOTE
+    assert "privacy_enforcement=off" in note
+    assert "provide it directly and verbatim" in note
+    assert "Do not apply ordinary-chat high-risk secret disclosure refusal" in note
+    assert "continue withholding raw secret literals" not in note
 
 
 def test_filter_questions_accepts_category_and_question_id() -> None:

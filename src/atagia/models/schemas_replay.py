@@ -50,6 +50,7 @@ class AblationConfig(BaseModel):
     privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
     skip_need_detection: bool = False
     skip_applicability_scoring: bool = False
+    applicability_gate_mode: Literal["off", "shadow", "enforced"] | None = None
     skip_contract_memory: bool = False
     skip_workspace_rollup: bool = False
     force_all_scopes: bool = False
@@ -57,8 +58,13 @@ class AblationConfig(BaseModel):
     skip_compaction: bool = False
     disable_context_cache: bool = False
     enable_llm_coverage_expansion: bool = False
+    enable_evidence_obligation_coverage: bool = True
+    enable_evidence_packets: bool = True
+    enable_final_answer_evidence_pack: bool = False
     composer_strategy: Literal["score_first", "budgeted_marginal"] | None = None
     override_retrieval_params: dict[str, Any] | None = None
+    context_envelope_budget_tokens: int | None = Field(default=None, gt=0)
+    context_envelope_ratios: dict[str, float] | None = None
 
 
 class PipelineResult(BaseModel):

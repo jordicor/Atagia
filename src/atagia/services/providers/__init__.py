@@ -6,6 +6,8 @@ from typing import Any
 
 from atagia.core.config import Settings
 from atagia.services.llm_client import ConfigurationError, LLMClient, RetryPolicy
+from atagia.services.llm_reliability import LLMTechnicalRecoveryConfig
+from atagia.services.llm_run_guard import LLMRunGuard, runtime_llm_run_guard_config
 from atagia.services.model_resolution import (
     ModelResolutionError,
     PROVIDER_SLUG_TO_NAME,
@@ -37,6 +39,7 @@ def build_llm_client(
             AnthropicProvider(
                 api_key=settings.anthropic_api_key,
                 base_url=settings.anthropic_base_url,
+                request_timeout_seconds=settings.anthropic_request_timeout_seconds,
             )
         )
     if settings.openai_api_key:
@@ -44,6 +47,7 @@ def build_llm_client(
             OpenAIProvider(
                 api_key=settings.openai_api_key,
                 base_url=settings.openai_base_url,
+                embedding_base_url=settings.openai_embedding_base_url,
             )
         )
     if settings.openrouter_api_key:
@@ -68,6 +72,8 @@ def build_llm_client(
         structured_output_retry_attempts=settings.llm_structured_output_retry_attempts,
         structured_output_rescue_enabled=settings.llm_structured_output_rescue_enabled,
         structured_output_rescue_model=settings.llm_structured_output_rescue_model,
+        technical_recovery_config=LLMTechnicalRecoveryConfig.from_settings(settings),
+        llm_run_guard=LLMRunGuard(runtime_llm_run_guard_config(settings)),
     )
 
     for provider_slug in sorted(required_provider_slugs(settings)):

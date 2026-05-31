@@ -30,6 +30,30 @@ class StubProvider(LLMProvider):
         )
 
 
+class _EmptyCursor:
+    async def fetchall(self) -> list[dict[str, object]]:
+        return []
+
+
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.statements: list[tuple[str, tuple[object, ...]]] = []
+
+    async def execute(
+        self,
+        statement: str,
+        parameters: tuple[object, ...] = (),
+    ) -> _EmptyCursor:
+        self.statements.append((statement, tuple(parameters)))
+        return _EmptyCursor()
+
+
+class _SerializingSQLiteVec:
+    def serialize_float32(self, values: list[float]) -> bytes:
+        assert values == [0.1, 0.2]
+        return b"serialized-vector"
+
+
 def _settings(
     *,
     backend: str,
@@ -114,6 +138,47 @@ async def test_sqlite_vec_backend_reports_configured_vector_limit_cap() -> None:
         assert backend.vector_limit == 7
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_vec_table_defines_user_id_partition_key() -> None:
+    connection = _RecordingConnection()
+    backend = SQLiteVecBackend(
+        connection,  # type: ignore[arg-type]
+        LLMClient(provider_name="embedding-factory-tests", providers=[StubProvider()]),
+        _settings(backend="sqlite_vec", model="embed-test-model"),
+    )
+
+    await backend._create_vector_table()  # noqa: SLF001
+
+    assert len(connection.statements) == 1
+    normalized_sql = " ".join(connection.statements[0][0].lower().split())
+    assert "user_id text partition key" in normalized_sql
+
+
+@pytest.mark.asyncio
+async def test_sqlite_vec_search_filters_user_partition_before_vector_rank() -> None:
+    connection = _RecordingConnection()
+    backend = SQLiteVecBackend(
+        connection,  # type: ignore[arg-type]
+        LLMClient(provider_name="embedding-factory-tests", providers=[StubProvider()]),
+        _settings(backend="sqlite_vec", model="embed-test-model"),
+    )
+    backend._sqlite_vec = _SerializingSQLiteVec()  # noqa: SLF001
+
+    matches = await backend.search("retry loop", "usr_1", 5)
+
+    assert matches == []
+    assert len(connection.statements) == 1
+    statement, parameters = connection.statements[0]
+    normalized_sql = " ".join(statement.split())
+    assert "WHERE v.embedding MATCH ?" in normalized_sql
+    assert "AND v.user_id = ?" in normalized_sql
+    assert "AND k = ?" in normalized_sql
+    assert "AND m.user_id = ?" in normalized_sql
+    assert normalized_sql.index("v.user_id = ?") < normalized_sql.index("k = ?")
+    assert normalized_sql.index("k = ?") < normalized_sql.index("ORDER BY v.distance ASC")
+    assert parameters == (b"serialized-vector", "usr_1", 5, "usr_1", 5)
 
 
 @pytest.mark.asyncio

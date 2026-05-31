@@ -15,7 +15,11 @@ build/
 dist/
 *.egg-info/
 .venv/
+# Local/private database snapshots and generated inspection notes.
 data/
+data/local_snapshots/
+data/local_snapshots/**/*.db
+data/local_snapshots/**/*.sqlite
 benchmarks/data/
 
 # Local editor / tool state (regenerated, machine-specific)
@@ -40,7 +44,10 @@ docs/*
 !docs/README.md
 !docs/IMPLEMENTATION_PLAN_v2.md
 !docs/PLATFORM_STATUS.md
+!docs/BENCHMARK_STATUS.md
 !docs/NEXT_ENGINEERING_STEPS.md
+!docs/RETRIEVAL_RECOVERY_AND_ANTI_OVERFIT_PLAN.md
+!docs/RETRIEVAL_PROMPT_SIMPLIFICATION_20260526.md
 !docs/HOST_SIDECAR_INTEGRATION.md
 !docs/MEMORY_NAMESPACES_AND_SCOPES.md
 !docs/MEMORY_REDESIGN_IMPLEMENTATION_PLAN.md
@@ -54,11 +61,15 @@ docs/*
 !docs/PROPOSAL_memory_coordinate_system_phase6_ojocentauri.md
 !docs/PROPOSAL_memory_coordinate_system_phase7_inspector.md
 !docs/PROPOSAL_retrieval_breakthrough_experiments.md
+!docs/STRATEGIC_ATAGIA_MARKET_DEEP_RESEARCH_20260522.md
+!docs/STRATEGIC_ATAGIA_POSITIONING_DASHBOARD_20260522.html
+!docs/STRATEGIC_ATAGIA_POSITIONING_CHATGPT_PRO_20260522.md
 !docs/BEYOND_HUMAN_MEMORY.md
 !docs/Beyond_Similarity_Applicability_Governed_Memory.md
 !docs/API.md
 !docs/CONFIGURATION_REFERENCE.md
 !docs/MODEL_ROUTING_NOTES.md
+!docs/LOCAL_MODEL_ROUTING_EVIDENCE.md
 !docs/tmp/
 docs/tmp/*
 !docs/tmp/README.md
@@ -66,6 +77,14 @@ docs/tmp/*
 !docs/tmp/2026-05-08-retrieval-wave0-graph-stress-baseline.md
 !docs/tmp/2026-05-08-retrieval-wave0-5-graph-stress-validation.md
 !docs/tmp/2026-05-11-evaluation-diagnostics-infra-consolidation.md
+!docs/tmp/retrieval_state_snapshot_20260522.md
+!docs/tmp/chatgpt_pro_retrieval_course_correction_20260522.md
+!docs/tmp/claude_retrieval_course_correction_20260522.md
+!docs/tmp/locomo_failure_ledger_conv26_30_41_42_43_20260523.md
+!docs/tmp/locomo_source_context_replay_and_summary_dedupe_20260523.md
+!docs/tmp/locomo_evidence_obligation_composer_20260523.md
+!docs/tmp/locomo_context_envelope_budget_ablation_20260523.md
+!docs/tmp/locomo_context_envelope_conv41_42_43_controls_20260523.md
 !docs/archive/
 docs/archive/*
 !docs/archive/2026-05-doc-cleanup/
@@ -74,3 +93,8 @@ docs/archive/2026-05-doc-cleanup/*
 !docs/archive/2026-05-doc-cleanup/RECENT_TRANSCRIPT_WORKING_MEMORY_PLAN.md
 !docs/archive/2026-05-doc-cleanup/LOCOMO_AUDIT_CONV26.md
 !docs/archive/2026-05-doc-cleanup/PENDING_TASK_LLM_MODEL_RESOLUTION_codex.md
+
+# Personal-flavored test fixtures: kept tracked in the private dev repo, but
+# never published (also excluded by the GitHub sync; this entry guards the
+# public checkout against accidental re-adds).
+tests/memory/test_applicability_scorer.py

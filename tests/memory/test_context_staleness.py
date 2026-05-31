@@ -277,12 +277,20 @@ async def test_high_stakes_language_forces_sync() -> None:
     )
     resolved_policy = _resolved_policy("general_qa")
 
+    # Token overlap is in the middle band (> deterministic-refresh max,
+    # < deterministic-reuse min) so the scorer consults the LLM, whose
+    # high_stakes_topic signal then forces a hard sync.
     score = await scorer.score(
-        _entry_payload(),
-        _request_payload(message_text="I need medical advice about medication dosage today."),
+        _entry_payload(
+            last_user_message_text="We were discussing the medication dosage schedule earlier."
+        ),
+        _request_payload(
+            message_text="I need medical advice about the medication dosage today."
+        ),
         resolved_policy,
     )
 
+    assert score.decision_band == "llm"
     assert score.hard_sync is True
     assert "high_stakes_language" in score.matched_signals
 
@@ -298,12 +306,17 @@ async def test_sensitive_language_forces_sync() -> None:
     )
     resolved_policy = _resolved_policy("general_qa")
 
+    # Token overlap is in the middle band so the scorer consults the LLM,
+    # whose sensitive_content signal then forces a hard sync.
     score = await scorer.score(
-        _entry_payload(),
+        _entry_payload(
+            last_user_message_text="I had a question about my bank account password earlier."
+        ),
         _request_payload(message_text="Here is my password and bank account issue."),
         resolved_policy,
     )
 
+    assert score.decision_band == "llm"
     assert score.hard_sync is True
     assert "sensitive_language" in score.matched_signals
 
@@ -446,3 +459,212 @@ async def test_invalid_mode_shift_target_fails_structured_validation() -> None:
             _request_payload(message_text="Switch modes."),
             resolved_policy,
         )
+
+
+# --- F2.2 deterministic-first staleness bands -------------------------------
+
+_NO_SIGNALS_JSON = (
+    '{"contradiction_detected": false, "high_stakes_topic": false, '
+    '"sensitive_content": false, "mode_shift_target": null, '
+    '"short_followup": false, "ambiguous_wording": false}'
+)
+# Cached previous message used by the deterministic-band fixtures. The reuse
+# message below is a strict token subset of this (overlap 1.0 >= the HIGH
+# threshold); the "below HIGH" flip message overlaps it at ~0.8 (< HIGH).
+_BAND_PREVIOUS_MESSAGE = (
+    "Can you walk me through the database migration steps again please"
+)
+_REUSE_MESSAGE = "Can you walk me through the database migration steps again"
+_REFRESH_LONG_LOW_OVERLAP_MESSAGE = (
+    "Switch topic completely and explain quantum entanglement basics now"
+)
+
+
+@pytest.mark.asyncio
+async def test_deterministic_reuse_band_skips_llm_when_all_conditions_hold() -> None:
+    client, provider = _staleness_client(_NO_SIGNALS_JSON)
+    scorer = ContextStalenessScorer(
+        FrozenClock(datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)),
+        llm_client=client,
+    )
+    resolved_policy = _resolved_policy("general_qa")
+
+    score = await scorer.score(
+        _entry_payload(last_user_message_text=_BAND_PREVIOUS_MESSAGE),
+        _request_payload(message_text=_REUSE_MESSAGE, current_message_seq=11),
+        resolved_policy,
+    )
+
+    assert provider.requests == []
+    assert score.decision_band == "deterministic_reuse"
+    assert score.hard_sync is False
+    assert score.should_refresh is False
+    assert score.token_overlap_ratio >= 0.85
+    assert "high_token_overlap" in score.matched_signals
+
+
+@pytest.mark.asyncio
+async def test_deterministic_reuse_band_yields_to_llm_when_overlap_below_high() -> None:
+    client, provider = _staleness_client(_NO_SIGNALS_JSON)
+    scorer = ContextStalenessScorer(
+        FrozenClock(datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)),
+        llm_client=client,
+    )
+    resolved_policy = _resolved_policy("general_qa")
+
+    score = await scorer.score(
+        _entry_payload(last_user_message_text=_BAND_PREVIOUS_MESSAGE),
+        _request_payload(
+            message_text="Walk me through the database migration steps once more please",
+            current_message_seq=11,
+        ),
+        resolved_policy,
+    )
+
+    assert len(provider.requests) == 1
+    assert 0.1 < score.token_overlap_ratio < 0.85
+    assert score.decision_band == "llm"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_reuse_band_yields_to_llm_when_two_messages_since_refresh() -> None:
+    client, provider = _staleness_client(_NO_SIGNALS_JSON)
+    scorer = ContextStalenessScorer(
+        FrozenClock(datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)),
+        llm_client=client,
+    )
+    resolved_policy = _resolved_policy("general_qa")
+
+    score = await scorer.score(
+        _entry_payload(last_user_message_text=_BAND_PREVIOUS_MESSAGE),
+        # entry.last_retrieval_message_seq == 10 => seq 12 is 2 messages since.
+        _request_payload(message_text=_REUSE_MESSAGE, current_message_seq=12),
+        resolved_policy,
+    )
+
+    assert len(provider.requests) == 1
+    assert score.messages_since_refresh == 2
+    assert score.decision_band == "llm"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_reuse_band_yields_to_llm_when_age_beyond_fraction() -> None:
+    # general_qa: max_minutes_without_refresh == 20, age fraction 0.25 => 5.0 min
+    # boundary. 6 minutes is past the reuse fraction but under the hard ceiling.
+    client, provider = _staleness_client(_NO_SIGNALS_JSON)
+    scorer = ContextStalenessScorer(
+        FrozenClock(datetime(2026, 4, 2, 12, 6, tzinfo=timezone.utc)),
+        llm_client=client,
+    )
+    resolved_policy = _resolved_policy("general_qa")
+
+    score = await scorer.score(
+        _entry_payload(last_user_message_text=_BAND_PREVIOUS_MESSAGE),
+        _request_payload(message_text=_REUSE_MESSAGE, current_message_seq=11),
+        resolved_policy,
+    )
+
+    assert len(provider.requests) == 1
+    assert score.minutes_since_refresh == pytest.approx(6.0)
+    assert score.decision_band == "llm"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_reuse_band_yields_to_llm_when_message_is_short() -> None:
+    # A high-overlap but SHORT message is excluded from the reuse band: the
+    # asymmetric overlap ratio is uninformative for terse follow-ups, so the
+    # LLM's short_followup signal handles it instead.
+    client, provider = _staleness_client(_NO_SIGNALS_JSON)
+    scorer = ContextStalenessScorer(
+        FrozenClock(datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)),
+        llm_client=client,
+    )
+    resolved_policy = _resolved_policy("general_qa")
+
+    score = await scorer.score(
+        _entry_payload(last_user_message_text=_BAND_PREVIOUS_MESSAGE),
+        # "database migration" is a strict subset of the cached message
+        # (overlap 1.0) but only 2 tokens long, so it is treated as short.
+        _request_payload(message_text="database migration", current_message_seq=11),
+        resolved_policy,
+    )
+
+    assert len(provider.requests) == 1
+    assert score.token_overlap_ratio >= 0.85
+    assert score.decision_band == "llm"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_refresh_band_skips_llm_for_long_low_overlap_message() -> None:
+    client, provider = _staleness_client(_NO_SIGNALS_JSON)
+    scorer = ContextStalenessScorer(
+        FrozenClock(datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)),
+        llm_client=client,
+    )
+    resolved_policy = _resolved_policy("general_qa")
+
+    score = await scorer.score(
+        _entry_payload(last_user_message_text=_BAND_PREVIOUS_MESSAGE),
+        _request_payload(
+            message_text=_REFRESH_LONG_LOW_OVERLAP_MESSAGE,
+            current_message_seq=11,
+        ),
+        resolved_policy,
+    )
+
+    assert provider.requests == []
+    assert score.decision_band == "deterministic_refresh"
+    assert score.hard_sync is False
+    assert score.should_refresh is True
+    assert score.token_overlap_ratio <= 0.1
+    assert "low_token_overlap" in score.matched_signals
+
+
+@pytest.mark.asyncio
+async def test_low_overlap_short_message_yields_to_llm_asymmetry_caveat() -> None:
+    # A SHORT low-overlap message must NOT trigger the deterministic refresh
+    # band: a terse continuation scores low overlap by construction, so it is
+    # routed to the LLM (whose short_followup signal can still keep the cache).
+    client, provider = _staleness_client(
+        '{"contradiction_detected": false, "high_stakes_topic": false, '
+        '"sensitive_content": false, "mode_shift_target": null, '
+        '"short_followup": true, "ambiguous_wording": false}'
+    )
+    scorer = ContextStalenessScorer(
+        FrozenClock(datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)),
+        llm_client=client,
+    )
+    resolved_policy = _resolved_policy("general_qa")
+
+    score = await scorer.score(
+        _entry_payload(last_user_message_text=_BAND_PREVIOUS_MESSAGE),
+        _request_payload(message_text="and now?", current_message_seq=11),
+        resolved_policy,
+    )
+
+    assert len(provider.requests) == 1
+    assert score.token_overlap_ratio <= 0.1
+    assert score.decision_band == "llm"
+    assert score.short_followup is True
+
+
+@pytest.mark.asyncio
+async def test_middle_band_message_calls_llm_and_records_band() -> None:
+    # Overlap strictly between the two deterministic thresholds => LLM path,
+    # unchanged from before, with the band recorded as "llm".
+    client, provider = _staleness_client(_NO_SIGNALS_JSON)
+    scorer = ContextStalenessScorer(
+        FrozenClock(datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)),
+        llm_client=client,
+    )
+    resolved_policy = _resolved_policy("general_qa")
+
+    score = await scorer.score(
+        _entry_payload(last_user_message_text="Vamos a arreglar la prueba de acceso"),
+        _request_payload(message_text="Seguimos con la prueba de acceso"),
+        resolved_policy,
+    )
+
+    assert len(provider.requests) == 1
+    assert 0.1 < score.token_overlap_ratio < 0.85
+    assert score.decision_band == "llm"

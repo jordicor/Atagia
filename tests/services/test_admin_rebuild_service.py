@@ -43,9 +43,12 @@ from atagia.services.llm_client import (
     LLMEmbeddingRequest,
     LLMEmbeddingResponse,
     LLMProvider,
+    LLMRunGuardError,
     OutputLimitExceededError,
     StructuredOutputError,
 )
+from atagia.services.llm_run_guard import LLMRunGuardDecision
+from tests.extraction_payload_support import rich_extraction_payload_to_lean
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -65,19 +68,7 @@ class ExtractorProvider(LLMProvider):
     name = "admin-rebuild-extractor"
 
     def __init__(self, payload: dict[str, object]) -> None:
-        normalized_payload = dict(payload)
-        normalized_payload["evidences"] = [
-            (
-                {
-                    **item,
-                    "language_codes": ["en"],
-                }
-                if isinstance(item, dict) and "canonical_text" in item and "language_codes" not in item
-                else item
-            )
-            for item in normalized_payload.get("evidences", [])
-        ]
-        self.payload = normalized_payload
+        self.payload = rich_extraction_payload_to_lean(payload)
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         if request.metadata.get("purpose") == "intent_classifier_claim_key_equivalence":
@@ -122,25 +113,27 @@ class RebuildReplayProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
-                    {
-                        "evidences": [
-                            {
-                                "canonical_text": canonical_text,
-                                "index_text": f"Context for {canonical_text.lower()} from replayed conversation history.",
-                                "scope": "conversation",
-                                "confidence": 0.92,
-                                "source_kind": "extracted",
-                                "privacy_level": 0,
-                                "language_codes": ["en"],
-                                "payload": {"kind": "fact"},
-                            }
-                        ],
-                        "beliefs": [],
-                        "contract_signals": [],
-                        "state_updates": [],
-                        "mode_guess": None,
-                        "nothing_durable": False,
-                    }
+                    rich_extraction_payload_to_lean(
+                        {
+                            "evidences": [
+                                {
+                                    "canonical_text": canonical_text,
+                                    "index_text": f"Context for {canonical_text.lower()} from replayed conversation history.",
+                                    "scope": "conversation",
+                                    "confidence": 0.92,
+                                    "source_kind": "extracted",
+                                    "privacy_level": 0,
+                                    "language_codes": ["en"],
+                                    "payload": {"kind": "fact"},
+                                }
+                            ],
+                            "beliefs": [],
+                            "contract_signals": [],
+                            "state_updates": [],
+                            "mode_guess": None,
+                            "nothing_durable": False,
+                        }
+                    )
                 ),
             )
         if purpose == "contract_projection":
@@ -249,6 +242,53 @@ class RebuildReplayProvider(LLMProvider):
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError(f"Embedding is not expected in this test: {request.metadata}")
+
+
+class EpisodeOutputLimitReplayProvider(RebuildReplayProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self._remaining_episode_output_limit_failures = 1
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        purpose = request.metadata.get("purpose")
+        if purpose == "summary_chunk_segmentation":
+            self.requests.append(request)
+            prompt = request.messages[1].content
+            message_sequences = [
+                int(item) for item in re.findall(r'<message seq="(\d+)"', prompt)
+            ]
+            if not message_sequences:
+                raise AssertionError("Expected message sequences in chunk segmentation prompt")
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "episodes": [
+                            {
+                                "start_seq": sequence,
+                                "end_seq": sequence,
+                                "summary_text": f"Chunk summary {sequence}.",
+                            }
+                            for sequence in message_sequences
+                        ]
+                    }
+                ),
+            )
+        if (
+            purpose == "episode_synthesis"
+            and self._remaining_episode_output_limit_failures
+        ):
+            self.requests.append(request)
+            self._remaining_episode_output_limit_failures -= 1
+            raise OutputLimitExceededError(
+                "openai stopped because it reached max output tokens",
+                provider="openai",
+                finish_reason="length",
+                max_output_tokens=8192,
+                partial_output_excerpt='"collaboration_and_growth","collaboration_and_growth"',
+            )
+        return await super().complete(request)
 
 
 class RecordingEmbeddingIndex(EmbeddingIndex):
@@ -696,9 +736,39 @@ async def test_rebuild_conversation_replays_assistant_messages_for_extraction() 
         assert result.processed_messages == 2
         assert result.extract_jobs_processed == 2
         assert result.contract_jobs_processed == 1
+        assert result.initial_context_package_refresh_jobs_processed >= 1
         assert {"msg_1", "msg_2"} <= source_ids
         assert extracted_rows
         assert all(row["index_text"] for row in extracted_rows)
+        pending_cursor = await connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM worker_job_runs
+            WHERE status IN ('queued', 'running', 'retrying')
+            """
+        )
+        pending_row = await pending_cursor.fetchone()
+        assert int(pending_row["count"]) == 0
+        cursor = await connection.execute(
+            """
+            SELECT edge.support_kind, span.span_role, span.quote_text, span.message_id
+            FROM memory_support_edges AS edge
+            JOIN memory_evidence_spans AS span
+              ON span.support_edge_id = edge.id
+            WHERE edge.memory_id IN ({placeholders})
+            ORDER BY span.message_id ASC, span.span_role ASC
+            """.format(
+                placeholders=", ".join("?" for _ in extracted_rows)
+            ),
+            tuple(str(row["id"]) for row in extracted_rows),
+        )
+        packets = [dict(row) for row in await cursor.fetchall()]
+        source_packets = [row for row in packets if row["span_role"] == "source"]
+        assert source_packets
+        assert {row["message_id"] for row in source_packets} == {"msg_1", "msg_2"}
+        assert any(row["quote_text"] == "User fact" for row in source_packets)
+        assert any(row["quote_text"] == "Assistant plan" for row in source_packets)
+        assert {row["support_kind"] for row in source_packets} == {"direct"}
         extraction_prompts = [
             request.messages[1].content
             for request in provider.requests
@@ -847,6 +917,64 @@ async def test_rebuild_conversation_recreates_hierarchy_for_short_conversation()
         assert await memories.get_memory_object("sum_mem_sum_old_episode", "usr_1") is None
         assert await memories.get_memory_object(f"sum_mem_{episode_rows[0]['id']}", "usr_1") is not None
         assert await memories.get_memory_object(f"sum_mem_{thematic_rows[0]['id']}", "usr_1") is not None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_conversation_recovers_episode_synthesis_output_limit() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+    summaries = SummaryRepository(connection, clock)
+    provider = EpisodeOutputLimitReplayProvider()
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        for sequence in range(1, 5):
+            await messages.create_message(
+                f"msg_{sequence}",
+                "cnv_1",
+                "user" if sequence % 2 else "assistant",
+                sequence,
+                f"Message {sequence}",
+                sequence,
+                {},
+                f"2026-04-10T12:0{sequence}:00+00:00",
+            )
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=EpisodeOutputLimitReplayProvider.name,
+                providers=[provider],
+            ),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        result = await service.rebuild_conversation("usr_1", "cnv_1")
+
+        episode_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE)
+        episode_chunk_counts = [
+            request.metadata.get("chunk_count")
+            for request in provider.requests
+            if request.metadata.get("purpose") == "episode_synthesis"
+        ]
+
+        assert result.status == "rebuilt"
+        assert result.recoverable_job_failures == 0
+        assert result.conversation_compaction_jobs_processed == 1
+        assert result.episode_compaction_jobs_processed == 1
+        assert len(episode_rows) == 2
+        assert episode_chunk_counts == [4, 2, 2]
     finally:
         await connection.close()
 
@@ -1341,6 +1469,62 @@ async def test_rebuild_conversation_skips_generic_llm_extract_error(
         assert result.extract_jobs_processed == 0
         assert result.recoverable_job_failures == 1
         assert result.recoverable_extract_job_failures == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_conversation_propagates_llm_run_guard_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+
+    class GuardedIngestWorker:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def process_job(self, payload):
+            raise LLMRunGuardError(
+                LLMRunGuardDecision(
+                    healthy=False,
+                    should_block=True,
+                    violations=("total failed LLM calls exceeded 1: 2",),
+                    snapshot={"status": "failed", "failed_calls": 2},
+                )
+            )
+
+    monkeypatch.setattr(admin_rebuild_module, "IngestWorker", GuardedIngestWorker)
+
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=RebuildReplayProvider.name,
+                providers=[RebuildReplayProvider()],
+            ),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        with pytest.raises(LLMRunGuardError):
+            await service.rebuild_conversation(
+                "usr_1",
+                "cnv_1",
+                skip_final_compaction=True,
+            )
     finally:
         await connection.close()
 

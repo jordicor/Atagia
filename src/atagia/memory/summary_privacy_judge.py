@@ -230,7 +230,6 @@ class SummaryPrivacyJudge:
                     ),
                 ),
             ],
-            temperature=0.0,
             max_output_tokens=SUMMARY_PRIVACY_JUDGE_MAX_OUTPUT_TOKENS,
             response_schema=SummaryPrivacyVerdict.model_json_schema(),
             metadata={
@@ -276,7 +275,6 @@ class SummaryPrivacyJudge:
                     ),
                 ),
             ],
-            temperature=0.0,
             max_output_tokens=SUMMARY_PRIVACY_REFINER_MAX_OUTPUT_TOKENS,
             response_schema=SummaryPrivacyRefinement.model_json_schema(),
             metadata={

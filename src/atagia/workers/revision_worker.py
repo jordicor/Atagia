@@ -744,6 +744,18 @@ class RevisionWorker:
                 maya_score=float(seed_belief["maya_score"]) if seed_belief is not None else 1.0,
                 privacy_level=int(seed_belief["privacy_level"]) if seed_belief is not None else 1,
                 status=MemoryStatus.ACTIVE,
+                language_codes=(
+                    [
+                        str(code).strip().lower()
+                        for code in seed_belief.get("language_codes_json", [])
+                        if str(code).strip()
+                    ]
+                    if isinstance(
+                        seed_belief.get("language_codes_json") if seed_belief else None,
+                        list,
+                    )
+                    else None
+                ),
                 user_persona_id=payload.user_persona_id,
                 platform_id=payload.platform_id,
                 character_id=payload.character_id if target_scope is MemoryScope.WORKSPACE else None,

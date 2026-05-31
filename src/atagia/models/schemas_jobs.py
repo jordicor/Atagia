@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -25,6 +25,7 @@ class JobType(str, Enum):
     COMPACT_SUMMARIES = "compact_summaries"
     SYNC_GRAPH = "sync_graph"
     RUN_EVALUATION = "run_evaluation"
+    REFRESH_INITIAL_CONTEXT_PACKAGE = "refresh_initial_context_package"
 
 
 class JobRunStatus(str, Enum):
@@ -50,6 +51,17 @@ class CompactionJobKind(str, Enum):
     WORKSPACE_ROLLUP = "workspace_rollup"
     EPISODE = "episode"
     THEMATIC_PROFILE = "thematic_profile"
+
+
+class InitialContextPackageRefreshReason(str, Enum):
+    MESSAGE_WRITE = "message_write"
+    MEMORY_EXTRACTION = "memory_extraction"
+    CONTRACT_PROJECTION = "contract_projection"
+    SUMMARY_COMPACTION = "summary_compaction"
+    LIFECYCLE_CHANGE = "lifecycle_change"
+    BACKFILL = "backfill"
+    ADMIN_REBUILD = "admin_rebuild"
+    COORDINATE_CHANGE = "coordinate_change"
 
 
 class JobEnvelope(BaseModel):
@@ -133,6 +145,9 @@ class MessageJobPayload(BaseModel):
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
     confirmation_strategy: ConfirmationStrategy | None = None
     memory_privacy_mode: MemoryPrivacyMode = MemoryPrivacyMode.BALANCED
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
+    authenticated_user_privilege_level: str | None = None
+    authenticated_user_is_atagia_master: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -175,6 +190,7 @@ REVISE_STREAM_NAME = "atagia:revise"
 COMPACT_STREAM_NAME = "atagia:compact"
 GRAPH_STREAM_NAME = "atagia:graph"
 EVALUATION_STREAM_NAME = "atagia:evaluate"
+INITIAL_CONTEXT_PACKAGE_STREAM_NAME = "atagia:initial_context_package"
 WORKER_GROUP_NAME = "atagia-workers"
 
 
@@ -237,7 +253,22 @@ class CompactionJobPayload(BaseModel):
     temporary_ttl_seconds: int | None = None
     purge_on_close: bool = False
     valid_to: str | None = None
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
     job_kind: CompactionJobKind
+
+
+class InitialContextPackageRefreshJobPayload(BaseModel):
+    """Payload used by prepared initial-context package refresh jobs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    conversation_id: str | None = None
+    package_kind: Literal["all", "baseline", "conversation"] = "all"
+    retrieval_profile_id: str | None = None
+    reason: InitialContextPackageRefreshReason
+    source_message_ids: list[str] = Field(default_factory=list)
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
 
 
 class EvaluationJobPayload(BaseModel):

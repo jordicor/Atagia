@@ -12,6 +12,7 @@ from typing import Any
 
 from atagia.integrations.message_projection import message_to_text
 from atagia.integrations.prompt_injection import build_injection_decision
+from atagia.models.schemas_memory import ResponseMode
 from atagia.models.schemas_openai_proxy import (
     OpenAIChatCompletionRequest,
     OpenAIModelList,
@@ -44,6 +45,8 @@ from atagia.services.sidecar_service import SidecarService
 
 logger = logging.getLogger(__name__)
 
+_RESPONSE_MODE_VALUES: frozenset[str] = frozenset(mode.value for mode in ResponseMode)
+
 _HARD_CONTEXT_ERRORS = (
     AssistantModeMismatchError,
     ConversationNotActiveError,
@@ -68,6 +71,12 @@ class OpenAIProxyIdentity:
     user_persona_id: str | None = None
     platform_id: str | None = None
     character_id: str | None = None
+    active_presence_id: str | None = None
+    mind_id: str | None = None
+    mind_topology: str | None = None
+    embodiment_id: str | None = None
+    realm_id: str | None = None
+    space_id: str | None = None
     mode: str | None = None
     incognito: bool | None = None
     operational_profile: str | None = None
@@ -80,6 +89,7 @@ class OpenAIProxyIdentity:
     ingest_origin: str | None = None
     confirmation_strategy: str | None = None
     memory_privacy_mode: str | None = None
+    response_mode: str | None = None
 
 
 @dataclass(slots=True)
@@ -111,6 +121,12 @@ class OpenAIProxyService:
         user_persona_id_header: str | None = None,
         platform_id_header: str | None = None,
         character_id_header: str | None = None,
+        active_presence_id_header: str | None = None,
+        mind_id_header: str | None = None,
+        mind_topology_header: str | None = None,
+        embodiment_id_header: str | None = None,
+        realm_id_header: str | None = None,
+        space_id_header: str | None = None,
         incognito_header: str | None = None,
         cross_chat_memory_header: str | None = None,
         message_id_header: str | None = None,
@@ -120,6 +136,7 @@ class OpenAIProxyService:
         ingest_origin_header: str | None = None,
         confirmation_strategy_header: str | None = None,
         memory_privacy_mode_header: str | None = None,
+        response_mode_header: str | None = None,
     ) -> dict[str, Any]:
         self._validate_model(request)
         completion_id = _completion_id()
@@ -134,6 +151,12 @@ class OpenAIProxyService:
             user_persona_id_header=user_persona_id_header,
             platform_id_header=platform_id_header,
             character_id_header=character_id_header,
+            active_presence_id_header=active_presence_id_header,
+            mind_id_header=mind_id_header,
+            mind_topology_header=mind_topology_header,
+            embodiment_id_header=embodiment_id_header,
+            realm_id_header=realm_id_header,
+            space_id_header=space_id_header,
             incognito_header=incognito_header,
             cross_chat_memory_header=cross_chat_memory_header,
             message_id_header=message_id_header,
@@ -143,6 +166,7 @@ class OpenAIProxyService:
             ingest_origin_header=ingest_origin_header,
             confirmation_strategy_header=confirmation_strategy_header,
             memory_privacy_mode_header=memory_privacy_mode_header,
+            response_mode_header=response_mode_header,
         )
         latest_user_text = _latest_user_text(request.messages)
         context = await self._context_for_turn_fail_open(identity, latest_user_text)
@@ -169,6 +193,12 @@ class OpenAIProxyService:
         user_persona_id_header: str | None = None,
         platform_id_header: str | None = None,
         character_id_header: str | None = None,
+        active_presence_id_header: str | None = None,
+        mind_id_header: str | None = None,
+        mind_topology_header: str | None = None,
+        embodiment_id_header: str | None = None,
+        realm_id_header: str | None = None,
+        space_id_header: str | None = None,
         incognito_header: str | None = None,
         cross_chat_memory_header: str | None = None,
         message_id_header: str | None = None,
@@ -178,6 +208,7 @@ class OpenAIProxyService:
         ingest_origin_header: str | None = None,
         confirmation_strategy_header: str | None = None,
         memory_privacy_mode_header: str | None = None,
+        response_mode_header: str | None = None,
     ) -> AsyncIterator[str]:
         self._validate_model(request)
         completion_id = _completion_id()
@@ -192,6 +223,12 @@ class OpenAIProxyService:
             user_persona_id_header=user_persona_id_header,
             platform_id_header=platform_id_header,
             character_id_header=character_id_header,
+            active_presence_id_header=active_presence_id_header,
+            mind_id_header=mind_id_header,
+            mind_topology_header=mind_topology_header,
+            embodiment_id_header=embodiment_id_header,
+            realm_id_header=realm_id_header,
+            space_id_header=space_id_header,
             incognito_header=incognito_header,
             cross_chat_memory_header=cross_chat_memory_header,
             message_id_header=message_id_header,
@@ -201,6 +238,7 @@ class OpenAIProxyService:
             ingest_origin_header=ingest_origin_header,
             confirmation_strategy_header=confirmation_strategy_header,
             memory_privacy_mode_header=memory_privacy_mode_header,
+            response_mode_header=response_mode_header,
         )
         latest_user_text = _latest_user_text(request.messages)
         context = await self._context_for_turn_fail_open(identity, latest_user_text)
@@ -318,12 +356,19 @@ class OpenAIProxyService:
                 user_persona_id=identity.user_persona_id,
                 platform_id=identity.platform_id,
                 character_id=identity.character_id,
+                active_presence_id=identity.active_presence_id,
+                mind_id=identity.mind_id,
+                mind_topology=identity.mind_topology,
+                embodiment_id=identity.embodiment_id,
+                realm_id=identity.realm_id,
+                space_id=identity.space_id,
                 incognito=identity.incognito,
                 message_id=identity.message_id,
                 source_seq=identity.source_seq,
                 ingest_origin=identity.ingest_origin,
                 confirmation_strategy=identity.confirmation_strategy,
                 memory_privacy_mode=identity.memory_privacy_mode,
+                response_mode=identity.response_mode,
             )
         except _HARD_CONTEXT_ERRORS:
             raise
@@ -346,6 +391,12 @@ class OpenAIProxyService:
         user_persona_id_header: str | None,
         platform_id_header: str | None,
         character_id_header: str | None,
+        active_presence_id_header: str | None,
+        mind_id_header: str | None,
+        mind_topology_header: str | None,
+        embodiment_id_header: str | None,
+        realm_id_header: str | None,
+        space_id_header: str | None,
         incognito_header: str | None,
         cross_chat_memory_header: str | None,
         message_id_header: str | None,
@@ -355,6 +406,7 @@ class OpenAIProxyService:
         ingest_origin_header: str | None,
         confirmation_strategy_header: str | None,
         memory_privacy_mode_header: str | None,
+        response_mode_header: str | None,
     ) -> OpenAIProxyIdentity:
         metadata = request.metadata or {}
         user_id = _first_text(
@@ -415,6 +467,40 @@ class OpenAIProxyService:
             metadata.get("atagia_character_id"),
             metadata.get("character_id"),
         ) or workspace_id
+        active_presence_id = _first_text(
+            active_presence_id_header,
+            metadata.get("atagia_active_presence_id"),
+            metadata.get("active_presence_id"),
+        )
+        mind_id = _first_text(
+            mind_id_header,
+            metadata.get("atagia_mind_id"),
+            metadata.get("mind_id"),
+            metadata.get("active_mind_id"),
+        )
+        mind_topology = _first_text(
+            mind_topology_header,
+            metadata.get("atagia_mind_topology"),
+            metadata.get("mind_topology"),
+        )
+        embodiment_id = _first_text(
+            embodiment_id_header,
+            metadata.get("atagia_embodiment_id"),
+            metadata.get("embodiment_id"),
+            metadata.get("active_embodiment_id"),
+        )
+        realm_id = _first_text(
+            realm_id_header,
+            metadata.get("atagia_realm_id"),
+            metadata.get("realm_id"),
+            metadata.get("active_realm_id"),
+        )
+        space_id = _first_text(
+            space_id_header,
+            metadata.get("atagia_space_id"),
+            metadata.get("space_id"),
+            metadata.get("active_space_id"),
+        )
         operational_profile = _first_text(
             metadata.get("atagia_operational_profile"),
             metadata.get("operational_profile"),
@@ -465,6 +551,19 @@ class OpenAIProxyService:
             metadata.get("atagia_memory_privacy_mode"),
             metadata.get("memory_privacy_mode"),
         )
+        response_mode = _first_text(
+            response_mode_header,
+            metadata.get("atagia_response_mode"),
+            metadata.get("response_mode"),
+            request.response_mode.value if request.response_mode is not None else None,
+        )
+        if response_mode is not None and response_mode not in _RESPONSE_MODE_VALUES:
+            logger.warning(
+                "OpenAI-compatible proxy ignoring invalid response mode %r; "
+                "falling back to the configured default",
+                response_mode,
+            )
+            response_mode = None
         resolved_cross_chat_memory = (
             not incognito
             if incognito is not None
@@ -478,6 +577,12 @@ class OpenAIProxyService:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            mind_id=mind_id,
+            mind_topology=mind_topology,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
             mode=mode,
             incognito=incognito,
             operational_profile=operational_profile,
@@ -494,6 +599,7 @@ class OpenAIProxyService:
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
             memory_privacy_mode=memory_privacy_mode,
+            response_mode=response_mode,
         )
 
     def _llm_request(
@@ -526,6 +632,12 @@ class OpenAIProxyService:
                 "user_persona_id": identity.user_persona_id,
                 "platform_id": identity.platform_id,
                 "character_id": identity.character_id,
+                "active_presence_id": identity.active_presence_id,
+                "mind_id": identity.mind_id,
+                "mind_topology": identity.mind_topology,
+                "embodiment_id": identity.embodiment_id,
+                "realm_id": identity.realm_id,
+                "space_id": identity.space_id,
                 "incognito": identity.incognito,
                 "cross_chat_memory": identity.cross_chat_memory,
                 "message_id": identity.message_id,
@@ -569,6 +681,12 @@ class OpenAIProxyService:
             user_persona_id=identity.user_persona_id,
             platform_id=identity.platform_id,
             character_id=identity.character_id,
+            active_presence_id=identity.active_presence_id,
+            mind_id=identity.mind_id,
+            mind_topology=identity.mind_topology,
+            embodiment_id=identity.embodiment_id,
+            realm_id=identity.realm_id,
+            space_id=identity.space_id,
             mode=identity.mode,
             incognito=identity.incognito,
             message_id=identity.response_message_id,

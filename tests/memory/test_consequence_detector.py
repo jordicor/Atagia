@@ -93,6 +93,7 @@ async def test_consequence_detector_detects_explicit_negative_feedback() -> None
                     "outcome_sentiment": "negative",
                     "confidence": 0.88,
                     "likely_action_message_id": "msg_assistant_1",
+                    "language_codes": ["EN"],
                     "rationale": "Provider-specific explanation field.",
                 }
             )
@@ -117,6 +118,7 @@ async def test_consequence_detector_detects_explicit_negative_feedback() -> None
     assert signal.is_consequence is True
     assert signal.outcome_sentiment.value == "negative"
     assert signal.likely_action_message_id == "msg_assistant_1"
+    assert signal.language_codes == ["en"]
 
 
 @pytest.mark.asyncio
@@ -215,7 +217,11 @@ async def test_consequence_detector_structured_failure_logs_compact_warning(
 ) -> None:
     provider = QueueProvider(["not json"])
     detector = ConsequenceDetector(
-        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        llm_client=LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+            structured_output_retry_attempts=0,
+        ),
         clock=FrozenClock(datetime(2026, 4, 2, 13, 0, tzinfo=timezone.utc)),
         settings=_settings(),
     )

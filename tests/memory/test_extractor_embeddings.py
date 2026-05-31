@@ -16,6 +16,7 @@ from atagia.core.storage_backend import InProcessBackend
 from atagia.memory.extractor import MemoryExtractor
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
 from atagia.models.schemas_memory import ExtractionConversationContext, MemoryStatus
+from atagia.services.embedding_payloads import build_embedding_upsert_payload
 from atagia.services.embeddings import NoneBackend
 from atagia.services.llm_client import (
     LLMClient,
@@ -25,6 +26,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
+from tests.extraction_payload_support import rich_extraction_payload_to_lean
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -34,19 +36,7 @@ class ExtractionProvider(LLMProvider):
     name = "extractor-embeddings"
 
     def __init__(self, payload: dict[str, object]) -> None:
-        normalized_payload = dict(payload)
-        normalized_payload["evidences"] = [
-            (
-                {
-                    **item,
-                    "language_codes": ["en"],
-                }
-                if isinstance(item, dict) and "canonical_text" in item and "language_codes" not in item
-                else item
-            )
-            for item in normalized_payload.get("evidences", [])
-        ]
-        self.payload = normalized_payload
+        self.payload = rich_extraction_payload_to_lean(payload)
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         if request.metadata.get("purpose") == "intent_classifier_explicit":
@@ -300,7 +290,12 @@ async def test_embedding_upsert_failure_still_persists_memory(caplog: pytest.Log
 
 
 @pytest.mark.asyncio
-async def test_protected_verbatim_memories_embed_only_index_text() -> None:
+async def test_preserve_verbatim_lean_memory_embeds_normally_below_protection_threshold() -> None:
+    # The verbatim-protection embedding path requires privacy_level >= 2, which
+    # the lean contract no longer carries (privacy enrichment is deferred, F1.2).
+    # A preserve_verbatim memory therefore persists active at privacy_level 0 and
+    # is embedded normally. The protection logic itself is covered directly by
+    # test_build_embedding_upsert_payload_protects_verbatim_secret below.
     embedding_index = TrackingEmbeddingIndex()
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 4, 10, 0, tzinfo=timezone.utc))
@@ -315,13 +310,11 @@ async def test_protected_verbatim_memories_embed_only_index_text() -> None:
         {
             "evidences": [
                 {
-                    "canonical_text": "Banking card PIN: 4512",
-                    "index_text": "User's banking card credential",
+                    "canonical_text": "I keep my notes in Obsidian",
+                    "index_text": "User's note-taking tool",
                     "scope": "global_user",
                     "confidence": 0.95,
                     "source_kind": "extracted",
-                    "privacy_level": 3,
-                    "memory_category": "pin_or_password",
                     "preserve_verbatim": True,
                     "payload": {},
                 }
@@ -349,7 +342,7 @@ async def test_protected_verbatim_memories_embed_only_index_text() -> None:
             "cnv_1",
             "user",
             1,
-            "My banking card PIN is 4512.",
+            "I keep my notes in Obsidian.",
             6,
             {},
         )
@@ -370,10 +363,36 @@ async def test_protected_verbatim_memories_embed_only_index_text() -> None:
 
         persisted = await memories.list_for_user("usr_1", statuses=None)
         assert len(persisted) == 1
-        assert persisted[0]["status"] == MemoryStatus.PENDING_USER_CONFIRMATION.value
-        assert len(embedding_index.calls) == 0
+        assert persisted[0]["status"] == MemoryStatus.ACTIVE.value
+        assert persisted[0]["privacy_level"] == 0
+        assert len(embedding_index.calls) == 1
+        # Below the protection threshold the canonical text is embedded directly.
+        assert embedding_index.calls[0]["text"] == "I keep my notes in Obsidian"
     finally:
         await connection.close()
+
+
+def test_build_embedding_upsert_payload_protects_verbatim_secret() -> None:
+    # Direct coverage of the verbatim-secret embedding protection that the
+    # extractor integration test used to exercise via model-supplied privacy.
+    payload = build_embedding_upsert_payload(
+        canonical_text="Banking card PIN: 4512",
+        index_text="User's banking card credential",
+        privacy_level=3,
+        preserve_verbatim=True,
+    )
+    assert payload.text == "User's banking card credential"
+    assert payload.index_text is None
+
+
+def test_build_embedding_upsert_payload_requires_index_text_for_protected_secret() -> None:
+    with pytest.raises(ValueError):
+        build_embedding_upsert_payload(
+            canonical_text="Banking card PIN: 4512",
+            index_text=None,
+            privacy_level=3,
+            preserve_verbatim=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -388,6 +407,9 @@ async def test_review_required_memories_do_not_create_embeddings() -> None:
     memories = MemoryObjectRepository(connection, clock)
     await users.create_user("usr_1")
     await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "Chat")
+    # Low confidence (< REVIEW_REQUIRED_CONFIDENCE) forces REVIEW_REQUIRED status
+    # through a lean-expressible signal; the embedding-suppression invariant for
+    # non-active statuses is what this test verifies.
     provider = ExtractionProvider(
         {
             "evidences": [
@@ -395,9 +417,8 @@ async def test_review_required_memories_do_not_create_embeddings() -> None:
                     "canonical_text": "Maybe concise replies would help.",
                     "index_text": "Sensitive preference candidate for debugging.",
                     "scope": "assistant_mode",
-                    "confidence": 0.9,
+                    "confidence": 0.3,
                     "source_kind": "extracted",
-                    "privacy_level": 2,
                     "payload": {},
                 }
             ],

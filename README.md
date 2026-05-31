@@ -171,10 +171,6 @@ Redis accelerates queues and caching but is optional.
 - Coordinate inspector tooling for admin/dev surfaces (memory coordinates, retrieval custody decisions, coordinate-correction audit with cache invalidation)
 - Library mode, REST API, MCP server
 - LoCoMo benchmark harness with ablation and replay
-- Benchmark privacy diagnostics: retained-DB replay can run with
-  privacy/sensitivity/intimacy enforcement disabled or audited after the
-  required `user_id` partition, including late candidate and composer gates, so
-  retrieval quality can be measured before policy gates are layered back on.
 
 **In progress**
 
@@ -338,20 +334,13 @@ Default runtime expects both `ATAGIA_OPENROUTER_API_KEY` and
 and retrieval intelligence, OpenRouter-hosted DeepSeek v4 Flash handles cheap
 ordinary chat answers, and Anthropic Claude Sonnet remains the default for
 privacy/consent/export-sensitive components. To run every component on one
-provider, set `ATAGIA_LLM_FORCED_GLOBAL_MODEL`; do not use that mode for
-retrieval-quality comparisons unless the test is explicitly about one-model
-routing. Benchmark CLIs default to direct Anthropic Opus 4.7 for judging so
-OpenRouter schema/JSON issues do not pollute code and retrieval diagnostics.
-Use the stable Gemini Flash-Lite slug without `-preview`; the preview endpoint
-is deprecated and scheduled for shutdown on May 25, 2026.
-Structured-output calls also perform one same-model corrective retry after
-JSON/schema validation fails; an optional rescue path can escalate only the
-stuck structured-output calls to direct Anthropic Opus 4.7 by default, with
-counts surfaced in benchmark LLM call summaries.
-Full configuration — embedding backends, model routing evidence, structured
-output repair, intimacy fallback policy, debug LLM I/O — is documented in
-[docs/CONFIGURATION_REFERENCE.md](docs/CONFIGURATION_REFERENCE.md) and
-[docs/MODEL_ROUTING_NOTES.md](docs/MODEL_ROUTING_NOTES.md).
+provider, set `ATAGIA_LLM_FORCED_GLOBAL_MODEL`. Use the stable Gemini
+Flash-Lite slug without `-preview`. Structured-output calls perform one
+same-model corrective retry after JSON/schema validation fails, with an
+optional rescue path that escalates only the stuck calls to a stronger model.
+Full configuration — embedding backends, model routing, structured output
+repair, intimacy fallback policy, debug LLM I/O — is documented in
+[docs/CONFIGURATION_REFERENCE.md](docs/CONFIGURATION_REFERENCE.md).
 
 ## Stack
 
@@ -382,15 +371,6 @@ some ground-truth issues in the dataset are still being audited.
 Current numbers are development signals. Public baselines are not yet frozen.
 Use the harness for regression tracking and reproducibility, not as a
 competitive claim.
-
-Retrieval and privacy are validated in stages. Controlled benchmark diagnostics
-must first show that the system can retrieve and use the right fact without
-active privacy/sensitivity/intimacy gates beyond `user_id`; only then should
-policy gates be enabled and measured as a separate delta. The 2026-05-12
-Atagia-bench `ben-q20` run is the cautionary example: privacy gates hid a
-summary containing the `$2,800` apartment budget, but privacy-off replay also
-revealed a deeper planner/scope/summary-level miss. Privacy should protect a
-working retrieval path, not obscure whether that path works.
 
 ## Research
 

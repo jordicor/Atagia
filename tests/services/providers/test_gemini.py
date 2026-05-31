@@ -10,6 +10,7 @@ import pytest
 from google.genai import errors as genai_errors
 
 from atagia.core.config import Settings
+from atagia.models.schemas_memory import ExtractionResult
 from atagia.services.llm_client import (
     ConfigurationError,
     LLMCompletionRequest,
@@ -21,6 +22,7 @@ from atagia.services.llm_client import (
     LLMMessage,
     LLMPolicyBlockedError,
     LLMProvider,
+    LLMRequestError,
     LLMToolSpec,
     OutputLimitExceededError,
     TransientLLMError,
@@ -129,10 +131,34 @@ def _request(**overrides) -> LLMCompletionRequest:
             LLMMessage(role="user", content="Hello"),
         ],
         "temperature": 0.2,
-        "max_output_tokens": 256,
+        "max_output_tokens": 8192,
     }
     payload.update(overrides)
     return LLMCompletionRequest(**payload)
+
+
+def _count_schema_key(node, key_name: str) -> int:
+    if isinstance(node, list):
+        return sum(_count_schema_key(item, key_name) for item in node)
+    if not isinstance(node, dict):
+        return 0
+    return (1 if key_name in node else 0) + sum(
+        _count_schema_key(value, key_name) for value in node.values()
+    )
+
+
+def _count_null_type(node) -> int:
+    if isinstance(node, list):
+        return sum(_count_null_type(item) for item in node)
+    if not isinstance(node, dict):
+        return 0
+    node_type = node.get("type")
+    count = (
+        1
+        if node_type == "null" or (isinstance(node_type, list) and "null" in node_type)
+        else 0
+    )
+    return count + sum(_count_null_type(value) for value in node.values())
 
 
 async def _collect_stream_events_and_error(provider: GeminiProvider):
@@ -182,7 +208,7 @@ async def test_gemini_complete_maps_text_and_request_shape() -> None:
     assert call["contents"][0].parts[0].text == "Hello"
     assert call["config"].system_instruction == "You are helpful."
     assert call["config"].temperature == 0.2
-    assert call["config"].max_output_tokens == 256
+    assert call["config"].max_output_tokens == 8192
     assert call["config"].thinking_config.include_thoughts is True
     from google.genai import types as genai_types
     assert call["config"].thinking_config.thinking_level == genai_types.ThinkingLevel.HIGH
@@ -264,7 +290,7 @@ async def test_gemini_complete_uses_structured_output_and_sanitizes_schema() -> 
     assert schema["properties"]["status"] == {"type": "string", "enum": ["ok", "warning"]}
     assert "minimum" not in schema["properties"]["score"]
     assert "maximum" not in schema["properties"]["score"]
-    assert schema["properties"]["note"] == {"type": "string", "nullable": True}
+    assert schema["properties"]["note"] == {"type": "string"}
 
 
 @pytest.mark.asyncio
@@ -507,6 +533,21 @@ async def test_gemini_stream_maps_text_tool_call_and_done() -> None:
 
 
 @pytest.mark.asyncio
+async def test_gemini_stream_does_not_duplicate_response_parts_helper() -> None:
+    parts = [_part(text='{"summary": "ok"}')]
+    response = _response(parts=parts, usage=None)
+    response.parts = parts
+    stream = FakeAsyncStream([response])
+    models = FakeGeminiModels(stream_response=stream)
+    provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
+
+    events = [event async for event in provider.stream(_request())]
+
+    assert [event.type for event in events] == ["text", "done"]
+    assert events[0].content == '{"summary": "ok"}'
+
+
+@pytest.mark.asyncio
 async def test_gemini_stream_propagates_errors_after_partial_output() -> None:
     stream_error = RuntimeError("stream broke")
     stream = FakeAsyncStream([_response(parts=[_part(text="partial")])], error=stream_error)
@@ -642,7 +683,23 @@ async def test_gemini_maps_errors(error_factory, expected_error) -> None:
         await provider.complete(_request())
 
 
-def test_gemini_schema_sanitizer_handles_nested_refs_arrays_and_nullable() -> None:
+@pytest.mark.asyncio
+async def test_gemini_maps_400_invalid_argument_to_request_error() -> None:
+    error = genai_errors.ClientError(
+        400,
+        {"error": {"code": 400, "message": "bad schema", "status": "INVALID_ARGUMENT"}},
+    )
+    models = FakeGeminiModels(error=error)
+    provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
+
+    with pytest.raises(LLMRequestError) as exc_info:
+        await provider.complete(_request())
+    assert exc_info.value.status_code == 400
+    assert isinstance(exc_info.value, LLMError)
+    assert not isinstance(exc_info.value, TransientLLMError)
+
+
+def test_gemini_schema_sanitizer_handles_nested_refs_arrays_and_strips_nullable() -> None:
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -676,14 +733,21 @@ def test_gemini_schema_sanitizer_handles_nested_refs_arrays_and_nullable() -> No
     assert "$defs" not in sanitized
     profile = sanitized["properties"]["profile"]
     assert "additionalProperties" not in profile
-    assert profile["properties"]["age"] == {"type": "integer", "nullable": True}
+    assert profile["properties"]["age"] == {"type": "integer"}
     assert "minItems" not in profile["properties"]["tags"]
     assert "maxItems" not in profile["properties"]["tags"]
     assert profile["properties"]["tags"]["items"] == {
         "type": "string",
         "enum": ["a", "b"],
     }
-    assert sanitized["properties"]["alias"] == {"type": "string", "nullable": True}
+    assert sanitized["properties"]["alias"] == {"type": "string"}
+
+
+def test_gemini_schema_sanitizer_strips_extraction_result_nullability() -> None:
+    sanitized = _sanitize_schema_for_gemini(ExtractionResult.model_json_schema())
+
+    assert _count_schema_key(sanitized, "nullable") == 0
+    assert _count_null_type(sanitized) == 0
 
 
 def test_gemini_schema_sanitizer_rejects_unresolved_ref() -> None:

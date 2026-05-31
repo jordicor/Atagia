@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from dataclasses import dataclass, field
+from collections import Counter
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
+from inspect import isawaitable
 from threading import Lock
 from time import monotonic
 from typing import Any
@@ -12,6 +15,120 @@ from uuid import uuid4
 
 from atagia.core.ids import generate_prefixed_id
 from atagia.models.schemas_jobs import StreamMessage
+
+
+DrainProgressCallback = Callable[
+    ["StorageDrainSnapshot"],
+    Awaitable[bool | None] | bool | None,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class StorageDrainSnapshot:
+    """Point-in-time view of transient stream work during a drain."""
+
+    queued_by_stream: dict[str, int] = field(default_factory=dict)
+    pending_by_stream: dict[str, int] = field(default_factory=dict)
+    pending_job_types: dict[str, int] = field(default_factory=dict)
+    active_jobs: tuple[dict[str, Any], ...] = ()
+    added_by_stream: dict[str, int] = field(default_factory=dict)
+    read_by_stream: dict[str, int] = field(default_factory=dict)
+    claimed_by_stream: dict[str, int] = field(default_factory=dict)
+    acked_by_stream: dict[str, int] = field(default_factory=dict)
+    elapsed_seconds: float = 0.0
+    idle_seconds: float = 0.0
+    timeout_seconds: float | None = None
+    idle_timeout_seconds: float | None = None
+
+    @property
+    def total_queued(self) -> int:
+        return sum(self.queued_by_stream.values())
+
+    @property
+    def total_pending(self) -> int:
+        return sum(self.pending_by_stream.values())
+
+    @property
+    def total_added(self) -> int:
+        return sum(self.added_by_stream.values())
+
+    @property
+    def total_read(self) -> int:
+        return sum(self.read_by_stream.values())
+
+    @property
+    def total_claimed(self) -> int:
+        return sum(self.claimed_by_stream.values())
+
+    @property
+    def total_acked(self) -> int:
+        return sum(self.acked_by_stream.values())
+
+    @property
+    def drained(self) -> bool:
+        return self.total_queued == 0 and self.total_pending == 0
+
+    def with_timing(
+        self,
+        *,
+        elapsed_seconds: float,
+        idle_seconds: float,
+        timeout_seconds: float | None,
+        idle_timeout_seconds: float | None,
+    ) -> "StorageDrainSnapshot":
+        return replace(
+            self,
+            elapsed_seconds=elapsed_seconds,
+            idle_seconds=idle_seconds,
+            timeout_seconds=timeout_seconds,
+            idle_timeout_seconds=idle_timeout_seconds,
+        )
+
+    def progress_marker(self) -> tuple[tuple[tuple[str, int], ...], ...]:
+        """Stable marker that changes when stream work moves forward."""
+        return (
+            tuple(sorted(self.queued_by_stream.items())),
+            tuple(sorted(self.pending_by_stream.items())),
+            tuple(sorted(self.added_by_stream.items())),
+            tuple(sorted(self.read_by_stream.items())),
+            tuple(sorted(self.claimed_by_stream.items())),
+            tuple(sorted(self.acked_by_stream.items())),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "queued_by_stream": dict(sorted(self.queued_by_stream.items())),
+            "pending_by_stream": dict(sorted(self.pending_by_stream.items())),
+            "pending_job_types": dict(sorted(self.pending_job_types.items())),
+            "active_jobs": [dict(job) for job in self.active_jobs],
+            "added_by_stream": dict(sorted(self.added_by_stream.items())),
+            "read_by_stream": dict(sorted(self.read_by_stream.items())),
+            "claimed_by_stream": dict(sorted(self.claimed_by_stream.items())),
+            "acked_by_stream": dict(sorted(self.acked_by_stream.items())),
+            "total_queued": self.total_queued,
+            "total_pending": self.total_pending,
+            "total_added": self.total_added,
+            "total_read": self.total_read,
+            "total_claimed": self.total_claimed,
+            "total_acked": self.total_acked,
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "idle_seconds": round(self.idle_seconds, 3),
+            "timeout_seconds": self.timeout_seconds,
+            "idle_timeout_seconds": self.idle_timeout_seconds,
+            "drained": self.drained,
+        }
+
+
+async def emit_drain_progress(
+    callback: DrainProgressCallback | None,
+    snapshot: StorageDrainSnapshot,
+) -> bool:
+    if callback is None:
+        return False
+    result = callback(snapshot)
+    if isawaitable(result):
+        result = await result
+    return bool(result)
 
 
 def extract_context_view_user_id(context_view: dict[str, Any]) -> str | None:
@@ -157,9 +274,23 @@ class StorageBackend:
     async def stream_ensure_group(self, stream_name: str, group_name: str) -> None:
         raise NotImplementedError
 
-    async def drain(self, timeout_seconds: float = 30.0) -> bool:
+    async def drain_snapshot(self) -> StorageDrainSnapshot:
+        """Return transient stream drain state when supported."""
+        return StorageDrainSnapshot()
+
+    async def drain(
+        self,
+        timeout_seconds: float = 30.0,
+        *,
+        idle_timeout_seconds: float | None = None,
+        progress_interval_seconds: float = 0.0,
+        progress_callback: DrainProgressCallback | None = None,
+    ) -> bool:
         """Wait for transient stream work to drain when supported."""
         del timeout_seconds
+        del idle_timeout_seconds
+        del progress_interval_seconds
+        del progress_callback
         return False
 
     async def remember_dedupe(self, key: str, ttl_seconds: int) -> bool:
@@ -202,6 +333,10 @@ class InProcessBackend(StorageBackend):
     _queues: dict[str, asyncio.Queue[dict[str, Any]]] = field(default_factory=dict)
     _stream_pending: dict[tuple[str, str], dict[str, dict[str, Any]]] = field(default_factory=dict)
     _stream_groups: set[tuple[str, str]] = field(default_factory=set)
+    _stream_add_counts: dict[str, int] = field(default_factory=dict)
+    _stream_read_counts: dict[str, int] = field(default_factory=dict)
+    _stream_claim_counts: dict[str, int] = field(default_factory=dict)
+    _stream_ack_counts: dict[str, int] = field(default_factory=dict)
     _pending_job_count: int = 0
     # Keep this critical section trivial: these async methods must not await while
     # holding the lock, or they would block the event loop thread.
@@ -448,6 +583,10 @@ class InProcessBackend(StorageBackend):
             f"stream:{stream_name}",
             {"message_id": message_id, "payload": copy.deepcopy(payload)},
         )
+        with self._guard:
+            self._stream_add_counts[stream_name] = (
+                self._stream_add_counts.get(stream_name, 0) + 1
+            )
         return message_id
 
     async def stream_read(
@@ -480,6 +619,9 @@ class InProcessBackend(StorageBackend):
                     "last_delivered_at": monotonic(),
                 }
                 self._pending_job_count += 1
+                self._stream_read_counts[stream_name] = (
+                    self._stream_read_counts.get(stream_name, 0) + 1
+                )
             messages.append(
                 StreamMessage(
                     message_id=message_id,
@@ -515,6 +657,9 @@ class InProcessBackend(StorageBackend):
                 delivery_count = int(entry.get("delivery_count", 1)) + 1
                 entry["delivery_count"] = delivery_count
                 entry["last_delivered_at"] = now
+                self._stream_claim_counts[stream_name] = (
+                    self._stream_claim_counts.get(stream_name, 0) + 1
+                )
                 messages.append(
                     StreamMessage(
                         message_id=message_id,
@@ -530,26 +675,125 @@ class InProcessBackend(StorageBackend):
             removed = pending.pop(message_id, None)
             if removed is not None and self._pending_job_count > 0:
                 self._pending_job_count -= 1
+            if removed is not None:
+                self._stream_ack_counts[stream_name] = (
+                    self._stream_ack_counts.get(stream_name, 0) + 1
+                )
 
     async def stream_ensure_group(self, stream_name: str, group_name: str) -> None:
         with self._guard:
             self._stream_groups.add((stream_name, group_name))
 
-    async def drain(self, timeout_seconds: float = 30.0) -> bool:
-        deadline = monotonic() + max(0.0, timeout_seconds)
+    async def drain_snapshot(self) -> StorageDrainSnapshot:
+        now = monotonic()
+        with self._guard:
+            queued_by_stream = {
+                queue_name.removeprefix("stream:"): queue.qsize()
+                for queue_name, queue in self._queues.items()
+                if queue_name.startswith("stream:")
+            }
+            pending_by_stream: Counter[str] = Counter()
+            pending_job_types: Counter[str] = Counter()
+            active_job_entries: list[tuple[float, dict[str, Any]]] = []
+            for (stream_name, group_name), pending in self._stream_pending.items():
+                if not pending:
+                    continue
+                pending_by_stream[stream_name] += len(pending)
+                for message_id, entry in pending.items():
+                    payload = entry.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    job_type = str(payload.get("job_type") or "unknown")
+                    pending_job_types[job_type] += 1
+                    last_delivered_at = float(entry.get("last_delivered_at", 0.0) or 0.0)
+                    nested_payload = payload.get("payload")
+                    active_job_entries.append(
+                        (
+                            last_delivered_at,
+                            {
+                                "stream": stream_name,
+                                "group": group_name,
+                                "message_id": message_id,
+                                "job_id": payload.get("job_id"),
+                                "job_type": job_type,
+                                "conversation_id": payload.get("conversation_id"),
+                                "message_ids": list(payload.get("message_ids") or [])[:5],
+                                "payload_message_id": (
+                                    nested_payload.get("message_id")
+                                    if isinstance(nested_payload, dict)
+                                    else None
+                                ),
+                                "delivery_count": int(entry.get("delivery_count", 1) or 1),
+                                "seconds_pending": round(
+                                    max(0.0, now - last_delivered_at),
+                                    3,
+                                ),
+                            },
+                        )
+                    )
+            active_job_entries.sort(key=lambda item: item[0])
+            return StorageDrainSnapshot(
+                queued_by_stream=dict(queued_by_stream),
+                pending_by_stream=dict(pending_by_stream),
+                pending_job_types=dict(pending_job_types),
+                active_jobs=tuple(entry for _, entry in active_job_entries[:8]),
+                added_by_stream=dict(self._stream_add_counts),
+                read_by_stream=dict(self._stream_read_counts),
+                claimed_by_stream=dict(self._stream_claim_counts),
+                acked_by_stream=dict(self._stream_ack_counts),
+            )
+
+    async def drain(
+        self,
+        timeout_seconds: float = 30.0,
+        *,
+        idle_timeout_seconds: float | None = None,
+        progress_interval_seconds: float = 0.0,
+        progress_callback: DrainProgressCallback | None = None,
+    ) -> bool:
+        timeout = max(0.0, timeout_seconds)
+        idle_timeout = (
+            None
+            if idle_timeout_seconds is None
+            else max(0.0, idle_timeout_seconds)
+        )
+        started_at = monotonic()
+        deadline = started_at + timeout
+        last_progress_at = started_at
+        last_marker: tuple[tuple[tuple[str, int], ...], ...] | None = None
+        progress_interval = max(0.0, progress_interval_seconds)
+        next_progress_at = started_at + progress_interval
         while True:
-            with self._guard:
-                stream_queues_empty = all(
-                    queue.empty()
-                    for queue_name, queue in self._queues.items()
-                    if queue_name.startswith("stream:")
+            now = monotonic()
+            snapshot = (await self.drain_snapshot()).with_timing(
+                elapsed_seconds=now - started_at,
+                idle_seconds=now - last_progress_at,
+                timeout_seconds=timeout,
+                idle_timeout_seconds=idle_timeout,
+            )
+            marker = snapshot.progress_marker()
+            if last_marker is None:
+                last_marker = marker
+            elif marker != last_marker:
+                last_marker = marker
+                last_progress_at = now
+                snapshot = snapshot.with_timing(
+                    elapsed_seconds=now - started_at,
+                    idle_seconds=0.0,
+                    timeout_seconds=timeout,
+                    idle_timeout_seconds=idle_timeout,
                 )
-                drained = stream_queues_empty and self._pending_job_count == 0
-            if drained:
+            if snapshot.drained:
                 return True
+            if progress_callback is not None and now >= next_progress_at:
+                if await emit_drain_progress(progress_callback, snapshot):
+                    last_progress_at = now
+                next_progress_at = now + max(progress_interval, 0.01)
+            if idle_timeout is not None and monotonic() - last_progress_at >= idle_timeout:
+                return False
             if monotonic() >= deadline:
                 return False
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
 
     async def remember_dedupe(self, key: str, ttl_seconds: int) -> bool:
         with self._guard:
@@ -608,6 +852,10 @@ class InProcessBackend(StorageBackend):
             self._queues.clear()
             self._stream_pending.clear()
             self._stream_groups.clear()
+            self._stream_add_counts.clear()
+            self._stream_read_counts.clear()
+            self._stream_claim_counts.clear()
+            self._stream_ack_counts.clear()
             self._pending_job_count = 0
 
 

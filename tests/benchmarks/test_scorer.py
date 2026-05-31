@@ -23,8 +23,10 @@ class JudgeProvider(LLMProvider):
 
     def __init__(self, outputs: Iterator[str]) -> None:
         self._outputs = iter(outputs)
+        self.requests: list[LLMCompletionRequest] = []
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.requests.append(request)
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
@@ -78,6 +80,40 @@ async def test_judge_incorrect() -> None:
 
     assert result.score == 0
     assert result.reasoning == "Wrong fact."
+
+
+@pytest.mark.asyncio
+async def test_judge_includes_official_source_evidence_when_available() -> None:
+    provider = JudgeProvider(
+        iter(['{"verdict": 1, "reasoning": "Source-supported year."}'])
+    )
+    scorer = LLMJudgeScorer(
+        LLMClient(provider_name="judge-tests", providers=[provider]),
+        judge_model="judge-model",
+    )
+
+    result = await scorer.score(
+        question="Is Elena expecting a baby, and if so, when?",
+        prediction="Elena is expecting a baby in May 2026.",
+        ground_truth="Elena is expecting a baby in May.",
+        source_evidence=[
+            {
+                "turn_id": "rosa-04-t07",
+                "timestamp": "2025-12-02T11:07:00",
+                "speaker": "user",
+                "text": "She is expecting a baby. She is due in May.",
+            }
+        ],
+    )
+
+    assert result.score == 1
+    assert provider.requests[0].metadata["source_evidence_used"] is True
+    system_prompt = provider.requests[0].messages[0].content
+    assert "official source evidence" in system_prompt.lower()
+    assert "Temporal specificity rule" in system_prompt
+    assert "next applicable future occurrence" in system_prompt
+    assert "timestamp=2025-12-02T11:07:00" in provider.requests[0].messages[1].content
+    assert "May 2026" in provider.requests[0].messages[1].content
 
 
 @pytest.mark.asyncio

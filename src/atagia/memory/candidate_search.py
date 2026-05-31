@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
 import re
@@ -12,6 +13,11 @@ import aiosqlite
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.artifact_repository import ArtifactRepository
+from atagia.core.memory_fact_facet_repository import fact_facet_value_key
+from atagia.core.language_codes import (
+    ISO_639_1_LANGUAGE_CODES,
+    normalize_optional_iso_639_1_code,
+)
 from atagia.core.repositories import (
     MemoryObjectRepository,
     MessageRepository,
@@ -39,7 +45,10 @@ from atagia.memory.realm_policy import (
     candidate_allows_realm_boundary,
     realm_visibility_sql_clause,
 )
-from atagia.memory.retrieval_planner import build_retrieval_fts_queries
+from atagia.memory.retrieval_planner import (
+    RetrievalFtsQuerySpec,
+    build_retrieval_fts_queries,
+)
 from atagia.memory.space_policy import (
     candidate_allows_space_boundary,
     space_visibility_sql_clause,
@@ -50,7 +59,9 @@ from atagia.models.schemas_memory import (
     MemoryScope,
     MemorySourceKind,
     MemoryStatus,
+    MindTopology,
     RetrievalPlan,
+    RuntimeAliasGroupTrace,
     SpaceBoundaryMode,
     SummaryViewKind,
 )
@@ -70,22 +81,26 @@ _CHANNEL_ORDER = (
     "verbatim_pin",
     "artifact_chunk",
     "fts",
+    "fact_facet",
     "embedding",
     "consequence",
     "verbatim_evidence_search",
 )
 _QUERY_TYPE_CHANNEL_MULTIPLIERS: dict[str, dict[str, float]] = {
     "slot_fill": {
+        "fact_facet": 1.15,
         "embedding": 0.75,
         "consequence": 0.85,
         "verbatim_evidence_search": 1.15,
     },
     "temporal": {
+        "fact_facet": 1.20,
         "embedding": 0.75,
         "consequence": 0.85,
         "verbatim_evidence_search": 1.20,
     },
     "broad_list": {
+        "fact_facet": 1.25,
         "verbatim_pin": 0.90,
         "artifact_chunk": 0.90,
         "fts": 0.90,
@@ -94,6 +109,7 @@ _QUERY_TYPE_CHANNEL_MULTIPLIERS: dict[str, dict[str, float]] = {
     },
 }
 _EXACT_RECALL_CHANNEL_MULTIPLIERS: dict[str, float] = {
+    "fact_facet": 1.25,
     "embedding": 0.65,
     "consequence": 0.85,
     "verbatim_evidence_search": 1.25,
@@ -113,9 +129,23 @@ _CHANNEL_OVERFETCH_MULTIPLIER = 2
 _TEMPORAL_OVERLAP_PRIORITY = 0
 _TEMPORAL_UNKNOWN_PRIORITY = 1
 _TEMPORAL_NON_OVERLAP_PRIORITY = 2
+_SQL_LIKE_ESCAPE = "\\"
+_SQL_LIKE_ESCAPE_CLAUSE = f"ESCAPE '{_SQL_LIKE_ESCAPE}'"
 _STALE_EPHEMERAL_PRIORITY = 1
 _SKIPPED_RAW_VERBATIM_MAX_CHARS = 12000
 _SKIPPED_RAW_VERBATIM_SNIPPET_MAX_CHARS = 2000
+_CORPUS_NEAR_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
+_CORPUS_NEAR_MIN_TOKEN_LENGTH = 5
+_CORPUS_NEAR_MAX_SOURCE_TOKENS = 6
+_CORPUS_NEAR_MAX_TERMS = 6
+_CORPUS_NEAR_MAX_TERMS_PER_TOKEN = 2
+_CORPUS_NEAR_ROW_SCAN_LIMIT = 200
+_RUNTIME_ALIAS_FTS_ALLOWED_ANCHOR_TYPES = frozenset({"concept", "attribute"})
+_RUNTIME_ALIAS_FTS_MAX_TERMS = 8
+_RUNTIME_ALIAS_FTS_KIND = "runtime_alias_or"
+_RUNTIME_ALIAS_FTS_SOURCE = "alias_anchor"
+_PERSISTED_SURFACE_FTS_SOURCE = "persisted_surface"
+_PERSISTED_SURFACE_FTS_KIND_PREFIX = "persisted_surface_"
 _SENSITIVITY_RANK = {
     "unknown": 0,
     "public": 1,
@@ -143,6 +173,76 @@ def _sql_float_literal(value: float) -> str:
     if not math.isfinite(resolved) or resolved <= 0.0:
         raise ValueError(f"Unsafe BM25 column weight: {value!r}")
     return format(resolved, ".12g")
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceMessageMetadataRows:
+    """Batched memory metadata linked to a verbatim source-message window."""
+
+    rows: list[dict[str, Any]]
+
+    def pending_message_ids(self) -> set[str]:
+        return {
+            str(row["message_id"])
+            for row in self.rows
+            if str(row.get("status") or "")
+            == MemoryStatus.PENDING_USER_CONFIRMATION.value
+            and str(row.get("message_id") or "").strip()
+        }
+
+    def metadata_for_source_message_ids(
+        self,
+        source_message_ids: list[str],
+    ) -> tuple[int, dict[str, Any], str, float]:
+        source_id_set = {
+            str(message_id).strip()
+            for message_id in source_message_ids
+            if str(message_id).strip()
+        }
+        rows = [
+            row
+            for row in self.rows
+            if str(row.get("message_id") or "").strip() in source_id_set
+        ]
+        privacy_level = max(
+            (int(row.get("privacy_level") or 0) for row in rows),
+            default=0,
+        )
+        high_risk_metadata = self._high_risk_metadata(rows)
+        boundary = strongest_intimacy_boundary(rows)
+        confidences = [
+            float(row.get("intimacy_boundary_confidence", 0.0) or 0.0)
+            for row in rows
+            if str(row.get("intimacy_boundary") or "ordinary") == boundary.value
+        ]
+        return (
+            privacy_level,
+            high_risk_metadata,
+            boundary.value,
+            max(confidences, default=0.0),
+        )
+
+    @staticmethod
+    def _high_risk_metadata(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        active_rows = [
+            row
+            for row in rows
+            if str(row.get("status") or "") == MemoryStatus.ACTIVE.value
+        ]
+        if not active_rows:
+            return {}
+        if any(
+            str(row.get("memory_category") or "")
+            == MemoryCategory.PIN_OR_PASSWORD.value
+            for row in active_rows
+        ):
+            return {
+                "memory_category": MemoryCategory.PIN_OR_PASSWORD.value,
+                "preserve_verbatim": True,
+            }
+        if any(bool(row.get("preserve_verbatim")) for row in active_rows):
+            return {"preserve_verbatim": True}
+        return {}
 
 
 class CandidateSearch:
@@ -175,11 +275,20 @@ class CandidateSearch:
         self._verbatim_evidence_search_limit = int(self._settings.verbatim_evidence_search_limit)
         self._verbatim_evidence_window_size = int(self._settings.verbatim_evidence_window_size)
         self._verbatim_evidence_window_overlap = int(self._settings.verbatim_evidence_window_overlap)
+        self._fact_facet_retrieval_enabled = self._settings.fact_facet_retrieval_enabled
+        self._fact_facet_structured_only = self._settings.fact_facet_structured_only
+        self._fact_facet_retrieval_limit = int(self._settings.fact_facet_retrieval_limit)
+        self._fact_facet_retrieval_weight = float(
+            self._settings.fact_facet_retrieval_rrf_weight
+        )
 
     async def search(
         self,
         plan: RetrievalPlan,
         user_id: str,
+        *,
+        fts_query_audit: list[dict[str, Any]] | None = None,
+        runtime_alias_groups: list[RuntimeAliasGroupTrace] | None = None,
     ) -> list[dict[str, Any]]:
         if plan.skip_retrieval or plan.max_candidates <= 0:
             return []
@@ -229,43 +338,222 @@ class CandidateSearch:
             visibility_clause=conversation_visibility_clause("mo"),
             memory_bm25_sql=self._memory_bm25_sql,
         )
+        surface_diagnostic_query = """
+            SELECT
+                mrs.id AS surface_id,
+                mo.id AS memory_id
+            FROM memory_retrieval_surfaces_fts
+            JOIN memory_retrieval_surfaces AS mrs
+              ON mrs._rowid = memory_retrieval_surfaces_fts.rowid
+            JOIN memory_objects AS mo
+              ON mo.id = mrs.memory_id
+             AND mo.user_id = mrs.user_id
+            WHERE mrs.user_id = ?
+              AND mo.user_id = ?
+              AND mrs.status = 'active'
+              AND mrs.non_evidential = 1
+              AND {visibility_clauses}
+              AND mo.status IN ({status_placeholders})
+              AND {privacy_filter}
+              AND {intimacy_filter}
+              AND ({retrieval_level_clauses})
+              AND mo.archived_by_conversation_id IS NULL
+              AND {visibility_clause}
+              AND memory_retrieval_surfaces_fts MATCH ?
+            ORDER BY mrs.updated_at DESC, mrs.id ASC
+            LIMIT ?
+        """.format(
+            visibility_clauses=" AND ".join(visibility_clauses),
+            status_placeholders=status_placeholders,
+            privacy_filter=privacy_filter,
+            retrieval_level_clauses=" OR ".join(retrieval_level_clauses),
+            intimacy_filter=intimacy_filter,
+            visibility_clause=conversation_visibility_clause("mo"),
+        )
+        surface_candidate_query = """
+            SELECT
+                mo.*,
+                0.0 AS rank
+            FROM memory_retrieval_surfaces_fts
+            JOIN memory_retrieval_surfaces AS mrs
+              ON mrs._rowid = memory_retrieval_surfaces_fts.rowid
+            JOIN memory_objects AS mo
+              ON mo.id = mrs.memory_id
+             AND mo.user_id = mrs.user_id
+            WHERE mrs.user_id = ?
+              AND mo.user_id = ?
+              AND mrs.status = 'active'
+              AND mrs.non_evidential = 1
+              AND mrs.preserve_verbatim = 0
+              AND {visibility_clauses}
+              AND mo.status IN ({status_placeholders})
+              AND {privacy_filter}
+              AND {intimacy_filter}
+              AND ({retrieval_level_clauses})
+              AND mo.archived_by_conversation_id IS NULL
+              AND {visibility_clause}
+              AND memory_retrieval_surfaces_fts MATCH ?
+            ORDER BY {temporal_order_case}{scope_order_case}, mrs.updated_at DESC, mo.updated_at DESC, mo.id ASC
+            LIMIT ?
+        """.format(
+            visibility_clauses=" AND ".join(visibility_clauses),
+            status_placeholders=status_placeholders,
+            privacy_filter=privacy_filter,
+            retrieval_level_clauses=" OR ".join(retrieval_level_clauses),
+            temporal_order_case=temporal_order_case,
+            scope_order_case=scope_order_case,
+            intimacy_filter=intimacy_filter,
+            visibility_clause=conversation_visibility_clause("mo"),
+        )
 
         aggregated: dict[str, dict[str, Any]] = {}
         for sub_query in plan.sub_query_plans:
             sub_query_aggregated: dict[str, dict[str, Any]] = {}
-            for fts_query in sub_query.fts_queries:
-                parameters = (
-                    user_id,
-                    *visibility_parameters,
-                    *(status.value for status in plan.status_filter),
-                    *privacy_parameters,
-                    *retrieval_level_parameters,
-                    plan.conversation_id,
-                    fts_query,
-                    *self._temporal_order_parameters(plan),
-                    fts_limit,
+            sub_query_memory_fts_raw_rows = 0
+            executed_fts_queries: set[str] = set()
+            persisted_surface_search_enabled = (
+                plan.exact_recall_mode or plan.query_type == "slot_fill"
+            )
+            for fts_query_index, fts_query in enumerate(sub_query.fts_queries):
+                fts_query_kind = self._fts_query_kind_at(
+                    sub_query,
+                    fts_query_index,
                 )
-                cursor = await self._connection.execute(query, parameters)
-                rows = await cursor.fetchall()
-                decoded_rows = [
-                    decoded
-                    for decoded in (_decode_json_columns(row) for row in rows)
-                    if decoded is not None
-                ]
-                await self._annotate_overseer_grants(decoded_rows, plan)
-                await self._annotate_realm_bridge_modes(decoded_rows, plan)
-                fts_candidates = self._assign_position_ranks(
-                    [
-                        self._annotate_fts_candidate(decoded)
-                        for decoded in decoded_rows
-                    ]
+                fts_candidates, raw_rows = await self._search_memory_fts_query(
+                    query,
+                    user_id=user_id,
+                    visibility_parameters=visibility_parameters,
+                    status_values=[status.value for status in plan.status_filter],
+                    privacy_parameters=privacy_parameters,
+                    retrieval_level_parameters=retrieval_level_parameters,
+                    plan=plan,
+                    sub_query_text=str(sub_query.text),
+                    fts_query=str(fts_query),
+                    fts_query_kind=fts_query_kind,
+                    fts_limit=fts_limit,
+                    fts_query_audit=fts_query_audit,
                 )
+                sub_query_memory_fts_raw_rows += raw_rows
+                executed_fts_queries.add(str(fts_query))
+                if persisted_surface_search_enabled:
+                    surface_candidates, surface_raw_rows = await self._search_persisted_surface_fts_query(
+                        surface_candidate_query,
+                        user_id=user_id,
+                        visibility_parameters=visibility_parameters,
+                        status_values=[status.value for status in plan.status_filter],
+                        privacy_parameters=privacy_parameters,
+                        retrieval_level_parameters=retrieval_level_parameters,
+                        plan=plan,
+                        sub_query_text=str(sub_query.text),
+                        fts_query=str(fts_query),
+                        fts_query_kind=fts_query_kind,
+                        fts_limit=fts_limit,
+                        fts_query_audit=fts_query_audit,
+                    )
+                    sub_query_memory_fts_raw_rows += surface_raw_rows
+                    self._merge_channel_candidates(
+                        sub_query_aggregated,
+                        surface_candidates,
+                        channel="fts",
+                        plan=plan,
+                    )
+                else:
+                    await self._audit_persisted_surface_fts_query(
+                        surface_diagnostic_query,
+                        user_id=user_id,
+                        visibility_parameters=visibility_parameters,
+                        status_values=[status.value for status in plan.status_filter],
+                        privacy_parameters=privacy_parameters,
+                        retrieval_level_parameters=retrieval_level_parameters,
+                        plan=plan,
+                        sub_query_text=str(sub_query.text),
+                        fts_query=str(fts_query),
+                        fts_query_kind=fts_query_kind,
+                        fts_limit=fts_limit,
+                        fts_query_audit=fts_query_audit,
+                    )
                 self._merge_channel_candidates(
                     sub_query_aggregated,
                     fts_candidates,
                     channel="fts",
                     plan=plan,
                 )
+            if plan.exact_recall_mode or plan.query_type == "slot_fill":
+                for spec in self._build_runtime_alias_fts_query_specs(
+                    sub_query=sub_query,
+                    runtime_alias_groups=runtime_alias_groups,
+                ):
+                    if spec.query in executed_fts_queries:
+                        continue
+                    fts_candidates, raw_rows = await self._search_memory_fts_query(
+                        query,
+                        user_id=user_id,
+                        visibility_parameters=visibility_parameters,
+                        status_values=[status.value for status in plan.status_filter],
+                        privacy_parameters=privacy_parameters,
+                        retrieval_level_parameters=retrieval_level_parameters,
+                        plan=plan,
+                        sub_query_text=str(sub_query.text),
+                        fts_query=spec.query,
+                        fts_query_kind=spec.kind,
+                        fts_limit=fts_limit,
+                        fts_query_audit=fts_query_audit,
+                        fts_query_source=_RUNTIME_ALIAS_FTS_SOURCE,
+                        non_evidential=True,
+                    )
+                    sub_query_memory_fts_raw_rows += raw_rows
+                    executed_fts_queries.add(spec.query)
+                    self._merge_channel_candidates(
+                        sub_query_aggregated,
+                        fts_candidates,
+                        channel="fts",
+                        plan=plan,
+                    )
+            if plan.exact_recall_mode and sub_query_memory_fts_raw_rows == 0:
+                corpus_near_specs = await self._build_corpus_near_fts_query_specs(
+                    plan=plan,
+                    user_id=user_id,
+                    sub_query=sub_query,
+                    visibility_parameters=visibility_parameters,
+                    status_values=[status.value for status in plan.status_filter],
+                    privacy_parameters=privacy_parameters,
+                    retrieval_level_parameters=retrieval_level_parameters,
+                )
+                for spec in corpus_near_specs:
+                    if spec.query in executed_fts_queries:
+                        continue
+                    fts_candidates, _raw_rows = await self._search_memory_fts_query(
+                        query,
+                        user_id=user_id,
+                        visibility_parameters=visibility_parameters,
+                        status_values=[status.value for status in plan.status_filter],
+                        privacy_parameters=privacy_parameters,
+                        retrieval_level_parameters=retrieval_level_parameters,
+                        plan=plan,
+                        sub_query_text=str(sub_query.text),
+                        fts_query=spec.query,
+                        fts_query_kind=spec.kind,
+                        fts_limit=fts_limit,
+                        fts_query_audit=fts_query_audit,
+                    )
+                    executed_fts_queries.add(spec.query)
+                    self._merge_channel_candidates(
+                        sub_query_aggregated,
+                        fts_candidates,
+                        channel="fts",
+                        plan=plan,
+                    )
+            fact_facet_candidates = await self._search_fact_facets(
+                plan=plan,
+                user_id=user_id,
+                sub_query=sub_query,
+            )
+            self._merge_channel_candidates(
+                sub_query_aggregated,
+                fact_facet_candidates,
+                channel="fact_facet",
+                plan=plan,
+            )
             verbatim_pin_candidates = await self._search_verbatim_pins(
                 plan=plan,
                 user_id=user_id,
@@ -382,7 +670,968 @@ class CandidateSearch:
             )
         return self._sort_candidates(aggregated.values(), plan)[: plan.max_candidates]
 
-    async def aggregate_retrievable_language_mix(
+    async def _search_memory_fts_query(
+        self,
+        query: str,
+        *,
+        user_id: str,
+        visibility_parameters: list[Any],
+        status_values: list[str],
+        privacy_parameters: list[Any],
+        retrieval_level_parameters: list[Any],
+        plan: RetrievalPlan,
+        sub_query_text: str,
+        fts_query: str,
+        fts_query_kind: str,
+        fts_limit: int,
+        fts_query_audit: list[dict[str, Any]] | None,
+        fts_query_source: str = "planned",
+        non_evidential: bool = True,
+    ) -> tuple[list[dict[str, Any]], int]:
+        parameters = (
+            user_id,
+            *visibility_parameters,
+            *status_values,
+            *privacy_parameters,
+            *retrieval_level_parameters,
+            plan.conversation_id,
+            fts_query,
+            *self._temporal_order_parameters(plan),
+            fts_limit,
+        )
+        cursor = await self._connection.execute(query, parameters)
+        rows = await cursor.fetchall()
+        raw_rows = len(rows)
+        self._record_fts_query_audit(
+            fts_query_audit,
+            sub_query_text=sub_query_text,
+            fts_query=fts_query,
+            fts_query_kind=fts_query_kind,
+            raw_rows=raw_rows,
+            source=fts_query_source,
+            non_evidential=non_evidential,
+        )
+        decoded_rows = [
+            decoded
+            for decoded in (_decode_json_columns(row) for row in rows)
+            if decoded is not None
+        ]
+        await self._annotate_overseer_grants(decoded_rows, plan)
+        await self._annotate_realm_bridge_modes(decoded_rows, plan)
+        fts_candidates = self._assign_position_ranks(
+            [
+                self._annotate_fts_candidate(decoded)
+                for decoded in decoded_rows
+            ]
+        )
+        fts_candidates = [
+            self._annotate_fts_query_match(
+                candidate,
+                sub_query_text=sub_query_text,
+                fts_query=fts_query,
+                fts_query_kind=fts_query_kind,
+                fts_query_source=fts_query_source,
+                non_evidential=non_evidential,
+            )
+            for candidate in fts_candidates
+        ]
+        return fts_candidates, raw_rows
+
+    async def _search_persisted_surface_fts_query(
+        self,
+        query: str,
+        *,
+        user_id: str,
+        visibility_parameters: list[Any],
+        status_values: list[str],
+        privacy_parameters: list[Any],
+        retrieval_level_parameters: list[Any],
+        plan: RetrievalPlan,
+        sub_query_text: str,
+        fts_query: str,
+        fts_query_kind: str,
+        fts_limit: int,
+        fts_query_audit: list[dict[str, Any]] | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        persisted_kind = f"{_PERSISTED_SURFACE_FTS_KIND_PREFIX}{fts_query_kind}"
+        parameters = (
+            user_id,
+            user_id,
+            *visibility_parameters,
+            *status_values,
+            *privacy_parameters,
+            *retrieval_level_parameters,
+            plan.conversation_id,
+            fts_query,
+            *self._temporal_order_parameters(plan),
+            fts_limit,
+        )
+        cursor = await self._connection.execute(query, parameters)
+        rows = await cursor.fetchall()
+        raw_rows = len(rows)
+        self._record_fts_query_audit(
+            fts_query_audit,
+            sub_query_text=sub_query_text,
+            fts_query=fts_query,
+            fts_query_kind=persisted_kind,
+            raw_rows=raw_rows,
+            source=_PERSISTED_SURFACE_FTS_SOURCE,
+            non_evidential=True,
+        )
+        decoded_rows = [
+            decoded
+            for decoded in (_decode_json_columns(row) for row in rows)
+            if decoded is not None
+        ]
+        await self._annotate_overseer_grants(decoded_rows, plan)
+        await self._annotate_realm_bridge_modes(decoded_rows, plan)
+        candidates = self._assign_position_ranks(
+            [
+                self._annotate_fts_candidate(decoded)
+                for decoded in decoded_rows
+            ]
+        )
+        return [
+            self._annotate_fts_query_match(
+                candidate,
+                sub_query_text=sub_query_text,
+                fts_query=fts_query,
+                fts_query_kind=persisted_kind,
+                fts_query_source=_PERSISTED_SURFACE_FTS_SOURCE,
+                non_evidential=True,
+            )
+            for candidate in candidates
+        ], raw_rows
+
+    async def _audit_persisted_surface_fts_query(
+        self,
+        query: str,
+        *,
+        user_id: str,
+        visibility_parameters: list[Any],
+        status_values: list[str],
+        privacy_parameters: list[Any],
+        retrieval_level_parameters: list[Any],
+        plan: RetrievalPlan,
+        sub_query_text: str,
+        fts_query: str,
+        fts_query_kind: str,
+        fts_limit: int,
+        fts_query_audit: list[dict[str, Any]] | None,
+    ) -> None:
+        if fts_query_audit is None:
+            return
+        parameters = (
+            user_id,
+            user_id,
+            *visibility_parameters,
+            *status_values,
+            *privacy_parameters,
+            *retrieval_level_parameters,
+            plan.conversation_id,
+            fts_query,
+            fts_limit,
+        )
+        cursor = await self._connection.execute(query, parameters)
+        rows = await cursor.fetchall()
+        raw_rows = len(rows)
+        if raw_rows <= 0:
+            return
+        self._record_fts_query_audit(
+            fts_query_audit,
+            sub_query_text=sub_query_text,
+            fts_query=fts_query,
+            fts_query_kind=f"{_PERSISTED_SURFACE_FTS_KIND_PREFIX}{fts_query_kind}",
+            raw_rows=raw_rows,
+            source=_PERSISTED_SURFACE_FTS_SOURCE,
+            non_evidential=True,
+        )
+
+    async def _search_fact_facets(
+        self,
+        *,
+        plan: RetrievalPlan,
+        user_id: str,
+        sub_query: Any,
+    ) -> list[dict[str, Any]]:
+        if not self._fact_facet_search_applies(plan):
+            return []
+
+        terms = self._fact_facet_query_terms(plan, sub_query)
+        if not terms:
+            return []
+
+        visibility_clauses, visibility_parameters = self._memory_visibility_clauses(
+            plan,
+            alias="mo",
+        )
+        if not visibility_clauses or not plan.status_filter:
+            return []
+        status_placeholders = ", ".join("?" for _ in plan.status_filter)
+        privacy_filter, privacy_parameters = self._privacy_ceiling_filter_clause(
+            plan,
+            alias="mo",
+        )
+        intimacy_filter = self._memory_intimacy_filter_clause(plan, alias="mo")
+        retrieval_level_clauses, retrieval_level_parameters = self._retrieval_level_clauses(
+            plan,
+            alias="mo",
+        )
+        if not retrieval_level_clauses:
+            return []
+
+        match_clauses: list[str] = []
+        match_parameters: list[str] = []
+        for term in terms:
+            like_value = self._fact_facet_like_pattern(term)
+            # SQLite LOWER() is ASCII-oriented unless ICU is enabled. The normalized
+            # facet key carries language-agnostic matching; raw fields remain
+            # best-effort surface fallbacks.
+            match_clauses.append(
+                "("
+                f"LOWER(mff.value_norm_key) LIKE ? {_SQL_LIKE_ESCAPE_CLAUSE} "
+                f"OR LOWER(mff.value_text) LIKE ? {_SQL_LIKE_ESCAPE_CLAUSE} "
+                f"OR LOWER(mff.facet_label) LIKE ? {_SQL_LIKE_ESCAPE_CLAUSE} "
+                f"OR LOWER(mff.subject_surface) LIKE ? {_SQL_LIKE_ESCAPE_CLAUSE}"
+                ")"
+            )
+            match_parameters.extend([like_value, like_value, like_value, like_value])
+        current_state_clause = (
+            "AND mff.current_state = 1"
+            if plan.coverage_mode == "current_state"
+            else ""
+        )
+        surface_class_clause = (
+            "AND mff.surface_class = 'structured'"
+            if self._fact_facet_structured_only
+            else ""
+        )
+        limit = min(
+            max(0, self._fact_facet_retrieval_limit),
+            max(1, plan.max_candidates * _CHANNEL_OVERFETCH_MULTIPLIER),
+        )
+        query = """
+            SELECT
+                mo.*,
+                mff.id AS fact_facet_id,
+                mff.memory_id AS fact_facet_memory_id,
+                mff.source_message_id AS fact_facet_source_message_id,
+                mff.source_span_id AS fact_facet_source_span_id,
+                mff.source_hash AS fact_facet_source_hash,
+                mff.subject_surface AS fact_facet_subject_surface,
+                mff.subject_cluster_id AS fact_facet_subject_cluster_id,
+                mff.surface_class AS fact_facet_surface_class,
+                mff.facet_label AS fact_facet_facet_label,
+                mff.value_text AS fact_facet_value_text,
+                mff.value_norm_key AS fact_facet_value_norm_key,
+                mff.value_type AS fact_facet_value_type,
+                mff.assertion_kind AS fact_facet_assertion_kind,
+                mff.list_group_key AS fact_facet_list_group_key,
+                mff.support_kind AS fact_facet_support_kind,
+                mff.observed_at AS fact_facet_observed_at,
+                mff.valid_from AS fact_facet_valid_from,
+                mff.valid_to AS fact_facet_valid_to,
+                mff.current_state AS fact_facet_current_state,
+                mff.temporal_phrase AS fact_facet_temporal_phrase,
+                mff.temporal_anchor_at AS fact_facet_temporal_anchor_at,
+                mff.resolved_interval_start AS fact_facet_resolved_interval_start,
+                mff.resolved_interval_end AS fact_facet_resolved_interval_end,
+                mff.temporal_granularity AS fact_facet_temporal_granularity,
+                mff.temporal_resolution_type AS fact_facet_temporal_resolution_type,
+                mff.temporal_confidence AS fact_facet_temporal_confidence,
+                mff.language_code AS fact_facet_language_code,
+                mff.confidence AS fact_facet_confidence,
+                mff.schema_version AS fact_facet_schema_version,
+                mff.created_at AS fact_facet_created_at,
+                span.quote_text AS fact_facet_source_quote,
+                span.seq AS fact_facet_source_seq,
+                span.occurred_at AS fact_facet_source_occurred_at,
+                span.conversation_id AS fact_facet_source_conversation_id
+            FROM memory_fact_facets AS mff
+            JOIN memory_objects AS mo
+              ON mo.id = mff.memory_id
+             AND mo.user_id = mff.user_id
+            JOIN memory_evidence_spans AS span
+              ON span.id = mff.source_span_id
+             AND span.user_id = mff.user_id
+            WHERE mff.user_id = ?
+              AND mo.user_id = ?
+              AND {visibility_clauses}
+              AND mo.status IN ({status_placeholders})
+              AND {privacy_filter}
+              AND {intimacy_filter}
+              AND ({retrieval_level_clauses})
+              AND mo.archived_by_conversation_id IS NULL
+              AND {visibility_clause}
+              {current_state_clause}
+              {surface_class_clause}
+              AND ({match_clauses})
+            ORDER BY
+                mff.current_state DESC,
+                COALESCE(mff.observed_at, mff.created_at) DESC,
+                mff.confidence DESC,
+                mff.id ASC
+            LIMIT ?
+        """.format(
+            visibility_clauses=" AND ".join(visibility_clauses),
+            status_placeholders=status_placeholders,
+            privacy_filter=privacy_filter,
+            intimacy_filter=intimacy_filter,
+            retrieval_level_clauses=" OR ".join(retrieval_level_clauses),
+            visibility_clause=conversation_visibility_clause("mo"),
+            current_state_clause=current_state_clause,
+            surface_class_clause=surface_class_clause,
+            match_clauses=" OR ".join(match_clauses),
+        )
+        parameters = (
+            user_id,
+            user_id,
+            *visibility_parameters,
+            *[status.value for status in plan.status_filter],
+            *privacy_parameters,
+            *retrieval_level_parameters,
+            plan.conversation_id,
+            *match_parameters,
+            limit,
+        )
+        cursor = await self._connection.execute(query, parameters)
+        rows = await cursor.fetchall()
+        decoded_rows = [
+            decoded
+            for decoded in (_decode_json_columns(row) for row in rows)
+            if decoded is not None
+        ]
+        await self._annotate_overseer_grants(decoded_rows, plan)
+        await self._annotate_realm_bridge_modes(decoded_rows, plan)
+        candidates = [
+            self._build_fact_facet_candidate(
+                row,
+                plan=plan,
+                sub_query_text=str(sub_query.text),
+                terms=terms,
+            )
+            for row in decoded_rows
+        ]
+        candidates = [
+            candidate for candidate in candidates if self._matches_plan_filters(candidate, plan)
+        ]
+        grouped = self._best_fact_facet_candidates_by_value(candidates, plan)
+        ordered = sorted(
+            grouped,
+            key=lambda candidate: (
+                self._temporal_priority(candidate, plan),
+                -float(candidate.get("fact_facet_match_score") or 0.0),
+                -float(candidate.get("fact_facet_confidence") or 0.0),
+                -self._updated_at_sort_key(str(candidate.get("updated_at"))),
+                str(candidate["id"]),
+            ),
+        )
+        ranked = self._assign_position_ranks(ordered[:limit])
+        for candidate in ranked:
+            candidate["channel_ranks"] = {
+                channel: (
+                    int(candidate["position_rank"]) if channel == "fact_facet" else None
+                )
+                for channel in _CHANNEL_ORDER
+            }
+        return ranked
+
+    def _fact_facet_search_applies(self, plan: RetrievalPlan) -> bool:
+        if not self._fact_facet_retrieval_enabled:
+            return False
+        if self._fact_facet_retrieval_limit <= 0:
+            return False
+        if plan.source_precision != "required":
+            return False
+        if plan.answer_shape in {"list", "temporal"}:
+            return True
+        return plan.answer_shape == "single_fact" and (
+            plan.coverage_mode == "current_state" or plan.exact_recall_mode
+        )
+
+    @classmethod
+    def _fact_facet_query_terms(cls, plan: RetrievalPlan, sub_query: Any) -> list[str]:
+        values: list[str] = []
+        for field_name in ("sparse_phrase", "text"):
+            value = getattr(sub_query, field_name, None)
+            if value:
+                values.append(str(value))
+        values.extend(str(value) for value in getattr(sub_query, "quoted_phrases", []) or [])
+        values.extend(str(value) for value in getattr(sub_query, "must_keep_terms", []) or [])
+        values.extend(str(facet.value) for facet in plan.exact_facets)
+        terms: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            normalized_phrase = fact_facet_value_key(value)
+            if len(normalized_phrase) >= 2 and normalized_phrase not in seen:
+                seen.add(normalized_phrase)
+                terms.append(normalized_phrase)
+            for match in _CORPUS_NEAR_TOKEN_PATTERN.finditer(value):
+                token = fact_facet_value_key(match.group(0))
+                if len(token) < 2:
+                    continue
+                if token in seen:
+                    continue
+                seen.add(token)
+                terms.append(token)
+                if len(terms) >= 12:
+                    return terms
+            if len(terms) >= 12:
+                return terms
+        return terms[:12]
+
+    @staticmethod
+    def _fact_facet_like_pattern(term: str) -> str:
+        escaped = (
+            str(term)
+            .replace(_SQL_LIKE_ESCAPE, _SQL_LIKE_ESCAPE * 2)
+            .replace("%", f"{_SQL_LIKE_ESCAPE}%")
+            .replace("_", f"{_SQL_LIKE_ESCAPE}_")
+        )
+        return f"%{escaped}%"
+
+    @classmethod
+    def _build_fact_facet_candidate(
+        cls,
+        row: dict[str, Any],
+        *,
+        plan: RetrievalPlan,
+        sub_query_text: str,
+        terms: list[str],
+    ) -> dict[str, Any]:
+        fact_id = str(row["fact_facet_id"])
+        base_memory_id = str(row["fact_facet_memory_id"])
+        value_text = str(row.get("fact_facet_value_text") or "")
+        facet_label = str(row.get("fact_facet_facet_label") or "")
+        subject_surface = str(row.get("fact_facet_subject_surface") or "")
+        observed_at = str(
+            row.get("fact_facet_observed_at")
+            or row.get("fact_facet_source_occurred_at")
+            or row.get("updated_at")
+        )
+        source_message_id = str(row["fact_facet_source_message_id"])
+        source_span_id = str(row["fact_facet_source_span_id"])
+        source_quote = str(row.get("fact_facet_source_quote") or "")
+        surface_class = str(row.get("fact_facet_surface_class") or "generic")
+        match_score = cls._fact_facet_match_score(row, terms)
+        payload_json = row.get("payload_json") or {}
+        if not isinstance(payload_json, dict):
+            payload_json = {}
+        fact_payload = {
+            "fact_id": fact_id,
+            "memory_id": base_memory_id,
+            "source_span_id": source_span_id,
+            "source_message_id": source_message_id,
+            "source_hash": row.get("fact_facet_source_hash"),
+            "subject_surface": subject_surface,
+            "subject_cluster_id": row.get("fact_facet_subject_cluster_id"),
+            "surface_class": surface_class,
+            "facet_label": facet_label,
+            "value_text": value_text,
+            "value_norm_key": row.get("fact_facet_value_norm_key"),
+            "value_type": row.get("fact_facet_value_type"),
+            "assertion_kind": row.get("fact_facet_assertion_kind"),
+            "list_group_key": row.get("fact_facet_list_group_key"),
+            "support_kind": row.get("fact_facet_support_kind"),
+            "observed_at": observed_at,
+            "current_state": bool(row.get("fact_facet_current_state")),
+            "temporal_phrase": row.get("fact_facet_temporal_phrase"),
+            "temporal_anchor_at": row.get("fact_facet_temporal_anchor_at"),
+            "resolved_interval_start": row.get("fact_facet_resolved_interval_start"),
+            "resolved_interval_end": row.get("fact_facet_resolved_interval_end"),
+            "temporal_granularity": row.get("fact_facet_temporal_granularity"),
+            "temporal_resolution_type": row.get("fact_facet_temporal_resolution_type"),
+            "temporal_confidence": row.get("fact_facet_temporal_confidence"),
+            "language_code": row.get("fact_facet_language_code"),
+            "schema_version": row.get("fact_facet_schema_version"),
+            "match_score": match_score,
+        }
+        updated_payload = dict(payload_json)
+        updated_payload.update(
+            {
+                "source_kind_variant": "fact_facet",
+                "source_memory_ids": [base_memory_id],
+                "source_message_ids": [source_message_id],
+                "source_span_ids": [source_span_id],
+                "fact_facet": fact_payload,
+                "subject_surface": subject_surface,
+                "surface_class": surface_class,
+                "facet_label": facet_label,
+                "value_text": value_text,
+                "value_norm_key": row.get("fact_facet_value_norm_key"),
+                "value_type": row.get("fact_facet_value_type"),
+                "display_text": value_text,
+                "surface": value_text,
+                "sub_query_text": sub_query_text,
+            }
+        )
+        candidate = dict(row)
+        candidate.update(
+            {
+                "id": fact_id,
+                "fact_facet_memory_id": base_memory_id,
+                "object_type": row.get("object_type") or MemoryObjectType.EVIDENCE.value,
+                "canonical_text": cls._format_fact_facet_text(
+                    subject_surface=subject_surface,
+                    facet_label=facet_label,
+                    value_text=value_text,
+                ),
+                "payload_json": updated_payload,
+                "source_kind": MemorySourceKind.EXTRACTED.value,
+                "confidence": float(row.get("fact_facet_confidence") or row.get("confidence") or 0.5),
+                "valid_from": row.get("fact_facet_valid_from") or row.get("valid_from"),
+                "valid_to": row.get("fact_facet_valid_to") or row.get("valid_to"),
+                "temporal_type": (
+                    row.get("fact_facet_temporal_resolution_type")
+                    or row.get("temporal_type")
+                    or "unknown"
+                ),
+                "updated_at": observed_at,
+                "rank": -match_score,
+                "fts_rank": -match_score,
+                "retrieval_level": 0,
+                "is_fact_facet_candidate": True,
+                "fact_facet_match_score": match_score,
+                "fact_facet_confidence": float(row.get("fact_facet_confidence") or 0.5),
+                "fact_facet_surface_class": surface_class,
+                "evidence_packets": [
+                    {
+                        "id": f"fact_facet:{fact_id}",
+                        "memory_id": fact_id,
+                        "support_kind": row.get("fact_facet_support_kind") or "direct",
+                        "speaker_relation_to_subject": "unknown",
+                        "confidence": float(row.get("fact_facet_confidence") or 0.5),
+                        "confidence_details": {"source": "memory_fact_facets"},
+                        "rationale": None,
+                        "spans": [
+                            {
+                                "id": source_span_id,
+                                "memory_id": base_memory_id,
+                                "conversation_id": row.get("fact_facet_source_conversation_id")
+                                or row.get("conversation_id"),
+                                "message_id": source_message_id,
+                                "span_role": "source",
+                                "quote_text": source_quote,
+                                "seq": row.get("fact_facet_source_seq"),
+                                "occurred_at": row.get("fact_facet_source_occurred_at")
+                                or observed_at,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        candidate["retrieval_sources"] = ["fact_facet"]
+        candidate["channel_ranks"] = {
+            channel: None
+            for channel in _CHANNEL_ORDER
+        }
+        candidate["retrieval_source"] = "fact_facet"
+        candidate["matched_sub_queries"] = [sub_query_text]
+        return candidate
+
+    @staticmethod
+    def _format_fact_facet_text(
+        *,
+        subject_surface: str,
+        facet_label: str,
+        value_text: str,
+    ) -> str:
+        subject = subject_surface.strip()
+        facet = facet_label.strip()
+        value = value_text.strip()
+        if subject and facet:
+            return f"{subject} / {facet}: {value}"
+        if facet:
+            return f"{facet}: {value}"
+        return value
+
+    @classmethod
+    def _fact_facet_match_score(cls, row: dict[str, Any], terms: list[str]) -> float:
+        fields = {
+            "value": fact_facet_value_key(str(row.get("fact_facet_value_text") or "")),
+            "value_key": fact_facet_value_key(str(row.get("fact_facet_value_norm_key") or "")),
+            "facet": fact_facet_value_key(str(row.get("fact_facet_facet_label") or "")),
+            "subject": fact_facet_value_key(str(row.get("fact_facet_subject_surface") or "")),
+            "canonical": fact_facet_value_key(str(row.get("canonical_text") or "")),
+        }
+        score = 0.0
+        for term in terms:
+            normalized = fact_facet_value_key(term)
+            if not normalized:
+                continue
+            if normalized in fields["value_key"] or normalized in fields["value"]:
+                score += 3.0
+            elif normalized in fields["facet"]:
+                score += 2.0
+            elif normalized in fields["subject"] or normalized in fields["canonical"]:
+                score += 1.0
+        return score
+
+    @classmethod
+    def _best_fact_facet_candidates_by_value(
+        cls,
+        candidates: list[dict[str, Any]],
+        plan: RetrievalPlan,
+    ) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for candidate in candidates:
+            payload = candidate.get("payload_json") or {}
+            fact_payload = payload.get("fact_facet") if isinstance(payload, dict) else None
+            if not isinstance(fact_payload, dict):
+                continue
+            group_key = (
+                str(fact_payload.get("facet_label") or ""),
+                str(fact_payload.get("value_norm_key") or candidate["id"]),
+                str(fact_payload.get("subject_surface") or ""),
+            )
+            current = grouped.get(group_key)
+            if current is None or cls._fact_facet_candidate_sort_key(
+                candidate,
+                plan,
+            ) < cls._fact_facet_candidate_sort_key(current, plan):
+                grouped[group_key] = candidate
+        return list(grouped.values())
+
+    @classmethod
+    def _fact_facet_candidate_sort_key(
+        cls,
+        candidate: dict[str, Any],
+        plan: RetrievalPlan,
+    ) -> tuple[int, float, float, float, str]:
+        current_state = 0 if candidate.get("fact_facet_current_state") else 1
+        temporal_priority = 0
+        if plan.coverage_mode == "chronology":
+            temporal_priority = 0 if candidate.get("valid_from") or candidate.get("valid_to") else 1
+        return (
+            current_state,
+            float(temporal_priority),
+            -float(candidate.get("fact_facet_match_score") or 0.0),
+            -float(candidate.get("fact_facet_confidence") or 0.0),
+            str(candidate["id"]),
+        )
+
+    def _build_runtime_alias_fts_query_specs(
+        self,
+        *,
+        sub_query: Any,
+        runtime_alias_groups: list[RuntimeAliasGroupTrace] | None,
+    ) -> list[RetrievalFtsQuerySpec]:
+        if not runtime_alias_groups:
+            return []
+        sub_query_text = str(getattr(sub_query, "text", "") or "")
+        alias_queries: list[str] = []
+        seen_queries: set[str] = set()
+        for group in runtime_alias_groups:
+            if group.sub_query_text != sub_query_text:
+                continue
+            if not self._runtime_alias_group_is_eligible(group):
+                continue
+            for alias in group.aliases:
+                if alias.non_evidential is not True:
+                    continue
+                surface_queries = build_retrieval_fts_queries(
+                    alias.surface,
+                    exact_recall=True,
+                )
+                if not surface_queries:
+                    continue
+                query = surface_queries[0]
+                if query in seen_queries:
+                    continue
+                seen_queries.add(query)
+                alias_queries.append(query)
+                if len(alias_queries) >= _RUNTIME_ALIAS_FTS_MAX_TERMS:
+                    break
+            if len(alias_queries) >= _RUNTIME_ALIAS_FTS_MAX_TERMS:
+                break
+        if not alias_queries:
+            return []
+        return [
+            RetrievalFtsQuerySpec(
+                query=" OR ".join(alias_queries),
+                kind=_RUNTIME_ALIAS_FTS_KIND,
+            )
+        ]
+
+    @staticmethod
+    def _runtime_alias_group_is_eligible(group: RuntimeAliasGroupTrace) -> bool:
+        if group.anchor_non_evidential is not True:
+            return False
+        if group.preserve_verbatim:
+            return False
+        return str(group.anchor_type) in _RUNTIME_ALIAS_FTS_ALLOWED_ANCHOR_TYPES
+
+    async def _build_corpus_near_fts_query_specs(
+        self,
+        *,
+        plan: RetrievalPlan,
+        user_id: str,
+        sub_query: Any,
+        visibility_parameters: list[Any],
+        status_values: list[str],
+        privacy_parameters: list[Any],
+        retrieval_level_parameters: list[Any],
+    ) -> list[RetrievalFtsQuerySpec]:
+        source_tokens = self._corpus_near_source_tokens(sub_query)
+        if not source_tokens:
+            return []
+        near_terms: list[str] = []
+        seen_terms: set[str] = set()
+        for source_token in source_tokens:
+            for term in await self._near_corpus_fts_terms(
+                plan=plan,
+                user_id=user_id,
+                source_token=source_token,
+                visibility_parameters=visibility_parameters,
+                status_values=status_values,
+                privacy_parameters=privacy_parameters,
+                retrieval_level_parameters=retrieval_level_parameters,
+            ):
+                if term in seen_terms:
+                    continue
+                seen_terms.add(term)
+                near_terms.append(term)
+                if len(near_terms) >= _CORPUS_NEAR_MAX_TERMS:
+                    break
+            if len(near_terms) >= _CORPUS_NEAR_MAX_TERMS:
+                break
+        if not near_terms:
+            return []
+        return [
+            RetrievalFtsQuerySpec(
+                query=" OR ".join(near_terms),
+                kind="corpus_near_or",
+            )
+        ]
+
+    @staticmethod
+    def _corpus_near_source_tokens(sub_query: Any) -> list[str]:
+        blocked_tokens = CandidateSearch._corpus_near_blocked_tokens(sub_query)
+        values: list[str] = []
+        sparse_phrase = getattr(sub_query, "sparse_phrase", None)
+        if sparse_phrase:
+            values.append(str(sparse_phrase))
+        else:
+            values.append(str(getattr(sub_query, "text", "") or ""))
+        values.extend(str(value) for value in getattr(sub_query, "must_keep_terms", []) or [])
+        values.extend(str(value) for value in getattr(sub_query, "quoted_phrases", []) or [])
+
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            for match in _CORPUS_NEAR_TOKEN_PATTERN.finditer(value):
+                raw_token = match.group(0)
+                token = raw_token.lower().strip("_")
+                if token in blocked_tokens:
+                    continue
+                if not CandidateSearch._is_corpus_near_source_token(raw_token, token):
+                    continue
+                if token in seen:
+                    continue
+                seen.add(token)
+                tokens.append(token)
+                if len(tokens) >= _CORPUS_NEAR_MAX_SOURCE_TOKENS:
+                    return tokens
+        return tokens
+
+    @staticmethod
+    def _corpus_near_blocked_tokens(sub_query: Any) -> set[str]:
+        explicit_lower_tokens = CandidateSearch._corpus_near_explicit_lower_tokens(
+            sub_query,
+        )
+        text_value = str(getattr(sub_query, "text", "") or "")
+        must_keep_values = [
+            str(value)
+            for value in getattr(sub_query, "must_keep_terms", []) or []
+        ]
+        quoted_values = [
+            str(value)
+            for value in getattr(sub_query, "quoted_phrases", []) or []
+        ]
+
+        blocked: set[str] = set()
+        for match in _CORPUS_NEAR_TOKEN_PATTERN.finditer(text_value):
+            raw_token = match.group(0)
+            token = raw_token.lower().strip("_")
+            if CandidateSearch._is_corpus_near_source_token(raw_token, token):
+                continue
+            if (
+                token in explicit_lower_tokens
+                and CandidateSearch._is_sentence_case_near_token(raw_token, token)
+            ):
+                continue
+            blocked.add(token)
+        for value in [*must_keep_values, *quoted_values]:
+            for match in _CORPUS_NEAR_TOKEN_PATTERN.finditer(value):
+                raw_token = match.group(0)
+                token = raw_token.lower().strip("_")
+                if not CandidateSearch._is_corpus_near_source_token(raw_token, token):
+                    blocked.add(token)
+        return blocked
+
+    @staticmethod
+    def _corpus_near_explicit_lower_tokens(sub_query: Any) -> set[str]:
+        values: list[str] = []
+        sparse_phrase = getattr(sub_query, "sparse_phrase", None)
+        if sparse_phrase:
+            values.append(str(sparse_phrase))
+        values.extend(str(value) for value in getattr(sub_query, "must_keep_terms", []) or [])
+
+        tokens: set[str] = set()
+        for value in values:
+            for match in _CORPUS_NEAR_TOKEN_PATTERN.finditer(value):
+                raw_token = match.group(0)
+                token = raw_token.lower().strip("_")
+                if CandidateSearch._is_corpus_near_source_token(raw_token, token):
+                    tokens.add(token)
+        return tokens
+
+    @staticmethod
+    def _is_sentence_case_near_token(raw_token: str, token: str) -> bool:
+        if len(token) < _CORPUS_NEAR_MIN_TOKEN_LENGTH:
+            return False
+        if any(character.isdigit() for character in token):
+            return False
+        if not token or token in {"and", "or", "not", "near"}:
+            return False
+        return raw_token == token[:1].upper() + token[1:]
+
+    @staticmethod
+    def _is_corpus_near_source_token(raw_token: str, token: str) -> bool:
+        if len(token) < _CORPUS_NEAR_MIN_TOKEN_LENGTH:
+            return False
+        if token != raw_token:
+            return False
+        if any(character.isdigit() for character in token):
+            return False
+        if not any(character.isalpha() for character in token):
+            return False
+        if token in {"and", "or", "not", "near"}:
+            return False
+        return True
+
+    async def _near_corpus_fts_terms(
+        self,
+        *,
+        plan: RetrievalPlan,
+        user_id: str,
+        source_token: str,
+        visibility_parameters: list[Any],
+        status_values: list[str],
+        privacy_parameters: list[Any],
+        retrieval_level_parameters: list[Any],
+    ) -> list[str]:
+        distance_limit = self._corpus_near_distance_limit(source_token)
+        if distance_limit <= 0:
+            return []
+
+        min_length = max(_CORPUS_NEAR_MIN_TOKEN_LENGTH, len(source_token) - distance_limit)
+        max_length = len(source_token) + distance_limit
+        visibility_clauses, _visibility_parameters = self._memory_visibility_clauses(
+            plan,
+            alias="mo",
+        )
+        if not visibility_clauses:
+            return []
+        status_placeholders = ", ".join("?" for _ in status_values)
+        privacy_filter, _privacy_parameters = self._privacy_ceiling_filter_clause(
+            plan,
+            alias="mo",
+        )
+        intimacy_filter = self._memory_intimacy_filter_clause(plan, alias="mo")
+        retrieval_level_clauses, _retrieval_level_parameters = self._retrieval_level_clauses(plan)
+        query = """
+            SELECT
+                mo.canonical_text AS canonical_text,
+                mo.index_text AS index_text
+            FROM memory_objects AS mo
+            WHERE mo.user_id = ?
+              AND {visibility_clauses}
+              AND mo.status IN ({status_placeholders})
+              AND {privacy_filter}
+              AND {intimacy_filter}
+              AND ({retrieval_level_clauses})
+              AND mo.archived_by_conversation_id IS NULL
+              AND {visibility_clause}
+              AND (
+                  mo.canonical_text LIKE ?
+                  OR COALESCE(mo.index_text, '') LIKE ?
+              )
+            ORDER BY mo.updated_at DESC
+            LIMIT ?
+        """.format(
+            visibility_clauses=" AND ".join(visibility_clauses),
+            status_placeholders=status_placeholders,
+            privacy_filter=privacy_filter,
+            retrieval_level_clauses=" OR ".join(retrieval_level_clauses),
+            intimacy_filter=intimacy_filter,
+            visibility_clause=conversation_visibility_clause("mo"),
+        )
+        cursor = await self._connection.execute(
+            query,
+            (
+                user_id,
+                *visibility_parameters,
+                *status_values,
+                *privacy_parameters,
+                *retrieval_level_parameters,
+                plan.conversation_id,
+                f"%{source_token[0]}%",
+                f"%{source_token[0]}%",
+                _CORPUS_NEAR_ROW_SCAN_LIMIT,
+            ),
+        )
+        rows = await cursor.fetchall()
+        seen_terms: set[str] = set()
+        terms: list[str] = []
+        for row in rows:
+            for value in (row["canonical_text"], row["index_text"]):
+                for match in _CORPUS_NEAR_TOKEN_PATTERN.finditer(str(value or "")):
+                    term = match.group(0).lower().strip("_")
+                    if term in seen_terms:
+                        continue
+                    seen_terms.add(term)
+                    if term == source_token:
+                        continue
+                    if len(term) < min_length or len(term) > max_length:
+                        continue
+                    if not term.startswith(source_token[0]):
+                        continue
+                    if self._bounded_edit_distance(source_token, term, distance_limit) > distance_limit:
+                        continue
+                    terms.append(term)
+                    if len(terms) >= _CORPUS_NEAR_MAX_TERMS_PER_TOKEN:
+                        return terms
+        return terms
+
+    @staticmethod
+    def _corpus_near_distance_limit(source_token: str) -> int:
+        if len(source_token) >= 5:
+            return 1
+        return 0
+
+    @staticmethod
+    def _bounded_edit_distance(left: str, right: str, limit: int) -> int:
+        if abs(len(left) - len(right)) > limit:
+            return limit + 1
+        previous = list(range(len(right) + 1))
+        for left_index, left_char in enumerate(left, start=1):
+            current = [left_index]
+            row_min = current[0]
+            for right_index, right_char in enumerate(right, start=1):
+                insertion = current[right_index - 1] + 1
+                deletion = previous[right_index] + 1
+                substitution = previous[right_index - 1] + (left_char != right_char)
+                value = min(insertion, deletion, substitution)
+                current.append(value)
+                row_min = min(row_min, value)
+            if row_min > limit:
+                return limit + 1
+            previous = current
+        return previous[-1]
+
+    async def aggregate_retrievable_content_language_mix(
         self,
         *,
         user_id: str,
@@ -395,6 +1644,12 @@ class CandidateSearch:
         user_persona_id: str | None = None,
         platform_id: str = "default",
         character_id: str | None = None,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = MindTopology.UNIMIND,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
         incognito: bool = False,
         remember_across_chats: bool = True,
         remember_across_devices: bool = True,
@@ -409,6 +1664,12 @@ class CandidateSearch:
             user_persona_id=user_persona_id,
             platform_id=platform_id,
             character_id=character_id if character_id is not None else workspace_id,
+            active_space_id=active_space_id,
+            active_space_boundary_mode=active_space_boundary_mode,
+            active_mind_id=active_mind_id,
+            mind_topology=mind_topology or MindTopology.UNIMIND,
+            active_embodiment_id=active_embodiment_id,
+            active_realm_id=active_realm_id,
             incognito=incognito,
             remember_across_chats=remember_across_chats,
             remember_across_devices=remember_across_devices,
@@ -425,13 +1686,22 @@ class CandidateSearch:
         )
         if not visibility_clauses:
             return []
+        valid_code_placeholders = ", ".join("?" for _code in ISO_639_1_LANGUAGE_CODES)
+        valid_language_codes = sorted(ISO_639_1_LANGUAGE_CODES)
         query = """
             SELECT
                 lc.value AS language_code,
                 COUNT(*) AS memory_count,
                 MAX(mo.updated_at) AS last_seen_at
             FROM memory_objects AS mo
-            JOIN json_each(mo.language_codes_json) AS lc
+            JOIN json_each(
+                CASE
+                    WHEN json_valid(mo.language_codes_json) = 1
+                     AND json_type(mo.language_codes_json) = 'array'
+                    THEN mo.language_codes_json
+                    ELSE '[]'
+                END
+            ) AS lc
             WHERE mo.user_id = ?
               AND {visibility_clauses}
               AND mo.status = ?
@@ -440,9 +1710,9 @@ class CandidateSearch:
               AND mo.archived_by_conversation_id IS NULL
               AND {visibility_clause}
               AND mo.language_codes_json IS NOT NULL
+              AND lc.type = 'text'
+              AND LOWER(lc.value) IN ({valid_codes})
             GROUP BY lc.value
-            ORDER BY memory_count DESC, last_seen_at DESC, language_code ASC
-            LIMIT ?
         """.format(
             visibility_clauses=" AND ".join(visibility_clauses),
             intimacy_filter=memory_object_intimacy_sql_clause(
@@ -450,6 +1720,7 @@ class CandidateSearch:
                 allow_intimacy_context=allow_intimacy_context,
             ),
             visibility_clause=conversation_visibility_clause("mo"),
+            valid_codes=valid_code_placeholders,
         )
         cursor = await self._connection.execute(
             query,
@@ -459,11 +1730,130 @@ class CandidateSearch:
                 MemoryStatus.ACTIVE.value,
                 privacy_ceiling,
                 conversation_id,
-                limit,
+                *valid_language_codes,
             ),
         )
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        known_rows = [dict(row) for row in await cursor.fetchall()]
+        unknown_query = """
+            SELECT
+                'unknown' AS language_code,
+                COUNT(*) AS memory_count,
+                MAX(mo.updated_at) AS last_seen_at
+            FROM memory_objects AS mo
+            WHERE mo.user_id = ?
+              AND {visibility_clauses}
+              AND mo.status = ?
+              AND mo.privacy_level <= ?
+              AND {intimacy_filter}
+              AND mo.archived_by_conversation_id IS NULL
+              AND {visibility_clause}
+              AND (
+                    mo.language_codes_json IS NULL
+                    OR TRIM(mo.language_codes_json) = ''
+                    OR json_valid(mo.language_codes_json) = 0
+                    OR (
+                        json_valid(mo.language_codes_json) = 1
+                        AND COALESCE(json_type(mo.language_codes_json), '') != 'array'
+                    )
+                    OR json_array_length(
+                        CASE
+                            WHEN json_valid(mo.language_codes_json) = 1
+                             AND json_type(mo.language_codes_json) = 'array'
+                            THEN mo.language_codes_json
+                            ELSE '[]'
+                        END
+                    ) = 0
+                    OR (
+                        json_valid(mo.language_codes_json) = 1
+                        AND json_array_length(
+                            CASE
+                                WHEN json_valid(mo.language_codes_json) = 1
+                                 AND json_type(mo.language_codes_json) = 'array'
+                                THEN mo.language_codes_json
+                                ELSE '[]'
+                            END
+                        ) > 0
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM json_each(
+                                CASE
+                                    WHEN json_valid(mo.language_codes_json) = 1
+                                     AND json_type(mo.language_codes_json) = 'array'
+                                    THEN mo.language_codes_json
+                                    ELSE '[]'
+                                END
+                            ) AS language_code
+                            WHERE language_code.type = 'text'
+                              AND LOWER(language_code.value) IN ({valid_codes})
+                        )
+                    )
+                  )
+        """.format(
+            visibility_clauses=" AND ".join(visibility_clauses),
+            intimacy_filter=memory_object_intimacy_sql_clause(
+                "mo",
+                allow_intimacy_context=allow_intimacy_context,
+            ),
+            visibility_clause=conversation_visibility_clause("mo"),
+            valid_codes=valid_code_placeholders,
+        )
+        unknown_cursor = await self._connection.execute(
+            unknown_query,
+            (
+                user_id,
+                *visibility_parameters,
+                MemoryStatus.ACTIVE.value,
+                privacy_ceiling,
+                conversation_id,
+                *valid_language_codes,
+            ),
+        )
+        unknown_row = await unknown_cursor.fetchone()
+        if unknown_row is not None and int(unknown_row["memory_count"] or 0) > 0:
+            known_rows.append(dict(unknown_row))
+        return self._coalesce_language_profile_rows(known_rows)[:limit]
+
+    @staticmethod
+    def _coalesce_language_profile_rows(
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            raw_language_code = str(row.get("language_code") or "").strip().lower()
+            language_code = (
+                "unknown"
+                if raw_language_code == "unknown"
+                else normalize_optional_iso_639_1_code(raw_language_code)
+            )
+            if language_code is None:
+                continue
+            memory_count = int(row.get("memory_count") or 0)
+            if memory_count <= 0:
+                continue
+            last_seen_at = str(row.get("last_seen_at") or "")
+            existing = merged.get(language_code)
+            if existing is None:
+                merged[language_code] = {
+                    "language_code": language_code,
+                    "memory_count": memory_count,
+                    "last_seen_at": last_seen_at,
+                }
+                continue
+            existing["memory_count"] = int(existing["memory_count"]) + memory_count
+            if last_seen_at > str(existing.get("last_seen_at") or ""):
+                existing["last_seen_at"] = last_seen_at
+
+        ordered = sorted(merged.values(), key=lambda row: str(row["language_code"]))
+        ordered = sorted(
+            ordered,
+            key=lambda row: str(row.get("last_seen_at") or ""),
+            reverse=True,
+        )
+        return sorted(
+            ordered,
+            key=lambda row: int(row.get("memory_count") or 0),
+            reverse=True,
+        )
 
     async def search_by_embedding(
         self,
@@ -1113,7 +2503,15 @@ class CandidateSearch:
             "rank": rank,
             "fts_rank": rank,
             "retrieval_sources": ["verbatim_pin"],
-            "channel_ranks": {"verbatim_pin": None, "fts": None, "embedding": None, "consequence": None, "verbatim_evidence_search": None},
+            "channel_ranks": {
+                "verbatim_pin": None,
+                "artifact_chunk": None,
+                "fts": None,
+                "fact_facet": None,
+                "embedding": None,
+                "consequence": None,
+                "verbatim_evidence_search": None,
+            },
             "matched_sub_queries": [sub_query_text],
             "is_verbatim_pin": True,
             "retrieval_level": 0,
@@ -1308,41 +2706,6 @@ class CandidateSearch:
         )
 
     @staticmethod
-    def _scope_clauses(
-        *,
-        scope_filter: list[MemoryScope],
-        assistant_mode_id: str,
-        workspace_id: str | None,
-        conversation_id: str,
-        alias: str = "mo",
-    ) -> tuple[list[str], list[Any]]:
-        del assistant_mode_id
-        scope_expr = (
-            f"CASE "
-            f"WHEN {alias}.scope_canonical IS NOT NULL THEN {alias}.scope_canonical "
-            f"WHEN {alias}.scope IN ('conversation', 'ephemeral_session') THEN 'chat' "
-            f"WHEN {alias}.scope = 'workspace' THEN 'character' "
-            f"WHEN {alias}.scope IN ('global_user', 'assistant_mode') THEN 'user' "
-            f"ELSE {alias}.scope END"
-        )
-        clauses: list[str] = []
-        parameters: list[Any] = []
-        for scope in MemoryObjectRepository.canonical_retrieval_scopes(scope_filter):
-            if scope is MemoryScope.USER:
-                clauses.append(f"({scope_expr} = 'user')")
-            elif scope is MemoryScope.CHARACTER and workspace_id is not None:
-                clauses.append(
-                    f"({scope_expr} = 'character' "
-                    f"AND ({alias}.character_id = ? OR ({alias}.character_id IS NULL AND {alias}.workspace_id = ?))"
-                    ")"
-                )
-                parameters.extend([workspace_id, workspace_id])
-            elif scope is MemoryScope.CHAT:
-                clauses.append(f"({scope_expr} = 'chat' AND {alias}.conversation_id = ?)")
-                parameters.append(conversation_id)
-        return clauses, parameters
-
-    @staticmethod
     def _scope_order_case(scope_filter: list[MemoryScope], alias: str = "mo") -> str:
         canonical_filter = MemoryObjectRepository.canonical_retrieval_scopes(scope_filter)
         clauses = [
@@ -1354,9 +2717,9 @@ class CandidateSearch:
     def _temporal_order_parameters(self, plan: RetrievalPlan) -> tuple[str, ...]:
         if plan.temporal_query_range is None:
             return ()
-        query_start_minus_horizon = (
-            plan.temporal_query_range.start
-            - timedelta(hours=self._settings.ephemeral_scoring_hours)
+        query_start_minus_horizon = self._subtract_non_negative_hours_clamped(
+            plan.temporal_query_range.start,
+            self._settings.ephemeral_scoring_hours,
         ).isoformat()
         return (
             plan.temporal_query_range.end.isoformat(),
@@ -1365,6 +2728,15 @@ class CandidateSearch:
             plan.temporal_query_range.end.isoformat(),
             plan.temporal_query_range.start.isoformat(),
         )
+
+    @staticmethod
+    def _subtract_non_negative_hours_clamped(value: datetime, hours: int) -> datetime:
+        if hours < 0:
+            raise ValueError("hours must be non-negative")
+        try:
+            return value - timedelta(hours=hours)
+        except OverflowError:
+            return datetime.min.replace(tzinfo=value.tzinfo)
 
     def _temporal_order_case(self, plan: RetrievalPlan, *, alias: str) -> str:
         if plan.temporal_query_range is None:
@@ -1520,7 +2892,7 @@ class CandidateSearch:
         if self._verbatim_evidence_search_limit <= 0:
             return []
 
-        channel_scope = self._pick_verbatim_evidence_scope(plan.scope_filter)
+        channel_scope = self._pick_verbatim_evidence_scope(plan)
         if channel_scope is None:
             return []
 
@@ -1548,6 +2920,10 @@ class CandidateSearch:
                 # search and returns no usable windows.
                 if aggregated:
                     break
+        active_conversation_only = (
+            not self._privacy_sql_filters_disabled(plan)
+            and not self._allow_cross_conversation_verbatim_evidence(plan)
+        )
         for fts_query in queries_to_try:
             rows = await self._message_repository.search_messages_with_privacy(
                 user_id=user_id,
@@ -1555,24 +2931,24 @@ class CandidateSearch:
                 privacy_ceiling=self._effective_privacy_ceiling(plan),
                 limit=self._verbatim_evidence_search_limit,
                 allow_conversation_id=plan.conversation_id,
-                active_conversation_only=not self._privacy_sql_filters_disabled(plan),
+                active_conversation_only=active_conversation_only,
                 include_pending_confirmation_sources=self._privacy_sql_filters_disabled(plan),
             )
             for row in rows:
-                window_candidate = await self._build_verbatim_evidence_search_window_candidate(
+                for window_candidate in await self._verbatim_evidence_search_window_candidates(
                     seed_row=row,
                     plan=plan,
                     user_id=user_id,
                     channel_scope=channel_scope,
-                )
-                if window_candidate is None or not self._matches_plan_filters(window_candidate, plan):
-                    continue
-                window_id = str(window_candidate["id"])
-                existing = aggregated.get(window_id)
-                if existing is None or float(window_candidate.get("fts_rank", 0.0)) < float(
-                    existing.get("fts_rank", 0.0)
                 ):
-                    aggregated[window_id] = window_candidate
+                    if not self._matches_plan_filters(window_candidate, plan):
+                        continue
+                    window_id = str(window_candidate["id"])
+                    existing = aggregated.get(window_id)
+                    if existing is None or float(window_candidate.get("fts_rank", 0.0)) < float(
+                        existing.get("fts_rank", 0.0)
+                    ):
+                        aggregated[window_id] = window_candidate
             if (
                 plan.exact_recall_mode
                 and len(aggregated) >= self._verbatim_evidence_search_limit
@@ -1609,6 +2985,45 @@ class CandidateSearch:
                 queries.append(fts_query)
         return queries
 
+    async def _verbatim_evidence_search_window_candidates(
+        self,
+        *,
+        seed_row: dict[str, Any],
+        plan: RetrievalPlan,
+        user_id: str,
+        channel_scope: MemoryScope,
+    ) -> list[dict[str, Any]]:
+        """Build centered and exact slot-fill follow-up evidence windows."""
+        seed_seq = int(seed_row["seq"])
+        window_specs = [(seed_seq, self._verbatim_evidence_window_size, "centered", 0.0)]
+        if plan.exact_recall_mode and plan.query_type == "slot_fill":
+            follow_up_window_size = min(5, self._verbatim_evidence_window_size + 2)
+            window_specs.append(
+                (seed_seq + 1, follow_up_window_size, "follow_up", -0.000001)
+            )
+
+        candidates: list[dict[str, Any]] = []
+        seen_window_ids: set[str] = set()
+        for center_seq, window_size, window_variant, rank_adjustment in window_specs:
+            window_candidate = await self._build_verbatim_evidence_search_window_candidate(
+                seed_row=seed_row,
+                plan=plan,
+                user_id=user_id,
+                channel_scope=channel_scope,
+                center_seq=center_seq,
+                window_size=window_size,
+                window_variant=window_variant,
+                rank_adjustment=rank_adjustment,
+            )
+            if window_candidate is None:
+                continue
+            window_id = str(window_candidate["id"])
+            if window_id in seen_window_ids:
+                continue
+            seen_window_ids.add(window_id)
+            candidates.append(window_candidate)
+        return candidates
+
     async def _build_verbatim_evidence_search_window_candidate(
         self,
         *,
@@ -1616,6 +3031,10 @@ class CandidateSearch:
         plan: RetrievalPlan,
         user_id: str,
         channel_scope: MemoryScope,
+        center_seq: int | None = None,
+        window_size: int | None = None,
+        window_variant: str = "centered",
+        rank_adjustment: float = 0.0,
     ) -> dict[str, Any] | None:
         """Shape a seed message row into a conversation-window candidate."""
         conversation_id = str(seed_row["conversation_id"])
@@ -1623,8 +3042,12 @@ class CandidateSearch:
         window_messages = await self._message_repository.fetch_message_window(
             conversation_id=conversation_id,
             user_id=user_id,
-            center_seq=seed_seq,
-            window_size=self._verbatim_evidence_window_size,
+            center_seq=seed_seq if center_seq is None else center_seq,
+            window_size=(
+                self._verbatim_evidence_window_size
+                if window_size is None
+                else window_size
+            ),
         )
         if not window_messages:
             return None
@@ -1632,10 +3055,15 @@ class CandidateSearch:
             self._message_with_seed_snippet(message, seed_row=seed_row, seed_seq=seed_seq)
             for message in window_messages
         ]
+        window_message_ids = [str(message["id"]) for message in window_messages]
+        metadata_rows = await self._source_message_metadata_rows(
+            user_id=user_id,
+            message_ids=window_message_ids,
+        )
         if not self._privacy_sql_filters_disabled(plan):
             window_messages = await self._gate_pending_confirmation_window_messages(
-                user_id=user_id,
                 messages=window_messages,
+                pending_ids=metadata_rows.pending_message_ids(),
             )
         conversation_mode_id = str(seed_row.get("conversation_assistant_mode_id") or "")
         # Scope mapping guards cross-conversation leakage for the
@@ -1671,16 +3099,12 @@ class CandidateSearch:
             for message in window_messages
             if not self._message_is_pending_confirmation(message)
         ]
-        privacy_level = await self._max_privacy_level_for_source_messages(
-            user_id=user_id,
-            source_message_ids=source_message_ids,
-        )
-        high_risk_metadata = await self._high_risk_metadata_for_source_messages(
-            user_id=user_id,
-            source_message_ids=source_message_ids,
-        )
-        intimacy_boundary, intimacy_boundary_confidence = await self._strongest_intimacy_boundary_for_source_messages(
-            user_id=user_id,
+        (
+            privacy_level,
+            high_risk_metadata,
+            intimacy_boundary,
+            intimacy_boundary_confidence,
+        ) = metadata_rows.metadata_for_source_message_ids(
             source_message_ids=source_message_ids,
         )
         source_window_start = str(
@@ -1699,6 +3123,7 @@ class CandidateSearch:
             "window_start_seq": start_seq,
             "window_end_seq": end_seq,
             "window_size": len(window_messages),
+            "verbatim_evidence_window_variant": window_variant,
             "source_message_window_start_occurred_at": source_window_start,
             "source_message_window_end_occurred_at": source_window_end,
         }
@@ -1745,7 +3170,7 @@ class CandidateSearch:
             payload["realm"] = {
                 "active_realm_id": realm_id,
             }
-        fts_rank = float(seed_row.get("rank") or 0.0)
+        fts_rank = float(seed_row.get("rank") or 0.0) + rank_adjustment
         # Phase 7 only permits raw/verbatim evidence from the active chat.
         # The window is user-visible transcript evidence rather than a
         # durable memory fact, so namespace gating happens through the active
@@ -1770,7 +3195,7 @@ class CandidateSearch:
             "realm_id": realm_id,
             "object_type": MemoryObjectType.EVIDENCE.value,
             "scope": resolved_scope.value,
-            "scope_canonical": MemoryScope.CHAT.value,
+            "scope_canonical": _canonical_scope_value(resolved_scope.value),
             "canonical_text": canonical_text,
             "payload_json": payload,
             "source_kind": MemorySourceKind.VERBATIM.value,
@@ -1799,19 +3224,16 @@ class CandidateSearch:
             "verbatim_evidence_window_conversation_id": conversation_id,
             "verbatim_evidence_window_start_seq": start_seq,
             "verbatim_evidence_window_end_seq": end_seq,
+            "verbatim_evidence_window_variant": window_variant,
             "verbatim_evidence_window_message_ids": source_message_ids,
         }
 
     async def _gate_pending_confirmation_window_messages(
         self,
         *,
-        user_id: str,
         messages: list[dict[str, Any]],
+        pending_ids: set[str],
     ) -> list[dict[str, Any]]:
-        pending_ids = await self._pending_confirmation_source_message_ids(
-            user_id=user_id,
-            message_ids=[str(message["id"]) for message in messages],
-        )
         if not pending_ids:
             return messages
         gated_messages: list[dict[str, Any]] = []
@@ -1832,145 +3254,40 @@ class CandidateSearch:
             gated_messages.append(gated)
         return gated_messages
 
-    async def _pending_confirmation_source_message_ids(
+    async def _source_message_metadata_rows(
         self,
         *,
         user_id: str,
         message_ids: list[str],
-    ) -> set[str]:
+    ) -> _SourceMessageMetadataRows:
         normalized_message_ids = [
             str(message_id).strip()
             for message_id in message_ids
             if str(message_id).strip()
         ]
         if not normalized_message_ids:
-            return set()
+            return _SourceMessageMetadataRows([])
         placeholders = ", ".join("?" for _ in normalized_message_ids)
         cursor = await self._connection.execute(
             """
-            SELECT DISTINCT CAST(pending_src.value AS TEXT) AS message_id
-            FROM memory_objects AS pending
+            SELECT
+                CAST(source_ids.value AS TEXT) AS message_id,
+                mo.status,
+                mo.privacy_level,
+                mo.memory_category,
+                mo.preserve_verbatim,
+                mo.intimacy_boundary,
+                mo.intimacy_boundary_confidence
+            FROM memory_objects AS mo
             JOIN json_each(
-                json_extract(pending.payload_json, '$.source_message_ids')
-            ) AS pending_src ON 1 = 1
-            WHERE pending.user_id = ?
-              AND pending.status = ?
-              AND CAST(pending_src.value AS TEXT) IN ({placeholders})
-            """.format(placeholders=placeholders),
-            (
-                user_id,
-                MemoryStatus.PENDING_USER_CONFIRMATION.value,
-                *normalized_message_ids,
-            ),
-        )
-        rows = await cursor.fetchall()
-        return {
-            str(row["message_id"])
-            for row in rows
-            if str(row["message_id"]).strip()
-        }
-
-    async def _max_privacy_level_for_source_messages(
-        self,
-        *,
-        user_id: str,
-        source_message_ids: list[str],
-    ) -> int:
-        normalized_message_ids = [
-            str(message_id).strip()
-            for message_id in source_message_ids
-            if str(message_id).strip()
-        ]
-        if not normalized_message_ids:
-            return 0
-        placeholders = ", ".join("?" for _ in normalized_message_ids)
-        cursor = await self._connection.execute(
-            """
-            SELECT MAX(mo.privacy_level) AS max_privacy_level
-            FROM memory_objects AS mo
-            JOIN json_each(mo.payload_json, '$.source_message_ids') AS source_ids ON 1 = 1
+                json_extract(mo.payload_json, '$.source_message_ids')
+            ) AS source_ids ON 1 = 1
             WHERE mo.user_id = ?
               AND CAST(source_ids.value AS TEXT) IN ({placeholders})
             """.format(placeholders=placeholders),
             (user_id, *normalized_message_ids),
         )
-        row = await cursor.fetchone()
-        if row is None or row["max_privacy_level"] is None:
-            return 0
-        return int(row["max_privacy_level"])
-
-    async def _high_risk_metadata_for_source_messages(
-        self,
-        *,
-        user_id: str,
-        source_message_ids: list[str],
-    ) -> dict[str, Any]:
-        normalized_message_ids = [
-            str(message_id).strip()
-            for message_id in source_message_ids
-            if str(message_id).strip()
-        ]
-        if not normalized_message_ids:
-            return {}
-        placeholders = ", ".join("?" for _ in normalized_message_ids)
-        cursor = await self._connection.execute(
-            """
-            SELECT mo.memory_category, mo.preserve_verbatim
-            FROM memory_objects AS mo
-            JOIN json_each(mo.payload_json, '$.source_message_ids') AS source_ids ON 1 = 1
-            WHERE mo.user_id = ?
-              AND mo.status = ?
-              AND CAST(source_ids.value AS TEXT) IN ({placeholders})
-            """.format(placeholders=placeholders),
-            (user_id, MemoryStatus.ACTIVE.value, *normalized_message_ids),
-        )
-        rows = [dict(row) for row in await cursor.fetchall()]
-        if not rows:
-            return {}
-        if any(
-            str(row.get("memory_category") or "") == MemoryCategory.PIN_OR_PASSWORD.value
-            for row in rows
-        ):
-            return {
-                "memory_category": MemoryCategory.PIN_OR_PASSWORD.value,
-                "preserve_verbatim": True,
-            }
-        if any(bool(row.get("preserve_verbatim")) for row in rows):
-            return {"preserve_verbatim": True}
-        return {}
-
-    async def _strongest_intimacy_boundary_for_source_messages(
-        self,
-        *,
-        user_id: str,
-        source_message_ids: list[str],
-    ) -> tuple[str, float]:
-        normalized_message_ids = [
-            str(message_id).strip()
-            for message_id in source_message_ids
-            if str(message_id).strip()
-        ]
-        if not normalized_message_ids:
-            return "ordinary", 0.0
-        placeholders = ", ".join("?" for _ in normalized_message_ids)
-        cursor = await self._connection.execute(
-            """
-            SELECT mo.intimacy_boundary, mo.intimacy_boundary_confidence
-            FROM memory_objects AS mo
-            JOIN json_each(mo.payload_json, '$.source_message_ids') AS source_ids ON 1 = 1
-            WHERE mo.user_id = ?
-              AND CAST(source_ids.value AS TEXT) IN ({placeholders})
-            """.format(placeholders=placeholders),
-            (user_id, *normalized_message_ids),
-        )
-        rows = [dict(row) for row in await cursor.fetchall()]
-        boundary = strongest_intimacy_boundary(rows)
-        confidences = [
-            float(row.get("intimacy_boundary_confidence", 0.0) or 0.0)
-            for row in rows
-            if str(row.get("intimacy_boundary") or "ordinary") == boundary.value
-        ]
-        return boundary.value, max(confidences, default=0.0)
+        return _SourceMessageMetadataRows([dict(row) for row in await cursor.fetchall()])
 
     @staticmethod
     def _build_artifact_chunk_candidate(
@@ -2155,6 +3472,7 @@ class CandidateSearch:
             "verbatim_pin": None,
             "artifact_chunk": 1,
             "fts": None,
+            "fact_facet": None,
             "embedding": None,
             "consequence": None,
             "verbatim_evidence_search": None,
@@ -2260,13 +3578,6 @@ class CandidateSearch:
         return None
 
     @staticmethod
-    def _optional_text(value: Any) -> str | None:
-        if value is None:
-            return None
-        normalized = str(value).strip()
-        return normalized or None
-
-    @staticmethod
     def _strictest_sensitivity(*values: str) -> str:
         resolved = "unknown"
         for value in values:
@@ -2327,11 +3638,15 @@ class CandidateSearch:
     def _message_can_include_skipped_raw(cls, message: dict[str, Any]) -> bool:
         if cls._message_is_pending_confirmation(message):
             return False
-        return str(message.get("policy_reason") or "") == "mechanical_size_threshold"
+        return str(message.get("policy_reason") or "") in {
+            "artifact_backed",
+            "mechanical_size_threshold",
+        }
 
     @classmethod
     def _message_skipped_raw_text(cls, message: dict[str, Any]) -> str:
         text = str(message.get("text") or "").strip()
+        policy_reason = str(message.get("policy_reason") or "skip_by_default")
         if len(text) <= _SKIPPED_RAW_VERBATIM_MAX_CHARS:
             return text
         snippet = " ".join(str(message.get("fts_snippet") or "").split()).strip()
@@ -2339,13 +3654,13 @@ class CandidateSearch:
             excerpt = snippet[:_SKIPPED_RAW_VERBATIM_SNIPPET_MAX_CHARS].strip()
             return (
                 "[Skipped raw message excerpt | "
-                f"seq={message.get('seq', '?')} policy=mechanical_size_threshold]\n"
+                f"seq={message.get('seq', '?')} policy={policy_reason}]\n"
                 f"{excerpt}"
             )
         return (
             text[:_SKIPPED_RAW_VERBATIM_MAX_CHARS].rstrip()
             + "\n[Truncated skipped raw message | "
-            f"seq={message.get('seq', '?')} policy=mechanical_size_threshold]"
+            f"seq={message.get('seq', '?')} policy={policy_reason}]"
         )
 
     @classmethod
@@ -2420,9 +3735,18 @@ class CandidateSearch:
         return None
 
     @staticmethod
-    def _pick_verbatim_evidence_scope(scope_filter: list[MemoryScope]) -> MemoryScope | None:
-        """Raw message evidence is only eligible from the active chat in Phase 7."""
-        allowed = set(scope_filter)
+    def _pick_verbatim_evidence_scope(plan: RetrievalPlan) -> MemoryScope | None:
+        """Pick the narrowest safe scope for raw transcript windows."""
+        allowed = set(plan.scope_filter)
+        if (
+            CandidateSearch._allow_cross_conversation_verbatim_evidence(plan)
+            and (
+                MemoryScope.GLOBAL_USER in allowed
+                or MemoryScope.ASSISTANT_MODE in allowed
+                or MemoryScope.USER in allowed
+            )
+        ):
+            return MemoryScope.GLOBAL_USER
         if MemoryScope.CONVERSATION in allowed:
             return MemoryScope.CONVERSATION
         if MemoryScope.EPHEMERAL_SESSION in allowed:
@@ -2446,6 +3770,12 @@ class CandidateSearch:
         (``global_user``) accept any conversation that already cleared
         the SQL-layer privacy check.
         """
+        if conversation_id == plan.conversation_id:
+            canonical_allowed = set(
+                MemoryObjectRepository.canonical_retrieval_scopes(plan.scope_filter)
+            )
+            if MemoryScope.CHAT in canonical_allowed:
+                return MemoryScope.CONVERSATION
         if channel_scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION, MemoryScope.CHAT}:
             if conversation_id != plan.conversation_id:
                 if CandidateSearch._privacy_sql_filters_disabled(plan):
@@ -2454,7 +3784,24 @@ class CandidateSearch:
             if channel_scope is MemoryScope.EPHEMERAL_SESSION:
                 return MemoryScope.EPHEMERAL_SESSION
             return MemoryScope.CONVERSATION
+        if channel_scope in {MemoryScope.GLOBAL_USER, MemoryScope.ASSISTANT_MODE, MemoryScope.USER}:
+            if plan.incognito or not plan.remember_across_chats:
+                return None
+            return MemoryScope.GLOBAL_USER
         return None
+
+    @staticmethod
+    def _allow_cross_conversation_verbatim_evidence(plan: RetrievalPlan) -> bool:
+        if not plan.exact_recall_mode:
+            return False
+        if plan.incognito or not plan.remember_across_chats:
+            return False
+        return (
+            plan.query_type == "broad_list"
+            or (plan.query_type == "slot_fill" and bool(plan.exact_facets))
+            or len(plan.sub_query_plans) > 1
+            or len(plan.exact_facets) > 1
+        )
 
     @staticmethod
     def _dedupe_verbatim_evidence_windows_against_memories(
@@ -2462,11 +3809,15 @@ class CandidateSearch:
         *,
         plan: RetrievalPlan,
     ) -> None:
-        """Drop evidence-window candidates already covered by a memory object.
+        """Drop evidence-window candidates already covered by direct memory.
 
         An evidence window is considered covered when any of its source
-        message ids appears in ``payload_json.source_message_ids`` of a
-        non-window candidate that also scored for the same sub-query.
+        message ids appears in ``payload_json.source_message_ids`` of a direct
+        non-window candidate that also scored for the same sub-query. Summary
+        views and fact-facet pointers are deliberately not treated as full
+        substitutes: they preserve recall and continuity, but they can omit
+        exact names, dates, list members, and surrounding utterance context
+        that verbatim windows are meant to rescue.
         """
         if plan.exact_recall_mode or plan.raw_context_access_mode == "verbatim":
             return
@@ -2474,6 +3825,10 @@ class CandidateSearch:
         covered_message_ids: set[str] = set()
         for candidate in aggregated.values():
             if candidate.get("is_verbatim_evidence_window"):
+                continue
+            if candidate.get("is_fact_facet_candidate"):
+                continue
+            if CandidateSearch._is_summary_like_evidence_coverage(candidate):
                 continue
             payload = candidate.get("payload_json")
             if not isinstance(payload, dict):
@@ -2496,6 +3851,13 @@ class CandidateSearch:
                 to_drop.append(window_id)
         for window_id in to_drop:
             aggregated.pop(window_id, None)
+
+    @staticmethod
+    def _is_summary_like_evidence_coverage(candidate: dict[str, Any]) -> bool:
+        return (
+            str(candidate.get("object_type") or "") == MemoryObjectType.SUMMARY_VIEW.value
+            or str(candidate.get("source_kind") or "") == MemorySourceKind.SUMMARIZED.value
+        )
 
     async def _annotate_realm_bridge_modes(
         self,
@@ -2704,6 +4066,73 @@ class CandidateSearch:
             annotated["fts_rank"] = annotated["rank"]
         return annotated
 
+    @staticmethod
+    def _annotate_fts_query_match(
+        candidate: dict[str, Any],
+        *,
+        sub_query_text: str,
+        fts_query: str,
+        fts_query_kind: str,
+        fts_query_source: str = "planned",
+        non_evidential: bool = True,
+    ) -> dict[str, Any]:
+        annotated = dict(candidate)
+        match = {
+            "subquery": sub_query_text,
+            "query": fts_query,
+            "kind": fts_query_kind,
+            "match_mode": CandidateSearch._fts_query_match_mode(fts_query),
+            "position_rank": int(candidate.get("position_rank") or 0),
+        }
+        if fts_query_source not in {"planned", "dynamic"}:
+            match["source"] = fts_query_source
+            match["non_evidential"] = bool(non_evidential)
+        annotated["fts_query_matches"] = [match]
+        return annotated
+
+    @staticmethod
+    def _record_fts_query_audit(
+        audit: list[dict[str, Any]] | None,
+        *,
+        sub_query_text: str,
+        fts_query: str,
+        fts_query_kind: str,
+        raw_rows: int,
+        source: str = "planned",
+        non_evidential: bool = True,
+    ) -> None:
+        if audit is None:
+            return
+        entry = {
+            "subquery": sub_query_text,
+            "query": fts_query,
+            "kind": fts_query_kind,
+            "match_mode": CandidateSearch._fts_query_match_mode(fts_query),
+            "raw_rows": max(0, int(raw_rows)),
+        }
+        if source not in {"planned", "dynamic"}:
+            entry["source"] = source
+            entry["non_evidential"] = bool(non_evidential)
+        audit.append(entry)
+
+    @staticmethod
+    def _fts_query_kind_at(sub_query: Any, index: int) -> str:
+        kinds = list(getattr(sub_query, "fts_query_kinds", []) or [])
+        if 0 <= index < len(kinds):
+            return str(kinds[index] or "unknown")
+        return "unknown"
+
+    @staticmethod
+    def _fts_query_match_mode(fts_query: str) -> str:
+        query = str(fts_query or "").strip()
+        if not query:
+            return "unknown"
+        if query.startswith('"') and query.endswith('"'):
+            return "quoted_phrase"
+        if " OR " in query:
+            return "explicit_or"
+        return "implicit_and"
+
     def _merge_channel_candidates(
         self,
         aggregated: dict[str, dict[str, Any]],
@@ -2719,6 +4148,7 @@ class CandidateSearch:
 
             memory_id = str(candidate["id"])
             current = aggregated.get(memory_id)
+            current_was_created = current is None
             if current is None:
                 current = self._initialize_channel_candidate(candidate)
                 aggregated[memory_id] = current
@@ -2732,10 +4162,14 @@ class CandidateSearch:
                         "rrf_score",
                         "rrf_score_raw",
                         "retrieval_source",
+                        "fts_query_matches",
                     }:
                         continue
                     current[key] = value
                 current["channel_ranks"][channel] = int(position_rank)
+
+            if not current_was_created:
+                self._merge_fts_query_matches(current, candidate)
 
             if channel not in current["retrieval_sources"]:
                 current["retrieval_sources"].append(channel)
@@ -2774,6 +4208,7 @@ class CandidateSearch:
 
             memory_id = str(candidate["id"])
             current = aggregated.get(memory_id)
+            current_was_created = current is None
             if current is None:
                 current = dict(candidate)
                 current["matched_sub_queries"] = []
@@ -2792,10 +4227,14 @@ class CandidateSearch:
                         "rrf_score",
                         "rrf_score_raw",
                         "position_rank",
+                        "fts_query_matches",
                     }:
                         continue
                     current[key] = value
                 current["subquery_ranks"][sub_query_text] = int(position_rank)
+
+            if not current_was_created:
+                self._merge_fts_query_matches(current, candidate)
 
             if sub_query_text not in current["matched_sub_queries"]:
                 current["matched_sub_queries"].append(sub_query_text)
@@ -2844,6 +4283,43 @@ class CandidateSearch:
         channel_candidate["rrf_score_raw"] = 0.0
         channel_candidate["retrieval_source"] = ""
         return channel_candidate
+
+    @staticmethod
+    def _merge_fts_query_matches(
+        current: dict[str, Any],
+        candidate: dict[str, Any],
+    ) -> None:
+        incoming = candidate.get("fts_query_matches")
+        if not isinstance(incoming, list) or not incoming:
+            return
+        existing = current.get("fts_query_matches")
+        if not isinstance(existing, list):
+            existing = []
+        seen = {
+            (
+                str(match.get("subquery") or ""),
+                str(match.get("query") or ""),
+                str(match.get("kind") or ""),
+                str(match.get("match_mode") or ""),
+            )
+            for match in existing
+            if isinstance(match, dict)
+        }
+        merged = list(existing)
+        for match in incoming:
+            if not isinstance(match, dict):
+                continue
+            signature = (
+                str(match.get("subquery") or ""),
+                str(match.get("query") or ""),
+                str(match.get("kind") or ""),
+                str(match.get("match_mode") or ""),
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            merged.append(dict(match))
+        current["fts_query_matches"] = merged
 
     def _compute_rrf_scores(
         self,
@@ -2904,6 +4380,8 @@ class CandidateSearch:
             raw_context_access_mode=raw_context_access_mode,
         )
         multiplier = multiplier_map.get(channel, 1.0)
+        if channel == "fact_facet":
+            return self._fact_facet_retrieval_weight * multiplier
         if channel == "verbatim_evidence_search":
             return self._verbatim_evidence_search_weight * multiplier
         return multiplier

@@ -6,20 +6,38 @@ from dataclasses import dataclass
 import logging
 from typing import Any
 
+from atagia.core.initial_context_package_repository import InitialContextPackageRepository
 from atagia.core.llm_output_limits import CHAT_REPLY_MAX_OUTPUT_TOKENS
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+)
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.core.topic_repository import TopicRepository
-from atagia.memory.lifecycle_runner import piggyback_lifecycle
+from atagia.memory.context_envelope import (
+    ContextEnvelopeBudget,
+    allocate_context_envelope_budget,
+)
+from atagia.memory.lifecycle_runner import request_lifecycle_piggyback
 from atagia.core.summary_repository import SummaryRepository
-from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
+from atagia.core.timestamps import (
+    normalize_optional_timestamp,
+    resolve_message_occurred_at,
+)
 from atagia.memory.intimacy_boundary_policy import (
     INTIMACY_FILTER_REASON,
     strongest_intimacy_boundary,
 )
 from atagia.models.schemas_api import ChatResult
-from atagia.models.schemas_memory import ConversationStatus, MindTopology
+from atagia.models.schemas_memory import (
+    ConversationStatus,
+    MindTopology,
+    ResponseMode,
+)
+from atagia.models.schemas_replay import AblationConfig
 from atagia.services.artifact_service import ArtifactService
 from atagia.services.chat_support import (
     CONTEXT_VIEW_TTL_SECONDS,
@@ -27,6 +45,7 @@ from atagia.services.chat_support import (
     RECENT_WINDOW_MESSAGES,
     apply_conversation_policy_overlay,
     build_message_jobs,
+    build_response_language_guidance,
     build_system_prompt,
     build_transcript_window,
     build_transcript_window_trace,
@@ -34,15 +53,23 @@ from atagia.services.chat_support import (
     enqueue_message_jobs,
     filter_topic_working_set_snapshot,
     missing_uncovered_tail_start_seq,
+    render_assistant_guidance_block,
+    render_answer_support_block,
     render_transcript_window,
     render_topic_working_set_block,
     resolve_retrieval_profile_id,
     resolve_operational_profile,
     resolve_policy,
     summarize_memory_summaries,
+    estimate_tokens,
 )
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.confirmation_service import PendingConfirmationService
+from atagia.services.initial_context_package_prompt import (
+    InitialContextPackagePromptAssembly,
+    assemble_initial_context_package_prompt,
+    drop_initial_context_package_for_overflow,
+)
 from atagia.services.job_tracking_service import (
     JobTrackingService,
     render_memory_processing_status_block,
@@ -66,10 +93,82 @@ from atagia.services.llm_client import (
     LLMCompletionRequest,
     LLMError,
     LLMMessage,
+    OutputLimitExceededError,
     known_intimacy_context_metadata,
 )
+from atagia.services.answer_postcondition import (
+    complete_answer_with_postcondition_guard,
+)
+from atagia.services.model_resolution import resolve_component_model
+from atagia.services.prompt_authority import normalize_request_authority_context
 
 logger = logging.getLogger(__name__)
+
+
+def _context_envelope_budget(
+    settings: Any,
+    ablation: AblationConfig | None,
+) -> ContextEnvelopeBudget:
+    return allocate_context_envelope_budget(
+        (
+            ablation.context_envelope_budget_tokens
+            if ablation is not None
+            and ablation.context_envelope_budget_tokens is not None
+            else settings.context_envelope_budget_tokens
+        ),
+        (
+            ablation.context_envelope_ratios
+            if ablation is not None and ablation.context_envelope_ratios is not None
+            else settings.context_envelope_ratios
+        ),
+    )
+
+
+def _estimate_llm_input_tokens(messages: list[LLMMessage]) -> int:
+    return sum(estimate_tokens(message.content) for message in messages)
+
+
+def _context_envelope_trace(
+    envelope_budget: ContextEnvelopeBudget | None,
+    *,
+    estimated_input_tokens: int,
+    retrieved_context_tokens: int,
+    transcript_budget_initial_tokens: int,
+    transcript_budget_final_tokens: int,
+    transcript_trace: dict[str, Any],
+) -> dict[str, Any] | None:
+    if envelope_budget is None:
+        return None
+    budget_payload = envelope_budget.model_dump()
+    return {
+        "enabled": True,
+        **budget_payload,
+        "retrieved_context_tokens": retrieved_context_tokens,
+        "recent_transcript_budget_initial_tokens": transcript_budget_initial_tokens,
+        "recent_transcript_budget_final_tokens": transcript_budget_final_tokens,
+        "recent_transcript_used_tokens": int(
+            transcript_trace.get("budget_used_tokens") or 0
+        ),
+        "estimated_input_tokens": estimated_input_tokens,
+        "estimated_overflow_tokens": max(
+            0,
+            estimated_input_tokens - envelope_budget.total_budget_tokens,
+        ),
+        "reserve_tokens": 0,
+    }
+
+
+def _transcript_message_ids(entries: list[Any]) -> set[str]:
+    message_ids: set[str] = set()
+    for entry in entries:
+        message_id = getattr(entry, "message_id", None)
+        if message_id is not None:
+            message_ids.add(str(message_id))
+            continue
+        message = getattr(entry, "message", None)
+        if isinstance(message, dict) and message.get("id") is not None:
+            message_ids.add(str(message["id"]))
+    return message_ids
 
 
 @dataclass(slots=True)
@@ -85,11 +184,13 @@ class ChatService:
         message_text: str,
         assistant_mode_id: str | None = None,
         *,
+        ablation: AblationConfig | None = None,
         attachments: list[Any] | None = None,
         message_occurred_at: str | None = None,
         include_thinking: bool = False,
         metadata: dict[str, Any] | None = None,
         debug: bool = False,
+        debug_include_sensitive: bool = True,
         operational_profile: str | None = None,
         operational_signals: Any | None = None,
         cross_chat_memory: bool = True,
@@ -104,12 +205,29 @@ class ChatService:
         space_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
+        response_mode: ResponseMode | str | None = None,
     ) -> ChatResult:
         """Run the full retrieval, generation, persistence, and background-job flow."""
+        resolved_response_mode = (
+            ResponseMode(self.runtime.settings.response_mode)
+            if response_mode is None
+            else ResponseMode(response_mode)
+        )
+        authority_context = normalize_request_authority_context(
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+            user_id=user_id,
+            purpose="chat_reply",
+        )
         cache_service = ContextCacheService(self.runtime)
         async with cache_service.user_cache_guard(user_id):
             await wait_for_in_memory_worker_quiescence(self.runtime)
             connection = await self.runtime.open_connection()
+            chat_result: ChatResult | None = None
             try:
                 conversations = ConversationRepository(connection, self.runtime.clock)
                 users = UserRepository(connection, self.runtime.clock)
@@ -136,7 +254,9 @@ class ChatService:
                     settings=self.runtime.settings,
                 )
 
-                conversation = await conversations.get_conversation(conversation_id, user_id)
+                conversation = await conversations.get_conversation(
+                    conversation_id, user_id
+                )
                 if conversation is None:
                     raise ConversationNotFoundError("Conversation not found for user")
                 _validate_optional_identity(
@@ -156,7 +276,9 @@ class ChatService:
                 memory_preferences = await users.get_memory_preferences(user_id)
                 if str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
                     raise ConversationNotActiveError("Conversation is not active")
-                if not cross_chat_memory and not bool(conversation.get("isolated_mode")):
+                if not cross_chat_memory and not bool(
+                    conversation.get("isolated_mode")
+                ):
                     updated = await conversations.mark_conversation_isolated(
                         conversation_id,
                         user_id,
@@ -177,7 +299,10 @@ class ChatService:
                         )
                         conversation = updated
 
-                conversation, active_presence = await ensure_conversation_active_presence(
+                (
+                    conversation,
+                    active_presence,
+                ) = await ensure_conversation_active_presence(
                     connection,
                     self.runtime.clock,
                     conversation=conversation,
@@ -200,7 +325,10 @@ class ChatService:
                     active_presence=active_presence,
                     character_id=character_id,
                 )
-                conversation, active_embodiment = await ensure_conversation_active_embodiment(
+                (
+                    conversation,
+                    active_embodiment,
+                ) = await ensure_conversation_active_embodiment(
                     connection,
                     self.runtime.clock,
                     conversation=conversation,
@@ -252,7 +380,9 @@ class ChatService:
                     user_id,
                     limit=RECENT_FETCH_LIMIT,
                 )
-                conversation_chunks = await summaries.list_all_conversation_chunks(user_id, conversation_id)
+                conversation_chunks = await summaries.list_all_conversation_chunks(
+                    user_id, conversation_id
+                )
                 missing_tail_start_seq = missing_uncovered_tail_start_seq(
                     prior_messages,
                     conversation_chunks,
@@ -272,11 +402,16 @@ class ChatService:
                         assistant_mode_id=resolved_mode_id,
                         user_persona_id=conversation.get("user_persona_id"),
                         platform_id=conversation.get("platform_id") or "default",
-                        character_id=conversation.get("character_id") or conversation.get("workspace_id"),
+                        character_id=conversation.get("character_id")
+                        or conversation.get("workspace_id"),
                         incognito=bool(conversation.get("incognito"))
                         or bool(conversation.get("isolated_mode")),
-                        remember_across_chats=bool(conversation.get("remember_across_chats", 1)),
-                        remember_across_devices=bool(conversation.get("remember_across_devices", 1)),
+                        remember_across_chats=bool(
+                            conversation.get("remember_across_chats", 1)
+                        ),
+                        remember_across_devices=bool(
+                            conversation.get("remember_across_devices", 1)
+                        ),
                         active_mind_id=active_mind.mind_id,
                         mind_topology=active_mind.topology,
                         active_embodiment_id=(
@@ -285,30 +420,52 @@ class ChatService:
                             else None
                         ),
                         active_realm_id=(
-                            active_realm.realm_id
-                            if active_realm is not None
-                            else None
+                            active_realm.realm_id if active_realm is not None else None
                         ),
                     )
                     == 0
                 )
-                confirmation_plan = await confirmations.plan_turn(
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    message_text=prompt_message_text,
+                if authority_context.privacy_restrictions_inactive:
+                    confirmation_plan = None
+                else:
+                    confirmation_plan = await confirmations.plan_turn(
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        message_text=prompt_message_text,
+                    )
+                invalidate_confirmation_cache = (
+                    confirmation_plan is not None
+                    and confirmation_plan.response_intent is not None
                 )
-                invalidate_confirmation_cache = confirmation_plan.response_intent is not None
-                resolution = await cache_service.resolve_with_connection(
-                    connection,
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    message_text=prompt_message_text,
-                    assistant_mode_id=resolved_mode_id,
-                    stored_messages=prior_messages,
-                    conversation=conversation,
-                    operational_profile=operational_profile,
-                    operational_signals=operational_signals,
-                )
+                if resolved_response_mode is ResponseMode.NORMAL:
+                    resolution = await cache_service.resolve_with_connection(
+                        connection,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        message_text=prompt_message_text,
+                        assistant_mode_id=resolved_mode_id,
+                        stored_messages=prior_messages,
+                        conversation=conversation,
+                        operational_profile=operational_profile,
+                        operational_signals=operational_signals,
+                        ablation=ablation,
+                        prompt_authority_context=authority_context,
+                    )
+                else:
+                    resolution = await cache_service.resolve_fast_with_connection(
+                        connection,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        message_text=prompt_message_text,
+                        response_mode=resolved_response_mode,
+                        assistant_mode_id=resolved_mode_id,
+                        stored_messages=prior_messages,
+                        conversation=conversation,
+                        operational_profile=operational_profile,
+                        operational_signals=operational_signals,
+                        ablation=ablation,
+                        prompt_authority_context=authority_context,
+                    )
                 topic_snapshot = await TopicRepository(
                     connection,
                     self.runtime.clock,
@@ -342,25 +499,30 @@ class ChatService:
                     user_id=user_id,
                     conversation_id=conversation_id,
                 )
+                context_envelope_budget = _context_envelope_budget(
+                    self.runtime.settings,
+                    ablation,
+                )
+                transcript_budget_tokens = 0
+                transcript_budget_initial_tokens = 0
+                raw_context_access_mode = str(
+                    resolution.source_retrieval_plan.get(
+                        "raw_context_access_mode", "normal"
+                    )
+                )
                 if self.runtime.settings.benchmark_disable_raw_recent_transcript:
                     transcript_entries = []
                     transcript_trace = build_transcript_window_trace([], 0)
                 else:
                     transcript_budget_tokens = (
-                        self.runtime.settings.effective_recent_transcript_budget_tokens(
-                            resolution.resolved_policy.transcript_budget_tokens,
-                            hard_cap_tokens=(
-                                resolution.resolved_operational_profile.policy_override.transcript_budget_tokens
-                            ),
-                        )
+                        context_envelope_budget.recent_transcript_budget_tokens
                     )
+                    transcript_budget_initial_tokens = transcript_budget_tokens
                     transcript_entries = build_transcript_window(
                         prior_messages,
                         conversation_chunks,
                         transcript_budget_tokens,
-                        raw_context_access_mode=str(
-                            resolution.source_retrieval_plan.get("raw_context_access_mode", "normal")
-                        ),
+                        raw_context_access_mode=raw_context_access_mode,
                         allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
                     )
                     transcript_trace = build_transcript_window_trace(
@@ -371,50 +533,252 @@ class ChatService:
                     *render_transcript_window(transcript_entries),
                     {"role": "user", "text": prompt_message_text},
                 ]
-                llm_response = await self.runtime.llm_client.complete(
-                    LLMCompletionRequest(
-                        model=chat_model(self.runtime.settings),
-                        messages=[
-                            LLMMessage(
-                                role="system",
-                                content=build_system_prompt(
-                                    resolved_mode_id,
-                                    resolution.resolved_policy,
-                                    resolution.composed_context.contract_block,
-                                    resolution.composed_context.workspace_block,
-                                    resolution.composed_context.memory_block,
-                                    resolution.composed_context.state_block,
-                                    topic_context_block=topic_context_block,
-                                    memory_processing_block=render_memory_processing_status_block(
-                                        prompt_memory_processing
-                                    ),
-                                ),
-                            ),
-                            *[
-                                LLMMessage(role=str(message["role"]), content=str(message["text"]))
-                                for message in transcript
-                            ],
-                        ],
-                        temperature=0.0,
-                        max_output_tokens=CHAT_REPLY_MAX_OUTPUT_TOKENS,
-                        include_thinking=include_thinking,
-                        metadata={
-                            "user_id": user_id,
-                            "conversation_id": conversation_id,
-                            "assistant_mode_id": resolved_mode_id,
-                            "purpose": "chat_reply",
-                            **self._chat_intimacy_metadata(
-                                visible_topic_snapshot,
-                                allow_intimacy_context=(
-                                    resolution.resolved_policy.allow_intimacy_context
-                                ),
-                            ),
-                        },
+                assistant_guidance_block = render_assistant_guidance_block(
+                    build_response_language_guidance(
+                        resolution.source_retrieval_plan,
+                        enabled=self.runtime.settings.assistant_guidance_enabled,
+                        from_cache=resolution.from_cache,
                     )
                 )
-                response_text = llm_response.output_text
-                if confirmation_plan.prompt_text is not None:
-                    response_text = f"{confirmation_plan.prompt_text}\n\n{llm_response.output_text}"
+                try:
+                    initial_context_package = await assemble_initial_context_package_prompt(
+                        connection,
+                        self.runtime.clock,
+                        enabled=self.runtime.settings.initial_context_package_read_enabled,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        conversation=conversation,
+                        resolved_policy=resolution.resolved_policy,
+                        authority_context=authority_context,
+                        operational_profile=(
+                            resolution.resolved_operational_profile.snapshot
+                        ),
+                        context_envelope_budget=context_envelope_budget,
+                        retrieved_context_tokens=(
+                            resolution.composed_context.total_tokens_estimate
+                        ),
+                        selected_memory_ids=(
+                            resolution.composed_context.selected_memory_ids
+                        ),
+                        topic_context_block=topic_context_block,
+                        live_contract_block=resolution.composed_context.contract_block,
+                        live_state_block=resolution.composed_context.state_block,
+                        recent_transcript_message_ids=_transcript_message_ids(
+                            transcript_entries
+                        ),
+                        include_recent_verbatim_seed=(
+                            not self.runtime.settings.benchmark_disable_raw_recent_transcript
+                        ),
+                        prompt_budget_tokens=(
+                            self.runtime.settings.initial_context_package_prompt_max_tokens
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Initial context package read failed for user_id=%s conversation_id=%s",
+                        user_id,
+                        conversation_id,
+                    )
+                    initial_context_package = InitialContextPackagePromptAssembly(
+                        "",
+                        {
+                            "enabled": (
+                                self.runtime.settings.initial_context_package_read_enabled
+                            ),
+                            "rendered": False,
+                            "read_ms": 0.0,
+                            "packages": [],
+                            "error": "read_failed",
+                        },
+                    )
+                system_prompt = build_system_prompt(
+                    resolved_mode_id,
+                    resolution.resolved_policy,
+                    resolution.composed_context.contract_block,
+                    resolution.composed_context.workspace_block,
+                    resolution.composed_context.memory_block,
+                    resolution.composed_context.state_block,
+                    answer_support_block=render_answer_support_block(
+                        resolution.composed_context
+                    ),
+                    prepared_initial_context_block=initial_context_package.block,
+                    topic_context_block=topic_context_block,
+                    memory_processing_block=render_memory_processing_status_block(
+                        prompt_memory_processing
+                    ),
+                    assistant_guidance_block=assistant_guidance_block,
+                    answer_stance=self.runtime.settings.answer_stance,
+                    answer_stance_prompt_variant=(
+                        self.runtime.settings.answer_stance_prompt_variant
+                    ),
+                    prompt_authority_context=authority_context,
+                )
+                chat_messages = [
+                    LLMMessage(role="system", content=system_prompt),
+                    *[
+                        LLMMessage(
+                            role=str(message["role"]), content=str(message["text"])
+                        )
+                        for message in transcript
+                    ],
+                ]
+                estimated_input_tokens = _estimate_llm_input_tokens(chat_messages)
+                if (
+                    estimated_input_tokens > context_envelope_budget.total_budget_tokens
+                    and initial_context_package.block
+                ):
+                    initial_context_package = drop_initial_context_package_for_overflow(
+                        initial_context_package
+                    )
+                    system_prompt = build_system_prompt(
+                        resolved_mode_id,
+                        resolution.resolved_policy,
+                        resolution.composed_context.contract_block,
+                        resolution.composed_context.workspace_block,
+                        resolution.composed_context.memory_block,
+                        resolution.composed_context.state_block,
+                        answer_support_block=render_answer_support_block(
+                            resolution.composed_context
+                        ),
+                        prepared_initial_context_block=initial_context_package.block,
+                        topic_context_block=topic_context_block,
+                        memory_processing_block=render_memory_processing_status_block(
+                            prompt_memory_processing
+                        ),
+                        assistant_guidance_block=assistant_guidance_block,
+                        answer_stance=self.runtime.settings.answer_stance,
+                        answer_stance_prompt_variant=(
+                            self.runtime.settings.answer_stance_prompt_variant
+                        ),
+                        prompt_authority_context=authority_context,
+                    )
+                    chat_messages = [
+                        LLMMessage(role="system", content=system_prompt),
+                        *[
+                            LLMMessage(
+                                role=str(message["role"]),
+                                content=str(message["text"]),
+                            )
+                            for message in transcript
+                        ],
+                    ]
+                    estimated_input_tokens = _estimate_llm_input_tokens(chat_messages)
+                if (
+                    estimated_input_tokens > context_envelope_budget.total_budget_tokens
+                    and transcript_budget_tokens > 0
+                    and transcript_entries
+                    and not self.runtime.settings.benchmark_disable_raw_recent_transcript
+                ):
+                    overflow_tokens = (
+                        estimated_input_tokens
+                        - context_envelope_budget.total_budget_tokens
+                    )
+                    transcript_budget_tokens = max(
+                        0,
+                        transcript_budget_tokens - overflow_tokens,
+                    )
+                    transcript_entries = build_transcript_window(
+                        prior_messages,
+                        conversation_chunks,
+                        transcript_budget_tokens,
+                        raw_context_access_mode=raw_context_access_mode,
+                        allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
+                    )
+                    transcript_trace = build_transcript_window_trace(
+                        transcript_entries,
+                        transcript_budget_tokens,
+                    )
+                    transcript = [
+                        *render_transcript_window(transcript_entries),
+                        {"role": "user", "text": prompt_message_text},
+                    ]
+                    chat_messages = [
+                        LLMMessage(role="system", content=system_prompt),
+                        *[
+                            LLMMessage(
+                                role=str(message["role"]),
+                                content=str(message["text"]),
+                            )
+                            for message in transcript
+                        ],
+                    ]
+                    estimated_input_tokens = _estimate_llm_input_tokens(chat_messages)
+                context_envelope_trace = _context_envelope_trace(
+                    context_envelope_budget,
+                    estimated_input_tokens=estimated_input_tokens,
+                    retrieved_context_tokens=resolution.composed_context.total_tokens_estimate,
+                    transcript_budget_initial_tokens=transcript_budget_initial_tokens,
+                    transcript_budget_final_tokens=transcript_budget_tokens,
+                    transcript_trace=transcript_trace,
+                )
+                if context_envelope_trace is not None:
+                    context_envelope_trace["initial_context_package"] = (
+                        initial_context_package.diagnostics
+                    )
+                chat_request = LLMCompletionRequest(
+                    model=chat_model(self.runtime.settings),
+                    messages=chat_messages,
+                    max_output_tokens=CHAT_REPLY_MAX_OUTPUT_TOKENS,
+                    include_thinking=include_thinking,
+                    metadata={
+                        "user_id": user_id,
+                        "conversation_id": conversation_id,
+                        "assistant_mode_id": resolved_mode_id,
+                        "purpose": "chat_reply",
+                        "privacy_enforcement": authority_context.privacy_enforcement,
+                        "effective_privacy_enforcement": (
+                            authority_context.effective_privacy_enforcement
+                        ),
+                        "authenticated_privilege_level": (
+                            authority_context.normalized_privilege_level
+                        ),
+                        "authenticated_atagia_master": (
+                            authority_context.authenticated_user_is_atagia_master
+                        ),
+                        **self._chat_intimacy_metadata(
+                            visible_topic_snapshot,
+                            allow_intimacy_context=(
+                                resolution.resolved_policy.allow_intimacy_context
+                            ),
+                        ),
+                    },
+                )
+                answer_postcondition_report: dict[str, Any] | None = None
+                if self.runtime.settings.answer_postcondition_guard_enabled:
+                    guarded_answer = await complete_answer_with_postcondition_guard(
+                        llm_client=self.runtime.llm_client,
+                        request=chat_request,
+                        verifier_model=resolve_component_model(
+                            self.runtime.settings,
+                            "answer_postcondition",
+                        ),
+                        original_query=prompt_message_text,
+                        composed_context=resolution.composed_context,
+                        retrieval_sufficiency=resolution.retrieval_sufficiency,
+                        retrieval_diagnostics=resolution.retrieval_diagnostics_for_guard,
+                        privacy_enforcement=authority_context.privacy_enforcement,
+                        answer_stance=self.runtime.settings.answer_stance,
+                        prompt_authority_context=authority_context,
+                        retry_max_output_tokens=(
+                            self.runtime.settings.answer_postcondition_retry_max_output_tokens
+                        ),
+                    )
+                    llm_response = guarded_answer.response
+                    assistant_output_text = guarded_answer.output_text
+                    answer_postcondition_report = guarded_answer.report.model_dump(
+                        mode="json"
+                    )
+                else:
+                    llm_response = await self.runtime.llm_client.complete(chat_request)
+                    assistant_output_text = llm_response.output_text
+                response_text = assistant_output_text
+                if (
+                    confirmation_plan is not None
+                    and confirmation_plan.prompt_text is not None
+                ):
+                    response_text = (
+                        f"{confirmation_plan.prompt_text}\n\n{assistant_output_text}"
+                    )
                 resolved_user_occurred_at = (
                     normalize_optional_timestamp(message_occurred_at)
                     or self.runtime.clock.now().isoformat()
@@ -434,7 +798,9 @@ class ChatService:
                         occurred_at=resolved_user_occurred_at,
                         active_presence_id=active_presence.presence_id,
                         source_presence_id=user_source_presence.presence_id,
-                        space_id=active_space.space_id if active_space is not None else None,
+                        space_id=active_space.space_id
+                        if active_space is not None
+                        else None,
                         active_mind_id=active_mind.mind_id,
                         source_mind_id=active_mind.mind_id,
                         active_embodiment_id=(
@@ -458,13 +824,17 @@ class ChatService:
                         conversation_id=conversation_id,
                         role="assistant",
                         seq=None,
-                        text=llm_response.output_text,
+                        text=assistant_output_text,
                         token_count=None,
-                        metadata={"thinking": llm_response.thinking} if llm_response.thinking else {},
+                        metadata={"thinking": llm_response.thinking}
+                        if llm_response.thinking
+                        else {},
                         occurred_at=assistant_occurred_at,
                         active_presence_id=active_presence.presence_id,
                         source_presence_id=active_presence.presence_id,
-                        space_id=active_space.space_id if active_space is not None else None,
+                        space_id=active_space.space_id
+                        if active_space is not None
+                        else None,
                         active_mind_id=active_mind.mind_id,
                         source_mind_id=active_mind.mind_id,
                         active_embodiment_id=(
@@ -477,6 +847,9 @@ class ChatService:
                         ),
                         commit=False,
                     )
+                    composed_context_json = resolution.composed_context.model_dump(
+                        mode="json"
+                    )
                     retrieval_event = await events.create_event(
                         {
                             "user_id": user_id,
@@ -486,16 +859,25 @@ class ChatService:
                             "assistant_mode_id": resolved_mode_id,
                             "user_persona_id": conversation.get("user_persona_id"),
                             "platform_id": conversation.get("platform_id") or "default",
-                            "character_id": conversation.get("character_id") or conversation.get("workspace_id"),
+                            "character_id": conversation.get("character_id")
+                            or conversation.get("workspace_id"),
                             "mode": conversation.get("mode") or resolved_mode_id,
-                            "incognito": bool(conversation.get("incognito")) or bool(conversation.get("isolated_mode")),
-                            "remember_across_chats": bool(memory_preferences["remember_across_chats"]),
-                            "remember_across_devices": bool(memory_preferences["remember_across_devices"]),
-                            "memory_privacy_mode": memory_preferences["memory_privacy_mode"],
+                            "incognito": bool(conversation.get("incognito"))
+                            or bool(conversation.get("isolated_mode")),
+                            "remember_across_chats": bool(
+                                memory_preferences["remember_across_chats"]
+                            ),
+                            "remember_across_devices": bool(
+                                memory_preferences["remember_across_devices"]
+                            ),
+                            "memory_privacy_mode": memory_preferences[
+                                "memory_privacy_mode"
+                            ],
                             "retrieval_plan_json": resolution.source_retrieval_plan,
                             "selected_memory_ids_json": resolution.composed_context.selected_memory_ids,
-                            "context_view_json": resolution.composed_context.model_dump(mode="json"),
+                            "context_view_json": composed_context_json,
                             "outcome_json": {
+                                "response_mode": resolved_response_mode.value,
                                 "cold_start": cold_start,
                                 "from_cache": resolution.from_cache,
                                 "cache_key": resolution.cache_key,
@@ -521,26 +903,43 @@ class ChatService:
                                 "sufficiency_diagnostics_v1_status": (
                                     resolution.sufficiency_diagnostics_v1_status
                                 ),
+                                "retrieval_diagnostics_for_guard": (
+                                    resolution.retrieval_diagnostics_for_guard
+                                ),
+                                "retrieval_trace": resolution.retrieval_trace,
                                 "stage_timings_ms": resolution.stage_timings,
                                 "transcript_window": transcript_trace,
-                                "operational_profile": (
-                                    resolution.resolved_operational_profile.snapshot.model_dump(mode="json")
+                                "context_envelope": context_envelope_trace,
+                                "initial_context_package": (
+                                    initial_context_package.diagnostics
                                 ),
+                                "operational_profile": (
+                                    resolution.resolved_operational_profile.snapshot.model_dump(
+                                        mode="json"
+                                    )
+                                ),
+                                "answer_postcondition_guard": answer_postcondition_report,
                                 **resolution.candidate_search_summary,
                             },
                         },
                         commit=False,
                     )
-                    confirmation_embedding_upserts = await confirmations.apply_turn_plan(
-                        user_id=user_id,
-                        plan=confirmation_plan,
-                        commit=False,
-                    )
+                    confirmation_embedding_upserts = []
+                    if confirmation_plan is not None:
+                        confirmation_embedding_upserts = (
+                            await confirmations.apply_turn_plan(
+                                user_id=user_id,
+                                plan=confirmation_plan,
+                                commit=False,
+                            )
+                        )
                     await connection.commit()
                 except Exception:
                     await connection.rollback()
                     raise
-                await confirmations.apply_post_commit_embeddings(confirmation_embedding_upserts)
+                await confirmations.apply_post_commit_embeddings(
+                    confirmation_embedding_upserts
+                )
 
                 post_commit_errors: list[str] = []
                 enqueued_job_ids: list[str] = []
@@ -549,7 +948,9 @@ class ChatService:
 
                 try:
                     if invalidate_confirmation_cache:
-                        await cache_service.invalidate_conversation_cache_for_conversation(conversation)
+                        await cache_service.invalidate_conversation_cache_for_conversation(
+                            conversation
+                        )
                     else:
                         await cache_service.publish_pending_cache_entry(
                             resolution,
@@ -569,19 +970,24 @@ class ChatService:
                         )
                         post_commit_errors.append("cache_publish_failed")
 
-                if self.runtime.settings.lifecycle_lazy_enabled:
-                    try:
-                        self.runtime.spawn_background_task(
-                            piggyback_lifecycle(self.runtime),
-                            name="atagia-lifecycle-piggyback",
-                        )
-                    except Exception:
-                        logger.exception("Failed to spawn lifecycle piggyback task")
-                        post_commit_errors.append("lifecycle_spawn_failed")
+                if resolved_response_mode is ResponseMode.SMART_FAST:
+                    cache_service.schedule_smart_fast_warm(
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        message_text=prompt_message_text,
+                        assistant_mode_id=resolved_mode_id,
+                        operational_profile=operational_profile,
+                        operational_signals=operational_signals,
+                        ablation=ablation,
+                        prompt_authority_context=authority_context,
+                        last_retrieval_message_seq=int(user_message["seq"]),
+                    )
 
                 final_window = [
                     {"role": str(message["role"]), "content": str(message["text"])}
-                    for message in [*prior_messages, user_message, assistant_message][-RECENT_WINDOW_MESSAGES:]
+                    for message in [*prior_messages, user_message, assistant_message][
+                        -RECENT_WINDOW_MESSAGES:
+                    ]
                 ]
                 try:
                     await self.runtime.storage_backend.set_recent_window(
@@ -598,7 +1004,7 @@ class ChatService:
                 try:
                     await self.runtime.storage_backend.set_context_view(
                         retrieval_event["id"],
-                        resolution.composed_context.model_dump(mode="json"),
+                        composed_context_json,
                         ttl_seconds=CONTEXT_VIEW_TTL_SECONDS,
                     )
                 except Exception:
@@ -624,9 +1030,13 @@ class ChatService:
                     source_presence_id=user_source_presence.presence_id,
                     source_presence_kind=user_source_presence.kind.value,
                     source_presence_display_name=user_source_presence.display_name,
-                    active_space_id=active_space.space_id if active_space is not None else None,
+                    active_space_id=active_space.space_id
+                    if active_space is not None
+                    else None,
                     active_space_boundary_mode=(
-                        active_space.boundary_mode.value if active_space is not None else None
+                        active_space.boundary_mode.value
+                        if active_space is not None
+                        else None
                     ),
                     active_space_display_name=(
                         active_space.display_name if active_space is not None else None
@@ -667,7 +1077,7 @@ class ChatService:
                     conversation=conversation,
                     message_id=str(assistant_message["id"]),
                     prior_messages=[*prior_messages, user_message],
-                    message_text=llm_response.output_text,
+                    message_text=assistant_output_text,
                     occurred_at=resolve_message_occurred_at(assistant_message),
                     role="assistant",
                     operational_profile=resolution.resolved_operational_profile.snapshot,
@@ -678,9 +1088,13 @@ class ChatService:
                     source_presence_id=active_presence.presence_id,
                     source_presence_kind=active_presence.kind.value,
                     source_presence_display_name=active_presence.display_name,
-                    active_space_id=active_space.space_id if active_space is not None else None,
+                    active_space_id=active_space.space_id
+                    if active_space is not None
+                    else None,
                     active_space_boundary_mode=(
-                        active_space.boundary_mode.value if active_space is not None else None
+                        active_space.boundary_mode.value
+                        if active_space is not None
+                        else None
                     ),
                     active_space_display_name=(
                         active_space.display_name if active_space is not None else None
@@ -725,6 +1139,13 @@ class ChatService:
                             connection,
                             self.runtime.clock,
                         ),
+                        initial_context_package_repository=InitialContextPackageRepository(
+                            connection,
+                            self.runtime.clock,
+                        ),
+                        initial_context_package_refresh_enabled=(
+                            self.runtime.settings.initial_context_package_refresh_enabled
+                        ),
                     )
                     memory_processing = await job_tracking.get_status(
                         user_id=user_id,
@@ -756,11 +1177,23 @@ class ChatService:
                 debug_payload: dict[str, Any] | None = None
                 if debug:
                     debug_payload = {
+                        "response_mode": resolved_response_mode.value,
                         "cold_start": cold_start,
                         "detected_needs": list(resolution.detected_needs),
                         "retrieval_plan": dict(resolution.source_retrieval_plan),
                         "selected_memory_ids": resolution.composed_context.selected_memory_ids,
-                        "context_view": resolution.composed_context.model_dump(mode="json"),
+                        "context_view": composed_context_json,
+                        "scored_candidates": resolution.scored_candidates,
+                        "retrieval_custody_v2": resolution.candidate_custody,
+                        "retrieval_sufficiency": resolution.retrieval_sufficiency,
+                        "retrieval_diagnostics_for_guard": (
+                            resolution.retrieval_diagnostics_for_guard
+                        ),
+                        "candidate_search_summary": resolution.candidate_search_summary,
+                        "retrieval_trace": resolution.retrieval_trace,
+                        "context_envelope": context_envelope_trace,
+                        "initial_context_package": initial_context_package.diagnostics,
+                        "stage_timings": resolution.stage_timings,
                         "cache": {
                             "from_cache": resolution.from_cache,
                             "staleness": resolution.staleness,
@@ -777,13 +1210,30 @@ class ChatService:
                             if memory_processing is None
                             else memory_processing.model_dump(mode="json")
                         ),
+                        "answer_postcondition_guard": answer_postcondition_report,
                         "topic_working_set": visible_topic_snapshot,
                         "topic_working_set_block": topic_context_block,
+                        "authority": {
+                            "privacy_enforcement": authority_context.privacy_enforcement,
+                            "effective_privacy_enforcement": (
+                                authority_context.effective_privacy_enforcement
+                            ),
+                            "authenticated_privilege_level": (
+                                authority_context.normalized_privilege_level
+                            ),
+                            "authenticated_atagia_master": (
+                                authority_context.authenticated_user_is_atagia_master
+                            ),
+                            "authority_source": authority_context.authority_source,
+                            "sensitive_trace": bool(debug_include_sensitive),
+                        },
                     }
                     if llm_response.thinking:
                         debug_payload["thinking"] = llm_response.thinking
+                    if not debug_include_sensitive:
+                        debug_payload = self._redact_debug_payload(debug_payload)
 
-                return ChatResult(
+                chat_result = ChatResult(
                     conversation_id=conversation_id,
                     request_message_id=str(user_message["id"]),
                     response_message_id=str(assistant_message["id"]),
@@ -791,14 +1241,59 @@ class ChatService:
                     retrieval_event_id=str(retrieval_event["id"]),
                     composed_context=resolution.composed_context,
                     detected_needs=resolution.detected_needs,
-                    memories_used=summarize_memory_summaries(resolution.memory_summaries),
+                    memories_used=summarize_memory_summaries(
+                        resolution.memory_summaries
+                    ),
                     memory_processing=memory_processing,
                     debug=debug_payload,
                 )
+            except OutputLimitExceededError as exc:
+                raise LLMUnavailableError("LLM output limit exceeded") from exc
             except LLMError as exc:
                 raise LLMUnavailableError("LLM service unavailable") from exc
             finally:
                 await connection.close()
+            if self.runtime.settings.lifecycle_lazy_enabled:
+                try:
+                    request_lifecycle_piggyback(self.runtime, reason="chat_completed")
+                except Exception:
+                    logger.exception("Failed to spawn lifecycle piggyback task")
+            if chat_result is None:
+                raise RuntimeError("Chat flow completed without a result")
+            return chat_result
+
+    @staticmethod
+    def _redact_debug_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """Return HTTP-safe observability without raw retrieved context."""
+        cache = payload.get("cache") if isinstance(payload.get("cache"), dict) else {}
+        postcondition = payload.get("answer_postcondition_guard")
+        postcondition_summary = None
+        if isinstance(postcondition, dict):
+            postcondition_summary = {
+                "status": postcondition.get("status"),
+                "failure_reasons": postcondition.get("failure_reasons"),
+                "retry_count": postcondition.get("retry_count"),
+                "output_limit_seen": postcondition.get("output_limit_seen"),
+            }
+        authority = payload.get("authority")
+        if isinstance(authority, dict):
+            authority = {**authority, "sensitive_trace": False}
+        return {
+            "cold_start": payload.get("cold_start"),
+            "detected_needs_count": len(payload.get("detected_needs") or []),
+            "selected_memory_count": len(payload.get("selected_memory_ids") or []),
+            "cache": {
+                "from_cache": cache.get("from_cache"),
+                "staleness": cache.get("staleness"),
+                "next_refresh_strategy": cache.get("next_refresh_strategy"),
+                "cache_age_seconds": cache.get("cache_age_seconds"),
+                "cache_source": cache.get("cache_source"),
+                "need_detection_skipped": cache.get("need_detection_skipped"),
+            },
+            "post_commit_errors": list(payload.get("post_commit_errors") or []),
+            "answer_postcondition_guard": postcondition_summary,
+            "authority": authority,
+        }
 
     @staticmethod
     def _chat_intimacy_metadata(
@@ -837,7 +1332,9 @@ class ChatService:
         return {}
 
 
-def _intimacy_boundary_counts(candidate_custody: list[dict[str, Any]]) -> dict[str, int]:
+def _intimacy_boundary_counts(
+    candidate_custody: list[dict[str, Any]],
+) -> dict[str, int]:
     counts: dict[str, int] = {}
     for record in candidate_custody:
         boundary = str(record.get("intimacy_boundary") or "ordinary")
@@ -878,7 +1375,10 @@ def _validate_optional_identity(
     if active_presence_id is not None:
         actual_presence = conversation.get("active_presence_id")
         actual_presence_text = None if actual_presence is None else str(actual_presence)
-        if actual_presence_text is not None and actual_presence_text != active_presence_id:
+        if (
+            actual_presence_text is not None
+            and actual_presence_text != active_presence_id
+        ):
             raise ConversationNotFoundError("Conversation not found for user")
     if mind_id is not None:
         actual_mind = conversation.get("active_mind_id")
@@ -889,7 +1389,10 @@ def _validate_optional_identity(
     if expected_topology is not None:
         actual_topology = conversation.get("mind_topology")
         actual_topology_text = None if actual_topology is None else str(actual_topology)
-        if actual_topology_text is not None and actual_topology_text != expected_topology:
+        if (
+            actual_topology_text is not None
+            and actual_topology_text != expected_topology
+        ):
             raise ConversationNotFoundError("Conversation not found for user")
     if space_id is not None:
         actual_space = conversation.get("active_space_id")
@@ -901,7 +1404,10 @@ def _validate_optional_identity(
         actual_embodiment_text = (
             None if actual_embodiment is None else str(actual_embodiment)
         )
-        if actual_embodiment_text is not None and actual_embodiment_text != embodiment_id:
+        if (
+            actual_embodiment_text is not None
+            and actual_embodiment_text != embodiment_id
+        ):
             raise ConversationNotFoundError("Conversation not found for user")
     if realm_id is not None:
         actual_realm = conversation.get("active_realm_id")

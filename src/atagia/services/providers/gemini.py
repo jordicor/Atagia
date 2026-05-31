@@ -31,10 +31,12 @@ from atagia.services.llm_client import (
     LLMError,
     LLMPolicyBlockedError,
     LLMProvider,
+    LLMRequestError,
     LLMStreamEvent,
     OutputLimitExceededError,
     TransientLLMError,
 )
+from atagia.services.llm_schema import strip_json_schema_nullability
 
 
 _TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -166,7 +168,6 @@ def _sanitize_schema_node(
         )
 
     cleaned: dict[str, Any] = {}
-    nullable = False
     for key, value in node.items():
         if key in {"$defs", "definitions"} or key in _UNSUPPORTED_SCHEMA_KEYS:
             continue
@@ -174,7 +175,6 @@ def _sanitize_schema_node(
             continue
         if key == "type" and isinstance(value, list):
             non_null_types = [item for item in value if item != "null"]
-            nullable = nullable or len(non_null_types) != len(value)
             if len(non_null_types) == 1:
                 cleaned["type"] = non_null_types[0]
             elif non_null_types:
@@ -184,7 +184,6 @@ def _sanitize_schema_node(
             variants = []
             for variant in value:
                 if _is_null_schema(variant):
-                    nullable = True
                     continue
                 variants.append(
                     _sanitize_schema_node(variant, root=root, ref_stack=ref_stack)
@@ -216,15 +215,12 @@ def _sanitize_schema_node(
 
     if cleaned.get("type") == "null":
         cleaned.pop("type")
-        nullable = True
-    if nullable:
-        cleaned["nullable"] = True
     return cleaned
 
 
 def _sanitize_schema_for_gemini(schema: dict[str, Any]) -> dict[str, Any]:
     """Strip or inline JSON Schema features rejected by Gemini response schemas."""
-    root = copy.deepcopy(schema)
+    root = strip_json_schema_nullability(schema)
     sanitized = _sanitize_schema_node(root, root=root)
     if not isinstance(sanitized, dict):
         raise LLMError("Gemini response schemas must sanitize to a JSON object")
@@ -414,6 +410,8 @@ def _map_exception(exc: Exception) -> LLMError:
         status_code = int(getattr(exc, "code", 0) or 0)
         if status_code in _TRANSIENT_STATUS_CODES or status_code >= 500:
             return TransientLLMError(str(exc))
+        if 400 <= status_code < 500:
+            return LLMRequestError(str(exc), status_code=status_code)
         return LLMError(str(exc))
     if isinstance(exc, (httpx.TransportError, TimeoutError, ConnectionError)):
         return TransientLLMError(str(exc))
@@ -428,8 +426,9 @@ def _iter_parts(response: Any) -> list[Any]:
     for candidate in candidates:
         content = _getattr_or_key(candidate, "content")
         parts.extend(_getattr_or_key(content, "parts", []) or [])
-    parts.extend(_getattr_or_key(response, "parts", []) or [])
-    return parts
+    if parts:
+        return parts
+    return list(_getattr_or_key(response, "parts", []) or [])
 
 
 def _safe_response_text(response: Any) -> str:

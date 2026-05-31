@@ -211,6 +211,77 @@ async def test_stream_drain_waits_for_pending_ack() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_drain_snapshot_reports_queue_pending_and_ack_progress() -> None:
+    backend = InProcessBackend()
+    await backend.stream_ensure_group("atagia:test", "workers")
+    message_id = await backend.stream_add(
+        "atagia:test",
+        {
+            "job_id": "job_1",
+            "job_type": "extract_memory_candidates",
+            "conversation_id": "conv_1",
+            "message_ids": ["msg_1"],
+            "payload": {"message_id": "msg_1"},
+        },
+    )
+
+    queued_snapshot = await backend.drain_snapshot()
+    assert queued_snapshot.total_queued == 1
+    assert queued_snapshot.queued_by_stream == {"atagia:test": 1}
+    assert queued_snapshot.total_pending == 0
+
+    await backend.stream_read(
+        "atagia:test",
+        "workers",
+        "consumer-1",
+        count=1,
+        block_ms=0,
+    )
+    pending_snapshot = await backend.drain_snapshot()
+    assert pending_snapshot.total_queued == 0
+    assert pending_snapshot.pending_by_stream == {"atagia:test": 1}
+    assert pending_snapshot.pending_job_types == {"extract_memory_candidates": 1}
+    assert pending_snapshot.active_jobs[0]["job_id"] == "job_1"
+    assert pending_snapshot.active_jobs[0]["payload_message_id"] == "msg_1"
+
+    await backend.stream_ack("atagia:test", "workers", message_id)
+    drained_snapshot = await backend.drain_snapshot()
+    assert drained_snapshot.drained is True
+    assert drained_snapshot.acked_by_stream == {"atagia:test": 1}
+
+
+@pytest.mark.asyncio
+async def test_stream_drain_idle_timeout_resets_when_progress_callback_reports_progress() -> None:
+    backend = InProcessBackend()
+    await backend.stream_ensure_group("atagia:test", "workers")
+    message_id = await backend.stream_add("atagia:test", {"job_id": "job_1"})
+    await backend.stream_read(
+        "atagia:test",
+        "workers",
+        "consumer-1",
+        count=1,
+        block_ms=0,
+    )
+    callback_calls = 0
+
+    async def report_progress_once(_snapshot) -> bool:
+        nonlocal callback_calls
+        callback_calls += 1
+        if callback_calls == 1:
+            await backend.stream_ack("atagia:test", "workers", message_id)
+            return True
+        return False
+
+    assert await backend.drain(
+        timeout_seconds=0.5,
+        idle_timeout_seconds=0.05,
+        progress_interval_seconds=0.01,
+        progress_callback=report_progress_once,
+    ) is True
+    assert callback_calls >= 1
+
+
+@pytest.mark.asyncio
 async def test_stream_drain_times_out_when_pending_work_remains() -> None:
     backend = InProcessBackend()
     await backend.stream_ensure_group("atagia:test", "workers")

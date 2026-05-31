@@ -283,7 +283,9 @@ async def list_pending_memory_confirmations(
 ) -> PendingMemoryConfirmationListResponse:
     user_id = _route_id(user_id)
     ensure_user_access(user_id, auth_context)
-    items = await PendingConfirmationService(connection, clock).list_pending_confirmations(
+    items = await PendingConfirmationService(
+        connection, clock
+    ).list_pending_confirmations(
         user_id=user_id,
         conversation_id=conversation_id,
         platform_id=platform_id,
@@ -316,7 +318,9 @@ async def confirm_pending_memory(
             clock,
         ).confirm_pending_memory(user_id=user_id, memory_id=memory_id)
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
     return PendingMemoryConfirmationActionResponse(
         memory_id=str(memory["id"]),
         status=str(memory["status"]),
@@ -343,7 +347,9 @@ async def decline_pending_memory(
             clock,
         ).decline_pending_memory(user_id=user_id, memory_id=memory_id)
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
     return PendingMemoryConfirmationActionResponse(
         memory_id=str(memory["id"]),
         status=str(memory["status"]),
@@ -416,7 +422,9 @@ async def save_from_incognito(
             detail=str(exc),
         ) from exc
     except (ConversationNotActiveError, ValueError) as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
     except UserDeletedError as exc:
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
@@ -446,7 +454,9 @@ async def close_conversation(
         incognito=payload.incognito,
     )
     try:
-        return await ConversationLifecycleService(get_runtime(request)).close_conversation(
+        return await ConversationLifecycleService(
+            get_runtime(request)
+        ).close_conversation(
             connection,
             user_id=payload.user_id,
             conversation_id=conversation_id,
@@ -459,11 +469,17 @@ async def close_conversation(
             detail="Conversation not found for user",
         ) from None
     except DeletionConfirmationError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
     except ConversationAlreadyClosedError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
     except InvalidConversationTransitionError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
 
 
 @router.post("/conversations/{conversation_id}/archive")
@@ -488,7 +504,9 @@ async def archive_conversation(
         require_active=False,
     )
     try:
-        return await ConversationLifecycleService(get_runtime(request)).archive_conversation(
+        return await ConversationLifecycleService(
+            get_runtime(request)
+        ).archive_conversation(
             connection,
             user_id=payload.user_id,
             conversation_id=conversation_id,
@@ -499,7 +517,9 @@ async def archive_conversation(
             detail="Conversation not found for user",
         ) from None
     except InvalidConversationTransitionError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
 
 
 @router.post("/conversations/{conversation_id}/delete", response_model=DeletionReport)
@@ -534,14 +554,18 @@ async def delete_conversation(
                 confirmation=payload.confirmation,
             )
     except DeletionConfirmationError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
     except ConversationNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found for user",
         ) from None
     except InvalidConversationTransitionError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
 
 
 @router.post("/users/{user_id}/erase", response_model=ErasureReport)
@@ -566,7 +590,9 @@ async def erase_user_data(
             confirmation=payload.confirmation,
         )
     except DeletionConfirmationError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
 
 
 @router.post("/workspaces")
@@ -617,6 +643,7 @@ async def chat_reply(
             include_thinking=payload.include_thinking,
             metadata=payload.metadata,
             debug=payload.debug,
+            debug_include_sensitive=auth_context.is_admin,
             attachments=payload.attachments,
             operational_profile=payload.operational_profile,
             operational_signals=payload.operational_signals,
@@ -632,6 +659,10 @@ async def chat_reply(
             space_id=payload.space_id,
             mode=payload.mode,
             incognito=payload.incognito,
+            privacy_enforcement=payload.privacy_enforcement,
+            authenticated_user_privilege_level=payload.authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=payload.authenticated_user_is_atagia_master,
+            response_mode=payload.response_mode,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -670,7 +701,14 @@ async def chat_reply(
         ) from exc
     except (ConversationNotActiveError, UserDeletedError) as exc:
         raise HTTPException(
-            status_code=status.HTTP_410_GONE if isinstance(exc, UserDeletedError) else status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_410_GONE
+            if isinstance(exc, UserDeletedError)
+            else status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
 
@@ -789,6 +827,10 @@ async def get_sidecar_context(
             ingest_origin=payload.ingest_origin,
             confirmation_strategy=payload.confirmation_strategy,
             memory_privacy_mode=payload.memory_privacy_mode,
+            privacy_enforcement=payload.privacy_enforcement,
+            authenticated_user_privilege_level=payload.authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=payload.authenticated_user_is_atagia_master,
+            response_mode=payload.response_mode,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -837,7 +879,9 @@ async def get_sidecar_context(
         ) from exc
     except (ConversationNotActiveError, UserDeletedError) as exc:
         raise HTTPException(
-            status_code=status.HTTP_410_GONE if isinstance(exc, UserDeletedError) else status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_410_GONE
+            if isinstance(exc, UserDeletedError)
+            else status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
     except ValueError as exc:
@@ -847,7 +891,9 @@ async def get_sidecar_context(
         ) from exc
 
 
-@router.post("/conversations/{conversation_id}/messages", response_model=SidecarMutationResponse)
+@router.post(
+    "/conversations/{conversation_id}/messages", response_model=SidecarMutationResponse
+)
 async def ingest_sidecar_message(
     conversation_id: str,
     payload: SidecarIngestMessageRequest,
@@ -887,6 +933,9 @@ async def ingest_sidecar_message(
             ingest_origin=payload.ingest_origin,
             confirmation_strategy=payload.confirmation_strategy,
             memory_privacy_mode=payload.memory_privacy_mode,
+            privacy_enforcement=payload.privacy_enforcement,
+            authenticated_user_privilege_level=payload.authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=payload.authenticated_user_is_atagia_master,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -935,7 +984,9 @@ async def ingest_sidecar_message(
         ) from exc
     except (ConversationNotActiveError, UserDeletedError) as exc:
         raise HTTPException(
-            status_code=status.HTTP_410_GONE if isinstance(exc, UserDeletedError) else status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_410_GONE
+            if isinstance(exc, UserDeletedError)
+            else status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
     except ValueError as exc:
@@ -951,7 +1002,9 @@ async def ingest_sidecar_message(
     )
 
 
-@router.post("/conversations/{conversation_id}/responses", response_model=SidecarMutationResponse)
+@router.post(
+    "/conversations/{conversation_id}/responses", response_model=SidecarMutationResponse
+)
 async def add_sidecar_response(
     conversation_id: str,
     payload: SidecarAddResponseRequest,
@@ -985,6 +1038,9 @@ async def add_sidecar_response(
             ingest_origin=payload.ingest_origin,
             confirmation_strategy=payload.confirmation_strategy,
             memory_privacy_mode=payload.memory_privacy_mode,
+            privacy_enforcement=payload.privacy_enforcement,
+            authenticated_user_privilege_level=payload.authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=payload.authenticated_user_is_atagia_master,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -1013,7 +1069,9 @@ async def add_sidecar_response(
         ) from exc
     except (ConversationNotActiveError, UserDeletedError) as exc:
         raise HTTPException(
-            status_code=status.HTTP_410_GONE if isinstance(exc, UserDeletedError) else status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_410_GONE
+            if isinstance(exc, UserDeletedError)
+            else status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
     return SidecarMutationResponse(
@@ -1031,7 +1089,11 @@ async def flush_sidecar_work(
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> FlushResponse:
     ensure_user_access(payload.user_id, auth_context)
-    conversation_id = _route_id(payload.conversation_id) if payload.conversation_id is not None else None
+    conversation_id = (
+        _route_id(payload.conversation_id)
+        if payload.conversation_id is not None
+        else None
+    )
     runtime = get_runtime(request)
     if not runtime.settings.workers_enabled:
         connection = await runtime.open_connection()

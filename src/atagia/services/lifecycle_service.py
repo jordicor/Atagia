@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING, Any, Iterable
 
 import aiosqlite
 
+from atagia.core.communication_profile_repository import CommunicationProfileRepository
 from atagia.core.ids import generate_prefixed_id
+from atagia.core.initial_context_package_repository import InitialContextPackageRepository
 from atagia.core.repositories import (
     MemoryObjectRepository,
     _decode_json_columns,
@@ -18,6 +20,7 @@ from atagia.core.repositories import (
 )
 from atagia.memory.lifecycle_runner import cache_generation_key
 from atagia.models.schemas_api import DeletionReport, ErasureReport
+from atagia.models.schemas_initial_context_package import InitialContextPackageKind
 from atagia.models.schemas_memory import ConversationStatus, MemoryObjectType, MemoryStatus, SpaceBoundaryMode
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.errors import (
@@ -102,6 +105,11 @@ class ConversationLifecycleService:
             )
             if cursor.rowcount == 0:
                 raise InvalidConversationTransitionError("Conversation is not active")
+            await self._delete_initial_context_packages_for_conversation(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
             await connection.commit()
         except Exception:
             await connection.rollback()
@@ -172,6 +180,29 @@ class ConversationLifecycleService:
                         *affected_memory_ids,
                     ),
                 )
+            await CommunicationProfileRepository(
+                connection,
+                self.runtime.clock,
+            ).mark_stale_for_conversation(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                reason="source_conversation_archived",
+                commit=False,
+            )
+            await CommunicationProfileRepository(
+                connection,
+                self.runtime.clock,
+            ).mark_stale_for_memories(
+                user_id=user_id,
+                memory_ids=affected_trace_ids,
+                reason="source_conversation_archived",
+                commit=False,
+            )
+            await self._delete_initial_context_packages_for_conversation(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
             cursor = await connection.execute(
                 """
                 UPDATE conversations
@@ -401,6 +432,25 @@ class ConversationLifecycleService:
                 """,
                 (normalized_text, timestamp, memory_id, user_id),
             )
+            await self._mark_retrieval_surfaces_stale_for_memory(
+                connection,
+                user_id=user_id,
+                memory_id=memory_id,
+                timestamp=timestamp,
+            )
+            await CommunicationProfileRepository(
+                connection,
+                self.runtime.clock,
+            ).mark_stale_for_memory(
+                user_id=user_id,
+                memory_id=memory_id,
+                reason="source_memory_edited",
+                commit=False,
+            )
+            await self._mark_initial_context_packages_stale_for_user(
+                connection,
+                user_id=user_id,
+            )
             await self._delete_embeddings_for_ids(connection, [memory_id])
             await connection.commit()
         except Exception:
@@ -542,9 +592,14 @@ class ConversationLifecycleService:
                     return DeletionReport(
                         conversation_id=conversation_id,
                         already_deleted=True,
-                    )
+                )
                 if str(existing["status"]) != ConversationStatus.PENDING_DELETION.value:
                     raise InvalidConversationTransitionError("Conversation cannot be deleted from its current state")
+            await self._delete_initial_context_packages_for_conversation(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
             await connection.commit()
         except Exception:
             await connection.rollback()
@@ -605,6 +660,29 @@ class ConversationLifecycleService:
                 memory_ids=all_memory_ids,
                 conversation_id=conversation_id,
                 timestamp=timestamp,
+            )
+            await CommunicationProfileRepository(
+                connection,
+                self.runtime.clock,
+            ).mark_stale_for_conversation(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                reason="source_conversation_deleted",
+                commit=False,
+            )
+            await CommunicationProfileRepository(
+                connection,
+                self.runtime.clock,
+            ).mark_stale_for_memories(
+                user_id=user_id,
+                memory_ids=all_memory_ids,
+                reason="source_conversation_deleted",
+                commit=False,
+            )
+            await self._delete_initial_context_packages_for_conversation(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
             )
             await self._delete_artifacts(connection, user_id=user_id, artifact_ids=artifact_ids)
             await connection.execute(
@@ -701,6 +779,29 @@ class ConversationLifecycleService:
             )
             await self._delete_summary_views(connection, user_id=user_id, summary_ids=summary_ids)
             await self._delete_memory_rows(connection, user_id=user_id, memory_ids=all_memory_ids)
+            await CommunicationProfileRepository(
+                connection,
+                self.runtime.clock,
+            ).mark_stale_for_conversation(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                reason="source_conversation_purged",
+                commit=False,
+            )
+            await CommunicationProfileRepository(
+                connection,
+                self.runtime.clock,
+            ).mark_stale_for_memories(
+                user_id=user_id,
+                memory_ids=all_memory_ids,
+                reason="source_conversation_purged",
+                commit=False,
+            )
+            await self._delete_initial_context_packages_for_conversation(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
             await self._delete_artifacts(connection, user_id=user_id, artifact_ids=artifact_ids)
             await connection.execute(
                 "DELETE FROM verbatim_pins WHERE user_id = ? AND conversation_id = ?",
@@ -792,6 +893,25 @@ class ConversationLifecycleService:
                 """,
                 (MemoryStatus.ARCHIVED.value, timestamp, memory_id, user_id),
             )
+            await self._mark_retrieval_surfaces_stale_for_memory(
+                connection,
+                user_id=user_id,
+                memory_id=memory_id,
+                timestamp=timestamp,
+            )
+            await CommunicationProfileRepository(
+                connection,
+                self.runtime.clock,
+            ).mark_stale_for_memory(
+                user_id=user_id,
+                memory_id=memory_id,
+                reason="source_memory_archived",
+                commit=False,
+            )
+            await self._mark_initial_context_packages_stale_for_user(
+                connection,
+                user_id=user_id,
+            )
             await self._delete_embeddings_for_ids(connection, [memory_id])
             await connection.commit()
         except Exception:
@@ -862,6 +982,20 @@ class ConversationLifecycleService:
                 connection,
                 user_id=user_id,
                 memory_ids=all_memory_ids,
+            )
+            for source_memory_id in all_memory_ids:
+                await CommunicationProfileRepository(
+                    connection,
+                    self.runtime.clock,
+                ).mark_stale_for_memory(
+                    user_id=user_id,
+                    memory_id=source_memory_id,
+                    reason="source_memory_deleted",
+                    commit=False,
+                )
+            await self._mark_initial_context_packages_stale_for_user(
+                connection,
+                user_id=user_id,
             )
             await self._delete_memory_rows(connection, user_id=user_id, memory_ids=all_memory_ids)
             await connection.commit()
@@ -1009,6 +1143,7 @@ class ConversationLifecycleService:
             "DELETE FROM memory_feedback_events WHERE user_id = ?",
             "DELETE FROM memory_links WHERE user_id = ?",
             "DELETE FROM contract_dimensions_current WHERE user_id = ?",
+            "DELETE FROM user_communication_profiles WHERE user_id = ?",
             "DELETE FROM consequence_chains WHERE user_id = ?",
             "DELETE FROM graph_relationship_sources WHERE user_id = ?",
             "DELETE FROM graph_relationships WHERE user_id = ?",
@@ -1016,6 +1151,7 @@ class ConversationLifecycleService:
             "DELETE FROM graph_entity_mentions WHERE user_id = ?",
             "DELETE FROM graph_projection_runs WHERE user_id = ?",
             "DELETE FROM graph_entities WHERE user_id = ?",
+            "DELETE FROM initial_context_packages WHERE user_id = ?",
             "DELETE FROM conversation_topic_sources WHERE user_id = ?",
             "DELETE FROM conversation_topic_events WHERE user_id = ?",
             "DELETE FROM conversation_topics WHERE user_id = ?",
@@ -1322,6 +1458,48 @@ class ConversationLifecycleService:
             (user_id, *memory_ids),
         )
 
+    async def _mark_retrieval_surfaces_stale_for_memory(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        memory_id: str,
+        timestamp: str,
+    ) -> None:
+        await connection.execute(
+            """
+            UPDATE memory_retrieval_surfaces
+            SET status = 'stale',
+                updated_at = ?
+            WHERE user_id = ?
+              AND memory_id = ?
+              AND status != 'deleted'
+            """,
+            (timestamp, user_id, memory_id),
+        )
+
+    async def _mark_retrieval_surfaces_deleted_for_memory_ids(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        memory_ids: list[str],
+        timestamp: str,
+    ) -> None:
+        if not memory_ids:
+            return
+        placeholders = self._placeholders(memory_ids)
+        await connection.execute(
+            f"""
+            UPDATE memory_retrieval_surfaces
+            SET status = 'deleted',
+                updated_at = ?
+            WHERE user_id = ?
+              AND memory_id IN ({placeholders})
+            """,
+            (timestamp, user_id, *memory_ids),
+        )
+
     async def _tombstone_memory_rows(
         self,
         connection: aiosqlite.Connection,
@@ -1350,6 +1528,12 @@ class ConversationLifecycleService:
                 user_id,
                 *memory_ids,
             ),
+        )
+        await self._mark_retrieval_surfaces_deleted_for_memory_ids(
+            connection,
+            user_id=user_id,
+            memory_ids=memory_ids,
+            timestamp=timestamp,
         )
 
     async def _delete_retrieval_events_for_memory_ids(
@@ -1380,6 +1564,36 @@ class ConversationLifecycleService:
         await self.runtime.storage_backend.increment_cache_generation(
             cache_generation_key(self.runtime.database_path, user_id)
         )
+
+    async def _delete_initial_context_packages_for_conversation(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> None:
+        repository = InitialContextPackageRepository(connection, self.runtime.clock)
+        await repository.delete_for_conversation(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            commit=False,
+        )
+        await repository.mark_stale_for_key_family(
+            user_id=user_id,
+            package_kind=InitialContextPackageKind.BASELINE,
+            commit=False,
+        )
+
+    async def _mark_initial_context_packages_stale_for_user(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+    ) -> None:
+        await InitialContextPackageRepository(
+            connection,
+            self.runtime.clock,
+        ).mark_stale_for_user(user_id, commit=False)
 
     async def _delete_orphan_graph_rows(
         self,

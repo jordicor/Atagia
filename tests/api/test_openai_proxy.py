@@ -382,6 +382,12 @@ async def test_openai_proxy_propagates_sidecar_control_fields(
                     "X-Atagia-User-Id": "usr_proxy",
                     "X-Atagia-Platform-Id": "proxy_desktop",
                     "X-Atagia-Conversation-Id": "cnv_proxy_controls",
+                    "X-Atagia-Active-Presence-Id": "presence_header",
+                    "X-Atagia-Mind-Id": "mind_header",
+                    "X-Atagia-Mind-Topology": "ojocentauri",
+                    "X-Atagia-Embodiment-Id": "body_header",
+                    "X-Atagia-Realm-Id": "realm_header",
+                    "X-Atagia-Space-Id": "space_header",
                     "X-Atagia-Message-Id": "host-user-1",
                     "X-Atagia-Source-Seq": "7",
                     "X-Atagia-Response-Message-Id": "host-assistant-1",
@@ -398,17 +404,35 @@ async def test_openai_proxy_propagates_sidecar_control_fields(
 
     assert response.status_code == 200
     assert captured["context"]["message_id"] == "host-user-1"
+    assert captured["context"]["active_presence_id"] == "presence_header"
+    assert captured["context"]["mind_id"] == "mind_header"
+    assert captured["context"]["mind_topology"] == "ojocentauri"
+    assert captured["context"]["embodiment_id"] == "body_header"
+    assert captured["context"]["realm_id"] == "realm_header"
+    assert captured["context"]["space_id"] == "space_header"
     assert captured["context"]["source_seq"] == 7
     assert captured["context"]["ingest_origin"] == "live_turn"
     assert captured["context"]["confirmation_strategy"] == "live_prompt_allowed"
     assert captured["context"]["memory_privacy_mode"] == "trusted_private"
     assert captured["response"]["message_id"] == "host-assistant-1"
+    assert captured["response"]["active_presence_id"] == "presence_header"
+    assert captured["response"]["mind_id"] == "mind_header"
+    assert captured["response"]["mind_topology"] == "ojocentauri"
+    assert captured["response"]["embodiment_id"] == "body_header"
+    assert captured["response"]["realm_id"] == "realm_header"
+    assert captured["response"]["space_id"] == "space_header"
     assert captured["response"]["source_seq"] == 8
     assert captured["response"]["ingest_origin"] == "live_turn"
     chat_requests = [
         request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
     ]
     assert chat_requests[-1].metadata["message_id"] == "host-user-1"
+    assert chat_requests[-1].metadata["active_presence_id"] == "presence_header"
+    assert chat_requests[-1].metadata["mind_id"] == "mind_header"
+    assert chat_requests[-1].metadata["mind_topology"] == "ojocentauri"
+    assert chat_requests[-1].metadata["embodiment_id"] == "body_header"
+    assert chat_requests[-1].metadata["realm_id"] == "realm_header"
+    assert chat_requests[-1].metadata["space_id"] == "space_header"
     assert chat_requests[-1].metadata["response_message_id"] == "host-assistant-1"
     assert chat_requests[-1].metadata["memory_privacy_mode"] == "trusted_private"
 
@@ -460,6 +484,12 @@ async def test_openai_proxy_accepts_control_fields_from_metadata(
                     "metadata": {
                         "conversation_id": "cnv_proxy_metadata_controls",
                         "platform_id": "proxy_metadata",
+                        "active_presence_id": "presence_meta",
+                        "mind_id": "mind_meta",
+                        "mind_topology": "ojocentauri",
+                        "embodiment_id": "body_meta",
+                        "realm_id": "realm_meta",
+                        "space_id": "space_meta",
                         "message_id": "meta-user-1",
                         "source_seq": 3,
                         "response_message_id": "meta-assistant-1",
@@ -473,10 +503,135 @@ async def test_openai_proxy_accepts_control_fields_from_metadata(
 
     assert response.status_code == 200
     assert captured["context"]["message_id"] == "meta-user-1"
+    assert captured["context"]["active_presence_id"] == "presence_meta"
+    assert captured["context"]["mind_id"] == "mind_meta"
+    assert captured["context"]["mind_topology"] == "ojocentauri"
+    assert captured["context"]["embodiment_id"] == "body_meta"
+    assert captured["context"]["realm_id"] == "realm_meta"
+    assert captured["context"]["space_id"] == "space_meta"
     assert captured["context"]["source_seq"] == 3
     assert captured["response"]["message_id"] == "meta-assistant-1"
+    assert captured["response"]["active_presence_id"] == "presence_meta"
+    assert captured["response"]["mind_id"] == "mind_meta"
+    assert captured["response"]["mind_topology"] == "ojocentauri"
+    assert captured["response"]["embodiment_id"] == "body_meta"
+    assert captured["response"]["realm_id"] == "realm_meta"
+    assert captured["response"]["space_id"] == "space_meta"
     assert captured["response"]["source_seq"] == 4
     assert captured["response"]["memory_privacy_mode"] == "balanced"
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_invalid_response_mode_header_keeps_context(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An invalid X-Atagia-Response-Mode must not nuke the memory context.
+
+    The bad value is validated away in identity resolution (warned + treated as
+    None so the configured default applies), instead of propagating into the
+    sidecar where ``ResponseMode(...)`` would raise and the broad fail-open
+    except would drop the entire memory context.
+    """
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            with caplog.at_level("WARNING"):
+                response = await client.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer service-key",
+                        "X-Atagia-User-Id": "usr_proxy",
+                        "X-Atagia-Platform-Id": "proxy_desktop",
+                        "X-Atagia-Conversation-Id": "cnv_proxy_bad_mode",
+                        "X-Atagia-Response-Mode": "turbo_nonsense",
+                    },
+                    json={
+                        "model": "atagia-memory-proxy",
+                        "messages": [
+                            {"role": "system", "content": "Base system"},
+                            {"role": "user", "content": "Keep my memory context."},
+                        ],
+                    },
+                )
+
+    assert response.status_code == 200
+    chat_requests = [
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
+    ]
+    assert chat_requests
+    # Context assembled (not dropped) despite the invalid mode header.
+    assert "[ATAGIA MEMORY CONTEXT - INTERNAL]" in chat_requests[-1].messages[0].content
+    assert any(
+        "turbo_nonsense" in record.getMessage()
+        and "invalid response mode" in record.getMessage().lower()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_valid_response_mode_header_passes_through(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, dict] = {}
+
+    async def capture_context(self, **kwargs):
+        captured["context"] = kwargs
+        return None
+
+    async def capture_response(self, **kwargs):
+        captured["response"] = kwargs
+        return None
+
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.SidecarService.get_context",
+        capture_context,
+    )
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.SidecarService.add_response",
+        capture_response,
+    )
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": "cnv_proxy_good_mode",
+                    "X-Atagia-Response-Mode": "smart_fast",
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "messages": [{"role": "user", "content": "Hello mode"}],
+                },
+            )
+
+    assert response.status_code == 200
+    assert captured["context"]["response_mode"] == "smart_fast"
 
 
 @pytest.mark.asyncio

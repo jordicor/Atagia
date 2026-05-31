@@ -8,6 +8,7 @@ import asyncio
 import json
 import re
 import sqlite3
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,7 +35,13 @@ from benchmarks.failure_taxonomy import (
     format_failure_taxonomy_summary,
     save_failure_taxonomy_report,
 )
+from benchmarks.llm_run_guard import LLMRunGuardConfig
 from benchmarks.locomo.benchmark import LoCoMoBenchmark
+from benchmarks.locomo.retrieval_readout import (
+    build_retrieval_readout,
+    save_retrieval_readout,
+)
+from benchmarks.retained_db_paths import default_benchmark_db_dir
 from benchmarks.report_diff import (
     BenchmarkDiffReport,
     build_benchmark_diff,
@@ -48,6 +55,7 @@ from atagia.services.model_resolution import COMPONENTS_BY_ID
 _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 _DEFAULT_JUDGE_MODEL = "anthropic/claude-opus-4-7"
+_DEFAULT_PRIVACY_ENFORCEMENT = "off"
 _BENCHMARK_DB_FILENAME = "benchmark.db"
 _BENCHMARK_DB_METADATA_FILENAME = "run_metadata.json"
 _BENCHMARK_INGESTION_PROGRESS_FILENAME = "ingestion_progress.json"
@@ -84,7 +92,45 @@ def _parse_ablation(raw_value: str | None) -> AblationConfig | None:
         "no_need_detection": AblationConfig(skip_need_detection=True),
         "no_revision": AblationConfig(skip_belief_revision=True),
         "no_compaction": AblationConfig(skip_compaction=True),
-        "composer_budgeted_marginal": AblationConfig(composer_strategy="budgeted_marginal"),
+        "composer_budgeted_marginal": AblationConfig(
+            composer_strategy="budgeted_marginal"
+        ),
+        "composer_evidence_obligation": AblationConfig(
+            enable_evidence_obligation_coverage=True
+        ),
+        "applicability_gate_shadow": AblationConfig(
+            applicability_gate_mode="shadow"
+        ),
+        "applicability_gate_enforced": AblationConfig(
+            applicability_gate_mode="enforced"
+        ),
+        "context_envelope_4k": AblationConfig(
+            context_envelope_budget_tokens=4_096,
+        ),
+        "context_envelope_8k": AblationConfig(
+            context_envelope_budget_tokens=8_192,
+        ),
+        "context_envelope_16k": AblationConfig(
+            context_envelope_budget_tokens=16_384,
+            override_retrieval_params={
+                "rerank_top_k": 20,
+                "final_context_items": 12,
+            },
+        ),
+        "context_envelope_24k": AblationConfig(
+            context_envelope_budget_tokens=24_576,
+            override_retrieval_params={
+                "rerank_top_k": 25,
+                "final_context_items": 16,
+            },
+        ),
+        "context_envelope_32k": AblationConfig(
+            context_envelope_budget_tokens=32_768,
+            override_retrieval_params={
+                "rerank_top_k": 25,
+                "final_context_items": 20,
+            },
+        ),
     }
     preset = presets.get(raw_value)
     if preset is not None:
@@ -92,8 +138,21 @@ def _parse_ablation(raw_value: str | None) -> AblationConfig | None:
     return AblationConfig.model_validate(json.loads(raw_value))
 
 
+def _benchmark_ablation(
+    raw_ablation: str | None,
+    privacy_enforcement: str | None,
+) -> AblationConfig:
+    ablation = _parse_ablation(raw_ablation)
+    effective_privacy_enforcement = privacy_enforcement or _DEFAULT_PRIVACY_ENFORCEMENT
+    return (ablation or AblationConfig()).model_copy(
+        update={"privacy_enforcement": effective_privacy_enforcement}
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the LoCoMo benchmark against Atagia.")
+    parser = argparse.ArgumentParser(
+        description="Run the LoCoMo benchmark against Atagia."
+    )
     parser.add_argument("--data-path", default=None, help="Path to locomo10.json")
     parser.add_argument(
         "--output",
@@ -105,31 +164,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=None,
-        help="Legacy alias for --answer-model; used only for benchmark answer generation.",
+        help="Legacy alias for --answer-model; used as the Atagia chat model.",
     )
     parser.add_argument(
         "--answer-model",
         default=None,
-        help="Model spec for benchmark answer generation, e.g. openrouter/google/gemini-3.1-flash-lite,medium.",
-    )
-    parser.add_argument(
-        "--answer-prompt-variant",
-        choices=("default", "grounded_connect", "light_world_knowledge"),
-        default="default",
-        help=(
-            "Benchmark-only answer prompt variant. Use default for the normal "
-            "Atagia prompt; grounded_connect and light_world_knowledge add "
-            "experimental instructions for answer generation only."
-        ),
-    )
-    parser.add_argument(
-        "--answer-max-output-tokens",
-        type=int,
-        default=None,
-        help=(
-            "Benchmark-only max output token budget for answer generation. "
-            "Defaults to the LoCoMo benchmark answer limit."
-        ),
+        help="Model spec for the real Atagia chat path, e.g. openai/chat-latest.",
     )
     parser.add_argument(
         "--judge-model",
@@ -137,6 +177,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional LLM model for scoring; defaults to direct Anthropic "
             "claude-opus-4-7 for benchmark stability"
+        ),
+    )
+    parser.add_argument(
+        "--answer-postcondition-guard",
+        action="store_true",
+        help=(
+            "Enable the real Atagia answer postcondition verifier with one "
+            "retry and controlled abstention on failure."
         ),
     )
     parser.add_argument(
@@ -194,7 +242,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Ablation preset (similarity_only, no_contract, no_scope, no_need_detection, "
-            "no_revision, no_compaction) or a JSON object matching AblationConfig"
+            "no_revision, no_compaction, composer_evidence_obligation, "
+            "context_envelope_4k, context_envelope_8k, context_envelope_16k, "
+            "context_envelope_24k, context_envelope_32k) or a JSON "
+            "object matching AblationConfig"
+        ),
+    )
+    parser.add_argument(
+        "--privacy-enforcement",
+        choices=("enforce", "audit_only", "off"),
+        default=_DEFAULT_PRIVACY_ENFORCEMENT,
+        help=(
+            "Request privacy_enforcement for LoCoMo client calls. Defaults to off "
+            "to match current Atagia-bench/default-readiness validation."
         ),
     )
     parser.add_argument(
@@ -256,7 +316,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--trusted-evaluation",
         action="store_true",
         help=(
-            "Run in controlled local benchmark mode: raise retrieval privacy "
+            "Use a trusted local evaluation context: raise retrieval privacy "
             "ceiling and allow sensitive facts from retrieved benchmark context"
         ),
     )
@@ -280,25 +340,126 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ingest-mode",
-        choices=("online", "bulk"),
+        choices=("online", "online_async", "online_batch", "bulk"),
         default="online",
         help=(
-            "Conversation ingestion mode. online preserves the per-turn worker drain "
-            "baseline; bulk persists turns first and rebuilds memory in phases."
+            "Conversation ingestion mode. online drains workers per turn, "
+            "online_async drains once at the end, online_batch drains every "
+            "--flush-every-turns turns, and bulk persists turns first then rebuilds."
         ),
+    )
+    parser.add_argument(
+        "--flush-every-turns",
+        type=int,
+        default=None,
+        help=(
+            "Drain online ingestion workers every N turns. With the default "
+            "online mode, values above 1 select the online_batch path."
+        ),
+    )
+    parser.add_argument(
+        "--require-evidence-packets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require source-backed memories to have evidence packets before "
+            "a retained DB is trusted for evaluate-only."
+        ),
+    )
+    parser.add_argument(
+        "--allow-untrusted",
+        action="store_true",
+        help=(
+            "Allow evaluate-only reuse of DBs explicitly marked untrusted. "
+            "Interrupted or incomplete DBs are still rejected."
+        ),
+    )
+    parser.add_argument(
+        "--llm-progress-every",
+        type=int,
+        default=0,
+        help="Log aggregate LLM call stats every N calls during long runs.",
+    )
+    parser.add_argument(
+        "--fail-on-llm-failure-ratio",
+        type=float,
+        default=0.20,
+        help="Abort ingestion when total LLM failure ratio exceeds this value. Use -1 to disable.",
+    )
+    parser.add_argument(
+        "--llm-failure-ratio-min-calls",
+        type=int,
+        default=10,
+        help="Minimum total LLM calls before enforcing --fail-on-llm-failure-ratio.",
+    )
+    parser.add_argument(
+        "--fail-on-llm-purpose-failure-ratio",
+        type=float,
+        default=0.30,
+        help="Abort ingestion when one LLM purpose exceeds this failure ratio. Use -1 to disable.",
+    )
+    parser.add_argument(
+        "--llm-purpose-failure-ratio-min-calls",
+        type=int,
+        default=5,
+        help="Minimum calls for one purpose before enforcing its failure ratio.",
+    )
+    parser.add_argument(
+        "--max-total-failed-llm-calls",
+        type=int,
+        default=None,
+        help="Abort ingestion after more than this many failed LLM calls. Negative disables.",
+    )
+    parser.add_argument(
+        "--max-failed-llm-calls-per-purpose",
+        type=int,
+        default=None,
+        help="Abort ingestion after one purpose exceeds this many failed calls. Negative disables.",
+    )
+    parser.add_argument(
+        "--max-consecutive-failed-llm-calls-per-purpose",
+        type=int,
+        default=8,
+        help="Abort ingestion after one purpose has more than this many consecutive failed calls. Negative disables.",
+    )
+    parser.add_argument(
+        "--max-total-llm-calls",
+        type=int,
+        default=None,
+        help="Abort ingestion after more than this many total LLM calls. Negative disables.",
+    )
+    parser.add_argument(
+        "--max-total-llm-tokens",
+        type=int,
+        default=None,
+        help="Abort ingestion after more than this many total LLM tokens. Negative disables.",
+    )
+    parser.add_argument(
+        "--max-wall-time-seconds",
+        type=float,
+        default=None,
+        help="Abort ingestion after this many wall-clock seconds. Negative disables.",
     )
     parser.add_argument(
         "--benchmark-db-dir",
         default=None,
         help=(
             "Directory for retained benchmark SQLite snapshots. Defaults to "
-            "docs/tmp/benchmark_dbs when --keep-db is used."
+            "<output>/dbs when --keep-db is used."
         ),
     )
     parser.add_argument(
         "--keep-db",
         action="store_true",
         help="Keep each conversation's benchmark SQLite DB and write run metadata.",
+    )
+    parser.add_argument(
+        "--allow-temp-benchmark-db-dir",
+        action="store_true",
+        help=(
+            "Allow --keep-db to retain benchmark DB snapshots under a system "
+            "temporary directory. Intended only for explicitly disposable runs."
+        ),
     )
     parser.add_argument(
         "--reuse-db",
@@ -309,6 +470,68 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--reuse-db-dir",
+        default=None,
+        help=(
+            "Evaluate selected conversations from retained benchmark DB "
+            "directories under this root. Implies --evaluate-only and supports "
+            "parallel conversation evaluation without reingest."
+        ),
+    )
+    parser.add_argument(
+        "--resume-db",
+        default=None,
+        help=(
+            "Resume ingestion for one selected conversation from an existing "
+            "benchmark.db or a directory containing benchmark.db."
+        ),
+    )
+    parser.add_argument(
+        "--resume-db-dir",
+        default=None,
+        help=(
+            "Resume ingestion for selected conversations from retained "
+            "benchmark DB directories under this root."
+        ),
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        action="store_true",
+        help=(
+            "Load the checkpoint output before scoring and skip questions "
+            "already present for each conversation."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-parallel-questions",
+        action="store_true",
+        help=(
+            "Reduce and retry question concurrency when provider rate-limit "
+            "or overload failures are detected."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-parallel-min",
+        type=int,
+        default=1,
+        help="Minimum question concurrency for --adaptive-parallel-questions.",
+    )
+    parser.add_argument(
+        "--adaptive-parallel-retries",
+        type=int,
+        default=1,
+        help="Retries per question after adaptive provider-overload failures.",
+    )
+    parser.add_argument(
+        "--stage-sleep-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Sleep before each scored question and between conversation starts; "
+            "use 300 for very conservative provider pacing."
+        ),
+    )
+    parser.add_argument(
         "--ingest-only",
         action="store_true",
         help="Ingest selected conversations, drain workers, keep metadata, and skip question evaluation.",
@@ -316,7 +539,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evaluate-only",
         action="store_true",
-        help="Skip ingestion and evaluate from --reuse-db.",
+        help="Skip ingestion and evaluate from --reuse-db or --reuse-db-dir.",
     )
     parser.add_argument(
         "--list-benchmark-dbs",
@@ -368,8 +591,7 @@ def _parse_component_model_overrides(raw_values: list[str] | None) -> dict[str, 
     for raw_value in raw_values or []:
         if "=" not in raw_value:
             raise ValueError(
-                "--component-model must use COMPONENT=MODEL, "
-                f"got {raw_value!r}"
+                f"--component-model must use COMPONENT=MODEL, got {raw_value!r}"
             )
         component_id, model = (part.strip() for part in raw_value.split("=", 1))
         if not component_id or not model:
@@ -396,6 +618,57 @@ def _default_checkpoint_output_path(output_dir: str | Path) -> Path:
     return Path(output_dir).expanduser() / "locomo-checkpoint.json"
 
 
+def _effective_benchmark_db_dir(args: argparse.Namespace) -> str | None:
+    if not args.keep_db and not args.ingest_only:
+        return args.benchmark_db_dir
+    if args.benchmark_db_dir is not None:
+        return args.benchmark_db_dir
+    return str(default_benchmark_db_dir(args.output))
+
+
+def _llm_run_guard_config(args: argparse.Namespace) -> LLMRunGuardConfig:
+    return LLMRunGuardConfig(
+        max_total_llm_calls=_optional_positive_int(args.max_total_llm_calls),
+        max_total_failed_llm_calls=_optional_positive_int(
+            args.max_total_failed_llm_calls
+        ),
+        max_failed_llm_call_ratio=_optional_ratio(args.fail_on_llm_failure_ratio),
+        min_calls_for_failed_ratio=args.llm_failure_ratio_min_calls,
+        max_failed_calls_per_purpose=_optional_positive_int(
+            args.max_failed_llm_calls_per_purpose
+        ),
+        max_failed_ratio_per_purpose=_optional_ratio(
+            args.fail_on_llm_purpose_failure_ratio
+        ),
+        min_calls_per_purpose_for_failed_ratio=(
+            args.llm_purpose_failure_ratio_min_calls
+        ),
+        max_total_tokens=_optional_positive_int(args.max_total_llm_tokens),
+        max_wall_time_seconds=_optional_positive_float(args.max_wall_time_seconds),
+        max_consecutive_failures_per_purpose=_optional_positive_int(
+            args.max_consecutive_failed_llm_calls_per_purpose
+        ),
+    )
+
+
+def _optional_ratio(value: float | None) -> float | None:
+    if value is None or value < 0:
+        return None
+    return value
+
+
+def _optional_positive_int(value: int | None) -> int | None:
+    if value is None or value < 0:
+        return None
+    return value
+
+
+def _optional_positive_float(value: float | None) -> float | None:
+    if value is None or value < 0:
+        return None
+    return value
+
+
 def _default_custody_output_path(report_path: Path) -> Path:
     timestamp = report_path.stem.removeprefix("locomo-report-")
     return report_path.with_name(f"locomo-failed-custody-{timestamp}.json")
@@ -406,9 +679,25 @@ def _default_taxonomy_output_path(report_path: Path) -> Path:
     return report_path.with_name(f"locomo-failure-taxonomy-{timestamp}.json")
 
 
+def _default_readout_output_path(report_path: Path) -> Path:
+    timestamp = report_path.stem.removeprefix("locomo-report-")
+    return report_path.with_name(f"locomo-retrieval-readout-{timestamp}.json")
+
+
 async def _run_async(
     args: argparse.Namespace,
-) -> tuple[BenchmarkReport, Path, Path | None, Path, Path, Path, Path, dict[str, object], BenchmarkDiffReport | None]:
+) -> tuple[
+    BenchmarkReport,
+    Path,
+    Path | None,
+    Path,
+    Path,
+    Path,
+    Path,
+    Path,
+    dict[str, object],
+    BenchmarkDiffReport | None,
+]:
     benchmark = LoCoMoBenchmark(
         data_path=args.data_path,
         llm_provider=args.provider,
@@ -421,13 +710,12 @@ async def _run_async(
         retrieval_model=args.retrieval_model,
         chat_model_override=args.chat_model,
         component_models=_parse_component_model_overrides(args.component_model),
-        answer_prompt_variant=args.answer_prompt_variant,
-        answer_max_output_tokens=args.answer_max_output_tokens,
         manifests_dir=args.manifests_dir,
         embedding_backend=args.embedding_backend,
         embedding_model=args.embedding_model,
         corrections_path=args.corrections,
         community_corrections_path=args.community_corrections,
+        answer_postcondition_guard_enabled=args.answer_postcondition_guard,
     )
     checkpoint_path = (
         Path(args.checkpoint_output).expanduser()
@@ -436,7 +724,10 @@ async def _run_async(
     )
     print(f"Checkpoint will be updated at: {checkpoint_path}", flush=True)
     report = await benchmark.run(
-        ablation=_parse_ablation(args.ablation),
+        ablation=_benchmark_ablation(
+            args.ablation,
+            getattr(args, "privacy_enforcement", None),
+        ),
         conversation_ids=_parse_csv_list(args.conversations),
         categories=_parse_categories(args.categories),
         question_ids=_parse_csv_list(args.questions),
@@ -444,14 +735,30 @@ async def _run_async(
         max_turns=args.max_turns,
         checkpoint_path=checkpoint_path,
         trusted_evaluation=args.trusted_evaluation,
-        benchmark_db_dir=args.benchmark_db_dir,
+        benchmark_db_dir=_effective_benchmark_db_dir(args),
+        requested_benchmark_db_dir=args.benchmark_db_dir,
+        allow_temp_benchmark_db_dir=args.allow_temp_benchmark_db_dir,
         keep_db=args.keep_db,
         reuse_db=args.reuse_db,
+        reuse_db_dir=args.reuse_db_dir,
+        resume_db=args.resume_db,
+        resume_db_dir=args.resume_db_dir,
+        allow_untrusted_reuse=args.allow_untrusted,
+        require_evidence_packets=args.require_evidence_packets,
+        llm_progress_interval=args.llm_progress_every,
+        llm_run_guard_config=_llm_run_guard_config(args),
         ingest_only=args.ingest_only,
         evaluate_only=args.evaluate_only,
+        resume_checkpoint=args.resume_checkpoint,
         parallel_conversations=args.parallel_conversations,
         parallel_questions=args.parallel_questions,
+        adaptive_parallel_questions=args.adaptive_parallel_questions,
+        adaptive_parallel_min=args.adaptive_parallel_min,
+        adaptive_parallel_retries=args.adaptive_parallel_retries,
         ingest_mode=args.ingest_mode,
+        flush_every_turns=args.flush_every_turns,
+        stage_sleep_seconds=args.stage_sleep_seconds,
+        invocation_args=sys.argv[1:],
     )
     report_path = benchmark.save_report(report, args.output)
 
@@ -478,10 +785,17 @@ async def _run_async(
         build_failed_question_custody_report(report, source_report=str(report_path)),
         custody_path,
     )
-    taxonomy_report = build_failure_taxonomy_report(report, source_report=str(report_path))
+    taxonomy_report = build_failure_taxonomy_report(
+        report, source_report=str(report_path)
+    )
     taxonomy_summary = failure_taxonomy_manifest_summary(taxonomy_report)
     taxonomy_path = _default_taxonomy_output_path(report_path)
     save_failure_taxonomy_report(taxonomy_report, taxonomy_path)
+    readout_path = _default_readout_output_path(report_path)
+    save_retrieval_readout(
+        build_retrieval_readout(report, source_report=str(report_path)),
+        readout_path,
+    )
     manifest_path = benchmark.save_run_manifest(
         report,
         report_path=report_path,
@@ -489,6 +803,7 @@ async def _run_async(
         diff_path=diff_path,
         custody_path=custody_path,
         taxonomy_path=taxonomy_path,
+        readout_path=readout_path,
         failure_taxonomy_summary=taxonomy_summary,
     )
     return (
@@ -499,6 +814,7 @@ async def _run_async(
         manifest_path,
         custody_path,
         taxonomy_path,
+        readout_path,
         taxonomy_summary,
         diff_report,
     )
@@ -545,9 +861,7 @@ def _retained_db_file_state(db_path: Path) -> dict[str, object]:
     wal_path = Path(f"{db_path}-wal")
     shm_path = Path(f"{db_path}-shm")
     stats = {
-        path: path.stat()
-        for path in (db_path, wal_path, shm_path)
-        if path.exists()
+        path: path.stat() for path in (db_path, wal_path, shm_path) if path.exists()
     }
     db_bytes = stats[db_path].st_size if db_path in stats else 0
     wal_bytes = stats[wal_path].st_size if wal_path in stats else 0
@@ -585,7 +899,9 @@ def _retained_db_sqlite_counts(db_path: Path) -> dict[str, int | None]:
     if not db_path.exists():
         return {field_name: None for field_name in table_counts}
     try:
-        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+        connection = sqlite3.connect(
+            f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0
+        )
     except sqlite3.Error:
         return {field_name: None for field_name in table_counts}
     try:
@@ -623,22 +939,29 @@ def _collect_benchmark_db_entries(db_dir: Path) -> list[dict[str, object]]:
         entries.append(
             {
                 "source": "metadata",
-                "timestamp": str(metadata.get("created_at") or progress.get("updated_at") or ""),
-                "conversation_id": str(metadata.get("conversation_id") or progress.get("conversation_id") or ""),
-                "turns": _format_ingestion_turns(progress) or str(metadata.get("turn_count") or ""),
+                "timestamp": str(
+                    metadata.get("created_at") or progress.get("updated_at") or ""
+                ),
+                "conversation_id": str(
+                    metadata.get("conversation_id")
+                    or progress.get("conversation_id")
+                    or ""
+                ),
+                "turns": _format_ingestion_turns(progress)
+                or str(metadata.get("turn_count") or ""),
                 "turn_count": metadata.get("turn_count"),
                 "selected_turns": progress.get("selected_turns"),
                 "ingested_turns": progress.get("ingested_turns"),
-                "model": str(metadata.get("answer_model") or metadata.get("llm_model") or ""),
+                "model": str(
+                    metadata.get("answer_model") or metadata.get("llm_model") or ""
+                ),
                 "status": str(progress.get("status") or "metadata_complete"),
                 "db_path": str(db_path),
                 "metadata_path": str(metadata_path),
                 "metadata_sha256": sha256_file_if_exists(metadata_path),
                 "progress_path": str(progress_path) if progress else None,
                 "progress_sha256": (
-                    sha256_file_if_exists(progress_path)
-                    if progress
-                    else None
+                    sha256_file_if_exists(progress_path) if progress else None
                 ),
                 "has_db": db_path.exists(),
                 **_retained_db_file_state(db_path),
@@ -784,7 +1107,9 @@ def _load_benchmark_db_snapshot(path: str | Path) -> dict[str, object]:
     entries = payload.get("entries")
     totals = payload.get("totals")
     if not isinstance(entries, list) or not isinstance(totals, dict):
-        raise ValueError(f"Benchmark DB snapshot is missing entries/totals: {snapshot_path}")
+        raise ValueError(
+            f"Benchmark DB snapshot is missing entries/totals: {snapshot_path}"
+        )
     return payload
 
 
@@ -850,7 +1175,8 @@ def _diff_benchmark_db_snapshot_entry(
 ) -> dict[str, object]:
     return {
         "db_path": _benchmark_db_snapshot_entry_key(after),
-        "conversation_id": after.get("conversation_id") or before.get("conversation_id"),
+        "conversation_id": after.get("conversation_id")
+        or before.get("conversation_id"),
         "status": {
             "before": before.get("status"),
             "after": after.get("status"),
@@ -899,7 +1225,10 @@ def _format_benchmark_db_snapshot_diff(
         f"Latest update: {latest_update.get('before')} -> {latest_update.get('after')}",
         "Totals delta: " + (" ".join(total_parts) if total_parts else "none"),
     ]
-    for label, key in (("New DBs", "new_db_paths"), ("Missing DBs", "missing_db_paths")):
+    for label, key in (
+        ("New DBs", "new_db_paths"),
+        ("Missing DBs", "missing_db_paths"),
+    ):
         values = diff.get(key)
         if isinstance(values, list) and values:
             lines.append(f"{label}: {', '.join(str(value) for value in values)}")
@@ -1073,7 +1402,9 @@ def _summarize_run_log(log_path: str | Path) -> dict[str, object]:
         "bytes": stat.st_size,
         "generated_at": generated_at.isoformat(),
         "file_updated_at": file_updated_at.isoformat(),
-        "seconds_since_update": max(0.0, (generated_at - file_updated_at).total_seconds()),
+        "seconds_since_update": max(
+            0.0, (generated_at - file_updated_at).total_seconds()
+        ),
         "line_count": line_count,
         "counts": dict(sorted(counts.items())),
         "validation_error_schemas": dict(sorted(validation_error_schemas.items())),
@@ -1155,6 +1486,8 @@ def _parse_run_log_turn_marker(
     except ValueError:
         return None
     conversation_id = conversation_text.strip().rstrip(".")
+    if " from turn " in conversation_id:
+        conversation_id = conversation_id.split(" from turn ", maxsplit=1)[0].strip()
     if not conversation_id:
         return None
     return conversation_id, first_count, second_count
@@ -1163,7 +1496,9 @@ def _parse_run_log_turn_marker(
 def _parse_run_log_question_marker(line: str) -> tuple[str, int, int] | None:
     try:
         conversation_text, question_text = line.split(": question ", maxsplit=1)
-        current_question_text, total_questions_text = question_text.split("/", maxsplit=1)
+        current_question_text, total_questions_text = question_text.split(
+            "/", maxsplit=1
+        )
         current_question = int(current_question_text)
         total_questions = int(total_questions_text)
         conversation_id = conversation_text.rsplit("(", maxsplit=1)[1].rstrip(")")
@@ -1211,9 +1546,7 @@ def _run_log_turn_progress_totals(
             completed_conversations += 1
 
     completion_ratio = (
-        round(completed_turns / total_turns, 6)
-        if total_turns > 0
-        else None
+        round(completed_turns / total_turns, 6) if total_turns > 0 else None
     )
     remaining_turns = max(0, total_turns - completed_turns)
     return {
@@ -1289,9 +1622,7 @@ def _format_run_log_turn_totals(value: object) -> str:
     if total_turns <= 0:
         return "none"
     ratio_text = (
-        f"{completion_ratio:.1%}"
-        if isinstance(completion_ratio, float)
-        else "unknown"
+        f"{completion_ratio:.1%}" if isinstance(completion_ratio, float) else "unknown"
     )
     return (
         f"{completed_turns}/{total_turns} ({ratio_text}) "
@@ -1381,8 +1712,7 @@ def _format_benchmark_db_totals_text(totals: dict[str, object]) -> str:
         ("topic_sources", "conversation_topic_source_count"),
     ]
     summary = "Totals: " + " ".join(
-        f"{label}={totals.get(field_name, 0)}"
-        for label, field_name in fields
+        f"{label}={totals.get(field_name, 0)}" for label, field_name in fields
     )
     latest_updated_at = totals.get("latest_file_updated_at")
     if latest_updated_at is not None:
@@ -1429,6 +1759,7 @@ def _format_report_summary(
     manifest_path: Path | None = None,
     custody_path: Path | None = None,
     taxonomy_path: Path | None = None,
+    readout_path: Path | None = None,
     failure_taxonomy_summary: dict[str, object] | None = None,
 ) -> str:
     category_stats = _category_counts(report)
@@ -1463,9 +1794,7 @@ def _format_report_summary(
         if total == 0:
             continue
         accuracy = (correct / total) * 100.0
-        lines.append(
-            f"  Cat {category} ({name}): {accuracy:6.1f}% ({correct}/{total})"
-        )
+        lines.append(f"  Cat {category} ({name}): {accuracy:6.1f}% ({correct}/{total})")
 
     lines.append("")
     lines.append("Per-conversation:")
@@ -1499,6 +1828,11 @@ def _format_report_summary(
             *(
                 [f"Failure taxonomy saved to: {taxonomy_path}"]
                 if taxonomy_path is not None
+                else []
+            ),
+            *(
+                [f"Retrieval readout saved to: {readout_path}"]
+                if readout_path is not None
                 else []
             ),
             "=" * 40,
@@ -1538,7 +1872,9 @@ def _format_phase_models(model_info: dict[str, object]) -> str:
     component_models = model_info.get("component_models")
     if isinstance(component_models, dict) and component_models:
         parts.append(f"components={len(component_models)}")
-    return "Phase models: " + (" ".join(parts) if parts else "default internal resolution")
+    return "Phase models: " + (
+        " ".join(parts) if parts else "default internal resolution"
+    )
 
 
 def _format_llm_call_summary(value: object) -> str:
@@ -1596,13 +1932,17 @@ def main() -> None:
         print(_format_benchmark_db_list(_benchmark_db_dir(args)))
         return
     if args.data_path is None:
-        parser.error("--data-path is required unless a list-benchmark-dbs option is used")
+        parser.error(
+            "--data-path is required unless a list-benchmark-dbs option is used"
+        )
     if args.provider is None:
-        parser.error("--provider is required unless a list-benchmark-dbs option is used")
+        parser.error(
+            "--provider is required unless a list-benchmark-dbs option is used"
+        )
     if args.model is not None and args.answer_model is not None:
-        parser.error("--model is a legacy alias; use either --model or --answer-model, not both")
-    if args.answer_max_output_tokens is not None and args.answer_max_output_tokens < 1:
-        parser.error("--answer-max-output-tokens must be positive")
+        parser.error(
+            "--model is a legacy alias; use either --model or --answer-model, not both"
+        )
     if (
         _resolve_answer_model(args) is None
         and args.chat_model is None
@@ -1618,13 +1958,67 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
     if args.embedding_backend == "sqlite_vec" and not args.embedding_model:
-        parser.error("--embedding-model is required when --embedding-backend is sqlite_vec")
-    if args.ingest_only and (args.evaluate_only or args.reuse_db is not None):
-        parser.error("--ingest-only cannot be combined with --evaluate-only or --reuse-db")
-    if args.evaluate_only and args.reuse_db is None:
-        parser.error("--evaluate-only requires --reuse-db")
+        parser.error(
+            "--embedding-model is required when --embedding-backend is sqlite_vec"
+        )
+    if args.reuse_db is not None and args.reuse_db_dir is not None:
+        parser.error("--reuse-db and --reuse-db-dir are mutually exclusive")
+    if args.resume_db is not None and args.resume_db_dir is not None:
+        parser.error("--resume-db and --resume-db-dir are mutually exclusive")
+    if (args.reuse_db is not None or args.reuse_db_dir is not None) and (
+        args.resume_db is not None or args.resume_db_dir is not None
+    ):
+        parser.error(
+            "--reuse-db/--reuse-db-dir cannot be combined with --resume-db/--resume-db-dir"
+        )
+    if args.ingest_only and (
+        args.evaluate_only or args.reuse_db is not None or args.reuse_db_dir is not None
+    ):
+        parser.error(
+            "--ingest-only cannot be combined with --evaluate-only, --reuse-db, or --reuse-db-dir"
+        )
+    if args.evaluate_only and args.reuse_db is None and args.reuse_db_dir is None:
+        parser.error("--evaluate-only requires --reuse-db or --reuse-db-dir")
+    if args.evaluate_only and (
+        args.resume_db is not None or args.resume_db_dir is not None
+    ):
+        parser.error("--evaluate-only cannot be combined with resume options")
     if args.parallel_conversations < 1:
         parser.error("--parallel-conversations must be at least 1")
+    if args.parallel_questions < 1:
+        parser.error("--parallel-questions must be at least 1")
+    if args.adaptive_parallel_min < 1:
+        parser.error("--adaptive-parallel-min must be at least 1")
+    if args.adaptive_parallel_min > args.parallel_questions:
+        parser.error("--adaptive-parallel-min cannot exceed --parallel-questions")
+    if args.adaptive_parallel_retries < 0:
+        parser.error("--adaptive-parallel-retries must be non-negative")
+    if args.flush_every_turns is not None and args.flush_every_turns < 1:
+        parser.error("--flush-every-turns must be at least 1")
+    if args.llm_progress_every < 0:
+        parser.error("--llm-progress-every must be non-negative")
+    if args.llm_failure_ratio_min_calls < 0:
+        parser.error("--llm-failure-ratio-min-calls must be non-negative")
+    if args.llm_purpose_failure_ratio_min_calls < 0:
+        parser.error("--llm-purpose-failure-ratio-min-calls must be non-negative")
+    for flag_name, value in (
+        ("--fail-on-llm-failure-ratio", args.fail_on_llm_failure_ratio),
+        (
+            "--fail-on-llm-purpose-failure-ratio",
+            args.fail_on_llm_purpose_failure_ratio,
+        ),
+    ):
+        if value > 1:
+            parser.error(f"{flag_name} must be between 0 and 1, or negative to disable")
+    if args.ingest_mode == "online_batch" and args.flush_every_turns is None:
+        parser.error("--ingest-mode online_batch requires --flush-every-turns")
+    if (
+        args.ingest_mode in {"bulk", "online_async"}
+        and args.flush_every_turns is not None
+    ):
+        parser.error(
+            f"--flush-every-turns cannot be combined with --ingest-mode {args.ingest_mode}"
+        )
     (
         report,
         output_path,
@@ -1633,6 +2027,7 @@ def main() -> None:
         manifest_path,
         custody_path,
         taxonomy_path,
+        readout_path,
         failure_taxonomy_summary,
         diff_report,
     ) = asyncio.run(_run_async(args))
@@ -1645,6 +2040,7 @@ def main() -> None:
             manifest_path=manifest_path,
             custody_path=custody_path,
             taxonomy_path=taxonomy_path,
+            readout_path=readout_path,
             failure_taxonomy_summary=failure_taxonomy_summary,
         )
     )

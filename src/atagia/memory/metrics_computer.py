@@ -507,11 +507,10 @@ class MetricsComputer:
             messages=[
                 LLMMessage(
                     role="system",
-                    content="Evaluate contract compliance as JSON only.",
+                    content="Check contract compliance as JSON only.",
                 ),
                 LLMMessage(role="user", content=prompt),
             ],
-            temperature=0.0,
             max_output_tokens=METRICS_COMPUTER_MAX_OUTPUT_TOKENS,
             response_schema=ContractComplianceEvaluation.model_json_schema(),
             metadata={

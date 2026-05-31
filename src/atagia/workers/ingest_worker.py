@@ -11,12 +11,15 @@ import aiosqlite
 from atagia.core import json_utils
 from atagia.core.belief_repository import BeliefRepository
 from atagia.core.clock import Clock
+from atagia.core.communication_profile_repository import CommunicationProfileRepository
 from atagia.core.config import Settings
 from atagia.core.ids import new_job_id
+from atagia.core.initial_context_package_repository import InitialContextPackageRepository
 from atagia.core.storage_backend import StorageBackend
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
+    MemoryRetrievalSurfaceRepository,
     MessageRepository,
     UserRepository,
 )
@@ -25,7 +28,12 @@ from atagia.memory.consequence_builder import ConsequenceChainBuilder
 from atagia.memory.consequence_detector import ConsequenceDetector
 from atagia.memory.extractor import MemoryExtractor
 from atagia.memory.intent_classifier import are_claim_keys_equivalent
+from atagia.memory.language_profile import UserCommunicationProfileService
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, ResolvedRetrievalPolicy
+from atagia.memory.retrieval_surface_dry_run import (
+    RetrievalSurfaceDryRunGenerator,
+    RetrievalSurfaceWriter,
+)
 from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
     CompactionJobKind,
@@ -34,6 +42,7 @@ from atagia.models.schemas_jobs import (
     GRAPH_STREAM_NAME,
     GraphProjectionChunkPayload,
     GraphProjectionJobPayload,
+    InitialContextPackageRefreshReason,
     JobEnvelope,
     JobType,
     MessageJobPayload,
@@ -55,6 +64,9 @@ from atagia.services.chat_support import apply_conversation_policy_overlay
 from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.llm_client import LLMClient, LLMError, StructuredOutputError, TransientLLMError
 from atagia.services.embeddings import EmbeddingIndex
+from atagia.services.initial_context_package_refresh_service import (
+    InitialContextPackageRefreshEnqueuer,
+)
 from atagia.services.model_resolution import resolve_component_model
 from atagia.services.worker_control_service import WorkerControlService, wait_if_worker_claims_paused
 from atagia.services.topic_working_set_service import TopicWorkingSetRefreshService
@@ -93,6 +105,10 @@ class IngestWorker:
         self._user_repository = UserRepository(connection, clock)
         self._belief_repository = BeliefRepository(connection, clock)
         self._summary_repository = SummaryRepository(connection, clock)
+        self._communication_profile_repository = CommunicationProfileRepository(
+            connection,
+            clock,
+        )
         self._worker_control = WorkerControlService(connection, clock)
         resolved_settings = settings or Settings.from_env()
         self._job_tracking = JobTrackingService(
@@ -101,11 +117,31 @@ class IngestWorker:
             workers_enabled=resolved_settings.workers_enabled,
             settings=resolved_settings,
         )
+        self._initial_context_package_refresh = InitialContextPackageRefreshEnqueuer(
+            storage_backend=storage_backend,
+            clock=clock,
+            job_tracking_service=self._job_tracking,
+            package_repository=InitialContextPackageRepository(connection, clock),
+            refresh_enabled=resolved_settings.initial_context_package_refresh_enabled,
+        )
         self._settings = resolved_settings
         self._classifier_model = resolve_component_model(
             resolved_settings,
             "intent_classifier",
         )
+        retrieval_packet_dry_run_generator = None
+        retrieval_packet_surface_writer = None
+        if resolved_settings.retrieval_packets_dry_run_enabled:
+            retrieval_packet_dry_run_generator = RetrievalSurfaceDryRunGenerator(
+                llm_client,
+                clock,
+                resolved_settings,
+            )
+            if resolved_settings.retrieval_packets_write_enabled:
+                retrieval_packet_surface_writer = RetrievalSurfaceWriter(
+                    MemoryRetrievalSurfaceRepository(connection, clock),
+                    clock,
+                )
         self._extractor = MemoryExtractor(
             llm_client=llm_client,
             clock=clock,
@@ -114,6 +150,15 @@ class IngestWorker:
             storage_backend=storage_backend,
             embedding_index=embedding_index,
             settings=resolved_settings,
+            retrieval_packet_dry_run_generator=retrieval_packet_dry_run_generator,
+            enable_retrieval_packet_dry_run=(
+                resolved_settings.retrieval_packets_dry_run_enabled
+            ),
+            retrieval_packet_surface_writer=retrieval_packet_surface_writer,
+            enable_retrieval_packet_surface_write=(
+                resolved_settings.retrieval_packets_dry_run_enabled
+                and resolved_settings.retrieval_packets_write_enabled
+            ),
         )
         self._consequence_detector = ConsequenceDetector(
             llm_client=llm_client,
@@ -124,6 +169,12 @@ class IngestWorker:
             connection=connection,
             llm_client=llm_client,
             clock=clock,
+            settings=resolved_settings,
+        )
+        self._user_language_profile_service = UserCommunicationProfileService(
+            llm_client=llm_client,
+            clock=clock,
+            profile_repository=self._communication_profile_repository,
             settings=resolved_settings,
         )
 
@@ -334,6 +385,13 @@ class IngestWorker:
             ingest_origin=job_payload.ingest_origin,
             confirmation_strategy=job_payload.confirmation_strategy,
             memory_privacy_mode=job_payload.memory_privacy_mode,
+            privacy_enforcement=job_payload.privacy_enforcement,
+            authenticated_user_privilege_level=(
+                job_payload.authenticated_user_privilege_level
+            ),
+            authenticated_user_is_atagia_master=(
+                job_payload.authenticated_user_is_atagia_master
+            ),
         )
         try:
             extraction_details = await self._extractor.extract_with_persistence_and_chunk_plan(
@@ -384,6 +442,58 @@ class IngestWorker:
         await self._maybe_refresh_topic_working_set(
             envelope=envelope,
             job_payload=job_payload,
+        )
+        if job_payload.role == "user":
+            await self._update_user_communication_profile(
+                job_payload=job_payload,
+                context=context,
+            )
+        await self._enqueue_initial_context_package_refresh(
+            envelope=envelope,
+            job_payload=job_payload,
+        )
+
+    async def _update_user_communication_profile(
+        self,
+        *,
+        job_payload: MessageJobPayload,
+        context: ExtractionConversationContext,
+    ) -> None:
+        try:
+            await self._user_language_profile_service.update_from_message(
+                message_text=job_payload.message_text,
+                role=job_payload.role,
+                conversation_context=context,
+                occurred_at=job_payload.message_occurred_at,
+            )
+        except Exception as exc:
+            logger.warning(
+                "user_language_profile_update_failed_skipping",
+                extra={
+                    "user_id": context.user_id,
+                    "conversation_id": context.conversation_id,
+                    "source_message_id": context.source_message_id,
+                    "error": str(exc),
+                },
+            )
+
+    async def _enqueue_initial_context_package_refresh(
+        self,
+        *,
+        envelope: JobEnvelope,
+        job_payload: MessageJobPayload,
+    ) -> None:
+        if envelope.conversation_id is None:
+            return
+        await self._initial_context_package_refresh.enqueue_refresh(
+            user_id=envelope.user_id,
+            conversation_id=envelope.conversation_id,
+            retrieval_profile_id=job_payload.assistant_mode_id,
+            reason=InitialContextPackageRefreshReason.MEMORY_EXTRACTION,
+            source_message_ids=[job_payload.message_id],
+            privacy_enforcement=job_payload.privacy_enforcement,
+            operational_profile=envelope.operational_profile,
+            fail_open=True,
         )
 
     async def _emit_revision_jobs(
@@ -746,6 +856,7 @@ class IngestWorker:
                 temporary_ttl_seconds=job_payload.temporary_ttl_seconds,
                 purge_on_close=job_payload.purge_on_close,
                 valid_to=job_payload.valid_to,
+                privacy_enforcement=job_payload.privacy_enforcement,
                 job_kind=CompactionJobKind.CONVERSATION_CHUNK,
             ).model_dump(mode="json"),
             created_at=envelope.created_at,

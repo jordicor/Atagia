@@ -14,14 +14,19 @@ from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository, WorkspaceRepository
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
 from atagia.memory.candidate_search import CandidateSearch
-from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
+from atagia.memory.context_composer import ContextComposer
+from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
 from atagia.models.schemas_memory import (
+    IntimacyBoundary,
+    MemoryCategory,
     MemoryObjectType,
     MemoryScope,
     MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
     RetrievalPlan,
+    ScoredCandidate,
+    SpaceBoundaryMode,
     VerbatimPinTargetKind,
 )
 from atagia.services.embeddings import EmbeddingMatch
@@ -49,6 +54,11 @@ class FakeEmbeddingIndex:
 
     async def delete(self, memory_id: str) -> None:
         raise AssertionError("delete() is not used in candidate search tests")
+
+
+def _resolved_policy():
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["coding_debug"]
+    return PolicyResolver().resolve(manifest, None, None)
 
 
 async def _build_runtime(
@@ -94,10 +104,17 @@ async def _seed_memory(
     platform_id: str | None = None,
     character_id: str | None = None,
     sensitivity: MemorySensitivity | None = None,
+    privacy_level: int = 0,
+    memory_category: MemoryCategory = MemoryCategory.UNKNOWN,
+    status: MemoryStatus = MemoryStatus.ACTIVE,
     platform_locked: bool = False,
     platform_id_lock: str | None = None,
     scope_canonical: str | None = None,
     index_text: str | None = None,
+    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+    intimacy_boundary_confidence: float = 0.0,
+    space_id: str | None = None,
+    space_boundary_mode: str | None = None,
 ) -> None:
     await memories.create_memory_object(
         user_id=user_id,
@@ -110,8 +127,8 @@ async def _seed_memory(
         index_text=index_text,
         source_kind=MemorySourceKind.EXTRACTED,
         confidence=0.8,
-        privacy_level=0,
-        status=MemoryStatus.ACTIVE,
+        privacy_level=privacy_level,
+        status=status,
         temporal_type=temporal_type,
         valid_from=valid_from,
         valid_to=valid_to,
@@ -120,9 +137,14 @@ async def _seed_memory(
         platform_id=platform_id,
         character_id=character_id,
         sensitivity=sensitivity,
+        memory_category=memory_category,
         platform_locked=platform_locked,
         platform_id_lock=platform_id_lock,
         scope_canonical=scope_canonical,
+        intimacy_boundary=intimacy_boundary,
+        intimacy_boundary_confidence=intimacy_boundary_confidence,
+        space_id=space_id,
+        space_boundary_mode=space_boundary_mode,
     )
 
 
@@ -156,7 +178,6 @@ def _plan(
         privacy_ceiling=1,
         retrieval_levels=[0],
         require_evidence_regrounding=False,
-        need_driven_boosts={},
         skip_retrieval=False,
     )
 
@@ -583,6 +604,629 @@ async def test_search_by_embedding_filters_by_user_and_scope() -> None:
 
 
 @pytest.mark.asyncio
+async def test_embedding_candidate_composition_uses_canonical_text_not_index_payload() -> None:
+    connection, memories, search, embedding_index = await _build_runtime(
+        [
+            EmbeddingMatch(
+                memory_id="mem_index_payload",
+                score=0.92,
+                position_rank=1,
+                metadata={"distance": 0.08},
+            )
+        ]
+    )
+    clock = FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc))
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_index_payload",
+            user_id="usr_1",
+            canonical_text="Ben prefers concise debugging answers for retry issues.",
+            index_text="respuestas depuracion concisas",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+
+        candidates = await search.search_by_embedding(
+            query_text="respuestas depuracion concisas",
+            user_id="usr_1",
+            plan=_plan(),
+            embedding_index=embedding_index,
+        )
+
+        assert [candidate["id"] for candidate in candidates] == ["mem_index_payload"]
+
+        composed = ContextComposer(clock).compose(
+            [
+                ScoredCandidate(
+                    memory_id="mem_index_payload",
+                    memory_object=candidates[0],
+                    llm_applicability=1.0,
+                    retrieval_score=0.92,
+                    vitality_boost=0.0,
+                    confirmation_boost=0.0,
+                    need_boost=0.0,
+                    penalty=0.0,
+                    final_score=1.0,
+                )
+            ],
+            current_contract={},
+            user_state=None,
+            resolved_policy=_resolved_policy(),
+            conversation_messages=[],
+            query_text="respuestas depuracion concisas",
+            query_type="slot_fill",
+            exact_recall_mode=False,
+        )
+
+        assert composed.selected_memory_ids == ["mem_index_payload"]
+        assert (
+            "Ben prefers concise debugging answers for retry issues."
+            in composed.memory_block
+        )
+        assert "respuestas depuracion concisas" not in composed.memory_block.lower()
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase7_payload_family_diagnostics_distinguish_payloads_without_evidence_leak() -> None:
+    payloads = {
+        "canonical": "Claire keeps the signed lease in the blue folder.",
+        "index": "carpeta azul contrato firmado alquiler",
+        "combined": "Claire keeps the signed lease in the blue folder.\ncarpeta azul contrato firmado alquiler",
+    }
+    connection, memories, search, _embedding_index = await _build_runtime([])
+    clock = FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc))
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_payload_family",
+            user_id="usr_1",
+            canonical_text=payloads["canonical"],
+            index_text=payloads["index"],
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+
+        diagnostic_report: list[dict[str, object]] = []
+        for family, payload_text in payloads.items():
+            family_index = FakeEmbeddingIndex(
+                [
+                    EmbeddingMatch(
+                        memory_id="mem_payload_family",
+                        score=0.94,
+                        position_rank=1,
+                        metadata={
+                            "payload_family": family,
+                            "payload_text": payload_text,
+                        },
+                    )
+                ]
+            )
+            candidates = await search.search_by_embedding(
+                query_text="contrato alquiler carpeta azul",
+                user_id="usr_1",
+                plan=_plan(),
+                embedding_index=family_index,
+            )
+            composed = ContextComposer(clock).compose(
+                [
+                    ScoredCandidate(
+                        memory_id="mem_payload_family",
+                        memory_object=candidates[0],
+                        llm_applicability=1.0,
+                        retrieval_score=0.94,
+                        vitality_boost=0.0,
+                        confirmation_boost=0.0,
+                        need_boost=0.0,
+                        penalty=0.0,
+                        final_score=1.0,
+                    )
+                ],
+                current_contract={},
+                user_state=None,
+                resolved_policy=_resolved_policy(),
+                conversation_messages=[],
+                query_text="contrato alquiler carpeta azul",
+                query_type="slot_fill",
+                exact_recall_mode=False,
+            )
+            diagnostic_report.append(
+                {
+                    "payload_family": family,
+                    "candidate_ids": [candidate["id"] for candidate in candidates],
+                    "selected_memory_ids": list(composed.selected_memory_ids),
+                    "memory_block": composed.memory_block,
+                }
+            )
+
+        assert {row["payload_family"] for row in diagnostic_report} == {
+            "canonical",
+            "index",
+            "combined",
+        }
+        assert all(row["candidate_ids"] == ["mem_payload_family"] for row in diagnostic_report)
+        assert all(row["selected_memory_ids"] == ["mem_payload_family"] for row in diagnostic_report)
+        assert all(payloads["canonical"] in str(row["memory_block"]) for row in diagnostic_report)
+        assert all(payloads["index"] not in str(row["memory_block"]).lower() for row in diagnostic_report)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase7_payload_family_diagnostics_filter_wrong_user_and_policy_restricted_rows() -> None:
+    matches = [
+        EmbeddingMatch(memory_id="mem_public", score=0.99, position_rank=1),
+        EmbeddingMatch(memory_id="mem_wrong_user", score=0.98, position_rank=2),
+        EmbeddingMatch(memory_id="mem_private", score=0.97, position_rank=3),
+        EmbeddingMatch(memory_id="mem_secret", score=0.96, position_rank=4),
+        EmbeddingMatch(memory_id="mem_high_risk", score=0.95, position_rank=5),
+    ]
+    connection, memories, search, embedding_index = await _build_runtime(matches)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_public",
+            user_id="usr_1",
+            canonical_text="Public retry preference.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_wrong_user",
+            user_id="usr_2",
+            canonical_text="Other user retry preference.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_2",
+            conversation_id="cnv_2",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_private",
+            user_id="usr_1",
+            canonical_text="Private retry preference.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            privacy_level=2,
+            sensitivity=MemorySensitivity.PRIVATE,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_secret",
+            user_id="usr_1",
+            canonical_text="Secret retry preference.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            privacy_level=3,
+            sensitivity=MemorySensitivity.SECRET,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_high_risk",
+            user_id="usr_1",
+            canonical_text="PIN-like retry preference.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            privacy_level=0,
+            memory_category=MemoryCategory.PIN_OR_PASSWORD,
+        )
+
+        candidates = await search.search_by_embedding(
+            query_text="retry preference",
+            user_id="usr_1",
+            plan=_plan(vector_limit=10, max_candidates=10),
+            embedding_index=embedding_index,
+        )
+
+        assert [candidate["id"] for candidate in candidates] == ["mem_public"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase7_exact_literal_code_and_proper_name_diagnostic_keeps_vector_recall_disabled() -> None:
+    connection, memories, search, embedding_index = await _build_runtime(
+        [
+            EmbeddingMatch(memory_id="mem_wrong_code", score=0.99, position_rank=1),
+            EmbeddingMatch(memory_id="mem_wrong_name", score=0.98, position_rank=2),
+        ]
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_wrong_code",
+            user_id="usr_1",
+            canonical_text="The deployment ticket is SA42.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_wrong_name",
+            user_id="usr_1",
+            canonical_text="Carolina owns the blue folder.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+
+        exact_sensitive_plan = _plan(vector_limit=0).model_copy(
+            update={
+                "exact_recall_mode": True,
+                "query_type": "slot_fill",
+                "exact_facets": ["code", "proper_name", "literal"],
+            }
+        )
+        candidates = await search.search_by_embedding(
+            query_text="SA43 Caroline",
+            user_id="usr_1",
+            plan=exact_sensitive_plan,
+            embedding_index=embedding_index,
+        )
+
+        assert candidates == []
+        assert embedding_index.calls == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase7_opt_in_embedding_recall_recovers_when_lexical_channels_miss() -> None:
+    connection, memories, search, embedding_index = await _build_runtime(
+        [
+            EmbeddingMatch(
+                memory_id="mem_embedding_only",
+                score=0.93,
+                position_rank=1,
+                metadata={
+                    "payload_family": "combined",
+                    "payload_text": "Claire keeps the signed lease in the blue folder.\ncontrato alquiler carpeta azul",
+                },
+            )
+        ]
+    )
+    clock = FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc))
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_embedding_only",
+            user_id="usr_1",
+            canonical_text="Claire keeps the signed lease in the blue folder.",
+            index_text="contrato alquiler carpeta azul",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+
+        query = "documento de arrendamiento archivado"
+        vector_plan = _plan(
+            vector_limit=5,
+            fts_queries=[query],
+        )
+        no_vector_plan = _plan(
+            vector_limit=0,
+            fts_queries=[query],
+        )
+
+        no_vector_candidates = await search.search(no_vector_plan, "usr_1")
+        candidates = await search.search(vector_plan, "usr_1")
+
+        assert no_vector_candidates == []
+        assert [candidate["id"] for candidate in candidates] == ["mem_embedding_only"]
+        assert candidates[0]["retrieval_sources"] == ["embedding"]
+        assert candidates[0]["channel_ranks"]["embedding"] == 1
+        assert candidates[0]["canonical_text"] == "Claire keeps the signed lease in the blue folder."
+        assert candidates[0]["index_text"] == "contrato alquiler carpeta azul"
+        assert embedding_index.calls == [(query, "usr_1", 20)]
+
+        composed = ContextComposer(clock).compose(
+            [
+                ScoredCandidate(
+                    memory_id="mem_embedding_only",
+                    memory_object=candidates[0],
+                    llm_applicability=1.0,
+                    retrieval_score=0.93,
+                    vitality_boost=0.0,
+                    confirmation_boost=0.0,
+                    need_boost=0.0,
+                    penalty=0.0,
+                    final_score=1.0,
+                )
+            ],
+            current_contract={},
+            user_state=None,
+            resolved_policy=_resolved_policy(),
+            conversation_messages=[],
+            query_text=query,
+            query_type="slot_fill",
+            exact_recall_mode=False,
+        )
+
+        assert composed.selected_memory_ids == ["mem_embedding_only"]
+        assert "Claire keeps the signed lease in the blue folder." in composed.memory_block
+        assert "contrato alquiler carpeta azul" not in composed.memory_block.lower()
+        assert query not in composed.memory_block.lower()
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase7_opt_in_embedding_recall_keeps_policy_lifecycle_and_platform_negatives() -> None:
+    matches = [
+        EmbeddingMatch(memory_id="mem_wrong_user", score=0.99, position_rank=1),
+        EmbeddingMatch(memory_id="mem_private", score=0.98, position_rank=2),
+        EmbeddingMatch(memory_id="mem_secret", score=0.97, position_rank=3),
+        EmbeddingMatch(memory_id="mem_high_risk", score=0.96, position_rank=4),
+        EmbeddingMatch(memory_id="mem_deleted", score=0.95, position_rank=5),
+        EmbeddingMatch(memory_id="mem_superseded", score=0.94, position_rank=6),
+        EmbeddingMatch(memory_id="mem_platform_locked", score=0.93, position_rank=7),
+        EmbeddingMatch(memory_id="mem_visible", score=0.92, position_rank=8),
+    ]
+    connection, memories, search, _embedding_index = await _build_runtime(matches)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_wrong_user",
+            user_id="usr_2",
+            canonical_text="Other user lease folder.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_2",
+            conversation_id="cnv_2",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_private",
+            user_id="usr_1",
+            canonical_text="Private lease folder.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            privacy_level=2,
+            sensitivity=MemorySensitivity.PRIVATE,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_secret",
+            user_id="usr_1",
+            canonical_text="Secret lease folder.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            privacy_level=3,
+            sensitivity=MemorySensitivity.SECRET,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_high_risk",
+            user_id="usr_1",
+            canonical_text="High-risk lease folder.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            memory_category=MemoryCategory.PIN_OR_PASSWORD,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_deleted",
+            user_id="usr_1",
+            canonical_text="Deleted lease folder.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            status=MemoryStatus.DELETED,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_superseded",
+            user_id="usr_1",
+            canonical_text="Superseded lease folder.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            status=MemoryStatus.SUPERSEDED,
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_platform_locked",
+            user_id="usr_1",
+            canonical_text="iOS-only lease folder.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            platform_id="ios",
+            platform_locked=True,
+            platform_id_lock="ios",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_visible",
+            user_id="usr_1",
+            canonical_text="Visible lease folder.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+
+        candidates = await search.search(
+            _plan(
+                vector_limit=10,
+                max_candidates=10,
+                fts_queries=["documento de arrendamiento archivado"],
+            ),
+            "usr_1",
+        )
+
+        assert [candidate["id"] for candidate in candidates] == ["mem_visible"]
+        assert candidates[0]["retrieval_sources"] == ["embedding"]
+        assert candidates[0]["embedding_position_rank"] == 8
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase8_embedding_policy_matrix_respects_base_memory_gates() -> None:
+    matches = [
+        EmbeddingMatch(memory_id="mem_phase8_embedding_wrong_user", score=0.99, position_rank=1),
+        EmbeddingMatch(memory_id="mem_phase8_embedding_restricted", score=0.98, position_rank=2),
+        EmbeddingMatch(memory_id="mem_phase8_embedding_platform", score=0.97, position_rank=3),
+        EmbeddingMatch(memory_id="mem_phase8_embedding_space", score=0.96, position_rank=4),
+        EmbeddingMatch(memory_id="mem_phase8_embedding_visible", score=0.95, position_rank=5),
+    ]
+    connection, memories, search, _embedding_index = await _build_runtime(matches)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_phase8_embedding_wrong_user",
+            user_id="usr_2",
+            canonical_text="Wrong user embedding base memory.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_2",
+            conversation_id="cnv_2",
+            space_id="space_active",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_phase8_embedding_restricted",
+            user_id="usr_1",
+            canonical_text="Restricted embedding base memory.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            privacy_level=3,
+            sensitivity=MemorySensitivity.SECRET,
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+            intimacy_boundary_confidence=0.9,
+            space_id="space_active",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_phase8_embedding_platform",
+            user_id="usr_1",
+            canonical_text="Wrong platform embedding base memory.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            platform_locked=True,
+            platform_id_lock="ios",
+            space_id="space_active",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_phase8_embedding_space",
+            user_id="usr_1",
+            canonical_text="Wrong space embedding base memory.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            space_id="space_other",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_phase8_embedding_visible",
+            user_id="usr_1",
+            canonical_text="Visible embedding base memory.",
+            index_text="derivedpayloadmarker",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            space_id="space_active",
+        )
+
+        mode_results: dict[str, list[dict[str, object]]] = {}
+        for mode in ("enforce", "audit_only", "off"):
+            plan = _plan(
+                vector_limit=10,
+                max_candidates=10,
+                fts_queries=["consulta sin coincidencia"],
+            ).model_copy(
+                update={
+                    "active_space_id": "space_active",
+                    "active_space_boundary_mode": SpaceBoundaryMode.FOCUS,
+                    "privacy_enforcement": mode,
+                }
+            )
+            mode_results[mode] = await search.search(plan, "usr_1")
+
+        for mode in ("enforce", "audit_only"):
+            assert [candidate["id"] for candidate in mode_results[mode]] == [
+                "mem_phase8_embedding_visible"
+            ]
+
+        assert [candidate["id"] for candidate in mode_results["off"]] == [
+            "mem_phase8_embedding_restricted",
+            "mem_phase8_embedding_visible",
+        ]
+        for candidate in mode_results["off"]:
+            assert candidate["retrieval_sources"] == ["embedding"]
+            assert "derivedpayloadmarker" not in candidate["canonical_text"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_phase7_exact_current_value_control_uses_lexical_evidence_with_vector_disabled() -> None:
+    connection, memories, search, embedding_index = await _build_runtime(
+        [
+            EmbeddingMatch(memory_id="mem_wrong_code", score=0.99, position_rank=1),
+            EmbeddingMatch(memory_id="mem_wrong_name", score=0.98, position_rank=2),
+        ]
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_exact_code",
+            user_id="usr_1",
+            canonical_text="The current deployment code is SA42.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_wrong_code",
+            user_id="usr_1",
+            canonical_text="The stale deployment code was SA43.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="mem_wrong_name",
+            user_id="usr_1",
+            canonical_text="Carolina owns an unrelated folder.",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+
+        exact_plan = _plan(vector_limit=0, fts_queries=["SA42"]).model_copy(
+            update={
+                "exact_recall_mode": True,
+                "query_type": "slot_fill",
+                "exact_facets": ["code", "current_value"],
+            }
+        )
+        candidates = await search.search(exact_plan, "usr_1")
+
+        assert [candidate["id"] for candidate in candidates] == ["mem_exact_code"]
+        assert candidates[0]["retrieval_sources"] == ["fts"]
+        assert candidates[0]["canonical_text"] == "The current deployment code is SA42."
+        assert embedding_index.calls == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_search_by_embedding_returns_empty_when_vector_limit_is_zero() -> None:
     connection, _memories, search, embedding_index = await _build_runtime(
         [EmbeddingMatch(memory_id="mem_1", score=0.88)]
@@ -881,6 +1525,7 @@ async def test_rrf_uses_best_fts_rank_once_across_query_rewrites() -> None:
             "embedding": None,
             "consequence": None,
             "verbatim_evidence_search": None,
+            "fact_facet": None,
         }
         assert shared["matched_sub_queries"] == ["retry loop fastapi"]
         assert shared["subquery_ranks"]["retry loop fastapi"] >= 1

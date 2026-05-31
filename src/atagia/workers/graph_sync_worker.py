@@ -278,6 +278,13 @@ class GraphSyncWorker:
                 ingest_origin=job_payload.ingest_origin,
                 confirmation_strategy=job_payload.confirmation_strategy,
                 memory_privacy_mode=job_payload.memory_privacy_mode,
+                privacy_enforcement=job_payload.privacy_enforcement,
+                authenticated_user_privilege_level=(
+                    job_payload.authenticated_user_privilege_level
+                ),
+                authenticated_user_is_atagia_master=(
+                    job_payload.authenticated_user_is_atagia_master
+                ),
             )
             await self._projector.project(
                 role=job_payload.role,

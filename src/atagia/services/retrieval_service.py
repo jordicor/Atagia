@@ -22,6 +22,10 @@ from atagia.services.chat_support import (
     resolve_policy,
 )
 from atagia.services.errors import ConversationNotFoundError
+from atagia.services.prompt_authority import (
+    PromptAuthorityContext,
+    normalize_request_authority_context,
+)
 from atagia.services.retrieval_pipeline import RetrievalPipeline
 
 
@@ -39,6 +43,10 @@ class RetrievalService:
         mode: str | None = None,
         operational_profile: ResolvedOperationalProfile | None = None,
         ablation: AblationConfig | None = None,
+        prompt_authority_context: PromptAuthorityContext | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
         stored_messages: list[dict[str, Any]] | None = None,
         trace: RetrievalTrace | None = None,
     ) -> PipelineResult:
@@ -53,6 +61,10 @@ class RetrievalService:
                 mode=mode,
                 operational_profile=operational_profile,
                 ablation=ablation,
+                prompt_authority_context=prompt_authority_context,
+                privacy_enforcement=privacy_enforcement,
+                authenticated_user_privilege_level=authenticated_user_privilege_level,
+                authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
                 stored_messages=stored_messages,
                 trace=trace,
             )
@@ -69,6 +81,10 @@ class RetrievalService:
         mode: str | None = None,
         operational_profile: ResolvedOperationalProfile | None = None,
         ablation: AblationConfig | None = None,
+        prompt_authority_context: PromptAuthorityContext | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
         conversation: dict[str, Any] | None = None,
         stored_messages: list[dict[str, Any]] | None = None,
         trace: RetrievalTrace | None = None,
@@ -81,6 +97,10 @@ class RetrievalService:
             mode=mode,
             operational_profile=operational_profile,
             ablation=ablation,
+            prompt_authority_context=prompt_authority_context,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
             conversation=conversation,
             stored_messages=stored_messages,
             trace=trace,
@@ -96,6 +116,10 @@ class RetrievalService:
         mode: str | None = None,
         operational_profile: ResolvedOperationalProfile | None = None,
         ablation: AblationConfig | None = None,
+        prompt_authority_context: PromptAuthorityContext | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
         conversation: dict[str, Any] | None = None,
         stored_messages: list[dict[str, Any]] | None = None,
         trace: RetrievalTrace | None = None,
@@ -109,6 +133,22 @@ class RetrievalService:
         if active_conversation is None:
             raise ConversationNotFoundError("Conversation not found for user")
         memory_preferences = await users.get_memory_preferences(user_id)
+        authority_context = prompt_authority_context or normalize_request_authority_context(
+            privacy_enforcement=(
+                ablation.privacy_enforcement
+                if ablation is not None
+                else privacy_enforcement
+            ),
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+            user_id=user_id,
+            purpose="retrieval",
+        )
+        retrieval_ablation = (
+            ablation
+            if ablation is not None
+            else AblationConfig(privacy_enforcement=authority_context.effective_privacy_enforcement)
+        )
 
         assistant_mode_id = resolve_retrieval_profile_id(
             str(active_conversation["assistant_mode_id"]),
@@ -198,6 +238,11 @@ class RetrievalService:
             remember_across_chats=bool(memory_preferences["remember_across_chats"]),
             remember_across_devices=bool(memory_preferences["remember_across_devices"]),
             memory_privacy_mode=memory_preferences["memory_privacy_mode"],
+            privacy_enforcement=authority_context.effective_privacy_enforcement,
+            authenticated_user_privilege_level=authority_context.normalized_privilege_level,
+            authenticated_user_is_atagia_master=(
+                authority_context.authenticated_user_is_atagia_master
+            ),
         )
         cold_start = (
             await memories.count_for_context(
@@ -236,7 +281,7 @@ class RetrievalService:
             conversation_context=conversation_context,
             resolved_policy=resolved_policy,
             cold_start=cold_start,
-            ablation=ablation,
+            ablation=retrieval_ablation,
             conversation_messages=transcript,
             trace=trace,
         )

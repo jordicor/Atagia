@@ -8,9 +8,11 @@ from dataclasses import dataclass
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, Literal
 
 from atagia import Atagia
+from atagia.core.env import env_bool as _env_bool
+from atagia.core.initial_context_package_repository import InitialContextPackageRepository
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
@@ -96,8 +98,12 @@ class AtagiaContext:
     platform_id: str
     user_persona_id: str | None = None
     character_id: str | None = None
+    active_presence_id: str | None = None
+    mind_id: str | None = None
+    mind_topology: str | None = None
     embodiment_id: str | None = None
     realm_id: str | None = None
+    space_id: str | None = None
     conversation_id: str | None = None
     incognito: bool = False
 
@@ -110,8 +116,12 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[AtagiaContext]:
     platform_id = _required_env_text("ATAGIA_PLATFORM_ID")
     user_persona_id = _optional_env_text("ATAGIA_USER_PERSONA_ID")
     character_id = _optional_env_text("ATAGIA_CHARACTER_ID")
+    active_presence_id = _optional_env_text("ATAGIA_ACTIVE_PRESENCE_ID")
+    mind_id = _optional_env_text("ATAGIA_MIND_ID")
+    mind_topology = _optional_env_text("ATAGIA_MIND_TOPOLOGY")
     embodiment_id = _optional_env_text("ATAGIA_EMBODIMENT_ID")
     realm_id = _optional_env_text("ATAGIA_REALM_ID")
+    space_id = _optional_env_text("ATAGIA_SPACE_ID")
     conversation_id = _optional_env_text("ATAGIA_CONVERSATION_ID")
     incognito = _env_bool("ATAGIA_INCOGNITO", default=False)
     await engine.setup()
@@ -122,8 +132,12 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[AtagiaContext]:
             platform_id=platform_id,
             user_persona_id=user_persona_id,
             character_id=character_id,
+            active_presence_id=active_presence_id,
+            mind_id=mind_id,
+            mind_topology=mind_topology,
             embodiment_id=embodiment_id,
             realm_id=realm_id,
+            space_id=space_id,
             conversation_id=conversation_id,
             incognito=incognito,
         )
@@ -154,18 +168,6 @@ def _optional_env_text(name: str) -> str | None:
     if value is None or not value.strip():
         return None
     return value.strip()
-
-
-def _env_bool(name: str, *, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None or not value.strip():
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise RuntimeError(f"{name} must be a boolean value")
 
 
 async def _runtime(engine: Atagia):
@@ -265,8 +267,12 @@ async def _ensure_conversation_id(
     mode: str | None = None,
     user_persona_id: str | None = None,
     character_id: str | None = None,
+    active_presence_id: str | None = None,
+    mind_id: str | None = None,
+    mind_topology: str | None = None,
     embodiment_id: str | None = None,
     realm_id: str | None = None,
+    space_id: str | None = None,
     incognito: bool = False,
 ) -> str:
     """Create or reuse a conversation and return its identifier."""
@@ -283,8 +289,12 @@ async def _ensure_conversation_id(
         platform_id=platform_id,
         user_persona_id=user_persona_id,
         character_id=character_id,
+        active_presence_id=active_presence_id,
+        mind_id=mind_id,
+        mind_topology=mind_topology,
         embodiment_id=embodiment_id,
         realm_id=realm_id,
+        space_id=space_id,
         mode=mode,
         incognito=incognito,
     )
@@ -302,9 +312,14 @@ async def _get_context_impl(
     operational_signals: dict[str, Any] | None = None,
     user_persona_id: str | None = None,
     character_id: str | None = None,
+    active_presence_id: str | None = None,
+    mind_id: str | None = None,
+    mind_topology: str | None = None,
     embodiment_id: str | None = None,
     realm_id: str | None = None,
+    space_id: str | None = None,
     incognito: bool = False,
+    response_mode: Literal["normal", "fast", "smart_fast"] | None = None,
 ) -> str:
     """Retrieve relevant memories for a message as a JSON string."""
     resolved_conversation_id = await _ensure_conversation_id(
@@ -316,8 +331,12 @@ async def _get_context_impl(
         mode=mode,
         user_persona_id=user_persona_id,
         character_id=character_id,
+        active_presence_id=active_presence_id,
+        mind_id=mind_id,
+        mind_topology=mind_topology,
         embodiment_id=embodiment_id,
         realm_id=realm_id,
+        space_id=space_id,
         incognito=incognito,
     )
     context = await engine.get_context(
@@ -330,10 +349,15 @@ async def _get_context_impl(
         user_persona_id=user_persona_id,
         platform_id=platform_id,
         character_id=character_id,
+        active_presence_id=active_presence_id,
+        mind_id=mind_id,
+        mind_topology=mind_topology,
         embodiment_id=embodiment_id,
         realm_id=realm_id,
+        space_id=space_id,
         incognito=incognito,
         ablation=AblationConfig(disable_context_cache=True),
+        response_mode=response_mode,
     )
     return json.dumps(
         {
@@ -352,10 +376,12 @@ async def _get_context_impl(
                 else context.recent_transcript_trace.model_dump(mode="json")
             ),
             "assistant_guidance": context.assistant_guidance,
+            "initial_context_package": context.initial_context_package,
             "memories": [memory.model_dump(mode="json") for memory in context.memories],
             "contract": context.contract,
             "detected_needs": context.detected_needs,
             "stage_timings": context.stage_timings,
+            "response_mode": context.response_mode,
             "memory_processing": (
                 None
                 if context.memory_processing is None
@@ -378,8 +404,12 @@ async def _add_memory_impl(
     operational_signals: dict[str, Any] | None = None,
     user_persona_id: str | None = None,
     character_id: str | None = None,
+    active_presence_id: str | None = None,
+    mind_id: str | None = None,
+    mind_topology: str | None = None,
     embodiment_id: str | None = None,
     realm_id: str | None = None,
+    space_id: str | None = None,
     incognito: bool = False,
 ) -> str:
     """Store a user message and enqueue extraction jobs."""
@@ -391,8 +421,12 @@ async def _add_memory_impl(
         default_conversation_id=default_conversation_id,
         user_persona_id=user_persona_id,
         character_id=character_id,
+        active_presence_id=active_presence_id,
+        mind_id=mind_id,
+        mind_topology=mind_topology,
         embodiment_id=embodiment_id,
         realm_id=realm_id,
+        space_id=space_id,
         incognito=incognito,
     )
     runtime = await _runtime(engine)
@@ -417,6 +451,7 @@ async def _add_memory_impl(
                 connection,
                 runtime.clock,
                 conversation=conversation,
+                active_presence_id=active_presence_id,
                 character_id=character_id,
             )
             source_presence = await resolve_source_presence_for_role(
@@ -516,6 +551,13 @@ async def _add_memory_impl(
                 worker_control_service=WorkerControlService(
                     tracking_connection,
                     runtime.clock,
+                ),
+                initial_context_package_repository=InitialContextPackageRepository(
+                    tracking_connection,
+                    runtime.clock,
+                ),
+                initial_context_package_refresh_enabled=(
+                    runtime.settings.initial_context_package_refresh_enabled
                 ),
             )
         finally:
@@ -1127,7 +1169,14 @@ async def atagia_get_context(
     mode: str | None = None,
     operational_profile: str | None = None,
     operational_signals: dict[str, Any] | None = None,
+    active_presence_id: str | None = None,
+    mind_id: str | None = None,
+    mind_topology: str | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
+    space_id: str | None = None,
     incognito: bool = False,
+    response_mode: Literal["normal", "fast", "smart_fast"] | None = None,
     ctx: Context[ServerSession, AtagiaContext] | None = None,
 ) -> str:
     """Retrieve relevant memories for a message. Returns enriched context."""
@@ -1146,9 +1195,22 @@ async def atagia_get_context(
             operational_signals=operational_signals,
             user_persona_id=ctx.request_context.lifespan_context.user_persona_id,
             character_id=ctx.request_context.lifespan_context.character_id,
-            embodiment_id=ctx.request_context.lifespan_context.embodiment_id,
-            realm_id=ctx.request_context.lifespan_context.realm_id,
+            active_presence_id=(
+                active_presence_id
+                or ctx.request_context.lifespan_context.active_presence_id
+            ),
+            mind_id=mind_id or ctx.request_context.lifespan_context.mind_id,
+            mind_topology=(
+                mind_topology
+                or ctx.request_context.lifespan_context.mind_topology
+            ),
+            embodiment_id=(
+                embodiment_id or ctx.request_context.lifespan_context.embodiment_id
+            ),
+            realm_id=realm_id or ctx.request_context.lifespan_context.realm_id,
+            space_id=space_id or ctx.request_context.lifespan_context.space_id,
             incognito=incognito or ctx.request_context.lifespan_context.incognito,
+            response_mode=response_mode,
         )
     except _EXPECTED_TOOL_ERRORS as exc:
         return _tool_error(exc)
@@ -1160,6 +1222,12 @@ async def atagia_add_memory(
     conversation_id: str | None = None,
     operational_profile: str | None = None,
     operational_signals: dict[str, Any] | None = None,
+    active_presence_id: str | None = None,
+    mind_id: str | None = None,
+    mind_topology: str | None = None,
+    embodiment_id: str | None = None,
+    realm_id: str | None = None,
+    space_id: str | None = None,
     incognito: bool = False,
     ctx: Context[ServerSession, AtagiaContext] | None = None,
 ) -> str:
@@ -1178,8 +1246,20 @@ async def atagia_add_memory(
             operational_signals=operational_signals,
             user_persona_id=ctx.request_context.lifespan_context.user_persona_id,
             character_id=ctx.request_context.lifespan_context.character_id,
-            embodiment_id=ctx.request_context.lifespan_context.embodiment_id,
-            realm_id=ctx.request_context.lifespan_context.realm_id,
+            active_presence_id=(
+                active_presence_id
+                or ctx.request_context.lifespan_context.active_presence_id
+            ),
+            mind_id=mind_id or ctx.request_context.lifespan_context.mind_id,
+            mind_topology=(
+                mind_topology
+                or ctx.request_context.lifespan_context.mind_topology
+            ),
+            embodiment_id=(
+                embodiment_id or ctx.request_context.lifespan_context.embodiment_id
+            ),
+            realm_id=realm_id or ctx.request_context.lifespan_context.realm_id,
+            space_id=space_id or ctx.request_context.lifespan_context.space_id,
             incognito=incognito or ctx.request_context.lifespan_context.incognito,
         )
     except _EXPECTED_TOOL_ERRORS as exc:

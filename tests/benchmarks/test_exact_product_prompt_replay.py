@@ -96,4 +96,4 @@ def test_load_locomo_summary_cases_marks_reconstructed_prompt(tmp_path: Path) ->
     assert cases[0].product_prompt_exact is False
     assert cases[0].product_prompt_source == "reconstructed_from_selected_summaries"
     assert "Jon attended a fair." in cases[0].memory_block
-    assert "Trusted benchmark evaluation mode is active" in cases[0].product_system_prompt
+    assert "Trusted local evaluation context is active" in cases[0].product_system_prompt

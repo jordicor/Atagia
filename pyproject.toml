@@ -48,6 +48,7 @@ embeddings = [
 atagia-api = "atagia.cli:main"
 atagia-mcp = "atagia.mcp_server:main"
 atagia-embeddings-backfill = "atagia.embedding_backfill_cli:main"
+atagia-content-language-backfill = "atagia.content_language_backfill_cli:main"
 atagia-artifact-payload-migrate = "atagia.artifact_payload_migrate_cli:main"
 
 [tool.setuptools]

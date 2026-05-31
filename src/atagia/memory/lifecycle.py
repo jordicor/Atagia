@@ -81,8 +81,10 @@ class MemoryLifecycleManager:
         result = LifecycleCycleResult()
         self._affected_user_ids = set()
 
-        await self._connection.execute("BEGIN")
+        transaction_started = False
         try:
+            await self._connection.execute("BEGIN IMMEDIATE")
+            transaction_started = True
             decayed_refs = await self._decay_vitality(decay_cutoff, timestamp)
             result.decayed_count = len(decayed_refs)
             declined_refs = await self._decline_expired_pending_confirmations(pending_cutoff, timestamp)
@@ -126,7 +128,8 @@ class MemoryLifecycleManager:
             return result
         except BaseException:
             self._affected_user_ids = set()
-            await self._connection.rollback()
+            if transaction_started:
+                await self._connection.rollback()
             raise
 
     async def _decay_vitality(self, decay_cutoff: str, timestamp: str) -> list[_LifecycleMemoryRef]:

@@ -11,8 +11,6 @@ memory.
 - `plugin/` is the copyable JS plugin bundle.
 - `atagia_adapter.py` is a Python facade over `SidecarBridge` for Python-hosted
   experiments or future wrappers.
-- `LOCAL_SMOKE_RUNBOOK.md` records the current local OpenClaw install,
-  OpenAI Codex auth state, and the planned live smoke procedure.
 
 ## Plugin Hooks
 
@@ -42,4 +40,5 @@ transcripts shaped as `messages`, `transcript`, or `sessionFile.messages`.
 - Atagia down/API error leaves OpenClaw generation working.
 - `before_compaction` or `session_end` can backfill a transcript rerunnably.
 
-For the current local test plan, start with `LOCAL_SMOKE_RUNBOOK.md`.
+Run the checklist above against a local OpenClaw install with the Atagia
+service running as a sidecar.

@@ -1,4 +1,4 @@
-"""Tests for the LLMClient `max_output_tokens` threshold policy.
+"""Tests for the LLMClient `max_output_tokens` floor policy.
 
 The policy is enforced once at the entry point of `LLMClient.complete`, so
 both direct `complete` calls and `complete_structured` (which delegates to
@@ -55,34 +55,34 @@ def _request(max_output_tokens: int | None) -> LLMCompletionRequest:
 
 
 @pytest.mark.asyncio
-async def test_llm_client_complete_applies_threshold() -> None:
+async def test_llm_client_complete_applies_floor() -> None:
     provider = RecordingProvider()
     client = LLMClient(provider_name="stub", providers=[provider])
 
     await client.complete(_request(max_output_tokens=256))
 
     assert len(provider.requests) == 1
-    assert provider.requests[0].max_output_tokens is None
+    assert provider.requests[0].max_output_tokens == 8192
 
 
 @pytest.mark.asyncio
-async def test_llm_client_complete_drops_value_at_floor() -> None:
+async def test_llm_client_complete_raises_legacy_floor_value() -> None:
     provider = RecordingProvider()
     client = LLMClient(provider_name="stub", providers=[provider])
 
     await client.complete(_request(max_output_tokens=512))
 
-    assert provider.requests[0].max_output_tokens is None
+    assert provider.requests[0].max_output_tokens == 8192
 
 
 @pytest.mark.asyncio
-async def test_llm_client_complete_passes_high_value_through() -> None:
+async def test_llm_client_complete_raises_intermediate_value_to_floor() -> None:
     provider = RecordingProvider()
     client = LLMClient(provider_name="stub", providers=[provider])
 
     await client.complete(_request(max_output_tokens=2048))
 
-    assert provider.requests[0].max_output_tokens == 2048
+    assert provider.requests[0].max_output_tokens == 8192
 
 
 @pytest.mark.asyncio
@@ -96,7 +96,7 @@ async def test_llm_client_complete_passes_none_through() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_client_complete_structured_applies_threshold() -> None:
+async def test_llm_client_complete_structured_applies_floor() -> None:
     provider = RecordingProvider(payload='{"label":"ok","score":7}')
     client = LLMClient(provider_name="stub", providers=[provider])
 
@@ -112,11 +112,11 @@ async def test_llm_client_complete_structured_applies_threshold() -> None:
     )
 
     assert len(provider.requests) == 1
-    assert provider.requests[0].max_output_tokens is None
+    assert provider.requests[0].max_output_tokens == 8192
 
 
 @pytest.mark.asyncio
-async def test_llm_client_complete_structured_passes_high_value_through() -> None:
+async def test_llm_client_complete_structured_raises_intermediate_value_to_floor() -> None:
     provider = RecordingProvider(payload='{"label":"ok","score":7}')
     client = LLMClient(provider_name="stub", providers=[provider])
 
@@ -131,11 +131,11 @@ async def test_llm_client_complete_structured_passes_high_value_through() -> Non
         StructuredPayload,
     )
 
-    assert provider.requests[0].max_output_tokens == 2048
+    assert provider.requests[0].max_output_tokens == 8192
 
 
 @pytest.mark.asyncio
-async def test_llm_client_stream_applies_threshold() -> None:
+async def test_llm_client_stream_applies_floor() -> None:
     """`stream()` must enforce the same sub-floor policy as `complete()`."""
     provider = RecordingProvider()
     client = LLMClient(provider_name="stub", providers=[provider])
@@ -144,14 +144,14 @@ async def test_llm_client_stream_applies_threshold() -> None:
 
     assert events  # provider yields at least one event so the path actually ran
     assert len(provider.requests) == 1
-    assert provider.requests[0].max_output_tokens is None
+    assert provider.requests[0].max_output_tokens == 8192
 
 
 @pytest.mark.asyncio
-async def test_llm_client_stream_passes_high_value_through() -> None:
+async def test_llm_client_stream_raises_intermediate_value_to_floor() -> None:
     provider = RecordingProvider()
     client = LLMClient(provider_name="stub", providers=[provider])
 
     [event async for event in client.stream(_request(max_output_tokens=2048))]
 
-    assert provider.requests[0].max_output_tokens == 2048
+    assert provider.requests[0].max_output_tokens == 8192

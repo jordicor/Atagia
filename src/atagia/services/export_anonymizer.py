@@ -188,7 +188,6 @@ class ExportAnonymizer:
             )
         request = LLMCompletionRequest(
             model=self._model,
-            temperature=0.0,
             max_output_tokens=EXPORT_ANONYMIZER_REWRITE_MAX_OUTPUT_TOKENS,
             messages=[
                 LLMMessage(
@@ -220,7 +219,6 @@ class ExportAnonymizer:
         projected_transcript = self._render_projection_transcript(selected_projection)
         request = LLMCompletionRequest(
             model=self._model,
-            temperature=0.0,
             max_output_tokens=EXPORT_ANONYMIZER_VERIFICATION_MAX_OUTPUT_TOKENS,
             messages=[
                 LLMMessage(

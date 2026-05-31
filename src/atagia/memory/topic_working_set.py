@@ -235,7 +235,6 @@ class TopicWorkingSetUpdater:
                 ),
                 LLMMessage(role="user", content=prompt),
             ],
-            temperature=0.0,
             max_output_tokens=TOPIC_WORKING_SET_MAX_OUTPUT_TOKENS,
             response_schema=TopicWorkingSetPlan.model_json_schema(),
             metadata={

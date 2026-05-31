@@ -221,6 +221,34 @@ def test_admin_worker_control_modes_are_persisted(tmp_path: Path) -> None:
         assert drain_payload["drain_completed"] is False
 
 
+def test_admin_can_inspect_and_reset_llm_run_guard(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    headers = {"Authorization": "Bearer admin-key"}
+    with TestClient(app) as client:
+        guard = client.app.state.runtime.llm_client.llm_run_guard
+        assert guard is not None
+        guard.record_failure(
+            call_type="completion",
+            purpose="extractor",
+            request_model="openai/test-model",
+            latency_ms=12.0,
+            error_type="TransientLLMError",
+        )
+
+        snapshot_response = client.get("/v1/admin/llm-run-guard", headers=headers)
+        assert snapshot_response.status_code == 200
+        snapshot = snapshot_response.json()
+        assert snapshot["enabled"] is True
+        assert snapshot["failed_calls"] == 1
+        assert snapshot["by_purpose"]["extractor"]["failed_calls"] == 1
+
+        reset_response = client.post("/v1/admin/llm-run-guard/reset", headers=headers)
+        assert reset_response.status_code == 200
+        reset_snapshot = reset_response.json()
+        assert reset_snapshot["total_calls"] == 0
+        assert reset_snapshot["failed_calls"] == 0
+
+
 def test_admin_can_list_and_archive_review_required_memory(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     headers = {"Authorization": "Bearer admin-key"}

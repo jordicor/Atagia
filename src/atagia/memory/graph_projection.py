@@ -46,6 +46,11 @@ from atagia.services.llm_client import (
     known_intimacy_context_metadata,
 )
 from atagia.services.model_resolution import resolve_component_model
+from atagia.services.prompt_authority import (
+    process_authority_context,
+    prompt_authority_metadata,
+    render_process_metadata_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +337,13 @@ class GraphProjector:
         source_memory_ids: list[str],
         chunk: GraphProjectionSourceChunk,
     ) -> GraphProjectionResult:
+        authority_context = process_authority_context(
+            privacy_enforcement=context.privacy_enforcement,
+            user_id=context.user_id,
+            privilege_level=context.authenticated_user_privilege_level,
+            is_atagia_master=context.authenticated_user_is_atagia_master,
+            purpose="graph_projection",
+        )
         prompt = await self._build_prompt(
             message_text=message_text,
             role=role,
@@ -347,7 +359,6 @@ class GraphProjector:
                 LLMMessage(role="system", content="Project source-backed entity and relationship graph rows as JSON."),
                 LLMMessage(role="user", content=prompt),
             ],
-            temperature=0.0,
             max_output_tokens=GRAPH_PROJECTION_MAX_OUTPUT_TOKENS,
             response_schema=GraphProjectionResult.model_json_schema(),
             metadata={
@@ -358,6 +369,10 @@ class GraphProjector:
                 "chunk_index": chunk.chunk_index,
                 "chunk_count": chunk.chunk_count,
                 "purpose": "graph_projection",
+                **prompt_authority_metadata(
+                    authority_context,
+                    prompt_authority_kind="process_metadata",
+                ),
                 **(
                     known_intimacy_context_metadata(
                         reason="resolved_policy_allows_intimacy_context"
@@ -486,24 +501,41 @@ class GraphProjector:
         message_timestamp_block = ""
         if occurred_at is not None:
             message_timestamp_block = f"<message_timestamp>{html.escape(occurred_at)}</message_timestamp>\n"
-        return GRAPH_PROJECTION_PROMPT_TEMPLATE.format(
-            role=html.escape(role),
-            message_timestamp_block=message_timestamp_block,
-            message_text=html.escape(message_text),
-            recent_context=recent_context,
-            source_memories=html.escape(json_utils.dumps(source_memories, sort_keys=True)),
-            known_entities=html.escape(
-                json_utils.dumps(
-                    {
-                        "chunk_index": chunk.chunk_index,
-                        "chunk_count": chunk.chunk_count,
-                        "entities": known_entities,
-                    },
-                    sort_keys=True,
-                )
-            ),
-            policy_json=html.escape(resolved_policy.model_dump_json()),
-            active_threshold=GRAPH_ACTIVE_CONFIDENCE_THRESHOLD,
+        authority_context = process_authority_context(
+            privacy_enforcement=context.privacy_enforcement,
+            user_id=context.user_id,
+            privilege_level=context.authenticated_user_privilege_level,
+            is_atagia_master=context.authenticated_user_is_atagia_master,
+            purpose="graph_projection",
+        )
+        return "\n\n".join(
+            (
+                render_process_metadata_block(
+                    authority_context,
+                    prompt_family="graph_projection",
+                ),
+                GRAPH_PROJECTION_PROMPT_TEMPLATE.format(
+                    role=html.escape(role),
+                    message_timestamp_block=message_timestamp_block,
+                    message_text=html.escape(message_text),
+                    recent_context=recent_context,
+                    source_memories=html.escape(
+                        json_utils.dumps(source_memories, sort_keys=True)
+                    ),
+                    known_entities=html.escape(
+                        json_utils.dumps(
+                            {
+                                "chunk_index": chunk.chunk_index,
+                                "chunk_count": chunk.chunk_count,
+                                "entities": known_entities,
+                            },
+                            sort_keys=True,
+                        )
+                    ),
+                    policy_json=html.escape(resolved_policy.model_dump_json()),
+                    active_threshold=GRAPH_ACTIVE_CONFIDENCE_THRESHOLD,
+                ),
+            )
         )
 
     @staticmethod

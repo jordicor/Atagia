@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import html
 import logging
+import math
 from pathlib import Path
 from time import time_ns
 from typing import Any
@@ -43,6 +45,12 @@ from atagia.services.llm_client import (
     known_intimacy_context_metadata,
 )
 from atagia.services.model_resolution import resolve_component_model
+from atagia.services.prompt_authority import (
+    PromptAuthorityContext,
+    process_authority_context,
+    prompt_authority_metadata,
+    render_process_metadata_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +85,18 @@ _STALE_EPHEMERAL_PENALTY = 0.08
 _MISSING_EPHEMERAL_START_PENALTY = 0.03
 _EXACT_VERBATIM_TERM_COVERAGE_THRESHOLD = 0.75
 _EXACT_VERBATIM_TERM_COVERAGE_BOOST = 0.20
+_MAX_APPLICABILITY_CANDIDATES_PER_BATCH = 32
+_APPLICABILITY_GATE_TRACE_KEY = "_applicability_gate"
+_DETERMINISTIC_APPLICABILITY_SCORE = 1.0
+# Shadow disagreement means an eligible deterministic skip would have hidden a
+# middling-or-worse LLM score; keep this high while the gate is still calibrated.
+_SHADOW_DISAGREEMENT_THRESHOLD = 0.75
+# Harmful disagreement is the stricter audit signal: the deterministic gate
+# would have skipped a candidate the LLM scored below the useful-support floor.
+_SHADOW_HARMFUL_DISAGREEMENT_THRESHOLD = 0.5
+# Provisional and intentionally over-broad until shadow traces calibrate the
+# adjacent RRF delta distribution; over-broad close ties skip less in enforced mode.
+_CLOSE_TIE_RRF_DELTA = 0.02
 
 APPLICABILITY_PROMPT_TEMPLATE = """You are scoring memory applicability for an assistant memory engine.
 
@@ -101,11 +121,23 @@ IMPORTANT:
 - If the candidate does not contain a resolvable relative temporal expression,
   return null.
 - Do not invent a date when the anchor is missing or ambiguous.
+- Retrieval query type tells you how to interpret usefulness.
+- For `broad_list`, score a candidate as useful when it contributes at least
+  one concrete member, event, or source quote that belongs in the requested
+  list. It does not need to contain the complete list.
+- Use semantic entailment, not only exact word overlap. If a concrete event
+  clearly satisfies the requested facet, do not require the candidate to repeat
+  the user's wording.
+- In exact recall mode, source-backed concrete facts that answer a requested
+  facet should outrank broad background and generic related memories.
 
 Assistant mode: {assistant_mode_id}
 Detected needs: {detected_needs}
 Allowed scopes: {allowed_scopes}
 Privacy ceiling: {privacy_ceiling}
+Retrieval query type: {query_type}
+Exact recall mode: {exact_recall_mode}
+Exact facets: {exact_facets}
 
 <source_message role="{role}">
 <user_message>
@@ -147,6 +179,12 @@ class _ApplicabilityScores(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     scores: list[_ApplicabilityScoreItem] = Field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _ApplicabilityGateDecision:
+    eligible: bool
+    reason: str
 
 
 class ApplicabilityScorer:
@@ -200,54 +238,117 @@ class ApplicabilityScorer:
         detected_needs: list[DetectedNeed],
         retrieval_plan: RetrievalPlan | None = None,
         trace: RetrievalTrace | None = None,
+        applicability_gate_mode: str | None = None,
     ) -> list[ScoredCandidate]:
         context = ExtractionConversationContext.model_validate(conversation_context)
         if not candidates:
             return []
-        llm_scores = await self._score_with_llm(
-            candidates,
-            message_text=message_text,
-            role="user",
-            conversation_context=context,
-            resolved_policy=resolved_policy,
-            detected_needs=detected_needs,
-            trace=trace,
+        gate_mode = self._resolve_applicability_gate_mode(applicability_gate_mode)
+        gate_decisions = (
+            self._applicability_gate_decisions(
+                candidates,
+                conversation_context=context,
+                resolved_policy=resolved_policy,
+                detected_needs=detected_needs,
+                retrieval_plan=retrieval_plan,
+            )
+            if gate_mode != "off"
+            else {}
+        )
+        if gate_mode != "off":
+            self._annotate_applicability_gate(
+                candidates,
+                gate_mode=gate_mode,
+                gate_decisions=gate_decisions,
+            )
+        facet_base_ids = self._fact_facet_base_ids(candidates)
+        llm_candidates = candidates
+        if gate_mode == "enforced":
+            llm_candidates = [
+                candidate
+                for candidate in candidates
+                if not gate_decisions.get(str(candidate["id"]), _ApplicabilityGateDecision(False, "not_checked")).eligible
+            ]
+            for candidate in candidates:
+                decision = gate_decisions.get(str(candidate["id"]))
+                if decision is not None and decision.eligible:
+                    self._update_applicability_gate_metadata(
+                        candidate,
+                        llm_skipped=True,
+                    )
+        if facet_base_ids:
+            llm_candidates = [
+                candidate
+                for candidate in llm_candidates
+                if str(candidate["id"]) not in facet_base_ids
+            ]
+        if gate_mode != "off":
+            self._update_applicability_gate_request_metadata(
+                candidates,
+                gate_mode=gate_mode,
+                llm_candidate_count=len(llm_candidates),
+            )
+        llm_scores = (
+            await self._score_with_llm(
+                llm_candidates,
+                message_text=message_text,
+                role="user",
+                conversation_context=context,
+                resolved_policy=resolved_policy,
+                detected_needs=detected_needs,
+                retrieval_plan=retrieval_plan,
+                trace=trace,
+            )
+            if llm_candidates
+            else {}
         )
         scored: list[ScoredCandidate] = []
         for candidate in candidates:
             memory_id = str(candidate["id"])
-            llm_score = llm_scores.get(memory_id)
+            gate_decision = gate_decisions.get(memory_id)
+            if (
+                gate_mode == "enforced"
+                and gate_decision is not None
+                and gate_decision.eligible
+            ):
+                llm_score = _ApplicabilityScore(
+                    llm_applicability=_DETERMINISTIC_APPLICABILITY_SCORE,
+                    resolved_date=None,
+                )
+            else:
+                llm_score = llm_scores.get(memory_id)
+                if llm_score is None:
+                    base_memory_id = facet_base_ids.get(memory_id)
+                    if base_memory_id is not None:
+                        llm_score = llm_scores.get(base_memory_id)
+                        base_gate_decision = gate_decisions.get(base_memory_id)
+                        if (
+                            llm_score is None
+                            and gate_mode == "enforced"
+                            and base_gate_decision is not None
+                            and base_gate_decision.eligible
+                        ):
+                            llm_score = _ApplicabilityScore(
+                                llm_applicability=(
+                                    _DETERMINISTIC_APPLICABILITY_SCORE
+                                ),
+                                resolved_date=None,
+                            )
             if llm_score is None:
                 continue
-            llm_applicability = llm_score.llm_applicability
-            retrieval_score = self._retrieval_score(candidate.get("rrf_score"))
-            vitality_boost = self._vitality_boost(candidate)
-            confirmation_boost = self._confirmation_boost(candidate)
-            need_boost = self._need_boost(candidate, detected_needs, resolved_policy.privacy_ceiling)
-            exact_recall_boost = self._exact_recall_boost(candidate, retrieval_plan)
-            penalty = self._penalty(candidate, retrieval_plan)
-            final_score = (
-                (llm_applicability * 0.65)
-                + (retrieval_score * 0.15)
-                + (vitality_boost * 0.10)
-                + (confirmation_boost * 0.10)
-                + need_boost
-                + exact_recall_boost
-                - penalty
-            )
-            final_score = max(0.0, min(1.0, final_score))
+            if gate_mode == "shadow" and gate_decision is not None:
+                self._annotate_shadow_gate_result(
+                    candidate,
+                    gate_decision=gate_decision,
+                    llm_score=llm_score,
+                )
             scored.append(
-                ScoredCandidate(
-                    memory_id=memory_id,
-                    memory_object=dict(candidate),
-                    llm_applicability=llm_applicability,
-                    retrieval_score=retrieval_score,
-                    vitality_boost=vitality_boost,
-                    confirmation_boost=confirmation_boost,
-                    need_boost=need_boost,
-                    penalty=penalty,
-                    final_score=final_score,
-                    resolved_date=llm_score.resolved_date,
+                self._build_scored_candidate(
+                    candidate,
+                    llm_score=llm_score,
+                    detected_needs=detected_needs,
+                    resolved_policy=resolved_policy,
+                    retrieval_plan=retrieval_plan,
                 )
             )
 
@@ -321,6 +422,431 @@ class ApplicabilityScorer:
         remainder = [candidate for candidate in preferred_ordered if candidate_key(candidate) not in preserved_keys]
         return preserved + remainder
 
+    def _build_scored_candidate(
+        self,
+        candidate: dict[str, Any],
+        *,
+        llm_score: _ApplicabilityScore,
+        detected_needs: list[DetectedNeed],
+        resolved_policy: ResolvedRetrievalPolicy,
+        retrieval_plan: RetrievalPlan | None,
+    ) -> ScoredCandidate:
+        llm_applicability = llm_score.llm_applicability
+        retrieval_score = self._retrieval_score(candidate.get("rrf_score"))
+        vitality_boost = self._vitality_boost(candidate)
+        confirmation_boost = self._confirmation_boost(candidate)
+        need_boost = self._need_boost(
+            candidate,
+            detected_needs,
+            resolved_policy.privacy_ceiling,
+        )
+        exact_recall_boost = self._exact_recall_boost(candidate, retrieval_plan)
+        penalty = self._penalty(candidate, retrieval_plan)
+        final_score = (
+            (llm_applicability * 0.65)
+            + (retrieval_score * 0.15)
+            + (vitality_boost * 0.10)
+            + (confirmation_boost * 0.10)
+            + need_boost
+            + exact_recall_boost
+            - penalty
+        )
+        final_score = max(0.0, min(1.0, final_score))
+        return ScoredCandidate(
+            memory_id=str(candidate["id"]),
+            memory_object=dict(candidate),
+            llm_applicability=llm_applicability,
+            retrieval_score=retrieval_score,
+            vitality_boost=vitality_boost,
+            confirmation_boost=confirmation_boost,
+            need_boost=need_boost,
+            penalty=penalty,
+            final_score=final_score,
+            resolved_date=llm_score.resolved_date,
+        )
+
+    def _resolve_applicability_gate_mode(self, mode: str | None) -> str:
+        value = (mode or self._settings.applicability_gate_mode or "off").strip().lower()
+        if value not in {"off", "shadow", "enforced"}:
+            raise ValueError(f"Invalid applicability gate mode: {value!r}")
+        return value
+
+    def _applicability_gate_decisions(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        conversation_context: ExtractionConversationContext,
+        resolved_policy: ResolvedRetrievalPolicy,
+        detected_needs: list[DetectedNeed],
+        retrieval_plan: RetrievalPlan | None,
+    ) -> dict[str, _ApplicabilityGateDecision]:
+        close_tie_ids = self._close_tie_candidate_ids(candidates)
+        # This is the pre-gate ordered slice that fits the policy render budget.
+        # Later composition can still reject/truncate, so do not treat it as a
+        # final rendering guarantee.
+        pre_gate_survival_slice_ids = {
+            str(candidate["id"])
+            for candidate in candidates[: resolved_policy.retrieval_params.final_context_items]
+        }
+        return {
+            str(candidate["id"]): self._applicability_gate_decision(
+                candidate,
+                conversation_context=conversation_context,
+                resolved_policy=resolved_policy,
+                detected_needs=detected_needs,
+                retrieval_plan=retrieval_plan,
+                close_tie_ids=close_tie_ids,
+                pre_gate_survival_slice_ids=pre_gate_survival_slice_ids,
+            )
+            for candidate in candidates
+        }
+
+    def _applicability_gate_decision(
+        self,
+        candidate: dict[str, Any],
+        *,
+        conversation_context: ExtractionConversationContext,
+        resolved_policy: ResolvedRetrievalPolicy,
+        detected_needs: list[DetectedNeed],
+        retrieval_plan: RetrievalPlan | None,
+        close_tie_ids: set[str],
+        pre_gate_survival_slice_ids: set[str],
+    ) -> _ApplicabilityGateDecision:
+        candidate_id = str(candidate["id"])
+        if str(candidate.get("user_id") or "") != conversation_context.user_id:
+            return _ApplicabilityGateDecision(False, "missing_user_scope")
+        if retrieval_plan is None:
+            return _ApplicabilityGateDecision(False, "missing_retrieval_plan")
+        if retrieval_plan.raw_context_access_mode != "normal":
+            return _ApplicabilityGateDecision(False, "raw_context_request")
+        if retrieval_plan.answer_shape == "open_domain":
+            return _ApplicabilityGateDecision(False, "unclear_answer_shape")
+        if retrieval_plan.source_precision != "required":
+            return _ApplicabilityGateDecision(False, "source_not_required")
+        policy_reason = self.candidate_filter_reason(
+            candidate,
+            resolved_policy,
+            detected_needs,
+            retrieval_plan=retrieval_plan,
+        )
+        if policy_reason is not None:
+            return _ApplicabilityGateDecision(False, "policy_ambiguity")
+        if not self._has_direct_source_support(candidate):
+            return _ApplicabilityGateDecision(False, "missing_direct_source_support")
+        if self._is_summary_only_candidate(candidate):
+            return _ApplicabilityGateDecision(False, "summary_only")
+        if not self._has_clear_subject_facet_or_exact_span(candidate, retrieval_plan):
+            return _ApplicabilityGateDecision(False, "unclear_subject_facet_or_span")
+        if self._has_unresolved_conflict(candidate):
+            return _ApplicabilityGateDecision(False, "unresolved_conflict")
+        if self._has_ambiguous_supersession(candidate):
+            return _ApplicabilityGateDecision(False, "ambiguous_supersession")
+        if self._has_temporal_ambiguity(candidate, retrieval_plan):
+            return _ApplicabilityGateDecision(False, "temporal_ambiguity")
+        if candidate_id in close_tie_ids:
+            return _ApplicabilityGateDecision(False, "close_tie")
+        if candidate_id not in pre_gate_survival_slice_ids:
+            return _ApplicabilityGateDecision(False, "outside_pre_gate_survival_slice")
+        return _ApplicabilityGateDecision(True, "eligible_source_backed_exact")
+
+    @classmethod
+    def _annotate_applicability_gate(
+        cls,
+        candidates: list[dict[str, Any]],
+        *,
+        gate_mode: str,
+        gate_decisions: dict[str, _ApplicabilityGateDecision],
+    ) -> None:
+        for candidate in candidates:
+            decision = gate_decisions.get(str(candidate["id"]))
+            if decision is None:
+                continue
+            candidate[_APPLICABILITY_GATE_TRACE_KEY] = {
+                "mode": gate_mode,
+                "eligible": decision.eligible,
+                "reason": decision.reason if decision.eligible else "",
+                "ineligible_reason": "" if decision.eligible else decision.reason,
+                "llm_skipped": False,
+                "estimated_calls_saved": 0,
+                "adjacent_rrf_delta_distribution": {},
+                "shadow_disagreement": False,
+                "shadow_harmful_disagreement": False,
+            }
+
+    @classmethod
+    def _update_applicability_gate_metadata(
+        cls,
+        candidate: dict[str, Any],
+        *,
+        llm_skipped: bool,
+    ) -> None:
+        metadata = candidate.get(_APPLICABILITY_GATE_TRACE_KEY)
+        if not isinstance(metadata, dict):
+            return
+        metadata["llm_skipped"] = llm_skipped
+
+    @classmethod
+    def _update_applicability_gate_request_metadata(
+        cls,
+        candidates: list[dict[str, Any]],
+        *,
+        gate_mode: str,
+        llm_candidate_count: int,
+    ) -> None:
+        estimated_calls_saved = cls._estimated_calls_saved(
+            gate_mode=gate_mode,
+            total_candidate_count=len(candidates),
+            llm_candidate_count=llm_candidate_count,
+        )
+        delta_distribution = cls._adjacent_rrf_delta_distribution(candidates)
+        first_metadata = True
+        for candidate in candidates:
+            metadata = candidate.get(_APPLICABILITY_GATE_TRACE_KEY)
+            if not isinstance(metadata, dict):
+                continue
+            if first_metadata:
+                metadata["estimated_calls_saved"] = estimated_calls_saved
+                metadata["adjacent_rrf_delta_distribution"] = delta_distribution
+                first_metadata = False
+            else:
+                metadata["estimated_calls_saved"] = 0
+                metadata["adjacent_rrf_delta_distribution"] = {}
+
+    @staticmethod
+    def _estimated_calls_saved(
+        *,
+        gate_mode: str,
+        total_candidate_count: int,
+        llm_candidate_count: int,
+    ) -> int:
+        if gate_mode != "enforced":
+            return 0
+        before = math.ceil(total_candidate_count / _MAX_APPLICABILITY_CANDIDATES_PER_BATCH)
+        after = math.ceil(llm_candidate_count / _MAX_APPLICABILITY_CANDIDATES_PER_BATCH)
+        return max(0, before - after)
+
+    @classmethod
+    def _annotate_shadow_gate_result(
+        cls,
+        candidate: dict[str, Any],
+        *,
+        gate_decision: _ApplicabilityGateDecision,
+        llm_score: _ApplicabilityScore,
+    ) -> None:
+        if not gate_decision.eligible:
+            return
+        metadata = candidate.get(_APPLICABILITY_GATE_TRACE_KEY)
+        if not isinstance(metadata, dict):
+            return
+        llm_applicability = float(llm_score.llm_applicability)
+        metadata["shadow_disagreement"] = (
+            llm_applicability < _SHADOW_DISAGREEMENT_THRESHOLD
+        )
+        metadata["shadow_harmful_disagreement"] = (
+            llm_applicability < _SHADOW_HARMFUL_DISAGREEMENT_THRESHOLD
+        )
+
+    @classmethod
+    def _close_tie_candidate_ids(cls, candidates: list[dict[str, Any]]) -> set[str]:
+        ordered = sorted(
+            ((str(candidate["id"]), cls._retrieval_score(candidate.get("rrf_score"))) for candidate in candidates),
+            key=lambda item: (-item[1], item[0]),
+        )
+        close_tie_ids: set[str] = set()
+        for index, (candidate_id, score) in enumerate(ordered):
+            neighbors: list[float] = []
+            if index > 0:
+                neighbors.append(ordered[index - 1][1])
+            if index + 1 < len(ordered):
+                neighbors.append(ordered[index + 1][1])
+            if any(abs(score - neighbor) <= _CLOSE_TIE_RRF_DELTA for neighbor in neighbors):
+                close_tie_ids.add(candidate_id)
+        return close_tie_ids
+
+    @classmethod
+    def _adjacent_rrf_delta_distribution(
+        cls,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, float]:
+        ordered_scores = sorted(
+            (cls._retrieval_score(candidate.get("rrf_score")) for candidate in candidates),
+            reverse=True,
+        )
+        deltas = sorted(
+            abs(left - right)
+            for left, right in zip(ordered_scores, ordered_scores[1:], strict=False)
+        )
+        if not deltas:
+            return {"count": 0.0, "p10": 0.0, "p50": 0.0, "p90": 0.0}
+        return {
+            "count": float(len(deltas)),
+            "p10": cls._nearest_rank_percentile(deltas, 0.10),
+            "p50": cls._nearest_rank_percentile(deltas, 0.50),
+            "p90": cls._nearest_rank_percentile(deltas, 0.90),
+        }
+
+    @staticmethod
+    def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
+        index = max(0, min(len(values) - 1, math.ceil(percentile * len(values)) - 1))
+        return float(values[index])
+
+    @classmethod
+    def _has_direct_source_support(cls, candidate: dict[str, Any]) -> bool:
+        if (
+            candidate.get("is_fact_facet_candidate")
+            or candidate.get("is_verbatim_pin")
+            or candidate.get("is_artifact_chunk")
+            or candidate.get("is_verbatim_evidence_window")
+        ):
+            return cls._has_source_span(candidate)
+        for packet in cls._evidence_packets(candidate):
+            support_kind = str(packet.get("support_kind") or "")
+            if support_kind not in {"direct", "contextual_direct"}:
+                continue
+            spans = packet.get("spans")
+            if isinstance(spans, list) and any(isinstance(span, dict) for span in spans):
+                return True
+        return False
+
+    @classmethod
+    def _has_source_span(cls, candidate: dict[str, Any]) -> bool:
+        for packet in cls._evidence_packets(candidate):
+            spans = packet.get("spans")
+            if not isinstance(spans, list):
+                continue
+            for span in spans:
+                if not isinstance(span, dict):
+                    continue
+                if span.get("id") or span.get("message_id") or span.get("quote_text"):
+                    return True
+        payload = candidate.get("payload_json")
+        if isinstance(payload, dict):
+            source_span_ids = payload.get("source_span_ids")
+            source_message_ids = payload.get("source_message_ids")
+            if source_span_ids or source_message_ids:
+                return True
+        return False
+
+    @staticmethod
+    def _evidence_packets(candidate: dict[str, Any]) -> list[dict[str, Any]]:
+        packets = candidate.get("evidence_packets")
+        if not isinstance(packets, list):
+            return []
+        return [packet for packet in packets if isinstance(packet, dict)]
+
+    @staticmethod
+    def _is_summary_only_candidate(candidate: dict[str, Any]) -> bool:
+        """Applicability-stage classifier for summary candidates needing source support."""
+        return str(candidate.get("object_type") or "") == MemoryObjectType.SUMMARY_VIEW.value
+
+    @classmethod
+    def _has_clear_subject_facet_or_exact_span(
+        cls,
+        candidate: dict[str, Any],
+        retrieval_plan: RetrievalPlan,
+    ) -> bool:
+        fact_payload = cls._fact_facet_payload(candidate)
+        if fact_payload is not None:
+            return bool(
+                str(fact_payload.get("facet_label") or "").strip()
+                and str(fact_payload.get("value_text") or "").strip()
+                and str(fact_payload.get("source_span_id") or "").strip()
+            )
+        return retrieval_plan.exact_recall_mode and cls._has_source_span(candidate)
+
+    @staticmethod
+    def _fact_facet_payload(candidate: dict[str, Any]) -> dict[str, Any] | None:
+        payload = candidate.get("payload_json")
+        if not isinstance(payload, dict):
+            return None
+        fact_payload = payload.get("fact_facet")
+        return fact_payload if isinstance(fact_payload, dict) else None
+
+    @classmethod
+    def _fact_facet_base_ids(
+        cls,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        candidate_ids = {
+            str(candidate.get("id"))
+            for candidate in candidates
+            if str(candidate.get("id") or "").strip()
+        }
+        base_ids: dict[str, str] = {}
+        for candidate in candidates:
+            candidate_id = str(candidate.get("id") or "").strip()
+            if not candidate_id or not bool(candidate.get("is_fact_facet_candidate")):
+                continue
+            base_id = cls._fact_facet_base_memory_id(candidate)
+            if base_id and base_id != candidate_id and base_id in candidate_ids:
+                base_ids[candidate_id] = base_id
+        return base_ids
+
+    @staticmethod
+    def _fact_facet_base_memory_id(candidate: dict[str, Any]) -> str | None:
+        direct_id = str(candidate.get("fact_facet_memory_id") or "").strip()
+        if direct_id:
+            return direct_id
+        payload = candidate.get("payload_json")
+        if not isinstance(payload, dict):
+            return None
+        source_memory_ids = payload.get("source_memory_ids")
+        if isinstance(source_memory_ids, list):
+            for source_memory_id in source_memory_ids:
+                normalized = str(source_memory_id or "").strip()
+                if normalized:
+                    return normalized
+        return None
+
+    @staticmethod
+    def _has_unresolved_conflict(candidate: dict[str, Any]) -> bool:
+        return float(candidate.get("tension_score") or 0.0) > 0.0
+
+    @staticmethod
+    def _has_ambiguous_supersession(candidate: dict[str, Any]) -> bool:
+        return str(candidate.get("status") or "") != MemoryStatus.ACTIVE.value
+
+    @classmethod
+    def _has_temporal_ambiguity(
+        cls,
+        candidate: dict[str, Any],
+        retrieval_plan: RetrievalPlan,
+    ) -> bool:
+        if retrieval_plan.answer_shape != "temporal" and retrieval_plan.coverage_mode not in {
+            "chronology",
+            "current_state",
+        }:
+            return False
+        fact_payload = cls._fact_facet_payload(candidate)
+        if retrieval_plan.coverage_mode == "current_state":
+            return fact_payload is None or not bool(fact_payload.get("current_state"))
+        temporal_fields = (
+            "observed_at",
+            "valid_from",
+            "valid_to",
+            "temporal_anchor_at",
+            "resolved_interval_start",
+            "resolved_interval_end",
+        )
+        if fact_payload is not None and any(fact_payload.get(field) for field in temporal_fields):
+            return False
+        if any(candidate.get(field) for field in ("valid_from", "valid_to")):
+            return False
+        payload = candidate.get("payload_json")
+        if isinstance(payload, dict) and (
+            payload.get("source_window_start_occurred_at")
+            or payload.get("source_window_end_occurred_at")
+        ):
+            return False
+        for packet in cls._evidence_packets(candidate):
+            spans = packet.get("spans")
+            if not isinstance(spans, list):
+                continue
+            for span in spans:
+                if isinstance(span, dict) and span.get("occurred_at"):
+                    return False
+        return str(candidate.get("temporal_type") or "unknown") == "unknown"
+
     def candidate_filter_reason(
         self,
         candidate: dict[str, Any],
@@ -388,6 +914,7 @@ class ApplicabilityScorer:
         conversation_context: ExtractionConversationContext,
         resolved_policy: ResolvedRetrievalPolicy,
         detected_needs: list[DetectedNeed],
+        retrieval_plan: RetrievalPlan | None = None,
         trace: RetrievalTrace | None = None,
     ) -> dict[str, _ApplicabilityScore]:
         by_id = await self._score_with_llm_resilient(
@@ -397,6 +924,7 @@ class ApplicabilityScorer:
             conversation_context=conversation_context,
             resolved_policy=resolved_policy,
             detected_needs=detected_needs,
+            retrieval_plan=retrieval_plan,
             trace=trace,
         )
         missing = self._missing_score_ids(candidates, by_id)
@@ -410,6 +938,7 @@ class ApplicabilityScorer:
                 conversation_context=conversation_context,
                 resolved_policy=resolved_policy,
                 detected_needs=detected_needs,
+                retrieval_plan=retrieval_plan,
                 trace=trace,
             )
             by_id.update(retry_scores)
@@ -458,10 +987,34 @@ class ApplicabilityScorer:
         conversation_context: ExtractionConversationContext,
         resolved_policy: ResolvedRetrievalPolicy,
         detected_needs: list[DetectedNeed],
+        retrieval_plan: RetrievalPlan | None = None,
         trace: RetrievalTrace | None = None,
     ) -> dict[str, _ApplicabilityScore]:
         if not candidates:
             return {}
+        if len(candidates) > _MAX_APPLICABILITY_CANDIDATES_PER_BATCH:
+            by_id: dict[str, _ApplicabilityScore] = {}
+            for start in range(
+                0,
+                len(candidates),
+                _MAX_APPLICABILITY_CANDIDATES_PER_BATCH,
+            ):
+                batch = candidates[
+                    start : start + _MAX_APPLICABILITY_CANDIDATES_PER_BATCH
+                ]
+                by_id.update(
+                    await self._score_with_llm_resilient(
+                        batch,
+                        message_text=message_text,
+                        role=role,
+                        conversation_context=conversation_context,
+                        resolved_policy=resolved_policy,
+                        detected_needs=detected_needs,
+                        retrieval_plan=retrieval_plan,
+                        trace=trace,
+                    )
+                )
+            return by_id
         try:
             return await self._score_with_llm_once(
                 candidates,
@@ -470,6 +1023,7 @@ class ApplicabilityScorer:
                 conversation_context=conversation_context,
                 resolved_policy=resolved_policy,
                 detected_needs=detected_needs,
+                retrieval_plan=retrieval_plan,
                 trace=trace,
             )
         except OutputLimitExceededError as exc:
@@ -550,6 +1104,7 @@ class ApplicabilityScorer:
                         conversation_context=conversation_context,
                         resolved_policy=resolved_policy,
                         detected_needs=detected_needs,
+                        retrieval_plan=retrieval_plan,
                         trace=trace,
                     )
                 )
@@ -564,8 +1119,14 @@ class ApplicabilityScorer:
         conversation_context: ExtractionConversationContext,
         resolved_policy: ResolvedRetrievalPolicy,
         detected_needs: list[DetectedNeed],
+        retrieval_plan: RetrievalPlan | None = None,
         trace: RetrievalTrace | None = None,
     ) -> dict[str, _ApplicabilityScore]:
+        authority_context = _authority_context_from_context_and_plan(
+            conversation_context,
+            retrieval_plan=retrieval_plan,
+            purpose="applicability_scoring",
+        )
         prompt = self._build_prompt(
             candidates,
             message_text=message_text,
@@ -573,17 +1134,18 @@ class ApplicabilityScorer:
             conversation_context=conversation_context,
             resolved_policy=resolved_policy,
             detected_needs=detected_needs,
+            retrieval_plan=retrieval_plan,
+            prompt_authority_context=authority_context,
         )
         request = LLMCompletionRequest(
             model=self._scoring_model,
             messages=[
                 LLMMessage(
                     role="system",
-                    content="Score candidate memory applicability as grounded JSON only.",
+                    content="Score candidate memory applicability as JSON only.",
                 ),
                 LLMMessage(role="user", content=prompt),
             ],
-            temperature=0.0,
             max_output_tokens=APPLICABILITY_SCORER_MAX_OUTPUT_TOKENS,
             response_schema=self._applicability_scores_schema(candidates),
             metadata={
@@ -591,6 +1153,10 @@ class ApplicabilityScorer:
                 "conversation_id": conversation_context.conversation_id,
                 "assistant_mode_id": conversation_context.assistant_mode_id,
                 "purpose": "applicability_scoring",
+                **prompt_authority_metadata(
+                    authority_context,
+                    prompt_authority_kind="process_metadata",
+                ),
                 **self._intimacy_metadata_for_candidates(candidates),
             },
         )
@@ -927,6 +1493,8 @@ class ApplicabilityScorer:
         conversation_context: ExtractionConversationContext,
         resolved_policy: ResolvedRetrievalPolicy,
         detected_needs: list[DetectedNeed],
+        retrieval_plan: RetrievalPlan | None,
+        prompt_authority_context: PromptAuthorityContext,
     ) -> str:
         escaped_message_text = html.escape(message_text)
         escaped_role = html.escape(role)
@@ -943,15 +1511,36 @@ class ApplicabilityScorer:
         )
         detected_needs_text = ", ".join(need.need_type.value for need in detected_needs) or "none"
         allowed_scopes_text = ", ".join(scope.value for scope in resolved_policy.allowed_scopes)
-        return APPLICABILITY_PROMPT_TEMPLATE.format(
-            assistant_mode_id=html.escape(conversation_context.assistant_mode_id),
-            detected_needs=detected_needs_text,
-            allowed_scopes=allowed_scopes_text,
-            privacy_ceiling=resolved_policy.privacy_ceiling,
-            role=escaped_role,
-            message_text=escaped_message_text,
-            recent_context=escaped_recent_context,
-            candidates_xml=candidates_xml,
+        query_type = str(getattr(retrieval_plan, "query_type", "") or "default")
+        exact_recall_mode = bool(
+            getattr(retrieval_plan, "exact_recall_mode", False)
+        )
+        exact_facets = ", ".join(
+            str(getattr(facet, "value", facet))
+            for facet in getattr(retrieval_plan, "exact_facets", []) or []
+        ) or "none"
+        return "\n\n".join(
+            (
+                render_process_metadata_block(
+                    prompt_authority_context,
+                    prompt_family="applicability_scoring",
+                ),
+                APPLICABILITY_PROMPT_TEMPLATE.format(
+                    assistant_mode_id=html.escape(
+                        conversation_context.assistant_mode_id
+                    ),
+                    detected_needs=detected_needs_text,
+                    allowed_scopes=allowed_scopes_text,
+                    privacy_ceiling=resolved_policy.privacy_ceiling,
+                    query_type=html.escape(query_type),
+                    exact_recall_mode=str(exact_recall_mode).lower(),
+                    exact_facets=html.escape(exact_facets),
+                    role=escaped_role,
+                    message_text=escaped_message_text,
+                    recent_context=escaped_recent_context,
+                    candidates_xml=candidates_xml,
+                ),
+            )
         )
 
     @staticmethod
@@ -1304,3 +1893,27 @@ class ApplicabilityScorer:
             reason="candidate_intimacy_boundary",
             boundary=strongest.value,
         )
+
+
+def _authority_context_from_context_and_plan(
+    context: ExtractionConversationContext,
+    *,
+    retrieval_plan: RetrievalPlan | None,
+    purpose: str,
+) -> PromptAuthorityContext:
+    privacy_enforcement = (
+        retrieval_plan.privacy_enforcement
+        if retrieval_plan is not None
+        else context.privacy_enforcement
+    )
+    is_master = context.authenticated_user_is_atagia_master or privacy_enforcement == "off"
+    return process_authority_context(
+        privacy_enforcement=privacy_enforcement,
+        user_id=context.user_id,
+        privilege_level=(
+            context.authenticated_user_privilege_level
+            or ("atagia_master" if is_master else None)
+        ),
+        is_atagia_master=is_master,
+        purpose=purpose,
+    )

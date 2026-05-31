@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import re
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from benchmarks.base import BenchmarkQuestion, BenchmarkReport, ConversationReport, QuestionResult, ScoreResult
 from benchmarks.locomo.__main__ import (
+    _benchmark_ablation,
     _build_parser,
     _format_benchmark_db_list,
     _format_benchmark_db_list_json,
@@ -21,6 +24,7 @@ from benchmarks.locomo.__main__ import (
     _format_run_log_summary,
     _format_run_log_summary_json,
 )
+from benchmarks.locomo import benchmark as locomo_benchmark_module
 from benchmarks.locomo.benchmark import LoCoMoBenchmark
 from atagia import Atagia
 from atagia.core.repositories import MessageRepository
@@ -36,6 +40,7 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.model_resolution import COMPONENTS_BY_ID, resolve_component_model
+from tests.extraction_payload_support import rich_extraction_payload_to_lean
 
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
@@ -111,7 +116,7 @@ class BenchmarkProvider(LLMProvider):
                     "mode_guess": None,
                     "nothing_durable": False,
                 }
-            return self._response(request, json.dumps(payload))
+            return self._response(request, json.dumps(rich_extraction_payload_to_lean(payload)))
         if purpose == "contract_projection":
             return self._response(
                 request,
@@ -177,14 +182,49 @@ class BenchmarkProvider(LLMProvider):
                     }
                 ),
             )
-        if purpose == "benchmark_answer_generation":
-            question = str(request.metadata.get("question"))
+        if purpose == "topic_working_set_update":
+            return self._response(
+                request,
+                json.dumps({"actions": [], "nothing_to_update": True}),
+            )
+        if purpose == "user_language_profile_update":
+            return self._response(
+                request,
+                json.dumps(
+                    {
+                        "observed_user_languages": [],
+                        "explicit_language_preferences": [],
+                        "explicit_language_abilities": [],
+                        "contextual_norms": [],
+                        "external_content_language_codes": [],
+                    }
+                ),
+            )
+        if purpose == "chat_reply":
+            question = request.messages[-1].content
             answer_map = {
                 "What color notebooks does Alice keep?": "red notebooks",
                 "Where is Bob's mug stored?": "kitchen",
                 "What color is the studio lamp?": "yellow",
             }
             return self._response(request, answer_map.get(question, "unknown"))
+        if purpose == "answer_postcondition_verification":
+            return self._response(
+                request,
+                json.dumps(
+                    {
+                        "readable": True,
+                        "is_abstention": False,
+                        "contains_concrete_claims": True,
+                        "unsupported_concrete_claims": False,
+                        "covers_requested_facets": True,
+                        "requires_abstention": False,
+                        "pass_postcondition": True,
+                        "failure_reasons": [],
+                        "explanation": "Benchmark stub pass.",
+                    }
+                ),
+            )
         if purpose == "benchmark_judge":
             prompt = request.messages[1].content
             lines = {
@@ -247,7 +287,7 @@ class FailingSecondAnswerProvider(BenchmarkProvider):
         self.answer_generation_calls = 0
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        if request.metadata.get("purpose") == "benchmark_answer_generation":
+        if request.metadata.get("purpose") == "chat_reply":
             self.answer_generation_calls += 1
             if self.answer_generation_calls == 2:
                 raise RuntimeError("simulated benchmark interruption")
@@ -275,7 +315,7 @@ class JudgeFailingForOneQuestionProvider(BenchmarkProvider):
 
 
 class AnswerFailingForOneQuestionProvider(BenchmarkProvider):
-    """Provider whose benchmark answer call raises LLMError for one question."""
+    """Provider whose real chat answer call raises LLMError for one question."""
 
     def __init__(self, failing_question_text: str) -> None:
         super().__init__()
@@ -284,8 +324,8 @@ class AnswerFailingForOneQuestionProvider(BenchmarkProvider):
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         if (
-            request.metadata.get("purpose") == "benchmark_answer_generation"
-            and request.metadata.get("question") == self._failing_question_text
+            request.metadata.get("purpose") == "chat_reply"
+            and request.messages[-1].content == self._failing_question_text
         ):
             self.answer_failures += 1
             raise LLMError("Answer provider overloaded")
@@ -508,10 +548,7 @@ def test_locomo_cli_accepts_answer_model_and_component_overrides() -> None:
             "openrouter/google/gemini-3.1-flash-lite,minimal",
             "--component-model",
             "extractor=openai/gpt-4o-mini",
-            "--answer-prompt-variant",
-            "grounded_connect",
-            "--answer-max-output-tokens",
-            "32768",
+            "--answer-postcondition-guard",
         ]
     )
 
@@ -520,8 +557,112 @@ def test_locomo_cli_accepts_answer_model_and_component_overrides() -> None:
     assert args.ingest_model == "openrouter/google/gemini-3.1-flash-lite,none"
     assert args.retrieval_model == "openrouter/google/gemini-3.1-flash-lite,minimal"
     assert args.component_model == ["extractor=openai/gpt-4o-mini"]
-    assert args.answer_prompt_variant == "grounded_connect"
-    assert args.answer_max_output_tokens == 32768
+    assert args.answer_postcondition_guard is True
+    assert args.privacy_enforcement == "off"
+
+
+def test_locomo_cli_privacy_enforcement_defaults_to_off() -> None:
+    ablation = _benchmark_ablation(None, None)
+
+    assert ablation == AblationConfig(privacy_enforcement="off")
+
+
+def test_locomo_cli_accepts_reuse_db_dir_and_flush_controls() -> None:
+    args = _build_parser().parse_args(
+        [
+            "--data-path",
+            "benchmarks/data/locomo10.json",
+            "--provider",
+            "openai",
+            "--answer-model",
+            "openai/chat-latest",
+            "--reuse-db-dir",
+            "docs/tmp/benchmark_dbs/full-locomo",
+            "--resume-checkpoint",
+            "--adaptive-parallel-questions",
+            "--parallel-conversations",
+            "10",
+            "--parallel-questions",
+            "3",
+            "--adaptive-parallel-min",
+            "2",
+            "--adaptive-parallel-retries",
+            "2",
+            "--stage-sleep-seconds",
+            "300",
+            "--ingest-mode",
+            "online_async",
+        ]
+    )
+
+    assert args.reuse_db_dir == "docs/tmp/benchmark_dbs/full-locomo"
+    assert args.parallel_conversations == 10
+    assert args.parallel_questions == 3
+    assert args.resume_checkpoint is True
+    assert args.adaptive_parallel_questions is True
+    assert args.adaptive_parallel_min == 2
+    assert args.adaptive_parallel_retries == 2
+    assert args.stage_sleep_seconds == 300
+    assert args.ingest_mode == "online_async"
+    assert args.flush_every_turns is None
+
+    resume_args = _build_parser().parse_args(
+        [
+            "--data-path",
+            "benchmarks/data/locomo10.json",
+            "--provider",
+            "openai",
+            "--answer-model",
+            "openai/chat-latest",
+            "--resume-db-dir",
+            "docs/tmp/benchmark_dbs/full-locomo",
+        ]
+    )
+
+    assert resume_args.resume_db_dir == "docs/tmp/benchmark_dbs/full-locomo"
+
+    batch_args = _build_parser().parse_args(
+        [
+            "--data-path",
+            "benchmarks/data/locomo10.json",
+            "--provider",
+            "openai",
+            "--answer-model",
+            "openai/chat-latest",
+            "--flush-every-turns",
+            "25",
+        ]
+    )
+
+    assert batch_args.ingest_mode == "online"
+    assert batch_args.flush_every_turns == 25
+
+
+def test_locomo_cli_accepts_ingest_health_and_llm_guard_flags() -> None:
+    args = _build_parser().parse_args(
+        [
+            "--data-path",
+            "benchmarks/data/locomo10.json",
+            "--provider",
+            "openai",
+            "--answer-model",
+            "openai/chat-latest",
+            "--allow-untrusted",
+            "--no-require-evidence-packets",
+            "--llm-progress-every",
+            "25",
+            "--fail-on-llm-failure-ratio",
+            "0.2",
+            "--max-consecutive-failed-llm-calls-per-purpose",
+            "4",
+        ]
+    )
+
+    assert args.allow_untrusted is True
+    assert args.require_evidence_packets is False
+    assert args.llm_progress_every == 25
+    assert args.fail_on_llm_failure_ratio == pytest.approx(0.2)
+    assert args.max_consecutive_failed_llm_calls_per_purpose == 4
 
 
 @pytest.mark.asyncio
@@ -561,6 +702,19 @@ async def test_benchmark_single_conversation(
         conversation_report.results[0].trace["retrieval_trace"]["retrieval_sufficiency"]
         == conversation_report.results[0].trace["shadow_sufficiency_diagnostics"]
     )
+    critical_evidence = conversation_report.results[0].trace[
+        "critical_evidence_custody"
+    ]
+    assert critical_evidence["counts"]["critical_evidence_count"] == len(
+        conversation_report.results[0].trace["evidence_memory_ids"]
+    )
+    assert critical_evidence["items"][0]["survival_stage"] in {
+        "selected",
+        "composer",
+        "post_applicability_rerank",
+        "shortlist",
+        "absent_from_raw_candidates",
+    }
     assert "selected_memory_ids" in conversation_report.results[0].trace
     assert report.model_info["provider"] == "openai"
     assert report.model_info["answer_model"] == "openai/answer-model"
@@ -582,9 +736,83 @@ async def test_benchmark_single_conversation(
         1
         for request in provider.requests
         if request.metadata.get("purpose") == "memory_extraction"
-    ) == 6
+    ) == 12
     assert report.model_info["llm_call_summary"]["total_calls"] > 0
     assert report.conversations[0].results[0].trace["llm_calls"]
+
+
+def test_critical_evidence_custody_marks_survival_stage() -> None:
+    custody = LoCoMoBenchmark._critical_evidence_custody(
+        {
+            "mem_absent": {
+                "id": "mem_absent",
+                "object_type": "summary_view",
+                "scope": "chat",
+                "status": "active",
+                "privacy_level": 0,
+                "source_kind": "summarized",
+                "payload_json": json.dumps({"source_message_ids": ["msg_absent"]}),
+            },
+            "mem_dropped": {
+                "id": "mem_dropped",
+                "object_type": "evidence",
+                "scope": "chat",
+                "status": "active",
+                "privacy_level": 0,
+                "source_kind": "extracted",
+                "payload_json": {"source_message_ids": ["msg_dropped"]},
+            },
+            "mem_selected": {
+                "id": "mem_selected",
+                "object_type": "evidence",
+                "scope": "chat",
+                "status": "active",
+                "privacy_level": 0,
+                "source_kind": "extracted",
+                "payload_json": {"source_message_ids": ["msg_selected"]},
+            },
+        },
+        [
+            {
+                "candidate_id": "mem_dropped",
+                "candidate_kind": "evidence",
+                "channels": ["fts"],
+                "scored": True,
+                "selected": False,
+                "drop_stage": "composer",
+                "drop_reason": "not_selected_after_scoring",
+                "composer_decision": "not_selected_after_scoring",
+                "score_rank": 4,
+            },
+            {
+                "candidate_id": "mem_selected",
+                "candidate_kind": "evidence",
+                "channels": ["fts"],
+                "scored": True,
+                "selected": True,
+                "selection_rank": 1,
+                "score_rank": 1,
+            },
+        ],
+    )
+
+    assert custody["counts"] == {
+        "critical_evidence_count": 3,
+        "raw_candidate_count": 2,
+        "scored_count": 2,
+        "selected_count": 1,
+        "absent_count": 1,
+    }
+    assert custody["survival_stage_counts"] == {
+        "absent_from_raw_candidates": 1,
+        "composer": 1,
+        "selected": 1,
+    }
+    by_id = {item["memory_id"]: item for item in custody["items"]}
+    assert by_id["mem_absent"]["source_message_ids"] == ["msg_absent"]
+    assert by_id["mem_absent"]["survival_stage"] == "absent_from_raw_candidates"
+    assert by_id["mem_dropped"]["drop_reason"] == "not_selected_after_scoring"
+    assert by_id["mem_selected"]["selected"] is True
 
 
 @pytest.mark.asyncio
@@ -606,8 +834,6 @@ async def test_benchmark_routes_models_by_phase_and_component(
         retrieval_model="retrieval-model,none",
         chat_model_override="chat-model",
         component_models={"extractor": "extractor-model,minimal"},
-        answer_prompt_variant="grounded_connect",
-        answer_max_output_tokens=32768,
         manifests_dir=MANIFESTS_DIR,
     )
 
@@ -622,7 +848,7 @@ async def test_benchmark_routes_models_by_phase_and_component(
     assert models_by_purpose["contract_projection"] == {"openai/ingest-model,minimal"}
     assert models_by_purpose["need_detection"] == {"openai/retrieval-model,none"}
     assert models_by_purpose["applicability_scoring"] == {"openai/retrieval-model,none"}
-    assert models_by_purpose["benchmark_answer_generation"] == {"openai/answer-model,high"}
+    assert models_by_purpose["chat_reply"] == {"openai/answer-model,high"}
     assert models_by_purpose["benchmark_judge"] == {"openai/judge-model,medium"}
 
     assert report.model_info["answer_model"] == "openai/answer-model,high"
@@ -634,29 +860,23 @@ async def test_benchmark_routes_models_by_phase_and_component(
     assert report.model_info["component_models"] == {
         "extractor": "openai/extractor-model,minimal"
     }
-    assert report.model_info["answer_prompt_variant"] == "grounded_connect"
-    assert report.model_info["answer_max_output_tokens"] == 32768
-    answer_request = next(
+    assert report.model_info["real_chat_path"] is True
+    chat_request = next(
         request
         for request in provider.requests
-        if request.metadata.get("purpose") == "benchmark_answer_generation"
+        if request.metadata.get("purpose") == "chat_reply"
     )
-    assert "Benchmark answer variant" in answer_request.messages[0].content
-    assert answer_request.max_output_tokens == 32768
-    answer_generation = report.conversations[0].results[0].trace["answer_generation"]
-    assert answer_generation["model"] == "openai/answer-model,high"
-    assert answer_generation["thinking_level"] == "high"
-    assert answer_generation["max_output_tokens"] == 32768
-    assert answer_generation["system_prompt"] == answer_request.messages[0].content
-    assert "memory_block" in answer_generation["context"]
+    assert chat_request.metadata["purpose"] == "chat_reply"
+    assert report.conversations[0].results[0].trace["real_chat_path"] is True
+    assert "answer_generation" not in report.conversations[0].results[0].trace
     llm_calls = report.conversations[0].results[0].trace["llm_calls"]
     assert {call["purpose"] for call in llm_calls} >= {
         "need_detection",
         "applicability_scoring",
-        "benchmark_answer_generation",
+        "chat_reply",
         "benchmark_judge",
     }
-    assert report.model_info["llm_call_summary"]["by_purpose"]["memory_extraction"]["calls"] == 6
+    assert report.model_info["llm_call_summary"]["by_purpose"]["memory_extraction"]["calls"] == 8
 
 
 @pytest.mark.asyncio
@@ -667,30 +887,47 @@ async def test_benchmark_with_ablation(
     provider = BenchmarkProvider()
     observed_ablation: list[AblationConfig | None] = []
     _install_stub_client(monkeypatch, provider)
-    original_retrieve = RetrievalService.retrieve
+    original_retrieve = RetrievalService.retrieve_with_connection
 
     async def _capture_retrieve(
         self: RetrievalService,
+        connection: object,
+        *,
         user_id: str,
         conversation_id: str,
         message_text: str,
         mode: str | None = None,
+        operational_profile: object | None = None,
         ablation: AblationConfig | None = None,
+        prompt_authority_context: object | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
+        conversation: dict[str, object] | None = None,
+        stored_messages: list[dict[str, object]] | None = None,
         trace: object | None = None,
     ):
         if message_text == "What color notebooks does Alice keep?":
             observed_ablation.append(ablation)
         return await original_retrieve(
             self,
+            connection,
             user_id=user_id,
             conversation_id=conversation_id,
             message_text=message_text,
             mode=mode,
+            operational_profile=operational_profile,
             ablation=ablation,
+            prompt_authority_context=prompt_authority_context,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+            conversation=conversation,
+            stored_messages=stored_messages,
             trace=trace,
         )
 
-    monkeypatch.setattr(RetrievalService, "retrieve", _capture_retrieve)
+    monkeypatch.setattr(RetrievalService, "retrieve_with_connection", _capture_retrieve)
     benchmark = LoCoMoBenchmark(
         data_path=_write_dataset(tmp_path),
         llm_provider="openai",
@@ -708,12 +945,14 @@ async def test_benchmark_with_ablation(
 
     assert report.total_questions == 1
     assert report.ablation_config is not None
+    assert report.ablation_config["privacy_enforcement"] == "off"
     assert report.ablation_config["skip_applicability_scoring"] is True
     assert len(observed_ablation) == 1
     assert observed_ablation[0] is not None
+    assert observed_ablation[0].privacy_enforcement == "off"
     assert observed_ablation[0].skip_applicability_scoring is True
     assert any(
-        request.metadata.get("purpose") == "benchmark_answer_generation"
+        request.metadata.get("purpose") == "chat_reply"
         for request in provider.requests
     )
 
@@ -749,7 +988,7 @@ async def test_benchmark_max_questions_limits_validation_run(
         1
         for request in provider.requests
         if request.metadata.get("purpose") == "memory_extraction"
-    ) == 6
+    ) == 8
 
 
 @pytest.mark.asyncio
@@ -824,30 +1063,47 @@ async def test_score_question_labels_retrieval_error_without_cancelling_siblings
     failing_question_text = "What color notebooks does Alice keep?"
     provider = BenchmarkProvider()
     _install_stub_client(monkeypatch, provider)
-    original_retrieve = RetrievalService.retrieve
+    original_retrieve = RetrievalService.retrieve_with_connection
 
     async def _fail_one_retrieval(
         self: RetrievalService,
+        connection: object,
+        *,
         user_id: str,
         conversation_id: str,
         message_text: str,
         mode: str | None = None,
+        operational_profile: object | None = None,
         ablation: AblationConfig | None = None,
+        prompt_authority_context: object | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
+        conversation: dict[str, object] | None = None,
+        stored_messages: list[dict[str, object]] | None = None,
         trace: object | None = None,
     ):
         if message_text == failing_question_text:
             raise LLMError("Retrieval provider overloaded")
         return await original_retrieve(
             self,
+            connection,
             user_id=user_id,
             conversation_id=conversation_id,
             message_text=message_text,
             mode=mode,
+            operational_profile=operational_profile,
             ablation=ablation,
+            prompt_authority_context=prompt_authority_context,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+            conversation=conversation,
+            stored_messages=stored_messages,
             trace=trace,
         )
 
-    monkeypatch.setattr(RetrievalService, "retrieve", _fail_one_retrieval)
+    monkeypatch.setattr(RetrievalService, "retrieve_with_connection", _fail_one_retrieval)
     benchmark = LoCoMoBenchmark(
         data_path=_write_dataset(tmp_path),
         llm_provider="openai",
@@ -870,7 +1126,7 @@ async def test_score_question_labels_retrieval_error_without_cancelling_siblings
     assert failed.trace["failure_stage"] == "retrieval"
     assert failed.trace["diagnosis_bucket"] == "retrieval_failed"
     assert failed.trace["sufficiency_diagnostic"] == "retrieval_failed"
-    assert failed.trace["retrieval_failure"]["exception_class"] == "LLMError"
+    assert failed.trace["retrieval_failure"]["exception_class"] == "LLMUnavailableError"
     assert report.model_info["warning_counts"]["retrieval_failed"] == 1
     assert report.model_info["failure_stage_counts"] == {"retrieval": 1}
     surviving_results = [
@@ -883,7 +1139,7 @@ async def test_score_question_labels_retrieval_error_without_cancelling_siblings
 
 
 @pytest.mark.asyncio
-async def test_score_question_labels_answer_generation_error(
+async def test_score_question_labels_real_chat_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -908,14 +1164,14 @@ async def test_score_question_labels_answer_generation_error(
         if result.question.question_text == failing_question_text
     )
     assert failed.score_result.score == 0
-    assert "Answer generation failed" in failed.score_result.reasoning
-    assert failed.trace["failure_stage"] == "answer_generation"
-    assert failed.trace["diagnosis_bucket"] == "answer_generation_failed"
-    assert failed.trace["sufficiency_diagnostic"] == "answer_generation_failed"
-    assert failed.trace["answer_generation_failure"]["exception_class"] == "LLMError"
+    assert "Retrieval failed" in failed.score_result.reasoning
+    assert failed.trace["failure_stage"] == "retrieval"
+    assert failed.trace["diagnosis_bucket"] == "retrieval_failed"
+    assert failed.trace["sufficiency_diagnostic"] == "retrieval_failed"
+    assert failed.trace["retrieval_failure"]["exception_class"] == "LLMUnavailableError"
     assert "retrieval_trace" in failed.trace
-    assert report.model_info["warning_counts"]["answer_generation_failed"] == 1
-    assert report.model_info["failure_stage_counts"] == {"answer_generation": 1}
+    assert report.model_info["warning_counts"]["retrieval_failed"] == 1
+    assert report.model_info["failure_stage_counts"] == {"retrieval": 1}
 
 
 @pytest.mark.asyncio
@@ -1062,6 +1318,185 @@ async def test_benchmark_parallel_questions_preserve_order_and_checkpoint(
 
 
 @pytest.mark.asyncio
+async def test_benchmark_resume_checkpoint_skips_completed_questions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    checkpoint_path = tmp_path / "checkpoints" / "locomo-checkpoint.json"
+    data_path = _write_dataset(tmp_path)
+    benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    first_report = await benchmark.run(
+        checkpoint_path=checkpoint_path,
+        max_questions=1,
+    )
+
+    assert first_report.total_questions == 1
+
+    resume_provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, resume_provider)
+    resume_benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await resume_benchmark.run(
+        checkpoint_path=checkpoint_path,
+        resume_checkpoint=True,
+        max_questions=2,
+    )
+
+    assert report.total_questions == 2
+    assert [
+        result.question.question_id
+        for result in report.conversations[0].results
+    ] == ["conv-test-1:q1", "conv-test-1:q2"]
+    assert sum(
+        1
+        for request in resume_provider.requests
+        if request.metadata.get("purpose") == "need_detection"
+    ) == 1
+    checkpoint = BenchmarkReport.model_validate_json(checkpoint_path.read_text())
+    assert checkpoint.total_questions == 2
+    assert report.model_info["resume_checkpoint"] is True
+
+
+@pytest.mark.asyncio
+async def test_benchmark_stage_sleep_throttles_scored_questions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    sleep_calls: list[dict[str, object]] = []
+
+    async def fake_stage_sleep(
+        seconds: float,
+        *,
+        stage: str,
+        conversation_id: str | None = None,
+        question_id: str | None = None,
+    ) -> None:
+        sleep_calls.append(
+            {
+                "seconds": seconds,
+                "stage": stage,
+                "conversation_id": conversation_id,
+                "question_id": question_id,
+            }
+        )
+
+    monkeypatch.setattr(
+        locomo_benchmark_module.LoCoMoBenchmark,
+        "_stage_sleep",
+        staticmethod(fake_stage_sleep),
+    )
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await benchmark.run(stage_sleep_seconds=300)
+
+    assert [call["seconds"] for call in sleep_calls] == [300, 300, 300]
+    assert {call["stage"] for call in sleep_calls} == {"question_start"}
+    assert report.total_questions == 3
+    assert report.model_info["stage_sleep_seconds"] == 300
+
+
+@pytest.mark.asyncio
+async def test_benchmark_adaptive_parallel_questions_retries_rate_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failing_question_text = "What color notebooks does Alice keep?"
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    original_retrieve = RetrievalService.retrieve_with_connection
+    failures_remaining = 1
+
+    async def _fail_once_retrieval(
+        self: RetrievalService,
+        connection: object,
+        *,
+        user_id: str,
+        conversation_id: str,
+        message_text: str,
+        mode: str | None = None,
+        operational_profile: object | None = None,
+        ablation: AblationConfig | None = None,
+        prompt_authority_context: object | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
+        conversation: dict[str, object] | None = None,
+        stored_messages: list[dict[str, object]] | None = None,
+        trace: object | None = None,
+    ):
+        nonlocal failures_remaining
+        if message_text == failing_question_text and failures_remaining:
+            failures_remaining -= 1
+            raise LLMError("Provider rate limit HTTP 429")
+        return await original_retrieve(
+            self,
+            connection,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_text=message_text,
+            mode=mode,
+            operational_profile=operational_profile,
+            ablation=ablation,
+            prompt_authority_context=prompt_authority_context,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+            conversation=conversation,
+            stored_messages=stored_messages,
+            trace=trace,
+        )
+
+    monkeypatch.setattr(RetrievalService, "retrieve_with_connection", _fail_once_retrieval)
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await benchmark.run(
+        categories=[1],
+        max_questions=1,
+        parallel_questions=2,
+        adaptive_parallel_questions=True,
+    )
+
+    assert failures_remaining == 0
+    assert report.total_questions == 1
+    assert report.total_correct == 1
+    assert report.model_info["adaptive_parallel_questions"] is True
+    assert "failure_stage" not in report.conversations[0].results[0].trace
+
+
+@pytest.mark.asyncio
 async def test_benchmark_max_turns_limits_ingestion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1089,6 +1524,9 @@ async def test_benchmark_max_turns_limits_ingestion(
         platform_id: str | None = None,
         character_id: str | None = None,
         incognito: bool | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> None:
         ingested_messages.append((role, text, occurred_at))
         await original_ingest_message(
@@ -1108,6 +1546,9 @@ async def test_benchmark_max_turns_limits_ingestion(
             platform_id=platform_id,
             character_id=character_id,
             incognito=incognito,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
         )
 
     monkeypatch.setattr(Atagia, "ingest_message", _capture_ingest_message)
@@ -1162,10 +1603,14 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
     ) -> None:
         raise AssertionError("bulk ingest should persist messages without live enqueue")
 
-    async def _capture_flush(self: Atagia, timeout_seconds: float = 30.0) -> bool:
+    async def _capture_flush(
+        self: Atagia,
+        timeout_seconds: float = 30.0,
+        **kwargs: Any,
+    ) -> bool:
         nonlocal flush_calls
         flush_calls += 1
-        return await original_flush(self, timeout_seconds=timeout_seconds)
+        return await original_flush(self, timeout_seconds=timeout_seconds, **kwargs)
 
     monkeypatch.setattr(Atagia, "ingest_message", _fail_ingest_message)
     monkeypatch.setattr(Atagia, "flush", _capture_flush)
@@ -1183,6 +1628,7 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
         categories=[1],
         max_questions=1,
         benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
         keep_db=True,
         ingest_mode="bulk",
     )
@@ -1203,8 +1649,40 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
     assert metadata["user_persona_id"] is None
     assert metadata["character_id"] is None
     assert metadata["status"] == "complete"
+    assert metadata["trusted_ingest"] is True
+    assert metadata["ingest_health"]["trusted_ingest"] is True
+    assert (
+        metadata["ingest_health"]["db_audit"][
+            "memory_objects_with_source_message_ids_without_packets"
+        ]
+        == 0
+    )
+    assert (
+        metadata["ingest_health"]["db_audit"]["counts"]["memory_support_edges"]
+        > 0
+    )
+    assert (
+        metadata["ingest_health"]["db_audit"]["counts"]["memory_evidence_spans"]
+        > 0
+    )
     assert metadata["rebuild_result"]["processed_messages"] == 6
     assert "parallel_questions" not in metadata
+    with sqlite3.connect(retained_db) as connection:
+        connection.row_factory = sqlite3.Row
+        packet = connection.execute(
+            """
+            SELECT edge.support_kind, span.span_role, span.quote_text, span.message_id
+            FROM memory_support_edges AS edge
+            JOIN memory_evidence_spans AS span
+              ON span.support_edge_id = edge.id
+            WHERE span.span_role = 'source'
+              AND span.quote_text LIKE '%Alice keeps red notebooks%'
+            LIMIT 1
+            """
+        ).fetchone()
+    assert packet is not None
+    assert packet["support_kind"] in {"direct", "contextual_direct"}
+    assert packet["message_id"]
 
     eval_provider = BenchmarkProvider()
     _install_stub_client(monkeypatch, eval_provider)
@@ -1231,12 +1709,12 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
         1
         for request in eval_provider.requests
         if request.metadata.get("purpose") == "memory_extraction"
-    ) == 0
+    ) == 2
     assert sum(
         1
         for request in provider.requests
         if request.metadata.get("purpose") == "memory_extraction"
-    ) == 6
+    ) == 8
     assert any(
         request.metadata.get("purpose") == "summary_chunk_segmentation"
         for request in provider.requests
@@ -1264,6 +1742,194 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
 
 
 @pytest.mark.asyncio
+async def test_benchmark_bulk_resume_rebuilds_completed_db_missing_rebuild_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    data_path = _write_dataset(tmp_path)
+    db_dir = tmp_path / "benchmark-dbs"
+    benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    await benchmark.run(
+        conversation_ids=["conv-test-1"],
+        ingest_only=True,
+        benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
+        keep_db=True,
+        ingest_mode="bulk",
+    )
+    retained_db = next(db_dir.glob("*/benchmark.db"))
+    metadata_path = retained_db.parent / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["rebuild_result"] = None
+    metadata["ingest_health"] = {"trusted_ingest": True, "reasons": []}
+    metadata["status"] = "complete"
+    metadata["trusted_ingest"] = True
+    metadata["usable_for_evaluate_only"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    eval_benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+    with pytest.raises(ValueError, match="missing required rebuild_result"):
+        await eval_benchmark.run(
+            conversation_ids=["conv-test-1"],
+            categories=[1],
+            max_questions=1,
+            reuse_db=retained_db,
+        )
+
+    resume_provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, resume_provider)
+    resume_benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await resume_benchmark.run(
+        conversation_ids=["conv-test-1"],
+        ingest_only=True,
+        resume_db=retained_db,
+    )
+
+    assert report.total_questions == 0
+    repaired_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert repaired_metadata["status"] == "complete"
+    assert repaired_metadata["trusted_ingest"] is True
+    assert repaired_metadata["usable_for_evaluate_only"] is True
+    assert repaired_metadata["rebuild_result"]["status"] == "rebuilt"
+    assert repaired_metadata["rebuild_result"]["processed_messages"] == 6
+    assert any(
+        request.metadata.get("purpose") == "memory_extraction"
+        for request in resume_provider.requests
+    )
+    assert any(
+        request.metadata.get("purpose") == "summary_chunk_segmentation"
+        for request in resume_provider.requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_benchmark_online_async_ingest_flushes_once_at_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    db_dir = tmp_path / "benchmark-dbs"
+    flush_calls = 0
+    original_flush = Atagia.flush
+
+    async def _capture_flush(
+        self: Atagia,
+        timeout_seconds: float = 30.0,
+        **kwargs: Any,
+    ) -> bool:
+        nonlocal flush_calls
+        flush_calls += 1
+        return await original_flush(self, timeout_seconds=timeout_seconds, **kwargs)
+
+    monkeypatch.setattr(Atagia, "flush", _capture_flush)
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await benchmark.run(
+        conversation_ids=["conv-test-1"],
+        ingest_only=True,
+        max_turns=4,
+        benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
+        ingest_mode="online_async",
+    )
+
+    assert report.total_questions == 0
+    assert report.model_info["ingest_mode"] == "online_async"
+    assert flush_calls == 1
+    retained_db = next(db_dir.glob("*/benchmark.db"))
+    metadata = json.loads((retained_db.parent / "run_metadata.json").read_text())
+    assert metadata["status"] == "complete"
+    assert metadata["usable_for_evaluate_only"] is True
+    assert metadata["ingest_mode"] == "online_async"
+    assert metadata["flush_every_turns"] is None
+
+
+@pytest.mark.asyncio
+async def test_benchmark_online_batch_ingest_flushes_every_n_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    db_dir = tmp_path / "benchmark-dbs"
+    flush_calls = 0
+    original_flush = Atagia.flush
+
+    async def _capture_flush(
+        self: Atagia,
+        timeout_seconds: float = 30.0,
+        **kwargs: Any,
+    ) -> bool:
+        nonlocal flush_calls
+        flush_calls += 1
+        return await original_flush(self, timeout_seconds=timeout_seconds, **kwargs)
+
+    monkeypatch.setattr(Atagia, "flush", _capture_flush)
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await benchmark.run(
+        conversation_ids=["conv-test-1"],
+        ingest_only=True,
+        max_turns=5,
+        benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
+        flush_every_turns=2,
+    )
+
+    assert report.model_info["ingest_mode"] == "online_batch"
+    assert report.model_info["requested_ingest_mode"] == "online"
+    assert report.model_info["effective_ingest_mode"] == "online_batch"
+    assert report.model_info["flush_every_turns"] == 2
+    assert flush_calls == 3
+    retained_db = next(db_dir.glob("*/benchmark.db"))
+    metadata = json.loads((retained_db.parent / "run_metadata.json").read_text())
+    assert metadata["status"] == "complete"
+    assert metadata["usable_for_evaluate_only"] is True
+    assert metadata["ingest_mode"] == "online_batch"
+    assert metadata["flush_every_turns"] == 2
+
+
+@pytest.mark.asyncio
 async def test_benchmark_bulk_ingest_persists_locomo_image_captions_as_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1286,6 +1952,7 @@ async def test_benchmark_bulk_ingest_persists_locomo_image_captions_as_artifacts
         ingest_only=True,
         max_turns=1,
         benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
         keep_db=True,
         ingest_mode="bulk",
     )
@@ -1346,6 +2013,7 @@ async def test_benchmark_bulk_ingest_falls_back_for_missing_turn_timestamp(
         categories=[1],
         max_questions=1,
         benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
         keep_db=True,
         ingest_mode="bulk",
     )
@@ -1446,6 +2114,7 @@ async def test_benchmark_can_reuse_retained_ingestion_db_without_persisting_ques
     ingest_report = await benchmark.run(
         conversation_ids=["conv-test-1"],
         benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
         ingest_only=True,
     )
 
@@ -1468,6 +2137,8 @@ async def test_benchmark_can_reuse_retained_ingestion_db_without_persisting_ques
     assert progress["selected_turns"] == 6
     assert progress["ingested_turns"] == 6
     assert progress["last_turn_id"] == "D3:2"
+    assert progress["worker_drain"]["storage"]["drained"] is True
+    assert "memory_objects" in progress["worker_drain"]["db_counts"]
     assert sum(
         1
         for request in provider.requests
@@ -1499,7 +2170,7 @@ async def test_benchmark_can_reuse_retained_ingestion_db_without_persisting_ques
         1
         for request in eval_provider.requests
         if request.metadata.get("purpose") == "memory_extraction"
-    ) == 0
+    ) == 2
 
     async with Atagia(
         db_path=retained_db,
@@ -1523,6 +2194,271 @@ async def test_benchmark_can_reuse_retained_ingestion_db_without_persisting_ques
 
 
 @pytest.mark.asyncio
+async def test_benchmark_can_resume_partial_ingestion_db(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    data_path = _write_dataset(tmp_path)
+    db_dir = tmp_path / "benchmark-dbs"
+    benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    await benchmark.run(
+        conversation_ids=["conv-test-1"],
+        benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
+        ingest_only=True,
+        max_turns=2,
+    )
+    retained_db = next(db_dir.glob("*/benchmark.db"))
+
+    resume_provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, resume_provider)
+    resume_benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await resume_benchmark.run(
+        conversation_ids=["conv-test-1"],
+        resume_db=retained_db,
+        ingest_only=True,
+    )
+
+    assert report.total_questions == 0
+    assert report.model_info["benchmark_db"]["resume_db_count"] == 1
+    assert report.model_info["benchmark_db"]["resume_db"] == str(retained_db)
+    progress = json.loads((retained_db.parent / "ingestion_progress.json").read_text())
+    metadata = json.loads((retained_db.parent / "run_metadata.json").read_text())
+    assert progress["status"] == "workers_drained"
+    assert progress["ingested_turns"] == 6
+    assert progress["last_turn_id"] == "D3:2"
+    assert metadata["status"] == "complete"
+    assert metadata["turn_count"] == 6
+    assert metadata["usable_for_evaluate_only"] is True
+    assert sum(
+        1
+        for request in resume_provider.requests
+        if request.metadata.get("purpose") == "memory_extraction"
+    ) == 4
+
+    async with Atagia(
+        db_path=retained_db,
+        manifests_dir=MANIFESTS_DIR,
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/answer-model",
+    ) as engine:
+        runtime = engine.runtime
+        assert runtime is not None
+        connection = await runtime.open_connection()
+        try:
+            messages = await MessageRepository(
+                connection,
+                runtime.clock,
+            ).list_messages_for_conversation("conv-test-1", "benchmark-user")
+        finally:
+            await connection.close()
+
+    assert len(messages) == 6
+
+
+@pytest.mark.asyncio
+async def test_benchmark_can_evaluate_reuse_db_dir_in_parallel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    data_path = _write_two_conversation_dataset(tmp_path)
+    db_dir = tmp_path / "benchmark-dbs"
+    benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    ingest_report = await benchmark.run(
+        conversation_ids=["conv-test-1", "conv-test-2"],
+        benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
+        ingest_only=True,
+        parallel_conversations=2,
+    )
+
+    assert ingest_report.total_questions == 0
+    assert len(list(db_dir.glob("*/benchmark.db"))) == 2
+
+    eval_provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, eval_provider)
+    eval_benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await eval_benchmark.run(
+        conversation_ids=["conv-test-1", "conv-test-2"],
+        categories=[1],
+        max_questions=1,
+        reuse_db_dir=db_dir,
+        parallel_conversations=2,
+    )
+
+    assert report.total_questions == 2
+    assert report.total_correct == 2
+    assert report.model_info["benchmark_db"]["evaluate_only"] is True
+    assert report.model_info["benchmark_db"]["reuse_db_dir"] == str(db_dir)
+    assert report.model_info["benchmark_db"]["reuse_db_count"] == 2
+    assert report.model_info["parallel_conversations"] == 2
+    assert [conversation.conversation_id for conversation in report.conversations] == [
+        "conv-test-1",
+        "conv-test-2",
+    ]
+    assert all(
+        conversation.metadata["evaluate_only"] is True
+        for conversation in report.conversations
+    )
+    assert sum(
+        1
+        for request in eval_provider.requests
+        if request.metadata.get("purpose") == "memory_extraction"
+    ) >= 2
+
+
+@pytest.mark.asyncio
+async def test_benchmark_marks_interrupted_db_unusable_for_evaluate_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    data_path = _write_dataset(tmp_path)
+    db_dir = tmp_path / "benchmark-dbs"
+    original_ingest_message = Atagia.ingest_message
+    calls = 0
+
+    async def _fail_second_ingest(self: Atagia, *args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated ingestion interruption")
+        await original_ingest_message(self, *args, **kwargs)
+
+    monkeypatch.setattr(Atagia, "ingest_message", _fail_second_ingest)
+    benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated ingestion interruption"):
+        await benchmark.run(
+            conversation_ids=["conv-test-1"],
+            benchmark_db_dir=db_dir,
+            allow_temp_benchmark_db_dir=True,
+            ingest_only=True,
+        )
+
+    retained_db = next(db_dir.glob("*/benchmark.db"))
+    metadata = json.loads((retained_db.parent / "run_metadata.json").read_text())
+    progress = json.loads((retained_db.parent / "ingestion_progress.json").read_text())
+    assert metadata["status"] == "interrupted"
+    assert metadata["usable_for_evaluate_only"] is False
+    assert metadata["ingestion_complete"] is False
+    assert metadata["partial"] is True
+    assert metadata["interrupted"] is True
+    assert metadata["interruption"]["exception_class"] == "RuntimeError"
+    assert metadata["llm_call_summary"] is not None
+    assert metadata["llm_call_summary"]["total_calls"] >= 0
+    assert metadata["interruption_db_audit"]["counts"]["messages"] >= 1
+    assert progress["status"] == "interrupted"
+    assert progress["interruption"]["exception_class"] == "RuntimeError"
+
+    with pytest.raises(ValueError, match="not usable"):
+        await benchmark.run(
+            conversation_ids=["conv-test-1"],
+            categories=[1],
+            max_questions=1,
+            reuse_db=retained_db,
+        )
+    with pytest.raises(ValueError, match="missing usable benchmark DBs"):
+        await benchmark.run(
+            conversation_ids=["conv-test-1"],
+            categories=[1],
+            max_questions=1,
+            reuse_db_dir=db_dir,
+        )
+
+
+@pytest.mark.asyncio
+async def test_benchmark_marks_cancelled_db_as_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    data_path = _write_dataset(tmp_path)
+    db_dir = tmp_path / "benchmark-dbs"
+    original_ingest_message = Atagia.ingest_message
+    calls = 0
+
+    async def _cancel_second_ingest(self: Atagia, *args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise asyncio.CancelledError()
+        await original_ingest_message(self, *args, **kwargs)
+
+    monkeypatch.setattr(Atagia, "ingest_message", _cancel_second_ingest)
+    benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await benchmark.run(
+            conversation_ids=["conv-test-1"],
+            benchmark_db_dir=db_dir,
+            allow_temp_benchmark_db_dir=True,
+            ingest_only=True,
+        )
+
+    retained_db = next(db_dir.glob("*/benchmark.db"))
+    metadata = json.loads((retained_db.parent / "run_metadata.json").read_text())
+    progress = json.loads((retained_db.parent / "ingestion_progress.json").read_text())
+    assert metadata["status"] == "cancelled"
+    assert metadata["cancelled"] is True
+    assert metadata["usable_for_evaluate_only"] is False
+    assert progress["status"] == "cancelled"
+    assert progress["interruption"]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_benchmark_reuse_db_rejects_metadata_conversation_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1543,6 +2479,7 @@ async def test_benchmark_reuse_db_rejects_metadata_conversation_mismatch(
     await benchmark.run(
         conversation_ids=["conv-test-1"],
         benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
         ingest_only=True,
     )
     retained_db = next(db_dir.glob("*/benchmark.db"))
@@ -1554,6 +2491,73 @@ async def test_benchmark_reuse_db_rejects_metadata_conversation_mismatch(
             max_questions=1,
             reuse_db=retained_db,
         )
+
+
+@pytest.mark.asyncio
+async def test_benchmark_reuse_db_rejects_untrusted_ingest_without_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    data_path = _write_dataset(tmp_path)
+    db_dir = tmp_path / "benchmark-dbs"
+    benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    await benchmark.run(
+        conversation_ids=["conv-test-1"],
+        benchmark_db_dir=db_dir,
+        allow_temp_benchmark_db_dir=True,
+        ingest_only=True,
+    )
+    retained_db = next(db_dir.glob("*/benchmark.db"))
+    metadata_path = retained_db.parent / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["status"] = "complete_untrusted"
+    metadata["trusted_ingest"] = False
+    metadata["usable_for_evaluate_only"] = False
+    metadata["ingest_health"] = {
+        "trusted_ingest": False,
+        "reasons": ["test untrusted DB"],
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="untrusted"):
+        await benchmark.run(
+            conversation_ids=["conv-test-1"],
+            categories=[1],
+            max_questions=1,
+            reuse_db=retained_db,
+        )
+
+    eval_provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, eval_provider)
+    eval_benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await eval_benchmark.run(
+        conversation_ids=["conv-test-1"],
+        categories=[1],
+        max_questions=1,
+        reuse_db=retained_db,
+        allow_untrusted_reuse=True,
+    )
+
+    assert report.total_questions == 1
+    assert report.conversations[0].metadata["trusted_ingest"] is False
 
 
 def test_format_report_summary_includes_key_sections(tmp_path: Path) -> None:
@@ -1630,6 +2634,7 @@ def test_format_report_summary_includes_key_sections(tmp_path: Path) -> None:
         report_path=tmp_path / "report.json",
         manifest_path=tmp_path / "locomo-run-manifest.json",
         custody_path=tmp_path / "locomo-failed-custody.json",
+        readout_path=tmp_path / "locomo-retrieval-readout.json",
     )
 
     assert "LoCoMo Benchmark Results" in summary
@@ -1645,9 +2650,18 @@ def test_format_report_summary_includes_key_sections(tmp_path: Path) -> None:
     assert "Report saved to:" in summary
     assert "Run manifest saved to:" in summary
     assert "Failed-question custody saved to:" in summary
+    assert "Retrieval readout saved to:" in summary
 
 
-def test_build_run_manifest_includes_reproducibility_fields(tmp_path: Path) -> None:
+def test_build_run_manifest_includes_reproducibility_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_FACT_FACET_SURFACES_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_FACT_FACET_RETRIEVAL_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_APPLICABILITY_GATE_MODE", "enforced")
+    monkeypatch.setenv("ATAGIA_GRAPH_PROJECTION_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_RESPONSE_MODE", "fast")
     data_path = _write_dataset(tmp_path)
     benchmark = LoCoMoBenchmark(
         data_path=data_path,
@@ -1656,6 +2670,8 @@ def test_build_run_manifest_includes_reproducibility_fields(tmp_path: Path) -> N
         llm_model="answer-model",
         judge_model="judge-model",
         manifests_dir=MANIFESTS_DIR,
+        embedding_backend="sqlite_vec",
+        answer_postcondition_guard_enabled=True,
     )
     report = BenchmarkReport(
         benchmark_name="LoCoMo",
@@ -1712,6 +2728,9 @@ def test_build_run_manifest_includes_reproducibility_fields(tmp_path: Path) -> N
     taxonomy_path = tmp_path / "locomo-failure-taxonomy.json"
     taxonomy_payload = b'{"total_failed_questions": 0}'
     taxonomy_path.write_bytes(taxonomy_payload)
+    readout_path = tmp_path / "locomo-retrieval-readout.json"
+    readout_payload = b'{"total_questions": 1}'
+    readout_path.write_bytes(readout_payload)
 
     manifest = benchmark.build_run_manifest(
         report,
@@ -1719,6 +2738,7 @@ def test_build_run_manifest_includes_reproducibility_fields(tmp_path: Path) -> N
         checkpoint_path=tmp_path / "checkpoint.json",
         custody_path=custody_path,
         taxonomy_path=taxonomy_path,
+        readout_path=readout_path,
         failure_taxonomy_summary={"taxonomy_counts": {}},
     )
 
@@ -1731,6 +2751,8 @@ def test_build_run_manifest_includes_reproducibility_fields(tmp_path: Path) -> N
     assert manifest["custody_sha256"] == hashlib.sha256(custody_payload).hexdigest()
     assert manifest["taxonomy_path"] == str(taxonomy_path)
     assert manifest["taxonomy_sha256"] == hashlib.sha256(taxonomy_payload).hexdigest()
+    assert manifest["readout_path"] == str(readout_path)
+    assert manifest["readout_sha256"] == hashlib.sha256(readout_payload).hexdigest()
     assert manifest["failure_taxonomy_summary"] == {"taxonomy_counts": {}}
     assert manifest["checkpoint_sha256"] is None
     assert manifest["benchmark_questions_persisted_as_messages"] is False
@@ -1740,6 +2762,16 @@ def test_build_run_manifest_includes_reproducibility_fields(tmp_path: Path) -> N
         "candidate_count": 1,
         "selected_count": 1,
     }
+    assert manifest["activation_flags"] == {
+        "fact_facet_surfaces_enabled": True,
+        "fact_facet_retrieval_enabled": True,
+        "applicability_gate_mode": "enforced",
+        "answer_postcondition_guard_enabled": True,
+        "embedding_backend": "sqlite_vec",
+        "graph_projection_enabled": True,
+        "response_mode": "fast",
+    }
+    assert manifest["run_counters"] == {"counts": {}, "labeled_counts": {}}
     assert manifest["selection"] == {
         "conversation_ids": ["conv-test-1"],
         "selected_conversation_count": 1,

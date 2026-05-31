@@ -13,6 +13,7 @@ from benchmarks.atagia_bench.runner import (
     CategoryStats,
     load_holdout_question_ids,
 )
+from atagia.services.run_counters import RunCounterAccumulator
 
 
 def test_load_holdout_question_ids_returns_sorted_unique_values(tmp_path: Path) -> None:
@@ -57,7 +58,15 @@ def test_filter_questions_can_exclude_holdout_ids() -> None:
     assert [question.question_id for question in filtered] == ["q1"]
 
 
-def test_save_run_manifest_records_dataset_hash_and_question_ids(tmp_path: Path) -> None:
+def test_save_run_manifest_records_dataset_hash_and_question_ids(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_FACT_FACET_SURFACES_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_FACT_FACET_RETRIEVAL_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_APPLICABILITY_GATE_MODE", "shadow")
+    monkeypatch.setenv("ATAGIA_GRAPH_PROJECTION_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_RESPONSE_MODE", "smart_fast")
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     (data_dir / "personas.json").write_text("[]", encoding="utf-8")
@@ -73,6 +82,8 @@ def test_save_run_manifest_records_dataset_hash_and_question_ids(tmp_path: Path)
         judge_model="judge-model",
         manifests_dir=manifests_dir,
         data_dir=data_dir,
+        embedding_backend="sqlite_vec",
+        answer_postcondition_guard_enabled=True,
     )
     report = AtagiaBenchReport(
         timestamp="2026-04-26T00:00:00+00:00",
@@ -165,6 +176,16 @@ def test_save_run_manifest_records_dataset_hash_and_question_ids(tmp_path: Path)
         "candidate_count": 1,
         "selected_count": 1,
     }
+    assert manifest["activation_flags"] == {
+        "fact_facet_surfaces_enabled": True,
+        "fact_facet_retrieval_enabled": True,
+        "applicability_gate_mode": "shadow",
+        "answer_postcondition_guard_enabled": True,
+        "embedding_backend": "sqlite_vec",
+        "graph_projection_enabled": True,
+        "response_mode": "smart_fast",
+    }
+    assert manifest["run_counters"] == {"counts": {}, "labeled_counts": {}}
     assert manifest["result_summary"]["retrieval_time_ms"] == {
         "count": 1,
         "mean": 42.0,
@@ -179,6 +200,53 @@ def test_save_run_manifest_records_dataset_hash_and_question_ids(tmp_path: Path)
     }
     assert manifest["question_ids"] == ["q1"]
     assert manifest["benchmark_questions_persisted_as_messages"] is False
+
+
+def test_run_manifest_records_non_empty_run_counters(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "personas.json").write_text("[]", encoding="utf-8")
+    manifests_dir = tmp_path / "manifests"
+    manifests_dir.mkdir()
+    runner = AtagiaBenchRunner(
+        llm_provider="openai",
+        llm_api_key=None,
+        llm_model="static-model",
+        judge_model="judge-model",
+        manifests_dir=manifests_dir,
+        data_dir=data_dir,
+    )
+    run_counters = RunCounterAccumulator()
+    run_counters.increment("grounding_dropped_count")
+    report = AtagiaBenchReport(
+        timestamp="2026-04-26T00:00:00+00:00",
+        run_duration_seconds=1.0,
+        config={
+            "provider": "static",
+            "benchmark_split": "all",
+            "question_filter": None,
+            "exclude_question_filter": None,
+            "holdout_question_ids": None,
+            "run_counters": run_counters.snapshot(),
+        },
+        personas_used=[],
+        total_questions=0,
+        total_passed=0,
+        pass_rate=0.0,
+        avg_score=0.0,
+        priority_failure_count=0,
+        per_question=[],
+        per_category=[],
+    )
+    report_path = tmp_path / "atagia-bench-report.json"
+    report_path.write_text("{}", encoding="utf-8")
+
+    manifest = runner.build_run_manifest(report, report_path=report_path)
+
+    assert manifest["run_counters"] == {
+        "counts": {"grounding_dropped_count": 1},
+        "labeled_counts": {},
+    }
 
 
 def test_runner_role_specific_model_config_uses_base_as_role_fallback(
@@ -208,6 +276,8 @@ def test_runner_role_specific_model_config_uses_base_as_role_fallback(
         "retrieval_model": "openai/gpt-5.4-nano",
         "answer_model": "openai/gpt-5.5-instant",
         "component_models": {"need_detector": "openai/gpt-5.4-mini"},
+        "answer_stance": "reactive",
+        "answer_stance_prompt_variant": "baseline",
         "judge_model": "openai/gpt-5.4-mini",
     }
     assert runner._atagia_model_kwargs() == {

@@ -24,6 +24,7 @@ class FakeParallelRunner(AtagiaBenchRunner):
         keep_db: bool,
         reuse_db: str | Path | None,
         evaluate_only: bool,
+        run_counters: Any,
     ) -> tuple[list[AtagiaQuestionResult], dict[str, Any], dict[str, Any]]:
         persona_id = persona_data.persona.persona_id
         if persona_id == "persona_a":

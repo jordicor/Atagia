@@ -35,7 +35,9 @@ class AtagiaClient(Protocol):
     async def create_user(self, user_id: str) -> None:
         """Create the user if it does not already exist."""
 
-    async def create_workspace(self, user_id: str, workspace_id: str, name: str) -> None:
+    async def create_workspace(
+        self, user_id: str, workspace_id: str, name: str
+    ) -> None:
         """Create the workspace if it does not already exist."""
 
     async def create_conversation(
@@ -84,6 +86,9 @@ class AtagiaClient(Protocol):
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> ContextResult:
         """Return memory context for a host-managed LLM call."""
 
@@ -110,6 +115,9 @@ class AtagiaClient(Protocol):
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> None:
         """Persist a host-generated assistant response."""
 
@@ -140,6 +148,9 @@ class AtagiaClient(Protocol):
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> None:
         """Persist one historical or sidecar message."""
 
@@ -153,6 +164,7 @@ class AtagiaClient(Protocol):
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         *,
+        debug: bool = False,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
         cross_chat_memory: bool = True,
@@ -164,10 +176,15 @@ class AtagiaClient(Protocol):
         realm_id: str | None = None,
         space_id: str | None = None,
         incognito: bool | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> ChatResult:
         """Run the full Atagia chat flow."""
 
-    async def flush(self, timeout_seconds: float = 30.0, user_id: str | None = None) -> bool:
+    async def flush(
+        self, timeout_seconds: float = 30.0, user_id: str | None = None
+    ) -> bool:
         """Wait for pending background work to finish when supported."""
 
     async def get_processing_status(
@@ -267,7 +284,9 @@ class LocalAtagiaClient:
     async def create_user(self, user_id: str) -> None:
         await self._engine.create_user(user_id)
 
-    async def create_workspace(self, user_id: str, workspace_id: str, name: str) -> None:
+    async def create_workspace(
+        self, user_id: str, workspace_id: str, name: str
+    ) -> None:
         await self._engine.create_workspace(user_id, workspace_id, name)
 
     async def create_conversation(
@@ -331,6 +350,9 @@ class LocalAtagiaClient:
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> ContextResult:
         return await self._engine.get_context(
             user_id=user_id,
@@ -356,6 +378,9 @@ class LocalAtagiaClient:
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
             memory_privacy_mode=memory_privacy_mode,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
         )
 
     async def add_response(
@@ -381,6 +406,9 @@ class LocalAtagiaClient:
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> None:
         await self._engine.add_response(
             user_id=user_id,
@@ -403,6 +431,9 @@ class LocalAtagiaClient:
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
             memory_privacy_mode=memory_privacy_mode,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
         )
 
     async def ingest_message(
@@ -432,6 +463,9 @@ class LocalAtagiaClient:
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> None:
         await self._engine.ingest_message(
             user_id=user_id,
@@ -458,6 +492,9 @@ class LocalAtagiaClient:
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
             memory_privacy_mode=memory_privacy_mode,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
         )
 
     async def chat(
@@ -470,6 +507,7 @@ class LocalAtagiaClient:
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         *,
+        debug: bool = False,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
         cross_chat_memory: bool = True,
@@ -481,6 +519,9 @@ class LocalAtagiaClient:
         realm_id: str | None = None,
         space_id: str | None = None,
         incognito: bool | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> ChatResult:
         return await self._engine.chat(
             user_id=user_id,
@@ -490,6 +531,7 @@ class LocalAtagiaClient:
             workspace_id=workspace_id,
             occurred_at=occurred_at,
             attachments=attachments,
+            debug=debug,
             operational_profile=operational_profile,
             operational_signals=operational_signals,
             cross_chat_memory=cross_chat_memory,
@@ -501,9 +543,14 @@ class LocalAtagiaClient:
             realm_id=realm_id,
             space_id=space_id,
             incognito=incognito,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
         )
 
-    async def flush(self, timeout_seconds: float = 30.0, user_id: str | None = None) -> bool:
+    async def flush(
+        self, timeout_seconds: float = 30.0, user_id: str | None = None
+    ) -> bool:
         return await self._engine.flush(timeout_seconds)
 
     async def get_processing_status(
@@ -648,7 +695,9 @@ class HttpAtagiaClient:
             json={"user_id": user_id},
         )
 
-    async def create_workspace(self, user_id: str, workspace_id: str, name: str) -> None:
+    async def create_workspace(
+        self, user_id: str, workspace_id: str, name: str
+    ) -> None:
         await self._post(
             "/v1/workspaces",
             user_id=user_id,
@@ -691,7 +740,9 @@ class HttpAtagiaClient:
                 "cross_chat_memory": cross_chat_memory,
                 "user_persona_id": user_persona_id,
                 "platform_id": platform_id,
-                "character_id": character_id if character_id is not None else workspace_id,
+                "character_id": character_id
+                if character_id is not None
+                else workspace_id,
                 "active_presence_id": active_presence_id,
                 "embodiment_id": embodiment_id,
                 "realm_id": realm_id,
@@ -730,35 +781,43 @@ class HttpAtagiaClient:
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> ContextResult:
         response = await self._post(
             f"/v1/conversations/{_path_segment(conversation_id)}/context",
             user_id=user_id,
             json=_omit_none(
                 {
-                "user_id": user_id,
-                "message_text": message,
-                "message_id": message_id,
-                "source_seq": source_seq,
-                "assistant_mode_id": mode,
-                "workspace_id": workspace_id,
-                "message_occurred_at": occurred_at,
-                "attachments": attachments or [],
-                "operational_profile": operational_profile,
-                "operational_signals": operational_signals,
-                "cross_chat_memory": cross_chat_memory,
-                "user_persona_id": user_persona_id,
-                "platform_id": platform_id,
-                "character_id": character_id if character_id is not None else workspace_id,
-                "active_presence_id": active_presence_id,
-                "embodiment_id": embodiment_id,
-                "realm_id": realm_id,
-                "space_id": space_id,
-                "mode": mode,
-                "incognito": incognito,
-                "ingest_origin": ingest_origin,
-                "confirmation_strategy": confirmation_strategy,
-                "memory_privacy_mode": memory_privacy_mode,
+                    "user_id": user_id,
+                    "message_text": message,
+                    "message_id": message_id,
+                    "source_seq": source_seq,
+                    "assistant_mode_id": mode,
+                    "workspace_id": workspace_id,
+                    "message_occurred_at": occurred_at,
+                    "attachments": attachments or [],
+                    "operational_profile": operational_profile,
+                    "operational_signals": operational_signals,
+                    "cross_chat_memory": cross_chat_memory,
+                    "user_persona_id": user_persona_id,
+                    "platform_id": platform_id,
+                    "character_id": character_id
+                    if character_id is not None
+                    else workspace_id,
+                    "active_presence_id": active_presence_id,
+                    "embodiment_id": embodiment_id,
+                    "realm_id": realm_id,
+                    "space_id": space_id,
+                    "mode": mode,
+                    "incognito": incognito,
+                    "ingest_origin": ingest_origin,
+                    "confirmation_strategy": confirmation_strategy,
+                    "memory_privacy_mode": memory_privacy_mode,
+                    "privacy_enforcement": privacy_enforcement,
+                    "authenticated_user_privilege_level": authenticated_user_privilege_level,
+                    "authenticated_user_is_atagia_master": authenticated_user_is_atagia_master,
                 }
             ),
         )
@@ -787,31 +846,37 @@ class HttpAtagiaClient:
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> None:
         await self._post(
             f"/v1/conversations/{_path_segment(conversation_id)}/responses",
             user_id=user_id,
             json=_omit_none(
                 {
-                "user_id": user_id,
-                "message_id": message_id,
-                "source_seq": source_seq,
-                "text": text,
-                "occurred_at": occurred_at,
-                "operational_profile": operational_profile,
-                "operational_signals": operational_signals,
-                "user_persona_id": user_persona_id,
-                "platform_id": platform_id,
-                "character_id": character_id,
-                "active_presence_id": active_presence_id,
-                "embodiment_id": embodiment_id,
-                "realm_id": realm_id,
-                "space_id": space_id,
-                "mode": mode,
-                "incognito": incognito,
-                "ingest_origin": ingest_origin,
-                "confirmation_strategy": confirmation_strategy,
-                "memory_privacy_mode": memory_privacy_mode,
+                    "user_id": user_id,
+                    "message_id": message_id,
+                    "source_seq": source_seq,
+                    "text": text,
+                    "occurred_at": occurred_at,
+                    "operational_profile": operational_profile,
+                    "operational_signals": operational_signals,
+                    "user_persona_id": user_persona_id,
+                    "platform_id": platform_id,
+                    "character_id": character_id,
+                    "active_presence_id": active_presence_id,
+                    "embodiment_id": embodiment_id,
+                    "realm_id": realm_id,
+                    "space_id": space_id,
+                    "mode": mode,
+                    "incognito": incognito,
+                    "ingest_origin": ingest_origin,
+                    "confirmation_strategy": confirmation_strategy,
+                    "memory_privacy_mode": memory_privacy_mode,
+                    "privacy_enforcement": privacy_enforcement,
+                    "authenticated_user_privilege_level": authenticated_user_privilege_level,
+                    "authenticated_user_is_atagia_master": authenticated_user_is_atagia_master,
                 }
             ),
         )
@@ -843,36 +908,44 @@ class HttpAtagiaClient:
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> None:
         await self._post(
             f"/v1/conversations/{_path_segment(conversation_id)}/messages",
             user_id=user_id,
             json=_omit_none(
                 {
-                "user_id": user_id,
-                "message_id": message_id,
-                "source_seq": source_seq,
-                "role": role,
-                "text": text,
-                "assistant_mode_id": mode,
-                "workspace_id": workspace_id,
-                "occurred_at": occurred_at,
-                "attachments": attachments or [],
-                "operational_profile": operational_profile,
-                "operational_signals": operational_signals,
-                "cross_chat_memory": cross_chat_memory,
-                "user_persona_id": user_persona_id,
-                "platform_id": platform_id,
-                "character_id": character_id if character_id is not None else workspace_id,
-                "active_presence_id": active_presence_id,
-                "embodiment_id": embodiment_id,
-                "realm_id": realm_id,
-                "space_id": space_id,
-                "mode": mode,
-                "incognito": incognito,
-                "ingest_origin": ingest_origin,
-                "confirmation_strategy": confirmation_strategy,
-                "memory_privacy_mode": memory_privacy_mode,
+                    "user_id": user_id,
+                    "message_id": message_id,
+                    "source_seq": source_seq,
+                    "role": role,
+                    "text": text,
+                    "assistant_mode_id": mode,
+                    "workspace_id": workspace_id,
+                    "occurred_at": occurred_at,
+                    "attachments": attachments or [],
+                    "operational_profile": operational_profile,
+                    "operational_signals": operational_signals,
+                    "cross_chat_memory": cross_chat_memory,
+                    "user_persona_id": user_persona_id,
+                    "platform_id": platform_id,
+                    "character_id": character_id
+                    if character_id is not None
+                    else workspace_id,
+                    "active_presence_id": active_presence_id,
+                    "embodiment_id": embodiment_id,
+                    "realm_id": realm_id,
+                    "space_id": space_id,
+                    "mode": mode,
+                    "incognito": incognito,
+                    "ingest_origin": ingest_origin,
+                    "confirmation_strategy": confirmation_strategy,
+                    "memory_privacy_mode": memory_privacy_mode,
+                    "privacy_enforcement": privacy_enforcement,
+                    "authenticated_user_privilege_level": authenticated_user_privilege_level,
+                    "authenticated_user_is_atagia_master": authenticated_user_is_atagia_master,
                 }
             ),
         )
@@ -887,6 +960,7 @@ class HttpAtagiaClient:
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         *,
+        debug: bool = False,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
         cross_chat_memory: bool = True,
@@ -898,6 +972,9 @@ class HttpAtagiaClient:
         realm_id: str | None = None,
         space_id: str | None = None,
         incognito: bool | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> ChatResult:
         await self.create_conversation(
             user_id=user_id,
@@ -925,19 +1002,24 @@ class HttpAtagiaClient:
                 "message_occurred_at": occurred_at,
                 "include_thinking": False,
                 "metadata": {},
-                "debug": False,
+                "debug": debug,
                 "operational_profile": operational_profile,
                 "operational_signals": operational_signals,
                 "cross_chat_memory": cross_chat_memory,
                 "user_persona_id": user_persona_id,
                 "platform_id": platform_id,
-                "character_id": character_id if character_id is not None else workspace_id,
+                "character_id": character_id
+                if character_id is not None
+                else workspace_id,
                 "active_presence_id": active_presence_id,
                 "embodiment_id": embodiment_id,
                 "realm_id": realm_id,
                 "space_id": space_id,
                 "mode": mode,
                 "incognito": incognito,
+                "privacy_enforcement": privacy_enforcement,
+                "authenticated_user_privilege_level": authenticated_user_privilege_level,
+                "authenticated_user_is_atagia_master": authenticated_user_is_atagia_master,
             },
         )
         payload = response.json()
@@ -955,7 +1037,9 @@ class HttpAtagiaClient:
             debug=payload.get("debug"),
         )
 
-    async def flush(self, timeout_seconds: float = 30.0, user_id: str | None = None) -> bool:
+    async def flush(
+        self, timeout_seconds: float = 30.0, user_id: str | None = None
+    ) -> bool:
         resolved_user_id = user_id or self._last_user_id
         if resolved_user_id is None:
             raise ValueError("user_id is required for the first HTTP flush call")
@@ -1231,10 +1315,14 @@ async def connect_atagia(
 
     if resolved_transport == "http":
         if resolved_base_url is None:
-            raise ValueError("base_url or ATAGIA_BASE_URL is required for HTTP transport")
+            raise ValueError(
+                "base_url or ATAGIA_BASE_URL is required for HTTP transport"
+            )
         resolved_api_key = api_key or os.getenv("ATAGIA_SERVICE_API_KEY")
         if resolved_api_key is None:
-            raise ValueError("api_key or ATAGIA_SERVICE_API_KEY is required for HTTP transport")
+            raise ValueError(
+                "api_key or ATAGIA_SERVICE_API_KEY is required for HTTP transport"
+            )
         return HttpAtagiaClient(
             base_url=resolved_base_url,
             api_key=resolved_api_key,

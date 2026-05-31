@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import TYPE_CHECKING, Any
 
 import aiosqlite
@@ -13,14 +14,21 @@ from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
 )
+from atagia.core.initial_context_package_repository import InitialContextPackageRepository
 from atagia.core.embodiment_repository import EmbodimentRepository, embodiment_snapshot
 from atagia.core.mind_repository import MindRepository, mind_snapshot
 from atagia.core.presence_repository import PresenceRepository, presence_snapshot
 from atagia.core.realm_repository import RealmRepository, realm_snapshot
 from atagia.core.topic_repository import TopicRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
-from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
-from atagia.memory.lifecycle_runner import cache_generation_key, piggyback_lifecycle
+from atagia.core.timestamps import (
+    normalize_optional_timestamp,
+    resolve_message_occurred_at,
+)
+from atagia.memory.context_envelope import allocate_context_envelope_budget
+from atagia.memory.lifecycle_runner import (
+    request_lifecycle_piggyback,
+)
 from atagia.models.schemas_api import ContextResult, MemoryProcessingStatus
 from atagia.models.schemas_memory import (
     ConfirmationStrategy,
@@ -28,6 +36,7 @@ from atagia.models.schemas_memory import (
     IngestOrigin,
     MemoryPrivacyMode,
     MindTopology,
+    ResponseMode,
     resolve_confirmation_strategy,
     resolve_memory_privacy_mode,
 )
@@ -38,21 +47,33 @@ from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
     build_recent_transcript_guidance,
     build_recent_transcript_window,
+    build_response_language_guidance,
     build_message_jobs,
     build_system_prompt,
     enqueue_message_jobs,
     filter_topic_working_set_snapshot,
     render_assistant_guidance_block,
+    render_answer_support_block,
     render_recent_transcript_json_block,
     render_topic_working_set_block,
     resolve_operational_profile,
     resolve_policy,
+    estimate_tokens,
 )
 from atagia.services.context_cache_service import ContextCacheService
+from atagia.services.initial_context_package_prompt import (
+    InitialContextPackagePromptAssembly,
+    assemble_initial_context_package_prompt,
+    drop_initial_context_package_for_overflow,
+)
+from atagia.services.initial_context_package_signatures import (
+    invalidate_initial_context_package_dependency,
+)
 from atagia.services.job_tracking_service import (
     JobTrackingService,
     render_memory_processing_status_block,
 )
+from atagia.services.prompt_authority import normalize_request_authority_context
 from atagia.services.presence_resolution import (
     ensure_conversation_active_presence,
     resolve_active_presence_snapshot,
@@ -87,6 +108,8 @@ from atagia.services.errors import (
 
 if TYPE_CHECKING:
     from atagia.app import AppRuntime
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -131,11 +154,29 @@ class SidecarService:
         ingest_origin: IngestOrigin | str | None = None,
         confirmation_strategy: ConfirmationStrategy | str | None = None,
         memory_privacy_mode: MemoryPrivacyMode | str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
+        response_mode: ResponseMode | str | None = None,
     ) -> ContextResult:
         """Run retrieval, persist the user message, and return a ready system prompt."""
-        resolved_ingest_origin, resolved_confirmation_strategy = self._resolve_ingest_control(
-            ingest_origin=ingest_origin,
-            confirmation_strategy=confirmation_strategy,
+        resolved_response_mode = self._resolve_response_mode(response_mode)
+        authority_context = normalize_request_authority_context(
+            privacy_enforcement=(
+                ablation.privacy_enforcement
+                if ablation is not None
+                else privacy_enforcement
+            ),
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+            user_id=user_id,
+            purpose="sidecar_context",
+        )
+        resolved_ingest_origin, resolved_confirmation_strategy = (
+            self._resolve_ingest_control(
+                ingest_origin=ingest_origin,
+                confirmation_strategy=confirmation_strategy,
+            )
         )
         cache_service = ContextCacheService(self.runtime)
         async with cache_service.user_cache_guard(user_id):
@@ -162,7 +203,10 @@ class SidecarService:
                     mode=mode,
                     incognito=incognito,
                 )
-                conversation, active_presence = await ensure_conversation_active_presence(
+                (
+                    conversation,
+                    active_presence,
+                ) = await ensure_conversation_active_presence(
                     connection,
                     self.runtime.clock,
                     conversation=conversation,
@@ -185,7 +229,10 @@ class SidecarService:
                     active_presence=active_presence,
                     character_id=character_id,
                 )
-                conversation, active_embodiment = await ensure_conversation_active_embodiment(
+                (
+                    conversation,
+                    active_embodiment,
+                ) = await ensure_conversation_active_embodiment(
                     connection,
                     self.runtime.clock,
                     conversation=conversation,
@@ -241,18 +288,35 @@ class SidecarService:
                     source_seq=resolved_source_seq,
                     existing_message=existing_user_message,
                 )
-                resolution = await cache_service.resolve_with_connection(
-                    connection,
-                    user_id=user_id,
-                    conversation_id=str(conversation["id"]),
-                    message_text=prompt_message_text,
-                    assistant_mode_id=mode,
-                    stored_messages=prior_messages,
-                    conversation=conversation,
-                    operational_profile=operational_profile,
-                    operational_signals=operational_signals,
-                    ablation=ablation,
-                )
+                if resolved_response_mode is ResponseMode.NORMAL:
+                    resolution = await cache_service.resolve_with_connection(
+                        connection,
+                        user_id=user_id,
+                        conversation_id=str(conversation["id"]),
+                        message_text=prompt_message_text,
+                        assistant_mode_id=mode,
+                        stored_messages=prior_messages,
+                        conversation=conversation,
+                        operational_profile=operational_profile,
+                        operational_signals=operational_signals,
+                        ablation=ablation,
+                        prompt_authority_context=authority_context,
+                    )
+                else:
+                    resolution = await cache_service.resolve_fast_with_connection(
+                        connection,
+                        user_id=user_id,
+                        conversation_id=str(conversation["id"]),
+                        message_text=prompt_message_text,
+                        response_mode=resolved_response_mode,
+                        assistant_mode_id=mode,
+                        stored_messages=prior_messages,
+                        conversation=conversation,
+                        operational_profile=operational_profile,
+                        operational_signals=operational_signals,
+                        ablation=ablation,
+                        prompt_authority_context=authority_context,
+                    )
                 topic_snapshot = await self._topic_snapshot(
                     connection,
                     user_id=user_id,
@@ -308,7 +372,9 @@ class SidecarService:
                                 else None
                             ),
                             space_id=(
-                                active_space.space_id if active_space is not None else None
+                                active_space.space_id
+                                if active_space is not None
+                                else None
                             ),
                             commit=False,
                         )
@@ -328,24 +394,22 @@ class SidecarService:
                 resolution,
                 last_retrieval_message_seq=int(user_message["seq"]),
             )
-            if existing_user_message is None:
-                memory_processing = await self._enqueue_message_jobs(
-                    conversation=conversation,
-                    message=user_message,
-                    prior_messages=prior_messages,
+            if resolved_response_mode is ResponseMode.SMART_FAST:
+                cache_service.schedule_smart_fast_warm(
+                    user_id=user_id,
+                    conversation_id=str(conversation["id"]),
                     message_text=prompt_message_text,
-                    role="user",
-                    operational_profile=resolution.resolved_operational_profile.snapshot,
-                    ingest_origin=resolved_ingest_origin,
-                    confirmation_strategy=resolved_confirmation_strategy,
-                    memory_privacy_mode=resolved_memory_privacy_mode,
+                    assistant_mode_id=mode,
+                    operational_profile=operational_profile,
+                    operational_signals=operational_signals,
+                    ablation=ablation,
+                    prompt_authority_context=authority_context,
+                    last_retrieval_message_seq=int(user_message["seq"]),
                 )
-            else:
-                memory_processing = await self._message_processing_status(conversation)
+            memory_processing = await self._message_processing_status(conversation)
             if self.runtime.settings.lifecycle_lazy_enabled:
-                self.runtime.spawn_background_task(
-                    piggyback_lifecycle(self.runtime),
-                    name="atagia-lifecycle-piggyback",
+                request_lifecycle_piggyback(
+                    self.runtime, reason="sidecar_context_completed"
                 )
 
         recent_transcript_entries = []
@@ -354,22 +418,34 @@ class SidecarService:
         recent_transcript_block = ""
         assistant_guidance = []
         assistant_guidance_block = ""
+        context_envelope_budget = allocate_context_envelope_budget(
+            (
+                ablation.context_envelope_budget_tokens
+                if ablation is not None
+                and ablation.context_envelope_budget_tokens is not None
+                else self.runtime.settings.context_envelope_budget_tokens
+            ),
+            (
+                ablation.context_envelope_ratios
+                if ablation is not None and ablation.context_envelope_ratios is not None
+                else self.runtime.settings.context_envelope_ratios
+            ),
+        )
+        recent_transcript_budget_tokens = 0
+        recent_transcript_budget_initial_tokens = 0
+        raw_context_access_mode = str(
+            resolution.source_retrieval_plan.get("raw_context_access_mode", "normal")
+        )
         if not self.runtime.settings.benchmark_disable_raw_recent_transcript:
             recent_transcript_budget_tokens = (
-                self.runtime.settings.effective_recent_transcript_budget_tokens(
-                    resolution.resolved_policy.transcript_budget_tokens,
-                    hard_cap_tokens=(
-                        resolution.resolved_operational_profile.policy_override.transcript_budget_tokens
-                    ),
-                )
+                context_envelope_budget.recent_transcript_budget_tokens
             )
+            recent_transcript_budget_initial_tokens = recent_transcript_budget_tokens
             recent_transcript = build_recent_transcript_window(
                 prior_messages,
                 recent_transcript_budget_tokens,
                 overage_ratio=self.runtime.settings.recent_transcript_overage_ratio,
-                raw_context_access_mode=str(
-                    resolution.source_retrieval_plan.get("raw_context_access_mode", "normal")
-                ),
+                raw_context_access_mode=raw_context_access_mode,
             )
             recent_transcript_entries = recent_transcript.entries
             recent_transcript_omissions = recent_transcript.omissions
@@ -381,35 +457,193 @@ class SidecarService:
                 recent_transcript_omissions,
                 enabled=self.runtime.settings.assistant_guidance_enabled,
             )
+            assistant_guidance.extend(
+                build_response_language_guidance(
+                    resolution.source_retrieval_plan,
+                    enabled=self.runtime.settings.assistant_guidance_enabled,
+                    from_cache=resolution.from_cache,
+                )
+            )
             assistant_guidance_block = render_assistant_guidance_block(
                 assistant_guidance,
             )
-        return ContextResult(
-            system_prompt=build_system_prompt(
+        else:
+            assistant_guidance_block = render_assistant_guidance_block(
+                build_response_language_guidance(
+                    resolution.source_retrieval_plan,
+                    enabled=self.runtime.settings.assistant_guidance_enabled,
+                    from_cache=resolution.from_cache,
+                )
+            )
+        topic_working_set_block = render_topic_working_set_block(
+            visible_topic_snapshot,
+            allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
+            privacy_ceiling=resolution.resolved_policy.privacy_ceiling,
+        )
+        memory_processing_block = render_memory_processing_status_block(
+            memory_processing
+        )
+        initial_context_package = await self._initial_context_package_prompt(
+            user_id=user_id,
+            conversation_id=str(conversation["id"]),
+            conversation=conversation,
+            resolution=resolution,
+            authority_context=authority_context,
+            context_envelope_budget=context_envelope_budget,
+            topic_context_block=topic_working_set_block,
+            recent_transcript_message_ids={
+                entry.message_id for entry in recent_transcript_entries
+            },
+        )
+        system_prompt = build_system_prompt(
+            resolution.resolved_policy.profile_id.value,
+            resolution.resolved_policy,
+            resolution.composed_context.contract_block,
+            resolution.composed_context.workspace_block,
+            resolution.composed_context.memory_block,
+            resolution.composed_context.state_block,
+            prepared_initial_context_block=initial_context_package.block,
+            topic_context_block=topic_working_set_block,
+            memory_processing_block=memory_processing_block,
+            recent_transcript_block=recent_transcript_block,
+            assistant_guidance_block=assistant_guidance_block,
+            answer_support_block=render_answer_support_block(
+                resolution.composed_context
+            ),
+            answer_stance=self.runtime.settings.answer_stance,
+            answer_stance_prompt_variant=(
+                self.runtime.settings.answer_stance_prompt_variant
+            ),
+            prompt_authority_context=authority_context,
+        )
+        estimated_input_tokens = estimate_tokens(system_prompt) + estimate_tokens(
+            message
+        )
+        if (
+            estimated_input_tokens > context_envelope_budget.total_budget_tokens
+            and initial_context_package.block
+        ):
+            initial_context_package = drop_initial_context_package_for_overflow(
+                initial_context_package
+            )
+            system_prompt = build_system_prompt(
                 resolution.resolved_policy.profile_id.value,
                 resolution.resolved_policy,
                 resolution.composed_context.contract_block,
                 resolution.composed_context.workspace_block,
                 resolution.composed_context.memory_block,
                 resolution.composed_context.state_block,
-                topic_context_block=render_topic_working_set_block(
-                    visible_topic_snapshot,
-                    allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
-                    privacy_ceiling=resolution.resolved_policy.privacy_ceiling,
-                ),
-                memory_processing_block=render_memory_processing_status_block(memory_processing),
+                prepared_initial_context_block=initial_context_package.block,
+                topic_context_block=topic_working_set_block,
+                memory_processing_block=memory_processing_block,
                 recent_transcript_block=recent_transcript_block,
                 assistant_guidance_block=assistant_guidance_block,
+                answer_support_block=render_answer_support_block(
+                    resolution.composed_context
+                ),
+                answer_stance=self.runtime.settings.answer_stance,
+                answer_stance_prompt_variant=(
+                    self.runtime.settings.answer_stance_prompt_variant
+                ),
+                prompt_authority_context=authority_context,
+            )
+            estimated_input_tokens = estimate_tokens(system_prompt) + estimate_tokens(
+                message
+            )
+        if (
+            estimated_input_tokens > context_envelope_budget.total_budget_tokens
+            and recent_transcript_budget_tokens > 0
+            and recent_transcript_entries
+            and not self.runtime.settings.benchmark_disable_raw_recent_transcript
+        ):
+            overflow_tokens = (
+                estimated_input_tokens - context_envelope_budget.total_budget_tokens
+            )
+            recent_transcript_budget_tokens = max(
+                0,
+                recent_transcript_budget_tokens - overflow_tokens,
+            )
+            recent_transcript = build_recent_transcript_window(
+                prior_messages,
+                recent_transcript_budget_tokens,
+                overage_ratio=self.runtime.settings.recent_transcript_overage_ratio,
+                raw_context_access_mode=raw_context_access_mode,
+            )
+            recent_transcript_entries = recent_transcript.entries
+            recent_transcript_omissions = recent_transcript.omissions
+            recent_transcript_trace = recent_transcript.trace
+            recent_transcript_block = render_recent_transcript_json_block(
+                recent_transcript_entries,
+            )
+            assistant_guidance = build_recent_transcript_guidance(
+                recent_transcript_omissions,
+                enabled=self.runtime.settings.assistant_guidance_enabled,
+            )
+            assistant_guidance.extend(
+                build_response_language_guidance(
+                    resolution.source_retrieval_plan,
+                    enabled=self.runtime.settings.assistant_guidance_enabled,
+                    from_cache=resolution.from_cache,
+                )
+            )
+            assistant_guidance_block = render_assistant_guidance_block(
+                assistant_guidance,
+            )
+            system_prompt = build_system_prompt(
+                resolution.resolved_policy.profile_id.value,
+                resolution.resolved_policy,
+                resolution.composed_context.contract_block,
+                resolution.composed_context.workspace_block,
+                resolution.composed_context.memory_block,
+                resolution.composed_context.state_block,
+                prepared_initial_context_block=initial_context_package.block,
+                topic_context_block=topic_working_set_block,
+                memory_processing_block=memory_processing_block,
+                recent_transcript_block=recent_transcript_block,
+                assistant_guidance_block=assistant_guidance_block,
+                answer_support_block=render_answer_support_block(
+                    resolution.composed_context
+                ),
+                answer_stance=self.runtime.settings.answer_stance,
+                answer_stance_prompt_variant=(
+                    self.runtime.settings.answer_stance_prompt_variant
+                ),
+                prompt_authority_context=authority_context,
+            )
+            estimated_input_tokens = estimate_tokens(system_prompt) + estimate_tokens(
+                message
+            )
+        context_envelope_trace = {
+            "enabled": True,
+            **context_envelope_budget.model_dump(),
+            "retrieved_context_tokens": (
+                resolution.composed_context.total_tokens_estimate
             ),
+            "initial_context_package": initial_context_package.diagnostics,
+            "recent_transcript_budget_initial_tokens": (
+                recent_transcript_budget_initial_tokens
+            ),
+            "recent_transcript_budget_final_tokens": recent_transcript_budget_tokens,
+            "recent_transcript_used_tokens": (
+                recent_transcript_trace.budget_used_tokens
+                if recent_transcript_trace is not None
+                else 0
+            ),
+            "estimated_input_tokens": estimated_input_tokens,
+            "estimated_overflow_tokens": max(
+                0,
+                estimated_input_tokens - context_envelope_budget.total_budget_tokens,
+            ),
+            "reserve_tokens": 0,
+        }
+        return ContextResult(
+            system_prompt=system_prompt,
             topic_working_set=visible_topic_snapshot,
-            topic_working_set_block=render_topic_working_set_block(
-                visible_topic_snapshot,
-                allow_intimacy_context=resolution.resolved_policy.allow_intimacy_context,
-                privacy_ceiling=resolution.resolved_policy.privacy_ceiling,
-            ),
+            topic_working_set_block=topic_working_set_block,
             recent_transcript=recent_transcript_entries,
             recent_transcript_omissions=recent_transcript_omissions,
             recent_transcript_trace=recent_transcript_trace,
+            context_envelope_trace=context_envelope_trace,
             assistant_guidance=assistant_guidance,
             memories=resolution.memory_summaries,
             contract=resolution.current_contract,
@@ -421,8 +655,10 @@ class SidecarService:
             cache_age_seconds=resolution.cache_age_seconds,
             cache_source=resolution.cache_source,
             need_detection_skipped=resolution.need_detection_skipped,
+            response_mode=resolved_response_mode.value,
             memory_processing=memory_processing,
             request_message_id=str(user_message["id"]),
+            initial_context_package=initial_context_package.diagnostics,
         )
 
     async def ingest_message(
@@ -453,13 +689,18 @@ class SidecarService:
         ingest_origin: IngestOrigin | str | None = None,
         confirmation_strategy: ConfirmationStrategy | str | None = None,
         memory_privacy_mode: MemoryPrivacyMode | str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> SidecarMessageWriteResult:
         """Store a message and enqueue extraction without running retrieval."""
         if role not in {"user", "assistant"}:
             raise ValueError("ingest_message role must be 'user' or 'assistant'")
-        resolved_ingest_origin, resolved_confirmation_strategy = self._resolve_ingest_control(
-            ingest_origin=ingest_origin,
-            confirmation_strategy=confirmation_strategy,
+        resolved_ingest_origin, resolved_confirmation_strategy = (
+            self._resolve_ingest_control(
+                ingest_origin=ingest_origin,
+                confirmation_strategy=confirmation_strategy,
+            )
         )
 
         cache_service = ContextCacheService(self.runtime)
@@ -496,7 +737,10 @@ class SidecarService:
                     mode=mode,
                     incognito=incognito,
                 )
-                conversation, active_presence = await ensure_conversation_active_presence(
+                (
+                    conversation,
+                    active_presence,
+                ) = await ensure_conversation_active_presence(
                     connection,
                     self.runtime.clock,
                     conversation=conversation,
@@ -519,7 +763,10 @@ class SidecarService:
                     active_presence=active_presence,
                     character_id=character_id,
                 )
-                conversation, active_embodiment = await ensure_conversation_active_embodiment(
+                (
+                    conversation,
+                    active_embodiment,
+                ) = await ensure_conversation_active_embodiment(
                     connection,
                     self.runtime.clock,
                     conversation=conversation,
@@ -620,7 +867,9 @@ class SidecarService:
                                 else None
                             ),
                             space_id=(
-                                active_space.space_id if active_space is not None else None
+                                active_space.space_id
+                                if active_space is not None
+                                else None
                             ),
                             commit=False,
                         )
@@ -630,7 +879,9 @@ class SidecarService:
                                 message_id=str(stored_message["id"]),
                                 commit=False,
                             )
-                        await cache_service.invalidate_conversation_cache_for_conversation(conversation)
+                        await cache_service.invalidate_conversation_cache_for_conversation(
+                            conversation
+                        )
                         await connection.commit()
                     except Exception:
                         await connection.rollback()
@@ -639,7 +890,9 @@ class SidecarService:
                 await connection.close()
 
             if conversation is None or stored_message is None:
-                raise RuntimeError("Message ingestion did not persist the message correctly")
+                raise RuntimeError(
+                    "Message ingestion did not persist the message correctly"
+                )
             if existing_message is None:
                 await self._enqueue_message_jobs(
                     conversation=conversation,
@@ -651,6 +904,13 @@ class SidecarService:
                     ingest_origin=resolved_ingest_origin,
                     confirmation_strategy=resolved_confirmation_strategy,
                     memory_privacy_mode=resolved_memory_privacy_mode,
+                    privacy_enforcement=privacy_enforcement,
+                    authenticated_user_privilege_level=(
+                        authenticated_user_privilege_level
+                    ),
+                    authenticated_user_is_atagia_master=(
+                        authenticated_user_is_atagia_master
+                    ),
                 )
             return SidecarMessageWriteResult(
                 message=stored_message,
@@ -682,11 +942,16 @@ class SidecarService:
         ingest_origin: IngestOrigin | str | None = None,
         confirmation_strategy: ConfirmationStrategy | str | None = None,
         memory_privacy_mode: MemoryPrivacyMode | str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> SidecarMessageWriteResult:
         """Persist an assistant response in the conversation history."""
-        resolved_ingest_origin, resolved_confirmation_strategy = self._resolve_ingest_control(
-            ingest_origin=ingest_origin,
-            confirmation_strategy=confirmation_strategy,
+        resolved_ingest_origin, resolved_confirmation_strategy = (
+            self._resolve_ingest_control(
+                ingest_origin=ingest_origin,
+                confirmation_strategy=confirmation_strategy,
+            )
         )
         cache_service = ContextCacheService(self.runtime)
         async with cache_service.user_cache_guard(user_id):
@@ -711,7 +976,9 @@ class SidecarService:
                     memory_privacy_mode,
                     memory_preferences,
                 )
-                conversation = await conversations.get_conversation(conversation_id, user_id)
+                conversation = await conversations.get_conversation(
+                    conversation_id, user_id
+                )
                 if conversation is None:
                     raise ConversationNotFoundError("Conversation not found for user")
                 self._validate_optional_identity(
@@ -726,7 +993,10 @@ class SidecarService:
                     realm_id=realm_id,
                     space_id=space_id,
                 )
-                conversation, active_presence = await ensure_conversation_active_presence(
+                (
+                    conversation,
+                    active_presence,
+                ) = await ensure_conversation_active_presence(
                     connection,
                     self.runtime.clock,
                     conversation=conversation,
@@ -742,7 +1012,10 @@ class SidecarService:
                     active_presence=active_presence,
                     character_id=character_id,
                 )
-                conversation, active_embodiment = await ensure_conversation_active_embodiment(
+                (
+                    conversation,
+                    active_embodiment,
+                ) = await ensure_conversation_active_embodiment(
                     connection,
                     self.runtime.clock,
                     conversation=conversation,
@@ -837,11 +1110,15 @@ class SidecarService:
                                 else None
                             ),
                             space_id=(
-                                active_space.space_id if active_space is not None else None
+                                active_space.space_id
+                                if active_space is not None
+                                else None
                             ),
                             commit=False,
                         )
-                        await cache_service.invalidate_conversation_cache_for_conversation(conversation)
+                        await cache_service.invalidate_conversation_cache_for_conversation(
+                            conversation
+                        )
                         await connection.commit()
                     except Exception:
                         await connection.rollback()
@@ -850,6 +1127,39 @@ class SidecarService:
                 await connection.close()
             if conversation is None or assistant_message is None:
                 raise RuntimeError("Assistant response did not persist correctly")
+            deferred_user_message, deferred_user_prior = (
+                self._latest_prior_user_message(prior_messages)
+            )
+            if deferred_user_message is not None:
+                (
+                    user_ingest_origin,
+                    user_confirmation_strategy,
+                    user_memory_privacy_mode,
+                ) = self._message_ingest_controls(
+                    deferred_user_message,
+                    ingest_origin=resolved_ingest_origin,
+                    confirmation_strategy=resolved_confirmation_strategy,
+                    memory_privacy_mode=resolved_memory_privacy_mode,
+                )
+                await self._enqueue_message_jobs(
+                    conversation=conversation,
+                    message=deferred_user_message,
+                    prior_messages=deferred_user_prior,
+                    message_text=str(deferred_user_message["text"]),
+                    role="user",
+                    operational_profile=resolved_operational_profile.snapshot,
+                    ingest_origin=user_ingest_origin,
+                    confirmation_strategy=user_confirmation_strategy,
+                    memory_privacy_mode=user_memory_privacy_mode,
+                    privacy_enforcement=privacy_enforcement,
+                    authenticated_user_privilege_level=(
+                        authenticated_user_privilege_level
+                    ),
+                    authenticated_user_is_atagia_master=(
+                        authenticated_user_is_atagia_master
+                    ),
+                    skip_existing_tracked_jobs=True,
+                )
             if existing_message is None:
                 await self._enqueue_message_jobs(
                     conversation=conversation,
@@ -861,6 +1171,14 @@ class SidecarService:
                     ingest_origin=resolved_ingest_origin,
                     confirmation_strategy=resolved_confirmation_strategy,
                     memory_privacy_mode=resolved_memory_privacy_mode,
+                    privacy_enforcement=privacy_enforcement,
+                    authenticated_user_privilege_level=(
+                        authenticated_user_privilege_level
+                    ),
+                    authenticated_user_is_atagia_master=(
+                        authenticated_user_is_atagia_master
+                    ),
+                    skip_existing_tracked_jobs=True,
                 )
             return SidecarMessageWriteResult(
                 message=assistant_message,
@@ -905,9 +1223,12 @@ class SidecarService:
                         else None
                     ),
                 )
-                await cache_service.invalidate_user_cache(user_id)
-                await self.runtime.storage_backend.increment_cache_generation(
-                    cache_generation_key(self.runtime.database_path, user_id)
+                await invalidate_initial_context_package_dependency(
+                    connection,
+                    clock=self.runtime.clock,
+                    storage_backend=self.runtime.storage_backend,
+                    database_path=self.runtime.database_path,
+                    user_id=user_id,
                 )
                 return {"user_id": user_id, **preferences}
             finally:
@@ -932,7 +1253,9 @@ class SidecarService:
                 users = UserRepository(connection, self.runtime.clock)
                 if await users.get_active_user(user_id) is None:
                     raise UserDeletedError("User has been erased or does not exist")
-                existing = await conversations.get_conversation(conversation_id, user_id)
+                existing = await conversations.get_conversation(
+                    conversation_id, user_id
+                )
                 if existing is None:
                     raise ConversationNotFoundError("Conversation not found for user")
                 self._validate_optional_identity(
@@ -951,10 +1274,12 @@ class SidecarService:
                     )
                     affected_memory_ids: list[str] = []
                     if incognito:
-                        affected_memory_ids = await self._mark_broad_conversation_rows_review_only(
-                            connection,
-                            user_id=user_id,
-                            conversation_id=conversation_id,
+                        affected_memory_ids = (
+                            await self._mark_broad_conversation_rows_review_only(
+                                connection,
+                                user_id=user_id,
+                                conversation_id=conversation_id,
+                            )
                         )
                         await self._delete_retrieval_events_for_memory_ids(
                             connection,
@@ -967,12 +1292,12 @@ class SidecarService:
                     raise
                 if updated is None:
                     raise ConversationNotFoundError("Conversation not found for user")
-                if incognito:
-                    await cache_service.invalidate_user_cache(user_id)
-                else:
-                    await cache_service.invalidate_conversation_cache_for_conversation(updated)
-                await self.runtime.storage_backend.increment_cache_generation(
-                    cache_generation_key(self.runtime.database_path, user_id)
+                await invalidate_initial_context_package_dependency(
+                    connection,
+                    clock=self.runtime.clock,
+                    storage_backend=self.runtime.storage_backend,
+                    database_path=self.runtime.database_path,
+                    user_id=user_id,
                 )
                 return updated
             finally:
@@ -1008,7 +1333,9 @@ class SidecarService:
             messages = MessageRepository(connection, self.runtime.clock)
             if await users.get_active_user(user_id) is None:
                 raise UserDeletedError("User has been erased or does not exist")
-            conversation = await conversations.get_conversation(conversation_id, user_id)
+            conversation = await conversations.get_conversation(
+                conversation_id, user_id
+            )
             if conversation is None:
                 raise ConversationNotFoundError("Conversation not found for user")
             self._validate_optional_identity(
@@ -1033,7 +1360,9 @@ class SidecarService:
                 or conversation.get("assistant_mode_id")
                 or DEFAULT_ASSISTANT_MODE_ID
             )
-            resolve_policy(self.runtime.manifests, str(resolved_mode), self.runtime.policy_resolver)
+            resolve_policy(
+                self.runtime.manifests, str(resolved_mode), self.runtime.policy_resolver
+            )
             source_messages = await messages.list_messages_for_conversation(
                 conversation_id,
                 user_id,
@@ -1066,7 +1395,9 @@ class SidecarService:
         finally:
             await connection.close()
 
-    async def ensure_user_exists(self, connection: aiosqlite.Connection, user_id: str) -> None:
+    async def ensure_user_exists(
+        self, connection: aiosqlite.Connection, user_id: str
+    ) -> None:
         """Create the user if it does not already exist."""
         users = UserRepository(connection, self.runtime.clock)
         user = await users.get_user(user_id)
@@ -1096,6 +1427,15 @@ class SidecarService:
             raise ValueError("source_seq must be a positive integer")
         return resolved
 
+    def _resolve_response_mode(
+        self,
+        response_mode: ResponseMode | str | None,
+    ) -> ResponseMode:
+        """Resolve the per-request mode, falling back to the global default."""
+        if response_mode is None:
+            return ResponseMode(self.runtime.settings.response_mode)
+        return ResponseMode(response_mode)
+
     @staticmethod
     def _resolve_ingest_control(
         *,
@@ -1111,7 +1451,9 @@ class SidecarService:
             resolved_origin is not IngestOrigin.LIVE_TURN
             and resolved_strategy is ConfirmationStrategy.LIVE_PROMPT_ALLOWED
         ):
-            raise ValueError("live_prompt_allowed confirmation_strategy requires live_turn origin")
+            raise ValueError(
+                "live_prompt_allowed confirmation_strategy requires live_turn origin"
+            )
         return resolved_origin, resolved_strategy
 
     @staticmethod
@@ -1139,6 +1481,33 @@ class SidecarService:
         normalized["confirmation_strategy"] = confirmation_strategy.value
         normalized["memory_privacy_mode"] = memory_privacy_mode.value
         return normalized
+
+    @staticmethod
+    def _message_ingest_controls(
+        message: dict[str, Any],
+        *,
+        ingest_origin: IngestOrigin,
+        confirmation_strategy: ConfirmationStrategy,
+        memory_privacy_mode: MemoryPrivacyMode,
+    ) -> tuple[str | IngestOrigin, str | ConfirmationStrategy, str | MemoryPrivacyMode]:
+        metadata = message.get("metadata_json")
+        if not isinstance(metadata, dict):
+            return ingest_origin, confirmation_strategy, memory_privacy_mode
+        return (
+            metadata.get("ingest_origin") or ingest_origin,
+            metadata.get("confirmation_strategy") or confirmation_strategy,
+            metadata.get("memory_privacy_mode") or memory_privacy_mode,
+        )
+
+    @staticmethod
+    def _latest_prior_user_message(
+        prior_messages: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        for index in range(len(prior_messages) - 1, -1, -1):
+            message = prior_messages[index]
+            if str(message.get("role")) == "user":
+                return message, prior_messages[:index]
+        return None, []
 
     @staticmethod
     async def _recent_messages_for_write(
@@ -1253,9 +1622,14 @@ class SidecarService:
         workspaces = WorkspaceRepository(connection, self.runtime.clock)
         conversation = None
         if conversation_id is not None:
-            conversation = await conversations.get_conversation(conversation_id, user_id)
+            conversation = await conversations.get_conversation(
+                conversation_id, user_id
+            )
         if conversation is not None:
-            if workspace_id is not None and conversation["workspace_id"] != workspace_id:
+            if (
+                workspace_id is not None
+                and conversation["workspace_id"] != workspace_id
+            ):
                 raise WorkspaceMismatchError(
                     "Requested workspace does not match the existing conversation workspace"
                 )
@@ -1280,9 +1654,9 @@ class SidecarService:
                     user_id,
                 )
                 if updated is not None:
-                    await ContextCacheService(self.runtime).invalidate_conversation_cache_for_conversation(
-                        updated
-                    )
+                    await ContextCacheService(
+                        self.runtime
+                    ).invalidate_conversation_cache_for_conversation(updated)
                     conversation = updated
             if incognito is True and not bool(conversation.get("incognito")):
                 updated = await conversations.mark_conversation_isolated(
@@ -1290,9 +1664,9 @@ class SidecarService:
                     user_id,
                 )
                 if updated is not None:
-                    await ContextCacheService(self.runtime).invalidate_conversation_cache_for_conversation(
-                        updated
-                    )
+                    await ContextCacheService(
+                        self.runtime
+                    ).invalidate_conversation_cache_for_conversation(updated)
                     conversation = updated
             conversation, active_presence = await ensure_conversation_active_presence(
                 connection,
@@ -1310,7 +1684,10 @@ class SidecarService:
                 active_presence=active_presence,
                 character_id=character_id,
             )
-            conversation, _active_embodiment = await ensure_conversation_active_embodiment(
+            (
+                conversation,
+                _active_embodiment,
+            ) = await ensure_conversation_active_embodiment(
                 connection,
                 self.runtime.clock,
                 conversation=conversation,
@@ -1337,7 +1714,9 @@ class SidecarService:
                 raise WorkspaceNotFoundError("Workspace not found for user")
 
         resolved_mode = mode or assistant_mode_id or DEFAULT_ASSISTANT_MODE_ID
-        resolve_policy(self.runtime.manifests, resolved_mode, self.runtime.policy_resolver)
+        resolve_policy(
+            self.runtime.manifests, resolved_mode, self.runtime.policy_resolver
+        )
         resolved_ttl = (
             temporary_ttl_seconds
             if temporary_ttl_seconds is not None
@@ -1364,7 +1743,9 @@ class SidecarService:
         resolved_incognito = (
             bool(incognito) if incognito is not None else (not cross_chat_memory)
         )
-        presences_character_id = character_id if character_id is not None else workspace_id
+        presences_character_id = (
+            character_id if character_id is not None else workspace_id
+        )
         active_presence = await resolve_active_presence_snapshot(
             connection,
             self.runtime.clock,
@@ -1464,8 +1845,13 @@ class SidecarService:
                 raise ConversationNotFoundError("Conversation not found for user")
         if active_presence_id is not None:
             actual_presence = conversation.get("active_presence_id")
-            actual_presence_text = None if actual_presence is None else str(actual_presence)
-            if actual_presence_text is not None and actual_presence_text != active_presence_id:
+            actual_presence_text = (
+                None if actual_presence is None else str(actual_presence)
+            )
+            if (
+                actual_presence_text is not None
+                and actual_presence_text != active_presence_id
+            ):
                 raise ConversationNotFoundError("Conversation not found for user")
         if mind_id is not None:
             actual_mind = conversation.get("active_mind_id")
@@ -1493,7 +1879,10 @@ class SidecarService:
             actual_embodiment_text = (
                 None if actual_embodiment is None else str(actual_embodiment)
             )
-            if actual_embodiment_text is not None and actual_embodiment_text != embodiment_id:
+            if (
+                actual_embodiment_text is not None
+                and actual_embodiment_text != embodiment_id
+            ):
                 raise ConversationNotFoundError("Conversation not found for user")
         if realm_id is not None:
             actual_realm = conversation.get("active_realm_id")
@@ -1597,11 +1986,17 @@ class SidecarService:
         ingest_origin: IngestOrigin | str | None = None,
         confirmation_strategy: ConfirmationStrategy | str | None = None,
         memory_privacy_mode: MemoryPrivacyMode | str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
+        skip_existing_tracked_jobs: bool = False,
     ) -> MemoryProcessingStatus:
         connection = await self.runtime.open_connection()
         try:
             users = UserRepository(connection, self.runtime.clock)
-            memory_preferences = await users.get_memory_preferences(str(conversation["user_id"]))
+            memory_preferences = await users.get_memory_preferences(
+                str(conversation["user_id"])
+            )
             owner_user_id = str(conversation["user_id"])
             presences = PresenceRepository(connection, self.runtime.clock)
             minds = MindRepository(connection, self.runtime.clock)
@@ -1615,9 +2010,9 @@ class SidecarService:
                 "active_mind_id"
             )
             source_mind_id = message.get("source_mind_id") or active_mind_id
-            active_embodiment_id = message.get("active_embodiment_id") or conversation.get(
+            active_embodiment_id = message.get(
                 "active_embodiment_id"
-            )
+            ) or conversation.get("active_embodiment_id")
             active_realm_id = message.get("active_realm_id") or conversation.get(
                 "active_realm_id"
             )
@@ -1641,8 +2036,12 @@ class SidecarService:
                 if source_presence_id is not None
                 else None
             )
-            active_snapshot = presence_snapshot(active_row) if active_row is not None else None
-            source_snapshot = presence_snapshot(source_row) if source_row is not None else None
+            active_snapshot = (
+                presence_snapshot(active_row) if active_row is not None else None
+            )
+            source_snapshot = (
+                presence_snapshot(source_row) if source_row is not None else None
+            )
             active_mind_row = (
                 await minds.get_mind(
                     owner_user_id=owner_user_id,
@@ -1700,16 +2099,21 @@ class SidecarService:
                     active_snapshot.kind.value if active_snapshot is not None else None
                 ),
                 active_presence_display_name=(
-                    active_snapshot.display_name if active_snapshot is not None else None
+                    active_snapshot.display_name
+                    if active_snapshot is not None
+                    else None
                 ),
                 source_presence_id=source_presence_id,
                 source_presence_kind=(
                     source_snapshot.kind.value if source_snapshot is not None else None
                 ),
                 source_presence_display_name=(
-                    source_snapshot.display_name if source_snapshot is not None else None
+                    source_snapshot.display_name
+                    if source_snapshot is not None
+                    else None
                 ),
-                active_space_id=message.get("space_id") or conversation.get("active_space_id"),
+                active_space_id=message.get("space_id")
+                or conversation.get("active_space_id"),
                 active_space_boundary_mode=(
                     conversation.get("active_space_boundary_mode") or "focus"
                 ),
@@ -1744,6 +2148,11 @@ class SidecarService:
                     if active_realm_snapshot is not None
                     else None
                 ),
+                privacy_enforcement=privacy_enforcement,
+                authenticated_user_privilege_level=(authenticated_user_privilege_level),
+                authenticated_user_is_atagia_master=(
+                    authenticated_user_is_atagia_master
+                ),
             )
             job_tracking = JobTrackingService(
                 connection,
@@ -1751,6 +2160,16 @@ class SidecarService:
                 workers_enabled=self.runtime.settings.workers_enabled,
                 settings=self.runtime.settings,
             )
+            if skip_existing_tracked_jobs:
+                jobs = [
+                    (stream_name, job)
+                    for stream_name, job in jobs
+                    if not await job_tracking.source_message_job_exists(
+                        user_id=str(conversation["user_id"]),
+                        source_message_id=str(message["id"]),
+                        job_type=job.job_type,
+                    )
+                ]
             await enqueue_message_jobs(
                 storage_backend=self.runtime.storage_backend,
                 jobs=jobs,
@@ -1758,6 +2177,13 @@ class SidecarService:
                 worker_control_service=WorkerControlService(
                     connection,
                     self.runtime.clock,
+                ),
+                initial_context_package_repository=InitialContextPackageRepository(
+                    connection,
+                    self.runtime.clock,
+                ),
+                initial_context_package_refresh_enabled=(
+                    self.runtime.settings.initial_context_package_refresh_enabled
                 ),
             )
             return await job_tracking.get_status(
@@ -1780,6 +2206,65 @@ class SidecarService:
             ).get_status(
                 user_id=str(conversation["user_id"]),
                 conversation_id=str(conversation["id"]),
+            )
+        finally:
+            await connection.close()
+
+    async def _initial_context_package_prompt(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        conversation: dict[str, Any],
+        resolution: Any,
+        authority_context: Any,
+        context_envelope_budget: Any,
+        topic_context_block: str,
+        recent_transcript_message_ids: set[str],
+    ) -> InitialContextPackagePromptAssembly:
+        connection = await self.runtime.open_connection()
+        try:
+            return await assemble_initial_context_package_prompt(
+                connection,
+                self.runtime.clock,
+                enabled=self.runtime.settings.initial_context_package_read_enabled,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                conversation=conversation,
+                resolved_policy=resolution.resolved_policy,
+                authority_context=authority_context,
+                operational_profile=resolution.resolved_operational_profile.snapshot,
+                context_envelope_budget=context_envelope_budget,
+                retrieved_context_tokens=(
+                    resolution.composed_context.total_tokens_estimate
+                ),
+                selected_memory_ids=resolution.composed_context.selected_memory_ids,
+                topic_context_block=topic_context_block,
+                live_contract_block=resolution.composed_context.contract_block,
+                live_state_block=resolution.composed_context.state_block,
+                recent_transcript_message_ids=recent_transcript_message_ids,
+                include_recent_verbatim_seed=(
+                    not self.runtime.settings.benchmark_disable_raw_recent_transcript
+                ),
+                prompt_budget_tokens=(
+                    self.runtime.settings.initial_context_package_prompt_max_tokens
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Initial context package read failed for user_id=%s conversation_id=%s",
+                user_id,
+                conversation_id,
+            )
+            return InitialContextPackagePromptAssembly(
+                "",
+                {
+                    "enabled": self.runtime.settings.initial_context_package_read_enabled,
+                    "rendered": False,
+                    "read_ms": 0.0,
+                    "packages": [],
+                    "error": "read_failed",
+                },
             )
         finally:
             await connection.close()

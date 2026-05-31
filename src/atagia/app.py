@@ -39,6 +39,7 @@ from atagia.models.schemas_jobs import (
     EVALUATION_STREAM_NAME,
     EXTRACT_STREAM_NAME,
     GRAPH_STREAM_NAME,
+    INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
     REVISE_STREAM_NAME,
     WORKER_GROUP_NAME,
 )
@@ -52,6 +53,7 @@ from atagia.workers.compaction_worker import CompactionWorker
 from atagia.workers.contract_worker import ContractWorker
 from atagia.workers.evaluation_worker import EvaluationWorker
 from atagia.workers.graph_sync_worker import GraphSyncWorker
+from atagia.workers.initial_context_package_worker import InitialContextPackageWorker
 from atagia.workers.ingest_worker import IngestWorker
 from atagia.workers.lifecycle_worker import LifecycleWorker
 from atagia.workers.revision_worker import RevisionWorker
@@ -79,6 +81,7 @@ class AppRuntime:
     revision_worker: RevisionWorker | None
     compaction_worker: CompactionWorker | None
     evaluation_worker: EvaluationWorker | None
+    initial_context_package_worker: InitialContextPackageWorker | None
     lifecycle_worker: LifecycleWorker | None
     worker_tasks: list[asyncio.Task[None]]
     bootstrap_connection: aiosqlite.Connection
@@ -192,6 +195,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
         revision_worker: RevisionWorker | None = None
         compaction_worker: CompactionWorker | None = None
         evaluation_worker: EvaluationWorker | None = None
+        initial_context_package_worker: InitialContextPackageWorker | None = None
         for stream_name in (
             EXTRACT_STREAM_NAME,
             CONTRACT_STREAM_NAME,
@@ -199,6 +203,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             REVISE_STREAM_NAME,
             COMPACT_STREAM_NAME,
             EVALUATION_STREAM_NAME,
+            INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
         ):
             await storage_backend.stream_ensure_group(stream_name, WORKER_GROUP_NAME)
         lifecycle_worker: LifecycleWorker | None = None
@@ -217,6 +222,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             revision_connection = await open_connection(database_path)
             compaction_connection = await open_connection(database_path)
             evaluation_connection = await open_connection(database_path)
+            initial_context_package_connection = await open_connection(database_path)
             worker_connections.extend(
                 [
                     ingest_connection,
@@ -225,6 +231,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
                     revision_connection,
                     compaction_connection,
                     evaluation_connection,
+                    initial_context_package_connection,
                 ]
             )
             ingest_worker = IngestWorker(
@@ -275,6 +282,15 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
                 clock=clock,
                 settings=settings,
             )
+            initial_context_package_worker = InitialContextPackageWorker(
+                storage_backend=storage_backend,
+                connection=initial_context_package_connection,
+                clock=clock,
+                manifest_loader=manifest_loader,
+                settings=settings,
+                operational_profile_loader=operational_profile_loader,
+                llm_client=llm_client,
+            )
             worker_tasks = [
                 # Each worker owns its own SQLite connection so their transactions
                 # cannot bleed across requests or each other.
@@ -284,6 +300,10 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
                 asyncio.create_task(revision_worker.run(), name="atagia-revision-worker"),
                 asyncio.create_task(compaction_worker.run(), name="atagia-compaction-worker"),
                 asyncio.create_task(evaluation_worker.run(), name="atagia-evaluation-worker"),
+                asyncio.create_task(
+                    initial_context_package_worker.run(),
+                    name="atagia-initial-context-package-worker",
+                ),
             ]
         if settings.lifecycle_worker_enabled:
             lifecycle_worker = LifecycleWorker(
@@ -317,6 +337,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             revision_worker=revision_worker,
             compaction_worker=compaction_worker,
             evaluation_worker=evaluation_worker,
+            initial_context_package_worker=initial_context_package_worker,
             lifecycle_worker=lifecycle_worker,
             worker_tasks=worker_tasks,
             bootstrap_connection=bootstrap_connection,

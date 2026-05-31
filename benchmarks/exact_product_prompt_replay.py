@@ -20,7 +20,7 @@ from benchmarks.broad_list_coverage import (
 )
 from benchmarks.fixed_context_answer_quality import AnswerProfile, parse_answer_profile
 from benchmarks.llm_metrics import summarize_llm_calls
-from benchmarks.trusted_eval import TRUSTED_EVALUATION_PROMPT_NOTE
+from benchmarks.trusted_eval import trusted_evaluation_prompt_note
 from atagia.core.config import Settings
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.services.chat_support import build_system_prompt
@@ -123,7 +123,6 @@ async def run_prompt_replay(
                     request = LLMCompletionRequest(
                         model=profile.model,
                         messages=messages,
-                        temperature=0.0,
                         max_output_tokens=profile.max_output_tokens,
                         metadata={
                             "purpose": "benchmark_exact_product_prompt_replay",
@@ -278,7 +277,7 @@ def _reconstruct_product_prompt(memory_block: str, *, trusted_evaluation: bool) 
         "",
     )
     if trusted_evaluation:
-        prompt = f"{prompt}\n\n{TRUSTED_EVALUATION_PROMPT_NOTE}"
+        prompt = f"{prompt}\n\n{trusted_evaluation_prompt_note()}"
     return prompt
 
 

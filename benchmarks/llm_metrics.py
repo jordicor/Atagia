@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
+import logging
 from time import perf_counter
 from typing import Any, Iterator
 
@@ -16,6 +17,8 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
 )
 
+logger = logging.getLogger(__name__)
+
 
 _CURRENT_LLM_CONTEXT: ContextVar[dict[str, Any]] = ContextVar(
     "benchmark_llm_context",
@@ -26,9 +29,10 @@ _CURRENT_LLM_CONTEXT: ContextVar[dict[str, Any]] = ContextVar(
 class LLMCallRecorder:
     """Collect timing and usage metadata for benchmark LLM calls."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, progress_interval: int = 0) -> None:
         self._records: list[dict[str, Any]] = []
         self._next_sequence = 1
+        self._progress_interval = max(0, int(progress_interval))
 
     @contextmanager
     def context(self, **fields: Any) -> Iterator[None]:
@@ -63,6 +67,21 @@ class LLMCallRecorder:
         """Return aggregate latency/token metrics for all recorded calls."""
         return summarize_llm_calls(self._records)
 
+    def raise_if_unhealthy(
+        self,
+        config: Any,
+        *,
+        elapsed_seconds: float | None = None,
+    ) -> None:
+        """Raise when configured benchmark LLM health thresholds are exceeded."""
+        from benchmarks.llm_run_guard import raise_if_llm_run_unhealthy
+
+        raise_if_llm_run_unhealthy(
+            self._records,
+            config,
+            elapsed_seconds=elapsed_seconds,
+        )
+
     def record_completion_success(
         self,
         request: LLMCompletionRequest,
@@ -94,10 +113,7 @@ class LLMCallRecorder:
             metadata=request.metadata,
             usage={},
             latency_ms=latency_ms,
-            error={
-                "type": type(exc).__name__,
-                "message": _truncate(str(exc), 500),
-            },
+            error=_error_payload(exc),
         )
 
     def record_embedding_success(
@@ -131,10 +147,7 @@ class LLMCallRecorder:
             metadata=request.metadata,
             usage={},
             latency_ms=latency_ms,
-            error={
-                "type": type(exc).__name__,
-                "message": _truncate(str(exc), 500),
-            },
+            error=_error_payload(exc),
         )
 
     def _append_record(
@@ -147,7 +160,7 @@ class LLMCallRecorder:
         metadata: dict[str, Any],
         usage: dict[str, Any],
         latency_ms: float,
-        error: dict[str, str] | None,
+        error: dict[str, Any] | None,
     ) -> None:
         sequence = self._next_sequence
         self._next_sequence += 1
@@ -168,6 +181,25 @@ class LLMCallRecorder:
             "error": error,
         }
         self._records.append(record)
+        if (
+            self._progress_interval
+            and sequence % self._progress_interval == 0
+        ):
+            summary = self.summary()
+            logger.info(
+                "benchmark_llm_progress calls=%s failed=%s total_tokens=%s by_purpose=%s",
+                summary.get("total_calls"),
+                summary.get("failed_calls"),
+                int((summary.get("token_totals") or {}).get("total_tokens") or 0),
+                {
+                    purpose: {
+                        "calls": group.get("calls"),
+                        "failed_calls": group.get("failed_calls"),
+                    }
+                    for purpose, group in (summary.get("by_purpose") or {}).items()
+                    if isinstance(group, dict)
+                },
+            )
 
 
 def install_llm_call_recorder(
@@ -260,11 +292,17 @@ def summarize_llm_calls(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "total_calls": len(records),
         "failed_calls": sum(1 for record in records if record.get("error") is not None),
+        "first_attempt_failures": _first_attempt_failures(records),
+        "output_limit_failures": _error_class_counts(records).get("OutputLimitExceededError", 0),
+        "watchdog_bounded_retries": _watchdog_bounded_retries(records),
         "total_latency_ms": total_latency_ms,
         "mean_latency_ms": (total_latency_ms / len(records)) if records else None,
         "token_totals": _sum_token_counts(records),
         "cost_totals": _sum_cost_counts(records),
         "model_call_counts": dict(sorted(model_counter.items())),
+        "error_class_counts": _error_class_counts(records),
+        "sample_errors": _sample_errors(records),
+        "retry_success_counts": _retry_success_counts(records),
         "structured_output_repair": _structured_output_repair_summary(records),
         "by_purpose": {
             purpose: _summarize_group(group)
@@ -292,12 +330,27 @@ def merge_llm_call_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
                     "error": None,
                     "_summary_count": group.get("calls") or 0,
                     "_summary_failed": group.get("failed_calls") or 0,
+                    "_summary_first_attempt_failed": group.get("first_attempt_failures") or 0,
+                    "_summary_output_limit_failed": group.get("output_limit_failures") or 0,
+                    "_summary_watchdog_bounded_retries": group.get("watchdog_bounded_retries") or 0,
+                    "_summary_error_class_counts": group.get("error_class_counts") or {},
+                    "_summary_retry_success_counts": group.get("retry_success_counts") or {},
+                    "_summary_sample_errors": group.get("sample_errors") or [],
                 }
             )
     if not records:
         return summarize_llm_calls([])
     total_calls = sum(int(record.get("_summary_count") or 0) for record in records)
     failed_calls = sum(int(record.get("_summary_failed") or 0) for record in records)
+    first_attempt_failures = sum(
+        int(record.get("_summary_first_attempt_failed") or 0) for record in records
+    )
+    output_limit_failures = sum(
+        int(record.get("_summary_output_limit_failed") or 0) for record in records
+    )
+    watchdog_bounded_retries = sum(
+        int(record.get("_summary_watchdog_bounded_retries") or 0) for record in records
+    )
     total_latency_ms = sum(_number(record.get("latency_ms")) or 0.0 for record in records)
     by_purpose: dict[str, dict[str, Any]] = {}
     for record in records:
@@ -311,10 +364,19 @@ def merge_llm_call_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
                 "mean_latency_ms": None,
                 "token_totals": {},
                 "cost_totals": {},
+                "first_attempt_failures": 0,
+                "output_limit_failures": 0,
+                "watchdog_bounded_retries": 0,
+                "error_class_counts": {},
+                "retry_success_counts": {},
+                "sample_errors": [],
             },
         )
         group["calls"] += int(record.get("_summary_count") or 0)
         group["failed_calls"] += int(record.get("_summary_failed") or 0)
+        group["first_attempt_failures"] += int(record.get("_summary_first_attempt_failed") or 0)
+        group["output_limit_failures"] += int(record.get("_summary_output_limit_failed") or 0)
+        group["watchdog_bounded_retries"] += int(record.get("_summary_watchdog_bounded_retries") or 0)
         group["total_latency_ms"] += _number(record.get("latency_ms")) or 0.0
         group["token_totals"] = _merge_token_counts(
             group["token_totals"],
@@ -324,12 +386,26 @@ def merge_llm_call_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
             group["cost_totals"],
             record.get("cost_counts") if isinstance(record.get("cost_counts"), dict) else {},
         )
+        group["error_class_counts"] = _merge_int_counts(
+            group["error_class_counts"],
+            record.get("_summary_error_class_counts"),
+        )
+        group["retry_success_counts"] = _merge_int_counts(
+            group["retry_success_counts"],
+            record.get("_summary_retry_success_counts"),
+        )
+        if isinstance(record.get("_summary_sample_errors"), list):
+            group["sample_errors"].extend(record["_summary_sample_errors"][:3])
+            group["sample_errors"] = group["sample_errors"][:3]
     for group in by_purpose.values():
         calls = int(group["calls"])
         group["mean_latency_ms"] = group["total_latency_ms"] / calls if calls else None
     return {
         "total_calls": total_calls,
         "failed_calls": failed_calls,
+        "first_attempt_failures": first_attempt_failures,
+        "output_limit_failures": output_limit_failures,
+        "watchdog_bounded_retries": watchdog_bounded_retries,
         "total_latency_ms": total_latency_ms,
         "mean_latency_ms": total_latency_ms / total_calls if total_calls else None,
         "token_totals": _merge_many_token_counts(
@@ -343,6 +419,15 @@ def merge_llm_call_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(summary.get("cost_totals"), dict)
         ),
         "model_call_counts": _merge_model_counts(summaries),
+        "error_class_counts": _merge_many_int_counts(
+            summary.get("error_class_counts") for summary in summaries
+        ),
+        "sample_errors": _merge_sample_errors(
+            summary.get("sample_errors") for summary in summaries
+        ),
+        "retry_success_counts": _merge_many_int_counts(
+            summary.get("retry_success_counts") for summary in summaries
+        ),
         "structured_output_repair": _merge_structured_output_repair_summaries(summaries),
         "by_purpose": dict(sorted(by_purpose.items())),
     }
@@ -353,12 +438,110 @@ def _summarize_group(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "calls": len(records),
         "failed_calls": sum(1 for record in records if record.get("error") is not None),
+        "first_attempt_failures": _first_attempt_failures(records),
+        "output_limit_failures": _error_class_counts(records).get("OutputLimitExceededError", 0),
+        "watchdog_bounded_retries": _watchdog_bounded_retries(records),
         "total_latency_ms": total_latency_ms,
         "mean_latency_ms": total_latency_ms / len(records) if records else None,
         "token_totals": _sum_token_counts(records),
         "cost_totals": _sum_cost_counts(records),
+        "error_class_counts": _error_class_counts(records),
+        "sample_errors": _sample_errors(records),
+        "retry_success_counts": _retry_success_counts(records),
         "structured_output_repair": _structured_output_repair_summary(records),
     }
+
+
+def _error_class_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for record in records:
+        error_type = _record_error_type(record)
+        if error_type:
+            counts[error_type] += 1
+    return dict(sorted(counts.items()))
+
+
+def _first_attempt_failures(records: list[dict[str, Any]]) -> int:
+    failures = 0
+    for record in records:
+        if record.get("error") is None:
+            continue
+        metadata = record.get("metadata")
+        if not isinstance(metadata, dict):
+            failures += 1
+            continue
+        if _truthy(metadata.get("atagia_structured_output_retry")):
+            continue
+        if _truthy(metadata.get("atagia_structured_output_rescue")):
+            continue
+        if metadata.get("extraction_retry_mode"):
+            continue
+        failures += 1
+    return failures
+
+
+def _retry_success_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for record in records:
+        if record.get("error") is not None:
+            continue
+        metadata = record.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        if _truthy(metadata.get("atagia_structured_output_retry")):
+            counts["structured_output_retry"] += 1
+        if _truthy(metadata.get("atagia_structured_output_rescue")):
+            counts["structured_output_rescue"] += 1
+        retry_mode = metadata.get("extraction_retry_mode")
+        if isinstance(retry_mode, str) and retry_mode:
+            counts[f"extraction_{retry_mode}"] += 1
+    return dict(sorted(counts.items()))
+
+
+def _watchdog_bounded_retries(records: list[dict[str, Any]]) -> int:
+    count = 0
+    for record in records:
+        metadata = record.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("extraction_retry_mode") == "bounded_output":
+            count += 1
+    return count
+
+
+def _sample_errors(records: list[dict[str, Any]], *, limit: int = 3) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    for record in records:
+        error = record.get("error")
+        if not isinstance(error, dict):
+            continue
+        samples.append(
+            {
+                "sequence": record.get("sequence"),
+                "purpose": record.get("purpose") or "unknown",
+                "call_type": record.get("call_type"),
+                "request_model": record.get("request_model"),
+                "error_type": _record_error_type(record),
+                "message": _truncate(str(error.get("message") or ""), 300),
+                "finish_reason": error.get("finish_reason"),
+                "max_output_tokens": error.get("max_output_tokens"),
+                "partial_output_chars": error.get("partial_output_chars"),
+                "partial_output_excerpt": error.get("partial_output_excerpt"),
+                "metadata": record.get("metadata") if isinstance(record.get("metadata"), dict) else {},
+                "context": record.get("context") if isinstance(record.get("context"), dict) else {},
+            }
+        )
+        if len(samples) >= limit:
+            break
+    return samples
+
+
+def _record_error_type(record: dict[str, Any]) -> str | None:
+    error = record.get("error")
+    if not isinstance(error, dict):
+        return None
+    error_type = error.get("type")
+    if isinstance(error_type, str) and error_type:
+        return error_type
+    return "UnknownError"
 
 
 def _structured_output_repair_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -475,6 +658,45 @@ def _merge_numeric_counts(left: dict[str, Any], right: dict[str, Any]) -> dict[s
             continue
         totals[key] = totals.get(key, 0.0) + numeric
     return totals
+
+
+def _merge_int_counts(left: dict[str, Any], right: Any) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for source in (left, right):
+        if not isinstance(source, dict):
+            continue
+        for key, amount in source.items():
+            try:
+                counts[str(key)] += int(amount)
+            except (TypeError, ValueError):
+                continue
+    return dict(sorted(counts.items()))
+
+
+def _merge_many_int_counts(values: Any) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key, amount in value.items():
+            try:
+                counts[str(key)] += int(amount)
+            except (TypeError, ValueError):
+                continue
+    return dict(sorted(counts.items()))
+
+
+def _merge_sample_errors(values: Any, *, limit: int = 3) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, dict):
+                samples.append(item)
+                if len(samples) >= limit:
+                    return samples
+    return samples
 
 
 def _merge_model_counts(summaries: list[dict[str, Any]]) -> dict[str, int]:
@@ -611,6 +833,25 @@ def _metadata_summary(metadata: dict[str, Any]) -> dict[str, Any]:
         "atagia_structured_output_rescue_model",
         "atagia_structured_output_rescue_original_model",
         "atagia_structured_output_rescue_retry_attempts",
+        "extraction_retry_mode",
+        "extraction_retry_trigger_class",
+        "extraction_watchdog_abort_policy",
+        "extraction_watchdog_confidence",
+        "extraction_watchdog_elapsed_seconds",
+        "extraction_watchdog_evidence_type",
+        "extraction_watchdog_gate_trigger",
+        "extraction_watchdog_latest_output_excerpt_chars",
+        "extraction_watchdog_max_repeat_count",
+        "extraction_watchdog_max_repeat_ratio_tokens",
+        "extraction_watchdog_mechanical_evidence",
+        "extraction_watchdog_output_input_ratio",
+        "extraction_watchdog_output_tokens",
+        "extraction_watchdog_reason",
+        "extraction_watchdog_repeated_phrases",
+        "output_limit_finish_reason",
+        "output_limit_max_output_tokens",
+        "output_limit_partial_output_chars",
+        "output_limit_partial_output_excerpt",
     }
     return {
         key: _truncate(value, 300) if isinstance(value, str) else _json_safe(value)
@@ -625,6 +866,25 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return False
+
+
+def _error_payload(exc: Exception) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": type(exc).__name__,
+        "message": _truncate(str(exc), 500),
+    }
+    for attr in (
+        "provider",
+        "finish_reason",
+        "max_output_tokens",
+        "partial_output_chars",
+        "partial_output_excerpt",
+    ):
+        value = getattr(exc, attr, None)
+        if value is None:
+            continue
+        payload[attr] = _truncate(value, 1000) if isinstance(value, str) else _json_safe(value)
+    return payload
 
 
 def _json_safe(value: Any) -> Any:

@@ -192,6 +192,30 @@ async def create_openai_proxy_chat_completion(
         default=None,
         alias="X-Atagia-Character-Id",
     ),
+    x_atagia_active_presence_id: str | None = Header(
+        default=None,
+        alias="X-Atagia-Active-Presence-Id",
+    ),
+    x_atagia_mind_id: str | None = Header(
+        default=None,
+        alias="X-Atagia-Mind-Id",
+    ),
+    x_atagia_mind_topology: str | None = Header(
+        default=None,
+        alias="X-Atagia-Mind-Topology",
+    ),
+    x_atagia_embodiment_id: str | None = Header(
+        default=None,
+        alias="X-Atagia-Embodiment-Id",
+    ),
+    x_atagia_realm_id: str | None = Header(
+        default=None,
+        alias="X-Atagia-Realm-Id",
+    ),
+    x_atagia_space_id: str | None = Header(
+        default=None,
+        alias="X-Atagia-Space-Id",
+    ),
     x_atagia_incognito: str | None = Header(
         default=None,
         alias="X-Atagia-Incognito",
@@ -228,6 +252,10 @@ async def create_openai_proxy_chat_completion(
         default=None,
         alias="X-Atagia-Memory-Privacy-Mode",
     ),
+    x_atagia_response_mode: str | None = Header(
+        default=None,
+        alias="X-Atagia-Response-Mode",
+    ),
 ):
     try:
         auth = _authenticate_proxy(request, authorization, x_atagia_user_id)
@@ -246,6 +274,12 @@ async def create_openai_proxy_chat_completion(
                 user_persona_id_header=x_atagia_user_persona_id,
                 platform_id_header=x_atagia_platform_id,
                 character_id_header=x_atagia_character_id,
+                active_presence_id_header=x_atagia_active_presence_id,
+                mind_id_header=x_atagia_mind_id,
+                mind_topology_header=x_atagia_mind_topology,
+                embodiment_id_header=x_atagia_embodiment_id,
+                realm_id_header=x_atagia_realm_id,
+                space_id_header=x_atagia_space_id,
                 incognito_header=x_atagia_incognito,
                 cross_chat_memory_header=x_atagia_cross_chat_memory,
                 message_id_header=x_atagia_message_id,
@@ -255,6 +289,7 @@ async def create_openai_proxy_chat_completion(
                 ingest_origin_header=x_atagia_ingest_origin,
                 confirmation_strategy_header=x_atagia_confirmation_strategy,
                 memory_privacy_mode_header=x_atagia_memory_privacy_mode,
+                response_mode_header=x_atagia_response_mode,
             )
             return StreamingResponse(
                 stream,
@@ -274,6 +309,12 @@ async def create_openai_proxy_chat_completion(
             user_persona_id_header=x_atagia_user_persona_id,
             platform_id_header=x_atagia_platform_id,
             character_id_header=x_atagia_character_id,
+            active_presence_id_header=x_atagia_active_presence_id,
+            mind_id_header=x_atagia_mind_id,
+            mind_topology_header=x_atagia_mind_topology,
+            embodiment_id_header=x_atagia_embodiment_id,
+            realm_id_header=x_atagia_realm_id,
+            space_id_header=x_atagia_space_id,
             incognito_header=x_atagia_incognito,
             cross_chat_memory_header=x_atagia_cross_chat_memory,
             message_id_header=x_atagia_message_id,
@@ -283,6 +324,7 @@ async def create_openai_proxy_chat_completion(
             ingest_origin_header=x_atagia_ingest_origin,
             confirmation_strategy_header=x_atagia_confirmation_strategy,
             memory_privacy_mode_header=x_atagia_memory_privacy_mode,
+            response_mode_header=x_atagia_response_mode,
         )
     except ValueError as exc:
         return _openai_error_response(
@@ -291,7 +333,7 @@ async def create_openai_proxy_chat_completion(
             param="model" if "Unknown model" in str(exc) else None,
             code="model_not_found" if "Unknown model" in str(exc) else None,
         )
-    except LLMError as exc:
+    except LLMError:
         return _openai_error_response(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "LLM service unavailable",

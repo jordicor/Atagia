@@ -26,6 +26,7 @@ from atagia.models.schemas_api import (
 from atagia.models.schemas_jobs import (
     JobEnvelope,
     JobRunStatus,
+    JobType,
     StreamMessage,
 )
 from atagia.services.worker_circuit_breaker_service import WorkerCircuitBreakerService
@@ -165,6 +166,31 @@ class JobTrackingService:
             operation,
         )
 
+    async def mark_skipped(self, message: StreamMessage, *, reason: str | None = None) -> None:
+        async def operation() -> None:
+            envelope = JobEnvelope.model_validate(message.payload)
+            await self._repository.mark_skipped(envelope.job_id, reason=reason)
+
+        await self._run_best_effort(
+            "mark_skipped",
+            operation,
+        )
+
+    async def mark_failed(self, message: StreamMessage, exc: Exception) -> None:
+        async def operation() -> None:
+            envelope = JobEnvelope.model_validate(message.payload)
+            await self._repository.mark_failed(
+                envelope.job_id,
+                error_class=exc.__class__.__name__,
+                error_message=str(exc),
+            )
+            await self._maybe_auto_pause_after_failure(exc)
+
+        await self._run_best_effort(
+            "mark_failed",
+            operation,
+        )
+
     async def mark_dead_lettered(self, message: StreamMessage, exc: Exception) -> None:
         async def operation() -> None:
             envelope = JobEnvelope.model_validate(message.payload)
@@ -210,6 +236,22 @@ class JobTrackingService:
                 conversation_id=conversation_id,
                 namespace_filter=namespace_filter,
                 admin=admin,
+            )
+        )
+
+    async def source_message_job_exists(
+        self,
+        *,
+        user_id: str,
+        source_message_id: str,
+        job_type: JobType | str,
+    ) -> bool:
+        """Return whether a nonfailed tracked job already covers a source message."""
+        return await self._run_repository_operation(
+            lambda: self._repository.source_message_job_exists(
+                user_id=user_id,
+                source_message_id=source_message_id,
+                job_type=job_type,
             )
         )
 
@@ -571,7 +613,16 @@ class JobTrackingService:
         metadata: dict[str, Any] = {
             "message_count": len(envelope.message_ids),
         }
-        for key in ("job_kind", "chunked", "chunk_count", "fallback_count"):
+        for key in (
+            "job_kind",
+            "chunked",
+            "chunk_count",
+            "fallback_count",
+            "package_kind",
+            "reason",
+            "retrieval_profile_id",
+            "privacy_enforcement",
+        ):
             value = payload.get(key)
             if isinstance(value, (str, int, float, bool)) or value is None:
                 metadata[key] = value
@@ -580,6 +631,9 @@ class JobTrackingService:
             metadata["chunk_count"] = len(chunks)
         if envelope.operational_profile is not None:
             metadata["operational_profile"] = envelope.operational_profile.profile_id
+            metadata["operational_profile_snapshot"] = envelope.operational_profile.model_dump(
+                mode="json"
+            )
         return metadata
 
     @staticmethod

@@ -28,7 +28,6 @@ from atagia.models.schemas_jobs import (
     JobType,
     REVISE_STREAM_NAME,
     RevisionJobPayload,
-    WORKER_GROUP_NAME,
 )
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
 from atagia.services.embeddings import EmbeddingIndex
@@ -182,7 +181,11 @@ async def _build_runtime(outputs: list[str], embedding_index: EmbeddingIndex | N
     worker = RevisionWorker(
         storage_backend=backend,
         connection=connection,
-        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        llm_client=LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+            structured_output_retry_attempts=0,
+        ),
         clock=clock,
         embedding_index=embedding_index,
         settings=_settings(),

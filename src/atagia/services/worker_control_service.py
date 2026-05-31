@@ -60,10 +60,18 @@ async def wait_if_worker_claims_paused(
 ) -> bool:
     """Return True after waiting briefly when hard pause blocks stream claims."""
     if await control_service.allows_worker_claims():
+        await _close_read_transaction(control_service.connection)
         return False
+    await _close_read_transaction(control_service.connection)
     sleep_seconds = WORKER_CONTROL_POLL_SECONDS
     if block_ms is not None:
         sleep_seconds = min(sleep_seconds, max(0.0, block_ms / 1000))
     if sleep_seconds > 0:
         await asyncio.sleep(sleep_seconds)
     return True
+
+
+async def _close_read_transaction(connection: aiosqlite.Connection) -> None:
+    if not connection.in_transaction:
+        return
+    await connection.commit()

@@ -29,7 +29,6 @@ def _plan() -> RetrievalPlan:
         privacy_ceiling=1,
         retrieval_levels=[0],
         require_evidence_regrounding=False,
-        need_driven_boosts={},
         skip_retrieval=False,
     )
 
@@ -96,9 +95,13 @@ def test_candidate_custody_uses_safe_fields_without_raw_text_values() -> None:
 
     assert custody == [
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "candidate_id": "mem_1",
             "candidate_kind": "evidence",
+            "source_window_id": None,
+            "source_window_message_ids": [],
+            "source_backed": True,
+            "summary_only": False,
             "fusion_position": 1,
             "channels": ["fts"],
             "channel_ranks": {"fts": 1},
@@ -187,6 +190,10 @@ def test_candidate_custody_uses_safe_fields_without_raw_text_values() -> None:
                 },
             },
             "filter_reason": None,
+            "drop_stage": None,
+            "drop_reason": None,
+            "eviction_reason": None,
+            "high_value_rejected": False,
             "shortlisted": True,
             "shortlist_rank": 1,
             "shortlist_status": "shortlisted",
@@ -204,6 +211,7 @@ def test_candidate_custody_uses_safe_fields_without_raw_text_values() -> None:
             },
             "composer_decision": "selected",
             "selected": True,
+            "rendered": True,
             "selection_rank": 1,
         }
     ]
@@ -240,12 +248,282 @@ def test_candidate_custody_separates_filter_shortlist_score_and_composer_status(
 
     by_id = {record["candidate_id"]: record for record in custody}
     assert by_id["mem_filtered"]["filter_reason"] == "policy_filtered_scope"
+    assert by_id["mem_filtered"]["drop_stage"] == "post_scope_coordinate_lifecycle"
+    assert by_id["mem_filtered"]["drop_reason"] == "policy_filtered_scope"
     assert by_id["mem_filtered"]["shortlist_status"] == "filtered_before_shortlist"
     assert by_id["mem_filtered"]["score_status"] == "filtered_before_scoring"
     assert by_id["mem_filtered"]["composer_decision"] == "not_scored"
     assert by_id["mem_kept"]["filter_reason"] is None
+    assert by_id["mem_kept"]["drop_stage"] == "shortlist"
+    assert by_id["mem_kept"]["drop_reason"] == "not_shortlisted"
     assert by_id["mem_kept"]["shortlist_status"] == "not_shortlisted"
     assert by_id["mem_kept"]["score_status"] == "not_shortlisted"
+
+
+def test_candidate_custody_records_fact_facet_surface_class_when_selected() -> None:
+    candidate = {
+        "id": "facet_1",
+        "is_fact_facet_candidate": True,
+        "fact_facet_surface_class": "structured",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+    }
+    scored = ScoredCandidate(
+        memory_id="facet_1",
+        memory_object=candidate,
+        llm_applicability=0.9,
+        retrieval_score=0.7,
+        vitality_boost=0.0,
+        confirmation_boost=0.0,
+        need_boost=0.0,
+        penalty=0.0,
+        final_score=0.7,
+    )
+
+    custody = build_candidate_custody(
+        raw_candidates=[candidate],
+        filtered_candidates=[candidate],
+        shortlist=[candidate],
+        scored_candidates=[scored],
+        selected_memory_ids=["facet_1"],
+        retrieval_plan=_plan(),
+        filter_reasons_by_id={},
+    )
+
+    assert custody[0]["candidate_kind"] == "fact_facet"
+    assert custody[0]["selected"] is True
+    assert custody[0]["surface_class"] == "structured"
+
+
+def test_candidate_custody_marks_high_value_source_backed_eviction() -> None:
+    evidence = {
+        "id": "mem_evidence",
+        "object_type": "evidence",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "source_kind": "extracted",
+        "channel_ranks": {"fts": 1},
+        "retrieval_sources": ["fts"],
+    }
+    summary = {
+        "id": "mem_summary",
+        "object_type": "summary_view",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "source_kind": "summarized",
+        "channel_ranks": {"fts": 2},
+        "retrieval_sources": ["fts"],
+    }
+    scored = [
+        ScoredCandidate(
+            memory_id="mem_evidence",
+            memory_object=evidence,
+            llm_applicability=0.9,
+            retrieval_score=0.8,
+            vitality_boost=0.0,
+            confirmation_boost=0.0,
+            need_boost=0.0,
+            penalty=0.0,
+            final_score=0.82,
+        ),
+        ScoredCandidate(
+            memory_id="mem_summary",
+            memory_object=summary,
+            llm_applicability=0.95,
+            retrieval_score=0.75,
+            vitality_boost=0.0,
+            confirmation_boost=0.0,
+            need_boost=0.0,
+            penalty=0.0,
+            final_score=0.84,
+        ),
+    ]
+
+    custody = build_candidate_custody(
+        raw_candidates=[evidence, summary],
+        filtered_candidates=[evidence, summary],
+        shortlist=[evidence, summary],
+        scored_candidates=scored,
+        selected_memory_ids=["mem_summary"],
+        retrieval_plan=_plan(),
+        filter_reasons_by_id={},
+    )
+
+    by_id = {record["candidate_id"]: record for record in custody}
+    assert by_id["mem_evidence"]["source_backed"] is True
+    assert by_id["mem_evidence"]["summary_only"] is False
+    assert by_id["mem_evidence"]["high_value_rejected"] is True
+    assert by_id["mem_evidence"]["eviction_reason"] == "summary_preferred"
+    assert by_id["mem_summary"]["source_backed"] is False
+    assert by_id["mem_summary"]["summary_only"] is True
+
+
+def test_candidate_custody_eviction_reason_matches_drop_stage() -> None:
+    selected = {
+        "id": "mem_selected",
+        "object_type": "evidence",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "source_kind": "extracted",
+    }
+    filtered = {
+        "id": "mem_filtered",
+        "object_type": "evidence",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "source_kind": "extracted",
+    }
+    not_shortlisted_summary = {
+        "id": "mem_summary_rank_dropped",
+        "object_type": "summary_view",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "source_kind": "summarized",
+    }
+    low_applicability = {
+        "id": "mem_low_applicability",
+        "object_type": "evidence",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "source_kind": "extracted",
+    }
+    budget_exhausted = {
+        "id": "mem_budget",
+        "object_type": "evidence",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "source_kind": "extracted",
+    }
+    composer_strategy = {
+        "id": "mem_strategy",
+        "object_type": "evidence",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "source_kind": "extracted",
+    }
+    scored = [
+        ScoredCandidate(
+            memory_id="mem_selected",
+            memory_object=selected,
+            llm_applicability=0.9,
+            retrieval_score=0.8,
+            vitality_boost=0.0,
+            confirmation_boost=0.0,
+            need_boost=0.0,
+            penalty=0.0,
+            final_score=0.8,
+        ),
+        ScoredCandidate(
+            memory_id="mem_budget",
+            memory_object=budget_exhausted,
+            llm_applicability=0.9,
+            retrieval_score=0.8,
+            vitality_boost=0.0,
+            confirmation_boost=0.0,
+            need_boost=0.0,
+            penalty=0.0,
+            final_score=0.81,
+        ),
+        ScoredCandidate(
+            memory_id="mem_strategy",
+            memory_object=composer_strategy,
+            llm_applicability=0.9,
+            retrieval_score=0.8,
+            vitality_boost=0.0,
+            confirmation_boost=0.0,
+            need_boost=0.0,
+            penalty=0.0,
+            final_score=0.79,
+        ),
+    ]
+
+    custody = build_candidate_custody(
+        raw_candidates=[
+            selected,
+            filtered,
+            not_shortlisted_summary,
+            low_applicability,
+            budget_exhausted,
+            composer_strategy,
+        ],
+        filtered_candidates=[
+            selected,
+            not_shortlisted_summary,
+            low_applicability,
+            budget_exhausted,
+            composer_strategy,
+        ],
+        shortlist=[selected, low_applicability, budget_exhausted, composer_strategy],
+        scored_candidates=scored,
+        selected_memory_ids=["mem_selected"],
+        retrieval_plan=_plan(),
+        filter_reasons_by_id={"mem_filtered": "policy_filtered_scope"},
+    )
+
+    by_id = {record["candidate_id"]: record for record in custody}
+    assert by_id["mem_filtered"]["eviction_reason"] == "policy_filtered"
+    assert by_id["mem_low_applicability"]["eviction_reason"] == "low_applicability"
+    assert by_id["mem_summary_rank_dropped"]["eviction_reason"] == "lower_score"
+    assert by_id["mem_budget"]["eviction_reason"] == "budget_exhausted"
+
+    no_selection_custody = build_candidate_custody(
+        raw_candidates=[composer_strategy],
+        filtered_candidates=[composer_strategy],
+        shortlist=[composer_strategy],
+        scored_candidates=[scored[2]],
+        selected_memory_ids=[],
+        retrieval_plan=_plan(),
+        filter_reasons_by_id={},
+    )
+    assert no_selection_custody[0]["eviction_reason"] == "composer_strategy"
+
+
+def test_candidate_custody_high_value_rejected_requires_score_floor() -> None:
+    evidence = {
+        "id": "mem_evidence_low_score",
+        "object_type": "evidence",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "source_kind": "extracted",
+        "channel_ranks": {"fts": 1},
+        "retrieval_sources": ["fts"],
+    }
+    scored = ScoredCandidate(
+        memory_id="mem_evidence_low_score",
+        memory_object=evidence,
+        llm_applicability=0.49,
+        retrieval_score=0.49,
+        vitality_boost=0.0,
+        confirmation_boost=0.0,
+        need_boost=0.0,
+        penalty=0.0,
+        final_score=0.49,
+    )
+
+    custody = build_candidate_custody(
+        raw_candidates=[evidence],
+        filtered_candidates=[evidence],
+        shortlist=[evidence],
+        scored_candidates=[scored],
+        selected_memory_ids=[],
+        retrieval_plan=_plan(),
+        filter_reasons_by_id={},
+    )
+
+    assert custody[0]["fusion_position"] == 1
+    assert custody[0]["shortlist_rank"] == 1
+    assert custody[0]["score_rank"] == 1
+    assert custody[0]["high_value_rejected"] is False
 
 
 def test_candidate_custody_includes_coordinate_trace_without_payload_text() -> None:

@@ -104,7 +104,6 @@ def _plan(
         temporal_query_range=resolved_temporal_query_range,
         consequence_search_enabled=False,
         require_evidence_regrounding=False,
-        need_driven_boosts={},
         skip_retrieval=False,
     )
 
@@ -247,6 +246,42 @@ async def test_temporal_query_demotes_expired_ephemeral_after_horizon() -> None:
         assert [candidate["id"] for candidate in candidates] == ["mem_unknown"]
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_temporal_query_clamps_ephemeral_horizon_at_datetime_min() -> None:
+    connection, memories, search = await _build_runtime()
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_ephemeral",
+            temporal_type="ephemeral",
+            valid_from="0001-01-01T00:00:00+00:00",
+            valid_to=None,
+        )
+
+        candidates = await search.search(
+            _plan(
+                max_candidates=1,
+                temporal_query_range=TemporalQueryRange(
+                    start=datetime.min.replace(tzinfo=timezone.utc),
+                    end=datetime(1, 1, 2, 0, 0, tzinfo=timezone.utc),
+                ),
+            ),
+            "usr_1",
+        )
+
+        assert [candidate["id"] for candidate in candidates] == ["mem_ephemeral"]
+    finally:
+        await connection.close()
+
+
+def test_temporal_horizon_clamp_rejects_negative_hours() -> None:
+    with pytest.raises(ValueError, match="hours must be non-negative"):
+        CandidateSearch._subtract_non_negative_hours_clamped(
+            datetime(2026, 4, 1, tzinfo=timezone.utc),
+            -1,
+        )
 
 
 @pytest.mark.asyncio

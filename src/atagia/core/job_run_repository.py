@@ -26,6 +26,10 @@ ROOT_JOB_TYPES: tuple[JobType, ...] = (
     JobType.EXTRACT_MEMORY_CANDIDATES,
     JobType.PROJECT_CONTRACT,
 )
+RECOVERABLE_JOB_TYPES: tuple[JobType, ...] = (
+    *ROOT_JOB_TYPES,
+    JobType.REFRESH_INITIAL_CONTEXT_PACKAGE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +333,49 @@ class JobRunRepository(BaseRepository):
             (*parameters, *(status.value for status in NONTERMINAL_JOB_STATUSES)),
         )
 
+    async def source_message_job_exists(
+        self,
+        *,
+        user_id: str,
+        source_message_id: str,
+        job_type: JobType | str,
+        statuses: Iterable[JobRunStatus] | None = None,
+    ) -> bool:
+        """Return whether a tracked source-message job already exists."""
+        resolved_statuses = tuple(
+            statuses
+            if statuses is not None
+            else (
+                JobRunStatus.QUEUED,
+                JobRunStatus.RUNNING,
+                JobRunStatus.RETRYING,
+                JobRunStatus.SUCCEEDED,
+                JobRunStatus.SKIPPED,
+            )
+        )
+        if not resolved_statuses:
+            return False
+        status_placeholders = ", ".join("?" for _ in resolved_statuses)
+        cursor = await self._connection.execute(
+            """
+            SELECT 1
+            FROM worker_job_runs AS wjr,
+                 json_each(wjr.source_message_ids_json) AS source_message
+            WHERE wjr.user_id = ?
+              AND wjr.job_type = ?
+              AND CAST(source_message.value AS TEXT) = ?
+              AND wjr.status IN ({status_placeholders})
+            LIMIT 1
+            """.format(status_placeholders=status_placeholders),
+            (
+                user_id,
+                job_type.value if isinstance(job_type, JobType) else str(job_type),
+                source_message_id,
+                *(status.value for status in resolved_statuses),
+            ),
+        )
+        return await cursor.fetchone() is not None
+
     async def source_message_progress(
         self,
         *,
@@ -467,22 +514,22 @@ class JobRunRepository(BaseRepository):
         return int(cursor.rowcount or 0)
 
     async def nonterminal_root_jobs_for_recovery(self) -> list[dict[str, Any]]:
-        """Return message-derived nonterminal jobs that can be stream-recovered."""
-        root_placeholders = ", ".join("?" for _ in ROOT_JOB_TYPES)
+        """Return nonterminal jobs that can be stream-recovered."""
+        recoverable_placeholders = ", ".join("?" for _ in RECOVERABLE_JOB_TYPES)
         nonterminal_placeholders = ", ".join("?" for _ in NONTERMINAL_JOB_STATUSES)
         return await self._fetch_all(
             """
             SELECT *
             FROM worker_job_runs
-            WHERE job_type IN ({root_placeholders})
+            WHERE job_type IN ({recoverable_placeholders})
               AND status IN ({nonterminal_placeholders})
             ORDER BY queued_at ASC, job_id ASC
             """.format(
-                root_placeholders=root_placeholders,
+                recoverable_placeholders=recoverable_placeholders,
                 nonterminal_placeholders=nonterminal_placeholders,
             ),
             (
-                *(job_type.value for job_type in ROOT_JOB_TYPES),
+                *(job_type.value for job_type in RECOVERABLE_JOB_TYPES),
                 *(status.value for status in NONTERMINAL_JOB_STATUSES),
             ),
         )

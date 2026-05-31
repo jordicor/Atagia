@@ -16,6 +16,7 @@ from atagia.core.belief_repository import BeliefRepository
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.llm_output_limits import BELIEF_REVISER_MAX_OUTPUT_TOKENS
+from atagia.core.memory_provenance import MemoryProvenanceWriter
 from atagia.core.repositories import MemoryObjectRepository
 from atagia.memory.intent_classifier import are_claim_keys_equivalent
 from atagia.memory.intimacy_boundary_policy import (
@@ -25,6 +26,8 @@ from atagia.memory.intimacy_boundary_policy import (
 from atagia.memory.scope_utils import resolve_scope_identifiers
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
+    MemoryEvidenceSpeakerRelation,
+    MemoryEvidenceSupportKind,
     MemoryObjectType,
     MemoryScope,
     MemorySourceKind,
@@ -184,6 +187,7 @@ class BeliefReviser:
         self._embedding_index = embedding_index or NoneBackend()
         self._memory_repository = MemoryObjectRepository(connection, clock)
         self._belief_repository = BeliefRepository(connection, clock)
+        self._memory_provenance_writer = MemoryProvenanceWriter(connection, clock)
         resolved_settings = settings or Settings.from_env()
         self._revision_model = resolve_component_model(resolved_settings, "belief_reviser")
         self._classifier_model = resolve_component_model(resolved_settings, "intent_classifier")
@@ -401,7 +405,6 @@ class BeliefReviser:
                 LLMMessage(role="system", content="Choose a belief revision action as grounded JSON only."),
                 LLMMessage(role="user", content=prompt),
             ],
-            temperature=0.0,
             max_output_tokens=BELIEF_REVISER_MAX_OUTPUT_TOKENS,
             response_schema=RevisionDecision.model_json_schema(),
             metadata={
@@ -919,6 +922,15 @@ class BeliefReviser:
             intimacy_boundary_confidence=intimacy_boundary_confidence,
             preserve_verbatim=bool(int(base_belief.get("preserve_verbatim", 0))),
             status=MemoryStatus.ACTIVE,
+            language_codes=(
+                [
+                    str(code).strip().lower()
+                    for code in base_belief.get("language_codes_json", [])
+                    if str(code).strip()
+                ]
+                if isinstance(base_belief.get("language_codes_json"), list)
+                else None
+            ),
             valid_from=valid_from,
             valid_to=None,
             memory_owner_id=base_belief.get("memory_owner_id"),
@@ -937,6 +949,17 @@ class BeliefReviser:
             condition=condition,
             support_count=support_count,
             contradict_count=contradict_count,
+            commit=False,
+        )
+        await self._memory_provenance_writer.create_packet_from_source_messages(
+            user_id=str(base_belief["user_id"]),
+            memory_id=str(created["id"]),
+            source_message_ids=[source_message_id],
+            writer_kind="belief_revision",
+            support_kind=MemoryEvidenceSupportKind.INFERRED,
+            speaker_relation_to_subject=MemoryEvidenceSpeakerRelation.ASSISTANT_INFERENCE,
+            confidence=float(base_belief["confidence"]),
+            rationale="Successor belief is inferred from revision evidence.",
             commit=False,
         )
         return created

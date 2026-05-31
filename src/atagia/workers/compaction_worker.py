@@ -11,6 +11,7 @@ import aiosqlite
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.ids import new_job_id
+from atagia.core.initial_context_package_repository import InitialContextPackageRepository
 from atagia.core.repositories import ConversationRepository, UserRepository
 from atagia.core.storage_backend import StorageBackend
 from atagia.memory.compactor import Compactor
@@ -18,6 +19,7 @@ from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
     CompactionJobKind,
     CompactionJobPayload,
+    InitialContextPackageRefreshReason,
     JobEnvelope,
     JobType,
     StreamMessage,
@@ -26,6 +28,9 @@ from atagia.models.schemas_jobs import (
 )
 from atagia.models.schemas_memory import ConversationStatus
 from atagia.services.embeddings import EmbeddingIndex
+from atagia.services.initial_context_package_refresh_service import (
+    InitialContextPackageRefreshEnqueuer,
+)
 from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.llm_client import LLMClient, StructuredOutputError, TransientLLMError
 from atagia.services.worker_control_service import WorkerControlService, wait_if_worker_claims_paused
@@ -60,6 +65,13 @@ class CompactionWorker:
             clock,
             workers_enabled=resolved_settings.workers_enabled,
             settings=resolved_settings,
+        )
+        self._initial_context_package_refresh = InitialContextPackageRefreshEnqueuer(
+            storage_backend=storage_backend,
+            clock=clock,
+            job_tracking_service=self._job_tracking,
+            package_repository=InitialContextPackageRepository(connection, clock),
+            refresh_enabled=resolved_settings.initial_context_package_refresh_enabled,
         )
         self._compactor = Compactor(
             connection=connection,
@@ -162,6 +174,13 @@ class CompactionWorker:
                 user_id=job_payload.user_id,
                 conversation_id=job_payload.conversation_id,
             )
+            await self._enqueue_initial_context_package_refresh(
+                user_id=job_payload.user_id,
+                conversation_id=job_payload.conversation_id,
+                retrieval_profile_id=None,
+                parent=envelope,
+                privacy_enforcement=job_payload.privacy_enforcement,
+            )
             if (
                 not await self._broad_hierarchy_blocked(job_payload)
                 and await self._conversation_allows_hierarchy(
@@ -186,11 +205,25 @@ class CompactionWorker:
                 character_id=character_id,
                 workspace_id=job_payload.workspace_id,
             )
+            await self._enqueue_initial_context_package_refresh(
+                user_id=job_payload.user_id,
+                conversation_id=None,
+                retrieval_profile_id=None,
+                parent=envelope,
+                privacy_enforcement=job_payload.privacy_enforcement,
+            )
             return {"job_kind": job_payload.job_kind.value, "summary_id": summary_id}
         if job_payload.job_kind is CompactionJobKind.EPISODE:
             if await self._broad_hierarchy_blocked(job_payload):
                 return {"job_kind": job_payload.job_kind.value, "summary_ids": []}
             summary_ids = await self._compactor.generate_episodes(job_payload.user_id)
+            await self._enqueue_initial_context_package_refresh(
+                user_id=job_payload.user_id,
+                conversation_id=None,
+                retrieval_profile_id=None,
+                parent=envelope,
+                privacy_enforcement=job_payload.privacy_enforcement,
+            )
             await self._enqueue_hierarchy_job(
                 user_id=job_payload.user_id,
                 job_kind=CompactionJobKind.THEMATIC_PROFILE,
@@ -201,8 +234,34 @@ class CompactionWorker:
             if await self._broad_hierarchy_blocked(job_payload):
                 return {"job_kind": job_payload.job_kind.value, "summary_ids": []}
             summary_ids = await self._compactor.generate_thematic_profiles(job_payload.user_id)
+            await self._enqueue_initial_context_package_refresh(
+                user_id=job_payload.user_id,
+                conversation_id=None,
+                retrieval_profile_id=None,
+                parent=envelope,
+                privacy_enforcement=job_payload.privacy_enforcement,
+            )
             return {"job_kind": job_payload.job_kind.value, "summary_ids": summary_ids}
         raise ValueError(f"Unsupported compaction job_kind: {job_payload.job_kind}")
+
+    async def _enqueue_initial_context_package_refresh(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        retrieval_profile_id: str | None,
+        parent: JobEnvelope,
+        privacy_enforcement: str,
+    ) -> None:
+        await self._initial_context_package_refresh.enqueue_refresh(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            retrieval_profile_id=retrieval_profile_id,
+            reason=InitialContextPackageRefreshReason.SUMMARY_COMPACTION,
+            privacy_enforcement=privacy_enforcement,
+            operational_profile=parent.operational_profile,
+            fail_open=True,
+        )
 
     async def _enqueue_hierarchy_job(
         self,

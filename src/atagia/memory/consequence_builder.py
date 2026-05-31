@@ -15,7 +15,9 @@ from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.consequence_repository import ConsequenceRepository
 from atagia.core.ids import generate_prefixed_id
+from atagia.core.language_codes import normalize_optional_iso_639_1_code
 from atagia.core.llm_output_limits import CONSEQUENCE_BUILDER_MAX_OUTPUT_TOKENS
+from atagia.core.memory_provenance import MemoryProvenanceWriter
 from atagia.core.repositories import MemoryObjectRepository
 from atagia.memory.embodiment_policy import embodiment_visibility_sql_clause_for_context
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
@@ -28,6 +30,8 @@ from atagia.models.schemas_memory import (
     ConsequenceSentiment,
     ConsequenceSignal,
     ExtractionConversationContext,
+    MemoryEvidenceSpeakerRelation,
+    MemoryEvidenceSupportKind,
     MemoryObjectType,
     MemoryScope,
     MemorySensitivity,
@@ -61,6 +65,8 @@ Write a short, specific memory statement that would help avoid repeating mistake
 or reinforce successful patterns in the same workspace or conversation context.
 
 If the evidence is too weak to infer a tendency, return an empty tendency_text.
+When tendency_text is non-empty, set language_codes to the ISO 639-1 code(s) of
+the language actually used in tendency_text. Do not translate it.
 
 {data_only_instruction}
 
@@ -78,6 +84,7 @@ class _TendencyResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     tendency_text: str = Field(default="")
+    language_codes: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -89,6 +96,26 @@ class _TendencyResult(BaseModel):
                 normalized["tendency_text"] = memory_statement
                 return normalized
         return value
+
+    @staticmethod
+    def _normalize_language_code(value: str) -> str:
+        code = normalize_optional_iso_639_1_code(value)
+        if code is None:
+            raise ValueError("language_codes must contain ISO 639-1 codes")
+        return code
+
+    @model_validator(mode="after")
+    def validate_language_codes(self) -> "_TendencyResult":
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in self.language_codes:
+            code = self._normalize_language_code(value)
+            if code in seen:
+                continue
+            seen.add(code)
+            normalized.append(code)
+        self.language_codes = normalized
+        return self
 
 
 class ConsequenceChainBuilder:
@@ -107,6 +134,7 @@ class ConsequenceChainBuilder:
         self._memory_repository = MemoryObjectRepository(connection, clock)
         self._link_repository = BeliefRepository(connection, clock)
         self._consequence_repository = ConsequenceRepository(connection, clock)
+        self._memory_provenance_writer = MemoryProvenanceWriter(connection, clock)
         resolved_settings = settings or Settings.from_env()
         self._tendency_model = resolve_component_model(
             resolved_settings,
@@ -151,6 +179,15 @@ class ConsequenceChainBuilder:
                     user_id=user_id,
                     conversation_context=conversation_context,
                 )
+                await self._persist_consequence_packet(
+                    memory=action_memory,
+                    user_id=user_id,
+                    writer_kind="consequence_action",
+                    support_kind=MemoryEvidenceSupportKind.INFERRED,
+                    speaker_relation_to_subject=MemoryEvidenceSpeakerRelation.ASSISTANT_INFERENCE,
+                    confidence=signal.confidence,
+                    rationale="Action memory is inferred from the consequence signal.",
+                )
                 resolving_action = False
             outcome_memory = await self._create_outcome_memory(
                 signal=signal,
@@ -158,6 +195,15 @@ class ConsequenceChainBuilder:
                 action_memory=action_memory,
                 conversation_context=conversation_context,
                 resolved_policy=resolved_policy,
+            )
+            await self._persist_consequence_packet(
+                memory=outcome_memory,
+                user_id=user_id,
+                writer_kind="consequence_outcome",
+                support_kind=MemoryEvidenceSupportKind.DIRECT,
+                speaker_relation_to_subject=MemoryEvidenceSpeakerRelation.SELF_REPORT,
+                confidence=signal.confidence,
+                rationale="Outcome memory is grounded in the current source message.",
             )
             tendency_memory = await self._create_tendency_memory(
                 signal=signal,
@@ -168,6 +214,16 @@ class ConsequenceChainBuilder:
                 conversation_context=conversation_context,
                 resolved_policy=resolved_policy,
             )
+            if tendency_memory is not None:
+                await self._persist_consequence_packet(
+                    memory=tendency_memory,
+                    user_id=user_id,
+                    writer_kind="consequence_tendency",
+                    support_kind=MemoryEvidenceSupportKind.INFERRED,
+                    speaker_relation_to_subject=MemoryEvidenceSpeakerRelation.ASSISTANT_INFERENCE,
+                    confidence=max(0.0, min(1.0, signal.confidence * 0.8)),
+                    rationale="Tendency memory is inferred from linked action and outcome evidence.",
+                )
             chain_id = generate_prefixed_id("chn")
             timestamp = self._timestamp()
             await self._consequence_repository.create_chain(
@@ -229,6 +285,32 @@ class ConsequenceChainBuilder:
             outcome_memory_id=str(outcome_memory["id"]),
             tendency_belief_id=None if tendency_memory is None else str(tendency_memory["id"]),
             confidence=signal.confidence,
+        )
+
+    async def _persist_consequence_packet(
+        self,
+        *,
+        memory: dict[str, Any],
+        user_id: str,
+        writer_kind: str,
+        support_kind: MemoryEvidenceSupportKind,
+        speaker_relation_to_subject: MemoryEvidenceSpeakerRelation,
+        confidence: float,
+        rationale: str,
+    ) -> None:
+        source_message_ids = self._memory_source_message_ids(memory)
+        if not source_message_ids:
+            return
+        await self._memory_provenance_writer.create_packet_from_source_messages(
+            user_id=user_id,
+            memory_id=str(memory["id"]),
+            source_message_ids=source_message_ids,
+            writer_kind=writer_kind,
+            support_kind=support_kind,
+            speaker_relation_to_subject=speaker_relation_to_subject,
+            confidence=confidence,
+            rationale=rationale,
+            commit=False,
         )
 
     async def _resolve_action_memory(
@@ -393,6 +475,7 @@ class ConsequenceChainBuilder:
             object_type=MemoryObjectType.EVIDENCE,
             scope=storage_scope,
             canonical_text=signal.action_description,
+            language_codes=signal.language_codes,
             source_kind=MemorySourceKind.INFERRED,
             confidence=max(0.0, min(1.0, signal.confidence)),
             privacy_level=0,
@@ -455,6 +538,7 @@ class ConsequenceChainBuilder:
             object_type=MemoryObjectType.EVIDENCE,
             scope=storage_scope,
             canonical_text=signal.outcome_description,
+            language_codes=signal.language_codes,
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=signal.confidence,
             privacy_level=resolved_policy.privacy_ceiling,
@@ -596,7 +680,6 @@ class ConsequenceChainBuilder:
                     ),
                 ),
             ],
-            temperature=0.0,
             max_output_tokens=CONSEQUENCE_BUILDER_MAX_OUTPUT_TOKENS,
             response_schema=_TendencyResult.model_json_schema(),
             metadata={
@@ -804,6 +887,24 @@ class ConsequenceChainBuilder:
             "cross_realm_mode": conversation_context.cross_realm_mode.value,
             "display_name": conversation_context.active_realm_display_name,
         }
+
+    @staticmethod
+    def _memory_source_message_ids(memory: dict[str, Any]) -> list[str]:
+        payload = memory.get("payload_json") or {}
+        if not isinstance(payload, dict):
+            return []
+        raw_ids = payload.get("source_message_ids")
+        if not isinstance(raw_ids, list):
+            return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in raw_ids:
+            value = str(item).strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
 
     @staticmethod
     def _compute_consequence_hash(

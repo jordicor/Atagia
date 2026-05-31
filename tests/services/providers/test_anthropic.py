@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import anthropic
@@ -12,10 +13,12 @@ from atagia.services.llm_client import (
     LLMCompletionRequest,
     LLMError,
     LLMMessage,
+    LLMRequestError,
     LLMToolSpec,
     OutputLimitExceededError,
     TransientLLMError,
 )
+from atagia.models.schemas_memory import ExtractionResult
 from atagia.services.providers.anthropic import AnthropicProvider
 
 
@@ -74,12 +77,146 @@ def _request() -> LLMCompletionRequest:
             LLMMessage(role="system", content="You are helpful."),
             LLMMessage(role="user", content="Summarize this."),
         ],
-        max_output_tokens=512,
+        max_output_tokens=8192,
         include_thinking=True,
         metadata={"anthropic_prompt_cache": True, "thinking_budget_tokens": -1},
         tools=[LLMToolSpec(name="lookup", description="Lookup data", input_schema={"type": "object"})],
         response_schema={"type": "object", "properties": {"label": {"type": "string"}}},
     )
+
+
+def test_anthropic_uses_prompt_fallback_for_large_native_schema() -> None:
+    provider = AnthropicProvider(
+        api_key="test",
+        client=FakeAnthropicClient(FakeAnthropicMessages()),
+    )
+    request = _request().model_copy(
+        update={"response_schema": ExtractionResult.model_json_schema()}
+    )
+
+    assert provider.supports_native_structured_output_for(request) is False
+
+
+def test_anthropic_keeps_native_schema_for_small_schema() -> None:
+    provider = AnthropicProvider(
+        api_key="test",
+        client=FakeAnthropicClient(FakeAnthropicMessages()),
+    )
+
+    assert provider.supports_native_structured_output_for(_request()) is True
+
+
+def _schema_just_over_cap_unstripped_under_when_stripped() -> dict:
+    """Build a schema that exceeds the cap unstripped but fits once nullability is stripped.
+
+    Nullable optional fields emit ``anyOf: [{...}, {"type": "null"}]`` plus a
+    ``default: null``; ``strip_json_schema_nullability`` collapses those, so the
+    sent payload is materially smaller than the raw schema. The gate must decide
+    on the sent (stripped) payload, not the raw one.
+    """
+    from atagia.services.llm_schema import strip_json_schema_nullability
+    from atagia.services.providers.anthropic import (
+        _ANTHROPIC_NATIVE_SCHEMA_MAX_CHARS,
+        _sanitize_schema,
+    )
+
+    cap = _ANTHROPIC_NATIVE_SCHEMA_MAX_CHARS
+    for field_count in range(40, 400):
+        properties = {
+            f"field_{index:03d}": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+                "title": f"Field {index:03d}",
+            }
+            for index in range(field_count)
+        }
+        schema = {"type": "object", "properties": properties}
+        unstripped_len = len(
+            json.dumps(_sanitize_schema(schema), separators=(",", ":"), sort_keys=True)
+        )
+        stripped_len = len(
+            json.dumps(
+                _sanitize_schema(strip_json_schema_nullability(schema)),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        if stripped_len <= cap < unstripped_len:
+            return schema
+    raise AssertionError("could not craft a schema straddling the native-schema cap")
+
+
+def test_anthropic_gate_decides_on_sent_payload_not_raw_schema() -> None:
+    provider = AnthropicProvider(
+        api_key="test",
+        client=FakeAnthropicClient(FakeAnthropicMessages()),
+    )
+    schema = _schema_just_over_cap_unstripped_under_when_stripped()
+    request = _request().model_copy(update={"response_schema": schema})
+
+    # The raw schema is over the cap; the stripped payload (what is sent) is under it.
+    assert provider.supports_native_structured_output_for(request) is True
+
+
+def test_anthropic_gate_matches_sent_output_config_payload() -> None:
+    from atagia.services.providers.anthropic import (
+        _ANTHROPIC_NATIVE_SCHEMA_MAX_CHARS,
+        _output_config,
+    )
+
+    provider = AnthropicProvider(
+        api_key="test",
+        client=FakeAnthropicClient(FakeAnthropicMessages()),
+    )
+    schema = _schema_just_over_cap_unstripped_under_when_stripped()
+    request = _request().model_copy(update={"response_schema": schema})
+
+    gate = provider.supports_native_structured_output_for(request)
+    sent_schema = _output_config(request)["format"]["schema"]
+    sent_len = len(json.dumps(sent_schema, separators=(",", ":"), sort_keys=True))
+
+    assert gate is True
+    assert sent_len <= _ANTHROPIC_NATIVE_SCHEMA_MAX_CHARS
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_uses_output_config_with_format_and_effort() -> None:
+    final_message = SimpleNamespace(stop_reason="end_turn", usage=None)
+    stream_manager = FakeStreamManager(
+        events=[SimpleNamespace(type="text", text="ok")],
+        final_message=final_message,
+    )
+    messages = FakeAnthropicMessages(stream_manager=stream_manager)
+    provider = AnthropicProvider(api_key="test", client=FakeAnthropicClient(messages))
+    request = _request().model_copy(
+        update={"metadata": {"anthropic_output_effort": "high"}}
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == ["text", "done"]
+    stream_call = messages.stream_calls[0]
+    assert "output_format" not in stream_call
+    output_config = stream_call["output_config"]
+    assert output_config["format"]["type"] == "json_schema"
+    assert output_config["effort"] == "high"
+
+
+def test_anthropic_provider_passes_timeout_to_sdk(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_anthropic_client(**kwargs):
+        captured.update(kwargs)
+        return FakeAnthropicClient(FakeAnthropicMessages())
+
+    monkeypatch.setattr(
+        "atagia.services.providers.anthropic.AsyncAnthropic",
+        fake_anthropic_client,
+    )
+
+    AnthropicProvider(api_key="test", request_timeout_seconds=45.5)
+
+    assert captured["timeout"] == 45.5
 
 
 async def _collect_stream_events_and_error(provider: AnthropicProvider):
@@ -154,6 +291,29 @@ async def test_anthropic_complete_omits_temperature_for_opus_4_7() -> None:
     request = _request().model_copy(
         update={
             "model": "claude-opus-4-7",
+            "temperature": 0.0,
+        }
+    )
+
+    completion = await provider.complete(request)
+
+    assert completion.output_text == "judged"
+    assert "temperature" not in messages.create_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_omits_temperature_for_opus_4_8() -> None:
+    response = SimpleNamespace(
+        model="claude-opus-4-8",
+        content=[SimpleNamespace(type="text", text="judged")],
+        usage=None,
+        model_dump=lambda: {"id": "msg_1"},
+    )
+    messages = FakeAnthropicMessages(completion_response=response)
+    provider = AnthropicProvider(api_key="test", client=FakeAnthropicClient(messages))
+    request = _request().model_copy(
+        update={
+            "model": "anthropic/claude-opus-4-8",
             "temperature": 0.0,
         }
     )
@@ -309,7 +469,9 @@ async def test_anthropic_stream_maps_text_thinking_and_tool_calls() -> None:
     assert events[1].content == "answer"
     assert events[2].payload["name"] == "lookup"
     assert events[3].payload["usage"] == {"input_tokens": 3, "output_tokens": 5}
-    assert messages.stream_calls[0]["output_format"]["type"] == "json_schema"
+    stream_call = messages.stream_calls[0]
+    assert "output_format" not in stream_call
+    assert stream_call["output_config"]["format"]["type"] == "json_schema"
 
 
 @pytest.mark.asyncio
@@ -397,6 +559,10 @@ async def test_anthropic_sanitizes_schema_and_filters_non_numeric_usage() -> Non
                         "minimum": 0,
                         "maximum": 1,
                     },
+                    "note": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "default": None,
+                    },
                     "nested": {
                         "type": "object",
                         "additionalProperties": True,
@@ -455,13 +621,15 @@ async def test_anthropic_sanitizes_schema_and_filters_non_numeric_usage() -> Non
     completion_call = messages.create_calls[0]
     stream_call = messages.stream_calls[0]
     completion_schema = completion_call["output_config"]["format"]["schema"]
-    stream_schema = stream_call["output_format"]["schema"]
+    assert "output_format" not in stream_call
+    stream_schema = stream_call["output_config"]["format"]["schema"]
     assert completion_call["max_tokens"] == 8192
     assert stream_call["max_tokens"] == 8192
     assert completion.usage == {"input_tokens": 11, "output_tokens": 7}
     assert events[-1].payload["usage"] == {"input_tokens": 5, "output_tokens": 3}
     assert completion_schema["additionalProperties"] is False
     assert completion_schema["properties"]["nested"]["additionalProperties"] is False
+    assert completion_schema["properties"]["note"] == {"type": "string"}
     assert "minimum" not in completion_schema["properties"]["score"]
     assert "maximum" not in completion_schema["properties"]["score"]
     assert "minItems" not in completion_schema["properties"]["nested"]["properties"]["tags"]
@@ -534,5 +702,26 @@ async def test_anthropic_maps_retryable_and_permanent_errors() -> None:
 
     with pytest.raises(TransientLLMError):
         await transient_provider.complete(request)
-    with pytest.raises(LLMError):
+    with pytest.raises(LLMRequestError) as exc_info:
         await permanent_provider.complete(request)
+    assert exc_info.value.status_code == 400
+    assert isinstance(exc_info.value, LLMError)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_maps_non_transient_4xx_status_error_to_request_error() -> None:
+    request = _request()
+    not_found_error = anthropic.APIStatusError(
+        "not found",
+        response=httpx.Response(404, request=httpx.Request("POST", "https://example.com")),
+        body={},
+    )
+    provider = AnthropicProvider(
+        api_key="test",
+        client=FakeAnthropicClient(FakeAnthropicMessages(error=not_found_error)),
+    )
+
+    with pytest.raises(LLMRequestError) as exc_info:
+        await provider.complete(request)
+    assert exc_info.value.status_code == 404
+    assert not isinstance(exc_info.value, TransientLLMError)

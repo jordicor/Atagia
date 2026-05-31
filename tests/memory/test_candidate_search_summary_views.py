@@ -13,8 +13,10 @@ from atagia.core.repositories import ConversationRepository, MemoryObjectReposit
 from atagia.memory.candidate_search import CandidateSearch
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import (
+    IntimacyBoundary,
     MemoryObjectType,
     MemoryScope,
+    MemorySensitivity,
     MemorySourceKind,
     MemoryStatus,
     RetrievalPlan,
@@ -41,22 +43,34 @@ async def _build_runtime() -> tuple[object, MemoryObjectRepository, CandidateSea
     return connection, memories, search
 
 
-def _plan(*, retrieval_levels: list[int]) -> RetrievalPlan:
+def _plan(
+    *,
+    retrieval_levels: list[int],
+    privacy_enforcement: str = "enforce",
+) -> RetrievalPlan:
+    resolved_fts_queries = ["pottery"]
     return RetrievalPlan(
         assistant_mode_id="general_qa",
         workspace_id="wrk_1",
         conversation_id="cnv_1",
-        fts_queries=["pottery"],
+        fts_queries=resolved_fts_queries,
+        sub_query_plans=[
+            {
+                "text": resolved_fts_queries[0],
+                "fts_queries": resolved_fts_queries,
+            }
+        ],
+        query_type="default",
         scope_filter=[MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION],
         status_filter=[MemoryStatus.ACTIVE],
         vector_limit=0,
         max_candidates=10,
         max_context_items=8,
         privacy_ceiling=2,
+        privacy_enforcement=privacy_enforcement,
         retrieval_levels=retrieval_levels,
         consequence_search_enabled=False,
         require_evidence_regrounding=False,
-        need_driven_boosts={},
         skip_retrieval=False,
     )
 
@@ -233,5 +247,52 @@ async def test_level_zero_retrieval_keeps_user_id_isolation_for_conflicting_chun
 
         assert "sum_mem_sum_chunk_usr1" in candidate_ids
         assert "sum_mem_sum_chunk_usr2" not in candidate_ids
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_privacy_enforcement_off_retrieves_policy_blocked_chunk_mirror() -> None:
+    connection, memories, search = await _build_runtime()
+    try:
+        await memories.upsert_summary_mirror(
+            user_id="usr_1",
+            summary_view_id="sum_chunk_secret",
+            summary_kind=SummaryViewKind.CONVERSATION_CHUNK,
+            hierarchy_level=0,
+            summary_text="The pottery studio planning budget was $2,800.",
+            source_object_ids=[],
+            created_at="2026-04-05T12:00:00+00:00",
+            updated_at="2026-04-05T12:00:00+00:00",
+            index_text="pottery studio planning budget 2800",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="general_qa",
+            confidence=0.68,
+            stability=0.74,
+            vitality=0.18,
+            privacy_level=3,
+            intimacy_boundary=IntimacyBoundary.ROMANTIC_PRIVATE,
+            intimacy_boundary_confidence=0.9,
+            status=MemoryStatus.ACTIVE,
+            payload={},
+            sensitivity=MemorySensitivity.SECRET,
+        )
+
+        enforce_candidates = await search.search(
+            _plan(retrieval_levels=[0], privacy_enforcement="enforce"),
+            "usr_1",
+        )
+        off_candidates = await search.search(
+            _plan(retrieval_levels=[0], privacy_enforcement="off"),
+            "usr_1",
+        )
+
+        enforce_ids = [candidate["id"] for candidate in enforce_candidates]
+        off_ids = [candidate["id"] for candidate in off_candidates]
+
+        assert "sum_mem_sum_chunk_secret" not in enforce_ids
+        assert "sum_mem_sum_chunk_secret" in off_ids
     finally:
         await connection.close()

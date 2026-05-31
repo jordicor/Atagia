@@ -74,7 +74,11 @@ async def _build_runtime(*, outputs: list[str], fail: bool = False):
     provider = QueueProvider(outputs, fail=fail)
     builder = ConsequenceChainBuilder(
         connection=connection,
-        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        llm_client=LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+            structured_output_retry_attempts=0,
+        ),
         clock=clock,
     )
     resolved_policy = PolicyResolver().resolve(manifest_loader.get("coding_debug"), None, None)
@@ -337,6 +341,7 @@ async def test_builder_creates_action_outcome_and_tendency_links() -> None:
                 outcome_sentiment="negative",
                 confidence=0.8,
                 likely_action_message_id=None,
+                language_codes=["en"],
             ),
             user_id="usr_1",
             conversation_context=context,
@@ -357,6 +362,8 @@ async def test_builder_creates_action_outcome_and_tendency_links() -> None:
         assert outcome is not None
         assert tendency is not None
         assert action["source_kind"] == MemorySourceKind.INFERRED.value
+        assert action["language_codes_json"] == ["en"]
+        assert outcome["language_codes_json"] == ["en"]
     finally:
         await connection.close()
 

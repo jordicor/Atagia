@@ -25,6 +25,7 @@ from benchmarks.broad_list_coverage import (
 )
 from benchmarks.llm_metrics import summarize_llm_calls
 from atagia.core.config import Settings
+from atagia.core.llm_output_limits import ATAGIA_BENCH_ANSWER_MAX_OUTPUT_TOKENS
 from atagia.services.llm_client import LLMCompletionRequest, LLMMessage
 from atagia.services.providers import build_llm_client
 
@@ -98,7 +99,7 @@ def parse_answer_profile(raw: str) -> AnswerProfile:
     if not label or not raw_model:
         raise ValueError("Answer profile label and model are required")
     model = raw_model
-    max_output_tokens = 8192
+    max_output_tokens = ATAGIA_BENCH_ANSWER_MAX_OUTPUT_TOKENS
     if ":" in raw_model:
         model, raw_tokens = raw_model.rsplit(":", 1)
         model = model.strip()
@@ -108,6 +109,8 @@ def parse_answer_profile(raw: str) -> AnswerProfile:
             raise ValueError("Answer profile max output tokens must be an integer") from exc
     if max_output_tokens < 1:
         raise ValueError("Answer profile max output tokens must be positive")
+    if max_output_tokens < ATAGIA_BENCH_ANSWER_MAX_OUTPUT_TOKENS:
+        max_output_tokens = ATAGIA_BENCH_ANSWER_MAX_OUTPUT_TOKENS
     return AnswerProfile(
         label=label,
         model=model,
@@ -146,7 +149,6 @@ async def run_fixed_context_quality(
                 request = LLMCompletionRequest(
                     model=profile.model,
                     messages=_answer_messages(case.record),
-                    temperature=0.0,
                     max_output_tokens=profile.max_output_tokens,
                     metadata={
                         "purpose": "benchmark_fixed_context_answer_generation",

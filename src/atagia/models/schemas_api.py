@@ -22,6 +22,7 @@ from atagia.models.schemas_memory import (
     MemorySensitivity,
     MindTopology,
     OperationalSignals,
+    ResponseMode,
     TopicWorkingSetTrace,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
@@ -311,6 +312,12 @@ class ChatReplyRequest(BaseModel):
     space_id: str | None = None
     mode: str | None = None
     incognito: bool | None = None
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
+    authenticated_user_privilege_level: str | None = None
+    authenticated_user_is_atagia_master: bool = False
+    # Per-turn latency/quality override. ``None`` falls back to the global
+    # ``response_mode`` setting (default ``normal``).
+    response_mode: ResponseMode | None = None
 
     @field_validator("message_occurred_at")
     @classmethod
@@ -323,9 +330,13 @@ class ChatReplyRequest(BaseModel):
 
 
 ArtifactType = Literal["url", "pdf", "image", "base64", "file", "pasted_text", "other"]
-ArtifactSourceKind = Literal["host_embedded", "upload", "url", "base64", "pasted_text", "external_ref"]
+ArtifactSourceKind = Literal[
+    "host_embedded", "upload", "url", "base64", "pasted_text", "external_ref"
+]
 ArtifactStatus = Literal["queued", "processing", "ready", "failed", "deleted", "purged"]
-ArtifactRelationKind = Literal["attachment", "inline_ref", "citation", "imported_source"]
+ArtifactRelationKind = Literal[
+    "attachment", "inline_ref", "citation", "imported_source"
+]
 ArtifactChunkKind = Literal["ocr", "extracted", "parsed", "transcript", "summary"]
 
 
@@ -384,7 +395,12 @@ class AttachmentInput(BaseModel):
     def validate_source_payload(self) -> "AttachmentInput":
         if not any(
             value is not None
-            for value in (self.content_text, self.content_base64, self.url, self.source_ref)
+            for value in (
+                self.content_text,
+                self.content_base64,
+                self.url,
+                self.source_ref,
+            )
         ):
             raise ValueError(
                 "attachments require content_text, content_base64, url, or source_ref"
@@ -440,6 +456,12 @@ class SidecarContextRequest(BaseModel):
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
     confirmation_strategy: ConfirmationStrategy | None = None
     memory_privacy_mode: MemoryPrivacyMode | None = None
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
+    authenticated_user_privilege_level: str | None = None
+    authenticated_user_is_atagia_master: bool = False
+    # Per-turn latency/quality override. ``None`` falls back to the global
+    # ``response_mode`` setting (default ``normal``).
+    response_mode: ResponseMode | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -495,6 +517,9 @@ class SidecarIngestMessageRequest(BaseModel):
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
     confirmation_strategy: ConfirmationStrategy | None = None
     memory_privacy_mode: MemoryPrivacyMode | None = None
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
+    authenticated_user_privilege_level: str | None = None
+    authenticated_user_is_atagia_master: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -545,6 +570,9 @@ class SidecarAddResponseRequest(BaseModel):
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
     confirmation_strategy: ConfirmationStrategy | None = None
     memory_privacy_mode: MemoryPrivacyMode | None = None
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
+    authenticated_user_privilege_level: str | None = None
+    authenticated_user_is_atagia_master: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -698,7 +726,9 @@ class MemoryProcessingEstimate(BaseModel):
         if value[0] < 0 or value[1] < 0:
             raise ValueError("estimate_range_seconds values must be non-negative")
         if value[1] < value[0]:
-            raise ValueError("estimate_range_seconds upper bound must be >= lower bound")
+            raise ValueError(
+                "estimate_range_seconds upper bound must be >= lower bound"
+            )
         return value
 
 
@@ -920,11 +950,17 @@ class ContextResult(BaseModel):
 
     request_message_id: str | None = None
     system_prompt: str
-    topic_working_set: TopicWorkingSetTrace = Field(default_factory=TopicWorkingSetTrace)
+    topic_working_set: TopicWorkingSetTrace = Field(
+        default_factory=TopicWorkingSetTrace
+    )
     topic_working_set_block: str = ""
     recent_transcript: list[RecentTranscriptEntry] = Field(default_factory=list)
-    recent_transcript_omissions: list[RecentTranscriptOmission] = Field(default_factory=list)
+    recent_transcript_omissions: list[RecentTranscriptOmission] = Field(
+        default_factory=list
+    )
     recent_transcript_trace: RecentTranscriptTrace | None = None
+    context_envelope_trace: dict[str, Any] | None = None
+    initial_context_package: dict[str, Any] = Field(default_factory=dict)
     assistant_guidance: list[str] = Field(default_factory=list)
     memories: list[MemorySummary] = Field(default_factory=list)
     contract: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -936,6 +972,7 @@ class ContextResult(BaseModel):
     cache_age_seconds: float | None = None
     cache_source: Literal["sync", "cache_hit"] | None = None
     need_detection_skipped: bool = False
+    response_mode: Literal["normal", "fast", "smart_fast"] = "normal"
     memory_processing: MemoryProcessingStatus | None = None
 
 
@@ -1234,7 +1271,9 @@ class VerbatimPinCreateRequest(BaseModel):
             and self.target_span_end is not None
             and self.target_span_end < self.target_span_start
         ):
-            raise ValueError("target_span_end must be greater than or equal to target_span_start")
+            raise ValueError(
+                "target_span_end must be greater than or equal to target_span_start"
+            )
         return self
 
 
@@ -1274,7 +1313,9 @@ class VerbatimPinUpdateRequest(BaseModel):
 
     @field_validator("payload_json")
     @classmethod
-    def validate_payload_json(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+    def validate_payload_json(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
         if value is None:
             return None
         return dict(value)
@@ -1295,7 +1336,9 @@ class VerbatimPinUpdateRequest(BaseModel):
             and self.target_span_end is not None
             and self.target_span_end < self.target_span_start
         ):
-            raise ValueError("target_span_end must be greater than or equal to target_span_start")
+            raise ValueError(
+                "target_span_end must be greater than or equal to target_span_start"
+            )
         return self
 
 
@@ -1411,7 +1454,9 @@ class VerbatimPinRecord(BaseModel):
             and self.target_span_end is not None
             and self.target_span_end < self.target_span_start
         ):
-            raise ValueError("target_span_end must be greater than or equal to target_span_start")
+            raise ValueError(
+                "target_span_end must be greater than or equal to target_span_start"
+            )
         return self
 
 

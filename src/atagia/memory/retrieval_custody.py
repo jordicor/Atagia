@@ -1,4 +1,8 @@
-"""Safe per-candidate retrieval custody records."""
+"""Safe per-candidate retrieval custody records.
+
+Composer-stage rejections use generic composer reasons; ``missing_source_span``
+was retired with C2.2 instead of adding composer-to-custody plumbing.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,14 @@ from atagia.memory.mind_policy import candidate_allows_mind_boundary
 from atagia.memory.realm_policy import candidate_allows_realm_boundary
 from atagia.memory.space_policy import candidate_allows_space_boundary
 from atagia.models.schemas_memory import RetrievalPlan, ScoredCandidate
+
+_SOURCE_BACKED_OBJECT_TYPES = {"evidence", "interaction_contract", "state_snapshot"}
+_SOURCE_BACKED_SOURCE_KINDS = {"verbatim", "extracted"}
+_SUMMARY_ONLY_SOURCE_KINDS = {"summarized", "composed"}
+_STALE_STATUSES = {"superseded", "archived", "deleted"}
+# Same 0..1 scale as final_score; 0.5 is the minimum plausibly useful score for
+# surfacing a selected-vs-rejected custody discrepancy during trace review.
+_HIGH_VALUE_SCORE_FLOOR = 0.5
 
 
 def build_candidate_custody(
@@ -40,10 +52,31 @@ def build_candidate_custody(
         memory_id: rank
         for rank, memory_id in enumerate(selected_memory_ids, start=1)
     }
+    candidate_stage_flags: dict[str, tuple[bool, bool]] = {}
     subquery_indexes = {
         sub_query.text: index
         for index, sub_query in enumerate(retrieval_plan.sub_query_plans)
     }
+
+    selected_summary_only_count = 0
+    selected_source_backed_count = 0
+    selected_scores = [
+        scored_by_id[memory_id].final_score
+        for memory_id in selection_ranks
+        if memory_id in scored_by_id
+    ]
+    selected_min_score = min(selected_scores) if selected_scores else None
+    for _, candidate in candidate_rows:
+        candidate_id = str(candidate.get("id") or "")
+        source_backed = _is_source_backed_candidate(candidate)
+        summary_only = _is_summary_only_candidate(candidate)
+        candidate_stage_flags[candidate_id] = (source_backed, summary_only)
+        if candidate_id not in selection_ranks:
+            continue
+        if source_backed:
+            selected_source_backed_count += 1
+        if summary_only:
+            selected_summary_only_count += 1
 
     custody: list[dict[str, Any]] = []
     for fusion_position, candidate in candidate_rows:
@@ -52,10 +85,58 @@ def build_candidate_custody(
         shortlisted = candidate_id in shortlist_ranks
         scored = scored_by_id.get(candidate_id)
         selected = candidate_id in selection_ranks
+        source_backed, summary_only = candidate_stage_flags[candidate_id]
+        shortlist_status = _shortlist_status(
+            candidate_id,
+            shortlisted=shortlisted,
+            filter_reason=filter_reason,
+            filtered_ids=filtered_ids,
+        )
+        score_status = _score_status(
+            shortlisted=shortlisted,
+            scored=scored is not None,
+            filter_reason=filter_reason,
+        )
+        composer_decision = _composer_decision(
+            selected=selected,
+            scored=scored is not None,
+        )
+        drop_stage, drop_reason = _drop_stage_and_reason(
+            selected=selected,
+            candidate_id=candidate_id,
+            filtered_ids=filtered_ids,
+            filter_reason=filter_reason,
+            shortlisted=shortlisted,
+            scored=scored is not None,
+            shortlist_status=shortlist_status,
+            score_status=score_status,
+            composer_decision=composer_decision,
+        )
+        eviction_reason = _eviction_reason(
+            candidate=candidate,
+            selected=selected,
+            source_backed=source_backed,
+            filter_reason=filter_reason,
+            shortlist_status=shortlist_status,
+            score_status=score_status,
+            scored=scored,
+            selected_summary_only_count=selected_summary_only_count,
+            selected_source_backed_count=selected_source_backed_count,
+            selected_min_score=selected_min_score,
+        )
+        high_value_rejected = _is_high_value_rejected(
+            selected=selected,
+            source_backed=source_backed,
+            scored=scored,
+        )
         record: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "candidate_id": candidate_id,
             "candidate_kind": _candidate_kind(candidate),
+            "source_window_id": _source_window_id(candidate, candidate_id),
+            "source_window_message_ids": _source_window_message_ids(candidate),
+            "source_backed": source_backed,
+            "summary_only": summary_only,
             "fusion_position": fusion_position,
             "channels": _candidate_channels(candidate),
             "channel_ranks": _safe_rank_map(candidate.get("channel_ranks")),
@@ -93,29 +174,25 @@ def build_candidate_custody(
             "temporal_type": _safe_optional_str(candidate.get("temporal_type")),
             "coordinate_trace_v1": build_coordinate_trace(candidate, retrieval_plan),
             "filter_reason": filter_reason,
+            "drop_stage": drop_stage,
+            "drop_reason": drop_reason,
+            "eviction_reason": eviction_reason,
+            "high_value_rejected": high_value_rejected,
             "shortlisted": shortlisted,
             "shortlist_rank": shortlist_ranks.get(candidate_id),
-            "shortlist_status": _shortlist_status(
-                candidate_id,
-                shortlisted=shortlisted,
-                filter_reason=filter_reason,
-                filtered_ids=filtered_ids,
-            ),
+            "shortlist_status": shortlist_status,
             "scored": scored is not None,
             "score_rank": score_ranks.get(candidate_id),
-            "score_status": _score_status(
-                shortlisted=shortlisted,
-                scored=scored is not None,
-                filter_reason=filter_reason,
-            ),
+            "score_status": score_status,
             "scorer": _scorer_record(scored),
-            "composer_decision": _composer_decision(
-                selected=selected,
-                scored=scored is not None,
-            ),
+            "composer_decision": composer_decision,
             "selected": selected,
+            "rendered": selected,
             "selection_rank": selection_ranks.get(candidate_id),
         }
+        surface_class = _fact_facet_surface_class(candidate)
+        if surface_class is not None:
+            record["surface_class"] = surface_class
         custody.append(record)
     return custody
 
@@ -169,9 +246,167 @@ def _candidate_kind(candidate: dict[str, Any]) -> str:
         return "verbatim_pin"
     if candidate.get("is_artifact_chunk"):
         return "artifact_chunk"
+    if candidate.get("is_fact_facet_candidate"):
+        return "fact_facet"
     if candidate.get("is_verbatim_evidence_window"):
         return "verbatim_evidence_search_window"
     return str(candidate.get("object_type") or candidate.get("candidate_kind") or "memory_object")
+
+
+def _fact_facet_surface_class(candidate: dict[str, Any]) -> str | None:
+    if not candidate.get("is_fact_facet_candidate"):
+        return None
+    surface_class = _safe_optional_str(
+        candidate.get("fact_facet_surface_class") or candidate.get("surface_class")
+    )
+    if surface_class:
+        return surface_class
+    payload = candidate.get("payload_json")
+    if isinstance(payload, dict):
+        surface_class = _safe_optional_str(payload.get("surface_class"))
+        if surface_class:
+            return surface_class
+        fact_facet = payload.get("fact_facet")
+        if isinstance(fact_facet, dict):
+            return _safe_optional_str(fact_facet.get("surface_class"))
+    return None
+
+
+def _is_source_backed_candidate(candidate: dict[str, Any]) -> bool:
+    """Lenient custody-stage classifier for source-backed observability counts."""
+    if _is_summary_only_candidate(candidate):
+        return False
+    if (
+        candidate.get("is_verbatim_pin")
+        or candidate.get("is_artifact_chunk")
+        or candidate.get("is_fact_facet_candidate")
+        or candidate.get("is_verbatim_evidence_window")
+    ):
+        return True
+    object_type = str(candidate.get("object_type") or candidate.get("candidate_kind") or "")
+    source_kind = str(candidate.get("source_kind") or "")
+    if (
+        object_type in _SOURCE_BACKED_OBJECT_TYPES
+        and source_kind in _SOURCE_BACKED_SOURCE_KINDS
+    ):
+        return True
+    if object_type in {"artifact_chunk", "raw_source_span"}:
+        return True
+    return _has_source_reference(candidate)
+
+
+def _is_summary_only_candidate(candidate: dict[str, Any]) -> bool:
+    """Custody-stage classifier for candidates that need source recovery."""
+    object_type = str(candidate.get("object_type") or candidate.get("candidate_kind") or "")
+    source_kind = str(candidate.get("source_kind") or "")
+    if object_type == "summary_view":
+        return True
+    if source_kind in _SUMMARY_ONLY_SOURCE_KINDS:
+        return True
+    return False
+
+
+def _has_source_reference(candidate: dict[str, Any]) -> bool:
+    direct_keys = {
+        "source_message_id",
+        "source_span_id",
+        "source_hash",
+        "source_memory_id",
+    }
+    if any(_safe_optional_str(candidate.get(key)) for key in direct_keys):
+        return True
+    list_keys = {
+        "source_message_ids",
+        "source_memory_ids",
+        "source_object_ids",
+        "source_span_ids",
+    }
+    for key in list_keys:
+        value = candidate.get(key)
+        if isinstance(value, list) and any(str(item).strip() for item in value):
+            return True
+    payload = candidate.get("payload_json")
+    if not isinstance(payload, dict):
+        return False
+    for key in direct_keys:
+        if _safe_optional_str(payload.get(key)):
+            return True
+    for key in list_keys:
+        value = payload.get(key)
+        if isinstance(value, list) and any(str(item).strip() for item in value):
+            return True
+    return False
+
+
+def _eviction_reason(
+    *,
+    candidate: dict[str, Any],
+    selected: bool,
+    source_backed: bool,
+    filter_reason: str | None,
+    shortlist_status: str,
+    score_status: str,
+    scored: ScoredCandidate | None,
+    selected_summary_only_count: int,
+    selected_source_backed_count: int,
+    selected_min_score: float | None,
+) -> str | None:
+    if selected:
+        return None
+    if filter_reason is not None:
+        return "policy_filtered"
+    if str(candidate.get("status") or "") in _STALE_STATUSES:
+        return "stale_or_superseded"
+    if score_status == "llm_score_missing":
+        return "low_applicability"
+    if shortlist_status == "not_shortlisted":
+        return "lower_score"
+    if scored is not None:
+        if (
+            source_backed
+            and selected_source_backed_count == 0
+            and selected_summary_only_count > 0
+        ):
+            return "summary_preferred"
+        if (
+            selected_min_score is not None
+            and float(scored.final_score) < selected_min_score
+        ):
+            return "lower_score"
+        if selected_min_score is not None:
+            return "budget_exhausted"
+        return "composer_strategy"
+    return "unknown"
+
+
+def _is_high_value_rejected(
+    *,
+    selected: bool,
+    source_backed: bool,
+    scored: ScoredCandidate | None,
+) -> bool:
+    if selected or not source_backed:
+        return False
+    return scored is not None and float(scored.final_score) >= _HIGH_VALUE_SCORE_FLOOR
+
+
+def _source_window_id(candidate: dict[str, Any], candidate_id: str) -> str | None:
+    if not candidate.get("is_verbatim_evidence_window"):
+        return None
+    return candidate_id or None
+
+
+def _source_window_message_ids(candidate: dict[str, Any]) -> list[str]:
+    if not candidate.get("is_verbatim_evidence_window"):
+        return []
+    raw_ids = candidate.get("verbatim_evidence_window_message_ids")
+    if not isinstance(raw_ids, list):
+        payload = candidate.get("payload_json")
+        if isinstance(payload, dict):
+            raw_ids = payload.get("source_message_ids")
+    if not isinstance(raw_ids, list):
+        return []
+    return sorted({str(message_id) for message_id in raw_ids if str(message_id)})
 
 
 def _candidate_channels(candidate: dict[str, Any]) -> list[str]:
@@ -187,6 +422,8 @@ def _candidate_channels(candidate: dict[str, Any]) -> list[str]:
         channels.add("verbatim_pin")
     if candidate.get("is_artifact_chunk"):
         channels.add("artifact_chunk")
+    if candidate.get("is_fact_facet_candidate"):
+        channels.add("fact_facet")
     if candidate.get("is_verbatim_evidence_window"):
         channels.add("verbatim_evidence_search")
     return sorted(channels)
@@ -545,6 +782,31 @@ def _composer_decision(*, selected: bool, scored: bool) -> str:
     if scored:
         return "not_selected_after_scoring"
     return "not_scored"
+
+
+def _drop_stage_and_reason(
+    *,
+    selected: bool,
+    candidate_id: str,
+    filtered_ids: set[str],
+    filter_reason: str | None,
+    shortlisted: bool,
+    scored: bool,
+    shortlist_status: str,
+    score_status: str,
+    composer_decision: str,
+) -> tuple[str | None, str | None]:
+    if selected:
+        return None, None
+    if filter_reason is not None:
+        return "post_scope_coordinate_lifecycle", filter_reason
+    if candidate_id not in filtered_ids:
+        return "post_scope_coordinate_lifecycle", shortlist_status
+    if not shortlisted:
+        return "shortlist", shortlist_status
+    if not scored:
+        return "post_applicability_rerank", score_status
+    return "composer", composer_decision
 
 
 def _scorer_record(scored: ScoredCandidate | None) -> dict[str, Any] | None:

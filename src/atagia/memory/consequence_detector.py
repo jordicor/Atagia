@@ -17,6 +17,11 @@ from atagia.services.llm_client import (
     StructuredOutputError,
 )
 from atagia.services.model_resolution import resolve_component_model
+from atagia.services.prompt_authority import (
+    process_authority_context,
+    prompt_authority_metadata,
+    render_process_metadata_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,8 @@ If is_consequence=true:
 - outcome_sentiment must be one of: positive, negative, neutral.
 - confidence should reflect how explicit the connection is.
 - likely_action_message_id should be the best matching assistant message id from the provided history, or null.
+- language_codes must list the ISO 639-1 code(s) of the language actually used
+  in action_description and outcome_description. Do not translate them.
 
 {data_only_instruction}
 
@@ -87,6 +94,13 @@ class ConsequenceDetector:
     ) -> ConsequenceSignal | None:
         if role != "user":
             return None
+        authority_context = process_authority_context(
+            privacy_enforcement=conversation_context.privacy_enforcement,
+            user_id=conversation_context.user_id,
+            privilege_level=conversation_context.authenticated_user_privilege_level,
+            is_atagia_master=conversation_context.authenticated_user_is_atagia_master,
+            purpose="consequence_detection",
+        )
 
         request = LLMCompletionRequest(
             model=self._classifier_model,
@@ -104,10 +118,10 @@ class ConsequenceDetector:
                         message_text=message_text,
                         role=role,
                         recent_assistant_messages=recent_assistant_messages,
+                        authority_context=authority_context,
                     ),
                 ),
             ],
-            temperature=0.0,
             max_output_tokens=CONSEQUENCE_DETECTOR_MAX_OUTPUT_TOKENS,
             response_schema=ConsequenceSignal.model_json_schema(),
             metadata={
@@ -115,6 +129,10 @@ class ConsequenceDetector:
                 "conversation_id": conversation_context.conversation_id,
                 "assistant_mode_id": conversation_context.assistant_mode_id,
                 "purpose": "consequence_detection",
+                **prompt_authority_metadata(
+                    authority_context,
+                    prompt_authority_kind="process_metadata",
+                ),
             },
         )
         try:
@@ -148,16 +166,25 @@ class ConsequenceDetector:
         message_text: str,
         role: str,
         recent_assistant_messages: list[dict[str, Any]],
+        authority_context: Any,
     ) -> str:
         assistant_history = "\n".join(
             self._assistant_message_xml(message)
             for message in recent_assistant_messages
         ) or '<assistant_message id="none">(none)</assistant_message>'
-        return _PROMPT_TEMPLATE.format(
-            data_only_instruction=_DATA_ONLY_INSTRUCTION,
-            role=html.escape(role),
-            message_text=html.escape(message_text),
-            assistant_history=assistant_history,
+        return "\n\n".join(
+            (
+                render_process_metadata_block(
+                    authority_context,
+                    prompt_family="consequence_detection",
+                ),
+                _PROMPT_TEMPLATE.format(
+                    data_only_instruction=_DATA_ONLY_INSTRUCTION,
+                    role=html.escape(role),
+                    message_text=html.escape(message_text),
+                    assistant_history=assistant_history,
+                ),
+            )
         )
 
     @staticmethod

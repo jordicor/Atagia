@@ -84,7 +84,6 @@ class ConsentConfirmationClassifier:
                     content=self._build_prompt(message_text, prompt_text=prompt_text),
                 ),
             ],
-            temperature=0.0,
             max_output_tokens=CONSENT_CONFIRMATION_MAX_OUTPUT_TOKENS,
             response_schema=_ConsentReplyResult.model_json_schema(),
             metadata={

@@ -13,7 +13,6 @@ from openai import (
     APIStatusError,
     APITimeoutError,
     AsyncOpenAI,
-    BadRequestError,
     InternalServerError,
     RateLimitError,
 )
@@ -27,9 +26,14 @@ from atagia.services.llm_client import (
     LLMError,
     LLMPolicyBlockedError,
     LLMProvider,
+    LLMRequestError,
     LLMStreamEvent,
     OutputLimitExceededError,
     TransientLLMError,
+)
+from atagia.services.llm_schema import (
+    has_json_schema_nullability,
+    strip_json_schema_nullability,
 )
 
 
@@ -60,6 +64,21 @@ def _usage_to_dict(usage: Any) -> dict[str, Any]:
 def _is_transient_status_error(exc: APIStatusError) -> bool:
     status_code = getattr(exc, "status_code", None)
     return status_code == 429 or (isinstance(status_code, int) and status_code >= 500)
+
+
+def _status_error_to_llm_error(exc: APIStatusError) -> LLMError:
+    """Convert an OpenAI ``APIStatusError`` (incl. ``BadRequestError``) to an LLM error.
+
+    ``BadRequestError`` is a subclass of ``APIStatusError`` (status 400), so the
+    same conversion classifies retryable status codes as transient and non-
+    transient client-request-class 4xx as a typed ``LLMRequestError``.
+    """
+    if _is_transient_status_error(exc):
+        return TransientLLMError(str(exc))
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and 400 <= status_code < 500:
+        return LLMRequestError(str(exc), status_code=status_code)
+    return LLMError(str(exc))
 
 
 _TRANSIENT_API_ERROR_MESSAGE_FRAGMENTS = frozenset(
@@ -100,7 +119,7 @@ def _openai_reasoning_model_id(model: str) -> str:
 
 def _is_openai_reasoning_model(model: str) -> bool:
     model_id = _openai_reasoning_model_id(model)
-    return model_id == "chat-latest" or model_id.startswith(("gpt-5", "o1", "o3", "o4"))
+    return model_id in {"chat-latest", "gpt-chat-latest"} or model_id.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
 def _uses_max_completion_tokens(model: str, *, provider_name: str) -> bool:
@@ -141,13 +160,29 @@ def _finish_reason_error(
     finish_reason: str | None,
     *,
     choice: Any = None,
+    max_output_tokens: int | None = None,
+    partial_output_text: str | None = None,
+    partial_output_chars: int | None = None,
 ) -> LLMError | None:
     if finish_reason is None or finish_reason in _SUCCESS_FINISH_REASONS:
         return None
     if finish_reason in _TRUNCATION_FINISH_REASONS:
+        excerpt = _output_tail_excerpt(partial_output_text)
+        char_count = (
+            partial_output_chars
+            if partial_output_chars is not None
+            else len(partial_output_text)
+            if partial_output_text is not None
+            else None
+        )
         return OutputLimitExceededError(
             f"{provider_name} stopped because it reached max output tokens "
-            f"(finish_reason={finish_reason})"
+            f"(finish_reason={finish_reason})",
+            provider=provider_name,
+            finish_reason=finish_reason,
+            max_output_tokens=max_output_tokens,
+            partial_output_chars=char_count,
+            partial_output_excerpt=excerpt,
         )
     if finish_reason in _BLOCKED_FINISH_REASONS:
         return LLMPolicyBlockedError(
@@ -172,6 +207,14 @@ def _empty_content_error(
     return TransientLLMError(
         f"{provider_name} returned no output content (finish_reason={label})"
     )
+
+
+def _output_tail_excerpt(text: str | None, *, limit: int = 1000) -> str | None:
+    if text is None:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
 
 
 async def _close_provider_stream(stream: Any) -> None:
@@ -292,11 +335,19 @@ def _sanitize_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _response_format(schema: dict[str, Any] | None) -> dict[str, Any] | None:
+def _response_format(
+    schema: dict[str, Any] | None,
+    *,
+    preserve_nullability: bool = False,
+) -> dict[str, Any] | None:
     if schema is None:
         return None
-    strict = not _has_free_form_objects(schema)
-    sanitized = _sanitize_strict_schema(schema) if strict else schema
+    llm_schema = schema if preserve_nullability else strip_json_schema_nullability(schema)
+    strict = (
+        not _has_free_form_objects(llm_schema)
+        and (preserve_nullability or not has_json_schema_nullability(schema))
+    )
+    sanitized = _sanitize_strict_schema(llm_schema) if strict else llm_schema
     return {
         "type": "json_schema",
         "json_schema": {
@@ -318,8 +369,10 @@ class OpenAICompatibleProvider(LLMProvider):
         api_key: str,
         *,
         base_url: str | None = None,
+        embedding_base_url: str | None = None,
         default_headers: dict[str, str] | None = None,
         client: AsyncOpenAI | None = None,
+        embedding_client: AsyncOpenAI | None = None,
     ) -> None:
         self._client = client or AsyncOpenAI(
             api_key=api_key,
@@ -327,6 +380,17 @@ class OpenAICompatibleProvider(LLMProvider):
             default_headers=default_headers,
             max_retries=0,
         )
+        if embedding_client is not None:
+            self._embedding_client = embedding_client
+        elif embedding_base_url is not None and embedding_base_url != base_url:
+            self._embedding_client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=embedding_base_url,
+                default_headers=default_headers,
+                max_retries=0,
+            )
+        else:
+            self._embedding_client = self._client
 
     def _completion_kwargs(self, request: LLMCompletionRequest, *, stream: bool) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -394,6 +458,8 @@ class OpenAICompatibleProvider(LLMProvider):
             self.name,
             finish_reason,
             choice=first_choice,
+            max_output_tokens=request.max_output_tokens,
+            partial_output_text=output_text,
         )
         if finish_error is not None:
             raise finish_error
@@ -418,12 +484,8 @@ class OpenAICompatibleProvider(LLMProvider):
             raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
-        except BadRequestError as exc:
-            raise LLMError(str(exc)) from exc
         except APIStatusError as exc:
-            if _is_transient_status_error(exc):
-                raise TransientLLMError(str(exc)) from exc
-            raise LLMError(str(exc)) from exc
+            raise _status_error_to_llm_error(exc) from exc
         except APIError as exc:
             if _is_transient_api_error(exc):
                 raise TransientLLMError(str(exc)) from exc
@@ -440,17 +502,13 @@ class OpenAICompatibleProvider(LLMProvider):
         if request.metadata.get("user_id"):
             kwargs["user"] = str(request.metadata["user_id"])
         try:
-            response = await self._client.embeddings.create(**kwargs)
+            response = await self._embedding_client.embeddings.create(**kwargs)
         except json.JSONDecodeError as exc:
             raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
-        except BadRequestError as exc:
-            raise LLMError(str(exc)) from exc
         except APIStatusError as exc:
-            if _is_transient_status_error(exc):
-                raise TransientLLMError(str(exc)) from exc
-            raise LLMError(str(exc)) from exc
+            raise _status_error_to_llm_error(exc) from exc
         except APIError as exc:
             if _is_transient_api_error(exc):
                 raise TransientLLMError(str(exc)) from exc
@@ -474,12 +532,8 @@ class OpenAICompatibleProvider(LLMProvider):
             raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
-        except BadRequestError as exc:
-            raise LLMError(str(exc)) from exc
         except APIStatusError as exc:
-            if _is_transient_status_error(exc):
-                raise TransientLLMError(str(exc)) from exc
-            raise LLMError(str(exc)) from exc
+            raise _status_error_to_llm_error(exc) from exc
         except APIError as exc:
             if _is_transient_api_error(exc):
                 raise TransientLLMError(str(exc)) from exc
@@ -490,6 +544,8 @@ class OpenAICompatibleProvider(LLMProvider):
         emitted_output_or_tool = False
         pending_error: Exception | None = None
         last_finish_reason: str | None = None
+        output_tail = ""
+        output_char_count = 0
 
         try:
             async for chunk in stream:
@@ -508,6 +564,10 @@ class OpenAICompatibleProvider(LLMProvider):
                     content = _getattr_or_key(delta, "content")
                     if content:
                         emitted_output_or_tool = True
+                        output_char_count += len(str(content))
+                        output_tail = _output_tail_excerpt(
+                            f"{output_tail}{content}",
+                        ) or ""
                         yield LLMStreamEvent(type="text", content=content)
 
                     for tool_call in _getattr_or_key(delta, "tool_calls", []) or []:
@@ -542,6 +602,9 @@ class OpenAICompatibleProvider(LLMProvider):
                         self.name,
                         finish_reason,
                         choice=choice,
+                        max_output_tokens=request.max_output_tokens,
+                        partial_output_text=output_tail,
+                        partial_output_chars=output_char_count,
                     )
                     if finish_error is not None:
                         pending_error = finish_error
@@ -550,12 +613,8 @@ class OpenAICompatibleProvider(LLMProvider):
                     break
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
-        except BadRequestError as exc:
-            raise LLMError(str(exc)) from exc
         except APIStatusError as exc:
-            if _is_transient_status_error(exc):
-                raise TransientLLMError(str(exc)) from exc
-            raise LLMError(str(exc)) from exc
+            raise _status_error_to_llm_error(exc) from exc
         except APIError as exc:
             if _is_transient_api_error(exc):
                 raise TransientLLMError(str(exc)) from exc
@@ -578,3 +637,9 @@ class OpenAIProvider(OpenAICompatibleProvider):
     """Concrete OpenAI provider."""
 
     name = "openai"
+
+    def _completion_response_format(
+        self,
+        request: LLMCompletionRequest,
+    ) -> dict[str, Any] | None:
+        return _response_format(request.response_schema, preserve_nullability=True)

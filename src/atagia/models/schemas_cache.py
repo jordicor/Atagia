@@ -29,6 +29,7 @@ class ContextCacheEntry(BaseModel):
     memory_summaries: list[MemorySummary] = Field(default_factory=list)
     detected_needs: list[str] = Field(default_factory=list)
     source_retrieval_plan: dict[str, Any] = Field(default_factory=dict)
+    retrieval_diagnostics_for_guard: dict[str, Any] = Field(default_factory=dict)
     selected_memory_ids: list[str] = Field(default_factory=list)
     cached_at: str = Field(min_length=1)
     last_retrieval_message_seq: int = Field(ge=0)

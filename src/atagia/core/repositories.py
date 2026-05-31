@@ -14,11 +14,11 @@ from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.ids import generate_prefixed_id, new_memory_id
+from atagia.core.language_codes import normalize_optional_iso_639_1_code
 from atagia.core.storage_backend import StorageBackend
 from atagia.core.timestamps import normalize_optional_timestamp
 from atagia.models.schemas_memory import (
     ConversationStatus,
-    EmbodimentBoundaryMode,
     IntimacyBoundary,
     MemoryCategory,
     MindTopology,
@@ -92,6 +92,34 @@ _INTIMACY_RANK: dict[IntimacyBoundary, int] = {
     IntimacyBoundary.AMBIGUOUS_INTIMATE: 5,
     IntimacyBoundary.SAFETY_BLOCKED: 6,
 }
+_RETRIEVAL_SURFACE_TYPES = frozenset({"pivot", "anchor", "alias", "corpus_surface"})
+_RETRIEVAL_SURFACE_STATUSES = frozenset({"active", "stale", "deleted"})
+_RETRIEVAL_SURFACE_ANCHOR_TYPES = frozenset(
+    {
+        "proper_name",
+        "person",
+        "organization",
+        "location",
+        "code",
+        "quantity",
+        "date_time",
+        "address",
+        "quoted_phrase",
+        "attribute",
+        "concept",
+        "unknown",
+    }
+)
+_RETRIEVAL_SURFACE_ALIAS_KINDS = frozenset(
+    {
+        "translation",
+        "transliteration",
+        "spelling_variant",
+        "acronym_expansion",
+        "domain_synonym",
+        "corpus_surface",
+    }
+)
 
 
 def _max_sensitivity(*values: MemorySensitivity) -> MemorySensitivity:
@@ -167,13 +195,12 @@ def _encode_json(value: dict[str, Any] | list[Any] | None) -> str:
 def _encode_language_codes(language_codes: list[str] | None) -> str | None:
     if not language_codes:
         return None
-    normalized = sorted(
-        {
-            str(code).strip().lower()
-            for code in language_codes
-            if str(code).strip()
-        }
-    )
+    normalized_codes: set[str] = set()
+    for code in language_codes:
+        normalized_code = normalize_optional_iso_639_1_code(code)
+        if normalized_code is not None:
+            normalized_codes.add(normalized_code)
+    normalized = sorted(normalized_codes)
     if not normalized:
         return None
     return json_utils.dumps(normalized)
@@ -253,6 +280,82 @@ def summary_mirror_id(summary_view_id: str) -> str:
     return f"sum_mem_{summary_view_id}"
 
 
+def retrieval_surface_key(surface_text: str) -> str:
+    """Return the mechanical dedupe key for a retrieval-only surface."""
+    return " ".join(surface_text.split()).casefold()
+
+
+def retrieval_surface_id(
+    *,
+    user_id: str,
+    memory_id: str,
+    surface_type: str,
+    language_code: str | None,
+    anchor_type: str | None,
+    alias_kind: str | None,
+    surface_key: str,
+) -> str:
+    """Return a deterministic id for a memory retrieval surface signature."""
+    signature = "\x1f".join(
+        [
+            user_id,
+            memory_id,
+            surface_type,
+            language_code or "",
+            anchor_type or "",
+            alias_kind or "",
+            surface_key,
+        ]
+    )
+    digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:32]
+    return f"mrs_{digest}"
+
+
+def _retrieval_surface_nullable_key(value: str | None) -> str:
+    if value is None:
+        return "n"
+    return f"v:{len(value)}:{value}"
+
+
+def _normalize_required_surface_text(value: str) -> str:
+    normalized = " ".join(str(value).split())
+    if not normalized:
+        raise ValueError("surface_text must be non-empty")
+    return normalized
+
+
+def _normalize_retrieval_surface_type(value: str) -> str:
+    normalized = str(value).strip()
+    if normalized not in _RETRIEVAL_SURFACE_TYPES:
+        raise ValueError(f"Unsupported retrieval surface type: {value!r}")
+    return normalized
+
+
+def _normalize_retrieval_surface_status(value: str) -> str:
+    normalized = str(value).strip()
+    if normalized not in _RETRIEVAL_SURFACE_STATUSES:
+        raise ValueError(f"Unsupported retrieval surface status: {value!r}")
+    return normalized
+
+
+def _normalize_retrieval_anchor_type(value: str | None) -> str | None:
+    normalized = _normalize_optional_text(value)
+    if normalized is None:
+        return None
+    if normalized not in _RETRIEVAL_SURFACE_ANCHOR_TYPES:
+        raise ValueError(f"Unsupported retrieval anchor type: {value!r}")
+    return normalized
+
+
+def _normalize_retrieval_alias_kind(value: str | None) -> str | None:
+    normalized = _normalize_optional_text(value)
+    if normalized is None:
+        return None
+    if normalized not in _RETRIEVAL_SURFACE_ALIAS_KINDS:
+        raise ValueError(f"Unsupported retrieval alias kind: {value!r}")
+    return normalized
+
+
 def _status_filter_clause(
     column_name: str,
     statuses: tuple[MemoryStatus, ...] | None,
@@ -323,6 +426,305 @@ class BaseRepository:
         cursor = await self._connection.execute(query, parameters)
         rows = await cursor.fetchall()
         return [_decode_json_columns(row) for row in rows]
+
+
+class MemoryRetrievalSurfaceRepository(BaseRepository):
+    """Persistence for non-evidential memory retrieval surfaces."""
+
+    async def upsert_surface(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        surface_type: str,
+        surface_text: str,
+        anchor_type: str | None = None,
+        alias_kind: str | None = None,
+        language_code: str | None = None,
+        preserve_verbatim: bool = False,
+        non_evidential: bool = True,
+        confidence: float = 0.5,
+        derivation_kind: str = "manual_fixture",
+        derivation_model: str | None = None,
+        derivation_prompt_version: str | None = None,
+        derivation: dict[str, Any] | None = None,
+        status: str = "active",
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        if non_evidential is not True:
+            raise ValueError("retrieval surfaces must be non_evidential")
+        if not 0.0 <= float(confidence) <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0")
+        normalized_surface_text = _normalize_required_surface_text(surface_text)
+        normalized_surface_type = _normalize_retrieval_surface_type(surface_type)
+        normalized_anchor_type = _normalize_retrieval_anchor_type(anchor_type)
+        normalized_alias_kind = _normalize_retrieval_alias_kind(alias_kind)
+        normalized_language_code = _normalize_optional_text(language_code)
+        if normalized_language_code is not None:
+            normalized_language_code = normalized_language_code.lower()
+        normalized_derivation_kind = _normalize_optional_text(derivation_kind)
+        if normalized_derivation_kind is None:
+            raise ValueError("derivation_kind must be non-empty")
+        normalized_status = _normalize_retrieval_surface_status(status)
+
+        memory = await self._fetch_one(
+            """
+            SELECT id, user_id
+            FROM memory_objects
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (memory_id, user_id),
+        )
+        if memory is None:
+            raise ValueError("memory_id must belong to user_id")
+
+        surface_key = retrieval_surface_key(normalized_surface_text)
+        surface_id = retrieval_surface_id(
+            user_id=user_id,
+            memory_id=memory_id,
+            surface_type=normalized_surface_type,
+            language_code=normalized_language_code,
+            anchor_type=normalized_anchor_type,
+            alias_kind=normalized_alias_kind,
+            surface_key=surface_key,
+        )
+        timestamp = self._timestamp()
+        existing = await self._fetch_one(
+            """
+            SELECT *
+            FROM memory_retrieval_surfaces
+            WHERE user_id = ?
+              AND memory_id = ?
+              AND surface_type = ?
+              AND language_key = ?
+              AND anchor_type_key = ?
+              AND alias_kind_key = ?
+              AND surface_key = ?
+            """,
+            (
+                user_id,
+                memory_id,
+                normalized_surface_type,
+                _retrieval_surface_nullable_key(normalized_language_code),
+                _retrieval_surface_nullable_key(normalized_anchor_type),
+                _retrieval_surface_nullable_key(normalized_alias_kind),
+                surface_key,
+            ),
+        )
+        if existing is None:
+            await self._connection.execute(
+                """
+                INSERT INTO memory_retrieval_surfaces(
+                    id,
+                    user_id,
+                    memory_id,
+                    surface_type,
+                    anchor_type,
+                    alias_kind,
+                    language_code,
+                    surface_text,
+                    surface_key,
+                    preserve_verbatim,
+                    non_evidential,
+                    confidence,
+                    derivation_kind,
+                    derivation_model,
+                    derivation_prompt_version,
+                    derivation_json,
+                    status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    surface_id,
+                    user_id,
+                    memory_id,
+                    normalized_surface_type,
+                    normalized_anchor_type,
+                    normalized_alias_kind,
+                    normalized_language_code,
+                    normalized_surface_text,
+                    surface_key,
+                    int(preserve_verbatim),
+                    float(confidence),
+                    normalized_derivation_kind,
+                    _normalize_optional_text(derivation_model),
+                    _normalize_optional_text(derivation_prompt_version),
+                    _encode_json(derivation or {}),
+                    normalized_status,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        else:
+            surface_id = str(existing["id"])
+            await self._connection.execute(
+                """
+                UPDATE memory_retrieval_surfaces
+                SET surface_text = ?,
+                    preserve_verbatim = ?,
+                    non_evidential = 1,
+                    confidence = ?,
+                    derivation_kind = ?,
+                    derivation_model = ?,
+                    derivation_prompt_version = ?,
+                    derivation_json = ?,
+                    status = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND user_id = ?
+                """,
+                (
+                    normalized_surface_text,
+                    int(preserve_verbatim),
+                    float(confidence),
+                    normalized_derivation_kind,
+                    _normalize_optional_text(derivation_model),
+                    _normalize_optional_text(derivation_prompt_version),
+                    _encode_json(derivation or {}),
+                    normalized_status,
+                    timestamp,
+                    surface_id,
+                    user_id,
+                ),
+            )
+        if commit:
+            await self._connection.commit()
+        refreshed = await self.get_surface(surface_id=surface_id, user_id=user_id)
+        if refreshed is None:
+            raise RuntimeError(f"Failed to upsert retrieval surface {surface_id}")
+        return refreshed
+
+    async def get_surface(
+        self,
+        *,
+        surface_id: str,
+        user_id: str,
+    ) -> dict[str, Any] | None:
+        return await self._fetch_one(
+            """
+            SELECT *
+            FROM memory_retrieval_surfaces
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (surface_id, user_id),
+        )
+
+    async def list_surfaces_for_memory(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_all(
+            """
+            SELECT *
+            FROM memory_retrieval_surfaces
+            WHERE user_id = ?
+              AND memory_id = ?
+            ORDER BY surface_type ASC, surface_key ASC, id ASC
+            """,
+            (user_id, memory_id),
+        )
+
+    async def mark_surfaces_stale_for_memory(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        commit: bool = True,
+    ) -> int:
+        timestamp = self._timestamp()
+        cursor = await self._connection.execute(
+            """
+            UPDATE memory_retrieval_surfaces
+            SET status = 'stale',
+                updated_at = ?
+            WHERE user_id = ?
+              AND memory_id = ?
+              AND status != 'deleted'
+            """,
+            (timestamp, user_id, memory_id),
+        )
+        if commit:
+            await self._connection.commit()
+        return int(cursor.rowcount or 0)
+
+    async def mark_surfaces_deleted_for_memory(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        commit: bool = True,
+    ) -> int:
+        timestamp = self._timestamp()
+        cursor = await self._connection.execute(
+            """
+            UPDATE memory_retrieval_surfaces
+            SET status = 'deleted',
+                updated_at = ?
+            WHERE user_id = ?
+              AND memory_id = ?
+            """,
+            (timestamp, user_id, memory_id),
+        )
+        if commit:
+            await self._connection.commit()
+        return int(cursor.rowcount or 0)
+
+    async def delete_surfaces_for_memory(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        commit: bool = True,
+    ) -> int:
+        cursor = await self._connection.execute(
+            """
+            DELETE FROM memory_retrieval_surfaces
+            WHERE user_id = ?
+              AND memory_id = ?
+            """,
+            (user_id, memory_id),
+        )
+        if commit:
+            await self._connection.commit()
+        return int(cursor.rowcount or 0)
+
+    async def search_active_surfaces(
+        self,
+        *,
+        user_id: str,
+        fts_query: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        return await self._fetch_all(
+            """
+            SELECT
+                mrs.*,
+                mo.status AS memory_status,
+                mo.privacy_level AS memory_privacy_level
+            FROM memory_retrieval_surfaces_fts
+            JOIN memory_retrieval_surfaces AS mrs
+              ON mrs._rowid = memory_retrieval_surfaces_fts.rowid
+            JOIN memory_objects AS mo
+              ON mo.id = mrs.memory_id
+            WHERE mrs.user_id = ?
+              AND mo.user_id = ?
+              AND mrs.status = 'active'
+              AND mo.status = ?
+              AND memory_retrieval_surfaces_fts MATCH ?
+            ORDER BY mrs.updated_at DESC, mrs.id ASC
+            LIMIT ?
+            """,
+            (user_id, user_id, MemoryStatus.ACTIVE.value, fts_query, limit),
+        )
 
 
 class UserRepository(BaseRepository):
@@ -1778,6 +2180,45 @@ class MemoryObjectRepository(BaseRepository):
         super().__init__(connection, clock)
         self._settings = settings or Settings.from_env()
 
+    async def _mark_retrieval_surfaces_stale_for_memory(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        timestamp: str,
+    ) -> int:
+        cursor = await self._connection.execute(
+            """
+            UPDATE memory_retrieval_surfaces
+            SET status = 'stale',
+                updated_at = ?
+            WHERE user_id = ?
+              AND memory_id = ?
+              AND status != 'deleted'
+            """,
+            (timestamp, user_id, memory_id),
+        )
+        return int(cursor.rowcount or 0)
+
+    async def _mark_retrieval_surfaces_deleted_for_memory(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        timestamp: str,
+    ) -> int:
+        cursor = await self._connection.execute(
+            """
+            UPDATE memory_retrieval_surfaces
+            SET status = 'deleted',
+                updated_at = ?
+            WHERE user_id = ?
+              AND memory_id = ?
+            """,
+            (timestamp, user_id, memory_id),
+        )
+        return int(cursor.rowcount or 0)
+
     async def get_memory_object(self, memory_id: str, user_id: str) -> dict[str, Any] | None:
         return await self._fetch_one(
             """
@@ -1886,6 +2327,7 @@ class MemoryObjectRepository(BaseRepository):
         commit: bool = True,
     ) -> bool:
         """Archive an active memory object and report whether a row was updated."""
+        timestamp = self._timestamp()
         cursor = await self._connection.execute(
             """
             UPDATE memory_objects
@@ -1897,12 +2339,18 @@ class MemoryObjectRepository(BaseRepository):
             """,
             (
                 MemoryStatus.ARCHIVED.value,
-                self._timestamp(),
+                timestamp,
                 memory_id,
                 user_id,
                 MemoryStatus.ACTIVE.value,
             ),
         )
+        if cursor.rowcount:
+            await self._mark_retrieval_surfaces_stale_for_memory(
+                user_id=user_id,
+                memory_id=memory_id,
+                timestamp=timestamp,
+            )
         if commit:
             await self._connection.commit()
         return cursor.rowcount > 0
@@ -1970,6 +2418,18 @@ class MemoryObjectRepository(BaseRepository):
             """.format(status_clause=status_clause),
             tuple(parameters),
         )
+        if status is MemoryStatus.DELETED:
+            await self._mark_retrieval_surfaces_deleted_for_memory(
+                user_id=user_id,
+                memory_id=memory_id,
+                timestamp=timestamp,
+            )
+        elif status is not MemoryStatus.ACTIVE:
+            await self._mark_retrieval_surfaces_stale_for_memory(
+                user_id=user_id,
+                memory_id=memory_id,
+                timestamp=timestamp,
+            )
         if commit:
             await self._connection.commit()
         return await self.get_memory_object(memory_id, user_id)
@@ -2007,10 +2467,12 @@ class MemoryObjectRepository(BaseRepository):
         platform_locked: bool = False,
         platform_id_lock: str | None = None,
         scope_canonical: str | None = None,
+        language_codes: list[str] | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         mirror_id = summary_mirror_id(summary_view_id)
         existing = await self.get_memory_object(mirror_id, user_id)
+        language_codes_json = _encode_language_codes(language_codes)
         normalized_source_ids = [
             str(item).strip()
             for item in source_object_ids
@@ -2055,10 +2517,17 @@ class MemoryObjectRepository(BaseRepository):
                 platform_locked=platform_locked,
                 platform_id_lock=platform_id_lock,
                 scope_canonical=scope_canonical,
+                language_codes=language_codes,
                 commit=commit,
             )
 
         storage_scope = _legacy_scope_to_canonical(scope)
+        timestamp = self._timestamp()
+        await self._mark_retrieval_surfaces_stale_for_memory(
+            user_id=user_id,
+            memory_id=mirror_id,
+            timestamp=timestamp,
+        )
         await self._connection.execute(
             """
             UPDATE memory_objects
@@ -2087,6 +2556,7 @@ class MemoryObjectRepository(BaseRepository):
                 platform_locked = ?,
                 platform_id_lock = ?,
                 preserve_verbatim = ?,
+                language_codes_json = ?,
                 status = ?,
                 updated_at = ?
             WHERE id = ?
@@ -2125,8 +2595,9 @@ class MemoryObjectRepository(BaseRepository):
                 int(platform_locked),
                 platform_id_lock,
                 0,
+                language_codes_json,
                 status.value,
-                self._timestamp(),
+                timestamp,
                 mirror_id,
                 user_id,
             ),
@@ -2137,6 +2608,28 @@ class MemoryObjectRepository(BaseRepository):
         if refreshed is None:
             raise ValueError(f"Unknown summary mirror memory_id: {mirror_id}")
         return refreshed
+
+    async def latest_summary_mirror_payload(
+        self,
+        *,
+        user_id: str,
+        summary_kind: SummaryViewKind,
+    ) -> dict[str, Any] | None:
+        row = await self._fetch_one(
+            """
+            SELECT payload_json
+            FROM memory_objects
+            WHERE user_id = ?
+              AND json_extract(payload_json, '$.summary_kind') = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (user_id, summary_kind.value),
+        )
+        if row is None:
+            return None
+        payload = row.get("payload_json")
+        return payload if isinstance(payload, dict) else None
 
     async def create_memory_object(
         self,
@@ -2897,6 +3390,54 @@ class MemoryObjectRepository(BaseRepository):
                 resolved_platform_id_lock,
                 resolved_extraction_hash,
                 resolved_status,
+                timestamp,
+                memory_id,
+                user_id,
+            ),
+        )
+        if commit:
+            await self._connection.commit()
+        refreshed = await self.get_memory_object(memory_id, user_id)
+        if refreshed is None:
+            raise ValueError(f"Unknown memory_id: {memory_id}")
+        return refreshed
+
+    async def fill_missing_memory_object_language_codes(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        language_codes: list[str],
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Fill language metadata only when an existing row has none."""
+        existing = await self.get_memory_object(memory_id, user_id)
+        if existing is None:
+            raise ValueError(f"Unknown memory_id: {memory_id}")
+        encoded_language_codes = _encode_language_codes(language_codes)
+        if encoded_language_codes is None:
+            return existing
+
+        timestamp = self._timestamp()
+        await self._connection.execute(
+            """
+            UPDATE memory_objects
+            SET language_codes_json = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+              AND (
+                    language_codes_json IS NULL
+                    OR TRIM(language_codes_json) = ''
+                    OR json_valid(language_codes_json) = 0
+                    OR (
+                        json_valid(language_codes_json) = 1
+                        AND json_array_length(language_codes_json) = 0
+                    )
+                  )
+            """,
+            (
+                encoded_language_codes,
                 timestamp,
                 memory_id,
                 user_id,

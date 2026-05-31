@@ -24,6 +24,11 @@ from atagia.models.schemas_jobs import (
     StreamMessage,
     WorkerControlMode,
 )
+from atagia.models.schemas_memory import (
+    OperationalProfileSnapshot,
+    OperationalRiskLevel,
+    OperationalSignals,
+)
 from atagia.services.chat_support import enqueue_message_jobs
 from atagia.services.job_tracking_service import JobTrackingService, render_memory_processing_status_block
 from atagia.services.llm_client import TransientLLMError
@@ -107,6 +112,17 @@ def _message_job(
             character_id=character_id,
         ).model_dump(mode="json"),
         created_at=created_at or datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc),
+    )
+
+
+def _operational_snapshot(token: str) -> OperationalProfileSnapshot:
+    return OperationalProfileSnapshot(
+        profile_id="normal",
+        signals=OperationalSignals(),
+        risk_level=OperationalRiskLevel.NORMAL,
+        authorized=True,
+        profile_hash=f"profile-{token}",
+        token=token,
     )
 
 
@@ -231,6 +247,30 @@ async def test_enqueue_message_jobs_records_success_and_enqueue_failure() -> Non
         assert failed["status"] == JobRunStatus.FAILED.value
         assert failed["error_class"] == "RuntimeError"
         assert failed["error_message"] == "stream unavailable"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_job_tracking_stores_full_operational_profile_snapshot() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        await _seed_scope(connection, clock)
+        service = JobTrackingService(connection, clock, workers_enabled=True)
+        repository = JobRunRepository(connection, clock)
+        envelope = _message_job("job_operational", "msg_operational", "Operational job")
+        envelope = envelope.model_copy(
+            update={"operational_profile": _operational_snapshot("custom-token")}
+        )
+
+        await service.create_queued_job(EXTRACT_STREAM_NAME, envelope)
+
+        stored = await repository.get_job("job_operational")
+        assert stored is not None
+        assert stored["metadata_json"]["operational_profile"] == "normal"
+        assert stored["metadata_json"]["operational_profile_snapshot"]["token"] == (
+            "custom-token"
+        )
     finally:
         await connection.close()
 

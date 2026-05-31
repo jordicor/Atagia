@@ -7,9 +7,20 @@ from enum import Enum
 import re
 from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from atagia.core import json_utils
+from atagia.core.language_codes import (
+    normalize_iso_639_1_code,
+    normalize_optional_iso_639_1_code,
+)
 
 
 class MemoryObjectType(str, Enum):
@@ -70,6 +81,22 @@ class MindTopology(str, Enum):
     UNIMIND = "unimind"
     MULTI_MIND = "multi_mind"
     OJOCENTAURI = "ojocentauri"
+
+
+class ResponseMode(str, Enum):
+    """Per-turn latency/quality tradeoff for context assembly.
+
+    - ``normal``: full synchronous retrieval pipeline (default, byte-identical
+      to pre-fast-mode behavior).
+    - ``fast``: respond from prepared package + recent transcript + a cheap
+      contract read, skipping the retrieval pipeline entirely.
+    - ``smart_fast``: respond like ``fast`` immediately, then run the normal
+      retrieval in the background so the next turn is warmed.
+    """
+
+    NORMAL = "normal"
+    FAST = "fast"
+    SMART_FAST = "smart_fast"
 
 
 class OverseerGrantKind(str, Enum):
@@ -160,6 +187,41 @@ class MemoryStatus(str, Enum):
     REVIEW_REQUIRED = "review_required"
     PENDING_USER_CONFIRMATION = "pending_user_confirmation"
     DECLINED = "declined"
+
+
+class MemoryEvidenceSupportKind(str, Enum):
+    DIRECT = "direct"
+    CONTEXTUAL_DIRECT = "contextual_direct"
+    INFERRED = "inferred"
+    WEAK_SIGNAL = "weak_signal"
+
+
+class MemoryEvidencePolarity(str, Enum):
+    SUPPORTS = "supports"
+    QUALIFIES = "qualifies"
+    CONTRADICTS = "contradicts"
+
+
+class MemoryEvidenceSpanRole(str, Enum):
+    SOURCE = "source"
+    TRIGGER = "trigger"
+    QUALIFIER = "qualifier"
+    CONTRADICTION = "contradiction"
+
+
+class MemoryEvidenceSpeakerRelation(str, Enum):
+    SELF_REPORT = "self_report"
+    SECOND_PERSON_CONFIRMATION = "second_person_confirmation"
+    THIRD_PARTY_REPORT = "third_party_report"
+    ASSISTANT_INFERENCE = "assistant_inference"
+    BEHAVIORAL_OBSERVATION = "behavioral_observation"
+    UNKNOWN = "unknown"
+
+
+class MemoryEvidenceStatus(str, Enum):
+    ACTIVE = "active"
+    REVIEW_REQUIRED = "review_required"
+    DELETED = "deleted"
 
 
 class IngestOrigin(str, Enum):
@@ -298,6 +360,27 @@ class RetrievalProfileId(str, Enum):
 TemporalType = Literal["permanent", "bounded", "event_triggered", "ephemeral", "unknown"]
 QueryType = Literal["broad_list", "temporal", "slot_fill", "default"]
 RawContextAccessMode = Literal["normal", "skipped_raw", "artifact", "verbatim"]
+AnswerShape = Literal[
+    "single_fact",
+    "list",
+    "temporal",
+    "open_domain",
+    "raw_context",
+]
+CoverageMode = Literal[
+    "top_support",
+    "exhaustive_known_set",
+    "chronology",
+    "current_state",
+]
+SourcePrecision = Literal["required", "preferred"]
+EvidenceCoverageState = Literal[
+    "unknown",
+    "complete",
+    "partial",
+    "conflicting",
+    "insufficient",
+]
 
 _VALID_TEMPORAL_TYPES = frozenset(get_args(TemporalType))
 _QUERY_HINT_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
@@ -337,6 +420,25 @@ def _append_unique_text(target: list[str], value: str | None) -> None:
     if not normalized or normalized in target:
         return
     target.append(normalized)
+
+
+def derive_answer_coverage_fields(
+    *,
+    query_type: QueryType,
+    exact_recall_needed: bool = False,
+    raw_context_access_mode: RawContextAccessMode = "normal",
+) -> tuple[AnswerShape, CoverageMode, SourcePrecision]:
+    """Derive lean answer-support routing from existing query intelligence."""
+    if raw_context_access_mode in {"artifact", "verbatim"}:
+        return ("raw_context", "top_support", "required")
+    if query_type == "broad_list":
+        return ("list", "exhaustive_known_set", "required")
+    if query_type == "temporal":
+        return ("temporal", "chronology", "required")
+    if query_type == "slot_fill":
+        coverage_mode: CoverageMode = "current_state" if exact_recall_needed else "top_support"
+        return ("single_fact", coverage_mode, "required")
+    return ("open_domain", "top_support", "preferred")
 
 
 def _normalize_sparse_hint_precision_fields(
@@ -601,8 +703,11 @@ class ExtractionContextMessage(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    id: str | None = None
     role: str
     content: str
+    seq: int | None = None
+    occurred_at: str | None = None
 
 
 class ExtractionConversationContext(BaseModel):
@@ -651,6 +756,9 @@ class ExtractionConversationContext(BaseModel):
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
     confirmation_strategy: ConfirmationStrategy | None = None
     memory_privacy_mode: MemoryPrivacyMode = MemoryPrivacyMode.BALANCED
+    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
+    authenticated_user_privilege_level: str | None = None
+    authenticated_user_is_atagia_master: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -676,6 +784,14 @@ class ExtractedMemoryBase(BaseModel):
     scope: MemoryScope
     confidence: float = Field(ge=0.0, le=1.0)
     source_kind: MemorySourceKind
+    support_kind: MemoryEvidenceSupportKind | None = None
+    evidence_polarity: MemoryEvidencePolarity | None = None
+    speaker_relation_to_subject: MemoryEvidenceSpeakerRelation | None = None
+    source_quote: str | None = None
+    trigger_message_ids: list[str] = Field(default_factory=list)
+    trigger_quote: str | None = None
+    support_rationale: str | None = None
+    confidence_details: dict[str, Any] = Field(default_factory=dict)
     privacy_level: int = Field(ge=0, le=3)
     sensitivity: MemorySensitivity = MemorySensitivity.UNKNOWN
     themes: list[str] = Field(default_factory=list)
@@ -718,6 +834,8 @@ class ExtractedMemoryBase(BaseModel):
         normalized.setdefault("confidence", 0.5)
         normalized.setdefault("scope", MemoryScope.CONVERSATION.value)
         normalized.setdefault("source_kind", MemorySourceKind.EXTRACTED.value)
+        normalized.setdefault("trigger_message_ids", [])
+        normalized.setdefault("confidence_details", {})
         normalized.setdefault("privacy_level", 0)
         normalized.setdefault("sensitivity", MemorySensitivity.UNKNOWN.value)
         normalized.setdefault("themes", [])
@@ -737,6 +855,20 @@ class ExtractedMemoryBase(BaseModel):
             )
         return normalized
 
+    @field_validator("language_codes", mode="before")
+    @classmethod
+    def normalize_language_codes_before_type_validation(cls, value: Any) -> list[str]:
+        values = value if isinstance(value, list) else [value]
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            code = normalize_optional_iso_639_1_code(item)
+            if code is None or code in seen:
+                continue
+            seen.add(code)
+            normalized.append(code)
+        return normalized
+
     @field_validator("index_text")
     @classmethod
     def validate_index_text(cls, value: str | None) -> str | None:
@@ -744,6 +876,27 @@ class ExtractedMemoryBase(BaseModel):
             return None
         normalized = value.strip()
         return normalized or None
+
+    @field_validator("source_quote", "trigger_quote", "support_rationale")
+    @classmethod
+    def validate_optional_evidence_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        return normalized or None
+
+    @field_validator("trigger_message_ids")
+    @classmethod
+    def normalize_trigger_message_ids(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            cleaned = str(value).strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            normalized.append(cleaned)
+        return normalized
 
     @field_validator("themes")
     @classmethod
@@ -808,11 +961,7 @@ class ExtractedMemoryBase(BaseModel):
             )
         seen: set[str] = set()
         for code in self.language_codes:
-            if not isinstance(code, str) or len(code) != 2:
-                raise ValueError(f"invalid ISO 639-1 code: {code!r}")
-            lowered = code.lower()
-            if not lowered.isalpha() or not lowered.isascii():
-                raise ValueError(f"invalid ISO 639-1 code: {code!r}")
+            lowered = normalize_iso_639_1_code(code)
             seen.add(lowered)
         self.language_codes = sorted(seen)
         return self
@@ -973,6 +1122,129 @@ class ExtractionResult(BaseModel):
         return self
 
 
+LeanCandidateKind = Literal["evidence", "belief", "contract_signal", "state_update"]
+LeanSubjectScope = Literal["chat", "character", "user"]
+
+
+class LeanTemporalStatus(BaseModel):
+    """Compact temporal annotation produced by the lean extraction contract."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: TemporalType = "unknown"
+    valid_from_iso: str | None = None
+    valid_to_iso: str | None = None
+
+    @field_validator("valid_from_iso", "valid_to_iso")
+    @classmethod
+    def validate_temporal_iso(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        datetime.fromisoformat(normalized)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_temporal_bounds(self) -> "LeanTemporalStatus":
+        if self.valid_from_iso and self.valid_to_iso:
+            if datetime.fromisoformat(self.valid_from_iso) > datetime.fromisoformat(self.valid_to_iso):
+                raise ValueError("valid_from_iso must be <= valid_to_iso")
+        return self
+
+
+class LeanExtractionCandidate(BaseModel):
+    """Single durable memory candidate in the model-facing lean contract.
+
+    The extractor maps these into the rich ``Extracted*`` objects server-side;
+    everything the model no longer produces receives an approved default there.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    canonical_text: str = Field(min_length=1)
+    kind: LeanCandidateKind
+    subject_scope: LeanSubjectScope
+    confidence: float = Field(ge=0.0, le=1.0)
+    language_codes: list[str]
+    index_text: str | None = None
+    preserve_verbatim: bool = False
+    source_span: str | None = None
+    temporal_status: LeanTemporalStatus | None = None
+    support_kind: MemoryEvidenceSupportKind = MemoryEvidenceSupportKind.DIRECT
+    claim_key: str | None = None
+    claim_value: str | None = None
+
+    @field_validator("language_codes", mode="before")
+    @classmethod
+    def normalize_language_codes_before_type_validation(cls, value: Any) -> list[str]:
+        values = value if isinstance(value, list) else [value]
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            code = normalize_optional_iso_639_1_code(item)
+            if code is None or code in seen:
+                continue
+            seen.add(code)
+            normalized.append(code)
+        return normalized
+
+    @field_validator("index_text")
+    @classmethod
+    def validate_index_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("source_span")
+    @classmethod
+    def validate_source_span(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_language_codes(self) -> "LeanExtractionCandidate":
+        if not self.language_codes:
+            raise ValueError(
+                "language_codes must contain at least one ISO 639-1 code for the language of canonical_text"
+            )
+        seen: set[str] = set()
+        for code in self.language_codes:
+            seen.add(normalize_iso_639_1_code(code))
+        self.language_codes = sorted(seen)
+        return self
+
+    @model_validator(mode="after")
+    def validate_belief_claim(self) -> "LeanExtractionCandidate":
+        if self.kind == "belief":
+            claim_key = (self.claim_key or "").strip()
+            claim_value = (self.claim_value or "").strip()
+            if not claim_key or not claim_value:
+                raise ValueError("belief candidates require non-empty claim_key and claim_value")
+            self.claim_key = claim_key
+            self.claim_value = claim_value
+        return self
+
+
+class LeanExtractionResult(BaseModel):
+    """Lean, model-facing structured output for memory extraction."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    nothing_durable: bool = False
+    candidates: list[LeanExtractionCandidate] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_nothing_durable_consistency(self) -> "LeanExtractionResult":
+        if self.nothing_durable and self.candidates:
+            raise ValueError("nothing_durable=true but candidates are non-empty")
+        return self
+
+
 class ContractSignal(BaseModel):
     """Contract preference signal extracted from a message."""
 
@@ -985,6 +1257,7 @@ class ContractSignal(BaseModel):
     scope: MemoryScope
     source_kind: MemorySourceKind = MemorySourceKind.INFERRED
     privacy_level: int = Field(ge=0, le=3, default=1)
+    language_codes: list[str] = Field(default_factory=list)
 
     @field_validator("dimension_name")
     @classmethod
@@ -992,6 +1265,19 @@ class ContractSignal(BaseModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("dimension_name must be non-empty")
+        return normalized
+
+    @field_validator("language_codes")
+    @classmethod
+    def validate_language_codes(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            code = _normalize_profile_language_code(value)
+            if code in seen:
+                continue
+            seen.add(code)
+            normalized.append(code)
         return normalized
 
 
@@ -1087,6 +1373,7 @@ class ConsequenceSignal(BaseModel):
     outcome_sentiment: ConsequenceSentiment = ConsequenceSentiment.NEUTRAL
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)
     likely_action_message_id: str | None = None
+    language_codes: list[str] = Field(default_factory=list)
 
     @field_validator("action_description", "outcome_description", mode="before")
     @classmethod
@@ -1101,6 +1388,19 @@ class ConsequenceSignal(BaseModel):
         if value is None:
             return ConsequenceSentiment.NEUTRAL
         return value
+
+    @field_validator("language_codes")
+    @classmethod
+    def validate_language_codes(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            code = _normalize_profile_language_code(value)
+            if code in seen:
+                continue
+            seen.add(code)
+            normalized.append(code)
+        return normalized
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -1179,10 +1479,172 @@ class SparseQueryHint(BaseModel):
         return self
 
 
+AnchorType = Literal[
+    "proper_name",
+    "person",
+    "organization",
+    "location",
+    "code",
+    "quantity",
+    "date_time",
+    "address",
+    "quoted_phrase",
+    "attribute",
+    "concept",
+    "unknown",
+]
+
+AliasKind = Literal[
+    "translation",
+    "transliteration",
+    "spelling_variant",
+    "acronym_expansion",
+    "domain_synonym",
+    "corpus_surface",
+]
+
+_PRESERVE_VERBATIM_ANCHOR_TYPES: set[str] = {
+    "proper_name",
+    "person",
+    "organization",
+    "location",
+    "code",
+    "quantity",
+    "date_time",
+    "address",
+    "quoted_phrase",
+}
+
+
+class RuntimeAnchorAlias(BaseModel):
+    """Runtime alias surface for retrieval only; never evidential proof."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    surface: str = Field(min_length=1)
+    alias_language: str | None = None
+    alias_kind: AliasKind
+    confidence: float = Field(ge=0.0, le=1.0, default=0.5)
+    derivation: dict[str, Any] = Field(default_factory=dict)
+    non_evidential: bool = True
+
+    @field_validator("surface")
+    @classmethod
+    def validate_required_surface(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("surface must be non-empty")
+        return normalized
+
+    @field_validator("alias_language")
+    @classmethod
+    def validate_optional_text_fields(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("non_evidential")
+    @classmethod
+    def validate_non_evidential(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("runtime aliases must be non_evidential")
+        return value
+
+
+class RuntimeAnchor(BaseModel):
+    """Structured query anchor for runtime retrieval planning only."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    sub_query_text: str = Field(min_length=1)
+    anchor_type: AnchorType = "unknown"
+    original_surface: str = Field(min_length=1)
+    normalized_surface: str | None = None
+    preserve_verbatim: bool = False
+    aliases: list[RuntimeAnchorAlias] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0, default=0.5)
+    derivation: dict[str, Any] = Field(default_factory=dict)
+    non_evidential: bool = True
+
+    @field_validator("sub_query_text")
+    @classmethod
+    def validate_required_sub_query_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("sub_query_text must be non-empty")
+        return normalized
+
+    @field_validator("original_surface")
+    @classmethod
+    def validate_required_original_surface(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("original_surface must be non-empty")
+        return normalized
+
+    @field_validator("normalized_surface")
+    @classmethod
+    def validate_optional_text_fields(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("aliases")
+    @classmethod
+    def validate_unique_aliases(
+        cls,
+        values: list[RuntimeAnchorAlias],
+    ) -> list[RuntimeAnchorAlias]:
+        seen: set[tuple[str, str | None, str]] = set()
+        normalized: list[RuntimeAnchorAlias] = []
+        for alias in values:
+            signature = (alias.surface, alias.alias_language, alias.alias_kind)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            normalized.append(alias)
+        return normalized
+
+    @field_validator("non_evidential")
+    @classmethod
+    def validate_non_evidential(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("runtime anchors must be non_evidential")
+        return value
+
+    @model_validator(mode="after")
+    def validate_preserve_verbatim(self) -> "RuntimeAnchor":
+        if self.anchor_type in _PRESERVE_VERBATIM_ANCHOR_TYPES and not self.preserve_verbatim:
+            raise ValueError(
+                "literal/name/code anchors must set preserve_verbatim=true"
+            )
+        return self
+
+
+class TemporaryScaffoldingTrace(BaseModel):
+    """Trace-only label for temporary recovery mechanisms."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["temporary_scaffolding"] = "temporary_scaffolding"
+    component: str
+    mechanism: str
+    trace_flag: str
+    intended_metric: str
+    replacement_architecture: str
+    retirement_condition: str
+
+
 class QueryIntelligenceResult(BaseModel):
     """Structured query understanding returned by need detection."""
 
     model_config = ConfigDict(extra="ignore")
+
+    _temporary_scaffolding: list[TemporaryScaffoldingTrace] = PrivateAttr(
+        default_factory=list
+    )
 
     needs: list[DetectedNeed] = Field(default_factory=list)
     temporal_range: TemporalQueryRange | None = None
@@ -1190,12 +1652,36 @@ class QueryIntelligenceResult(BaseModel):
     callback_bias: bool = False
     raw_context_access_mode: RawContextAccessMode = "normal"
     sparse_query_hints: list[SparseQueryHint] = Field(default_factory=list)
+    query_language: str | None = None
+    answer_language: str | None = None
+    anchors: list[RuntimeAnchor] = Field(default_factory=list)
     query_type: QueryType = "default"
     retrieval_levels: list[int] = Field(default_factory=lambda: [0])
     # Wave 1 batch 2 (1-D): exact recall routing. The LLM decides; the
     # pipeline resolves deterministically.
     exact_recall_needed: bool = False
     exact_facets: list[ExactFacet] = Field(default_factory=list)
+    answer_shape: AnswerShape = "open_domain"
+    coverage_mode: CoverageMode = "top_support"
+    source_precision: SourcePrecision = "preferred"
+
+    @property
+    def temporary_scaffolding(self) -> list[TemporaryScaffoldingTrace]:
+        """Return trace-only temporary scaffolding labels."""
+        return list(self._temporary_scaffolding)
+
+    def model_copy_with_temporary_scaffolding(
+        self,
+        *,
+        update: dict[str, Any] | None = None,
+        additional: list[TemporaryScaffoldingTrace] | None = None,
+    ) -> "QueryIntelligenceResult":
+        """Copy while preserving trace-only scaffolding labels."""
+        copied = self.model_copy(update=update)
+        copied._temporary_scaffolding = _dedupe_temporary_scaffolding(
+            [*self._temporary_scaffolding, *(additional or [])]
+        )
+        return copied
 
     @model_validator(mode="before")
     @classmethod
@@ -1231,27 +1717,55 @@ class QueryIntelligenceResult(BaseModel):
             raise ValueError("retrieval_levels must contain only 0, 1, or 2")
         return normalized
 
+    @field_validator("query_language", "answer_language", mode="before")
+    @classmethod
+    def validate_language_codes(cls, value: Any) -> str | None:
+        return normalize_optional_iso_639_1_code(value)
+
     @model_validator(mode="after")
-    def validate_sparse_query_hints(self) -> "QueryIntelligenceResult":
-        if not self.sparse_query_hints:
-            return self
+    def validate_sparse_query_hints_and_anchors(self) -> "QueryIntelligenceResult":
+        (
+            self.answer_shape,
+            self.coverage_mode,
+            self.source_precision,
+        ) = derive_answer_coverage_fields(
+            query_type=self.query_type,
+            exact_recall_needed=self.exact_recall_needed,
+            raw_context_access_mode=self.raw_context_access_mode,
+        )
         sub_queries = set(self.sub_queries)
-        seen_hint_targets: set[str] = set()
-        normalized_hints: list[SparseQueryHint] = []
-        for hint in self.sparse_query_hints:
-            if hint.sub_query_text not in sub_queries:
-                raise ValueError("SparseQueryHint.sub_query_text must reference an item from sub_queries")
-            if hint.sub_query_text in seen_hint_targets:
-                raise ValueError("SparseQueryHint.sub_query_text values must be unique")
-            seen_hint_targets.add(hint.sub_query_text)
-            normalized_hints.append(
-                _normalize_sparse_hint_precision_fields(
-                    hint,
-                    query_type=self.query_type,
-                    callback_bias=self.callback_bias,
+        if self.sparse_query_hints:
+            seen_hint_targets: set[str] = set()
+            normalized_hints: list[SparseQueryHint] = []
+            for hint in self.sparse_query_hints:
+                if hint.sub_query_text not in sub_queries:
+                    raise ValueError("SparseQueryHint.sub_query_text must reference an item from sub_queries")
+                if hint.sub_query_text in seen_hint_targets:
+                    raise ValueError("SparseQueryHint.sub_query_text values must be unique")
+                seen_hint_targets.add(hint.sub_query_text)
+                normalized_hints.append(
+                    _normalize_sparse_hint_precision_fields(
+                        hint,
+                        query_type=self.query_type,
+                        callback_bias=self.callback_bias,
+                    )
                 )
+            self.sparse_query_hints = normalized_hints
+        seen_anchor_signatures: set[tuple[str, str, str]] = set()
+        normalized_anchors: list[RuntimeAnchor] = []
+        for anchor in self.anchors:
+            if anchor.sub_query_text not in sub_queries:
+                raise ValueError("RuntimeAnchor.sub_query_text must reference an item from sub_queries")
+            signature = (
+                anchor.sub_query_text,
+                anchor.anchor_type,
+                anchor.original_surface,
             )
-        self.sparse_query_hints = normalized_hints
+            if signature in seen_anchor_signatures:
+                continue
+            seen_anchor_signatures.add(signature)
+            normalized_anchors.append(anchor)
+        self.anchors = normalized_anchors
         if self.callback_bias:
             for hint in self.sparse_query_hints:
                 if hint.quoted_phrases or hint.must_keep_terms:
@@ -1282,6 +1796,89 @@ class QueryIntelligenceResult(BaseModel):
         return self
 
 
+# QueryPlanCore is the lean primary need-detection schema. The detailed
+# rationale is kept as a comment (not a docstring) so it does NOT inflate the
+# json_schema the model receives on every interactive turn.
+#
+# It is the small "contract" the primary need-detection LLM call must satisfy.
+# Relative to the rich QueryIntelligenceResult it drops the heavy part of the
+# schema only: the structured `anchors` list with its nested
+# `RuntimeAnchorAlias` arrays-of-objects (about half of the rich JSON schema
+# and the source of the cross-field anchor validators). Anchors are produced
+# by a conditional anchor review and merged back in server-side.
+#
+# Every other rich field is KEPT here because none is neutral when defaulted.
+# `needs` drives retrieval boosts, `temporal_range` drives time filtering,
+# `callback_bias` shapes hints, `retrieval_levels` selects evidence tiers, and
+# `query_language` / `answer_language` are cheap scalars that feed the answer-
+# language hint downstream (dropping them silently disables that feature for
+# every turn). Keeping these scalars costs only a few hundred schema chars; the
+# bloat lived entirely in the structured anchors.
+#
+# It performs per-field shape validation only. It does NOT raise on
+# hint<->sub_query linkage problems; those are repaired mechanically by
+# `need_detector_repair` before the rich object is built, so a medium model
+# that drifts on cross-field linkage degrades gracefully instead of failing
+# the whole structured call.
+class QueryPlanCore(BaseModel):
+    """Lean primary need-detection plan requested from the model."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    needs: list[DetectedNeed] = Field(default_factory=list)
+    temporal_range: TemporalQueryRange | None = None
+    sub_queries: list[str] = Field(min_length=1, max_length=3)
+    callback_bias: bool = False
+    raw_context_access_mode: RawContextAccessMode = "normal"
+    sparse_query_hints: list[SparseQueryHint] = Field(default_factory=list)
+    query_language: str | None = None
+    answer_language: str | None = None
+    query_type: QueryType = "default"
+    memory_needed: bool = True
+    retrieval_levels: list[int] = Field(default_factory=lambda: [0])
+    exact_recall_needed: bool = False
+    exact_facets: list[ExactFacet] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_exact_recall_flag(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if not data.get("exact_facets"):
+            return data
+        normalized = dict(data)
+        normalized["exact_recall_needed"] = True
+        return normalized
+
+    @field_validator("exact_facets")
+    @classmethod
+    def validate_exact_facets(cls, values: list[ExactFacet]) -> list[ExactFacet]:
+        return _ensure_unique_values(values)
+
+    @field_validator("sub_queries")
+    @classmethod
+    def validate_sub_queries(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values if value.strip()]
+        if not normalized:
+            raise ValueError("sub_queries must not be empty")
+        return _ensure_unique_values(normalized)
+
+    @field_validator("query_language", "answer_language", mode="before")
+    @classmethod
+    def validate_language_codes(cls, value: Any) -> str | None:
+        return normalize_optional_iso_639_1_code(value)
+
+    @field_validator("retrieval_levels")
+    @classmethod
+    def validate_retrieval_levels(cls, values: list[int]) -> list[int]:
+        normalized = _ensure_unique_values(values)
+        if not normalized:
+            raise ValueError("retrieval_levels must not be empty")
+        if any(value not in {0, 1, 2} for value in normalized):
+            raise ValueError("retrieval_levels must contain only 0, 1, or 2")
+        return normalized
+
+
 class PlannedSubQuery(BaseModel):
     """Mechanical retrieval rewrites for one semantic sub-query."""
 
@@ -1292,6 +1889,7 @@ class PlannedSubQuery(BaseModel):
     quoted_phrases: list[str] = Field(default_factory=list)
     must_keep_terms: list[str] = Field(default_factory=list)
     fts_queries: list[str] = Field(min_length=1)
+    fts_query_kinds: list[str] = Field(default_factory=list)
 
     @field_validator("text", "sparse_phrase")
     @classmethod
@@ -1316,6 +1914,18 @@ class PlannedSubQuery(BaseModel):
         if not normalized:
             raise ValueError("fts_queries must not be empty")
         return _ensure_unique_values(normalized)
+
+    @field_validator("fts_query_kinds")
+    @classmethod
+    def validate_fts_query_kinds(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values if value.strip()]
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_fts_query_kind_alignment(self) -> "PlannedSubQuery":
+        if self.fts_query_kinds and len(self.fts_query_kinds) != len(self.fts_queries):
+            raise ValueError("fts_query_kinds must align with fts_queries")
+        return self
 
 
 class RetrievalPlan(BaseModel):
@@ -1348,6 +1958,8 @@ class RetrievalPlan(BaseModel):
     sub_query_plans: list[PlannedSubQuery] = Field(default_factory=list)
     callback_bias: bool = False
     raw_context_access_mode: RawContextAccessMode = "normal"
+    query_language: str | None = None
+    answer_language: str | None = None
     query_type: QueryType = "default"
     scope_filter: list[MemoryScope] = Field(default_factory=list)
     status_filter: list[MemoryStatus] = Field(default_factory=list)
@@ -1362,13 +1974,15 @@ class RetrievalPlan(BaseModel):
     temporal_query_range: TemporalQueryRange | None = None
     consequence_search_enabled: bool = False
     require_evidence_regrounding: bool = False
-    need_driven_boosts: dict[NeedTrigger, float] = Field(default_factory=dict)
     skip_retrieval: bool = False
     # Wave 1 batch 2 (1-D): exact recall lane. When enabled, downstream
     # stages prioritize raw evidence and concrete L0 memories over
     # abstracted summaries/beliefs.
     exact_recall_mode: bool = False
     exact_facets: list[ExactFacet] = Field(default_factory=list)
+    answer_shape: AnswerShape = "open_domain"
+    coverage_mode: CoverageMode = "top_support"
+    source_precision: SourcePrecision = "preferred"
 
     @field_validator("fts_queries")
     @classmethod
@@ -1383,6 +1997,11 @@ class RetrievalPlan(BaseModel):
             return None
         normalized = value.strip()
         return normalized or None
+
+    @field_validator("query_language", "answer_language", mode="before")
+    @classmethod
+    def validate_plan_language_codes(cls, value: Any) -> str | None:
+        return normalize_optional_iso_639_1_code(value)
 
     @field_validator("sub_query_plans")
     @classmethod
@@ -1418,6 +2037,19 @@ class RetrievalPlan(BaseModel):
     def validate_plan_exact_facets(cls, values: list[ExactFacet]) -> list[ExactFacet]:
         return _ensure_unique_values(values)
 
+    @model_validator(mode="after")
+    def normalize_answer_coverage_fields(self) -> "RetrievalPlan":
+        (
+            self.answer_shape,
+            self.coverage_mode,
+            self.source_precision,
+        ) = derive_answer_coverage_fields(
+            query_type=self.query_type,
+            exact_recall_needed=self.exact_recall_mode,
+            raw_context_access_mode=self.raw_context_access_mode,
+        )
+        return self
+
 
 class ScoredCandidate(BaseModel):
     """Scored retrieval candidate ready for context composition."""
@@ -1443,6 +2075,17 @@ class ComposedContext(BaseModel):
 
     contract_block: str = ""
     workspace_block: str = ""
+    answer_evidence_block: str = ""
+    answer_evidence_memory_ids: list[str] = Field(default_factory=list)
+    answer_evidence_items: list[dict[str, Any]] = Field(default_factory=list)
+    answer_evidence_sufficiency: dict[str, Any] = Field(default_factory=dict)
+    answer_shape: AnswerShape = "open_domain"
+    coverage_mode: CoverageMode = "top_support"
+    source_precision: SourcePrecision = "preferred"
+    coverage_state: EvidenceCoverageState = "unknown"
+    support_map: dict[str, list[str]] = Field(default_factory=dict)
+    allowed_values: list[dict[str, Any]] = Field(default_factory=list)
+    missing_slots: list[dict[str, Any]] = Field(default_factory=list)
     memory_block: str = ""
     state_block: str = ""
     selected_memory_ids: list[str] = Field(default_factory=list)
@@ -1576,6 +2219,312 @@ class RetrievalEvent(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class RuntimeAliasSurfaceTrace(BaseModel):
+    """Content-minimal runtime alias diagnostic; never evidential proof."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    surface: str
+    alias_kind: AliasKind
+    alias_language: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    non_evidential: Literal[True] = True
+
+    @field_validator("surface")
+    @classmethod
+    def validate_surface(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("surface must be non-empty")
+        return normalized
+
+    @field_validator("alias_language")
+    @classmethod
+    def validate_alias_language(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class RuntimeAliasGroupTrace(BaseModel):
+    """Runtime aliases grouped by their source sub-query and anchor."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sub_query_text: str
+    anchor_type: AnchorType
+    original_surface: str
+    normalized_surface: str | None = None
+    preserve_verbatim: bool = False
+    anchor_confidence: float = Field(ge=0.0, le=1.0)
+    anchor_non_evidential: Literal[True] = True
+    aliases: list[RuntimeAliasSurfaceTrace] = Field(default_factory=list)
+
+    @field_validator("sub_query_text", "original_surface")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("runtime alias group required text must be non-empty")
+        return normalized
+
+    @field_validator("normalized_surface")
+    @classmethod
+    def validate_normalized_surface(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+def _normalize_profile_language_code(value: str) -> str:
+    return normalize_iso_639_1_code(value)
+
+
+def _normalize_profile_text(value: str, *, field_name: str) -> str:
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValueError(f"{field_name} must be non-empty")
+    return normalized
+
+
+class LanguageProfileSourceRef(BaseModel):
+    """Source reference proving one user communication profile row."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_kind: Literal["source_message", "message_window", "memory_object"]
+    memory_id: str | None = None
+    conversation_id: str | None = None
+    source_message_id: str | None = None
+    from_seq: int | None = Field(default=None, ge=0)
+    to_seq: int | None = Field(default=None, ge=0)
+
+    @field_validator("memory_id", "conversation_id", "source_message_id")
+    @classmethod
+    def validate_optional_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_source_reference(self) -> "LanguageProfileSourceRef":
+        if self.source_kind == "memory_object" and not self.memory_id:
+            raise ValueError("memory_object source refs require memory_id")
+        if self.source_kind == "source_message" and not self.source_message_id:
+            raise ValueError("source_message source refs require source_message_id")
+        if self.source_kind == "message_window":
+            if not self.conversation_id:
+                raise ValueError("message_window source refs require conversation_id")
+            if self.from_seq is None or self.to_seq is None:
+                raise ValueError("message_window source refs require from_seq and to_seq")
+            if self.from_seq > self.to_seq:
+                raise ValueError("message_window from_seq must be <= to_seq")
+        if not (self.memory_id or self.conversation_id or self.source_message_id):
+            raise ValueError("source refs require at least one concrete source id")
+        return self
+
+
+class ObservedUserLanguage(BaseModel):
+    """Observed user-authored language use; not a fluency claim."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    language_code: str
+    evidence_kind: Literal["user_authored_messages"] = "user_authored_messages"
+    message_count: int = Field(ge=1)
+    last_seen_at: str | None = None
+    context_label: str = "default"
+    source_refs: list[LanguageProfileSourceRef] = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("language_code")
+    @classmethod
+    def validate_language_code(cls, value: str) -> str:
+        return _normalize_profile_language_code(value)
+
+    @field_validator("context_label")
+    @classmethod
+    def validate_context_label(cls, value: str) -> str:
+        return _normalize_profile_text(value, field_name="context_label")
+
+    @field_validator("last_seen_at")
+    @classmethod
+    def validate_last_seen_at(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class ExplicitLanguagePreference(BaseModel):
+    """A source-backed language preference stated by the user."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    language_code: str
+    preference_kind: Literal[
+        "default_answer_language",
+        "contextual_answer_language",
+        "avoid_language",
+        "terms_or_code_language",
+    ]
+    context_label: str = "default"
+    source_refs: list[LanguageProfileSourceRef] = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("language_code")
+    @classmethod
+    def validate_language_code(cls, value: str) -> str:
+        return _normalize_profile_language_code(value)
+
+    @field_validator("context_label")
+    @classmethod
+    def validate_context_label(cls, value: str) -> str:
+        return _normalize_profile_text(value, field_name="context_label")
+
+
+class ExplicitLanguageAbility(BaseModel):
+    """A source-backed claim about language ability, separate from observation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    language_code: str
+    ability_kind: Literal["speaks", "understands", "native", "fluent", "learning"]
+    source_refs: list[LanguageProfileSourceRef] = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("language_code")
+    @classmethod
+    def validate_language_code(cls, value: str) -> str:
+        return _normalize_profile_language_code(value)
+
+
+class LanguageContextualNorm(BaseModel):
+    """A source-backed norm for language behavior in one context."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    language_code: str
+    norm_kind: Literal[
+        "default_answer_language",
+        "comfortable_for_terms_or_code",
+        "work_language",
+        "personal_language",
+        "language_switch_ok",
+    ]
+    context_label: str
+    source_refs: list[LanguageProfileSourceRef] = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("language_code")
+    @classmethod
+    def validate_language_code(cls, value: str) -> str:
+        return _normalize_profile_language_code(value)
+
+    @field_validator("context_label")
+    @classmethod
+    def validate_context_label(cls, value: str) -> str:
+        return _normalize_profile_text(value, field_name="context_label")
+
+
+class UserCommunicationProfile(BaseModel):
+    """Derived control-plane memory of how the user communicates."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    profile_kind: Literal["user_language_profile"] = "user_language_profile"
+    profile_version: Literal[1] = 1
+    subject_presence_id: str | None = None
+    observed_user_languages: list[ObservedUserLanguage] = Field(default_factory=list)
+    explicit_language_preferences: list[ExplicitLanguagePreference] = Field(
+        default_factory=list
+    )
+    explicit_language_abilities: list[ExplicitLanguageAbility] = Field(
+        default_factory=list
+    )
+    contextual_norms: list[LanguageContextualNorm] = Field(default_factory=list)
+    stale: bool = False
+    stale_reason: str | None = None
+    external_content_languages_excluded: Literal[True] = True
+    control_plane_only: Literal[True] = True
+
+    @field_validator("subject_presence_id", "stale_reason")
+    @classmethod
+    def validate_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_stale_reason(self) -> "UserCommunicationProfile":
+        if self.stale and not self.stale_reason:
+            raise ValueError("stale profiles require stale_reason")
+        return self
+
+
+class UserCommunicationProfileTrace(BaseModel):
+    """Content-minimal trace of user communication profile use."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    profile_kind: Literal["user_language_profile"] = "user_language_profile"
+    profile_version: int = Field(ge=1)
+    stale: bool = False
+    observed_language_codes: list[str] = Field(default_factory=list)
+    preference_language_codes: list[str] = Field(default_factory=list)
+    ability_language_codes: list[str] = Field(default_factory=list)
+    contextual_norm_language_codes: list[str] = Field(default_factory=list)
+    control_plane_only: Literal[True] = True
+
+    @field_validator(
+        "observed_language_codes",
+        "preference_language_codes",
+        "ability_language_codes",
+        "contextual_norm_language_codes",
+    )
+    @classmethod
+    def validate_language_codes(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            code = _normalize_profile_language_code(value)
+            if code in seen:
+                continue
+            seen.add(code)
+            normalized.append(code)
+        return normalized
+
+
+class ContentLanguageProfileTraceRow(BaseModel):
+    """Content-free language metadata row used by need-detection diagnostics."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    language_code: str
+    memory_count: int = Field(ge=0)
+    last_seen_at: str | None = None
+
+    @field_validator("language_code")
+    @classmethod
+    def validate_language_code(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("language_code must be non-empty")
+        return normalized
+
+    @field_validator("last_seen_at")
+    @classmethod
+    def validate_last_seen_at(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
 class NeedDetectionTrace(BaseModel):
     """Trace of the need detection stage."""
 
@@ -1584,14 +2533,41 @@ class NeedDetectionTrace(BaseModel):
     detected_needs: list[str] = Field(default_factory=list)
     sub_queries: list[str] = Field(default_factory=list)
     sparse_hints: list[str] = Field(default_factory=list)
+    query_language: str | None = None
+    answer_language: str | None = None
+    content_language_profile: list[ContentLanguageProfileTraceRow] = Field(
+        default_factory=list
+    )
+    user_communication_profile: UserCommunicationProfileTrace | None = None
+    anchors: list[RuntimeAnchor] = Field(default_factory=list)
+    alias_groups: list[RuntimeAliasGroupTrace] = Field(default_factory=list)
     query_type: str = "default"
     raw_context_access_mode: str = "normal"
+    answer_shape: AnswerShape = "open_domain"
+    coverage_mode: CoverageMode = "top_support"
+    source_precision: SourcePrecision = "preferred"
     temporal_range: str | None = None
     retrieval_levels: list[int] = Field(default_factory=lambda: [0])
     degraded_mode: bool = False
     exact_recall_needed: bool = False
     exact_facets: list[str] = Field(default_factory=list)
+    temporary_scaffolding: list[TemporaryScaffoldingTrace] = Field(default_factory=list)
     duration_ms: float = Field(ge=0.0)
+
+
+class FtsQueryExecutionCount(BaseModel):
+    """Per-FTS-query execution diagnostics for one sub-query."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    query: str
+    kind: str = "unknown"
+    match_mode: str = "implicit_and"
+    source: str = "planned"
+    non_evidential: Literal[True] = True
+    # Rows returned by SQL after filters and channel limit, before merge/fusion.
+    raw_rows: int = Field(ge=0, default=0)
+    candidates: int = Field(ge=0, default=0)
 
 
 class SubQuerySearchCount(BaseModel):
@@ -1603,8 +2579,12 @@ class SubQuerySearchCount(BaseModel):
     verbatim_pin: int = Field(ge=0, default=0)
     artifact_chunk: int = Field(ge=0, default=0)
     fts: int = Field(ge=0, default=0)
+    fact_facet: int = Field(ge=0, default=0)
     embedding: int = Field(ge=0, default=0)
     verbatim_evidence_search: int = Field(ge=0, default=0)
+    fts_queries: list[str] = Field(default_factory=list)
+    fts_query_kinds: list[str] = Field(default_factory=list)
+    fts_query_executions: list[FtsQueryExecutionCount] = Field(default_factory=list)
 
 
 class CandidateSearchTrace(BaseModel):
@@ -1615,6 +2595,7 @@ class CandidateSearchTrace(BaseModel):
     fts_candidates_count: int = Field(ge=0, default=0)
     verbatim_pin_candidates_count: int = Field(ge=0, default=0)
     artifact_chunk_candidates_count: int = Field(ge=0, default=0)
+    fact_facet_candidates_count: int = Field(ge=0, default=0)
     embedding_candidates_count: int = Field(ge=0, default=0)
     consequence_candidates_count: int = Field(ge=0, default=0)
     verbatim_evidence_search_candidates_count: int = Field(ge=0, default=0)
@@ -1641,6 +2622,15 @@ class ScoringTrace(BaseModel):
     top_score: float = 0.0
     median_score: float = 0.0
     min_score: float = 0.0
+    applicability_gate_mode: Literal["off", "shadow", "enforced"] = "off"
+    eligible_candidate_count: int = Field(ge=0, default=0)
+    ineligible_reason_counts: dict[str, int] = Field(default_factory=dict)
+    llm_applicability_skipped_count: int = Field(ge=0, default=0)
+    shadow_disagreement_count: int = Field(ge=0, default=0)
+    shadow_harmful_disagreement_count: int = Field(ge=0, default=0)
+    estimated_calls_saved: int = Field(ge=0, default=0)
+    adjacent_rrf_delta_distribution: dict[str, float] = Field(default_factory=dict)
+    gate_reason: str = "mode_off"
     duration_ms: float = Field(ge=0.0)
 
 
@@ -1658,6 +2648,10 @@ class CompositionTrace(BaseModel):
     state_tokens: int = Field(ge=0, default=0)
     diversity_penalties_applied: int = Field(ge=0, default=0)
     support_level: str = "UNKNOWN"
+    answer_shape: AnswerShape = "open_domain"
+    coverage_mode: CoverageMode = "top_support"
+    source_precision: SourcePrecision = "preferred"
+    coverage_state: EvidenceCoverageState = "unknown"
     duration_ms: float = Field(ge=0.0)
 
 
@@ -1715,6 +2709,143 @@ class RetrievalSufficiencyDiagnostic(BaseModel):
     artifact_candidate_count: int = Field(ge=0, default=0)
     unsupported_summary_candidate_count: int = Field(ge=0, default=0)
     contradictory_candidate_count: int = Field(ge=0, default=0)
+
+
+FacetObligationStatus = Literal["covered", "partial", "missing"]
+FacetSupportVerdict = Literal["supported", "unsupported"]
+
+
+class FacetSupportObligationTrace(BaseModel):
+    """Text-free support trace for one retrieval obligation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    description: str
+    status: FacetObligationStatus
+    selected_memory_ids: list[str] = Field(default_factory=list)
+    composed_memory_ids: list[str] = Field(default_factory=list)
+    support_verdict: FacetSupportVerdict = "unsupported"
+
+
+class FacetSupportTrace(BaseModel):
+    """Facet/obligation coverage diagnostics for stability gates."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    obligations: list[FacetSupportObligationTrace] = Field(default_factory=list)
+
+
+ProofSourceKind = Literal[
+    "base_canonical",
+    "summary_joined",
+    "summary_only",
+    "raw_source_span",
+    "raw_only",
+    "derived_only",
+]
+
+
+class ProvenanceEvidenceTrace(BaseModel):
+    """Selected evidence provenance without raw memory text."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    memory_id: str
+    recovery_channels: list[str] = Field(default_factory=list)
+    proof_source: ProofSourceKind
+    joined_to_base: bool = False
+    selected: bool = False
+    matched_subquery_indexes: list[int] = Field(default_factory=list)
+    scope: str | None = None
+    scope_canonical: str | None = None
+    conversation_id: str | None = None
+
+
+class DirectVsIndirectProvenanceTrace(BaseModel):
+    """Direct/indirect recovery provenance for selected context."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evidence: list[ProvenanceEvidenceTrace] = Field(default_factory=list)
+    direct_recovery_count: int = Field(ge=0, default=0)
+    indirect_recovery_count: int = Field(ge=0, default=0)
+    summary_only_count: int = Field(ge=0, default=0)
+    raw_cross_conversation_count: int = Field(ge=0, default=0)
+
+
+class TokenBudgetTrace(BaseModel):
+    """Retrieval-time token budget diagnostics."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    context_tokens: int = Field(ge=0, default=0)
+    answer_max_tokens: int | None = Field(default=None, ge=0)
+    finish_reason: str | None = None
+    postcondition_retry_count: int = Field(ge=0, default=0)
+    output_limit_seen: bool = False
+    context_compression_used: bool = False
+    token_budget_total: int = Field(ge=0, default=0)
+    token_budget_used: int = Field(ge=0, default=0)
+    contract_tokens: int = Field(ge=0, default=0)
+    workspace_tokens: int = Field(ge=0, default=0)
+    memory_tokens: int = Field(ge=0, default=0)
+    state_tokens: int = Field(ge=0, default=0)
+
+
+class CrossConversationRawPolicyTrace(BaseModel):
+    """Policy trace for cross-conversation raw evidence recovery."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = False
+    activation_reason: str | None = None
+    candidate_count: int = Field(ge=0, default=0)
+    selected_count: int = Field(ge=0, default=0)
+    violation_count: int = Field(ge=0, default=0)
+    max_windows_per_subquery: int = Field(ge=0, default=0)
+    policy_filters: list[str] = Field(default_factory=list)
+
+
+class RetrievalCustodyTrace(BaseModel):
+    """Stage-level retrieval custody counts without raw candidate text."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    raw_candidate_count: int = Field(ge=0, default=0)
+    candidate_count_by_channel: dict[str, int] = Field(default_factory=dict)
+    source_backed_candidate_count: int = Field(ge=0, default=0)
+    summary_only_candidate_count: int = Field(ge=0, default=0)
+    post_user_id_candidate_count: int = Field(ge=0, default=0)
+    post_scope_coordinate_lifecycle_candidate_count: int = Field(ge=0, default=0)
+    scored_candidate_count: int = Field(ge=0, default=0)
+    selected_candidate_count: int = Field(ge=0, default=0)
+    selected_evidence_ids: list[str] = Field(default_factory=list)
+    selected_source_evidence_count: int = Field(ge=0, default=0)
+    selected_summary_count: int = Field(ge=0, default=0)
+    high_value_rejected_candidate_count: int = Field(ge=0, default=0)
+    high_value_rejected_reasons: dict[str, int] = Field(default_factory=dict)
+    candidate_found_but_not_selected: list[str] = Field(default_factory=list)
+    rendered_evidence_ids: list[str] = Field(default_factory=list)
+    funnel_coverage_state: EvidenceCoverageState = "unknown"
+    source_window_ids: list[str] = Field(default_factory=list)
+    selected_source_window_ids: list[str] = Field(default_factory=list)
+    drop_counts_by_stage: dict[str, int] = Field(default_factory=dict)
+    drop_counts_by_reason: dict[str, int] = Field(default_factory=dict)
+
+
+class RequestRuntimeDiagnosticsTrace(BaseModel):
+    """Request-path cost and latency counters for retrieval diagnostics."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage_timings_ms: dict[str, float] = Field(default_factory=dict)
+    db_query_count: int = Field(ge=0, default=0)
+    db_query_count_by_operation: dict[str, int] = Field(default_factory=dict)
+    hydration_timings_ms: dict[str, float] = Field(default_factory=dict)
+    lock_wait_count: int = Field(ge=0, default=0)
+    sqlite_busy_count: int = Field(ge=0, default=0)
 
 
 class TopicTraceItem(BaseModel):
@@ -1812,6 +2943,7 @@ class RetrievalTrace(BaseModel):
     conversation_id: str
     requested_mode: str | None = None
     effective_mode: str | None = None
+    response_mode: Literal["normal", "fast", "smart_fast"] = "normal"
     timestamp_iso: str
     small_corpus_mode: bool = False
     degraded_mode: bool = False
@@ -1824,5 +2956,28 @@ class RetrievalTrace(BaseModel):
     scoring: ScoringTrace | None = None
     composition: CompositionTrace | None = None
     retrieval_sufficiency: RetrievalSufficiencyDiagnostic | None = None
+    facet_support: FacetSupportTrace | None = None
+    direct_vs_indirect_provenance: DirectVsIndirectProvenanceTrace | None = None
+    token_budget: TokenBudgetTrace | None = None
+    cross_conversation_raw_policy: CrossConversationRawPolicyTrace | None = None
+    custody: RetrievalCustodyTrace = Field(default_factory=RetrievalCustodyTrace)
+    runtime_diagnostics: RequestRuntimeDiagnosticsTrace = Field(
+        default_factory=RequestRuntimeDiagnosticsTrace
+    )
     structured_output_diagnostics: list[LLMStructuredOutputDiagnostic] = Field(default_factory=list)
+    temporary_scaffolding: list[TemporaryScaffoldingTrace] = Field(default_factory=list)
     total_duration_ms: float = Field(ge=0.0, default=0.0)
+
+
+def _dedupe_temporary_scaffolding(
+    events: list[TemporaryScaffoldingTrace],
+) -> list[TemporaryScaffoldingTrace]:
+    deduped: list[TemporaryScaffoldingTrace] = []
+    seen: set[tuple[str, str, str]] = set()
+    for event in events:
+        key = (event.component, event.mechanism, event.trace_flag)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(event)
+    return deduped

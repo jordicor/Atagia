@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import re
@@ -112,6 +113,24 @@ class ChatServiceProvider(LLMProvider):
                 model=request.model,
                 output_text="Check the retry guard first.",
             )
+        if purpose == "answer_postcondition_verification":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "readable": True,
+                        "is_abstention": False,
+                        "contains_concrete_claims": True,
+                        "unsupported_concrete_claims": False,
+                        "covers_requested_facets": True,
+                        "requires_abstention": False,
+                        "pass_postcondition": True,
+                        "failure_reasons": [],
+                        "explanation": "Supported for the test.",
+                    }
+                ),
+            )
         raise AssertionError(f"Unexpected purpose: {purpose}")
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -127,6 +146,34 @@ class FailingChatServiceProvider(ChatServiceProvider):
         if request.metadata.get("purpose") == self._fail_purpose:
             raise LLMError(f"Injected failure for {self._fail_purpose}")
         return await super().complete(request)
+
+
+def test_redacted_debug_payload_omits_raw_context() -> None:
+    payload = {
+        "cold_start": False,
+        "detected_needs": ["exact_recall"],
+        "selected_memory_ids": ["mem_secret"],
+        "context_view": {"memory_block": "secret text"},
+        "retrieval_plan": {"fts_queries": ["secret"]},
+        "cache": {"from_cache": False, "staleness": 1.0},
+        "post_commit_errors": [],
+        "answer_postcondition_guard": {
+            "status": "passed",
+            "failure_reasons": [],
+            "retry_count": 0,
+            "output_limit_seen": False,
+            "verdict": {"contains": "raw"},
+        },
+        "authority": {"sensitive_trace": True},
+    }
+
+    redacted = ChatService._redact_debug_payload(payload)
+
+    assert "context_view" not in redacted
+    assert "retrieval_plan" not in redacted
+    assert "selected_memory_ids" not in redacted
+    assert redacted["selected_memory_count"] == 1
+    assert redacted["authority"]["sensitive_trace"] is False
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -221,6 +268,46 @@ async def test_chat_reply_basic(
             assert event["outcome_json"]["sufficiency_diagnostics_v1"]["state"] == (
                 "insufficient_no_candidates"
             )
+        finally:
+            await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_records_answer_postcondition_report_when_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ChatServiceProvider()
+    monkeypatch.setattr(
+        "atagia.app.build_llm_client",
+        lambda _settings: LLMClient(provider_name=provider.name, providers=[provider]),
+    )
+    runtime = await initialize_runtime(
+        replace(_settings(tmp_path), answer_postcondition_guard_enabled=True)
+    )
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        result = await ChatService(runtime).chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="Please help me debug this retry loop.",
+            assistant_mode_id="coding_debug",
+            debug=True,
+        )
+
+        assert result.response_text == "Check the retry guard first."
+        assert result.debug is not None
+        assert result.debug["answer_postcondition_guard"]["status"] == "passed"
+        connection = await runtime.open_connection()
+        try:
+            event = await RetrievalEventRepository(connection, runtime.clock).get_event(
+                result.retrieval_event_id,
+                "usr_1",
+            )
+            assert event is not None
+            assert event["outcome_json"]["answer_postcondition_guard"]["status"] == "passed"
         finally:
             await connection.close()
     finally:

@@ -11,6 +11,7 @@ from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.contract_repository import ContractDimensionRepository
 from atagia.core.llm_output_limits import CONTRACT_PROJECTION_MAX_OUTPUT_TOKENS
+from atagia.core.memory_provenance import MemoryProvenanceWriter
 from atagia.core.repositories import MemoryObjectRepository, MessageRepository
 from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
 from atagia.memory.namespace import MemoryNamespaceContext
@@ -20,8 +21,11 @@ from atagia.models.schemas_memory import (
     ContractProjectionResult,
     ContractSignal,
     ExtractionConversationContext,
+    MemoryEvidenceSpeakerRelation,
+    MemoryEvidenceSupportKind,
     MemoryObjectType,
     MemoryScope,
+    MemorySourceKind,
     MemoryStatus,
 )
 from atagia.services.llm_client import (
@@ -32,6 +36,11 @@ from atagia.services.llm_client import (
     known_intimacy_context_metadata,
 )
 from atagia.services.model_resolution import resolve_component_model
+from atagia.services.prompt_authority import (
+    process_authority_context,
+    prompt_authority_metadata,
+    render_process_metadata_block,
+)
 
 REVIEW_REQUIRED_CONFIDENCE = 0.4
 NORMAL_PROJECTION_THRESHOLD = 0.55
@@ -97,6 +106,8 @@ Rules:
 - The dimension_name field is open-ended text, not a fixed enum.
 - Prefer the priority dimensions when relevant, but capture another dimension if it is explicitly expressed.
 - Keep canonical_text concise and grounded in the source message.
+- For every signal, set `language_codes` to the ISO 639-1 code(s) of the
+  language actually used in its `canonical_text`. Do not translate it.
 - Set nothing_durable=true when the message contains no usable contract signal.
 """
 
@@ -128,6 +139,10 @@ class ContractProjector:
         self._message_repository = message_repository
         self._memory_repository = memory_repository
         self._contract_repository = contract_repository
+        self._memory_provenance_writer = MemoryProvenanceWriter(
+            memory_repository._connection,
+            clock,
+        )
         resolved_settings = settings or Settings.from_env()
         self._projection_model = resolve_component_model(
             resolved_settings,
@@ -148,6 +163,13 @@ class ContractProjector:
             raise ValueError("Conversation context user_id must match the provided user_id")
         if context.assistant_mode_id != resolved_policy.profile_id.value:
             raise ValueError("Conversation context assistant_mode_id must match the resolved policy")
+        authority_context = process_authority_context(
+            privacy_enforcement=context.privacy_enforcement,
+            user_id=context.user_id,
+            privilege_level=context.authenticated_user_privilege_level,
+            is_atagia_master=context.authenticated_user_is_atagia_master,
+            purpose="contract_projection",
+        )
 
         source_message = await self._message_repository.get_message(context.source_message_id, context.user_id)
         if source_message is None or source_message["conversation_id"] != context.conversation_id:
@@ -171,7 +193,6 @@ class ContractProjector:
                 LLMMessage(role="system", content="Extract grounded interaction contract signals as JSON."),
                 LLMMessage(role="user", content=prompt),
             ],
-            temperature=0.0,
             max_output_tokens=CONTRACT_PROJECTION_MAX_OUTPUT_TOKENS,
             response_schema=ContractProjectionResult.model_json_schema(),
             metadata={
@@ -179,6 +200,10 @@ class ContractProjector:
                 "conversation_id": context.conversation_id,
                 "assistant_mode_id": context.assistant_mode_id,
                 "purpose": "contract_projection",
+                **prompt_authority_metadata(
+                    authority_context,
+                    prompt_authority_kind="process_metadata",
+                ),
                 **(
                     known_intimacy_context_metadata(
                         reason="resolved_policy_allows_intimacy_context"
@@ -216,6 +241,7 @@ class ContractProjector:
                 object_type=MemoryObjectType.INTERACTION_CONTRACT,
                 scope=storage_scope,
                 canonical_text=signal.canonical_text,
+                language_codes=signal.language_codes,
                 payload={
                     "dimension_name": signal.dimension_name,
                     "value_json": signal.value_json,
@@ -259,6 +285,26 @@ class ContractProjector:
             )
             if memory_object is None:
                 raise RuntimeError("Failed to create interaction_contract memory object")
+            await self._memory_provenance_writer.create_packet_from_source_messages(
+                user_id=context.user_id,
+                memory_id=str(memory_object["id"]),
+                source_message_ids=[context.source_message_id],
+                writer_kind="contract_projection",
+                support_kind=(
+                    MemoryEvidenceSupportKind.INFERRED
+                    if signal.source_kind is MemorySourceKind.INFERRED
+                    else MemoryEvidenceSupportKind.DIRECT
+                ),
+                speaker_relation_to_subject=(
+                    MemoryEvidenceSpeakerRelation.SELF_REPORT
+                    if role == "user"
+                    else MemoryEvidenceSpeakerRelation.ASSISTANT_INFERENCE
+                ),
+                confidence=signal.confidence,
+                confidence_details={"dimension_name": signal.dimension_name},
+                rationale="Interaction contract signal is grounded in the source message.",
+                source_quote_by_message_id={context.source_message_id: message_text},
+            )
 
             if (
                 memory_status is MemoryStatus.ACTIVE
@@ -478,20 +524,35 @@ class ContractProjector:
             indent=2,
             sort_keys=True,
         )
-        return CONTRACT_PROMPT_TEMPLATE.format(
-            role=escaped_role,
-            message_timestamp_block=escaped_message_timestamp_block,
-            message_text=escaped_message_text,
-            recent_context=escaped_recent_context,
-            policy_json=policy_json,
-            priority_dimensions=json_utils.dumps(
-                resolved_policy.contract_dimensions_priority,
-                sort_keys=True,
-            ),
-            cold_start=str(cold_start).lower(),
-            projection_threshold=self._projection_threshold(cold_start),
-            review_required_threshold=REVIEW_REQUIRED_CONFIDENCE,
-            privacy_ceiling=resolved_policy.privacy_ceiling,
+        authority_context = process_authority_context(
+            privacy_enforcement=context.privacy_enforcement,
+            user_id=context.user_id,
+            privilege_level=context.authenticated_user_privilege_level,
+            is_atagia_master=context.authenticated_user_is_atagia_master,
+            purpose="contract_projection",
+        )
+        return "\n\n".join(
+            (
+                render_process_metadata_block(
+                    authority_context,
+                    prompt_family="contract_projection",
+                ),
+                CONTRACT_PROMPT_TEMPLATE.format(
+                    role=escaped_role,
+                    message_timestamp_block=escaped_message_timestamp_block,
+                    message_text=escaped_message_text,
+                    recent_context=escaped_recent_context,
+                    policy_json=policy_json,
+                    priority_dimensions=json_utils.dumps(
+                        resolved_policy.contract_dimensions_priority,
+                        sort_keys=True,
+                    ),
+                    cold_start=str(cold_start).lower(),
+                    projection_threshold=self._projection_threshold(cold_start),
+                    review_required_threshold=REVIEW_REQUIRED_CONFIDENCE,
+                    privacy_ceiling=resolved_policy.privacy_ceiling,
+                ),
+            )
         )
 
     @staticmethod

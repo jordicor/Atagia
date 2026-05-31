@@ -12,7 +12,6 @@ from anthropic import (
     APIStatusError,
     APITimeoutError,
     AsyncAnthropic,
-    BadRequestError,
     InternalServerError,
     RateLimitError,
 )
@@ -26,10 +25,31 @@ from atagia.services.llm_client import (
     LLMError,
     LLMPolicyBlockedError,
     LLMProvider,
+    LLMRequestError,
     LLMStreamEvent,
     OutputLimitExceededError,
     TransientLLMError,
 )
+from atagia.services.llm_schema import strip_json_schema_nullability
+
+
+_ANTHROPIC_TRANSIENT_STATUS_CODES = frozenset(
+    {408, 409, 425, 429, 500, 502, 503, 504, 529}
+)
+
+
+def _anthropic_status_error(exc: APIStatusError) -> LLMError:
+    """Convert an Anthropic ``APIStatusError`` (incl. ``BadRequestError``) to an LLM error.
+
+    ``BadRequestError`` is a subclass of ``APIStatusError`` in the SDK, so its
+    400 status flows through here and becomes a typed ``LLMRequestError``.
+    """
+    status_code = int(getattr(exc, "status_code", 0) or 0)
+    if status_code in _ANTHROPIC_TRANSIENT_STATUS_CODES:
+        return TransientLLMError(str(exc))
+    if 400 <= status_code < 500:
+        return LLMRequestError(str(exc), status_code=status_code)
+    return LLMError(str(exc))
 
 
 def _model_dump(value: Any) -> dict[str, Any]:
@@ -56,7 +76,10 @@ _TRUNCATION_STOP_REASONS = frozenset({"max_tokens", "model_context_window_exceed
 _BLOCKED_STOP_REASONS = frozenset({"refusal"})
 _TRANSIENT_STOP_REASONS = frozenset({"pause_turn"})
 _SUCCESS_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "tool_use"})
-_ANTHROPIC_NO_TEMPERATURE_MODELS = frozenset({"claude-opus-4-7"})
+_ANTHROPIC_NO_TEMPERATURE_MODELS = frozenset(
+    {"claude-opus-4-7", "claude-opus-4-8"}
+)
+_ANTHROPIC_NATIVE_SCHEMA_MAX_CHARS = 12_000
 
 
 def _canonical_model_name(model: str) -> str:
@@ -249,26 +272,33 @@ def _anthropic_output_effort(request: LLMCompletionRequest) -> str | None:
     return None
 
 
-def _completion_output_config(request: LLMCompletionRequest) -> dict[str, Any] | None:
+def _native_schema_payload(request: LLMCompletionRequest) -> dict[str, Any] | None:
+    """Return the exact schema payload Anthropic will receive for this request.
+
+    The native-schema gate and the senders must agree on the same object so the
+    size cap decides on what is actually transmitted.
+    """
+    if request.response_schema is None:
+        return None
+    return _sanitize_schema(strip_json_schema_nullability(request.response_schema))
+
+
+def _output_format_block(request: LLMCompletionRequest) -> dict[str, Any] | None:
+    schema = _native_schema_payload(request)
+    if schema is None:
+        return None
+    return {"type": "json_schema", "schema": schema}
+
+
+def _output_config(request: LLMCompletionRequest) -> dict[str, Any] | None:
     config: dict[str, Any] = {}
-    if request.response_schema is not None:
-        config["format"] = {
-            "type": "json_schema",
-            "schema": _sanitize_schema(request.response_schema),
-        }
+    output_format = _output_format_block(request)
+    if output_format is not None:
+        config["format"] = output_format
     effort = _anthropic_output_effort(request)
     if effort is not None:
         config["effort"] = effort
     return config or None
-
-
-def _stream_output_format(request: LLMCompletionRequest) -> dict[str, Any] | None:
-    if request.response_schema is None:
-        return None
-    return {
-        "type": "json_schema",
-        "schema": _sanitize_schema(request.response_schema),
-    }
 
 
 class AnthropicProvider(LLMProvider):
@@ -277,17 +307,30 @@ class AnthropicProvider(LLMProvider):
     name = "anthropic"
     supports_embeddings = False
 
+    def supports_native_structured_output_for(self, request: LLMCompletionRequest) -> bool:
+        payload = _native_schema_payload(request)
+        if payload is None:
+            return True
+        schema_text = json.dumps(
+            payload,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return len(schema_text) <= _ANTHROPIC_NATIVE_SCHEMA_MAX_CHARS
+
     def __init__(
         self,
         api_key: str,
         *,
         base_url: str | None = None,
+        request_timeout_seconds: float | None = None,
         client: AsyncAnthropic | None = None,
     ) -> None:
         self._client = client or AsyncAnthropic(
             api_key=api_key,
             base_url=base_url,
             max_retries=0,
+            timeout=request_timeout_seconds,
         )
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
@@ -311,7 +354,7 @@ class AnthropicProvider(LLMProvider):
                 }
                 for tool in request.tools
             ]
-        output_config = _completion_output_config(request)
+        output_config = _output_config(request)
         if output_config is not None:
             kwargs["output_config"] = output_config
         thinking = _thinking_config(request, max_tokens)
@@ -322,10 +365,8 @@ class AnthropicProvider(LLMProvider):
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
         except APIStatusError as exc:
-            if int(getattr(exc, "status_code", 0) or 0) in {408, 409, 425, 429, 500, 502, 503, 504, 529}:
-                raise TransientLLMError(str(exc)) from exc
-            raise LLMError(str(exc)) from exc
-        except (BadRequestError, APIError) as exc:
+            raise _anthropic_status_error(exc) from exc
+        except APIError as exc:
             raise LLMError(str(exc)) from exc
 
         output_text = ""
@@ -388,12 +429,9 @@ class AnthropicProvider(LLMProvider):
                 }
                 for tool in request.tools
             ]
-        output_format = _stream_output_format(request)
-        if output_format is not None:
-            kwargs["output_format"] = output_format
-        effort = _anthropic_output_effort(request)
-        if effort is not None:
-            kwargs["output_config"] = {"effort": effort}
+        output_config = _output_config(request)
+        if output_config is not None:
+            kwargs["output_config"] = output_config
         thinking = _thinking_config(request, max_tokens)
         if thinking is not None:
             kwargs["thinking"] = thinking
@@ -450,10 +488,8 @@ class AnthropicProvider(LLMProvider):
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise TransientLLMError(str(exc)) from exc
         except APIStatusError as exc:
-            if int(getattr(exc, "status_code", 0) or 0) in {408, 409, 425, 429, 500, 502, 503, 504, 529}:
-                raise TransientLLMError(str(exc)) from exc
-            raise LLMError(str(exc)) from exc
-        except (BadRequestError, APIError) as exc:
+            raise _anthropic_status_error(exc) from exc
+        except APIError as exc:
             raise LLMError(str(exc)) from exc
 
         yield LLMStreamEvent(

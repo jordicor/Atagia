@@ -6,14 +6,12 @@ truth.
 
 Policy:
 
-- An explicit `max_output_tokens` greater than 512 is honored as-is.
-- An explicit `max_output_tokens` less than or equal to 512 is treated as
-  "not specified" -- `LLMClient` passes None to the provider, which either
+- `None` means "not specified" and is honored as-is. The provider then either
   uses an API-level default (OpenAI / OpenRouter / Gemini) or the explicit
   Anthropic fallback (`ANTHROPIC_FALLBACK_MAX_OUTPUT_TOKENS`).
-- The 512 floor exists because tiny caps such as 256 silently break models
-  with verbose structured output (e.g. Opus 4.6 used as a benchmark judge),
-  so we prefer the provider default over a fragile micro-cap.
+- An explicit `max_output_tokens` lower than 8192 is raised to 8192.
+- An explicit `max_output_tokens` greater than or equal to 8192 is honored
+  as-is.
 
 Standard cap is 8192. `max_tokens` is a ceiling, not a target, so a generous
 cap costs nothing unless the model actually needs the headroom (e.g. for
@@ -30,12 +28,12 @@ retries, provider routing).
 from __future__ import annotations
 
 
-# === Provider-level fallbacks (used when no explicit value or value <=512) ===
+# === Provider-level fallbacks (used when no explicit value is provided) ===
+MIN_LLM_OUTPUT_TOKENS = 8192
 ANTHROPIC_FALLBACK_MAX_OUTPUT_TOKENS = 8192
 
 # === Runtime - memory components ===
 MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS = 16384
-EXTRACTION_WATCHDOG_MAX_OUTPUT_TOKENS = 1024
 TEXT_CHUNKER_MAX_OUTPUT_TOKENS = 8192
 COMPACTOR_CONVERSATION_CHUNK_MAX_OUTPUT_TOKENS = 8192
 COMPACTOR_WORKSPACE_ROLLUP_MAX_OUTPUT_TOKENS = 8192
@@ -79,7 +77,7 @@ COMPACTION_EVAL_JUDGE_MAX_OUTPUT_TOKENS = 8192
 COMPACTION_EVAL_REFINER_MAX_OUTPUT_TOKENS = 8192
 
 # === Benchmarks - provider diagnostic scripts ===
-PROVIDER_BENCH_OLLAMA_WARMUP_MAX_OUTPUT_TOKENS = 10  # intentionally tiny; this path bypasses LLMClient and sends the literal to Ollama directly
+PROVIDER_BENCH_OLLAMA_WARMUP_MAX_OUTPUT_TOKENS = 8192
 PROVIDER_BENCH_OLLAMA_MAX_OUTPUT_TOKENS = 8192
 PROVIDER_BENCH_OPENAI_MAX_OUTPUT_TOKENS = 8192
 PROVIDER_BENCH_ANTHROPIC_MAX_OUTPUT_TOKENS = 8192
@@ -89,17 +87,14 @@ PROVIDER_BENCH_LLM_EVALUATOR_JUDGE_MAX_OUTPUT_TOKENS = 8192
 
 
 def apply_min_output_threshold(requested: int | None) -> int | None:
-    """Drop sub-threshold caps to None so provider default applies.
+    """Raise explicit sub-floor caps while preserving omitted limits.
 
-    Values <= 512 are treated as "unset" -- the LLMClient passes None to the
-    provider, which either uses an API-level default (OpenAI/OpenRouter/Gemini)
-    or our explicit Anthropic fallback (ANTHROPIC_FALLBACK_MAX_OUTPUT_TOKENS).
-
-    This guard exists because tiny caps like 256 break models with verbose
-    output (e.g., Opus 4.6 as a benchmark judge).
+    `None` remains unset. Explicit values below 8192 are raised to the standard
+    floor so models with adaptive thinking and verbose structured outputs have
+    enough headroom.
     """
     if requested is None:
         return None
-    if requested <= 512:
-        return None
+    if requested < MIN_LLM_OUTPUT_TOKENS:
+        return MIN_LLM_OUTPUT_TOKENS
     return requested

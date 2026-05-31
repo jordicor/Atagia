@@ -41,6 +41,17 @@ def test_atagia_bench_failed_question_custody_report_extracts_context(tmp_path: 
             "sufficiency_diagnostic": "missing_raw_evidence",
             "evidence_memory_ids": ["mem_evidence"],
             "selected_memory_ids": [],
+            "gold_evidence_diagnostics": [
+                {
+                    "memory_id": "mem_evidence",
+                    "candidate_record_found": False,
+                    "last_observed_stage": "not_found",
+                }
+            ],
+            "gold_evidence_diagnostic_summary": {
+                "gold_evidence_count": 1,
+                "composed_count": 0,
+            },
             "retrieval_custody": [
                 {
                     "candidate_id": "mem_1",
@@ -111,13 +122,30 @@ def test_atagia_bench_failed_question_custody_report_extracts_context(tmp_path: 
         "candidate_kind_counts": {"memory": 1},
         "composer_decision_counts": {},
         "filter_reason_counts": {},
+        "eviction_reason_counts": {},
+        "source_backed_candidate_count": 0,
+        "summary_only_candidate_count": 0,
+        "selected_source_backed_count": 0,
+        "selected_summary_count": 0,
+        "high_value_rejected_candidate_count": 0,
+        "high_value_rejected_reasons": {},
     }
     assert custody.failures[0].persona_id == "persona_1"
     assert custody.failures[0].category_tags == ["retrieval"]
     assert custody.failures[0].memories_used == 0
     assert custody.failures[0].retrieval_time_ms == 12.0
+    assert custody.failures[0].gold_evidence_diagnostics[0]["memory_id"] == (
+        "mem_evidence"
+    )
+    assert custody.failures[0].gold_evidence_diagnostic_summary == {
+        "gold_evidence_count": 1,
+        "composed_count": 0,
+    }
     assert custody.failures[0].retrieval_custody[0]["candidate_id"] == "mem_1"
     assert persisted["total_failed_questions"] == 1
     assert persisted["source_report_sha256"] == expected_hash
     assert persisted["retrieval_time_ms"]["mean"] == 12.0
     assert persisted["failures"][0]["retrieval_time_ms"] == 12.0
+    assert persisted["failures"][0]["gold_evidence_diagnostics"][0]["memory_id"] == (
+        "mem_evidence"
+    )

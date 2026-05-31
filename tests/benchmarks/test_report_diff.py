@@ -91,6 +91,20 @@ def test_build_benchmark_diff_tracks_question_flips() -> None:
                     "failure_stage": "judge",
                     "selected_memory_ids": ["mem_old"],
                     "selected_evidence_memory_ids": [],
+                    "critical_evidence_custody": {
+                        "counts": {
+                            "critical_evidence_count": 2,
+                            "raw_candidate_count": 1,
+                            "scored_count": 1,
+                            "selected_count": 0,
+                            "absent_count": 1,
+                        },
+                        "survival_stage_counts": {
+                            "absent_from_raw_candidates": 1,
+                            "composer": 1,
+                        },
+                        "items": [],
+                    },
                     "retrieval_custody": [
                         {
                             "candidate_id": "mem_old",
@@ -130,6 +144,20 @@ def test_build_benchmark_diff_tracks_question_flips() -> None:
                     "sufficiency_diagnostic": "retrieval_sufficient",
                     "selected_memory_ids": ["mem_new"],
                     "selected_evidence_memory_ids": ["mem_new"],
+                    "critical_evidence_custody": {
+                        "counts": {
+                            "critical_evidence_count": 2,
+                            "raw_candidate_count": 2,
+                            "scored_count": 2,
+                            "selected_count": 1,
+                            "absent_count": 0,
+                        },
+                        "survival_stage_counts": {
+                            "composer": 1,
+                            "selected": 1,
+                        },
+                        "items": [],
+                    },
                     "retrieval_custody": [
                         {
                             "candidate_id": "mem_new",
@@ -209,6 +237,13 @@ def test_build_benchmark_diff_tracks_question_flips() -> None:
         "candidate_kind_counts": {"memory": 1},
         "composer_decision_counts": {"rejected": 1},
         "filter_reason_counts": {"low_score": 1},
+        "eviction_reason_counts": {},
+        "source_backed_candidate_count": 0,
+        "summary_only_candidate_count": 0,
+        "selected_source_backed_count": 0,
+        "selected_summary_count": 0,
+        "high_value_rejected_candidate_count": 0,
+        "high_value_rejected_reasons": {},
     }
     assert diff.after_retrieval_custody_summary == {
         "candidate_count": 1,
@@ -218,6 +253,50 @@ def test_build_benchmark_diff_tracks_question_flips() -> None:
         "candidate_kind_counts": {"memory": 1},
         "composer_decision_counts": {"selected": 1},
         "filter_reason_counts": {},
+        "eviction_reason_counts": {},
+        "source_backed_candidate_count": 0,
+        "summary_only_candidate_count": 0,
+        "selected_source_backed_count": 0,
+        "selected_summary_count": 0,
+        "high_value_rejected_candidate_count": 0,
+        "high_value_rejected_reasons": {},
+    }
+    assert diff.before_critical_evidence_custody_summary == {
+        "question_count": 1,
+        "critical_evidence_count": 2,
+        "raw_candidate_count": 1,
+        "scored_count": 1,
+        "selected_count": 0,
+        "absent_count": 1,
+        "survival_stage_counts": {
+            "absent_from_raw_candidates": 1,
+            "composer": 1,
+        },
+    }
+    assert diff.after_critical_evidence_custody_summary == {
+        "question_count": 1,
+        "critical_evidence_count": 2,
+        "raw_candidate_count": 2,
+        "scored_count": 2,
+        "selected_count": 1,
+        "absent_count": 0,
+        "survival_stage_counts": {
+            "composer": 1,
+            "selected": 1,
+        },
+    }
+    assert diff.critical_evidence_custody_deltas == {
+        "question_count": 0,
+        "critical_evidence_count": 0,
+        "raw_candidate_count": 1,
+        "scored_count": 1,
+        "selected_count": 1,
+        "absent_count": -1,
+        "survival_stage_counts": {
+            "absent_from_raw_candidates": -1,
+            "composer": 0,
+            "selected": 1,
+        },
     }
     assert diff.improved_questions == 1
     assert diff.regressed_questions == 1
@@ -272,6 +351,13 @@ def test_build_benchmark_diff_tracks_question_flips() -> None:
     assert first_diff.before_failure_stage == "judge"
     assert first_diff.after_failure_stage is None
     assert first_diff.after_selected_evidence_memory_ids == ["mem_new"]
+    assert first_diff.critical_evidence_count_deltas == {
+        "absent_count": -1,
+        "critical_evidence_count": 0,
+        "raw_candidate_count": 1,
+        "scored_count": 1,
+        "selected_count": 1,
+    }
     assert diff.conversations[0].retrieval_time_delta_ms.model_dump() == {
         "count": 2,
         "mean": 0.25,
@@ -357,6 +443,19 @@ def test_format_diff_summary_includes_observability_sections() -> None:
                     "diagnosis_bucket": "retrieval_or_ranking_miss",
                     "sufficiency_diagnostic": "retrieval_insufficient",
                     "failure_stage": "answer_generation",
+                    "critical_evidence_custody": {
+                        "counts": {
+                            "critical_evidence_count": 1,
+                            "raw_candidate_count": 0,
+                            "scored_count": 0,
+                            "selected_count": 0,
+                            "absent_count": 1,
+                        },
+                        "survival_stage_counts": {
+                            "absent_from_raw_candidates": 1
+                        },
+                        "items": [],
+                    },
                     "retrieval_custody": [
                         {
                             "candidate_id": "mem_old",
@@ -386,6 +485,17 @@ def test_format_diff_summary_includes_observability_sections() -> None:
                 trace={
                     "diagnosis_bucket": "passed",
                     "sufficiency_diagnostic": "retrieval_sufficient",
+                    "critical_evidence_custody": {
+                        "counts": {
+                            "critical_evidence_count": 1,
+                            "raw_candidate_count": 1,
+                            "scored_count": 1,
+                            "selected_count": 1,
+                            "absent_count": 0,
+                        },
+                        "survival_stage_counts": {"selected": 1},
+                        "items": [],
+                    },
                     "retrieval_custody": [
                         {
                             "candidate_id": "mem_new",
@@ -417,6 +527,13 @@ def test_format_diff_summary_includes_observability_sections() -> None:
     assert "Retrieval custody:" in summary
     assert "Before: candidates=1 selected=0 channels=fts=1" in summary
     assert "After:  candidates=1 selected=1 channels=embedding=1" in summary
+    assert "Critical evidence custody:" in summary
+    assert "Before: questions=1 critical=1 raw=0 scored=0 selected=0 absent=1" in summary
+    assert "After:  questions=1 critical=1 raw=1 scored=1 selected=1 absent=0" in summary
+    assert (
+        "Critical evidence deltas: raw_candidate_count=+1, scored_count=+1, "
+        "selected_count=+1, absent_count=-1"
+    ) in summary
     assert "Warning deltas: failed_questions=-1" in summary
     assert "Diagnosis deltas: passed=+1, retrieval_or_ranking_miss=-1" in summary
     assert "Sufficiency deltas: retrieval_insufficient=-1, retrieval_sufficient=+1" in summary

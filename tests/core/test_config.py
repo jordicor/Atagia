@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from atagia.core.env import env_bool
 from atagia.core.config import (
     MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS,
     Settings,
@@ -90,6 +91,80 @@ def test_workers_can_be_enabled_explicitly(monkeypatch) -> None:
     assert settings.workers_enabled is True
 
 
+def test_episode_synthesis_max_episodes_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ATAGIA_EPISODE_SYNTHESIS_MAX_EPISODES", raising=False)
+    assert Settings.from_env().episode_synthesis_max_episodes == 24
+
+    monkeypatch.setenv("ATAGIA_EPISODE_SYNTHESIS_MAX_EPISODES", "7")
+    assert Settings.from_env().episode_synthesis_max_episodes == 7
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("1", True),
+        ("true", True),
+        ("YES", True),
+        ("on", True),
+        ("0", False),
+        ("false", False),
+        ("No", False),
+        ("OFF", False),
+    ],
+)
+def test_env_bool_accepts_documented_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("ATAGIA_TEST_BOOL", value)
+
+    assert env_bool("ATAGIA_TEST_BOOL", default=not expected) is expected
+
+
+@pytest.mark.parametrize("default", [True, False])
+def test_env_bool_uses_default_for_unset_or_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    default: bool,
+) -> None:
+    monkeypatch.delenv("ATAGIA_TEST_BOOL", raising=False)
+    assert env_bool("ATAGIA_TEST_BOOL", default=default) is default
+
+    monkeypatch.setenv("ATAGIA_TEST_BOOL", "   ")
+    assert env_bool("ATAGIA_TEST_BOOL", default=default) is default
+
+
+def test_env_bool_rejects_invalid_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATAGIA_TEST_BOOL", "enabled")
+
+    with pytest.raises(ValueError, match="ATAGIA_TEST_BOOL"):
+        env_bool("ATAGIA_TEST_BOOL", default=False)
+
+
+def test_settings_reject_invalid_boolean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATAGIA_WORKERS_ENABLED", "enabled")
+
+    with pytest.raises(ValueError, match="ATAGIA_WORKERS_ENABLED"):
+        Settings.from_env()
+
+
+def test_openai_embedding_base_url_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_OPENAI_BASE_URL", "http://completion.test/v1")
+    monkeypatch.setenv(
+        "ATAGIA_OPENAI_EMBEDDING_BASE_URL",
+        "http://embedding.test/v1",
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.openai_base_url == "http://completion.test/v1"
+    assert settings.openai_embedding_base_url == "http://embedding.test/v1"
+
+
 def test_embedding_retrieval_settings_can_be_overridden(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -117,6 +192,53 @@ def test_embedding_retrieval_settings_reject_invalid_values(
     value: str,
 ) -> None:
     monkeypatch.setenv(env_name, value)
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+def test_initial_context_package_rollout_settings_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_INITIAL_CONTEXT_PACKAGE_READ_ENABLED", "false")
+    monkeypatch.setenv("ATAGIA_INITIAL_CONTEXT_PACKAGE_REFRESH_ENABLED", "false")
+    monkeypatch.setenv("ATAGIA_INITIAL_CONTEXT_PACKAGE_CURATION_ENABLED", "false")
+    monkeypatch.setenv("ATAGIA_INITIAL_CONTEXT_PACKAGE_PROMPT_MAX_TOKENS", "512")
+    monkeypatch.setenv("ATAGIA_INITIAL_CONTEXT_PACKAGE_PROFILE_MAX_TOKENS", "256")
+    monkeypatch.setenv("ATAGIA_INITIAL_CONTEXT_PACKAGE_TOTAL_MAX_TOKENS", "1024")
+    monkeypatch.setenv("ATAGIA_INITIAL_CONTEXT_PACKAGE_CURATED_BLOCK_MAX_TOKENS", "128")
+    monkeypatch.setenv("ATAGIA_INITIAL_CONTEXT_PACKAGE_CURATED_MAX_ITEMS", "3")
+    monkeypatch.setenv("ATAGIA_INITIAL_CONTEXT_PACKAGE_CURATION_MAX_OUTPUT_TOKENS", "640")
+
+    settings = Settings.from_env()
+
+    assert settings.initial_context_package_read_enabled is False
+    assert settings.initial_context_package_refresh_enabled is False
+    assert settings.initial_context_package_curation_enabled is False
+    assert settings.initial_context_package_prompt_max_tokens == 512
+    assert settings.initial_context_package_profile_max_tokens == 256
+    assert settings.initial_context_package_total_max_tokens == 1024
+    assert settings.initial_context_package_curated_block_max_tokens == 128
+    assert settings.initial_context_package_curated_max_items == 3
+    assert settings.initial_context_package_curation_max_output_tokens == 640
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "ATAGIA_INITIAL_CONTEXT_PACKAGE_PROMPT_MAX_TOKENS",
+        "ATAGIA_INITIAL_CONTEXT_PACKAGE_PROFILE_MAX_TOKENS",
+        "ATAGIA_INITIAL_CONTEXT_PACKAGE_TOTAL_MAX_TOKENS",
+        "ATAGIA_INITIAL_CONTEXT_PACKAGE_CURATED_BLOCK_MAX_TOKENS",
+        "ATAGIA_INITIAL_CONTEXT_PACKAGE_CURATED_MAX_ITEMS",
+        "ATAGIA_INITIAL_CONTEXT_PACKAGE_CURATION_MAX_OUTPUT_TOKENS",
+    ],
+)
+def test_initial_context_package_rollout_settings_reject_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+) -> None:
+    monkeypatch.setenv(env_name, "0")
 
     with pytest.raises(ValueError):
         Settings.from_env()
@@ -157,6 +279,94 @@ def test_worker_circuit_breaker_rejects_invalid_settings(monkeypatch) -> None:
         Settings.from_env()
 
 
+def test_llm_run_guard_settings_use_defaults(monkeypatch) -> None:
+    for name in (
+        "ATAGIA_LLM_RUN_GUARD_ENABLED",
+        "ATAGIA_LLM_RUN_GUARD_MODE",
+        "ATAGIA_LLM_RUN_GUARD_MAX_TOTAL_CALLS",
+        "ATAGIA_LLM_RUN_GUARD_MAX_TOTAL_FAILED_CALLS",
+        "ATAGIA_LLM_RUN_GUARD_MAX_FAILED_CALL_RATIO",
+        "ATAGIA_LLM_RUN_GUARD_MAX_FAILED_RATIO_PER_PURPOSE",
+        "ATAGIA_LLM_RUN_GUARD_MAX_CONSECUTIVE_FAILURES_PER_PURPOSE",
+        "ATAGIA_BULK_INGEST_LLM_RUN_GUARD_MAX_TOTAL_CALLS",
+        "ATAGIA_BULK_INGEST_LLM_RUN_GUARD_MAX_TOTAL_FAILED_CALLS",
+        "ATAGIA_BULK_INGEST_LLM_RUN_GUARD_MAX_FAILED_CALL_RATIO",
+        "ATAGIA_BULK_INGEST_LLM_RUN_GUARD_MAX_FAILED_RATIO_PER_PURPOSE",
+        "ATAGIA_BULK_INGEST_LLM_RUN_GUARD_MAX_CONSECUTIVE_FAILURES_PER_PURPOSE",
+        "ATAGIA_BULK_INGEST_LLM_RUN_GUARD_MAX_WALL_TIME_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.llm_run_guard_enabled is True
+    assert settings.llm_run_guard_mode == "enforce"
+    assert settings.llm_run_guard_max_total_calls is None
+    assert settings.llm_run_guard_max_total_failed_calls == 80
+    assert settings.llm_run_guard_max_failed_call_ratio == 0.50
+    assert settings.llm_run_guard_max_failed_ratio_per_purpose == 0.50
+    assert settings.llm_run_guard_max_consecutive_failures_per_purpose == 8
+    assert settings.bulk_ingest_llm_run_guard_max_total_calls == 10000
+    assert settings.bulk_ingest_llm_run_guard_max_total_failed_calls == 40
+    assert settings.bulk_ingest_llm_run_guard_max_failed_call_ratio == 0.20
+    assert settings.bulk_ingest_llm_run_guard_max_failed_ratio_per_purpose == 0.30
+    assert settings.bulk_ingest_llm_run_guard_max_consecutive_failures_per_purpose == 4
+    assert settings.bulk_ingest_llm_run_guard_max_wall_time_seconds == 14400.0
+
+
+def test_llm_run_guard_settings_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_LLM_RUN_GUARD_ENABLED", "false")
+    monkeypatch.setenv("ATAGIA_LLM_RUN_GUARD_MODE", "audit")
+    monkeypatch.setenv("ATAGIA_LLM_RUN_GUARD_MAX_TOTAL_CALLS", "123")
+    monkeypatch.setenv("ATAGIA_LLM_RUN_GUARD_MAX_TOTAL_FAILED_CALLS", "7")
+    monkeypatch.setenv("ATAGIA_LLM_RUN_GUARD_MAX_FAILED_CALL_RATIO", "0.25")
+    monkeypatch.setenv("ATAGIA_LLM_RUN_GUARD_MAX_REPORTED_COST_USD", "3.50")
+    monkeypatch.setenv("ATAGIA_BULK_INGEST_LLM_RUN_GUARD_MAX_TOTAL_CALLS", "456")
+    monkeypatch.setenv(
+        "ATAGIA_BULK_INGEST_LLM_RUN_GUARD_MAX_CONSECUTIVE_FAILURES_PER_PURPOSE",
+        "2",
+    )
+    monkeypatch.setenv(
+        "ATAGIA_BULK_INGEST_LLM_RUN_GUARD_MAX_WALL_TIME_SECONDS",
+        "900",
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.llm_run_guard_enabled is False
+    assert settings.llm_run_guard_mode == "audit"
+    assert settings.llm_run_guard_max_total_calls == 123
+    assert settings.llm_run_guard_max_total_failed_calls == 7
+    assert settings.llm_run_guard_max_failed_call_ratio == 0.25
+    assert settings.llm_run_guard_max_reported_cost_usd == 3.50
+    assert settings.bulk_ingest_llm_run_guard_max_total_calls == 456
+    assert (
+        settings.bulk_ingest_llm_run_guard_max_consecutive_failures_per_purpose
+        == 2
+    )
+    assert settings.bulk_ingest_llm_run_guard_max_wall_time_seconds == 900.0
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("ATAGIA_LLM_RUN_GUARD_MODE", "panic"),
+        ("ATAGIA_LLM_RUN_GUARD_MAX_TOTAL_FAILED_CALLS", "0"),
+        ("ATAGIA_LLM_RUN_GUARD_MAX_FAILED_CALL_RATIO", "1.1"),
+        ("ATAGIA_BULK_INGEST_LLM_RUN_GUARD_MAX_WALL_TIME_SECONDS", "0"),
+    ],
+)
+def test_llm_run_guard_rejects_invalid_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(env_name, value)
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
 def test_intimacy_model_settings_can_be_overridden(monkeypatch) -> None:
     monkeypatch.setenv("ATAGIA_LLM_INTIMACY_INGEST_MODEL", "openrouter/z-ai/glm-4.6")
     monkeypatch.setenv(
@@ -173,7 +383,9 @@ def test_intimacy_model_settings_can_be_overridden(monkeypatch) -> None:
 
     assert settings.llm_intimacy_ingest_model == "openrouter/z-ai/glm-4.6"
     assert settings.llm_intimacy_retrieval_model == "openrouter/x-ai/grok-4.1-fast"
-    assert settings.llm_intimacy_component_models == {"extractor": "google/gemini-3.1-flash-lite"}
+    assert settings.llm_intimacy_component_models == {
+        "extractor": "google/gemini-3.1-flash-lite"
+    }
     assert settings.llm_intimacy_proactive_routing_enabled is True
 
 
@@ -200,6 +412,106 @@ def test_structured_output_rescue_uses_default_model_when_enabled(monkeypatch) -
 
     assert settings.llm_structured_output_rescue_enabled is True
     assert settings.llm_structured_output_rescue_model == "anthropic/claude-opus-4-7"
+
+
+def test_llm_technical_recovery_settings_use_defaults(monkeypatch) -> None:
+    for name in (
+        "ATAGIA_LLM_TECHNICAL_RECOVERY_ENABLED",
+        "ATAGIA_LLM_OUTPUT_LIMIT_RETRY_ATTEMPTS",
+        "ATAGIA_LLM_RUNAWAY_WATCHDOG_ENABLED",
+        "ATAGIA_LLM_RUNAWAY_MIN_ELAPSED_SECONDS",
+        "ATAGIA_LLM_RUNAWAY_MIN_OUTPUT_TOKENS",
+        "ATAGIA_LLM_RUNAWAY_CHECK_INTERVAL_TOKENS",
+        "ATAGIA_LLM_RUNAWAY_MAX_CHECKS",
+        "ATAGIA_LLM_RUNAWAY_HARD_ABORT_MIN_OUTPUT_TOKENS",
+        "ATAGIA_LLM_RUNAWAY_MIN_REPEAT_COUNT",
+        "ATAGIA_LLM_RUNAWAY_MIN_REPEAT_RATIO_TOKENS",
+        "ATAGIA_LLM_RUNAWAY_OUTPUT_INPUT_RATIO",
+        "ATAGIA_LLM_RUNAWAY_HARD_OUTPUT_INPUT_RATIO",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.llm_technical_recovery_enabled is True
+    assert settings.llm_output_limit_retry_attempts == 1
+    assert settings.llm_runaway_watchdog_enabled is True
+    assert settings.llm_runaway_min_elapsed_seconds == pytest.approx(8.0)
+    assert settings.llm_runaway_min_output_tokens == 2048
+    assert settings.llm_runaway_check_interval_tokens == 1024
+    assert settings.llm_runaway_max_checks == 2
+    assert settings.llm_runaway_hard_abort_min_output_tokens == 4096
+    assert settings.llm_runaway_min_repeat_count == 3
+    assert settings.llm_runaway_min_repeat_ratio_tokens == pytest.approx(0.12)
+    assert settings.llm_runaway_output_input_ratio == pytest.approx(12.0)
+    assert settings.llm_runaway_hard_output_input_ratio == pytest.approx(8.0)
+
+
+def test_llm_technical_recovery_settings_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_LLM_TECHNICAL_RECOVERY_ENABLED", "false")
+    monkeypatch.setenv("ATAGIA_LLM_OUTPUT_LIMIT_RETRY_ATTEMPTS", "2")
+    monkeypatch.setenv("ATAGIA_LLM_RUNAWAY_WATCHDOG_ENABLED", "false")
+    monkeypatch.setenv("ATAGIA_LLM_RUNAWAY_MIN_ELAPSED_SECONDS", "0.5")
+    monkeypatch.setenv("ATAGIA_LLM_RUNAWAY_MIN_OUTPUT_TOKENS", "99")
+    monkeypatch.setenv("ATAGIA_LLM_RUNAWAY_CHECK_INTERVAL_TOKENS", "44")
+    monkeypatch.setenv("ATAGIA_LLM_RUNAWAY_MAX_CHECKS", "5")
+    monkeypatch.setenv("ATAGIA_LLM_RUNAWAY_HARD_ABORT_MIN_OUTPUT_TOKENS", "777")
+    monkeypatch.setenv("ATAGIA_LLM_RUNAWAY_MIN_REPEAT_COUNT", "4")
+    monkeypatch.setenv("ATAGIA_LLM_RUNAWAY_MIN_REPEAT_RATIO_TOKENS", "0.2")
+    monkeypatch.setenv("ATAGIA_LLM_RUNAWAY_OUTPUT_INPUT_RATIO", "9.0")
+    monkeypatch.setenv("ATAGIA_LLM_RUNAWAY_HARD_OUTPUT_INPUT_RATIO", "6.0")
+
+    settings = Settings.from_env()
+
+    assert settings.llm_technical_recovery_enabled is False
+    assert settings.llm_output_limit_retry_attempts == 2
+    assert settings.llm_runaway_watchdog_enabled is False
+    assert settings.llm_runaway_min_elapsed_seconds == pytest.approx(0.5)
+    assert settings.llm_runaway_min_output_tokens == 99
+    assert settings.llm_runaway_check_interval_tokens == 44
+    assert settings.llm_runaway_max_checks == 5
+    assert settings.llm_runaway_hard_abort_min_output_tokens == 777
+    assert settings.llm_runaway_min_repeat_count == 4
+    assert settings.llm_runaway_min_repeat_ratio_tokens == pytest.approx(0.2)
+    assert settings.llm_runaway_output_input_ratio == pytest.approx(9.0)
+    assert settings.llm_runaway_hard_output_input_ratio == pytest.approx(6.0)
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("ATAGIA_LLM_OUTPUT_LIMIT_RETRY_ATTEMPTS", "-1"),
+        ("ATAGIA_LLM_RUNAWAY_MIN_ELAPSED_SECONDS", "-0.1"),
+        ("ATAGIA_LLM_RUNAWAY_MIN_OUTPUT_TOKENS", "0"),
+        ("ATAGIA_LLM_RUNAWAY_CHECK_INTERVAL_TOKENS", "0"),
+        ("ATAGIA_LLM_RUNAWAY_MAX_CHECKS", "-1"),
+        ("ATAGIA_LLM_RUNAWAY_MIN_REPEAT_RATIO_TOKENS", "1.1"),
+        ("ATAGIA_LLM_RUNAWAY_OUTPUT_INPUT_RATIO", "0"),
+    ],
+)
+def test_llm_technical_recovery_settings_reject_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(env_name, value)
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+def test_answer_postcondition_guard_settings_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_ANSWER_POSTCONDITION_GUARD_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_ANSWER_POSTCONDITION_RETRY_MAX_OUTPUT_TOKENS", "16384")
+    monkeypatch.setenv("ATAGIA_ANSWER_STANCE", "proactive")
+    monkeypatch.setenv("ATAGIA_ANSWER_STANCE_PROMPT_VARIANT", "template_v1")
+
+    settings = Settings.from_env()
+
+    assert settings.answer_postcondition_guard_enabled is True
+    assert settings.answer_postcondition_retry_max_output_tokens == 16384
+    assert settings.answer_stance == "proactive"
+    assert settings.answer_stance_prompt_variant == "template_v1"
 
 
 def test_context_cache_settings_use_defaults(monkeypatch) -> None:
@@ -268,7 +580,10 @@ def test_recent_transcript_budget_defaults_to_policy_with_floor(monkeypatch) -> 
 
     assert settings.recent_transcript_budget_tokens is None
     assert settings.effective_recent_transcript_budget_tokens(4000) == 4000
-    assert settings.effective_recent_transcript_budget_tokens(512) == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
+    assert (
+        settings.effective_recent_transcript_budget_tokens(512)
+        == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
+    )
 
 
 def test_recent_transcript_budget_can_be_overridden_from_env(monkeypatch) -> None:
@@ -285,7 +600,10 @@ def test_recent_transcript_budget_override_is_floored(monkeypatch) -> None:
 
     settings = Settings.from_env()
 
-    assert settings.effective_recent_transcript_budget_tokens(4000) == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
+    assert (
+        settings.effective_recent_transcript_budget_tokens(4000)
+        == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
+    )
 
 
 def test_recent_transcript_budget_respects_hard_cap(monkeypatch) -> None:
@@ -309,12 +627,63 @@ def test_recent_transcript_budget_rejects_non_positive_override(monkeypatch) -> 
         Settings.from_env()
 
 
+def test_context_envelope_defaults_to_structural_4k_budget(monkeypatch) -> None:
+    monkeypatch.delenv("ATAGIA_CONTEXT_ENVELOPE_BUDGET_TOKENS", raising=False)
+    monkeypatch.delenv("ATAGIA_CONTEXT_ENVELOPE_RATIOS", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.context_envelope_budget_tokens == 4096
+    assert settings.context_envelope_ratios["retrieved_context"] == 0.67
+    assert settings.context_envelope_ratios["recent_transcript"] == 0.20
+
+
+def test_context_envelope_budget_and_ratios_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_CONTEXT_ENVELOPE_BUDGET_TOKENS", "4096")
+    monkeypatch.setenv(
+        "ATAGIA_CONTEXT_ENVELOPE_RATIOS",
+        "instructions=1,current_turn=1,retrieved_context=6,recent_transcript=2",
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.context_envelope_budget_tokens == 4096
+    assert settings.context_envelope_ratios == {
+        "instructions": 1.0,
+        "current_turn": 1.0,
+        "retrieved_context": 6.0,
+        "recent_transcript": 2.0,
+    }
+
+
+def test_context_envelope_rejects_invalid_ratio_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_CONTEXT_ENVELOPE_RATIOS", "retrieved_context=-1")
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
 def test_benchmark_disable_raw_recent_transcript_defaults_off(monkeypatch) -> None:
     monkeypatch.delenv("ATAGIA_BENCHMARK_DISABLE_RAW_RECENT_TRANSCRIPT", raising=False)
 
     settings = Settings.from_env()
 
     assert settings.benchmark_disable_raw_recent_transcript is False
+
+
+def test_anthropic_request_timeout_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_ANTHROPIC_REQUEST_TIMEOUT_SECONDS", "45.5")
+
+    settings = Settings.from_env()
+
+    assert settings.anthropic_request_timeout_seconds == pytest.approx(45.5)
+
+
+def test_anthropic_request_timeout_rejects_invalid_value(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_ANTHROPIC_REQUEST_TIMEOUT_SECONDS", "0")
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
 
 
 def test_benchmark_disable_raw_recent_transcript_can_be_enabled(monkeypatch) -> None:
@@ -329,11 +698,6 @@ def test_extraction_watchdog_settings_use_defaults(monkeypatch) -> None:
     for name in (
         "ATAGIA_EXTRACTION_WATCHDOG_ENABLED",
         "ATAGIA_EXTRACTION_WATCHDOG_ALLOW_DIFFERENT_PROVIDER",
-        "ATAGIA_EXTRACTION_WATCHDOG_MIN_ELAPSED_SECONDS",
-        "ATAGIA_EXTRACTION_WATCHDOG_MIN_OUTPUT_TOKENS",
-        "ATAGIA_EXTRACTION_WATCHDOG_CHECK_INTERVAL_TOKENS",
-        "ATAGIA_EXTRACTION_WATCHDOG_MAX_CHECKS",
-        "ATAGIA_EXTRACTION_WATCHDOG_LLM_TIMEOUT_SECONDS",
         "ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_ITEMS",
         "ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_OUTPUT_TOKENS",
     ):
@@ -343,52 +707,36 @@ def test_extraction_watchdog_settings_use_defaults(monkeypatch) -> None:
 
     assert settings.extraction_watchdog_enabled is True
     assert settings.extraction_watchdog_allow_different_provider is False
-    assert settings.extraction_watchdog_min_elapsed_seconds == pytest.approx(8.0)
-    assert settings.extraction_watchdog_min_output_tokens == 2048
-    assert settings.extraction_watchdog_check_interval_tokens == 1024
-    assert settings.extraction_watchdog_max_checks == 2
-    assert settings.extraction_watchdog_llm_timeout_seconds == pytest.approx(8.0)
     assert settings.extraction_watchdog_bounded_retry_max_items == 8
-    assert settings.extraction_watchdog_bounded_retry_max_output_tokens == 4096
+    assert settings.extraction_watchdog_bounded_retry_max_output_tokens == 8192
 
 
 def test_extraction_watchdog_settings_can_be_overridden(monkeypatch) -> None:
     monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_ENABLED", "false")
     monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_ALLOW_DIFFERENT_PROVIDER", "true")
-    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_MIN_ELAPSED_SECONDS", "1.5")
-    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_MIN_OUTPUT_TOKENS", "77")
-    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_CHECK_INTERVAL_TOKENS", "33")
-    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_MAX_CHECKS", "4")
-    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_LLM_TIMEOUT_SECONDS", "2.5")
     monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_ITEMS", "3")
-    monkeypatch.setenv("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_OUTPUT_TOKENS", "2048")
+    monkeypatch.setenv(
+        "ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_OUTPUT_TOKENS", "16384"
+    )
 
     settings = Settings.from_env()
 
     assert settings.extraction_watchdog_enabled is False
     assert settings.extraction_watchdog_allow_different_provider is True
-    assert settings.extraction_watchdog_min_elapsed_seconds == pytest.approx(1.5)
-    assert settings.extraction_watchdog_min_output_tokens == 77
-    assert settings.extraction_watchdog_check_interval_tokens == 33
-    assert settings.extraction_watchdog_max_checks == 4
-    assert settings.extraction_watchdog_llm_timeout_seconds == pytest.approx(2.5)
     assert settings.extraction_watchdog_bounded_retry_max_items == 3
-    assert settings.extraction_watchdog_bounded_retry_max_output_tokens == 2048
+    assert settings.extraction_watchdog_bounded_retry_max_output_tokens == 16384
 
 
 @pytest.mark.parametrize(
     ("env_name", "value"),
     [
-        ("ATAGIA_EXTRACTION_WATCHDOG_MIN_ELAPSED_SECONDS", "-1"),
-        ("ATAGIA_EXTRACTION_WATCHDOG_MIN_OUTPUT_TOKENS", "0"),
-        ("ATAGIA_EXTRACTION_WATCHDOG_CHECK_INTERVAL_TOKENS", "0"),
-        ("ATAGIA_EXTRACTION_WATCHDOG_MAX_CHECKS", "-1"),
-        ("ATAGIA_EXTRACTION_WATCHDOG_LLM_TIMEOUT_SECONDS", "0"),
         ("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_ITEMS", "0"),
-        ("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_OUTPUT_TOKENS", "512"),
+        ("ATAGIA_EXTRACTION_WATCHDOG_BOUNDED_RETRY_MAX_OUTPUT_TOKENS", "8191"),
     ],
 )
-def test_extraction_watchdog_settings_reject_invalid_values(monkeypatch, env_name, value) -> None:
+def test_extraction_watchdog_settings_reject_invalid_values(
+    monkeypatch, env_name, value
+) -> None:
     monkeypatch.setenv(env_name, value)
 
     with pytest.raises(ValueError):
@@ -417,7 +765,9 @@ def test_privacy_gate_settings_can_be_overridden(monkeypatch) -> None:
     monkeypatch.setenv("ATAGIA_PRIVACY_VALIDATION_GATE_ENABLED", "true")
     monkeypatch.setenv("ATAGIA_PRIVACY_VALIDATION_GATE_TIMEOUT_SECONDS", "3.5")
     monkeypatch.setenv("ATAGIA_PRIVACY_VALIDATION_GATE_MAX_SOURCE_CHARS", "1234")
-    monkeypatch.setenv("ATAGIA_PRIVACY_VALIDATION_GATE_MAX_SUMMARIES_GATED_PER_JOB", "7")
+    monkeypatch.setenv(
+        "ATAGIA_PRIVACY_VALIDATION_GATE_MAX_SUMMARIES_GATED_PER_JOB", "7"
+    )
 
     settings = Settings.from_env()
 
@@ -510,7 +860,9 @@ def test_artifact_blob_storage_settings_can_be_overridden(monkeypatch) -> None:
 def test_llm_debug_io_settings_can_be_overridden(monkeypatch) -> None:
     monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO", "true")
     monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_DIR", "/tmp/atagia-llm-debug")
-    monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_PURPOSES", "applicability_scoring,need_detection")
+    monkeypatch.setenv(
+        "ATAGIA_DEBUG_LLM_IO_PURPOSES", "applicability_scoring,need_detection"
+    )
     monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_RAW", "yes")
     monkeypatch.setenv("ATAGIA_DEBUG_LLM_IO_MAX_CHARS", "1234")
 

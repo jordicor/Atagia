@@ -29,6 +29,44 @@ PACE_LABEL_MULTIPLIER = {
     "default": 1.0,
     "methodical": 0.8,
 }
+
+# Deterministic-first staleness bands (F2.2). After the hard ceilings pass, two
+# narrow deterministic bands short-circuit the per-turn LLM round-trip; the
+# ambiguous middle (and ALL short messages) still call the LLM unchanged.
+#
+# Constant rationale: `metrics_repository` / `retrieval_event_repository` do not
+# record a token-overlap distribution to fit these against, so these are
+# conservative defaults chosen to keep both bands rare and safe, coherent with
+# the existing per-mode ceilings (max_messages_without_refresh 4-15,
+# max_minutes_without_refresh 10-30; see manifests/*.json).
+#
+# - REFRESH band is the safe side (it never serves stale), so its overlap gate
+#   can be permissive-but-low: at/below this ratio of shared tokens the new
+#   message is treated as a topic change and refreshed without the LLM.
+STALENESS_DETERMINISTIC_REFRESH_MAX_OVERLAP = 0.1
+# - REUSE band is the risk side (it serves cache without the LLM's contradiction
+#   detection), so its overlap gate is high and it is further constrained by
+#   message/age conditions below. Only near-identical follow-ups qualify.
+STALENESS_DETERMINISTIC_REUSE_MIN_OVERLAP = 0.85
+# Short messages are excluded from BOTH deterministic bands: the asymmetric
+# overlap ratio (it divides by the CURRENT message's tokens) is uninformative
+# for terse follow-ups, which is exactly the case the LLM's `short_followup`
+# signal handles. Mechanical token count only (same tokenizer as the ratio).
+STALENESS_DETERMINISTIC_MIN_MESSAGE_TOKENS = 6
+# REUSE additionally requires the cache entry to be well within its age ceiling:
+# at most this fraction of effective_max_minutes_without_refresh has elapsed.
+# Combined with messages_since_refresh <= 1, this keeps the reused window tight
+# so the accepted residual risk (a same-turn high-overlap contradiction reused
+# without the LLM, self-correcting next turn) stays rare.
+STALENESS_DETERMINISTIC_REUSE_MAX_AGE_FRACTION = 0.25
+STALENESS_DETERMINISTIC_REUSE_MAX_MESSAGES_SINCE_REFRESH = 1
+
+# decision_band values recorded on every ContextStalenessScore for the trace.
+DECISION_BAND_LLM = "llm"
+DECISION_BAND_DETERMINISTIC_REFRESH = "deterministic_refresh"
+DECISION_BAND_DETERMINISTIC_REUSE = "deterministic_reuse"
+# Hard ceilings / cache validation already return refresh before any band runs.
+DECISION_BAND_HARD_PRECHECK = "hard_precheck"
 STALENESS_PROMPT_TEMPLATE = """You are deciding whether an existing cached memory context is still safe to reuse.
 
 Return JSON only, matching the provided schema exactly.
@@ -122,6 +160,7 @@ class ContextStalenessScore(BaseModel):
     token_overlap_ratio: float = Field(ge=0.0, le=1.0)
     short_followup: bool
     matched_signals: list[str] = Field(default_factory=list)
+    decision_band: str = DECISION_BAND_HARD_PRECHECK
 
 
 class ContextStalenessSignalDetector:
@@ -149,11 +188,10 @@ class ContextStalenessSignalDetector:
             messages=[
                 LLMMessage(
                     role="system",
-                    content="Classify cache staleness signals as grounded JSON only.",
+                    content="Check if cached context is outdated. Return JSON only.",
                 ),
                 LLMMessage(role="user", content=prompt),
             ],
-            temperature=0.0,
             max_output_tokens=CONTEXT_STALENESS_MAX_OUTPUT_TOKENS,
             response_schema=_StalenessSignals.model_json_schema(),
             metadata={
@@ -290,6 +328,87 @@ class ContextStalenessScorer:
         )
         message_penalty = _clamp(messages_since_refresh * MESSAGE_PENALTY_PER_MESSAGE)
         time_penalty = _clamp(minutes_since_refresh * TIME_PENALTY_PER_MINUTE)
+
+        # Deterministic-first bands (F2.2): the hard ceilings above already
+        # returned refresh pre-LLM. Two NARROW deterministic bands now short-
+        # circuit the per-turn LLM round-trip; everything else (and ALL short
+        # messages) falls through to the LLM exactly as before.
+        message_is_short = (
+            len(_tokenize(request_model.message_text))
+            < STALENESS_DETERMINISTIC_MIN_MESSAGE_TOKENS
+        )
+        if not message_is_short:
+            # Band 1 - deterministic REFRESH (safe side, never serves stale):
+            # very low overlap => topic change. Refresh without the LLM.
+            if token_overlap_ratio <= STALENESS_DETERMINISTIC_REFRESH_MAX_OVERLAP:
+                topic_penalty = _topic_penalty(
+                    token_overlap_ratio=token_overlap_ratio,
+                    short_followup=False,
+                )
+                staleness = _clamp(message_penalty + time_penalty + topic_penalty)
+                return ContextStalenessScore(
+                    staleness=staleness,
+                    should_refresh=True,
+                    hard_sync=False,
+                    effective_sync_threshold=cache_policy.sync_threshold,
+                    messages_since_refresh=messages_since_refresh,
+                    minutes_since_refresh=round(minutes_since_refresh, 4),
+                    effective_max_messages_without_refresh=effective_max_messages,
+                    effective_max_minutes_without_refresh=effective_max_minutes,
+                    pace_label=pace_label,
+                    pace_multiplier=pace_multiplier,
+                    message_penalty=message_penalty,
+                    time_penalty=time_penalty,
+                    topic_penalty=topic_penalty,
+                    safety_penalty=0.0,
+                    token_overlap_ratio=token_overlap_ratio,
+                    short_followup=False,
+                    matched_signals=["low_token_overlap"],
+                    decision_band=DECISION_BAND_DETERMINISTIC_REFRESH,
+                )
+            # Band 2 - deterministic REUSE (narrow by design; knowingly skips
+            # the LLM's contradiction detection, so every condition is required):
+            # near-identical follow-up, at most one message since refresh, and
+            # well within the age ceiling.
+            within_age_fraction = minutes_since_refresh <= (
+                effective_max_minutes * STALENESS_DETERMINISTIC_REUSE_MAX_AGE_FRACTION
+            )
+            if (
+                token_overlap_ratio >= STALENESS_DETERMINISTIC_REUSE_MIN_OVERLAP
+                and messages_since_refresh
+                <= STALENESS_DETERMINISTIC_REUSE_MAX_MESSAGES_SINCE_REFRESH
+                and within_age_fraction
+            ):
+                topic_penalty = _topic_penalty(
+                    token_overlap_ratio=token_overlap_ratio,
+                    short_followup=False,
+                )
+                staleness = _clamp(message_penalty + time_penalty + topic_penalty)
+                return ContextStalenessScore(
+                    staleness=staleness,
+                    # Mirrors the LLM-path math defensively. For every shipping
+                    # mode the in-band worst case (~0.225) sits far below the
+                    # lowest sync_threshold (0.7), so this is always False today;
+                    # it only diverges if a future mode lowers its threshold.
+                    should_refresh=staleness >= cache_policy.sync_threshold,
+                    hard_sync=False,
+                    effective_sync_threshold=cache_policy.sync_threshold,
+                    messages_since_refresh=messages_since_refresh,
+                    minutes_since_refresh=round(minutes_since_refresh, 4),
+                    effective_max_messages_without_refresh=effective_max_messages,
+                    effective_max_minutes_without_refresh=effective_max_minutes,
+                    pace_label=pace_label,
+                    pace_multiplier=pace_multiplier,
+                    message_penalty=message_penalty,
+                    time_penalty=time_penalty,
+                    topic_penalty=topic_penalty,
+                    safety_penalty=0.0,
+                    token_overlap_ratio=token_overlap_ratio,
+                    short_followup=False,
+                    matched_signals=["high_token_overlap"],
+                    decision_band=DECISION_BAND_DETERMINISTIC_REUSE,
+                )
+
         if self._signal_detector is None:
             raise RuntimeError("ContextStalenessScorer requires an LLM client for semantic signals")
         signals = await self._signal_detector.detect(
@@ -324,6 +443,7 @@ class ContextStalenessScorer:
                 ),
                 token_overlap_ratio=token_overlap_ratio,
                 short_followup=signals.short_followup,
+                decision_band=DECISION_BAND_LLM,
             )
         if signals.mode_shift_target is not None:
             return self._hard_sync_score(
@@ -347,6 +467,7 @@ class ContextStalenessScorer:
                 ),
                 token_overlap_ratio=token_overlap_ratio,
                 short_followup=signals.short_followup,
+                decision_band=DECISION_BAND_LLM,
             )
         if signals.high_stakes_topic:
             return self._hard_sync_score(
@@ -366,6 +487,7 @@ class ContextStalenessScorer:
                 ),
                 token_overlap_ratio=token_overlap_ratio,
                 short_followup=signals.short_followup,
+                decision_band=DECISION_BAND_LLM,
             )
         if signals.sensitive_content:
             return self._hard_sync_score(
@@ -385,6 +507,7 @@ class ContextStalenessScorer:
                 ),
                 token_overlap_ratio=token_overlap_ratio,
                 short_followup=signals.short_followup,
+                decision_band=DECISION_BAND_LLM,
             )
 
         topic_penalty = _topic_penalty(
@@ -417,6 +540,7 @@ class ContextStalenessScorer:
             token_overlap_ratio=token_overlap_ratio,
             short_followup=signals.short_followup,
             matched_signals=_unique(matched_signals),
+            decision_band=DECISION_BAND_LLM,
         )
 
     def _validate_cache_entry(
@@ -470,6 +594,7 @@ class ContextStalenessScorer:
         topic_penalty: float = 0.0,
         token_overlap_ratio: float = 0.0,
         short_followup: bool = False,
+        decision_band: str = DECISION_BAND_HARD_PRECHECK,
     ) -> ContextStalenessScore:
         policy = resolved_policy.context_cache_policy
         return ContextStalenessScore(
@@ -494,6 +619,7 @@ class ContextStalenessScorer:
             token_overlap_ratio=token_overlap_ratio,
             short_followup=short_followup,
             matched_signals=_unique(matched_signals),
+            decision_band=decision_band,
         )
 
 

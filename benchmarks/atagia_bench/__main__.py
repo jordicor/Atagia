@@ -6,12 +6,10 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 from dotenv import load_dotenv
-
-load_dotenv()
-
 from benchmarks.artifact_hash import sha256_file_if_exists
 from benchmarks.atagia_bench.custody_report import (
     build_failed_question_custody_report,
@@ -23,7 +21,11 @@ from benchmarks.atagia_bench.report_diff import (
     load_atagia_bench_report,
     save_diff,
 )
-from benchmarks.atagia_bench.runner import AtagiaBenchReport, AtagiaBenchRunner, load_holdout_question_ids
+from benchmarks.atagia_bench.runner import (
+    AtagiaBenchReport,
+    AtagiaBenchRunner,
+    load_holdout_question_ids,
+)
 from benchmarks.custody_summary import format_retrieval_custody_summary
 from benchmarks.failure_taxonomy import (
     build_failure_taxonomy_report,
@@ -31,13 +33,18 @@ from benchmarks.failure_taxonomy import (
     format_failure_taxonomy_summary,
     save_failure_taxonomy_report,
 )
+from benchmarks.retained_db_paths import default_benchmark_db_dir
+from atagia.core.config import ANSWER_STANCE_PROMPT_VARIANTS
 from atagia.models.schemas_replay import AblationConfig
 from atagia.services.model_resolution import COMPONENTS_BY_ID
+
+load_dotenv()
 
 _DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 _DEFAULT_HOLDOUT_FILE = Path(__file__).resolve().parent / "data" / "holdout_v0.json"
 _DEFAULT_JUDGE_MODEL = "anthropic/claude-opus-4-7"
+_DEFAULT_PRIVACY_ENFORCEMENT = "off"
 
 
 def _parse_csv_list(raw_value: str | None) -> list[str] | None:
@@ -56,7 +63,45 @@ def _parse_ablation(raw_value: str | None) -> AblationConfig | None:
         "no_need_detection": AblationConfig(skip_need_detection=True),
         "no_revision": AblationConfig(skip_belief_revision=True),
         "no_compaction": AblationConfig(skip_compaction=True),
-        "composer_budgeted_marginal": AblationConfig(composer_strategy="budgeted_marginal"),
+        "composer_budgeted_marginal": AblationConfig(
+            composer_strategy="budgeted_marginal"
+        ),
+        "composer_evidence_obligation": AblationConfig(
+            enable_evidence_obligation_coverage=True
+        ),
+        "applicability_gate_shadow": AblationConfig(
+            applicability_gate_mode="shadow"
+        ),
+        "applicability_gate_enforced": AblationConfig(
+            applicability_gate_mode="enforced"
+        ),
+        "context_envelope_4k": AblationConfig(
+            context_envelope_budget_tokens=4_096,
+        ),
+        "context_envelope_8k": AblationConfig(
+            context_envelope_budget_tokens=8_192,
+        ),
+        "context_envelope_16k": AblationConfig(
+            context_envelope_budget_tokens=16_384,
+            override_retrieval_params={
+                "rerank_top_k": 20,
+                "final_context_items": 12,
+            },
+        ),
+        "context_envelope_24k": AblationConfig(
+            context_envelope_budget_tokens=24_576,
+            override_retrieval_params={
+                "rerank_top_k": 25,
+                "final_context_items": 16,
+            },
+        ),
+        "context_envelope_32k": AblationConfig(
+            context_envelope_budget_tokens=32_768,
+            override_retrieval_params={
+                "rerank_top_k": 25,
+                "final_context_items": 20,
+            },
+        ),
     }
     preset = presets.get(raw_value)
     if preset is not None:
@@ -69,10 +114,9 @@ def _benchmark_ablation(
     privacy_enforcement: str | None,
 ) -> AblationConfig | None:
     ablation = _parse_ablation(raw_ablation)
-    if privacy_enforcement is None:
-        return ablation
+    effective_privacy_enforcement = privacy_enforcement or _DEFAULT_PRIVACY_ENFORCEMENT
     return (ablation or AblationConfig()).model_copy(
-        update={"privacy_enforcement": privacy_enforcement}
+        update={"privacy_enforcement": effective_privacy_enforcement}
     )
 
 
@@ -120,7 +164,33 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--answer-model",
         default=None,
-        help="Model for benchmark answer generation.",
+        help="Model for Atagia answer-generation components.",
+    )
+    parser.add_argument(
+        "--answer-postcondition-guard",
+        action="store_true",
+        help=(
+            "Enable the generic answer postcondition verifier with one retry "
+            "and controlled abstention on failure."
+        ),
+    )
+    parser.add_argument(
+        "--answer-stance",
+        choices=("reactive", "proactive"),
+        default="reactive",
+        help=(
+            "Answer behavior stance. reactive answers only the exact request; "
+            "proactive can add clearly caveated related evidence when useful."
+        ),
+    )
+    parser.add_argument(
+        "--answer-stance-prompt-variant",
+        choices=ANSWER_STANCE_PROMPT_VARIANTS,
+        default="baseline",
+        help=(
+            "Experimental answer-stance prompt variant. Use baseline unless "
+            "running prompt ablations."
+        ),
     )
     parser.add_argument(
         "--component-model",
@@ -186,19 +256,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Ablation preset (no_contract, no_scope, no_need_detection, "
-            "no_revision, no_compaction) or JSON AblationConfig"
+            "no_revision, no_compaction, composer_evidence_obligation, "
+            "context_envelope_4k, context_envelope_8k, context_envelope_16k, "
+            "context_envelope_24k, context_envelope_32k) or JSON "
+            "AblationConfig"
         ),
     )
     parser.add_argument(
         "--privacy-enforcement",
         choices=("enforce", "audit_only", "off"),
-        default=None,
+        default=_DEFAULT_PRIVACY_ENFORCEMENT,
         help=(
-            "Benchmark diagnostic privacy mode. Defaults to enforce. "
+            "Request privacy_enforcement for Atagia-bench client calls. Defaults to off. "
+            "Core Atagia-bench/default-readiness runs must stay off until "
+            "full Atagia-bench, full LoCoMo, and competitor baselines are "
+            "matched or beaten without privacy enforcement. "
             "audit_only keeps SQL privacy gates but audits/skips the late "
             "candidate/composer policy filters; off also disables retrieval SQL "
             "privacy/intimacy/sensitivity gates and related context gates, and "
-            "grades privacy_check questions as private-fact retrieval diagnostics "
+            "grades privacy_check questions as private-fact retrieval checks "
             "while preserving user isolation."
         ),
     )
@@ -221,8 +297,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--trusted-evaluation",
         action="store_true",
         help=(
-            "Run in controlled local benchmark mode: raise retrieval privacy "
-            "ceiling and activate pending memories for coverage audit while "
+            "Use a trusted local evaluation context: raise retrieval privacy "
+            "ceiling and activate pending memories for coverage auditing while "
             "preserving ordinary high-risk secret disclosure refusals"
         ),
     )
@@ -244,6 +320,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-db",
         action="store_true",
         help="Keep the ingested benchmark SQLite DB and write reuse metadata.",
+    )
+    parser.add_argument(
+        "--allow-temp-benchmark-db-dir",
+        action="store_true",
+        help=(
+            "Allow --keep-db to retain benchmark DB snapshots under a system "
+            "temporary directory. Intended only for explicitly disposable runs."
+        ),
     )
     parser.add_argument(
         "--reuse-db",
@@ -272,8 +356,7 @@ def _parse_component_model_overrides(raw_values: list[str] | None) -> dict[str, 
     for raw_value in raw_values or []:
         if "=" not in raw_value:
             raise ValueError(
-                "--component-model must use COMPONENT=MODEL, "
-                f"got {raw_value!r}"
+                f"--component-model must use COMPONENT=MODEL, got {raw_value!r}"
             )
         component_id, model = (part.strip() for part in raw_value.split("=", 1))
         if not component_id or not model:
@@ -306,6 +389,14 @@ def _default_taxonomy_output_path(report_path: Path) -> Path:
     return report_path.with_name(f"atagia-bench-failure-taxonomy-{timestamp}.json")
 
 
+def _effective_benchmark_db_dir(args: argparse.Namespace) -> str | None:
+    if not args.keep_db:
+        return args.benchmark_db_dir
+    if args.benchmark_db_dir is not None:
+        return args.benchmark_db_dir
+    return str(default_benchmark_db_dir(args.output))
+
+
 def _question_filters_for_split(
     *,
     explicit_question_ids: list[str] | None,
@@ -324,7 +415,9 @@ def _question_filters_for_split(
 
 async def _run_async(
     args: argparse.Namespace,
-) -> tuple[AtagiaBenchReport, Path, Path | None, Any, Path, Path, Path, dict[str, object]]:
+) -> tuple[
+    AtagiaBenchReport, Path, Path | None, Any, Path, Path, Path, dict[str, object]
+]:
     holdout_ids = load_holdout_question_ids(args.holdout_file)
     question_ids, exclude_question_ids = _question_filters_for_split(
         explicit_question_ids=_parse_csv_list(args.questions),
@@ -349,6 +442,9 @@ async def _run_async(
         embedding_backend=args.embedding_backend,
         embedding_model=args.embedding_model,
         data_dir=args.data_dir,
+        answer_postcondition_guard_enabled=args.answer_postcondition_guard,
+        answer_stance=args.answer_stance,
+        answer_stance_prompt_variant=args.answer_stance_prompt_variant,
     )
     report = await runner.run(
         persona_ids=_parse_csv_list(args.personas),
@@ -363,10 +459,13 @@ async def _run_async(
         ),
         trusted_evaluation=args.trusted_evaluation,
         parallel_personas=args.parallel_personas,
-        benchmark_db_dir=args.benchmark_db_dir,
+        benchmark_db_dir=_effective_benchmark_db_dir(args),
+        requested_benchmark_db_dir=args.benchmark_db_dir,
+        allow_temp_benchmark_db_dir=args.allow_temp_benchmark_db_dir,
         keep_db=args.keep_db,
         reuse_db=args.reuse_db,
         evaluate_only=args.evaluate_only,
+        invocation_args=sys.argv[1:],
     )
     report_path = runner.save_report(report, args.output)
 
@@ -394,7 +493,9 @@ async def _run_async(
         build_failed_question_custody_report(report, source_report=str(report_path)),
         custody_path,
     )
-    taxonomy_report = build_failure_taxonomy_report(report, source_report=str(report_path))
+    taxonomy_report = build_failure_taxonomy_report(
+        report, source_report=str(report_path)
+    )
     taxonomy_summary = failure_taxonomy_manifest_summary(taxonomy_report)
     taxonomy_path = _default_taxonomy_output_path(report_path)
     save_failure_taxonomy_report(taxonomy_report, taxonomy_path)
@@ -408,7 +509,16 @@ async def _run_async(
         failure_taxonomy_summary=taxonomy_summary,
     )
 
-    return report, report_path, diff_path, diff_report, manifest_path, custody_path, taxonomy_path, taxonomy_summary
+    return (
+        report,
+        report_path,
+        diff_path,
+        diff_report,
+        manifest_path,
+        custody_path,
+        taxonomy_path,
+        taxonomy_summary,
+    )
 
 
 def _format_duration(duration_seconds: float) -> str:
@@ -450,8 +560,7 @@ def _format_report_summary(
             report.config.get("retrieval_custody_summary")
         ),
         format_failure_taxonomy_summary(
-            failure_taxonomy_summary
-            or report.config.get("failure_taxonomy_summary")
+            failure_taxonomy_summary or report.config.get("failure_taxonomy_summary")
         ),
         "",
         "Category breakdown:",
@@ -470,42 +579,38 @@ def _format_report_summary(
         lines.append("")
         lines.append(f"Failed questions ({len(failed)}):")
         for r in failed[:20]:  # Limit output
-            lines.append(
-                f"  {r.question_id}: {r.grade.reason[:80]}"
-            )
+            lines.append(f"  {r.question_id}: {r.grade.reason[:80]}")
         if len(failed) > 20:
             lines.append(f"  ... and {len(failed) - 20} more")
 
-    lines.extend([
-        "",
-        f"Report saved to: {report_path}",
-        *[
-            f"Benchmark DB: {entry.get('db_path')}"
-            for entry in (report.config.get("benchmark_databases") or [])
-            if isinstance(entry, dict) and entry.get("db_path")
-        ],
-        *(
-            [f"Run manifest saved to: {manifest_path}"]
-            if manifest_path is not None
-            else []
-        ),
-        *(
-            [f"Failed-question custody saved to: {custody_path}"]
-            if custody_path is not None
-            else []
-        ),
-        *(
-            [f"Failure taxonomy saved to: {taxonomy_path}"]
-            if taxonomy_path is not None
-            else []
-        ),
-        *(
-            [f"Diff saved to: {diff_path}"]
-            if diff_path is not None
-            else []
-        ),
-        "=" * 50,
-    ])
+    lines.extend(
+        [
+            "",
+            f"Report saved to: {report_path}",
+            *[
+                f"Benchmark DB: {entry.get('db_path')}"
+                for entry in (report.config.get("benchmark_databases") or [])
+                if isinstance(entry, dict) and entry.get("db_path")
+            ],
+            *(
+                [f"Run manifest saved to: {manifest_path}"]
+                if manifest_path is not None
+                else []
+            ),
+            *(
+                [f"Failed-question custody saved to: {custody_path}"]
+                if custody_path is not None
+                else []
+            ),
+            *(
+                [f"Failure taxonomy saved to: {taxonomy_path}"]
+                if taxonomy_path is not None
+                else []
+            ),
+            *([f"Diff saved to: {diff_path}"] if diff_path is not None else []),
+            "=" * 50,
+        ]
+    )
     return "\n".join(lines)
 
 

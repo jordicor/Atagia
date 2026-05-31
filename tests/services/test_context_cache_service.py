@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,15 +16,22 @@ from atagia.core.canonical import canonical_json_bytes
 from atagia.core.config import Settings
 from atagia.core.repositories import ConversationRepository, UserRepository
 from atagia.memory.policy_manifest import compute_effective_policy_hash
-from atagia.models.schemas_replay import AblationConfig
+from atagia.models.schemas_memory import ComposedContext, ResponseMode, RetrievalPlan
+from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.chat_support import (
     default_operational_profile_snapshot,
     resolve_operational_profile,
     resolve_policy,
 )
+from atagia.core.repositories import MemoryObjectRepository
 from atagia.services.context_cache_service import (
     CONTEXT_CACHE_KEY_VERSION,
     ContextCacheService,
+)
+from atagia.services.prompt_authority import (
+    effective_allow_private_for_sql_repository,
+    normalize_request_authority_context,
+    privacy_sql_filters_disabled,
 )
 from atagia.services.llm_client import (
     LLMClient,
@@ -129,6 +138,170 @@ def _settings(tmp_path: Path) -> Settings:
         allow_insecure_http=True,
         small_corpus_token_threshold_ratio=0.0,
     )
+
+
+def test_cache_key_includes_effective_authority_context() -> None:
+    base = {
+        "user_id": "user-1",
+        "assistant_mode_id": "general_qa",
+        "conversation_id": "conv-1",
+        "workspace_id": "workspace-1",
+        "operational_profile_token": "profile-token",
+    }
+
+    enforce_key = ContextCacheService.build_cache_key(
+        **base,
+        privacy_enforcement="enforce",
+        authenticated_user_privilege_level="standard",
+        authenticated_user_is_atagia_master=False,
+    )
+    off_key = ContextCacheService.build_cache_key(
+        **base,
+        privacy_enforcement="off",
+        authenticated_user_privilege_level="standard",
+        authenticated_user_is_atagia_master=False,
+    )
+    master_key = ContextCacheService.build_cache_key(
+        **base,
+        privacy_enforcement="off",
+        authenticated_user_privilege_level="atagia_master",
+        authenticated_user_is_atagia_master=True,
+    )
+
+    assert enforce_key != off_key
+    assert off_key != master_key
+
+
+def test_normal_response_mode_cache_key_is_byte_identical_to_pre_change() -> None:
+    """Normal-mode keys must not shift when the response_mode arg is added.
+
+    The expected subject below is exactly what the key builder produced before
+    fast modes existed (no ``response_mode`` field). Default and explicit normal
+    must both match that hash byte-for-byte so no cache is invalidated.
+    """
+    base = {
+        "user_id": "user-1",
+        "assistant_mode_id": "general_qa",
+        "conversation_id": "conv-1",
+        "workspace_id": "workspace-1",
+        "operational_profile_token": "profile-token",
+    }
+    pre_change_subject = {
+        "v": CONTEXT_CACHE_KEY_VERSION,
+        "active_embodiment_id": None,
+        "active_mind_id": None,
+        "active_presence_id": None,
+        "active_realm_id": None,
+        "active_space_id": None,
+        "assistant_mode_id": "general_qa",
+        "conversation_id": "conv-1",
+        "mind_topology": "unimind",
+        "operational_profile_token": "profile-token",
+        "privacy_enforcement": "enforce",
+        "authenticated_user_privilege_level": "standard",
+        "authenticated_user_is_atagia_master": False,
+        "user_id": "user-1",
+        "workspace_id": "workspace-1",
+    }
+    pre_change_key = (
+        f"ctx:v{CONTEXT_CACHE_KEY_VERSION}:"
+        + hashlib.sha256(canonical_json_bytes(pre_change_subject)).hexdigest()
+    )
+
+    default_key = ContextCacheService.build_cache_key(**base)
+    explicit_normal_key = ContextCacheService.build_cache_key(
+        **base, response_mode=ResponseMode.NORMAL
+    )
+
+    assert default_key == pre_change_key
+    assert explicit_normal_key == pre_change_key
+
+
+def test_response_mode_partitions_cache_key_space() -> None:
+    base = {
+        "user_id": "user-1",
+        "assistant_mode_id": "general_qa",
+        "conversation_id": "conv-1",
+        "workspace_id": "workspace-1",
+        "operational_profile_token": "profile-token",
+    }
+    normal_key = ContextCacheService.build_cache_key(**base)
+    fast_key = ContextCacheService.build_cache_key(
+        **base, response_mode=ResponseMode.FAST
+    )
+    smart_fast_key = ContextCacheService.build_cache_key(
+        **base, response_mode=ResponseMode.SMART_FAST
+    )
+
+    assert len({normal_key, fast_key, smart_fast_key}) == 3
+
+
+def test_guard_retrieval_diagnostics_include_answer_evidence() -> None:
+    composed_context = ComposedContext(
+        memory_block="[Retrieved Memories]\n1. related context",
+        selected_memory_ids=["mem_vibes"],
+        answer_evidence_sufficiency={
+            "state": "sufficient_direct_quote",
+            "confidence": 0.91,
+            "rendered": False,
+            "top_memory_id": "mem_vibes",
+        },
+        answer_evidence_items=[
+            {
+                "memory_id": "mem_vibes",
+                "claim": "Jon wanted to savor the good vibes.",
+                "supporting_quote": "Jon: I want to savor all the good vibes.",
+                "quote_source": "source_message",
+                "support_kind": "contextual_direct",
+                "source_chain": [
+                    "assistant seq 282: The studio looks amazing.",
+                    "user seq 283: I want to savor all the good vibes.",
+                ],
+                "selected_for_answer_pack": False,
+                "final_score": 0.94,
+            }
+        ],
+        answer_shape="list",
+        coverage_mode="exhaustive_known_set",
+        source_precision="required",
+        coverage_state="complete",
+        allowed_values=[
+            {
+                "display_text": "good vibes",
+                "normalized_key": "value|good vibes",
+                "evidence_ids": ["memory:mem_vibes"],
+            }
+        ],
+        total_tokens_estimate=18,
+        budget_tokens=100,
+        items_included=1,
+        items_dropped=0,
+    )
+    result = PipelineResult(
+        retrieval_plan=RetrievalPlan(
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_1",
+            max_candidates=5,
+            max_context_items=4,
+            privacy_ceiling=3,
+            privacy_enforcement="off",
+        ),
+        composed_context=composed_context,
+    )
+
+    diagnostics = ContextCacheService._guard_retrieval_diagnostics(result)
+
+    assert diagnostics["answer_evidence"]["sufficiency"]["state"] == (
+        "sufficient_direct_quote"
+    )
+    assert diagnostics["answer_evidence"]["direct_memory_ids"] == ["mem_vibes"]
+    assert diagnostics["answer_evidence"]["items"][0]["supporting_quote"] == (
+        "Jon: I want to savor all the good vibes."
+    )
+    assert diagnostics["answer_support"]["allowed_values"][0]["display_text"] == (
+        "good vibes"
+    )
+    assert diagnostics["answer_support"]["coverage_state"] == "complete"
 
 
 async def _build_runtime(
@@ -279,6 +452,20 @@ async def test_context_cache_service_cache_miss_builds_pending_entry_and_publish
         assert resolution.from_cache is False
         assert resolution.cache_source == "sync"
         assert resolution.pending_cache_entry is not None
+        assert (
+            resolution.retrieval_diagnostics_for_guard["need_detection"]["query_type"]
+            == "default"
+        )
+        assert (
+            resolution.retrieval_diagnostics_for_guard[
+                "diagnostic_shape_fallback_used"
+            ]
+            is False
+        )
+        assert (
+            resolution.pending_cache_entry.retrieval_diagnostics_for_guard
+            == resolution.retrieval_diagnostics_for_guard
+        )
 
         published = await service.publish_pending_cache_entry(
             resolution,
@@ -290,6 +477,9 @@ async def test_context_cache_service_cache_miss_builds_pending_entry_and_publish
         assert stored is not None
         assert stored["last_retrieval_message_seq"] == 1
         assert stored["assistant_mode_id"] == "coding_debug"
+        assert stored["retrieval_diagnostics_for_guard"]["need_detection"][
+            "query_type"
+        ] == "default"
     finally:
         await runtime.close()
 
@@ -337,6 +527,9 @@ async def test_context_cache_service_cache_hit_skips_need_detection(
         assert second.detected_needs == []
         assert second.need_detection_skipped is True
         assert second.pending_cache_entry is None
+        assert second.retrieval_diagnostics_for_guard["need_detection"][
+            "query_type"
+        ] == "default"
         assert need_count_after == need_count_before
     finally:
         await runtime.close()
@@ -775,5 +968,156 @@ async def test_context_cache_service_retrieval_overrides_disable_cache(
         assert resolution.from_cache is False
         assert resolution.pending_cache_entry is None
         assert resolution.cache_key == cache_key
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_fast_contract_lookup_master_enforce_matches_normal_sql_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fast contract lookup must gate sensitivity exactly like the normal pipeline.
+
+    For an atagia_master authority running with privacy_enforcement="enforce",
+    master must NOT silently widen the SQL sensitivity gate: the fast path has
+    to pass the same (gates_enabled, allow_private) pair the full pipeline
+    computes, and secret-tier rows must stay out of the SQL clause.
+    """
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(
+            runtime, user_id="usr_master", conversation_id="cnv_master"
+        )
+        service = ContextCacheService(runtime)
+
+        captured: dict[str, object] = {}
+
+        async def capture_contract(self, *args, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        monkeypatch.setattr(
+            "atagia.memory.contract_projection.ContractProjector.get_current_contract",
+            capture_contract,
+        )
+
+        resolved_operational_profile = resolve_operational_profile(
+            loader=runtime.operational_profile_loader,
+            settings=runtime.settings,
+        )
+        resolved_policy = resolve_policy(
+            runtime.manifests,
+            str(conversation["assistant_mode_id"]),
+            runtime.policy_resolver,
+            resolved_operational_profile,
+        )
+        authority_context = normalize_request_authority_context(
+            privacy_enforcement="enforce",
+            authenticated_user_is_atagia_master=True,
+            user_id="usr_master",
+            purpose="context_cache_fast",
+        )
+        ablation = AblationConfig(privacy_enforcement="enforce")
+
+        connection = await runtime.open_connection()
+        try:
+            await service._fast_contract_lookup(
+                connection,
+                conversation=conversation,
+                resolved_policy=resolved_policy,
+                authority_context=authority_context,
+                ablation=ablation,
+            )
+        finally:
+            await connection.close()
+
+        expected_gates = privacy_sql_filters_disabled(ablation)
+        expected_allow_private = effective_allow_private_for_sql_repository(
+            resolved_policy, ablation
+        )
+        assert captured["sensitivity_gates_enabled"] == expected_gates
+        assert captured["allow_private_sensitivity"] == expected_allow_private
+        # Master + enforce keeps the gate closed; the relaxed (gates_enabled=True)
+        # branch that admits secret rows must not be taken.
+        assert captured["sensitivity_gates_enabled"] is False
+        clause = MemoryObjectRepository.sensitivity_filter_clause(
+            gates_enabled=bool(captured["sensitivity_gates_enabled"]),
+            allow_private_sensitivity=bool(captured["allow_private_sensitivity"]),
+        )
+        assert "secret" not in clause
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_smart_fast_warm_holds_guard_only_around_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow warm resolve must not block a same-user foreground guard acquire.
+
+    The per-user cache guard is held only around the cache publish, so while the
+    warm's (slow) retrieval resolve is in flight a foreground turn can acquire
+    and release the same guard immediately. The warm's publish still runs after.
+    """
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(
+            runtime, user_id="usr_warm", conversation_id="cnv_warm"
+        )
+        service = ContextCacheService(runtime)
+
+        resolve_in_flight = asyncio.Event()
+        foreground_acquired_guard = asyncio.Event()
+        publish_called = asyncio.Event()
+
+        async def slow_resolve(self, connection, **kwargs):
+            resolve_in_flight.set()
+            # Block until the foreground proves it acquired the guard while the
+            # resolve is still running (i.e. the warm is NOT holding it).
+            await asyncio.wait_for(foreground_acquired_guard.wait(), timeout=5.0)
+            return SimpleNamespace(
+                cache_key="cache_key_warm",
+                from_cache=False,
+                composed_context=SimpleNamespace(selected_memory_ids=[]),
+            )
+
+        async def fake_publish(self, resolution, *, last_retrieval_message_seq):
+            publish_called.set()
+            return True
+
+        # ContextCacheService is a slots dataclass, so patch on the class.
+        monkeypatch.setattr(
+            ContextCacheService, "resolve_with_connection", slow_resolve
+        )
+        monkeypatch.setattr(
+            ContextCacheService, "publish_pending_cache_entry", fake_publish
+        )
+
+        warm_task = asyncio.create_task(
+            service._run_smart_fast_warm(
+                user_id="usr_warm",
+                conversation_id="cnv_warm",
+                message_text="hello",
+                assistant_mode_id=None,
+                operational_profile=None,
+                operational_signals=None,
+                ablation=None,
+                prompt_authority_context=normalize_request_authority_context(
+                    privacy_enforcement="enforce",
+                    user_id="usr_warm",
+                    purpose="context_cache_fast",
+                ),
+                last_retrieval_message_seq=1,
+            )
+        )
+
+        await asyncio.wait_for(resolve_in_flight.wait(), timeout=5.0)
+        # Guard must be free while resolve is mid-flight.
+        async with service.user_cache_guard("usr_warm"):
+            foreground_acquired_guard.set()
+        await asyncio.wait_for(warm_task, timeout=5.0)
+        assert publish_called.is_set()
     finally:
         await runtime.close()

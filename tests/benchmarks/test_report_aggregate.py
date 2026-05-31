@@ -232,6 +232,13 @@ def test_combined_report_summarizes_trace_diagnostics() -> None:
         "candidate_kind_counts": {"memory": 1},
         "composer_decision_counts": {"selected": 1},
         "filter_reason_counts": {},
+        "eviction_reason_counts": {},
+        "source_backed_candidate_count": 0,
+        "summary_only_candidate_count": 0,
+        "selected_source_backed_count": 0,
+        "selected_summary_count": 0,
+        "high_value_rejected_candidate_count": 0,
+        "high_value_rejected_reasons": {},
     }
 
 
@@ -340,5 +347,12 @@ def test_combined_run_manifest_records_artifact_hashes(tmp_path: Path) -> None:
         "candidate_kind_counts": {},
         "composer_decision_counts": {},
         "filter_reason_counts": {},
+        "eviction_reason_counts": {},
+        "source_backed_candidate_count": 0,
+        "summary_only_candidate_count": 0,
+        "selected_source_backed_count": 0,
+        "selected_summary_count": 0,
+        "high_value_rejected_candidate_count": 0,
+        "high_value_rejected_reasons": {},
     }
     assert "git" in manifest

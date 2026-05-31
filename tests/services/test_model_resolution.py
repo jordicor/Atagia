@@ -232,6 +232,7 @@ def test_default_flashlite_migration_scope_is_explicit() -> None:
         "consequence_detector",
         "topic_working_set",
         "intent_classifier",
+        "initial_context_package_curation",
         "need_detector",
         "coverage_expander",
         "applicability_scorer",
@@ -243,8 +244,33 @@ def test_default_flashlite_migration_scope_is_explicit() -> None:
         assert COMPONENTS_BY_ID[component_id].default_model == OPENROUTER_FLASH_LITE_MODEL
 
 
+def test_answer_postcondition_defaults_to_chat_model_family() -> None:
+    resolved = resolve_component(ResolutionSettings(), "answer_postcondition")
+
+    assert resolved.category == "chat"
+    assert resolved.model_spec == OPENROUTER_DEEPSEEK_V4_FLASH_MODEL
+
+
 def test_coverage_expansion_purpose_maps_to_component() -> None:
     assert component_id_for_llm_purpose("coverage_expansion") == "coverage_expander"
+
+
+def test_multi_facet_exact_review_purpose_maps_to_need_detector() -> None:
+    assert component_id_for_llm_purpose("need_detection_multi_facet_exact_review") == (
+        "need_detector"
+    )
+    assert component_id_for_llm_purpose("need_detection_unknown_only_contract_review") == (
+        "need_detector"
+    )
+
+
+def test_answer_postcondition_purpose_maps_to_component() -> None:
+    assert component_id_for_llm_purpose("answer_postcondition_verification") == (
+        "answer_postcondition"
+    )
+    assert component_id_for_llm_purpose("answer_abstention_legitimacy_verification") == (
+        "answer_postcondition"
+    )
 
 
 def test_forced_global_model_limits_required_completion_provider() -> None:

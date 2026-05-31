@@ -15,8 +15,16 @@ mcp_available = pytest.importorskip("mcp", reason="mcp package not installed")
 
 from atagia import Atagia
 from atagia.core.clock import FrozenClock
+from atagia.core.initial_context_package_repository import InitialContextPackageRepository
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository
 from atagia.core.space_repository import SpaceRepository
+from atagia.models.schemas_api import ContextResult
+from atagia.models.schemas_initial_context_package import (
+    InitialContextPackageCoordinateSignature,
+    InitialContextPackageKind,
+    InitialContextPackagePolicySignature,
+    initial_context_package_key_hash,
+)
 from atagia.models.schemas_jobs import EXTRACT_STREAM_NAME, JobEnvelope, WORKER_GROUP_NAME
 from atagia.models.schemas_memory import (
     MemoryObjectType,
@@ -38,7 +46,23 @@ from atagia.mcp_server import (
 from atagia.services.errors import DeletionConfirmationError, MemoryNotFoundError
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.context_cache_service import ContextCacheService
+from atagia.services.initial_context_package_builder import INITIAL_CONTEXT_PACKAGE_SCHEMA_VERSION
+from atagia.services.initial_context_package_keys import build_initial_context_package_key
 from atagia.services.chat_support import default_operational_profile_snapshot
+
+
+class _FakeMcpEngine:
+    def __init__(self) -> None:
+        self.create_kwargs: dict[str, object] | None = None
+        self.context_kwargs: dict[str, object] | None = None
+
+    async def create_conversation(self, **kwargs):
+        self.create_kwargs = kwargs
+        return kwargs["conversation_id"]
+
+    async def get_context(self, **kwargs):
+        self.context_kwargs = kwargs
+        return ContextResult(system_prompt="fake prompt")
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -229,6 +253,45 @@ async def _seed_memory(
         )
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_context_passes_full_coordinate_fields() -> None:
+    engine = _FakeMcpEngine()
+
+    payload = json.loads(
+        await _get_context_impl(
+            engine,  # type: ignore[arg-type]
+            "usr_1",
+            "mcp",
+            "Coordinate-aware context please.",
+            conversation_id="cnv_1",
+            mode="coding_debug",
+            user_persona_id="persona_mcp",
+            character_id="char_mcp",
+            active_presence_id="presence_mcp",
+            mind_id="mind_mcp",
+            mind_topology="ojocentauri",
+            embodiment_id="body_mcp",
+            realm_id="realm_mcp",
+            space_id="space_mcp",
+            incognito=True,
+        )
+    )
+
+    assert payload["conversation_id"] == "cnv_1"
+    assert engine.create_kwargs is not None
+    assert engine.context_kwargs is not None
+    for key, expected in {
+        "active_presence_id": "presence_mcp",
+        "mind_id": "mind_mcp",
+        "mind_topology": "ojocentauri",
+        "embodiment_id": "body_mcp",
+        "realm_id": "realm_mcp",
+        "space_id": "space_mcp",
+    }.items():
+        assert engine.create_kwargs[key] == expected
+        assert engine.context_kwargs[key] == expected
 
 
 @pytest.mark.asyncio
@@ -731,6 +794,59 @@ async def test_mcp_add_memory(
             {"user_id": "usr_2", "conversation_id": "cnv_2"},
             ttl_seconds=60,
         )
+        operational_profile = default_operational_profile_snapshot(
+            loader=engine.runtime.operational_profile_loader,
+            settings=engine.runtime.settings,
+        )
+        policy_signature = InitialContextPackagePolicySignature(
+            effective_policy_hash="policy-mcp-test",
+            policy_prompt_hash="prompt-mcp-test",
+            privacy_enforcement="enforce",
+        )
+        coordinate_signature = InitialContextPackageCoordinateSignature(
+            coordinate_signature_hash="coord-mcp-test",
+            complete=True,
+        )
+        package_key = build_initial_context_package_key(
+            version=INITIAL_CONTEXT_PACKAGE_SCHEMA_VERSION,
+            package_kind=InitialContextPackageKind.CONVERSATION,
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            retrieval_profile_id="coding_debug",
+            subject_json={
+                "user_persona_id": None,
+                "platform_id": "mcp",
+                "character_id": None,
+                "workspace_id": None,
+                "assistant_mode_id": "coding_debug",
+                "mode": "coding_debug",
+            },
+            policy_signature=policy_signature,
+            coordinate_signature=coordinate_signature,
+            operational_profile=operational_profile,
+        )
+        package_hash = initial_context_package_key_hash(package_key)
+        package_connection = await engine.runtime.open_connection()
+        try:
+            await InitialContextPackageRepository(
+                package_connection,
+                engine.runtime.clock,
+            ).upsert_package(
+                package_kind=InitialContextPackageKind.CONVERSATION,
+                version=INITIAL_CONTEXT_PACKAGE_SCHEMA_VERSION,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                retrieval_profile_id="coding_debug",
+                key_json=package_key,
+                policy_signature_json=policy_signature,
+                coordinate_signature_json=coordinate_signature,
+                blocks_json={
+                    "prepared_memory_profile_block": "Existing MCP prepared context.",
+                    "source_counts": {"profile_items": 1},
+                },
+            )
+        finally:
+            await package_connection.close()
 
         confirmation = await _add_memory_impl(
             engine,
@@ -751,6 +867,14 @@ async def test_mcp_add_memory(
             assert stored_messages[-1]["role"] == "user"
             assert stored_messages[-1]["text"] == "Please remember that the retry loop needs a backoff."
             assert stored_messages[-1]["occurred_at"] == "2026-03-31T04:00:00+00:00"
+            package_status = await InitialContextPackageRepository(
+                connection,
+                runtime.clock,
+            ).read_by_key_hash(
+                user_id="usr_1",
+                package_key_hash=package_hash,
+            )
+            assert package_status.status == "stale"
         finally:
             await connection.close()
         assert await engine.runtime.storage_backend.get_context_view(cache_key) is None

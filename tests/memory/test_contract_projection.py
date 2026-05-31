@@ -158,6 +158,7 @@ def test_contract_projection_result_accepts_root_signal_list() -> None:
                 "scope": "assistant_mode",
                 "source_kind": "inferred",
                 "privacy_level": 1,
+                "language_codes": ["EN"],
             }
         ]
     )
@@ -165,6 +166,7 @@ def test_contract_projection_result_accepts_root_signal_list() -> None:
     assert result.nothing_durable is False
     assert len(result.signals) == 1
     assert result.signals[0].dimension_name == "directness"
+    assert result.signals[0].language_codes == ["en"]
 
 
 def test_contract_projection_result_ignores_provider_extra_signal_fields() -> None:
@@ -346,6 +348,7 @@ async def test_normal_projection_persists_memory_and_current_dimension() -> None
                 "scope": "assistant_mode",
                 "source_kind": "inferred",
                 "privacy_level": 1,
+                "language_codes": ["en"],
             }
         ],
         "nothing_durable": False,
@@ -387,6 +390,7 @@ async def test_normal_projection_persists_memory_and_current_dimension() -> None
         assert len(signals) == 1
         assert len(persisted) == 1
         assert persisted[0]["object_type"] == "interaction_contract"
+        assert persisted[0]["language_codes_json"] == ["en"]
         assert projected_rows[0]["dimension_name"] == "directness"
         assert current_contract["directness"] == {"label": "direct", "score": 0.88}
         assert "<message_timestamp>2023-05-08T13:56:00</message_timestamp>" in provider.requests[0].messages[1].content

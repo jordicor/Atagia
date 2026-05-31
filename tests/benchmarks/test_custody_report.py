@@ -102,6 +102,13 @@ def test_failed_question_custody_report_extracts_failure_context(tmp_path: Path)
         "candidate_kind_counts": {"memory": 1},
         "composer_decision_counts": {},
         "filter_reason_counts": {},
+        "eviction_reason_counts": {},
+        "source_backed_candidate_count": 0,
+        "summary_only_candidate_count": 0,
+        "selected_source_backed_count": 0,
+        "selected_summary_count": 0,
+        "high_value_rejected_candidate_count": 0,
+        "high_value_rejected_reasons": {},
     }
     assert custody.failures[0].memories_used == 0
     assert custody.failures[0].retrieval_time_ms == 12.0

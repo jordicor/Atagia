@@ -26,6 +26,12 @@ def test_parse_answer_profile_defaults_to_baseline_8k_budget() -> None:
     assert profile.max_output_tokens == 8192
 
 
+def test_parse_answer_profile_raises_small_explicit_budget_to_8k() -> None:
+    profile = parse_answer_profile("small=openrouter/openai/gpt-5.5,high:1024")
+
+    assert profile.max_output_tokens == 8192
+
+
 def test_answer_messages_preserve_selected_context_and_question() -> None:
     record = AnswerRecord(
         question_id="q1",

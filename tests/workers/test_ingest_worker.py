@@ -13,6 +13,7 @@ import pytest
 
 from atagia.app import create_app
 from atagia.core.clock import FrozenClock
+from atagia.core.communication_profile_repository import CommunicationProfileRepository
 from atagia.core.config import Settings
 from atagia.core.contract_repository import ContractDimensionRepository
 from atagia.core.db_sqlite import initialize_database
@@ -25,8 +26,10 @@ from atagia.core.repositories import (
     WorkspaceRepository,
 )
 from atagia.core.storage_backend import InProcessBackend
+from atagia.memory.candidate_search import CandidateSearch
+from atagia.memory.context_composer import ContextComposer
 from atagia.memory.extractor import ExtractionPersistenceDetails
-from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
+from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
 from atagia.memory.text_chunker import ChunkingPlan, TextChunk
 from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
@@ -39,7 +42,17 @@ from atagia.models.schemas_jobs import (
     WorkerControlMode,
     WORKER_GROUP_NAME,
 )
-from atagia.models.schemas_memory import ExtractionResult, MemoryObjectType
+from atagia.models.schemas_memory import (
+    ExtractionConversationContext,
+    ExtractionResult,
+    MemoryObjectType,
+    MemoryScope,
+    MemorySensitivity,
+    MemoryStatus,
+    PlannedSubQuery,
+    RetrievalPlan,
+    ScoredCandidate,
+)
 from atagia.services.llm_client import (
     LLMError,
     LLMClient,
@@ -53,6 +66,7 @@ from atagia.services.llm_client import (
 from atagia.services.worker_control_service import WorkerControlService
 from atagia.workers.contract_worker import ContractWorker
 from atagia.workers.ingest_worker import IngestWorker
+from tests.extraction_payload_support import rich_extraction_json_to_lean
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -67,6 +81,14 @@ class QueueProvider(LLMProvider):
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
+        if request.metadata.get("purpose") == "retrieval_surface_generation_dry_run":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {"surfaces": self._retrieval_surface_payloads(request)}
+                ),
+            )
         if request.metadata.get("purpose") == "need_detection":
             if not self.outputs:
                 raise AssertionError("No queued output left for this test")
@@ -92,6 +114,30 @@ class QueueProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text=output_text,
+            )
+        if request.metadata.get("purpose") == "need_detection_unknown_only_contract_review":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "is_exact_value_lookup": False,
+                        "exact_facets": [],
+                        "must_keep_terms": [],
+                        "quoted_phrases": [],
+                    }
+                ),
+            )
+        if request.metadata.get("purpose") == "need_detection_multi_facet_exact_review":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "has_multiple_obligations": False,
+                        "sub_queries": [],
+                    }
+                ),
             )
         if request.metadata.get("purpose") == "intent_classifier_explicit":
             return LLMCompletionResponse(
@@ -131,11 +177,20 @@ class QueueProvider(LLMProvider):
                 model=request.model,
                 output_text=json.dumps({"tendency_text": ""}),
             )
+        if request.metadata.get("purpose") == "user_language_profile_update":
+            output_text = _empty_user_language_profile_update_json()
+            if self.outputs and _is_user_language_profile_update_json(self.outputs[0]):
+                output_text = self.outputs.pop(0)
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=output_text,
+            )
         if not self.outputs:
             raise AssertionError("No queued output left for this test")
         output_text = self.outputs.pop(0)
         if request.metadata.get("purpose") == "memory_extraction":
-            output_text = _with_default_language_codes_json(output_text)
+            output_text = rich_extraction_json_to_lean(output_text)
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
@@ -144,6 +199,33 @@ class QueueProvider(LLMProvider):
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError("Embeddings are not used in worker tests")
+
+    def _retrieval_surface_payloads(
+        self,
+        request: LLMCompletionRequest,
+    ) -> list[dict[str, object]]:
+        prompt = request.messages[-1].content
+        assert isinstance(prompt, str)
+        start = prompt.index("<source_memories>") + len("<source_memories>")
+        end = prompt.index("</source_memories>")
+        source_memories = json.loads(prompt[start:end].strip())
+        assert isinstance(source_memories, list)
+        return [
+            {
+                "memory_id": str(memory["id"]),
+                "surface_type": "alias",
+                "surface_text": "respuestas depuracion concisas",
+                "alias_kind": "domain_synonym",
+                "language_code": "es",
+                "preserve_verbatim": False,
+                "non_evidential": True,
+                "confidence": 0.74,
+                "visibility_policy": "base_memory_gated",
+                "derivation": {"reason": "worker fixture dry-run"},
+            }
+            for memory in source_memories
+            if isinstance(memory, dict)
+        ]
 
 
 def _settings(**overrides: object) -> Settings:
@@ -170,29 +252,133 @@ def _settings(**overrides: object) -> Settings:
     return Settings(**{**asdict(settings), **overrides})
 
 
-def _with_default_language_codes_json(output_text: str) -> str:
+def _resolved_policy():
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["coding_debug"]
+    return PolicyResolver().resolve(manifest, None, None)
+
+
+def _persisted_surface_plan(
+    fts_query: str,
+    *,
+    query_type: str = "slot_fill",
+    exact_recall_mode: bool = True,
+) -> RetrievalPlan:
+    return RetrievalPlan(
+        original_query=fts_query,
+        assistant_mode_id="coding_debug",
+        conversation_id="cnv_1",
+        sub_query_plans=[
+            PlannedSubQuery(
+                text=fts_query,
+                fts_queries=[fts_query],
+                fts_query_kinds=["surface_probe"],
+            )
+        ],
+        scope_filter=[MemoryScope.GLOBAL_USER],
+        status_filter=[MemoryStatus.ACTIVE],
+        query_type=query_type,
+        max_candidates=10,
+        max_context_items=5,
+        privacy_ceiling=1,
+        retrieval_levels=[0],
+        exact_recall_mode=exact_recall_mode,
+    )
+
+
+def _empty_user_language_profile_update_json() -> str:
+    return json.dumps(
+        {
+            "observed_user_languages": [],
+            "explicit_language_preferences": [],
+            "explicit_language_abilities": [],
+            "contextual_norms": [],
+            "external_content_language_codes": [],
+        }
+    )
+
+
+def _is_user_language_profile_update_json(output_text: str) -> bool:
     try:
         payload = json.loads(output_text)
     except json.JSONDecodeError:
-        return output_text
+        return False
     if not isinstance(payload, dict):
-        return output_text
-    for field_name in ("evidences", "beliefs", "contract_signals", "state_updates"):
-        items = payload.get(field_name)
-        if not isinstance(items, list):
-            continue
-        payload[field_name] = [
-            (
+        return False
+    language_profile_fields = {
+        "observed_user_languages",
+        "explicit_language_preferences",
+        "explicit_language_abilities",
+        "contextual_norms",
+        "external_content_language_codes",
+    }
+    return bool(language_profile_fields & set(payload))
+
+
+def _public_extraction_payload() -> str:
+    return json.dumps(
+        {
+            "evidences": [
                 {
-                    **item,
-                    "language_codes": ["en"],
+                    "canonical_text": "I prefer concise debugging answers for retry issues",
+                    "scope": "user",
+                    "confidence": 0.92,
+                    "source_kind": "extracted",
+                    "privacy_level": 0,
+                    "sensitivity": "public",
+                    "payload": {"kind": "preference"},
                 }
-                if isinstance(item, dict) and "canonical_text" in item and "language_codes" not in item
-                else item
-            )
-            for item in items
-        ]
-    return json.dumps(payload)
+            ],
+            "beliefs": [],
+            "contract_signals": [],
+            "state_updates": [],
+            "mode_guess": None,
+            "nothing_durable": False,
+        }
+    )
+
+
+def _high_risk_extraction_payload() -> str:
+    return json.dumps(
+        {
+            "evidences": [
+                {
+                    "canonical_text": "The retry issue recovery PIN is stored elsewhere",
+                    "scope": "user",
+                    "confidence": 0.92,
+                    "source_kind": "extracted",
+                    "privacy_level": 3,
+                    "sensitivity": "secret",
+                    "memory_category": "pin_or_password",
+                    "payload": {"kind": "credential"},
+                }
+            ],
+            "beliefs": [],
+            "contract_signals": [],
+            "state_updates": [],
+            "mode_guess": None,
+            "nothing_durable": False,
+        }
+    )
+
+
+async def _retrieval_surface_counts(connection) -> tuple[int, int]:
+    surface_cursor = await connection.execute(
+        "SELECT COUNT(*) AS count FROM memory_retrieval_surfaces"
+    )
+    surface_row = await surface_cursor.fetchone()
+    fts_cursor = await connection.execute(
+        "SELECT COUNT(*) AS count FROM memory_retrieval_surfaces_fts"
+    )
+    fts_row = await fts_cursor.fetchone()
+    return int(surface_row["count"]), int(fts_row["count"])
+
+
+def _retrieval_packet_request_count(provider: QueueProvider) -> int:
+    return sum(
+        1
+        for request in provider.requests
+        if request.metadata.get("purpose") == "retrieval_surface_generation_dry_run"
+    )
 
 
 async def _build_runtime(
@@ -273,7 +459,12 @@ async def _build_runtime(
     )
 
 
-def _extract_job(message_id: str, *, workspace_id: str | None = None) -> JobEnvelope:
+def _extract_job(
+    message_id: str,
+    *,
+    workspace_id: str | None = None,
+    message_text: str = "I prefer concise debugging answers for retry issues.",
+) -> JobEnvelope:
     return JobEnvelope(
         job_id="job_extract_1",
         job_type="extract_memory_candidates",
@@ -282,7 +473,7 @@ def _extract_job(message_id: str, *, workspace_id: str | None = None) -> JobEnve
         message_ids=[message_id],
         payload={
             "message_id": message_id,
-            "message_text": "I prefer concise debugging answers for retry issues.",
+            "message_text": message_text,
             "role": "user",
             "assistant_mode_id": "coding_debug",
             "workspace_id": workspace_id,
@@ -317,6 +508,314 @@ def _contract_job(message_id: str) -> JobEnvelope:
         },
         created_at=datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc),
     )
+
+
+def test_retrieval_packet_settings_default_off_and_parse_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ATAGIA_RETRIEVAL_PACKETS_DRY_RUN_ENABLED", raising=False)
+    monkeypatch.delenv("ATAGIA_RETRIEVAL_PACKETS_WRITE_ENABLED", raising=False)
+
+    defaults = Settings.from_env()
+
+    assert defaults.retrieval_packets_dry_run_enabled is False
+    assert defaults.retrieval_packets_write_enabled is False
+
+    monkeypatch.setenv("ATAGIA_RETRIEVAL_PACKETS_WRITE_ENABLED", "true")
+    writer_only = Settings.from_env()
+
+    assert writer_only.retrieval_packets_dry_run_enabled is False
+    assert writer_only.retrieval_packets_write_enabled is True
+
+    monkeypatch.setenv("ATAGIA_RETRIEVAL_PACKETS_DRY_RUN_ENABLED", "true")
+    both = Settings.from_env()
+
+    assert both.retrieval_packets_dry_run_enabled is True
+    assert both.retrieval_packets_write_enabled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("settings_overrides", "expect_dry_run", "expect_writer"),
+    [
+        ({}, False, False),
+        ({"retrieval_packets_dry_run_enabled": True}, True, False),
+        ({"retrieval_packets_write_enabled": True}, False, False),
+        (
+            {
+                "retrieval_packets_dry_run_enabled": True,
+                "retrieval_packets_write_enabled": True,
+            },
+            True,
+            True,
+        ),
+    ],
+)
+async def test_ingest_worker_retrieval_packet_constructor_wiring(
+    settings_overrides: dict[str, object],
+    expect_dry_run: bool,
+    expect_writer: bool,
+) -> None:
+    (
+        connection,
+        _clock,
+        _backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        _message,
+    ) = await _build_runtime([], settings=_settings(**settings_overrides))
+    try:
+        extractor = ingest_worker._extractor
+
+        assert extractor._retrieval_packet_dry_run_enabled is expect_dry_run
+        assert (extractor._retrieval_packet_dry_run_generator is not None) is expect_dry_run
+        assert extractor._retrieval_packet_surface_write_enabled is expect_writer
+        assert (extractor._retrieval_packet_surface_writer is not None) is expect_writer
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("settings_overrides", "expected_packet_requests", "expected_surface_rows"),
+    [
+        ({}, 0, 0),
+        ({"retrieval_packets_write_enabled": True}, 0, 0),
+        ({"retrieval_packets_dry_run_enabled": True}, 1, 0),
+        (
+            {
+                "retrieval_packets_dry_run_enabled": True,
+                "retrieval_packets_write_enabled": True,
+            },
+            1,
+            1,
+        ),
+    ],
+)
+async def test_ingest_worker_retrieval_packet_flags_control_calls_and_writes(
+    settings_overrides: dict[str, object],
+    expected_packet_requests: int,
+    expected_surface_rows: int,
+) -> None:
+    (
+        connection,
+        _clock,
+        backend,
+        provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
+        [_public_extraction_payload()],
+        settings=_settings(**settings_overrides),
+    )
+    try:
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"])).model_dump(mode="json"),
+        )
+
+        result = await ingest_worker.run_once()
+        surface_count, fts_count = await _retrieval_surface_counts(connection)
+        stored = await memories.list_for_user("usr_1")
+
+        assert result.acked == 1
+        assert len(stored) == 1
+        assert _retrieval_packet_request_count(provider) == expected_packet_requests
+        assert surface_count == expected_surface_rows
+        assert fts_count == expected_surface_rows
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_worker_updates_user_language_profile_after_ingest() -> None:
+    language_profile_update = json.dumps(
+        {
+            "observed_user_languages": [
+                {"language_code": "es", "confidence": 0.9}
+            ],
+            "explicit_language_preferences": [
+                {
+                    "language_code": "es",
+                    "preference_kind": "default_answer_language",
+                    "context_label": "ordinary_chat",
+                    "confidence": 0.93,
+                }
+            ],
+            "explicit_language_abilities": [],
+            "contextual_norms": [],
+            "external_content_language_codes": [],
+        }
+    )
+    (
+        connection,
+        clock,
+        _backend,
+        provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime([_public_extraction_payload(), language_profile_update])
+    try:
+        await ingest_worker.process_job(_extract_job(str(message["id"])).model_dump(mode="json"))
+
+        repository = CommunicationProfileRepository(connection, clock)
+        profile = await repository.get_user_language_profile_for_context(
+            ExtractionConversationContext(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                source_message_id=str(message["id"]),
+                workspace_id=None,
+                assistant_mode_id="coding_debug",
+                platform_id="default",
+                character_id=None,
+            )
+        )
+        assert profile is not None
+        assert [row.language_code for row in profile.observed_user_languages] == ["es"]
+        assert profile.explicit_language_preferences[0].preference_kind == "default_answer_language"
+        assert any(
+            request.metadata.get("purpose") == "user_language_profile_update"
+            for request in provider.requests
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_worker_retrieval_packet_surface_recovers_and_composes_base_memory() -> None:
+    (
+        connection,
+        clock,
+        backend,
+        provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
+        [_public_extraction_payload()],
+        settings=_settings(
+            retrieval_packets_dry_run_enabled=True,
+            retrieval_packets_write_enabled=True,
+        ),
+    )
+    try:
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"])).model_dump(mode="json"),
+        )
+
+        result = await ingest_worker.run_once()
+        surface_count, fts_count = await _retrieval_surface_counts(connection)
+        stored = await memories.list_for_user("usr_1")
+
+        assert result.acked == 1
+        assert len(stored) == 1
+        assert _retrieval_packet_request_count(provider) == 1
+        assert surface_count == 1
+        assert fts_count == 1
+
+        fts_query_audit: list[dict[str, object]] = []
+        candidates = await CandidateSearch(connection, clock).search(
+            _persisted_surface_plan("respuestas depuracion concisas"),
+            user_id="usr_1",
+            fts_query_audit=fts_query_audit,
+        )
+
+        memory_id = str(stored[0]["id"])
+        assert [str(candidate["id"]) for candidate in candidates] == [memory_id]
+        assert candidates[0]["canonical_text"] == (
+            "I prefer concise debugging answers for retry issues"
+        )
+        persisted_matches = [
+            match
+            for match in candidates[0].get("fts_query_matches", [])
+            if match.get("source") == "persisted_surface"
+        ]
+        assert persisted_matches
+        assert persisted_matches[0]["non_evidential"] is True
+        persisted_audit = [
+            entry
+            for entry in fts_query_audit
+            if entry.get("source") == "persisted_surface"
+        ]
+        assert persisted_audit[0]["raw_rows"] == 1
+
+        composed = ContextComposer(clock).compose(
+            [
+                ScoredCandidate(
+                    memory_id=memory_id,
+                    memory_object=candidates[0],
+                    llm_applicability=1.0,
+                    retrieval_score=float(candidates[0].get("rrf_score", 0.0)),
+                    vitality_boost=0.0,
+                    confirmation_boost=0.0,
+                    need_boost=0.0,
+                    penalty=0.0,
+                    final_score=1.0,
+                )
+            ],
+            current_contract={},
+            user_state=None,
+            resolved_policy=_resolved_policy(),
+            conversation_messages=[],
+            query_text="respuestas depuracion concisas",
+            query_type="slot_fill",
+            exact_recall_mode=True,
+        )
+
+        assert composed.selected_memory_ids == [memory_id]
+        assert "I prefer concise debugging answers for retry issues" in composed.memory_block
+        assert "respuestas depuracion concisas" not in composed.memory_block.lower()
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_worker_lean_extraction_persists_formerly_high_risk_as_active() -> None:
+    # Privacy enrichment is deferred (F1.2): the lean contract carries no
+    # privacy_level/sensitivity/memory_category, so content that previously
+    # registered as high-risk now persists active and public. The retrieval
+    # packet writer's high-risk exclusion is therefore not triggered at
+    # extraction time; that exclusion is covered by the dedicated retrieval
+    # surface policy tests.
+    (
+        connection,
+        clock,
+        backend,
+        provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
+        [_high_risk_extraction_payload()],
+        settings=_settings(
+            retrieval_packets_dry_run_enabled=True,
+            retrieval_packets_write_enabled=True,
+        ),
+    )
+    try:
+        message_text = "The retry issue recovery PIN is stored elsewhere"
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"]), message_text=message_text).model_dump(mode="json"),
+        )
+
+        result = await ingest_worker.run_once()
+        stored = await memories.list_for_user("usr_1")
+
+        assert result.acked == 1
+        assert len(stored) == 1
+        assert stored[0]["status"] == MemoryStatus.ACTIVE.value
+        assert stored[0]["privacy_level"] == 0
+        assert stored[0]["sensitivity"] == MemorySensitivity.PUBLIC.value
+    finally:
+        await connection.close()
 
 
 @pytest.mark.asyncio
@@ -524,7 +1023,7 @@ async def test_ingest_worker_dead_letter_includes_structured_error_details_after
         assert dead_letter is not None
         assert dead_letter["error"] == "Provider returned invalid structured output"
         assert dead_letter["error_details"] == [
-            "$.state_updates[0]: Value error, valid_from_iso must be <= valid_to_iso"
+            "$.candidates[0].temporal_status: Value error, valid_from_iso must be <= valid_to_iso"
         ]
     finally:
         await connection.close()
@@ -1268,7 +1767,8 @@ def test_chat_reply_enqueues_stream_jobs_and_worker_processes_extraction(tmp_pat
             )
 
             assert response.status_code == 200
-            assert len(response.json()["debug"]["enqueued_job_ids"]) == 3
+            assert response.json()["debug"]["selected_memory_count"] == 0
+            assert "enqueued_job_ids" not in response.json()["debug"]
 
             ingest_worker = IngestWorker(
                 storage_backend=runtime.storage_backend,

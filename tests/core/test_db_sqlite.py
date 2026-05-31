@@ -56,14 +56,20 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "graph_projection_runs",
             "graph_relationship_sources",
             "graph_relationships",
+            "initial_context_packages",
             "memory_feedback_events",
+            "memory_fact_facets",
+            "memory_retrieval_surfaces",
+            "memory_retrieval_surfaces_fts",
             "memory_embedding_metadata",
             "memory_links",
             "memory_consent_profile",
             "memory_edit_history",
+            "memory_evidence_spans",
             "memory_objects",
             "memory_objects_fts",
             "memory_object_subjects",
+            "memory_support_edges",
             "messages",
             "messages_fts",
             "minds",
@@ -141,6 +147,69 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
         assert "source_mind_id" in memory_columns
         assert "embodiment_id" in memory_columns
         assert "realm_id" in memory_columns
+        surface_columns_cursor = await connection.execute(
+            "PRAGMA table_info(memory_retrieval_surfaces);"
+        )
+        surface_columns = {row["name"] for row in await surface_columns_cursor.fetchall()}
+        assert {
+            "_rowid",
+            "id",
+            "user_id",
+            "memory_id",
+            "surface_type",
+            "anchor_type",
+            "alias_kind",
+            "language_code",
+            "surface_text",
+            "surface_key",
+            "preserve_verbatim",
+            "non_evidential",
+            "confidence",
+            "derivation_kind",
+            "derivation_model",
+            "derivation_prompt_version",
+            "derivation_json",
+            "status",
+            "created_at",
+            "updated_at",
+        }.issubset(surface_columns)
+        fact_facet_columns_cursor = await connection.execute(
+            "PRAGMA table_info(memory_fact_facets);"
+        )
+        fact_facet_columns = {
+            row["name"] for row in await fact_facet_columns_cursor.fetchall()
+        }
+        assert {
+            "_rowid",
+            "id",
+            "user_id",
+            "conversation_id",
+            "memory_id",
+            "source_message_id",
+            "source_span_id",
+            "source_hash",
+            "subject_surface",
+            "subject_cluster_id",
+            "surface_class",
+            "facet_label",
+            "value_text",
+            "value_norm_key",
+            "value_type",
+            "assertion_kind",
+            "list_group_key",
+            "support_kind",
+            "observed_at",
+            "valid_from",
+            "valid_to",
+            "current_state",
+            "resolved_interval_start",
+            "resolved_interval_end",
+            "temporal_confidence",
+            "language_code",
+            "confidence",
+            "schema_version",
+            "created_at",
+        }.issubset(fact_facet_columns)
         conversation_columns_cursor = await connection.execute("PRAGMA table_info(conversations);")
         conversation_columns = {row["name"] for row in await conversation_columns_cursor.fetchall()}
         assert {
@@ -403,6 +472,33 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "status",
             "dedupe_key",
         }.issubset(graph_relationship_columns)
+        initial_context_package_columns_cursor = await connection.execute(
+            "PRAGMA table_info(initial_context_packages);"
+        )
+        initial_context_package_columns = {
+            row["name"] for row in await initial_context_package_columns_cursor.fetchall()
+        }
+        assert {
+            "_rowid",
+            "id",
+            "package_key_hash",
+            "package_kind",
+            "version",
+            "user_id",
+            "conversation_id",
+            "retrieval_profile_id",
+            "key_json",
+            "policy_signature_json",
+            "coordinate_signature_json",
+            "source_fingerprint_json",
+            "blocks_json",
+            "source_refs_json",
+            "diagnostics_json",
+            "build_status",
+            "created_at",
+            "updated_at",
+            "valid_until",
+        }.issubset(initial_context_package_columns)
     finally:
         await connection.close()
 
@@ -414,6 +510,280 @@ async def test_migrations_are_idempotent() -> None:
         manager = MigrationManager(MIGRATIONS_DIR)
         applied = await manager.apply_all(connection)
         assert applied == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_retrieval_surfaces_fts_owner_guard_and_cascade() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    try:
+        await connection.executescript(
+            """
+            INSERT INTO users(id, external_ref, created_at, updated_at, deleted_at)
+            VALUES
+                ('usr_1', NULL, '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00', NULL),
+                ('usr_2', NULL, '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00', NULL);
+
+            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+            VALUES ('coding_debug', 'Coding Debug', 'hash_1', '{}', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00');
+
+            INSERT INTO conversations(id, user_id, workspace_id, assistant_mode_id, title, status, metadata_json, created_at, updated_at)
+            VALUES ('cnv_1', 'usr_1', NULL, 'coding_debug', 'Conversation', 'active', '{}', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00');
+
+            INSERT INTO memory_objects(
+                id, user_id, workspace_id, conversation_id, assistant_mode_id,
+                object_type, scope, canonical_text, index_text, payload_json,
+                source_kind, confidence, stability, vitality, maya_score,
+                privacy_level, status, created_at, updated_at
+            )
+            VALUES (
+                'mem_1', 'usr_1', NULL, 'cnv_1', 'coding_debug',
+                'evidence', 'chat', 'Ben moved to 44 Pine Lane', NULL, '{}',
+                'extracted', 0.8, 0.5, 0.0, 0.0,
+                0, 'active', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+            );
+
+            INSERT INTO memory_retrieval_surfaces(
+                id, user_id, memory_id, surface_type, language_code,
+                surface_text, surface_key, non_evidential, derivation_kind,
+                created_at, updated_at
+            )
+            VALUES (
+                'mrs_1', 'usr_1', 'mem_1', 'alias', 'es',
+                'nuevo apartamento', 'nuevo apartamento', 1, 'manual_fixture',
+                '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+            );
+            """
+        )
+        await connection.commit()
+
+        cursor = await connection.execute(
+            """
+            SELECT mrs.id
+            FROM memory_retrieval_surfaces_fts
+            JOIN memory_retrieval_surfaces AS mrs
+              ON mrs._rowid = memory_retrieval_surfaces_fts.rowid
+            WHERE memory_retrieval_surfaces_fts MATCH 'apartamento'
+            """
+        )
+        assert [row["id"] for row in await cursor.fetchall()] == ["mrs_1"]
+
+        await connection.execute(
+            """
+            UPDATE memory_retrieval_surfaces
+            SET surface_text = ?,
+                surface_key = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                "new apartment",
+                "new apartment",
+                "2026-03-30T00:05:00+00:00",
+                "mrs_1",
+            ),
+        )
+        await connection.commit()
+
+        cursor = await connection.execute(
+            "SELECT rowid FROM memory_retrieval_surfaces_fts WHERE memory_retrieval_surfaces_fts MATCH 'apartamento'"
+        )
+        assert await cursor.fetchall() == []
+        cursor = await connection.execute(
+            "SELECT rowid FROM memory_retrieval_surfaces_fts WHERE memory_retrieval_surfaces_fts MATCH 'apartment'"
+        )
+        assert len(await cursor.fetchall()) == 1
+
+        with pytest.raises(aiosqlite.IntegrityError, match="user_id must match"):
+            await connection.execute(
+                """
+                INSERT INTO memory_retrieval_surfaces(
+                    id, user_id, memory_id, surface_type, surface_text,
+                    surface_key, derivation_kind, created_at, updated_at
+                )
+                VALUES (
+                    'mrs_wrong_user', 'usr_2', 'mem_1', 'alias',
+                    'wrong owner', 'wrong owner', 'manual_fixture',
+                    '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+                )
+                """
+            )
+
+        await connection.execute("DELETE FROM memory_objects WHERE id = 'mem_1'")
+        await connection.commit()
+        cursor = await connection.execute("SELECT COUNT(*) AS count FROM memory_retrieval_surfaces")
+        row = await cursor.fetchone()
+        assert row["count"] == 0
+        cursor = await connection.execute(
+            "SELECT rowid FROM memory_retrieval_surfaces_fts WHERE memory_retrieval_surfaces_fts MATCH 'apartment'"
+        )
+        assert await cursor.fetchall() == []
+
+        await connection.executescript(
+            """
+            INSERT INTO memory_objects(
+                id, user_id, workspace_id, conversation_id, assistant_mode_id,
+                object_type, scope, canonical_text, index_text, payload_json,
+                source_kind, confidence, stability, vitality, maya_score,
+                privacy_level, status, created_at, updated_at
+            )
+            VALUES (
+                'mem_erase', 'usr_1', NULL, 'cnv_1', 'coding_debug',
+                'evidence', 'chat', 'User erasure surface base', NULL, '{}',
+                'extracted', 0.8, 0.5, 0.0, 0.0,
+                0, 'active', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+            );
+
+            INSERT INTO memory_retrieval_surfaces(
+                id, user_id, memory_id, surface_type, surface_text,
+                surface_key, non_evidential, derivation_kind, created_at, updated_at
+            )
+            VALUES (
+                'mrs_erase', 'usr_1', 'mem_erase', 'alias',
+                'erase surface', 'erase surface', 1, 'manual_fixture',
+                '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+            );
+            """
+        )
+        await connection.commit()
+        await connection.execute("DELETE FROM memory_objects WHERE user_id = 'usr_1'")
+        await connection.commit()
+        cursor = await connection.execute("SELECT COUNT(*) AS count FROM memory_retrieval_surfaces")
+        row = await cursor.fetchone()
+        assert row["count"] == 0
+        cursor = await connection.execute(
+            "SELECT rowid FROM memory_retrieval_surfaces_fts WHERE memory_retrieval_surfaces_fts MATCH 'erase'"
+        )
+        assert await cursor.fetchall() == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_fact_facets_supersedes_owner_guard() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    try:
+        await connection.executescript(
+            """
+            INSERT INTO users(id, external_ref, created_at, updated_at, deleted_at)
+            VALUES
+                ('usr_1', NULL, '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00', NULL),
+                ('usr_2', NULL, '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00', NULL);
+
+            INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
+            VALUES ('coding_debug', 'Coding Debug', 'hash_1', '{}', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00');
+
+            INSERT INTO conversations(id, user_id, workspace_id, assistant_mode_id, title, status, metadata_json, created_at, updated_at)
+            VALUES
+                ('cnv_1', 'usr_1', NULL, 'coding_debug', 'One', 'active', '{}', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'),
+                ('cnv_2', 'usr_2', NULL, 'coding_debug', 'Two', 'active', '{}', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00');
+
+            INSERT INTO messages(id, conversation_id, role, seq, text, token_count, metadata_json, created_at)
+            VALUES
+                ('msg_1', 'cnv_1', 'user', 1, 'Paris.', 1, '{}', '2026-03-30T00:00:00+00:00'),
+                ('msg_2', 'cnv_2', 'user', 1, 'Rome.', 1, '{}', '2026-03-30T00:00:00+00:00');
+
+            INSERT INTO memory_objects(
+                id, user_id, workspace_id, conversation_id, assistant_mode_id,
+                object_type, scope, canonical_text, index_text, payload_json,
+                source_kind, confidence, stability, vitality, maya_score,
+                privacy_level, status, created_at, updated_at
+            )
+            VALUES
+                (
+                    'mem_1', 'usr_1', NULL, 'cnv_1', 'coding_debug',
+                    'evidence', 'chat', 'User mentioned Paris.', NULL, '{}',
+                    'extracted', 0.8, 0.5, 0.0, 0.0,
+                    0, 'active', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+                ),
+                (
+                    'mem_2', 'usr_2', NULL, 'cnv_2', 'coding_debug',
+                    'evidence', 'chat', 'User mentioned Rome.', NULL, '{}',
+                    'extracted', 0.8, 0.5, 0.0, 0.0,
+                    0, 'active', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+                );
+
+            INSERT INTO memory_support_edges(id, user_id, memory_id, created_at, updated_at)
+            VALUES
+                ('edge_1', 'usr_1', 'mem_1', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'),
+                ('edge_2', 'usr_2', 'mem_2', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00');
+
+            INSERT INTO memory_evidence_spans(
+                id, user_id, support_edge_id, memory_id, conversation_id, message_id,
+                span_role, quote_text, created_at, updated_at
+            )
+            VALUES
+                ('span_1', 'usr_1', 'edge_1', 'mem_1', 'cnv_1', 'msg_1', 'source', 'Paris.', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'),
+                ('span_2', 'usr_2', 'edge_2', 'mem_2', 'cnv_2', 'msg_2', 'source', 'Rome.', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00');
+
+            INSERT INTO memory_fact_facets(
+                id, user_id, conversation_id, memory_id, source_message_id,
+                source_span_id, source_hash, subject_surface, surface_class,
+                facet_label, value_text, value_norm_key, assertion_kind,
+                support_kind, observed_at, created_at
+            )
+            VALUES
+                (
+                    'mff_1', 'usr_1', 'cnv_1', 'mem_1', 'msg_1',
+                    'span_1', 'hash_1', 'user', 'structured',
+                    'city', 'Paris', 'paris', 'evidence',
+                    'direct', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+                ),
+                (
+                    'mff_2', 'usr_2', 'cnv_2', 'mem_2', 'msg_2',
+                    'span_2', 'hash_2', 'user', 'structured',
+                    'city', 'Rome', 'rome', 'evidence',
+                    'direct', '2026-03-30T00:00:00+00:00', '2026-03-30T00:00:00+00:00'
+                );
+            """
+        )
+
+        with pytest.raises(aiosqlite.IntegrityError, match="supersedes_fact_id"):
+            await connection.execute(
+                """
+                INSERT INTO memory_fact_facets(
+                    id, user_id, conversation_id, memory_id, source_message_id,
+                    source_span_id, source_hash, subject_surface, surface_class,
+                    facet_label, value_text, value_norm_key, assertion_kind,
+                    support_kind, observed_at, current_state, supersedes_fact_id,
+                    created_at
+                )
+                VALUES (
+                    'mff_cross_user', 'usr_2', 'cnv_2', 'mem_2', 'msg_2',
+                    'span_2', 'hash_3', 'user', 'structured',
+                    'city', 'Milan', 'milan', 'evidence',
+                    'direct', '2026-03-30T00:00:00+00:00', 1, 'mff_1',
+                    '2026-03-30T00:00:00+00:00'
+                )
+                """
+            )
+
+        with pytest.raises(aiosqlite.IntegrityError, match="supersedes_fact_id"):
+            await connection.execute(
+                """
+                UPDATE memory_fact_facets
+                SET supersedes_fact_id = 'mff_1'
+                WHERE id = 'mff_2'
+                """
+            )
+
+        with pytest.raises(aiosqlite.IntegrityError, match="supersedes_fact_id"):
+            await connection.execute(
+                """
+                UPDATE memory_fact_facets
+                SET supersedes_fact_id = 'mff_nonexistent'
+                WHERE id = 'mff_1'
+                """
+            )
+
+        await connection.execute(
+            """
+            UPDATE memory_fact_facets
+            SET supersedes_fact_id = 'mff_2'
+            WHERE id = 'mff_2'
+            """
+        )
     finally:
         await connection.close()
 
@@ -912,42 +1282,12 @@ async def test_migration_0012_backfills_summary_view_user_ids_and_drops_orphans(
         )
         rows = await rows_cursor.fetchall()
 
-        assert [migration.version for migration in applied] == [
-            12,
-            13,
-            14,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-            28,
-            29,
-            30,
-            31,
-            32,
-            33,
-            34,
-            35,
-            36,
-            37,
-            38,
-            39,
-            40,
-            41,
-            42,
-            43,
-            44,
-            45,
+        expected_versions = [
+            migration.version
+            for migration in manager.discover()
+            if migration.version >= 12
         ]
+        assert [migration.version for migration in applied] == expected_versions
         assert [row["id"] for row in rows] == ["sum_conv", "sum_rollup"]
         assert all(row["user_id"] == "usr_1" for row in rows)
         assert all(row["hierarchy_level"] == 0 for row in rows)

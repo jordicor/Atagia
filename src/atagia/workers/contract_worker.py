@@ -11,6 +11,7 @@ import aiosqlite
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.contract_repository import ContractDimensionRepository
+from atagia.core.initial_context_package_repository import InitialContextPackageRepository
 from atagia.core.storage_backend import StorageBackend
 from atagia.core.repositories import (
     ConversationRepository,
@@ -22,6 +23,7 @@ from atagia.memory.contract_projection import ContractProjector
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.models.schemas_jobs import (
     CONTRACT_STREAM_NAME,
+    InitialContextPackageRefreshReason,
     JobEnvelope,
     StreamMessage,
     JobType,
@@ -35,6 +37,9 @@ from atagia.models.schemas_memory import (
     ExtractionConversationContext,
 )
 from atagia.services.chat_support import apply_conversation_policy_overlay
+from atagia.services.initial_context_package_refresh_service import (
+    InitialContextPackageRefreshEnqueuer,
+)
 from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.llm_client import LLMClient, StructuredOutputError
 from atagia.services.worker_control_service import WorkerControlService, wait_if_worker_claims_paused
@@ -70,6 +75,13 @@ class ContractWorker:
             clock,
             workers_enabled=resolved_settings.workers_enabled,
             settings=resolved_settings,
+        )
+        self._initial_context_package_refresh = InitialContextPackageRefreshEnqueuer(
+            storage_backend=storage_backend,
+            clock=clock,
+            job_tracking_service=self._job_tracking,
+            package_repository=InitialContextPackageRepository(connection, clock),
+            refresh_enabled=resolved_settings.initial_context_package_refresh_enabled,
         )
         self._conversation_repository = ConversationRepository(connection, clock)
         self._user_repository = UserRepository(connection, clock)
@@ -270,6 +282,13 @@ class ContractWorker:
                 ingest_origin=job_payload.ingest_origin,
                 confirmation_strategy=job_payload.confirmation_strategy,
                 memory_privacy_mode=job_payload.memory_privacy_mode,
+                privacy_enforcement=job_payload.privacy_enforcement,
+                authenticated_user_privilege_level=(
+                    job_payload.authenticated_user_privilege_level
+                ),
+                authenticated_user_is_atagia_master=(
+                    job_payload.authenticated_user_is_atagia_master
+                ),
             )
             await self._projector.project(
                 message_text=job_payload.message_text,
@@ -282,6 +301,16 @@ class ContractWorker:
             await self._storage_backend.remember_dedupe(
                 dedupe_key,
                 CONTRACT_DEDUPE_TTL_SECONDS,
+            )
+            await self._initial_context_package_refresh.enqueue_refresh(
+                user_id=envelope.user_id,
+                conversation_id=envelope.conversation_id,
+                retrieval_profile_id=job_payload.assistant_mode_id,
+                reason=InitialContextPackageRefreshReason.CONTRACT_PROJECTION,
+                source_message_ids=[job_payload.message_id],
+                privacy_enforcement=job_payload.privacy_enforcement,
+                operational_profile=envelope.operational_profile,
+                fail_open=True,
             )
         finally:
             await self._storage_backend.release_lock(f"{dedupe_key}:lock", lock_token)

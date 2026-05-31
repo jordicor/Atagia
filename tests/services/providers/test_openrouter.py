@@ -156,9 +156,20 @@ async def test_openrouter_complete_raises_transient_on_error_finish_reason() -> 
 
 
 @pytest.mark.asyncio
-async def test_openrouter_complete_omits_response_format_for_structured_schema() -> None:
+@pytest.mark.parametrize(
+    "model",
+    [
+        "anthropic/claude-sonnet-4.6",
+        "google/gemini-3.1-flash-lite",
+        "openai/gpt-chat-latest",
+        "x-ai/grok-4-fast",
+    ],
+)
+async def test_openrouter_complete_uses_response_format_for_major_structured_vendors(
+    model: str,
+) -> None:
     response = SimpleNamespace(
-        model="anthropic/claude-sonnet-4.6",
+        model=model,
         choices=[SimpleNamespace(message=SimpleNamespace(content='{"score":0.8}'))],
         usage=None,
         model_dump=lambda: {"id": "gen_1"},
@@ -172,7 +183,7 @@ async def test_openrouter_complete_omits_response_format_for_structured_schema()
     )
 
     request = LLMCompletionRequest(
-        model="anthropic/claude-sonnet-4.6",
+        model=model,
         messages=[LLMMessage(role="user", content="Return JSON.")],
         max_output_tokens=128,
         response_schema={
@@ -190,7 +201,253 @@ async def test_openrouter_complete_omits_response_format_for_structured_schema()
     completion = await provider.complete(request)
 
     assert completion.output_text == '{"score":0.8}'
+    call = completions.calls[0]
+    assert call["response_format"]["type"] == "json_schema"
+    if model.startswith("google/"):
+        assert call["response_format"]["json_schema"]["strict"] is False
+        schema = call["response_format"]["json_schema"]["schema"]
+        assert "required" not in schema
+        assert "minimum" not in schema["properties"]["score"]
+        assert "maximum" not in schema["properties"]["score"]
+    else:
+        assert call["response_format"]["json_schema"]["strict"] is True
+        assert call["response_format"]["json_schema"]["schema"]["required"] == ["score"]
+    assert call["extra_body"]["provider"]["require_parameters"] is True
+
+
+@pytest.mark.asyncio
+async def test_openrouter_strips_nullable_for_google_structured_output() -> None:
+    response = SimpleNamespace(
+        model="google/gemini-3.1-flash-lite",
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"label":"ok"}'))],
+        usage=None,
+        model_dump=lambda: {"id": "gen_1"},
+    )
+    completions = FakeChatCompletions(response)
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://atagia.org",
+        app_name="Atagia",
+        client=FakeOpenAIClient(completions),
+    )
+    request = LLMCompletionRequest(
+        model="google/gemini-3.1-flash-lite",
+        messages=[LLMMessage(role="user", content="Return JSON.")],
+        max_output_tokens=128,
+        response_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {"$ref": "#/$defs/Status"},
+                "label": {"type": "string"},
+                "note": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": None,
+                },
+            },
+            "$defs": {"Status": {"type": "string", "enum": ["ok", "warning"]}},
+        },
+    )
+
+    await provider.complete(request)
+
+    response_format = completions.calls[0]["response_format"]
+    assert response_format["json_schema"]["strict"] is False
+    schema = response_format["json_schema"]["schema"]
+    assert "$defs" not in schema
+    assert "additionalProperties" not in schema
+    assert schema["properties"]["status"] == {"type": "string", "enum": ["ok", "warning"]}
+    assert schema["properties"]["note"] == {"type": "string"}
+
+
+@pytest.mark.asyncio
+async def test_openrouter_preserves_nullable_for_openai_vendor() -> None:
+    response = SimpleNamespace(
+        model="openai/gpt-chat-latest",
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"label":"ok"}'))],
+        usage=None,
+        model_dump=lambda: {"id": "gen_1"},
+    )
+    completions = FakeChatCompletions(response)
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://atagia.org",
+        app_name="Atagia",
+        client=FakeOpenAIClient(completions),
+    )
+    request = LLMCompletionRequest(
+        model="openai/gpt-chat-latest",
+        messages=[LLMMessage(role="user", content="Return JSON.")],
+        max_output_tokens=128,
+        response_schema={
+            "type": "object",
+            "properties": {
+                "label": {"type": "string"},
+                "note": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": None,
+                },
+            },
+        },
+    )
+
+    await provider.complete(request)
+
+    response_format = completions.calls[0]["response_format"]
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["properties"]["note"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_complete_preserves_provider_body_when_requiring_schema_support() -> None:
+    response = SimpleNamespace(
+        model="openai/gpt-chat-latest",
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"score":0.8}'))],
+        usage=None,
+        model_dump=lambda: {"id": "gen_1"},
+    )
+    completions = FakeChatCompletions(response)
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://atagia.org",
+        app_name="Atagia",
+        client=FakeOpenAIClient(completions),
+    )
+
+    request = LLMCompletionRequest(
+        model="openai/gpt-chat-latest",
+        messages=[LLMMessage(role="user", content="Return JSON.")],
+        response_schema={
+            "type": "object",
+            "properties": {"score": {"type": "number"}},
+        },
+        metadata={
+            "provider_extra_body": {
+                "provider": {"sort": "latency", "require_parameters": False},
+                "reasoning": {"effort": "low"},
+            }
+        },
+    )
+
+    await provider.complete(request)
+
+    assert completions.calls[0]["extra_body"] == {
+        "provider": {"sort": "latency", "require_parameters": True},
+        "reasoning": {"effort": "low"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model",
+    [
+        "qwen/qwen3-coder-30b-a3b-instruct",
+        "mistralai/mistral-small-3.2-24b-instruct",
+    ],
+)
+async def test_openrouter_profile_flag_uses_native_response_format(
+    model: str,
+) -> None:
+    response = SimpleNamespace(
+        model=model,
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"score":0.8}'))],
+        usage=None,
+        model_dump=lambda: {"id": "gen_1"},
+    )
+    completions = FakeChatCompletions(response)
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://atagia.org",
+        app_name="Atagia",
+        client=FakeOpenAIClient(completions),
+    )
+
+    request = LLMCompletionRequest(
+        model=model,
+        messages=[LLMMessage(role="user", content="Return JSON.")],
+        max_output_tokens=128,
+        response_schema={
+            "type": "object",
+            "properties": {"score": {"type": "number"}},
+        },
+        metadata={"openrouter_native_structured_output": True},
+    )
+
+    await provider.complete(request)
+
+    call = completions.calls[0]
+    assert call["response_format"]["type"] == "json_schema"
+    assert call["extra_body"]["provider"]["require_parameters"] is True
+
+
+@pytest.mark.asyncio
+async def test_openrouter_openai_chat_latest_omits_unsupported_temperature() -> None:
+    response = SimpleNamespace(
+        model="openai/gpt-chat-latest",
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"score":0.8}'))],
+        usage=None,
+        model_dump=lambda: {"id": "gen_1"},
+    )
+    completions = FakeChatCompletions(response)
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://atagia.org",
+        app_name="Atagia",
+        client=FakeOpenAIClient(completions),
+    )
+
+    request = LLMCompletionRequest(
+        model="openai/gpt-chat-latest",
+        messages=[LLMMessage(role="user", content="Return JSON.")],
+        temperature=0.0,
+        max_output_tokens=8192,
+        response_schema={
+            "type": "object",
+            "properties": {"score": {"type": "number"}},
+        },
+    )
+
+    await provider.complete(request)
+
+    call = completions.calls[0]
+    assert "temperature" not in call
+    assert call["max_tokens"] == 8192
+    assert call["response_format"]["type"] == "json_schema"
+    assert call["extra_body"]["provider"]["require_parameters"] is True
+
+
+@pytest.mark.asyncio
+async def test_openrouter_complete_omits_response_format_for_flexible_vendor() -> None:
+    response = SimpleNamespace(
+        model="deepseek/deepseek-v4-flash",
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"score":0.8}'))],
+        usage=None,
+        model_dump=lambda: {"id": "gen_1"},
+    )
+    completions = FakeChatCompletions(response)
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://atagia.org",
+        app_name="Atagia",
+        client=FakeOpenAIClient(completions),
+    )
+
+    request = LLMCompletionRequest(
+        model="deepseek/deepseek-v4-flash",
+        messages=[LLMMessage(role="user", content="Return JSON.")],
+        max_output_tokens=128,
+        response_schema={
+            "type": "object",
+            "properties": {"score": {"type": "number"}},
+        },
+    )
+
+    completion = await provider.complete(request)
+
+    assert completion.output_text == '{"score":0.8}'
     assert "response_format" not in completions.calls[0]
+    assert "extra_body" not in completions.calls[0]
 
 
 def test_openrouter_default_headers_and_factory_wiring(monkeypatch: pytest.MonkeyPatch) -> None:

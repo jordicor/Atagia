@@ -10,19 +10,17 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import aiosqlite
 
 from atagia import Atagia
-from atagia.core.llm_output_limits import LOCOMO_REPLAY_PROBE_ANSWER_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import ConversationRepository, summary_mirror_id
 from atagia.memory.retrieval_planner import build_retrieval_fts_queries
-from atagia.models.schemas_replay import AblationConfig, PipelineResult
-from atagia.services.chat_support import build_system_prompt, chat_model, resolve_policy
-from atagia.services.llm_client import LLMCompletionRequest, LLMMessage
+from atagia.models.schemas_replay import AblationConfig
 from atagia.services.model_resolution import COMPONENTS_BY_ID, provider_qualified_model
-from atagia.services.retrieval_service import RetrievalService
 from benchmarks.base import BenchmarkConversation
 from benchmarks.json_artifacts import write_json_atomic
 from benchmarks.llm_config import provider_api_key_kwargs
@@ -61,16 +59,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm-model",
         default=os.getenv("ATAGIA_LLM_CHAT_MODEL"),
-        help="Legacy alias for --answer-model; used only for answer generation.",
+        help="Legacy alias for --answer-model; used as the real Atagia chat model.",
     )
     parser.add_argument(
         "--answer-model",
-        help="Model override for answer generation, e.g. openrouter/google/gemini-3.1-flash-lite,medium",
+        help="Model override for the real Atagia chat path, e.g. openrouter/google/gemini-3.1-flash-lite,medium",
     )
     parser.add_argument("--forced-global-model", help="Force one model for every Atagia internal LLM component")
     parser.add_argument("--ingest-model", help="Model for Atagia ingest components")
     parser.add_argument("--retrieval-model", help="Model for Atagia retrieval components")
     parser.add_argument("--chat-model", help="Model for Atagia chat component fallback")
+    parser.add_argument(
+        "--privacy-enforcement",
+        choices=("enforce", "audit_only", "off"),
+        default="off",
+        help="Request privacy_enforcement for the real Atagia chat call. Defaults to off.",
+    )
+    parser.add_argument(
+        "--answer-postcondition-guard",
+        action="store_true",
+        help="Enable the real Atagia answer postcondition verifier.",
+    )
     parser.add_argument(
         "--component-model",
         action="append",
@@ -80,7 +89,6 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-need-detection", action="store_true", help="Disable LLM need detection")
     parser.add_argument("--skip-applicability-scoring", action="store_true", help="Disable LLM applicability scoring")
-    parser.add_argument("--skip-answer", action="store_true", help="Skip final answer generation")
     parser.add_argument("--summary-hit-limit", type=int, default=10, help="How many summary surface hits to log")
     args = parser.parse_args()
     if not any([args.question_index, args.question_id, args.question_text]):
@@ -236,7 +244,41 @@ def _raw_candidate_record(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _jsonable(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def _scored_candidate_record(pipeline_candidate: Any) -> dict[str, Any]:
+    if isinstance(pipeline_candidate, dict):
+        memory_object = pipeline_candidate.get("memory_object") or {}
+        return {
+            "memory_id": pipeline_candidate.get("memory_id"),
+            "llm_applicability": pipeline_candidate.get("llm_applicability"),
+            "retrieval_score": pipeline_candidate.get("retrieval_score"),
+            "vitality_boost": pipeline_candidate.get("vitality_boost"),
+            "confirmation_boost": pipeline_candidate.get("confirmation_boost"),
+            "need_boost": pipeline_candidate.get("need_boost"),
+            "penalty": pipeline_candidate.get("penalty"),
+            "final_score": pipeline_candidate.get("final_score"),
+            "memory_object": {
+                "id": memory_object.get("id"),
+                "canonical_text": memory_object.get("canonical_text"),
+                "object_type": memory_object.get("object_type"),
+                "scope": memory_object.get("scope"),
+                "payload_json": memory_object.get("payload_json"),
+                **_surface_record(memory_object),
+            },
+        }
     memory_object = pipeline_candidate.memory_object
     return {
         "memory_id": pipeline_candidate.memory_id,
@@ -328,43 +370,16 @@ async def _summary_surface_hits(
     return results
 
 
-async def _generate_answer(
-    *,
-    runtime: Any,
-    assistant_mode_id: str,
-    pipeline_result: PipelineResult,
-    question_text: str,
-    model_override: str | None,
-) -> str:
-    resolved_policy = resolve_policy(
-        runtime.manifests,
-        assistant_mode_id,
-        runtime.policy_resolver,
-    )
-    system_prompt = build_system_prompt(
-        assistant_mode_id,
-        resolved_policy,
-        pipeline_result.composed_context.contract_block,
-        pipeline_result.composed_context.workspace_block,
-        pipeline_result.composed_context.memory_block,
-        pipeline_result.composed_context.state_block,
-    )
-    response = await runtime.llm_client.complete(
-        LLMCompletionRequest(
-            model=model_override or chat_model(runtime.settings),
-            messages=[
-                LLMMessage(role="system", content=system_prompt),
-                LLMMessage(role="user", content=question_text),
-            ],
-            temperature=0.0,
-            max_output_tokens=LOCOMO_REPLAY_PROBE_ANSWER_MAX_OUTPUT_TOKENS,
-            metadata={
-                "purpose": "benchmark_answer_generation",
-                "question": question_text,
-            },
-        )
-    )
-    return response.output_text
+def _copy_sqlite_db(source_db_path: Path, destination_db_path: Path) -> None:
+    destination_db_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_db_path, destination_db_path)
+    for suffix in ("-wal", "-shm"):
+        sidecar = source_db_path.with_name(f"{source_db_path.name}{suffix}")
+        if sidecar.exists():
+            shutil.copy2(
+                sidecar,
+                destination_db_path.with_name(f"{destination_db_path.name}{suffix}"),
+            )
 
 
 async def _run(args: argparse.Namespace) -> Path:
@@ -373,77 +388,92 @@ async def _run(args: argparse.Namespace) -> Path:
     output_path = Path(args.output).expanduser() if args.output else _default_output_path(args.conversation_id, question_id)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ablation = AblationConfig(
+        privacy_enforcement=args.privacy_enforcement,
         skip_need_detection=args.skip_need_detection,
         skip_applicability_scoring=args.skip_applicability_scoring,
     )
+    source_db_path = Path(args.db_path).expanduser()
+    with TemporaryDirectory(prefix="atagia-locomo-replay-probe-") as temp_dir:
+        probe_db_path = Path(temp_dir) / "benchmark.db"
+        _copy_sqlite_db(source_db_path, probe_db_path)
+        async with Atagia(
+            db_path=probe_db_path,
+            manifests_dir=args.manifests_dir,
+            llm_forced_global_model=_qualified_model(args.provider, args.forced_global_model),
+            llm_ingest_model=_qualified_model(args.provider, args.ingest_model),
+            llm_retrieval_model=_qualified_model(args.provider, args.retrieval_model),
+            llm_chat_model=_qualified_model(args.provider, _answer_model(args) or args.chat_model),
+            llm_component_models=_qualified_component_models(
+                args.provider,
+                _parse_component_model_overrides(args.component_model),
+            ),
+            **provider_api_key_kwargs(args.provider, args.api_key),
+            embedding_backend=args.embedding_backend,
+            embedding_model=args.embedding_model,
+            context_cache_enabled=False,
+            answer_postcondition_guard_enabled=args.answer_postcondition_guard,
+        ) as engine:
+            runtime = engine.runtime
+            if runtime is None:
+                raise RuntimeError("Atagia runtime was unexpectedly unavailable")
 
-    async with Atagia(
-        db_path=args.db_path,
-        manifests_dir=args.manifests_dir,
-        llm_forced_global_model=_qualified_model(args.provider, args.forced_global_model),
-        llm_ingest_model=_qualified_model(args.provider, args.ingest_model),
-        llm_retrieval_model=_qualified_model(args.provider, args.retrieval_model),
-        llm_chat_model=_qualified_model(args.provider, args.chat_model),
-        llm_component_models=_qualified_component_models(
-            args.provider,
-            _parse_component_model_overrides(args.component_model),
-        ),
-        **provider_api_key_kwargs(args.provider, args.api_key),
-        embedding_backend=args.embedding_backend,
-        embedding_model=args.embedding_model,
-        context_cache_enabled=False,
-    ) as engine:
-        runtime = engine.runtime
-        if runtime is None:
-            raise RuntimeError("Atagia runtime was unexpectedly unavailable")
-
-        connection = await runtime.open_connection()
-        try:
-            conversations = ConversationRepository(connection, runtime.clock)
-            conversation_row = await conversations.get_conversation(args.conversation_id, args.user_id)
-            if conversation_row is None:
-                raise ValueError(
-                    f"Conversation {args.conversation_id} was not found for user {args.user_id}"
+            connection = await runtime.open_connection()
+            try:
+                conversations = ConversationRepository(connection, runtime.clock)
+                conversation_row = await conversations.get_conversation(
+                    args.conversation_id,
+                    args.user_id,
                 )
-            retrieval_profile_id = str(
-                conversation_row["mode"]
-                or conversation_row["assistant_mode_id"]
-            )
-            platform_id = conversation_row["platform_id"]
-            user_persona_id = conversation_row["user_persona_id"]
-            character_id = conversation_row["character_id"]
-            summary_hits = await _summary_surface_hits(
-                connection,
+                if conversation_row is None:
+                    raise ValueError(
+                        f"Conversation {args.conversation_id} was not found for user {args.user_id}"
+                    )
+                retrieval_profile_id = str(
+                    conversation_row["mode"]
+                    or conversation_row["assistant_mode_id"]
+                )
+                platform_id = conversation_row["platform_id"]
+                user_persona_id = conversation_row["user_persona_id"]
+                character_id = conversation_row["character_id"]
+                summary_hits = await _summary_surface_hits(
+                    connection,
+                    user_id=args.user_id,
+                    conversation_id=args.conversation_id,
+                    question_text=question_text,
+                    limit=args.summary_hit_limit,
+                )
+            finally:
+                await connection.close()
+
+            chat_result = await engine.chat(
                 user_id=args.user_id,
                 conversation_id=args.conversation_id,
-                question_text=question_text,
-                limit=args.summary_hit_limit,
+                message=question_text,
+                mode=retrieval_profile_id,
+                ablation=ablation,
+                debug=True,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                privacy_enforcement=args.privacy_enforcement,
+                authenticated_user_privilege_level=(
+                    "atagia_master"
+                    if args.privacy_enforcement == "off"
+                    else None
+                ),
+                authenticated_user_is_atagia_master=(
+                    args.privacy_enforcement == "off"
+                ),
             )
-        finally:
-            await connection.close()
 
-        pipeline_result = await RetrievalService(runtime).retrieve(
-            user_id=args.user_id,
-            conversation_id=args.conversation_id,
-            message_text=question_text,
-            mode=retrieval_profile_id,
-            ablation=ablation,
-        )
-
-        answer: str | None = None
-        answer_error: str | None = None
-        if not args.skip_answer:
-            try:
-                answer = await _generate_answer(
-                    runtime=runtime,
-                    assistant_mode_id=retrieval_profile_id,
-                    pipeline_result=pipeline_result,
-                    question_text=question_text,
-                    model_override=_qualified_model(args.provider, _answer_model(args)),
-                )
-            except Exception as exc:  # pragma: no cover - best effort artifact enrichment
-                logger.exception("Replay probe answer generation failed")
-                answer_error = f"{type(exc).__name__}: {exc}"
+    debug = chat_result.debug if isinstance(chat_result.debug, dict) else {}
+    context = chat_result.composed_context
+    scored_candidates = debug.get("scored_candidates")
+    scored_candidates_list = scored_candidates if isinstance(scored_candidates, list) else []
+    candidate_search_summary = debug.get("candidate_search_summary")
+    raw_candidate_count = 0
+    if isinstance(candidate_search_summary, dict):
+        raw_candidate_count = int(candidate_search_summary.get("raw_candidate_count") or 0)
 
     artifact = {
         "conversation_id": args.conversation_id,
@@ -452,7 +482,8 @@ async def _run(args: argparse.Namespace) -> Path:
         "ground_truth": ground_truth,
         "category": category,
         "evidence_turn_ids": evidence_turn_ids,
-        "db_path": str(Path(args.db_path).expanduser()),
+        "db_path": str(source_db_path),
+        "db_snapshot_isolation": "temporary_copy",
         "user_id": args.user_id,
         "platform_id": platform_id,
         "user_persona_id": user_persona_id,
@@ -473,20 +504,30 @@ async def _run(args: argparse.Namespace) -> Path:
             _parse_component_model_overrides(args.component_model),
         ),
         "ablation": ablation.model_dump(mode="json"),
-        "retrieval_plan": pipeline_result.retrieval_plan.model_dump(mode="json"),
-        "stage_timings": dict(pipeline_result.stage_timings),
+        "privacy_enforcement": args.privacy_enforcement,
+        "real_chat_path": True,
+        "retrieval_event_id": chat_result.retrieval_event_id,
+        "retrieval_plan": _jsonable(debug.get("retrieval_plan")),
+        "retrieval_sufficiency": _jsonable(debug.get("retrieval_sufficiency")),
+        "candidate_search_summary": _jsonable(candidate_search_summary),
+        "stage_timings": {},
         "summary_surface_hits": summary_hits,
-        "raw_candidate_count": len(pipeline_result.raw_candidates),
-        "raw_candidates": [_raw_candidate_record(candidate) for candidate in pipeline_result.raw_candidates],
-        "scored_candidate_count": len(pipeline_result.scored_candidates),
+        "raw_candidate_count": raw_candidate_count,
+        "raw_candidates": [],
+        "scored_candidate_count": len(scored_candidates_list),
         "scored_candidates": [
             _scored_candidate_record(candidate)
-            for candidate in pipeline_result.scored_candidates
+            for candidate in scored_candidates_list
         ],
-        "selected_memory_ids": list(pipeline_result.composed_context.selected_memory_ids),
-        "memory_block": pipeline_result.composed_context.memory_block,
-        "answer": answer,
-        "answer_error": answer_error,
+        "selected_memory_ids": (
+            list(context.selected_memory_ids)
+            if context is not None
+            else list(debug.get("selected_memory_ids") or [])
+        ),
+        "memory_block": context.memory_block if context is not None else None,
+        "answer": chat_result.response_text,
+        "answer_error": None,
+        "debug": _jsonable(debug),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     return write_json_atomic(output_path, artifact)

@@ -11,9 +11,12 @@ from uuid import uuid4
 from atagia.core.canonical import canonical_json_hash
 from atagia.core import json_utils
 from atagia.core.storage_backend import (
+    DrainProgressCallback,
     StorageBackend,
+    StorageDrainSnapshot,
     _job_matches_conversation,
     _job_matches_user,
+    emit_drain_progress,
     extract_context_view_conversation_id,
     extract_context_view_user_id,
 )
@@ -81,6 +84,10 @@ class RedisBackend(StorageBackend):
             raise RuntimeError("redis dependency is not installed")
         self._client: Redis = from_url(redis_url, decode_responses=True)
         self._stream_groups: set[tuple[str, str]] = set()
+        self._stream_add_counts: dict[str, int] = {}
+        self._stream_read_counts: dict[str, int] = {}
+        self._stream_claim_counts: dict[str, int] = {}
+        self._stream_ack_counts: dict[str, int] = {}
 
     async def get_recent_window(self, key: str) -> list[dict[str, Any]] | None:
         raw = await self._client.get(f"recent_window:{key}")
@@ -288,10 +295,14 @@ class RedisBackend(StorageBackend):
         return json_utils.loads(raw_payload)
 
     async def stream_add(self, stream_name: str, payload: dict[str, Any]) -> str:
-        return await self._client.xadd(
+        message_id = await self._client.xadd(
             stream_name,
             {"payload": json_utils.dumps(payload, sort_keys=True)},
         )
+        self._stream_add_counts[stream_name] = (
+            self._stream_add_counts.get(stream_name, 0) + 1
+        )
+        return message_id
 
     async def stream_read(
         self,
@@ -320,6 +331,9 @@ class RedisBackend(StorageBackend):
                         payload=json_utils.loads(raw_payload),
                         delivery_count=1,
                     )
+                )
+                self._stream_read_counts[stream_name] = (
+                    self._stream_read_counts.get(stream_name, 0) + 1
                 )
         return messages
 
@@ -360,10 +374,17 @@ class RedisBackend(StorageBackend):
                     delivery_count=delivery_counts.get(message_id, 2),
                 )
             )
+            self._stream_claim_counts[stream_name] = (
+                self._stream_claim_counts.get(stream_name, 0) + 1
+            )
         return messages
 
     async def stream_ack(self, stream_name: str, group_name: str, message_id: str) -> None:
-        await self._client.xack(stream_name, group_name, message_id)
+        removed = await self._client.xack(stream_name, group_name, message_id)
+        if int(removed or 0) > 0:
+            self._stream_ack_counts[stream_name] = (
+                self._stream_ack_counts.get(stream_name, 0) + 1
+            )
 
     async def stream_ensure_group(self, stream_name: str, group_name: str) -> None:
         try:
@@ -378,27 +399,86 @@ class RedisBackend(StorageBackend):
                 raise
         self._stream_groups.add((stream_name, group_name))
 
-    async def drain(self, timeout_seconds: float = 30.0) -> bool:
+    async def drain_snapshot(self) -> StorageDrainSnapshot:
+        queued_by_stream: dict[str, int] = {}
+        pending_by_stream: dict[str, int] = {}
+        for stream_name, group_name in self._stream_groups:
+            pending_count, lag_count = await self._group_backlog(stream_name, group_name)
+            queued_by_stream[stream_name] = max(
+                queued_by_stream.get(stream_name, 0),
+                lag_count,
+            )
+            pending_by_stream[stream_name] = (
+                pending_by_stream.get(stream_name, 0) + pending_count
+            )
+        return StorageDrainSnapshot(
+            queued_by_stream=queued_by_stream,
+            pending_by_stream=pending_by_stream,
+            added_by_stream=dict(self._stream_add_counts),
+            read_by_stream=dict(self._stream_read_counts),
+            claimed_by_stream=dict(self._stream_claim_counts),
+            acked_by_stream=dict(self._stream_ack_counts),
+        )
+
+    async def drain(
+        self,
+        timeout_seconds: float = 30.0,
+        *,
+        idle_timeout_seconds: float | None = None,
+        progress_interval_seconds: float = 0.0,
+        progress_callback: DrainProgressCallback | None = None,
+    ) -> bool:
         if not self._stream_groups:
             return True
 
-        deadline = monotonic() + max(0.0, timeout_seconds)
+        timeout = max(0.0, timeout_seconds)
+        idle_timeout = (
+            None
+            if idle_timeout_seconds is None
+            else max(0.0, idle_timeout_seconds)
+        )
+        started_at = monotonic()
+        deadline = started_at + timeout
+        last_progress_at = started_at
+        last_marker: tuple[tuple[tuple[str, int], ...], ...] | None = None
+        progress_interval = max(0.0, progress_interval_seconds)
+        next_progress_at = started_at + progress_interval
         stable_started_at: float | None = None
         while True:
-            backlog_detected = False
-            for stream_name, group_name in self._stream_groups:
-                pending_count, lag_count = await self._group_backlog(stream_name, group_name)
-                if pending_count > 0 or lag_count > 0:
-                    backlog_detected = True
-                    stable_started_at = None
-                    break
+            now = monotonic()
+            snapshot = (await self.drain_snapshot()).with_timing(
+                elapsed_seconds=now - started_at,
+                idle_seconds=now - last_progress_at,
+                timeout_seconds=timeout,
+                idle_timeout_seconds=idle_timeout,
+            )
+            marker = snapshot.progress_marker()
+            if last_marker is None:
+                last_marker = marker
+            elif marker != last_marker:
+                last_marker = marker
+                last_progress_at = now
+                snapshot = snapshot.with_timing(
+                    elapsed_seconds=now - started_at,
+                    idle_seconds=0.0,
+                    timeout_seconds=timeout,
+                    idle_timeout_seconds=idle_timeout,
+                )
 
-            if not backlog_detected:
+            if snapshot.drained:
                 if stable_started_at is None:
                     stable_started_at = monotonic()
                 elif monotonic() - stable_started_at >= DRAIN_STABLE_WINDOW_SECONDS:
                     return True
+            else:
+                stable_started_at = None
 
+            if progress_callback is not None and now >= next_progress_at:
+                if await emit_drain_progress(progress_callback, snapshot):
+                    last_progress_at = now
+                next_progress_at = now + max(progress_interval, 0.01)
+            if idle_timeout is not None and monotonic() - last_progress_at >= idle_timeout:
+                return False
             if monotonic() >= deadline:
                 return False
             await asyncio.sleep(0.05)

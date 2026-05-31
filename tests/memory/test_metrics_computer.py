@@ -623,7 +623,11 @@ async def test_compute_ccr_llm_evaluation_produces_compliance_score() -> None:
             at=_dt(10, 2),
         )
         provider = CCRProvider([{"compliance_score": 0.82, "reasoning": "Compliant."}])
-        llm_client = LLMClient(provider_name=provider.name, providers=[provider])
+        llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+            structured_output_retry_attempts=0,
+        )
 
         result = await computer.compute_ccr("usr_1", "coding_debug", "2026-03-31", llm_client)
 
@@ -661,7 +665,11 @@ async def test_compute_ccr_ignores_provider_extra_fields() -> None:
                 }
             ]
         )
-        llm_client = LLMClient(provider_name=provider.name, providers=[provider])
+        llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+            structured_output_retry_attempts=0,
+        )
 
         result = await computer.compute_ccr("usr_1", "coding_debug", "2026-03-31", llm_client)
 
@@ -724,7 +732,11 @@ async def test_compute_ccr_logs_structured_failure_without_traceback(
             at=_dt(10, 2),
         )
         provider = CCRProvider([{"compliance_score": 0.82}])
-        llm_client = LLMClient(provider_name=provider.name, providers=[provider])
+        llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+            structured_output_retry_attempts=0,
+        )
 
         with caplog.at_level(logging.WARNING, logger="atagia.memory.metrics_computer"):
             result = await computer.compute_ccr("usr_1", "coding_debug", "2026-03-31", llm_client)

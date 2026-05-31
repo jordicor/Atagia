@@ -57,7 +57,7 @@ from atagia.models.schemas_replay import (
     ReplayEventRequest,
     ReplayResult,
 )
-from atagia.services.llm_client import LLMClient
+from atagia.services.llm_client import LLMClient, LLMRunGuardError
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.embedding_backfill_service import EmbeddingBackfillResult, EmbeddingBackfillService
 from atagia.services.admin_rebuild_service import AdminRebuildService, RebuildResult
@@ -116,6 +116,16 @@ async def _audit_admin_action(
         target_type=target_type,
         target_id=target_id,
         metadata=metadata or {},
+    )
+
+
+def _llm_run_guard_http_exception(exc: LLMRunGuardError) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "message": str(exc),
+            "llm_guard": exc.decision.snapshot,
+        },
     )
 
 
@@ -427,6 +437,36 @@ async def backfill_embeddings(
     return result
 
 
+@router.get("/llm-run-guard")
+async def get_llm_run_guard(
+    _auth_context: AuthContext = Depends(get_admin_auth_context),
+    llm_client: LLMClient[object] = Depends(get_llm_client),
+) -> dict[str, Any]:
+    snapshot = llm_client.llm_run_guard_snapshot()
+    return snapshot if snapshot is not None else {"enabled": False}
+
+
+@router.post("/llm-run-guard/reset")
+async def reset_llm_run_guard(
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+    llm_client: LLMClient[object] = Depends(get_llm_client),
+) -> dict[str, Any]:
+    snapshot = llm_client.reset_llm_run_guard()
+    result = snapshot if snapshot is not None else {"enabled": False}
+    await _audit_admin_action(
+        connection,
+        clock,
+        auth_context,
+        action="reset_llm_run_guard",
+        target_type="llm_run_guard",
+        target_id="runtime",
+        metadata=result,
+    )
+    return result
+
+
 @router.post("/rebuild/conversation/{conversation_id}")
 async def rebuild_conversation(
     conversation_id: str,
@@ -451,18 +491,21 @@ async def rebuild_conversation(
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
 
-    result = await AdminRebuildService(
-        connection=connection,
-        llm_client=llm_client,
-        embedding_index=embedding_index,
-        clock=clock,
-        manifest_loader=manifest_loader,
-        settings=settings,
-        storage_backend=storage_backend,
-    ).rebuild_conversation(
-        user_id=str(row["user_id"]),
-        conversation_id=str(row["id"]),
-    )
+    try:
+        result = await AdminRebuildService(
+            connection=connection,
+            llm_client=llm_client,
+            embedding_index=embedding_index,
+            clock=clock,
+            manifest_loader=manifest_loader,
+            settings=settings,
+            storage_backend=storage_backend,
+        ).rebuild_conversation(
+            user_id=str(row["user_id"]),
+            conversation_id=str(row["id"]),
+        )
+    except LLMRunGuardError as exc:
+        raise _llm_run_guard_http_exception(exc) from exc
     await _audit_admin_action(
         connection,
         clock,
@@ -491,15 +534,18 @@ async def rebuild_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    result = await AdminRebuildService(
-        connection=connection,
-        llm_client=llm_client,
-        embedding_index=embedding_index,
-        clock=clock,
-        manifest_loader=manifest_loader,
-        settings=settings,
-        storage_backend=storage_backend,
-    ).rebuild_user(user_id)
+    try:
+        result = await AdminRebuildService(
+            connection=connection,
+            llm_client=llm_client,
+            embedding_index=embedding_index,
+            clock=clock,
+            manifest_loader=manifest_loader,
+            settings=settings,
+            storage_backend=storage_backend,
+        ).rebuild_user(user_id)
+    except LLMRunGuardError as exc:
+        raise _llm_run_guard_http_exception(exc) from exc
     await _audit_admin_action(
         connection,
         clock,

@@ -5,17 +5,21 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 import pytest
 
 from atagia.core.clock import FrozenClock
 from atagia.core.db_sqlite import initialize_database
+from atagia.core.memory_evidence_repository import MemoryEvidenceRepository
+from atagia.core.memory_provenance import MemoryProvenanceWriter
 from atagia.core.storage_backend import InProcessBackend
 from atagia.core.repositories import (
     RETRIEVAL_ELIGIBLE_MEMORY_STATUSES,
     ConversationRepository,
     MemoryObjectRepository,
+    MemoryRetrievalSurfaceRepository,
     MessageRepository,
     UserRepository,
     WorkspaceRepository,
@@ -50,6 +54,247 @@ async def _insert_assistant_mode(connection: aiosqlite.Connection, mode_id: str 
         (mode_id, "Coding Debug", "hash_1", "{}", "2026-03-30T12:00:00+00:00", "2026-03-30T12:00:00+00:00"),
     )
     await connection.commit()
+
+
+async def _create_test_memory(
+    memories: MemoryObjectRepository,
+    *,
+    user_id: str,
+    memory_id: str,
+    canonical_text: str,
+) -> dict[str, Any]:
+    return await memories.create_memory_object(
+        user_id=user_id,
+        assistant_mode_id="coding_debug",
+        object_type=MemoryObjectType.EVIDENCE,
+        scope=MemoryScope.USER,
+        canonical_text=canonical_text,
+        payload={},
+        source_kind=MemorySourceKind.EXTRACTED,
+        confidence=0.8,
+        privacy_level=0,
+        memory_id=memory_id,
+    )
+
+
+async def _count_table(connection: aiosqlite.Connection, table_name: str) -> int:
+    cursor = await connection.execute(f"SELECT COUNT(*) AS count FROM {table_name}")
+    row = await cursor.fetchone()
+    return int(row["count"])
+
+
+@pytest.mark.asyncio
+async def test_memory_evidence_repository_round_trips_packets_and_enforces_user_scope() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+        evidence = MemoryEvidenceRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await users.create_user("usr_b")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+        await conversations.create_conversation("cnv_b", "usr_b", None, "coding_debug", "Chat B")
+        await messages.create_message("msg_trigger", "cnv_a", "assistant", 1, "What's your fave?", 4, {})
+        await messages.create_message(
+            "msg_source",
+            "cnv_a",
+            "user",
+            2,
+            "Yeah, me too! Contemporary dance really speaks to me.",
+            9,
+            {},
+            occurred_at="2023-01-20T16:04:00+00:00",
+        )
+        await messages.create_message("msg_other_user", "cnv_b", "user", 1, "Other user's evidence.", 4, {})
+        await _create_test_memory(
+            memories,
+            user_id="usr_a",
+            memory_id="mem_gina",
+            canonical_text="Gina's favorite dance style is contemporary.",
+        )
+
+        packet = await evidence.create_support_edge_with_spans(
+            user_id="usr_a",
+            memory_id="mem_gina",
+            support_kind="contextual_direct",
+            evidence_polarity="supports",
+            speaker_relation_to_subject="self_report",
+            confidence=0.91,
+            rationale="Gina answers the favorite-dance question.",
+            spans=[
+                {
+                    "span_role": "source",
+                    "message_id": "msg_source",
+                    "quote_text": "Contemporary dance really speaks to me.",
+                },
+                {
+                    "span_role": "trigger",
+                    "message_id": "msg_trigger",
+                    "quote_text": "What's your fave?",
+                },
+            ],
+        )
+
+        assert packet["support_kind"] == "contextual_direct"
+        assert [span["span_role"] for span in packet["spans"]] == ["source", "trigger"]
+        packets = await evidence.list_packets_for_memory_ids(
+            user_id="usr_a",
+            memory_ids=["mem_gina"],
+        )
+        assert packets["mem_gina"][0]["speaker_relation_to_subject"] == "self_report"
+        assert await evidence.list_packets_for_memory_ids(
+            user_id="usr_b",
+            memory_ids=["mem_gina"],
+        ) == {}
+
+        with pytest.raises(ValueError, match="same user"):
+            await evidence.create_support_edge_with_spans(
+                user_id="usr_a",
+                memory_id="mem_gina",
+                spans=[
+                    {
+                        "span_role": "source",
+                        "message_id": "msg_other_user",
+                        "quote_text": "Other user's evidence.",
+                    }
+                ],
+            )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_evidence_spans_cascade_when_memory_is_deleted() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+        evidence = MemoryEvidenceRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+        await messages.create_message("msg_source", "cnv_a", "user", 1, "I like contemporary.", 4, {})
+        await _create_test_memory(
+            memories,
+            user_id="usr_a",
+            memory_id="mem_gina",
+            canonical_text="Gina likes contemporary dance.",
+        )
+        await evidence.create_support_edge_with_spans(
+            user_id="usr_a",
+            memory_id="mem_gina",
+            spans=[
+                {
+                    "span_role": "source",
+                    "message_id": "msg_source",
+                    "quote_text": "I like contemporary.",
+                }
+            ],
+        )
+
+        assert await _count_table(connection, "memory_support_edges") == 1
+        assert await _count_table(connection, "memory_evidence_spans") == 1
+        await connection.execute("DELETE FROM memory_objects WHERE id = ?", ("mem_gina",))
+        await connection.commit()
+
+        assert await _count_table(connection, "memory_support_edges") == 0
+        assert await _count_table(connection, "memory_evidence_spans") == 0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_evidence_repository_preserves_quote_whitespace() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+        evidence = MemoryEvidenceRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+        await messages.create_message("msg_source", "cnv_a", "user", 1, "prefix\n\nexact quote", 4, {})
+        await _create_test_memory(
+            memories,
+            user_id="usr_a",
+            memory_id="mem_gina",
+            canonical_text="Gina has multiline evidence.",
+        )
+
+        packet = await evidence.create_support_edge_with_spans(
+            user_id="usr_a",
+            memory_id="mem_gina",
+            spans=[
+                {
+                    "span_role": "source",
+                    "message_id": "msg_source",
+                    "quote_text": "prefix\n\nexact quote",
+                    "char_start": 0,
+                    "char_end": 19,
+                }
+            ],
+        )
+
+        span = packet["spans"][0]
+        assert span["quote_text"] == "prefix\n\nexact quote"
+        assert span["char_start"] == 0
+        assert span["char_end"] == 19
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_provenance_writer_falls_back_to_exact_message_text() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+
+        message_text = "Gina: I won regionals.\n\n[Attachments omitted]\nimage attachment"
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+        await messages.create_message("msg_source", "cnv_a", "user", 1, message_text, 8, {})
+        await _create_test_memory(
+            memories,
+            user_id="usr_a",
+            memory_id="mem_gina",
+            canonical_text="Gina won regionals.",
+        )
+
+        writer = MemoryProvenanceWriter(connection, clock)
+        packet = await writer.create_packet_from_source_messages(
+            user_id="usr_a",
+            memory_id="mem_gina",
+            source_message_ids=["msg_source"],
+            writer_kind="test",
+            support_kind="direct",
+            source_quote_by_message_id={
+                "msg_source": "Gina: I won regionals. [Attachments omitted] image attachment"
+            },
+        )
+
+        assert packet is not None
+        span = packet["spans"][0]
+        assert span["quote_text"] == message_text
+        assert span["char_start"] == 0
+        assert span["char_end"] == len(message_text)
+        assert span["metadata_json"]["quote_fallback"] == "full_message_exact"
+    finally:
+        await connection.close()
 
 
 @pytest.mark.asyncio
@@ -1165,6 +1410,7 @@ async def test_upsert_summary_mirror_is_deterministic_and_updates_in_place() -> 
     try:
         users = UserRepository(connection, clock)
         memories = MemoryObjectRepository(connection, clock)
+        surfaces = MemoryRetrievalSurfaceRepository(connection, clock)
 
         await users.create_user("usr_a")
         await _insert_assistant_mode(connection)
@@ -1179,6 +1425,13 @@ async def test_upsert_summary_mirror_is_deterministic_and_updates_in_place() -> 
             created_at="2026-03-30T12:00:00+00:00",
             scope=MemoryScope.GLOBAL_USER,
             privacy_level=1,
+            language_codes=["EN", "jp", "zz"],
+        )
+        surface = await surfaces.upsert_surface(
+            user_id="usr_a",
+            memory_id=first["id"],
+            surface_type="alias",
+            surface_text="first summary surface",
         )
         second = await memories.upsert_summary_mirror(
             user_id="usr_a",
@@ -1191,6 +1444,7 @@ async def test_upsert_summary_mirror_is_deterministic_and_updates_in_place() -> 
             updated_at="2026-03-30T12:05:00+00:00",
             scope=MemoryScope.GLOBAL_USER,
             privacy_level=2,
+            language_codes=["es", "en", "jp"],
         )
 
         rows = await memories.list_for_user("usr_a")
@@ -1201,6 +1455,301 @@ async def test_upsert_summary_mirror_is_deterministic_and_updates_in_place() -> 
         assert rows[0]["payload_json"]["summary_view_id"] == "sum_episode_1"
         assert rows[0]["payload_json"]["source_object_ids"] == ["mem_1", "mem_2"]
         assert rows[0]["privacy_level"] == 2
+        assert rows[0]["language_codes_json"] == ["en", "es"]
+        surface_rows = await surfaces.list_surfaces_for_memory(
+            user_id="usr_a",
+            memory_id=first["id"],
+        )
+        assert [row["id"] for row in surface_rows] == [surface["id"]]
+        assert surface_rows[0]["status"] == "stale"
+        assert await surfaces.search_active_surfaces(
+            user_id="usr_a",
+            fts_query="summary",
+        ) == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_retrieval_surface_upsert_is_deterministic_and_user_isolated() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+        surfaces = MemoryRetrievalSurfaceRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await users.create_user("usr_b")
+        await _insert_assistant_mode(connection)
+        await _create_test_memory(
+            memories,
+            user_id="usr_a",
+            memory_id="mem_a",
+            canonical_text="Ben moved to 44 Pine Lane.",
+        )
+        await _create_test_memory(
+            memories,
+            user_id="usr_b",
+            memory_id="mem_b",
+            canonical_text="Bob moved to 55 Cedar Street.",
+        )
+
+        first = await surfaces.upsert_surface(
+            user_id="usr_a",
+            memory_id="mem_a",
+            surface_type="alias",
+            surface_text="nuevo apartamento",
+            alias_kind="translation",
+            language_code="ES",
+            confidence=0.6,
+            derivation={"version": 1},
+        )
+        second = await surfaces.upsert_surface(
+            user_id="usr_a",
+            memory_id="mem_a",
+            surface_type="alias",
+            surface_text="  nuevo   apartamento  ",
+            alias_kind="translation",
+            language_code="es",
+            confidence=0.9,
+            derivation={"version": 2},
+        )
+        other_user = await surfaces.upsert_surface(
+            user_id="usr_b",
+            memory_id="mem_b",
+            surface_type="alias",
+            surface_text="nuevo apartamento",
+            alias_kind="translation",
+            language_code="es",
+        )
+
+        user_a_rows = await surfaces.list_surfaces_for_memory(
+            user_id="usr_a",
+            memory_id="mem_a",
+        )
+        user_b_rows = await surfaces.list_surfaces_for_memory(
+            user_id="usr_b",
+            memory_id="mem_b",
+        )
+
+        assert first["id"] == second["id"]
+        assert other_user["id"] != first["id"]
+        assert len(user_a_rows) == 1
+        assert len(user_b_rows) == 1
+        assert user_a_rows[0]["surface_text"] == "nuevo apartamento"
+        assert user_a_rows[0]["confidence"] == pytest.approx(0.9)
+        assert user_a_rows[0]["derivation_json"] == {"version": 2}
+        assert user_a_rows[0]["language_code"] == "es"
+        assert await surfaces.list_surfaces_for_memory(
+            user_id="usr_b",
+            memory_id="mem_a",
+        ) == []
+
+        user_a_hits = await surfaces.search_active_surfaces(
+            user_id="usr_a",
+            fts_query="apartamento",
+        )
+        user_b_hits = await surfaces.search_active_surfaces(
+            user_id="usr_b",
+            fts_query="apartamento",
+        )
+
+        assert [row["id"] for row in user_a_hits] == [first["id"]]
+        assert [row["id"] for row in user_b_hits] == [other_user["id"]]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_retrieval_surface_rejects_blank_and_evidential_rows() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+        surfaces = MemoryRetrievalSurfaceRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await _create_test_memory(
+            memories,
+            user_id="usr_a",
+            memory_id="mem_a",
+            canonical_text="Rosa takes amlodipine.",
+        )
+
+        with pytest.raises(ValueError, match="surface_text must be non-empty"):
+            await surfaces.upsert_surface(
+                user_id="usr_a",
+                memory_id="mem_a",
+                surface_type="alias",
+                surface_text="  ",
+            )
+
+        with pytest.raises(ValueError, match="must be non_evidential"):
+            await surfaces.upsert_surface(
+                user_id="usr_a",
+                memory_id="mem_a",
+                surface_type="alias",
+                surface_text="amlodipino",
+                non_evidential=False,
+            )
+
+        with pytest.raises(ValueError, match="memory_id must belong to user_id"):
+            await surfaces.upsert_surface(
+                user_id="usr_b",
+                memory_id="mem_a",
+                surface_type="alias",
+                surface_text="amlodipino",
+            )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_retrieval_surface_stale_and_delete_behavior() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+        surfaces = MemoryRetrievalSurfaceRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await _create_test_memory(
+            memories,
+            user_id="usr_a",
+            memory_id="mem_a",
+            canonical_text="Rosa takes amlodipine 10 mg.",
+        )
+
+        active = await surfaces.upsert_surface(
+            user_id="usr_a",
+            memory_id="mem_a",
+            surface_type="alias",
+            surface_text="amlodipino",
+            alias_kind="translation",
+            language_code="es",
+        )
+        assert [row["id"] for row in await surfaces.search_active_surfaces(
+            user_id="usr_a",
+            fts_query="amlodipino",
+        )] == [active["id"]]
+
+        assert await surfaces.mark_surfaces_stale_for_memory(
+            user_id="usr_a",
+            memory_id="mem_a",
+        ) == 1
+        stale_rows = await surfaces.list_surfaces_for_memory(
+            user_id="usr_a",
+            memory_id="mem_a",
+        )
+        assert stale_rows[0]["status"] == "stale"
+        assert await surfaces.search_active_surfaces(
+            user_id="usr_a",
+            fts_query="amlodipino",
+        ) == []
+
+        restored = await surfaces.upsert_surface(
+            user_id="usr_a",
+            memory_id="mem_a",
+            surface_type="alias",
+            surface_text="amlodipino",
+            alias_kind="translation",
+            language_code="es",
+        )
+        assert restored["id"] == active["id"]
+        assert restored["status"] == "active"
+
+        assert await surfaces.mark_surfaces_deleted_for_memory(
+            user_id="usr_a",
+            memory_id="mem_a",
+        ) == 1
+        assert await surfaces.search_active_surfaces(
+            user_id="usr_a",
+            fts_query="amlodipino",
+        ) == []
+
+        assert await surfaces.delete_surfaces_for_memory(
+            user_id="usr_a",
+            memory_id="mem_a",
+        ) == 1
+        assert await surfaces.list_surfaces_for_memory(
+            user_id="usr_a",
+            memory_id="mem_a",
+        ) == []
+        assert await surfaces.search_active_surfaces(
+            user_id="usr_a",
+            fts_query="amlodipino",
+        ) == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_status_changes_stale_or_delete_retrieval_surfaces() -> None:
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+        surfaces = MemoryRetrievalSurfaceRepository(connection, clock)
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await _create_test_memory(
+            memories,
+            user_id="usr_a",
+            memory_id="mem_archive",
+            canonical_text="Archive lifecycle memory.",
+        )
+        await _create_test_memory(
+            memories,
+            user_id="usr_a",
+            memory_id="mem_delete",
+            canonical_text="Delete lifecycle memory.",
+        )
+        archive_surface = await surfaces.upsert_surface(
+            user_id="usr_a",
+            memory_id="mem_archive",
+            surface_type="alias",
+            surface_text="archivelifecycle",
+        )
+        delete_surface = await surfaces.upsert_surface(
+            user_id="usr_a",
+            memory_id="mem_delete",
+            surface_type="alias",
+            surface_text="deletelifecycle",
+        )
+
+        assert await memories.archive_memory_object("mem_archive", "usr_a")
+        deleted = await memories.update_memory_object_status(
+            memory_id="mem_delete",
+            user_id="usr_a",
+            status=MemoryStatus.DELETED,
+        )
+
+        assert deleted is not None
+        archive_rows = await surfaces.list_surfaces_for_memory(
+            user_id="usr_a",
+            memory_id="mem_archive",
+        )
+        delete_rows = await surfaces.list_surfaces_for_memory(
+            user_id="usr_a",
+            memory_id="mem_delete",
+        )
+        assert [(row["id"], row["status"]) for row in archive_rows] == [
+            (archive_surface["id"], "stale")
+        ]
+        assert [(row["id"], row["status"]) for row in delete_rows] == [
+            (delete_surface["id"], "deleted")
+        ]
+        assert await surfaces.search_active_surfaces(
+            user_id="usr_a",
+            fts_query="archivelifecycle",
+        ) == []
+        assert await surfaces.search_active_surfaces(
+            user_id="usr_a",
+            fts_query="deletelifecycle",
+        ) == []
     finally:
         await connection.close()
 

@@ -33,7 +33,6 @@ def _pipeline_result(*, selected_ids: list[str], scores: dict[str, float], token
             privacy_ceiling=1,
             retrieval_levels=[0],
             require_evidence_regrounding=False,
-            need_driven_boosts={},
             skip_retrieval=False,
         ),
         raw_candidates=[],

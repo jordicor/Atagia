@@ -172,6 +172,13 @@ def test_atagia_bench_diff_carries_diagnostics_and_selected_ids() -> None:
         "candidate_kind_counts": {"memory": 1},
         "composer_decision_counts": {"rejected": 1},
         "filter_reason_counts": {"low_score": 1},
+        "eviction_reason_counts": {},
+        "source_backed_candidate_count": 0,
+        "summary_only_candidate_count": 0,
+        "selected_source_backed_count": 0,
+        "selected_summary_count": 0,
+        "high_value_rejected_candidate_count": 0,
+        "high_value_rejected_reasons": {},
     }
     assert diff.after_retrieval_custody_summary == {
         "candidate_count": 1,
@@ -181,6 +188,13 @@ def test_atagia_bench_diff_carries_diagnostics_and_selected_ids() -> None:
         "candidate_kind_counts": {"memory": 1},
         "composer_decision_counts": {"selected": 1},
         "filter_reason_counts": {},
+        "eviction_reason_counts": {},
+        "source_backed_candidate_count": 0,
+        "summary_only_candidate_count": 0,
+        "selected_source_backed_count": 0,
+        "selected_summary_count": 0,
+        "high_value_rejected_candidate_count": 0,
+        "high_value_rejected_reasons": {},
     }
     summary = format_diff_summary(diff)
     assert "Retrieval custody:" in summary

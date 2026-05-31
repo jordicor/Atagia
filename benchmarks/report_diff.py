@@ -61,6 +61,9 @@ class QuestionDiff(BaseModel):
     after_selected_memory_ids: list[str] = Field(default_factory=list)
     before_selected_evidence_memory_ids: list[str] = Field(default_factory=list)
     after_selected_evidence_memory_ids: list[str] = Field(default_factory=list)
+    before_critical_evidence_counts: dict[str, int] = Field(default_factory=dict)
+    after_critical_evidence_counts: dict[str, int] = Field(default_factory=dict)
+    critical_evidence_count_deltas: dict[str, int] = Field(default_factory=dict)
 
 
 class ConversationDiff(BaseModel):
@@ -125,6 +128,15 @@ class BenchmarkDiffReport(BaseModel):
     )
     after_retrieval_custody_summary: dict[str, object] = Field(
         default_factory=lambda: summarize_retrieval_custody([])
+    )
+    before_critical_evidence_custody_summary: dict[str, object] = Field(
+        default_factory=lambda: _critical_evidence_custody_summary(None)
+    )
+    after_critical_evidence_custody_summary: dict[str, object] = Field(
+        default_factory=lambda: _critical_evidence_custody_summary(None)
+    )
+    critical_evidence_custody_deltas: dict[str, object] = Field(
+        default_factory=dict
     )
     category_deltas: dict[int, float] = Field(default_factory=dict)
     improved_questions: int = Field(ge=0)
@@ -247,6 +259,8 @@ def build_benchmark_diff(
     )
     before_retrieval_custody_summary = _retrieval_custody_summary(before)
     after_retrieval_custody_summary = _retrieval_custody_summary(after)
+    before_critical_evidence_summary = _critical_evidence_custody_summary(before)
+    after_critical_evidence_summary = _critical_evidence_custody_summary(after)
 
     return BenchmarkDiffReport(
         benchmark_name=after.benchmark_name,
@@ -289,6 +303,12 @@ def build_benchmark_diff(
         ),
         before_retrieval_custody_summary=before_retrieval_custody_summary,
         after_retrieval_custody_summary=after_retrieval_custody_summary,
+        before_critical_evidence_custody_summary=before_critical_evidence_summary,
+        after_critical_evidence_custody_summary=after_critical_evidence_summary,
+        critical_evidence_custody_deltas=_critical_evidence_custody_deltas(
+            before_critical_evidence_summary,
+            after_critical_evidence_summary,
+        ),
         category_deltas=category_deltas,
         improved_questions=improved_questions,
         regressed_questions=regressed_questions,
@@ -356,6 +376,35 @@ def format_diff_summary(diff_report: BenchmarkDiffReport) -> str:
         f"  Before: {_format_custody_summary_for_diff(diff_report.before_retrieval_custody_summary)}",
         f"  After:  {_format_custody_summary_for_diff(diff_report.after_retrieval_custody_summary)}",
     ]
+    if _has_critical_evidence_summary(
+        diff_report.before_critical_evidence_custody_summary,
+    ) or _has_critical_evidence_summary(
+        diff_report.after_critical_evidence_custody_summary,
+    ):
+        lines.extend(
+            [
+                "",
+                "Critical evidence custody:",
+                (
+                    "  Before: "
+                    + _format_critical_evidence_summary(
+                        diff_report.before_critical_evidence_custody_summary
+                    )
+                ),
+                (
+                    "  After:  "
+                    + _format_critical_evidence_summary(
+                        diff_report.after_critical_evidence_custody_summary
+                    )
+                ),
+            ]
+        )
+        critical_delta_line = _format_critical_evidence_deltas(
+            "Critical evidence deltas",
+            diff_report.critical_evidence_custody_deltas,
+        )
+        if critical_delta_line is not None:
+            lines.append(critical_delta_line)
     warning_delta_line = _format_count_deltas("Warning deltas", diff_report.warning_count_deltas)
     if warning_delta_line is not None:
         lines.extend(["", warning_delta_line])
@@ -443,6 +492,8 @@ def _question_diffs(
                 after_result.retrieval_time_ms - before_result.retrieval_time_ms,
                 6,
             )
+        before_critical_counts = _critical_evidence_counts(before_result)
+        after_critical_counts = _critical_evidence_counts(after_result)
         diffs.append(
             QuestionDiff(
                 question_id=question.question_id,
@@ -492,6 +543,12 @@ def _question_diffs(
                 after_selected_evidence_memory_ids=_trace_list(
                     after_result,
                     "selected_evidence_memory_ids",
+                ),
+                before_critical_evidence_counts=before_critical_counts,
+                after_critical_evidence_counts=after_critical_counts,
+                critical_evidence_count_deltas=_count_deltas(
+                    before_critical_counts,
+                    after_critical_counts,
                 ),
             )
         )
@@ -630,6 +687,99 @@ def _retrieval_custody_summary(report: BenchmarkReport) -> dict[str, object]:
     )
 
 
+_CRITICAL_EVIDENCE_COUNT_KEYS = (
+    "critical_evidence_count",
+    "raw_candidate_count",
+    "scored_count",
+    "selected_count",
+    "absent_count",
+)
+
+
+def _critical_evidence_custody_summary(
+    report: BenchmarkReport | None,
+) -> dict[str, object]:
+    counts = {key: 0 for key in _CRITICAL_EVIDENCE_COUNT_KEYS}
+    stage_counts: dict[str, int] = {}
+    question_count = 0
+    if report is None:
+        return {
+            "question_count": 0,
+            **counts,
+            "survival_stage_counts": stage_counts,
+        }
+
+    for conversation in report.conversations:
+        for result in conversation.results:
+            question_counts = _critical_evidence_counts(result)
+            if not question_counts:
+                continue
+            question_count += 1
+            for key in _CRITICAL_EVIDENCE_COUNT_KEYS:
+                counts[key] += question_counts.get(key, 0)
+            custody = result.trace.get("critical_evidence_custody")
+            if not isinstance(custody, dict):
+                continue
+            raw_stage_counts = custody.get("survival_stage_counts")
+            if not isinstance(raw_stage_counts, dict):
+                continue
+            for stage, amount in raw_stage_counts.items():
+                try:
+                    stage_counts[str(stage)] = stage_counts.get(str(stage), 0) + int(
+                        amount
+                    )
+                except (TypeError, ValueError):
+                    continue
+    return {
+        "question_count": question_count,
+        **counts,
+        "survival_stage_counts": dict(sorted(stage_counts.items())),
+    }
+
+
+def _critical_evidence_counts(result: QuestionResult | None) -> dict[str, int]:
+    if result is None or not isinstance(result.trace, dict):
+        return {}
+    custody = result.trace.get("critical_evidence_custody")
+    if not isinstance(custody, dict):
+        return {}
+    raw_counts = custody.get("counts")
+    if not isinstance(raw_counts, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for key in _CRITICAL_EVIDENCE_COUNT_KEYS:
+        try:
+            counts[key] = int(raw_counts.get(key, 0))
+        except (TypeError, ValueError):
+            counts[key] = 0
+    return counts
+
+
+def _critical_evidence_custody_deltas(
+    before_summary: dict[str, object],
+    after_summary: dict[str, object],
+) -> dict[str, object]:
+    numeric_keys = ("question_count", *_CRITICAL_EVIDENCE_COUNT_KEYS)
+    deltas: dict[str, object] = {
+        key: _summary_int(after_summary, key) - _summary_int(before_summary, key)
+        for key in numeric_keys
+    }
+    before_stages = before_summary.get("survival_stage_counts")
+    after_stages = after_summary.get("survival_stage_counts")
+    deltas["survival_stage_counts"] = _count_deltas(
+        before_stages if isinstance(before_stages, dict) else {},
+        after_stages if isinstance(after_stages, dict) else {},
+    )
+    return deltas
+
+
+def _summary_int(summary: dict[str, object], key: str) -> int:
+    try:
+        return int(summary.get(key, 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _count_deltas(before_counts: dict[str, int], after_counts: dict[str, int]) -> dict[str, int]:
     return {
         key: after_counts.get(key, 0) - before_counts.get(key, 0)
@@ -643,6 +793,56 @@ def _format_count_deltas(label: str, value: dict[str, int]) -> str | None:
         for key, amount in sorted(value.items())
         if amount != 0
     ]
+    if not parts:
+        return None
+    return f"{label}: " + ", ".join(parts)
+
+
+def _has_critical_evidence_summary(value: dict[str, object]) -> bool:
+    return _summary_int(value, "critical_evidence_count") > 0
+
+
+def _format_critical_evidence_summary(value: dict[str, object]) -> str:
+    parts = [
+        f"questions={_summary_int(value, 'question_count')}",
+        f"critical={_summary_int(value, 'critical_evidence_count')}",
+        f"raw={_summary_int(value, 'raw_candidate_count')}",
+        f"scored={_summary_int(value, 'scored_count')}",
+        f"selected={_summary_int(value, 'selected_count')}",
+        f"absent={_summary_int(value, 'absent_count')}",
+    ]
+    stage_counts = value.get("survival_stage_counts")
+    if isinstance(stage_counts, dict) and stage_counts:
+        rendered_stages = [
+            f"{stage}={amount}"
+            for stage, amount in sorted(stage_counts.items())
+            if amount
+        ]
+        if rendered_stages:
+            parts.append("stages=" + " ".join(rendered_stages))
+    return " ".join(parts)
+
+
+def _format_critical_evidence_deltas(
+    label: str,
+    value: dict[str, object],
+) -> str | None:
+    numeric_parts = [
+        f"{key}={amount:+d}"
+        for key in ("question_count", *_CRITICAL_EVIDENCE_COUNT_KEYS)
+        if (amount := _summary_int(value, key)) != 0
+    ]
+    stage_counts = value.get("survival_stage_counts")
+    stage_parts = []
+    if isinstance(stage_counts, dict):
+        stage_parts = [
+            f"{key}={amount:+d}"
+            for key in sorted(stage_counts)
+            if (amount := _summary_int(stage_counts, str(key))) != 0
+        ]
+    parts = numeric_parts
+    if stage_parts:
+        parts.append("stages=" + " ".join(stage_parts))
     if not parts:
         return None
     return f"{label}: " + ", ".join(parts)

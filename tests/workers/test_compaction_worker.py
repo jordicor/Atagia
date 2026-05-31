@@ -15,7 +15,15 @@ from atagia.core.repositories import ConversationRepository, MemoryObjectReposit
 from atagia.core.storage_backend import InProcessBackend
 from atagia.core.summary_repository import SummaryRepository
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
-from atagia.models.schemas_jobs import COMPACT_STREAM_NAME, CompactionJobKind, JobEnvelope, JobType
+from atagia.models.schemas_jobs import (
+    COMPACT_STREAM_NAME,
+    INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
+    WORKER_GROUP_NAME,
+    CompactionJobKind,
+    InitialContextPackageRefreshJobPayload,
+    JobEnvelope,
+    JobType,
+)
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, SummaryViewKind
 from atagia.services.llm_client import (
     LLMClient,
@@ -94,7 +102,11 @@ async def _build_runtime(
     await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
     backend = InProcessBackend()
     provider = QueueProvider(outputs, failing_purposes=failing_purposes)
-    llm_client = LLMClient(provider_name=provider.name, providers=[provider])
+    llm_client = LLMClient(
+        provider_name=provider.name,
+        providers=[provider],
+        structured_output_retry_attempts=0,
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -119,7 +131,7 @@ async def _seed_messages(messages: MessageRepository) -> None:
     await messages.create_message("msg_2", "cnv_1", "assistant", 2, "Patch the retry guard first.", 6, {})
 
 
-def _compaction_job(*, job_kind: str) -> JobEnvelope:
+def _compaction_job(*, job_kind: str, privacy_enforcement: str = "enforce") -> JobEnvelope:
     return JobEnvelope(
         job_id="job_compact_1",
         job_type=JobType.COMPACT_SUMMARIES,
@@ -130,6 +142,7 @@ def _compaction_job(*, job_kind: str) -> JobEnvelope:
             "user_id": "usr_1",
             "workspace_id": "wrk_1",
             "conversation_id": "cnv_1",
+            "privacy_enforcement": privacy_enforcement,
             "job_kind": job_kind,
         },
         created_at=datetime(2026, 4, 3, 14, 0, tzinfo=timezone.utc),
@@ -162,6 +175,56 @@ async def test_compaction_worker_processes_conversation_chunk_job() -> None:
         assert len(rows) == 1
         assert rows[0]["summary_text"] == "Patch-first debugging summary."
     finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_refresh_preserves_privacy_enforcement_variant() -> None:
+    connection, backend, messages, _summaries, _memories, worker = await _build_runtime(
+        {
+            "summary_chunk_segmentation": [
+                json.dumps(
+                    {
+                        "episodes": [
+                            {
+                                "start_seq": 1,
+                                "end_seq": 2,
+                                "summary_text": "Privacy-off summary.",
+                            }
+                        ]
+                    }
+                )
+            ]
+        }
+    )
+    try:
+        await _seed_messages(messages)
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(
+                job_kind=CompactionJobKind.CONVERSATION_CHUNK.value,
+                privacy_enforcement="off",
+            ).model_dump(mode="json"),
+        )
+
+        result = await worker.run_once()
+        refresh_messages = await backend.stream_read(
+            INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
+            WORKER_GROUP_NAME,
+            "test",
+            count=1,
+            block_ms=0,
+        )
+
+        assert result.acked == 1
+        assert len(refresh_messages) == 1
+        refresh_envelope = JobEnvelope.model_validate(refresh_messages[0].payload)
+        refresh_payload = InitialContextPackageRefreshJobPayload.model_validate(
+            refresh_envelope.payload
+        )
+        assert refresh_payload.privacy_enforcement == "off"
+    finally:
+        await backend.close()
         await connection.close()
 
 

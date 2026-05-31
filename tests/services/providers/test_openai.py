@@ -14,11 +14,12 @@ from atagia.services.llm_client import (
     LLMEmbeddingRequest,
     LLMError,
     LLMMessage,
+    LLMRequestError,
     LLMToolSpec,
     OutputLimitExceededError,
     TransientLLMError,
 )
-from atagia.services.providers.openai import OpenAIProvider
+from atagia.services.providers.openai import OpenAICompatibleProvider, OpenAIProvider
 from atagia.services.providers.openrouter import OpenRouterProvider
 
 
@@ -87,7 +88,7 @@ def _request(model: str = "gpt-5-mini") -> LLMCompletionRequest:
     return LLMCompletionRequest(
         model=model,
         messages=[LLMMessage(role="system", content="You are helpful."), LLMMessage(role="user", content="Hello")],
-        max_output_tokens=256,
+        max_output_tokens=8192,
         temperature=0.2,
         response_schema={
             "type": "object",
@@ -161,7 +162,7 @@ async def test_openai_complete_maps_response_and_uses_structured_output() -> Non
     assert completion.output_text == "hello world"
     assert completion.tool_calls[0]["name"] == "lookup"
     call = completions.calls[0]
-    assert call["max_completion_tokens"] == 256
+    assert call["max_completion_tokens"] == 8192
     assert "max_tokens" not in call
     assert call["response_format"]["type"] == "json_schema"
     schema = call["response_format"]["json_schema"]["schema"]
@@ -173,6 +174,76 @@ async def test_openai_complete_maps_response_and_uses_structured_output() -> Non
     assert "default" not in schema["properties"]["status"]
     assert call["tools"][0]["function"]["name"] == "lookup"
     assert call["user"] == "usr_1"
+
+
+@pytest.mark.asyncio
+async def test_openai_preserves_nullable_optionals_for_strict_structured_output() -> None:
+    response = SimpleNamespace(
+        model="gpt-5-mini",
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"label":"ok"}'))],
+        usage=None,
+        model_dump=lambda: {},
+    )
+    completions = FakeChatCompletions(create_result=response)
+    provider = OpenAIProvider(api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()))
+    request = _request().model_copy(
+        update={
+            "response_schema": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "note": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "default": None,
+                    },
+                },
+            },
+        }
+    )
+
+    await provider.complete(request)
+
+    response_format = completions.calls[0]["response_format"]
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["required"] == ["label", "note"]
+    assert schema["properties"]["note"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_provider_strips_nullable_by_default() -> None:
+    response = SimpleNamespace(
+        model="local-model",
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"label":"ok"}'))],
+        usage=None,
+        model_dump=lambda: {},
+    )
+    completions = FakeChatCompletions(create_result=response)
+    provider = OpenAICompatibleProvider(
+        api_key="test",
+        client=FakeOpenAIClient(completions, FakeEmbeddings()),
+    )
+    request = _request(model="local-model").model_copy(
+        update={
+            "response_schema": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "note": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "default": None,
+                    },
+                },
+            },
+        }
+    )
+
+    await provider.complete(request)
+
+    response_format = completions.calls[0]["response_format"]
+    assert response_format["json_schema"]["strict"] is False
+    schema = response_format["json_schema"]["schema"]
+    assert schema["properties"]["note"] == {"type": "string"}
 
 
 @pytest.mark.asyncio
@@ -283,9 +354,12 @@ async def test_openrouter_openai_reasoning_model_omits_temperature() -> None:
 
     call = completions.calls[0]
     assert "temperature" not in call
-    assert call["max_tokens"] == 256
+    assert call["max_tokens"] == 8192
     assert "max_completion_tokens" not in call
-    assert call["extra_body"] == {"reasoning": {"effort": "high"}}
+    assert call["extra_body"] == {
+        "reasoning": {"effort": "high"},
+        "provider": {"require_parameters": True},
+    }
 
 
 @pytest.mark.asyncio
@@ -303,7 +377,7 @@ async def test_openai_chat_latest_uses_completion_tokens_and_omits_temperature()
 
     call = completions.calls[0]
     assert "temperature" not in call
-    assert call["max_completion_tokens"] == 256
+    assert call["max_completion_tokens"] == 8192
     assert "max_tokens" not in call
 
 
@@ -370,6 +444,9 @@ async def test_openai_complete_raises_non_transient_on_length_finish_reason() ->
 
     assert isinstance(exc_info.value, LLMError)
     assert not isinstance(exc_info.value, TransientLLMError)
+    assert exc_info.value.finish_reason == "length"
+    assert exc_info.value.partial_output_chars == len("partial")
+    assert exc_info.value.partial_output_excerpt == "partial"
 
 
 @pytest.mark.asyncio
@@ -461,6 +538,9 @@ async def test_openai_stream_emits_done_then_raises_on_length_finish_reason() ->
     assert isinstance(raised, LLMError)
     assert not isinstance(raised, TransientLLMError)
     assert "max output tokens" in str(raised)
+    assert raised.finish_reason == "length"
+    assert raised.partial_output_chars == len("partial")
+    assert raised.partial_output_excerpt == "partial"
 
 
 @pytest.mark.asyncio
@@ -520,6 +600,69 @@ async def test_openai_embed_maps_vectors() -> None:
     assert [vector.values for vector in response.vectors] == [[0.1, 0.2], [0.3, 0.4]]
     assert embeddings.calls[0]["dimensions"] == 1536
     assert embeddings.calls[0]["user"] == "usr_1"
+
+
+@pytest.mark.asyncio
+async def test_openai_embed_can_use_separate_embedding_base_url(monkeypatch) -> None:
+    created_clients: list[SimpleNamespace] = []
+
+    class FakeAsyncOpenAI:
+        def __init__(
+            self,
+            *,
+            api_key: str,
+            base_url: str | None,
+            default_headers: dict[str, str] | None,
+            max_retries: int,
+        ) -> None:
+            response = SimpleNamespace(
+                model="gpt-5-mini",
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=None,
+                model_dump=lambda: {},
+            )
+            embedding_response = SimpleNamespace(
+                model="qwen3-embedding:4b",
+                data=[SimpleNamespace(index=0, embedding=[0.1, 0.2])],
+                model_dump=lambda: {},
+            )
+            self.api_key = api_key
+            self.base_url = base_url
+            self.default_headers = default_headers
+            self.max_retries = max_retries
+            self.chat = SimpleNamespace(
+                completions=FakeChatCompletions(create_result=response)
+            )
+            self.embeddings = FakeEmbeddings(result=embedding_response)
+            created_clients.append(self)
+
+    monkeypatch.setattr(
+        "atagia.services.providers.openai.AsyncOpenAI",
+        FakeAsyncOpenAI,
+    )
+    provider = OpenAIProvider(
+        api_key="ollama",
+        base_url="http://4090.test/v1",
+        embedding_base_url="http://4080.test/v1",
+    )
+
+    await provider.complete(_request(model="qwen3-coder:30b"))
+    await provider.embed(
+        LLMEmbeddingRequest(
+            model="qwen3-embedding:4b",
+            input_texts=["hello"],
+            dimensions=1536,
+        )
+    )
+
+    assert [client.base_url for client in created_clients] == [
+        "http://4090.test/v1",
+        "http://4080.test/v1",
+    ]
+    assert len(created_clients[0].chat.completions.calls) == 1
+    assert created_clients[0].embeddings.calls == []
+    assert len(created_clients[1].embeddings.calls) == 1
+    assert created_clients[1].chat.completions.calls == []
 
 
 @pytest.mark.asyncio
@@ -585,8 +728,52 @@ async def test_openai_maps_retryable_and_permanent_errors() -> None:
         await transient_provider.complete(_request())
     with pytest.raises(TransientLLMError):
         await rate_limit_provider.complete(_request())
-    with pytest.raises(LLMError):
+    with pytest.raises(LLMRequestError) as exc_info:
         await permanent_provider.complete(_request())
+    assert exc_info.value.status_code == 400
+    assert isinstance(exc_info.value, LLMError)
+
+
+@pytest.mark.asyncio
+async def test_openai_maps_non_transient_4xx_status_error_to_request_error() -> None:
+    not_found_error = openai.APIStatusError(
+        "not found",
+        response=httpx.Response(
+            404,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={},
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(FakeChatCompletions(error=not_found_error), FakeEmbeddings()),
+    )
+
+    with pytest.raises(LLMRequestError) as exc_info:
+        await provider.complete(_request())
+    assert exc_info.value.status_code == 404
+    assert not isinstance(exc_info.value, TransientLLMError)
+
+
+@pytest.mark.asyncio
+async def test_openrouter_maps_bad_request_to_request_error() -> None:
+    bad_request = openai.BadRequestError(
+        "bad request",
+        response=httpx.Response(
+            400, request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        ),
+        body={},
+    )
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://example.test",
+        app_name="Atagia",
+        client=FakeOpenAIClient(FakeChatCompletions(error=bad_request), FakeEmbeddings()),
+    )
+
+    with pytest.raises(LLMRequestError) as exc_info:
+        await provider.complete(_request(model="deepseek/deepseek-v4-flash"))
+    assert exc_info.value.status_code == 400
 
 
 @pytest.mark.asyncio

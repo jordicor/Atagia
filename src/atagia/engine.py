@@ -10,6 +10,7 @@ from atagia.app import AppRuntime, initialize_runtime
 from atagia.core.config import Settings, configured_resource_path
 from atagia.core import json_utils
 from atagia.core.repositories import MemoryObjectRepository, WorkspaceRepository
+from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.models.schemas_api import (
     ChatResult,
     ContextResult,
@@ -37,6 +38,7 @@ from atagia.models.schemas_memory import (
     MemoryCategory,
     MemoryScope,
     MemoryStatus,
+    ResponseMode,
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
@@ -122,8 +124,17 @@ class Atagia:
         disable_chunking_extraction: bool | None = None,
         assistant_guidance_enabled: bool | None = None,
         recent_transcript_budget_tokens: int | None = None,
+        context_envelope_budget_tokens: int | None = None,
+        context_envelope_ratios: dict[str, float] | None = None,
+        answer_stance: str | None = None,
+        answer_stance_prompt_variant: str | None = None,
+        answer_postcondition_guard_enabled: bool | None = None,
     ) -> None:
-        self._db_path = str(Path(db_path).expanduser()) if isinstance(db_path, Path) else str(db_path)
+        self._db_path = (
+            str(Path(db_path).expanduser())
+            if isinstance(db_path, Path)
+            else str(db_path)
+        )
         self._redis_url = redis_url
         self._manifests_dir = (
             str(Path(manifests_dir).expanduser())
@@ -146,8 +157,12 @@ class Atagia:
         self._llm_intimacy_proactive_routing_enabled = (
             llm_intimacy_proactive_routing_enabled
         )
-        self._llm_structured_output_retry_attempts = llm_structured_output_retry_attempts
-        self._llm_structured_output_rescue_enabled = llm_structured_output_rescue_enabled
+        self._llm_structured_output_retry_attempts = (
+            llm_structured_output_retry_attempts
+        )
+        self._llm_structured_output_rescue_enabled = (
+            llm_structured_output_rescue_enabled
+        )
         self._llm_structured_output_rescue_model = llm_structured_output_rescue_model
         self._anthropic_api_key = anthropic_api_key
         self._openai_api_key = openai_api_key
@@ -161,6 +176,15 @@ class Atagia:
         self._disable_chunking_extraction = disable_chunking_extraction
         self._assistant_guidance_enabled = assistant_guidance_enabled
         self._recent_transcript_budget_tokens = recent_transcript_budget_tokens
+        self._context_envelope_budget_tokens = context_envelope_budget_tokens
+        self._context_envelope_ratios = (
+            dict(context_envelope_ratios)
+            if context_envelope_ratios is not None
+            else None
+        )
+        self._answer_stance = answer_stance
+        self._answer_stance_prompt_variant = answer_stance_prompt_variant
+        self._answer_postcondition_guard_enabled = answer_postcondition_guard_enabled
         self._runtime: AppRuntime | None = None
         self._closed = False
 
@@ -212,6 +236,10 @@ class Atagia:
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
+        response_mode: ResponseMode | str | None = None,
     ) -> ContextResult:
         """Run retrieval, persist the user message, and return a ready system prompt."""
         runtime = await self._require_runtime()
@@ -242,14 +270,30 @@ class Atagia:
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
             memory_privacy_mode=memory_privacy_mode,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+            response_mode=response_mode,
         )
 
-    async def flush(self, timeout_seconds: float = 30.0) -> bool:
+    async def flush(
+        self,
+        timeout_seconds: float = 30.0,
+        *,
+        idle_timeout_seconds: float | None = None,
+        progress_interval_seconds: float = 0.0,
+        progress_callback: Any | None = None,
+    ) -> bool:
         """Wait for pending background work to finish when workers are enabled."""
         runtime = await self._require_runtime()
         if not runtime.settings.workers_enabled:
             return False
-        return await runtime.storage_backend.drain(timeout_seconds)
+        return await runtime.storage_backend.drain(
+            timeout_seconds,
+            idle_timeout_seconds=idle_timeout_seconds,
+            progress_interval_seconds=progress_interval_seconds,
+            progress_callback=progress_callback,
+        )
 
     async def get_worker_control(self) -> WorkerControlResponse:
         """Return the current background-processing stop-switch state."""
@@ -353,7 +397,9 @@ class Atagia:
                 limit=int(filters.get("limit", 100)),
                 offset=int(filters.get("offset", 0)),
             )
-            return PendingMemoryConfirmationListResponse.model_validate({"items": items})
+            return PendingMemoryConfirmationListResponse.model_validate(
+                {"items": items}
+            )
         finally:
             await connection.close()
 
@@ -438,7 +484,10 @@ class Atagia:
                 connection,
                 runtime.clock,
             ).get_memory_object(memory_id, user_id)
-            if memory is None or memory.get("status") != MemoryStatus.REVIEW_REQUIRED.value:
+            if (
+                memory is None
+                or memory.get("status") != MemoryStatus.REVIEW_REQUIRED.value
+            ):
                 raise ValueError("Review-required memory not found")
             await ConversationLifecycleService(runtime).delete_memory(
                 connection,
@@ -466,7 +515,10 @@ class Atagia:
                 connection,
                 runtime.clock,
             ).get_memory_object(memory_id, user_id)
-            if memory is None or memory.get("status") != MemoryStatus.REVIEW_REQUIRED.value:
+            if (
+                memory is None
+                or memory.get("status") != MemoryStatus.REVIEW_REQUIRED.value
+            ):
                 raise ValueError("Review-required memory not found")
             await ConversationLifecycleService(runtime).delete_memory(
                 connection,
@@ -511,6 +563,9 @@ class Atagia:
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> None:
         """Store a message and enqueue extraction without running retrieval."""
         runtime = await self._require_runtime()
@@ -541,6 +596,9 @@ class Atagia:
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
             memory_privacy_mode=memory_privacy_mode,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
         )
 
     async def add_response(
@@ -568,6 +626,9 @@ class Atagia:
         ingest_origin: str | None = None,
         confirmation_strategy: str | None = None,
         memory_privacy_mode: str | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
     ) -> None:
         """Persist an assistant response in the conversation history."""
         runtime = await self._require_runtime()
@@ -594,6 +655,9 @@ class Atagia:
             ingest_origin=ingest_origin,
             confirmation_strategy=confirmation_strategy,
             memory_privacy_mode=memory_privacy_mode,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
         )
 
     async def chat(
@@ -606,6 +670,8 @@ class Atagia:
         occurred_at: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         *,
+        ablation: AblationConfig | None = None,
+        debug: bool = False,
         operational_profile: str | None = None,
         operational_signals: dict[str, Any] | None = None,
         cross_chat_memory: bool = True,
@@ -619,10 +685,15 @@ class Atagia:
         realm_id: str | None = None,
         space_id: str | None = None,
         incognito: bool | None = None,
+        privacy_enforcement: str = "enforce",
+        authenticated_user_privilege_level: str | None = None,
+        authenticated_user_is_atagia_master: bool = False,
+        response_mode: ResponseMode | str | None = None,
     ) -> ChatResult:
         """Run the full chat flow, including the LLM response generation."""
         runtime = await self._require_runtime()
         sidecar = SidecarService(runtime)
+        await wait_for_in_memory_worker_quiescence(runtime)
         connection = await runtime.open_connection()
         try:
             await sidecar.ensure_user_exists(connection, user_id)
@@ -652,8 +723,11 @@ class Atagia:
             conversation_id=conversation_id,
             message_text=message,
             assistant_mode_id=mode,
+            ablation=ablation,
             attachments=attachments,
             message_occurred_at=occurred_at,
+            debug=debug,
+            debug_include_sensitive=True,
             operational_profile=operational_profile,
             operational_signals=operational_signals,
             cross_chat_memory=cross_chat_memory,
@@ -668,6 +742,10 @@ class Atagia:
             space_id=space_id,
             mode=mode,
             incognito=incognito,
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+            response_mode=response_mode,
         )
 
     async def get_memory_preferences(self, user_id: str) -> MemoryPreferencesResponse:
@@ -717,7 +795,9 @@ class Atagia:
         finally:
             await connection.close()
 
-    async def create_workspace(self, user_id: str, workspace_id: str, name: str) -> None:
+    async def create_workspace(
+        self, user_id: str, workspace_id: str, name: str
+    ) -> None:
         """Create the workspace if it does not already exist."""
         runtime = await self._require_runtime()
         sidecar = SidecarService(runtime)
@@ -809,7 +889,9 @@ class Atagia:
         finally:
             await connection.close()
 
-    async def archive_conversation(self, user_id: str, conversation_id: str) -> dict[str, Any]:
+    async def archive_conversation(
+        self, user_id: str, conversation_id: str
+    ) -> dict[str, Any]:
         """Archive a conversation and hide its derived data from default retrieval."""
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
@@ -892,7 +974,9 @@ class Atagia:
             finally:
                 await connection.close()
 
-    async def erase_user_data(self, user_id: str, *, confirmation: str) -> ErasureReport:
+    async def erase_user_data(
+        self, user_id: str, *, confirmation: str
+    ) -> ErasureReport:
         """Erase all user data after explicit right-to-erasure confirmation."""
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
@@ -1047,7 +1131,9 @@ class Atagia:
                 expires_at=expires_at,
                 payload_json=payload_json,
             )
-            return None if updated is None else VerbatimPinRecord.model_validate(updated)
+            return (
+                None if updated is None else VerbatimPinRecord.model_validate(updated)
+            )
         finally:
             await connection.close()
 
@@ -1065,7 +1151,9 @@ class Atagia:
                 user_id=user_id,
                 pin_id=pin_id,
             )
-            return None if deleted is None else VerbatimPinRecord.model_validate(deleted)
+            return (
+                None if deleted is None else VerbatimPinRecord.model_validate(deleted)
+            )
         finally:
             await connection.close()
 
@@ -1208,12 +1296,9 @@ class Atagia:
 
     def _build_settings(self) -> Settings:
         env_settings = Settings.from_env()
-        manifests_path = (
-            self._manifests_dir
-            or configured_resource_path(
-                "manifests",
-                os.getenv("ATAGIA_MANIFESTS_PATH"),
-            )
+        manifests_path = self._manifests_dir or configured_resource_path(
+            "manifests",
+            os.getenv("ATAGIA_MANIFESTS_PATH"),
         )
         operational_profiles_path = (
             self._operational_profiles_dir
@@ -1226,15 +1311,18 @@ class Atagia:
             "migrations",
             os.getenv("ATAGIA_MIGRATIONS_PATH"),
         )
-        use_env_redis = self._redis_url is None and env_settings.storage_backend == "redis"
-        storage_backend = "redis" if self._redis_url is not None or use_env_redis else "inprocess"
+        use_env_redis = (
+            self._redis_url is None and env_settings.storage_backend == "redis"
+        )
+        storage_backend = (
+            "redis" if self._redis_url is not None or use_env_redis else "inprocess"
+        )
         anthropic_api_key = self._anthropic_api_key or env_settings.anthropic_api_key
         openai_api_key = self._openai_api_key or env_settings.openai_api_key
         google_api_key = self._google_api_key or env_settings.google_api_key
         openrouter_api_key = self._openrouter_api_key or env_settings.openrouter_api_key
         forced_global_model = (
-            self._llm_forced_global_model
-            or env_settings.llm_forced_global_model
+            self._llm_forced_global_model or env_settings.llm_forced_global_model
         )
         overridden_categories = {
             category
@@ -1276,13 +1364,15 @@ class Atagia:
             openrouter_api_key=openrouter_api_key,
             anthropic_base_url=env_settings.anthropic_base_url,
             openai_base_url=env_settings.openai_base_url,
+            openai_embedding_base_url=env_settings.openai_embedding_base_url,
             openrouter_base_url=env_settings.openrouter_base_url,
             openrouter_site_url=env_settings.openrouter_site_url,
             openrouter_app_name=env_settings.openrouter_app_name,
             llm_chat_model=self._llm_chat_model or env_settings.llm_chat_model,
             llm_forced_global_model=forced_global_model,
             llm_ingest_model=self._llm_ingest_model or env_settings.llm_ingest_model,
-            llm_retrieval_model=self._llm_retrieval_model or env_settings.llm_retrieval_model,
+            llm_retrieval_model=self._llm_retrieval_model
+            or env_settings.llm_retrieval_model,
             llm_component_models=component_models,
             llm_intimacy_ingest_model=(
                 self._llm_intimacy_ingest_model
@@ -1317,11 +1407,103 @@ class Atagia:
             llm_debug_io_purposes=env_settings.llm_debug_io_purposes,
             llm_debug_io_raw=env_settings.llm_debug_io_raw,
             llm_debug_io_max_chars=env_settings.llm_debug_io_max_chars,
+            answer_postcondition_guard_enabled=(
+                env_settings.answer_postcondition_guard_enabled
+                if self._answer_postcondition_guard_enabled is None
+                else self._answer_postcondition_guard_enabled
+            ),
+            answer_postcondition_retry_max_output_tokens=(
+                env_settings.answer_postcondition_retry_max_output_tokens
+            ),
+            answer_stance=(
+                env_settings.answer_stance
+                if self._answer_stance is None
+                else self._answer_stance
+            ),
+            answer_stance_prompt_variant=(
+                env_settings.answer_stance_prompt_variant
+                if self._answer_stance_prompt_variant is None
+                else self._answer_stance_prompt_variant
+            ),
             service_mode=False,
             service_api_key=None,
             admin_api_key=None,
             workers_enabled=True,
             debug=env_settings.debug,
+            worker_circuit_breaker_enabled=env_settings.worker_circuit_breaker_enabled,
+            worker_circuit_breaker_failure_threshold=(
+                env_settings.worker_circuit_breaker_failure_threshold
+            ),
+            worker_circuit_breaker_window_seconds=(
+                env_settings.worker_circuit_breaker_window_seconds
+            ),
+            worker_circuit_breaker_min_failure_ratio=(
+                env_settings.worker_circuit_breaker_min_failure_ratio
+            ),
+            llm_run_guard_enabled=env_settings.llm_run_guard_enabled,
+            llm_run_guard_mode=env_settings.llm_run_guard_mode,
+            llm_run_guard_max_total_calls=env_settings.llm_run_guard_max_total_calls,
+            llm_run_guard_max_total_failed_calls=(
+                env_settings.llm_run_guard_max_total_failed_calls
+            ),
+            llm_run_guard_max_failed_call_ratio=(
+                env_settings.llm_run_guard_max_failed_call_ratio
+            ),
+            llm_run_guard_failed_ratio_min_calls=(
+                env_settings.llm_run_guard_failed_ratio_min_calls
+            ),
+            llm_run_guard_max_failed_calls_per_purpose=(
+                env_settings.llm_run_guard_max_failed_calls_per_purpose
+            ),
+            llm_run_guard_max_failed_ratio_per_purpose=(
+                env_settings.llm_run_guard_max_failed_ratio_per_purpose
+            ),
+            llm_run_guard_purpose_failure_ratio_min_calls=(
+                env_settings.llm_run_guard_purpose_failure_ratio_min_calls
+            ),
+            llm_run_guard_max_consecutive_failures_per_purpose=(
+                env_settings.llm_run_guard_max_consecutive_failures_per_purpose
+            ),
+            llm_run_guard_max_total_tokens=env_settings.llm_run_guard_max_total_tokens,
+            llm_run_guard_max_reported_cost_usd=(
+                env_settings.llm_run_guard_max_reported_cost_usd
+            ),
+            bulk_ingest_llm_run_guard_enabled=(
+                env_settings.bulk_ingest_llm_run_guard_enabled
+            ),
+            bulk_ingest_llm_run_guard_max_total_calls=(
+                env_settings.bulk_ingest_llm_run_guard_max_total_calls
+            ),
+            bulk_ingest_llm_run_guard_max_total_failed_calls=(
+                env_settings.bulk_ingest_llm_run_guard_max_total_failed_calls
+            ),
+            bulk_ingest_llm_run_guard_max_failed_call_ratio=(
+                env_settings.bulk_ingest_llm_run_guard_max_failed_call_ratio
+            ),
+            bulk_ingest_llm_run_guard_failed_ratio_min_calls=(
+                env_settings.bulk_ingest_llm_run_guard_failed_ratio_min_calls
+            ),
+            bulk_ingest_llm_run_guard_max_failed_calls_per_purpose=(
+                env_settings.bulk_ingest_llm_run_guard_max_failed_calls_per_purpose
+            ),
+            bulk_ingest_llm_run_guard_max_failed_ratio_per_purpose=(
+                env_settings.bulk_ingest_llm_run_guard_max_failed_ratio_per_purpose
+            ),
+            bulk_ingest_llm_run_guard_purpose_failure_ratio_min_calls=(
+                env_settings.bulk_ingest_llm_run_guard_purpose_failure_ratio_min_calls
+            ),
+            bulk_ingest_llm_run_guard_max_consecutive_failures_per_purpose=(
+                env_settings.bulk_ingest_llm_run_guard_max_consecutive_failures_per_purpose
+            ),
+            bulk_ingest_llm_run_guard_max_total_tokens=(
+                env_settings.bulk_ingest_llm_run_guard_max_total_tokens
+            ),
+            bulk_ingest_llm_run_guard_max_reported_cost_usd=(
+                env_settings.bulk_ingest_llm_run_guard_max_reported_cost_usd
+            ),
+            bulk_ingest_llm_run_guard_max_wall_time_seconds=(
+                env_settings.bulk_ingest_llm_run_guard_max_wall_time_seconds
+            ),
             allow_insecure_http=True,
             embedding_backend=self._embedding_backend or env_settings.embedding_backend,
             embedding_model=self._embedding_model or env_settings.embedding_model,
@@ -1341,8 +1523,26 @@ class Atagia:
             lifecycle_review_ttl_days=env_settings.lifecycle_review_ttl_days,
             lifecycle_lazy_enabled=env_settings.lifecycle_lazy_enabled,
             lifecycle_min_interval_seconds=env_settings.lifecycle_min_interval_seconds,
+            lifecycle_busy_timeout_ms=env_settings.lifecycle_busy_timeout_ms,
+            lifecycle_busy_backoff_seconds=env_settings.lifecycle_busy_backoff_seconds,
+            lifecycle_failure_backoff_seconds=env_settings.lifecycle_failure_backoff_seconds,
             lifecycle_worker_enabled=env_settings.lifecycle_worker_enabled,
             lifecycle_worker_interval_seconds=env_settings.lifecycle_worker_interval_seconds,
+            retrieval_packets_dry_run_enabled=(
+                env_settings.retrieval_packets_dry_run_enabled
+            ),
+            retrieval_packets_write_enabled=env_settings.retrieval_packets_write_enabled,
+            fact_facet_surfaces_enabled=env_settings.fact_facet_surfaces_enabled,
+            fact_facet_retrieval_enabled=env_settings.fact_facet_retrieval_enabled,
+            fact_facet_structured_only=env_settings.fact_facet_structured_only,
+            fact_facet_span_coadmission_enabled=(
+                env_settings.fact_facet_span_coadmission_enabled
+            ),
+            fact_facet_retrieval_limit=env_settings.fact_facet_retrieval_limit,
+            fact_facet_retrieval_rrf_weight=(
+                env_settings.fact_facet_retrieval_rrf_weight
+            ),
+            applicability_gate_mode=env_settings.applicability_gate_mode,
             promotion_conv_to_ws_min_conversations=env_settings.promotion_conv_to_ws_min_conversations,
             promotion_ws_to_global_min_sessions=env_settings.promotion_ws_to_global_min_sessions,
             promotion_require_mode_consistency=env_settings.promotion_require_mode_consistency,
@@ -1371,17 +1571,6 @@ class Atagia:
             extraction_watchdog_allow_different_provider=(
                 env_settings.extraction_watchdog_allow_different_provider
             ),
-            extraction_watchdog_min_elapsed_seconds=(
-                env_settings.extraction_watchdog_min_elapsed_seconds
-            ),
-            extraction_watchdog_min_output_tokens=env_settings.extraction_watchdog_min_output_tokens,
-            extraction_watchdog_check_interval_tokens=(
-                env_settings.extraction_watchdog_check_interval_tokens
-            ),
-            extraction_watchdog_max_checks=env_settings.extraction_watchdog_max_checks,
-            extraction_watchdog_llm_timeout_seconds=(
-                env_settings.extraction_watchdog_llm_timeout_seconds
-            ),
             extraction_watchdog_bounded_retry_max_items=(
                 env_settings.extraction_watchdog_bounded_retry_max_items
             ),
@@ -1400,6 +1589,16 @@ class Atagia:
                 env_settings.recent_transcript_budget_tokens
                 if self._recent_transcript_budget_tokens is None
                 else self._recent_transcript_budget_tokens
+            ),
+            context_envelope_budget_tokens=(
+                env_settings.context_envelope_budget_tokens
+                if self._context_envelope_budget_tokens is None
+                else self._context_envelope_budget_tokens
+            ),
+            context_envelope_ratios=(
+                env_settings.context_envelope_ratios
+                if self._context_envelope_ratios is None
+                else self._context_envelope_ratios
             ),
             benchmark_disable_raw_recent_transcript=(
                 env_settings.benchmark_disable_raw_recent_transcript

@@ -60,8 +60,34 @@ class ClientProvider(LLMProvider):
                     }
                 ),
             )
+        if purpose == "need_detection_unknown_only_contract_review":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "is_exact_value_lookup": False,
+                        "exact_facets": [],
+                        "must_keep_terms": [],
+                        "quoted_phrases": [],
+                    }
+                ),
+            )
+        if purpose == "need_detection_multi_facet_exact_review":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {
+                        "has_multiple_obligations": False,
+                        "sub_queries": [],
+                    }
+                ),
+            )
         if purpose == "applicability_scoring":
-            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
+                request.messages[1].content
+            )
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
@@ -139,10 +165,14 @@ class ClientProvider(LLMProvider):
         raise AssertionError(f"Unexpected LLM purpose: {purpose}")
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        raise AssertionError(f"Embeddings are not used in client tests: {request.model}")
+        raise AssertionError(
+            f"Embeddings are not used in client tests: {request.model}"
+        )
 
 
-def _install_stub_client(monkeypatch: pytest.MonkeyPatch, provider: ClientProvider) -> None:
+def _install_stub_client(
+    monkeypatch: pytest.MonkeyPatch, provider: ClientProvider
+) -> None:
     monkeypatch.setattr(
         "atagia.app.build_llm_client",
         lambda _settings: LLMClient(provider_name=provider.name, providers=[provider]),
@@ -298,10 +328,22 @@ async def test_connect_atagia_local_sidecar_round_trip(
             message="Why is the retry loop failing?",
             mode="coding_debug",
             workspace_id="wrk_1",
+            privacy_enforcement="off",
+            authenticated_user_privilege_level="atagia_master",
+            authenticated_user_is_atagia_master=True,
         )
 
         assert context.system_prompt
         assert chat_result.response_text == "Check the retry guard first."
+        chat_request = next(
+            request
+            for request in provider.requests
+            if request.metadata.get("purpose") == "chat_reply"
+        )
+        assert chat_request.metadata["privacy_enforcement"] == "off"
+        assert chat_request.metadata["effective_privacy_enforcement"] == "off"
+        assert chat_request.metadata["authenticated_privilege_level"] == "atagia_master"
+        assert chat_request.metadata["authenticated_atagia_master"] is True
         assert await client.flush(timeout_seconds=0.1) is True
         status = await client.get_processing_status("usr_1", conversation_id)
         assert status.workers_enabled is True
@@ -368,7 +410,10 @@ async def test_local_client_propagates_embodiment_id_to_engine_rows(
         runtime = client._engine.runtime
         if runtime is None:
             raise AssertionError("Engine runtime should remain initialized")
-        conversation_embodiment, message_embodiments = await _conversation_and_message_embodiments(
+        (
+            conversation_embodiment,
+            message_embodiments,
+        ) = await _conversation_and_message_embodiments(
             runtime,
             user_id="usr_1",
             conversation_id=conversation_id,
@@ -513,10 +558,25 @@ async def test_connect_atagia_http_sidecar_round_trip(tmp_path: Path) -> None:
                 message="Why is the retry loop failing?",
                 workspace_id="wrk_1",
                 platform_id="client_http",
+                privacy_enforcement="off",
+                authenticated_user_privilege_level="atagia_master",
+                authenticated_user_is_atagia_master=True,
             )
 
             assert context.system_prompt
             assert chat_result.response_text == "Check the retry guard first."
+            chat_request = next(
+                request
+                for request in provider.requests
+                if request.metadata.get("purpose") == "chat_reply"
+            )
+            assert chat_request.metadata["privacy_enforcement"] == "off"
+            assert chat_request.metadata["effective_privacy_enforcement"] == "off"
+            assert (
+                chat_request.metadata["authenticated_privilege_level"]
+                == "atagia_master"
+            )
+            assert chat_request.metadata["authenticated_atagia_master"] is True
             assert await client.flush(timeout_seconds=0.1) is False
             status = await client.get_processing_status("usr_1", conversation_id)
             assert status.workers_enabled is False
@@ -584,7 +644,10 @@ async def test_http_client_propagates_embodiment_id_to_api_rows(tmp_path: Path) 
                 embodiment_id="body_http",
             )
 
-        conversation_embodiment, message_embodiments = await _conversation_and_message_embodiments(
+        (
+            conversation_embodiment,
+            message_embodiments,
+        ) = await _conversation_and_message_embodiments(
             app.state.runtime,
             user_id="usr_1",
             conversation_id=conversation_id,
@@ -827,7 +890,10 @@ async def test_http_sidecar_routes_require_claimed_user_header(tmp_path: Path) -
             )
 
             assert response.status_code == 401
-            assert response.json()["detail"] == "X-Atagia-User-Id header is required in service mode"
+            assert (
+                response.json()["detail"]
+                == "X-Atagia-User-Id header is required in service mode"
+            )
 
 
 @pytest.mark.asyncio

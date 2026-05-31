@@ -393,7 +393,6 @@ class TextChunker:
                     ),
                 ),
             ],
-            temperature=0.0,
             max_output_tokens=TEXT_CHUNKER_MAX_OUTPUT_TOKENS,
             metadata={"purpose": "text_chunking_level1", **(metadata or {})},
         )

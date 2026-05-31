@@ -129,6 +129,13 @@ def test_summarize_retrieval_custody_counts_channels_and_selected() -> None:
         "candidate_kind_counts": {"evidence": 1, "verbatim_evidence_search_window": 1},
         "composer_decision_counts": {"not_selected": 1, "selected": 1},
         "filter_reason_counts": {"not_scored_or_filtered": 1},
+        "eviction_reason_counts": {},
+        "source_backed_candidate_count": 0,
+        "summary_only_candidate_count": 0,
+        "selected_source_backed_count": 0,
+        "selected_summary_count": 0,
+        "high_value_rejected_candidate_count": 0,
+        "high_value_rejected_reasons": {},
         "scope_counts": {"chat": 1, "user": 1},
         "selected_scope_counts": {"chat": 1},
         "sensitivity_counts": {"private": 1, "public": 1},
@@ -150,9 +157,10 @@ def test_format_retrieval_custody_summary_is_terminal_friendly() -> None:
     assert format_retrieval_custody_summary(summary) == (
         "Retrieval custody: candidates=2 selected=1 "
         "channels=fts=2 selected_channels=fts=1 "
+        "source_backed=0 summary_only=0 high_value_rejected=0 "
         "kinds=memory=2 "
         "decisions=not_selected=1 selected=1 "
-        "filters=not_scored_or_filtered=1"
+        "filters=not_scored_or_filtered=1 evictions=none"
     )
 
 
@@ -172,8 +180,9 @@ def test_format_retrieval_custody_summary_includes_namespace_and_sensitivity() -
     assert format_retrieval_custody_summary(summary) == (
         "Retrieval custody: candidates=2 selected=1 "
         "channels=fts=2 selected_channels=fts=1 "
+        "source_backed=0 summary_only=0 high_value_rejected=0 "
         "scopes=chat=1 user=1 sensitivity=private=1 public=1 "
         "kinds=memory=2 "
         "decisions=not_selected=1 selected=1 "
-        "filters=sensitivity_filtered=1"
+        "filters=sensitivity_filtered=1 evictions=none"
     )

@@ -10,19 +10,32 @@ from pathlib import Path
 import pytest
 
 from atagia.core.clock import FrozenClock
+from atagia.core.communication_profile_repository import CommunicationProfileRepository
 from atagia.core.config import Settings
 from atagia.core.contract_repository import ContractDimensionRepository
 from atagia.core.db_sqlite import initialize_database
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository, WorkspaceRepository
+from atagia.core.memory_evidence_repository import MemoryEvidenceRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    UserRepository,
+    WorkspaceRepository,
+)
 from atagia.core.space_repository import SpaceRepository
 from atagia.core.summary_repository import SummaryRepository
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
+from atagia.memory.policy_manifest import (
+    ManifestLoader,
+    PolicyResolver,
+    sync_assistant_modes,
+)
 from atagia.memory.context_composer import ContextComposer
 from atagia.models.schemas_memory import (
     DetectedNeed,
+    ExplicitLanguagePreference,
     ExtractionConversationContext,
     IntimacyBoundary,
+    LanguageProfileSourceRef,
     MemoryCategory,
     MemoryObjectType,
     MemoryScope,
@@ -35,6 +48,8 @@ from atagia.models.schemas_memory import (
     RetrievalTrace,
     SpaceBoundaryMode,
     SummaryViewKind,
+    UserCommunicationProfile,
+    ObservedUserLanguage,
     VerbatimPinTargetKind,
 )
 from atagia.models.schemas_replay import AblationConfig
@@ -110,6 +125,41 @@ def test_policy_filter_audit_separates_actual_and_would_filter_reasons() -> None
     }
 
 
+def test_policy_filter_audit_renders_all_phase8_policy_modes() -> None:
+    policy_reasons = {
+        "mem_private": "policy_filtered_privacy",
+        "mem_secret": "policy_filtered_sensitivity",
+    }
+
+    off = RetrievalPipeline._build_policy_filter_audit("off", policy_reasons)
+    audit_only = RetrievalPipeline._build_policy_filter_audit(
+        "audit_only",
+        policy_reasons,
+    )
+    enforce = RetrievalPipeline._build_policy_filter_audit("enforce", policy_reasons)
+
+    assert off["privacy_enforcement"] == "off"
+    assert off["enforced"] is False
+    assert off["high_risk_secret_literal_redaction_enforced"] is False
+    assert off["high_risk_secret_literal_redaction_disabled"] is True
+    assert off["would_filter_count"] == 2
+
+    assert audit_only["privacy_enforcement"] == "audit_only"
+    assert audit_only["enforced"] is False
+    assert audit_only["high_risk_secret_literal_redaction_enforced"] is True
+    assert audit_only["high_risk_secret_literal_redaction_disabled"] is False
+    assert audit_only["would_filter_reason_counts"] == {
+        "policy_filtered_privacy": 1,
+        "policy_filtered_sensitivity": 1,
+    }
+
+    assert enforce["privacy_enforcement"] == "enforce"
+    assert enforce["enforced"] is True
+    assert enforce["high_risk_secret_literal_redaction_enforced"] is True
+    assert enforce["high_risk_secret_literal_redaction_disabled"] is False
+    assert enforce["would_filter_by_candidate_id"] == policy_reasons
+
+
 class PipelineProvider(LLMProvider):
     name = "retrieval-pipeline-tests"
 
@@ -117,7 +167,10 @@ class PipelineProvider(LLMProvider):
         self,
         *,
         need_response: dict[str, object] | None = None,
+        anchor_review_response: dict[str, object] | None = None,
         coverage_response: dict[str, object] | None = None,
+        unknown_exact_review_response: dict[str, object] | None = None,
+        multi_facet_exact_review_response: dict[str, object] | None = None,
         score_map: dict[str, float] | None = None,
     ) -> None:
         self.need_response = need_response or {
@@ -133,9 +186,20 @@ class PipelineProvider(LLMProvider):
             "query_type": "default",
             "retrieval_levels": [0],
         }
+        self.anchor_review_response = anchor_review_response or {"anchors": []}
         self.coverage_response = coverage_response or {
             "should_expand": False,
             "missing_facets": [],
+            "sub_queries": [],
+        }
+        self.unknown_exact_review_response = unknown_exact_review_response or {
+            "is_exact_value_lookup": False,
+            "exact_facets": [],
+            "must_keep_terms": [],
+            "quoted_phrases": [],
+        }
+        self.multi_facet_exact_review_response = multi_facet_exact_review_response or {
+            "has_multiple_obligations": False,
             "sub_queries": [],
         }
         self.score_map = dict(score_map or {})
@@ -150,9 +214,17 @@ class PipelineProvider(LLMProvider):
                 model=request.model,
                 output_text=json.dumps(self.need_response),
             )
+        if purpose == "need_detection_anchor_review":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(self.anchor_review_response),
+            )
         if purpose == "applicability_scoring":
             payload = {
-                "scores": _scores_for_prompt(request.messages[1].content, self.score_map),
+                "scores": _scores_for_prompt(
+                    request.messages[1].content, self.score_map
+                ),
             }
             return LLMCompletionResponse(
                 provider=self.name,
@@ -164,6 +236,18 @@ class PipelineProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(self.coverage_response),
+            )
+        if purpose == "need_detection_unknown_only_contract_review":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(self.unknown_exact_review_response),
+            )
+        if purpose == "need_detection_multi_facet_exact_review":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(self.multi_facet_exact_review_response),
             )
         raise AssertionError(f"Unexpected purpose: {purpose}")
 
@@ -215,7 +299,9 @@ class OmitFirstApplicabilityScoreProvider(PipelineProvider):
             "scores": _scores_for_prompt(
                 request.messages[1].content,
                 self.score_map,
-                omitted_memory_ids={self._omitted_memory_id} if self._scoring_calls == 1 else set(),
+                omitted_memory_ids={self._omitted_memory_id}
+                if self._scoring_calls == 1
+                else set(),
             ),
         }
         return LLMCompletionResponse(
@@ -246,10 +332,14 @@ class MalformedFirstApplicabilityScoreProvider(PipelineProvider):
         self.requests.append(request)
         self._scoring_calls += 1
         scores: list[dict[str, float | str]] = []
-        for memory_id, score_key in _score_keys_by_memory_id(request.messages[1].content).items():
+        for memory_id, score_key in _score_keys_by_memory_id(
+            request.messages[1].content
+        ).items():
             score = self.score_map.get(memory_id, 0.5)
             if self._scoring_calls == 1 and memory_id == self._malformed_memory_id:
-                scores.append({"score_key": "candidate_999", "llm_applicability": score})
+                scores.append(
+                    {"score_key": "candidate_999", "llm_applicability": score}
+                )
             else:
                 scores.append({"score_key": score_key, "llm_applicability": score})
         return LLMCompletionResponse(
@@ -278,7 +368,9 @@ class InvalidFirstApplicabilityScoreProvider(PipelineProvider):
         self.requests.append(request)
         self._scoring_calls += 1
         if self._scoring_calls == 1:
-            score_key = next(iter(_score_keys_by_memory_id(request.messages[1].content).values()))
+            score_key = next(
+                iter(_score_keys_by_memory_id(request.messages[1].content).values())
+            )
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
@@ -326,7 +418,9 @@ async def _build_runtime(
 ):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -369,7 +463,15 @@ async def _build_runtime(
         assistant_mode_id=mode_id,
         recent_messages=[],
     )
-    return connection, memories, contracts, pipeline, llm_provider, resolved_policy, context
+    return (
+        connection,
+        memories,
+        contracts,
+        pipeline,
+        llm_provider,
+        resolved_policy,
+        context,
+    )
 
 
 async def _seed_memory(
@@ -383,6 +485,7 @@ async def _seed_memory(
     status: MemoryStatus = MemoryStatus.ACTIVE,
     space_id: str | None = None,
     space_boundary_mode: SpaceBoundaryMode | None = None,
+    language_codes: list[str] | None = None,
 ) -> dict[str, object]:
     scope_canonical = {
         MemoryScope.CONVERSATION: MemoryScope.CHAT.value,
@@ -398,17 +501,63 @@ async def _seed_memory(
         object_type=object_type,
         scope=scope,
         canonical_text=canonical_text,
-        source_kind=MemorySourceKind.EXTRACTED if object_type is not MemoryObjectType.INTERACTION_CONTRACT else MemorySourceKind.INFERRED,
+        source_kind=MemorySourceKind.EXTRACTED
+        if object_type is not MemoryObjectType.INTERACTION_CONTRACT
+        else MemorySourceKind.INFERRED,
         confidence=0.8,
         privacy_level=0,
         status=status,
+        language_codes=language_codes,
         memory_id=memory_id,
         platform_id="default",
         character_id="wrk_1" if scope is MemoryScope.WORKSPACE else None,
         scope_canonical=scope_canonical,
         space_id=space_id,
-        space_boundary_mode=space_boundary_mode.value if space_boundary_mode is not None else None,
+        space_boundary_mode=space_boundary_mode.value
+        if space_boundary_mode is not None
+        else None,
     )
+
+
+@pytest.mark.asyncio
+async def test_empty_clean_first_turn_skips_llm_retrieval_work() -> None:
+    connection, _memories, _contracts, pipeline, provider, resolved_policy, context = (
+        await _build_runtime()
+    )
+    try:
+        trace = RetrievalTrace(
+            query_text="Hello, can you help me plan my day?",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-05T12:00:00+00:00",
+        )
+
+        result = await pipeline.execute(
+            message_text="Hello, can you help me plan my day?",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=True,
+            conversation_messages=[
+                {
+                    "id": "pending:cnv_1",
+                    "role": "user",
+                    "seq": 1,
+                    "text": "Hello, can you help me plan my day?",
+                }
+            ],
+            trace=trace,
+        )
+
+        assert provider.requests == []
+        assert result.detected_needs == []
+        assert result.raw_candidates == []
+        assert result.scored_candidates == []
+        assert "empty_clean_fast_path" in result.stage_timings
+        assert result.trace is not None
+        assert result.trace.need_detection is not None
+        assert result.trace.need_detection.duration_ms == 0.0
+    finally:
+        await connection.close()
 
 
 def _score_request_memory_ids(provider: PipelineProvider) -> list[str]:
@@ -440,7 +589,11 @@ def _slot_fill_plan(
             )
         ],
         query_type="slot_fill",
-        scope_filter=[MemoryScope.CONVERSATION, MemoryScope.WORKSPACE, MemoryScope.GLOBAL_USER],
+        scope_filter=[
+            MemoryScope.CONVERSATION,
+            MemoryScope.WORKSPACE,
+            MemoryScope.GLOBAL_USER,
+        ],
         status_filter=[MemoryStatus.ACTIVE],
         vector_limit=0,
         max_candidates=30,
@@ -485,7 +638,9 @@ def _candidate_record(
         "platform_id_lock": None,
         "assistant_mode_id": "general_qa",
         "conversation_id": "cnv_1" if scope is MemoryScope.CONVERSATION else None,
-        "workspace_id": "wrk_1" if scope in {MemoryScope.CONVERSATION, MemoryScope.WORKSPACE} else None,
+        "workspace_id": "wrk_1"
+        if scope in {MemoryScope.CONVERSATION, MemoryScope.WORKSPACE}
+        else None,
         "canonical_text": canonical_text,
         "payload_json": payload_json or {},
         "source_kind": MemorySourceKind.EXTRACTED.value,
@@ -542,7 +697,15 @@ async def test_pipeline_executes_full_flow() -> None:
         },
         score_map={"mem_1": 0.91},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await _seed_memory(
             memories,
@@ -551,23 +714,39 @@ async def test_pipeline_executes_full_flow() -> None:
             scope=MemoryScope.CONVERSATION,
         )
 
+        trace = RetrievalTrace(
+            query_text=message_text,
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-09T12:00:00Z",
+        )
         result = await pipeline.execute(
             message_text=message_text,
             conversation_context=context,
             resolved_policy=resolved_policy,
             cold_start=False,
             conversation_messages=[{"role": "user", "text": message_text}],
+            trace=trace,
         )
 
-        assert [need.need_type.value for need in result.detected_needs] == ["follow_up_failure"]
+        assert [need.need_type.value for need in result.detected_needs] == [
+            "follow_up_failure"
+        ]
         assert result.retrieval_plan.query_type == "broad_list"
-        assert [sub_query.text for sub_query in result.retrieval_plan.sub_query_plans] == [
+        assert [
+            sub_query.text for sub_query in result.retrieval_plan.sub_query_plans
+        ] == [
             "retry loop websocket backoff",
             "production failure outcome",
         ]
-        assert result.retrieval_plan.max_candidates >= resolved_policy.retrieval_params.fts_limit
+        assert (
+            result.retrieval_plan.max_candidates
+            >= resolved_policy.retrieval_params.fts_limit
+        )
         assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_1"]
-        assert [candidate.memory_id for candidate in result.scored_candidates] == ["mem_1"]
+        assert [candidate.memory_id for candidate in result.scored_candidates] == [
+            "mem_1"
+        ]
         assert result.composed_context.selected_memory_ids == ["mem_1"]
         assert result.retrieval_sufficiency is not None
         assert result.retrieval_sufficiency.state == "retrieval_sufficient"
@@ -577,6 +756,41 @@ async def test_pipeline_executes_full_flow() -> None:
         assert result.candidate_custody[0]["score_status"] == "scored"
         assert result.candidate_custody[0]["composer_decision"] == "selected"
         assert result.candidate_custody[0]["matched_subquery_indexes"] == [0]
+        assert trace.facet_support is not None
+        assert [
+            obligation.status for obligation in trace.facet_support.obligations
+        ] == [
+            "covered",
+            "missing",
+        ]
+        assert trace.direct_vs_indirect_provenance is not None
+        assert trace.direct_vs_indirect_provenance.direct_recovery_count == 1
+        assert trace.direct_vs_indirect_provenance.evidence[0].proof_source == (
+            "base_canonical"
+        )
+        assert trace.token_budget is not None
+        assert (
+            trace.token_budget.context_tokens
+            == result.composed_context.total_tokens_estimate
+        )
+        assert trace.cross_conversation_raw_policy is not None
+        assert trace.cross_conversation_raw_policy.enabled is False
+        assert trace.custody.raw_candidate_count == 1
+        assert trace.custody.post_user_id_candidate_count == 1
+        assert trace.custody.post_scope_coordinate_lifecycle_candidate_count == 1
+        assert trace.custody.scored_candidate_count == 1
+        assert trace.custody.selected_candidate_count == 1
+        assert trace.custody.candidate_count_by_channel == {"fts": 1}
+        assert trace.custody.source_backed_candidate_count == 1
+        assert trace.custody.summary_only_candidate_count == 0
+        assert trace.custody.selected_evidence_ids == ["mem_1"]
+        assert trace.custody.selected_source_evidence_count == 1
+        assert trace.custody.selected_summary_count == 0
+        assert trace.custody.rendered_evidence_ids == ["mem_1"]
+        assert trace.custody.candidate_found_but_not_selected == []
+        assert trace.custody.funnel_coverage_state == "complete"
+        assert trace.runtime_diagnostics.stage_timings_ms["candidate_search"] >= 0.0
+        assert trace.runtime_diagnostics.hydration_timings_ms["contract_lookup"] >= 0.0
         assert {
             "need_detection",
             "planning",
@@ -593,7 +807,132 @@ async def test_pipeline_executes_full_flow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_expands_broad_list_candidates_from_retrieved_source_message() -> None:
+async def test_pipeline_promotes_summary_source_window_for_privacy_off_benchmark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from atagia.core.repositories import MessageRepository
+
+    message_text = "What does Jon plan to do at the grand opening?"
+    source_window_id = "ssw_sum_grand_opening_277_283"
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": [message_text],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": message_text,
+                    "fts_phrase": "grand opening plan",
+                }
+            ],
+            "query_type": "slot_fill",
+            "retrieval_levels": [0, 1],
+        },
+        score_map={
+            "sum_grand_opening": 0.72,
+            source_window_id: 0.96,
+        },
+    )
+    (
+        connection,
+        _memories,
+        _contracts,
+        pipeline,
+        provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
+        mode_id="general_qa",
+        provider=provider,
+    )
+    try:
+        clock = FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc))
+        messages = MessageRepository(connection, clock)
+        for seq, role, text in [
+            (275, "assistant", "Jon: I need to sort out permits first."),
+            (276, "user", "Gina: The lease papers finally cleared."),
+            (277, "assistant", "Jon: Still working on opening a dance studio."),
+            (278, "user", "Gina: When are you opening the studio?"),
+            (279, "assistant", "Jon: The official opening night is tomorrow."),
+            (280, "user", "Gina: Congrats, Jon! The studio looks amazing."),
+            (281, "assistant", "Jon: Thanks, Gina! I'm excited!"),
+            (282, "user", "Gina: Take some time to savor it."),
+            (283, "assistant", "Jon: I want to savor all the good vibes."),
+        ]:
+            await messages.create_message(
+                message_id=f"msg_{seq}",
+                conversation_id="cnv_1",
+                role=role,
+                seq=seq,
+                text=text,
+                occurred_at="2023-06-19T10:04:00+00:00",
+            )
+
+        candidates = [
+            _candidate_record(
+                memory_id="sum_grand_opening",
+                canonical_text="Jon and Gina discussed the dance studio grand opening.",
+                object_type=MemoryObjectType.SUMMARY_VIEW,
+                rrf_score=1.0,
+                payload_json={
+                    "summary_kind": "conversation_chunk",
+                    "hierarchy_level": 0,
+                    "source_message_ids": [
+                        "msg_275",
+                        "msg_276",
+                        "msg_277",
+                        "msg_278",
+                        "msg_279",
+                        "msg_280",
+                        "msg_281",
+                        "msg_282",
+                        "msg_283",
+                    ],
+                },
+            )
+        ]
+
+        async def fake_search(
+            _plan: RetrievalPlan,
+            _user_id: str,
+            **_kwargs: object,
+        ) -> list[dict[str, object]]:
+            return candidates
+
+        monkeypatch.setattr(pipeline._candidate_search, "search", fake_search)
+
+        result = await pipeline.execute(
+            message_text=message_text,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": message_text}],
+            ablation=AblationConfig(privacy_enforcement="off"),
+        )
+
+        scored_ids = [candidate.memory_id for candidate in result.scored_candidates]
+        assert source_window_id in scored_ids
+        assert source_window_id in _score_request_memory_ids(provider)
+        source_window = next(
+            candidate
+            for candidate in result.scored_candidates
+            if candidate.memory_id == source_window_id
+        )
+        assert source_window.memory_object["source_kind"] == "verbatim"
+        assert (
+            source_window.memory_object["payload_json"]["source_kind_variant"]
+            == "summary_source_window"
+        )
+        assert "savor all the good vibes" in source_window.memory_object["canonical_text"]
+        assert source_window_id in result.composed_context.selected_memory_ids
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_expands_broad_list_candidates_from_retrieved_source_message() -> (
+    None
+):
     message_text = "Which details were part of the campaign?"
     provider = PipelineProvider(
         need_response={
@@ -614,9 +953,15 @@ async def test_pipeline_expands_broad_list_candidates_from_retrieved_source_mess
             "mem_source_sibling": 0.91,
         },
     )
-    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
-        provider=provider
-    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         source_payload = {"source_message_ids": ["msg_campaign"]}
         await memories.create_memory_object(
@@ -659,7 +1004,9 @@ async def test_pipeline_expands_broad_list_candidates_from_retrieved_source_mess
         raw_ids = [candidate["id"] for candidate in result.raw_candidates]
         assert raw_ids == ["mem_matched", "mem_source_sibling"]
         sibling = next(
-            candidate for candidate in result.raw_candidates if candidate["id"] == "mem_source_sibling"
+            candidate
+            for candidate in result.raw_candidates
+            if candidate["id"] == "mem_source_sibling"
         )
         assert sibling["retrieval_sources"] == ["source_neighbor"]
         assert sibling["coverage_source_message_id"] == "msg_campaign"
@@ -700,9 +1047,15 @@ async def test_llm_coverage_expansion_is_default_off() -> None:
         },
         score_map={"mem_rollout": 0.82, "mem_visual": 0.95},
     )
-    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
-        provider=provider
-    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await _seed_memory(
             memories,
@@ -725,7 +1078,9 @@ async def test_llm_coverage_expansion_is_default_off() -> None:
             conversation_messages=[{"role": "user", "text": message_text}],
         )
 
-        assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_rollout"]
+        assert [candidate["id"] for candidate in result.raw_candidates] == [
+            "mem_rollout"
+        ]
         assert "coverage_expansion" not in {
             str(request.metadata.get("purpose")) for request in provider.requests
         }
@@ -765,9 +1120,15 @@ async def test_pipeline_adds_llm_coverage_expansion_candidates_when_enabled() ->
         },
         score_map={"mem_rollout": 0.82, "mem_visual": 0.95},
     )
-    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
-        provider=provider
-    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await _seed_memory(
             memories,
@@ -794,22 +1155,31 @@ async def test_pipeline_adds_llm_coverage_expansion_candidates_when_enabled() ->
         raw_ids = [candidate["id"] for candidate in result.raw_candidates]
         assert raw_ids == ["mem_rollout", "mem_visual"]
         visual_candidate = next(
-            candidate for candidate in result.raw_candidates if candidate["id"] == "mem_visual"
+            candidate
+            for candidate in result.raw_candidates
+            if candidate["id"] == "mem_visual"
         )
         assert "llm_coverage_expansion" in visual_candidate["retrieval_sources"]
-        assert visual_candidate["coverage_expansion_sub_queries"] == ["red hoodie video frame"]
+        assert visual_candidate["coverage_expansion_sub_queries"] == [
+            "red hoodie video frame"
+        ]
         assert "mem_visual" in _score_request_memory_ids(provider)
         assert "coverage_expansion" in {
             str(request.metadata.get("purpose")) for request in provider.requests
         }
         assert result.stage_timings["llm_coverage_expansion"] >= 0.0
-        assert result.stage_timings["candidate_search"] >= result.stage_timings["llm_coverage_expansion"]
+        assert (
+            result.stage_timings["candidate_search"]
+            >= result.stage_timings["llm_coverage_expansion"]
+        )
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_pipeline_filters_intimacy_boundary_during_source_message_expansion() -> None:
+async def test_pipeline_filters_intimacy_boundary_during_source_message_expansion() -> (
+    None
+):
     message_text = "Which details were part of the campaign?"
     provider = PipelineProvider(
         need_response={
@@ -827,9 +1197,15 @@ async def test_pipeline_filters_intimacy_boundary_during_source_message_expansio
         },
         score_map={"mem_matched": 0.72, "mem_private_sibling": 0.99},
     )
-    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
-        provider=provider
-    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         source_payload = {"source_message_ids": ["msg_campaign"]}
         await memories.create_memory_object(
@@ -871,16 +1247,28 @@ async def test_pipeline_filters_intimacy_boundary_during_source_message_expansio
             conversation_messages=[{"role": "user", "text": message_text}],
         )
 
-        assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_matched"]
+        assert [candidate["id"] for candidate in result.raw_candidates] == [
+            "mem_matched"
+        ]
         assert "mem_private_sibling" not in _score_request_memory_ids(provider)
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_privacy_enforcement_off_reaches_composer_for_restricted_candidates() -> None:
+async def test_privacy_enforcement_off_reaches_composer_for_restricted_candidates() -> (
+    None
+):
     provider = PipelineProvider(score_map={"mem_restricted_budget": 0.99})
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
     )
     try:
@@ -929,9 +1317,12 @@ async def test_privacy_enforcement_off_reaches_composer_for_restricted_candidate
         }
         assert "mem_restricted_budget" in result.composed_context.selected_memory_ids
         assert "$2,800" in result.composed_context.memory_block
-        assert trace.policy_filter_audit["would_filter_by_candidate_id"][
-            "mem_restricted_budget"
-        ] == "policy_filtered_sensitivity"
+        assert (
+            trace.policy_filter_audit["would_filter_by_candidate_id"][
+                "mem_restricted_budget"
+            ]
+            == "policy_filtered_sensitivity"
+        )
         assert (
             trace.policy_filter_audit["high_risk_secret_literal_redaction_enforced"]
             is False
@@ -949,7 +1340,15 @@ async def test_privacy_enforcement_off_includes_review_and_pending_statuses() ->
             "mem_declined": 1.0,
         }
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
     )
     try:
@@ -1020,7 +1419,9 @@ async def test_privacy_enforcement_off_includes_review_and_pending_statuses() ->
 
 
 @pytest.mark.asyncio
-async def test_privacy_enforcement_off_can_search_cross_conversation_chat_memory() -> None:
+async def test_privacy_enforcement_off_can_search_cross_conversation_chat_memory() -> (
+    None
+):
     provider = PipelineProvider(
         need_response={
             "needs": [],
@@ -1037,7 +1438,15 @@ async def test_privacy_enforcement_off_can_search_cross_conversation_chat_memory
         },
         score_map={"mem_cross_chat_secret": 0.99},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
     )
     conversations = ConversationRepository(
@@ -1096,14 +1505,18 @@ async def test_privacy_enforcement_off_can_search_cross_conversation_chat_memory
         assert "mem_cross_chat_secret" in {
             candidate["id"] for candidate in diagnostic.raw_candidates
         }
-        assert "mem_cross_chat_secret" in diagnostic.composed_context.selected_memory_ids
+        assert (
+            "mem_cross_chat_secret" in diagnostic.composed_context.selected_memory_ids
+        )
         assert "Dr. Reeves" in diagnostic.composed_context.memory_block
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_privacy_enforcement_off_disables_high_risk_redaction_in_context() -> None:
+async def test_privacy_enforcement_off_disables_high_risk_redaction_in_context() -> (
+    None
+):
     provider = PipelineProvider(
         need_response={
             "needs": [],
@@ -1165,7 +1578,7 @@ async def test_privacy_enforcement_off_disables_high_risk_redaction_in_context()
         assert "The deployment PIN is 1234." in result.composed_context.memory_block
         assert "raw value withheld" not in result.composed_context.memory_block
         assert (
-            "benchmark_disclosure: high_risk_secret_literal_unredacted"
+            "privacy_restrictions_inactive: high_risk_secret_literal_unredacted"
             in result.composed_context.memory_block
         )
     finally:
@@ -1185,7 +1598,15 @@ async def test_pipeline_forwards_budgeted_composer_strategy(
 
     monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
     provider = PipelineProvider(score_map={"mem_1": 0.91})
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await _seed_memory(
             memories,
@@ -1200,10 +1621,359 @@ async def test_pipeline_forwards_budgeted_composer_strategy(
             resolved_policy=resolved_policy,
             cold_start=False,
             ablation=AblationConfig(composer_strategy="budgeted_marginal"),
-            conversation_messages=[{"role": "user", "text": "retry loop websocket backoff"}],
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"}
+            ],
         )
 
         assert observed_strategies == ["budgeted_marginal"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_forwards_evidence_obligation_composer_ablation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_flags: list[bool | None] = []
+    original_compose = ContextComposer.compose
+
+    def _capture_compose(self: ContextComposer, *args, **kwargs):
+        observed_flags.append(kwargs.get("enable_evidence_obligation_coverage"))
+        return original_compose(self, *args, **kwargs)
+
+    monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
+    provider = PipelineProvider(score_map={"mem_1": 0.91})
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(enable_evidence_obligation_coverage=True),
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"}
+            ],
+        )
+
+        assert observed_flags == [True]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_forwards_answer_coverage_shape_to_composer_and_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_shape_kwargs: list[tuple[str | None, str | None, str | None]] = []
+    original_compose = ContextComposer.compose
+
+    def _capture_compose(self: ContextComposer, *args, **kwargs):
+        observed_shape_kwargs.append(
+            (
+                kwargs.get("answer_shape"),
+                kwargs.get("coverage_mode"),
+                kwargs.get("source_precision"),
+            )
+        )
+        return original_compose(self, *args, **kwargs)
+
+    monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["Which cities did Caroline mention?"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "Which cities did Caroline mention?",
+                    "fts_phrase": "cities Caroline mention",
+                    "must_keep_terms": ["Caroline", "cities"],
+                }
+            ],
+            "query_type": "broad_list",
+            "retrieval_levels": [0],
+        },
+        score_map={"mem_1": 0.91},
+    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="Caroline mentioned the cities Paris and Rome.",
+            scope=MemoryScope.CONVERSATION,
+        )
+        trace = RetrievalTrace(
+            query_text="Which cities did Caroline mention?",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-05T12:00:00+00:00",
+        )
+
+        result = await pipeline.execute(
+            message_text="Which cities did Caroline mention?",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(applicability_gate_mode="shadow"),
+            conversation_messages=[
+                {"role": "user", "text": "Which cities did Caroline mention?"}
+            ],
+            trace=trace,
+        )
+
+        assert observed_shape_kwargs == [
+            ("list", "exhaustive_known_set", "required")
+        ]
+        assert result.retrieval_plan.answer_shape == "list"
+        assert result.retrieval_plan.coverage_mode == "exhaustive_known_set"
+        assert result.retrieval_plan.source_precision == "required"
+        assert result.composed_context.answer_shape == "list"
+        assert result.composed_context.coverage_mode == "exhaustive_known_set"
+        assert result.composed_context.source_precision == "required"
+        assert trace.need_detection is not None
+        assert trace.need_detection.answer_shape == "list"
+        assert trace.need_detection.coverage_mode == "exhaustive_known_set"
+        assert trace.need_detection.source_precision == "required"
+        assert trace.composition is not None
+        assert trace.composition.answer_shape == "list"
+        assert trace.composition.coverage_mode == "exhaustive_known_set"
+        assert trace.composition.source_precision == "required"
+        assert trace.scoring is not None
+        assert trace.scoring.applicability_gate_mode == "shadow"
+        assert trace.scoring.eligible_candidate_count == 0
+        assert trace.scoring.ineligible_reason_counts == {
+            "missing_direct_source_support": 1
+        }
+        assert trace.scoring.estimated_calls_saved == 0
+        assert trace.scoring.adjacent_rrf_delta_distribution["count"] == 0.0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_hydrates_evidence_packets_only_when_ablation_enabled() -> None:
+    from atagia.core.repositories import MessageRepository
+
+    provider = PipelineProvider(score_map={"mem_gina": 0.95})
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
+        mode_id="general_qa",
+        provider=provider,
+    )
+    try:
+        clock = FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc))
+        messages = MessageRepository(connection, clock)
+        await messages.create_message(
+            message_id="msg_source",
+            conversation_id="cnv_1",
+            role="user",
+            seq=None,
+            text="Gina: Contemporary dance really speaks to me.",
+            occurred_at="2023-01-20T16:04:00+00:00",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="general_qa",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Gina's favorite dance style is contemporary.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            payload={"source_message_ids": ["msg_source"]},
+            memory_id="mem_gina",
+        )
+        await MemoryEvidenceRepository(connection, clock).create_support_edge_with_spans(
+            user_id="usr_1",
+            memory_id="mem_gina",
+            support_kind="contextual_direct",
+            evidence_polarity="supports",
+            speaker_relation_to_subject="self_report",
+            confidence=0.91,
+            spans=[
+                {
+                    "span_role": "source",
+                    "message_id": "msg_source",
+                    "quote_text": "Contemporary dance really speaks to me.",
+                }
+            ],
+        )
+
+        default_packets = await pipeline.execute(
+            message_text="What is Gina's favorite style of dance?",
+            conversation_context=context.model_copy(
+                update={"assistant_mode_id": "general_qa"}
+            ),
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "What is Gina's favorite style of dance?"}
+            ],
+        )
+        without_packets = await pipeline.execute(
+            message_text="What is Gina's favorite style of dance?",
+            conversation_context=context.model_copy(
+                update={"assistant_mode_id": "general_qa"}
+            ),
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(enable_evidence_packets=False),
+            conversation_messages=[
+                {"role": "user", "text": "What is Gina's favorite style of dance?"}
+            ],
+        )
+
+        assert "evidence_packet:" not in without_packets.composed_context.memory_block
+        assert "evidence_packet: support: contextual_direct" in default_packets.composed_context.memory_block
+        assert "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 1: Contemporary dance really speaks to me." in default_packets.composed_context.memory_block
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_applies_structural_context_envelope_budget_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_budgets: list[int] = []
+    original_compose = ContextComposer.compose
+
+    def _capture_compose(self: ContextComposer, *args, **kwargs):
+        observed_policy = kwargs["resolved_policy"]
+        observed_budgets.append(observed_policy.context_budget_tokens)
+        return original_compose(self, *args, **kwargs)
+
+    monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
+    provider = PipelineProvider(score_map={"mem_1": 0.91})
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"}
+            ],
+        )
+
+        assert observed_budgets == [2_744]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_applies_context_envelope_budget_to_composer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_budgets: list[int] = []
+    observed_final_items: list[int] = []
+    original_compose = ContextComposer.compose
+
+    def _capture_compose(self: ContextComposer, *args, **kwargs):
+        observed_policy = kwargs["resolved_policy"]
+        observed_budgets.append(observed_policy.context_budget_tokens)
+        observed_final_items.append(
+            observed_policy.retrieval_params.final_context_items
+        )
+        return original_compose(self, *args, **kwargs)
+
+    monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
+    provider = PipelineProvider(score_map={"mem_1": 0.91})
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(
+                context_envelope_budget_tokens=10_000,
+                override_retrieval_params={"final_context_items": 3},
+            ),
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"}
+            ],
+        )
+
+        assert observed_budgets == [6_700]
+        assert observed_final_items == [3]
+        expanded_policy = resolved_policy.model_copy(
+            update={
+                "retrieval_params": resolved_policy.retrieval_params.model_copy(
+                    update={"final_context_items": 70}
+                )
+            }
+        )
+        capped_policy = RetrievalPipeline._cap_explicit_final_context_items(
+            expanded_policy,
+            AblationConfig(override_retrieval_params={"final_context_items": 20}),
+        )
+        assert capped_policy.retrieval_params.final_context_items == 20
     finally:
         await connection.close()
 
@@ -1221,7 +1991,15 @@ async def test_pipeline_small_corpus_forwards_budgeted_composer_strategy(
 
     monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
     provider = PipelineProvider(score_map={"mem_1": 0.91})
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=1.0),
     )
@@ -1239,7 +2017,9 @@ async def test_pipeline_small_corpus_forwards_budgeted_composer_strategy(
             resolved_policy=resolved_policy,
             cold_start=False,
             ablation=AblationConfig(composer_strategy="budgeted_marginal"),
-            conversation_messages=[{"role": "user", "text": "retry loop websocket backoff"}],
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"}
+            ],
         )
 
         assert observed_strategies == ["budgeted_marginal"]
@@ -1254,7 +2034,15 @@ async def test_pipeline_retries_partial_applicability_scores_without_crashing() 
         "mem_missing_first",
         score_map={"mem_present": 0.7, "mem_missing_first": 0.86},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await _seed_memory(
             memories,
@@ -1293,13 +2081,23 @@ async def test_pipeline_retries_partial_applicability_scores_without_crashing() 
 
 
 @pytest.mark.asyncio
-async def test_pipeline_retries_malformed_applicability_scores_without_crashing() -> None:
+async def test_pipeline_retries_malformed_applicability_scores_without_crashing() -> (
+    None
+):
     message_text = "retry loop websocket backoff"
     provider = MalformedFirstApplicabilityScoreProvider(
         "mem_malformed_first",
         score_map={"mem_present": 0.7, "mem_malformed_first": 0.86},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await _seed_memory(
             memories,
@@ -1343,7 +2141,15 @@ async def test_pipeline_retries_invalid_applicability_scores_without_crashing() 
     provider = InvalidFirstApplicabilityScoreProvider(
         score_map={"mem_present": 0.7, "mem_retry": 0.86},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await _seed_memory(
             memories,
@@ -1374,7 +2180,9 @@ async def test_pipeline_retries_invalid_applicability_scores_without_crashing() 
             if str(request.metadata.get("purpose")) == "applicability_scoring"
         ]
         assert len(scoring_requests) == 2
-        assert set(_MEMORY_ID_PATTERN.findall(scoring_requests[1].messages[1].content)) == {
+        assert set(
+            _MEMORY_ID_PATTERN.findall(scoring_requests[1].messages[1].content)
+        ) == {
             "mem_present",
             "mem_retry",
         }
@@ -1383,10 +2191,22 @@ async def test_pipeline_retries_invalid_applicability_scores_without_crashing() 
 
 
 @pytest.mark.asyncio
-async def test_pipeline_excludes_pending_and_declined_candidates_before_scoring() -> None:
+async def test_pipeline_excludes_pending_and_declined_candidates_before_scoring() -> (
+    None
+):
     message_text = "retry loop websocket backoff"
-    provider = PipelineProvider(score_map={"mem_active": 0.9, "mem_pending": 0.99, "mem_declined": 0.99})
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    provider = PipelineProvider(
+        score_map={"mem_active": 0.9, "mem_pending": 0.99, "mem_declined": 0.99}
+    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await _seed_memory(
             memories,
@@ -1418,19 +2238,38 @@ async def test_pipeline_excludes_pending_and_declined_candidates_before_scoring(
             conversation_messages=[{"role": "user", "text": message_text}],
         )
 
-        assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_active"]
-        assert [candidate.memory_id for candidate in result.scored_candidates] == ["mem_active"]
+        assert [candidate["id"] for candidate in result.raw_candidates] == [
+            "mem_active"
+        ]
+        assert [candidate.memory_id for candidate in result.scored_candidates] == [
+            "mem_active"
+        ]
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_pipeline_skip_need_detection_returns_empty_needs_without_llm_call() -> None:
+async def test_pipeline_skip_need_detection_returns_empty_needs_without_llm_call() -> (
+    None
+):
     message_text = "retry loop websocket backoff"
     provider = PipelineProvider(score_map={"mem_1": 0.88})
-    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(provider=provider)
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
-        await _seed_memory(memories, memory_id="mem_1", canonical_text="retry loop websocket backoff", scope=MemoryScope.CONVERSATION)
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+        )
 
         result = await pipeline.execute(
             message_text=message_text,
@@ -1443,8 +2282,13 @@ async def test_pipeline_skip_need_detection_returns_empty_needs_without_llm_call
 
         assert result.detected_needs == []
         assert result.retrieval_plan.query_type == "default"
-        assert [sub_query.text for sub_query in result.retrieval_plan.sub_query_plans] == [message_text]
-        assert not any(request.metadata.get("purpose") == "need_detection" for request in provider.requests)
+        assert [
+            sub_query.text for sub_query in result.retrieval_plan.sub_query_plans
+        ] == [message_text]
+        assert not any(
+            request.metadata.get("purpose") == "need_detection"
+            for request in provider.requests
+        )
     finally:
         await connection.close()
 
@@ -1469,7 +2313,15 @@ async def test_pipeline_normalizes_callback_hint_anchor_before_planning() -> Non
         },
         score_map={"mem_1": 0.87},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await _seed_memory(
             memories,
@@ -1487,7 +2339,9 @@ async def test_pipeline_normalizes_callback_hint_anchor_before_planning() -> Non
         )
 
         assert result.retrieval_plan.callback_bias is True
-        assert result.retrieval_plan.sub_query_plans[0].quoted_phrases == ["citrus marinade"]
+        assert result.retrieval_plan.sub_query_plans[0].quoted_phrases == [
+            "citrus marinade"
+        ]
         assert result.composed_context.selected_memory_ids == ["mem_1"]
     finally:
         await connection.close()
@@ -1497,9 +2351,22 @@ async def test_pipeline_normalizes_callback_hint_anchor_before_planning() -> Non
 async def test_pipeline_skip_applicability_scoring_uses_raw_scores() -> None:
     message_text = "retry loop websocket backoff"
     provider = PipelineProvider()
-    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(provider=provider)
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
-        await _seed_memory(memories, memory_id="mem_1", canonical_text="retry loop websocket backoff", scope=MemoryScope.CONVERSATION)
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+        )
 
         result = await pipeline.execute(
             message_text=message_text,
@@ -1510,8 +2377,13 @@ async def test_pipeline_skip_applicability_scoring_uses_raw_scores() -> None:
             conversation_messages=[{"role": "user", "text": message_text}],
         )
 
-        assert result.scored_candidates[0].final_score == pytest.approx(result.scored_candidates[0].retrieval_score)
-        assert not any(request.metadata.get("purpose") == "applicability_scoring" for request in provider.requests)
+        assert result.scored_candidates[0].final_score == pytest.approx(
+            result.scored_candidates[0].retrieval_score
+        )
+        assert not any(
+            request.metadata.get("purpose") == "applicability_scoring"
+            for request in provider.requests
+        )
     finally:
         await connection.close()
 
@@ -1520,7 +2392,15 @@ async def test_pipeline_skip_applicability_scoring_uses_raw_scores() -> None:
 async def test_pipeline_skip_contract_memory_clears_contract_block() -> None:
     message_text = "retry loop websocket backoff"
     provider = PipelineProvider(score_map={"mem_1": 0.9})
-    connection, memories, contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    (
+        connection,
+        memories,
+        contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         source_memory = await _seed_memory(
             memories,
@@ -1540,7 +2420,12 @@ async def test_pipeline_skip_contract_memory_clears_contract_block() -> None:
             confidence=0.9,
             source_memory_id=str(source_memory["id"]),
         )
-        await _seed_memory(memories, memory_id="mem_1", canonical_text="retry loop websocket backoff", scope=MemoryScope.CONVERSATION)
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+        )
 
         result = await pipeline.execute(
             message_text=message_text,
@@ -1560,14 +2445,24 @@ async def test_pipeline_skip_contract_memory_clears_contract_block() -> None:
 @pytest.mark.asyncio
 async def test_pipeline_force_all_scopes_overrides_scope_filter() -> None:
     provider = PipelineProvider()
-    connection, _memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        _memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         mode_id="general_qa",
         provider=provider,
     )
     try:
         result = await pipeline.execute(
             message_text="What should I do next?",
-            conversation_context=context.model_copy(update={"assistant_mode_id": "general_qa"}),
+            conversation_context=context.model_copy(
+                update={"assistant_mode_id": "general_qa"}
+            ),
             resolved_policy=resolved_policy,
             cold_start=False,
             ablation=AblationConfig(force_all_scopes=True),
@@ -1581,8 +2476,18 @@ async def test_pipeline_force_all_scopes_overrides_scope_filter() -> None:
 
 @pytest.mark.asyncio
 async def test_pipeline_resolves_character_rollup_with_namespace_gates() -> None:
-    connection, _memories, _contracts, pipeline, _provider, _resolved_policy, context = await _build_runtime()
-    summaries = SummaryRepository(connection, FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+    (
+        connection,
+        _memories,
+        _contracts,
+        pipeline,
+        _provider,
+        _resolved_policy,
+        context,
+    ) = await _build_runtime()
+    summaries = SummaryRepository(
+        connection, FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc))
+    )
     try:
         await summaries.create_summary(
             "usr_1",
@@ -1628,7 +2533,9 @@ async def test_pipeline_resolves_character_rollup_with_namespace_gates() -> None
             ablation=AblationConfig(),
         )
         other_platform_row = await pipeline._resolve_workspace_rollup(  # noqa: SLF001
-            conversation_context=gated_context.model_copy(update={"platform_id": "mobile"}),
+            conversation_context=gated_context.model_copy(
+                update={"platform_id": "mobile"}
+            ),
             retrieval_plan=plan.model_copy(update={"platform_id": "mobile"}),
             workspace_rollup=None,
             ablation=AblationConfig(),
@@ -1642,7 +2549,9 @@ async def test_pipeline_resolves_character_rollup_with_namespace_gates() -> None
 
 
 @pytest.mark.asyncio
-async def test_pipeline_high_stakes_filters_derived_memory_and_workspace_rollup() -> None:
+async def test_pipeline_high_stakes_filters_derived_memory_and_workspace_rollup() -> (
+    None
+):
     message_text = "database migration rollback safety"
     provider = PipelineProvider(
         need_response={
@@ -1670,7 +2579,15 @@ async def test_pipeline_high_stakes_filters_derived_memory_and_workspace_rollup(
         },
         score_map={"mem_belief": 0.99, "mem_evidence": 0.51},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(provider=provider)
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await _seed_memory(
             memories,
@@ -1692,21 +2609,26 @@ async def test_pipeline_high_stakes_filters_derived_memory_and_workspace_rollup(
             conversation_context=context,
             resolved_policy=resolved_policy,
             cold_start=False,
-            workspace_rollup={"summary_text": "Derived workspace rollup that should be suppressed."},
+            workspace_rollup={
+                "summary_text": "Derived workspace rollup that should be suppressed."
+            },
             conversation_messages=[{"role": "user", "text": message_text}],
         )
 
         assert result.retrieval_plan.require_evidence_regrounding is True
         assert result.retrieval_plan.query_type == "broad_list"
         assert len(result.retrieval_plan.sub_query_plans) == 2
-        assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_evidence"]
-        assert [candidate.memory_id for candidate in result.scored_candidates] == ["mem_evidence"]
+        assert [candidate["id"] for candidate in result.raw_candidates] == [
+            "mem_evidence"
+        ]
+        assert [candidate.memory_id for candidate in result.scored_candidates] == [
+            "mem_evidence"
+        ]
         assert result.composed_context.selected_memory_ids == ["mem_evidence"]
         assert result.composed_context.workspace_block == ""
         assert "mem_belief" not in result.composed_context.memory_block
         custody_by_id = {
-            record["candidate_id"]: record
-            for record in result.candidate_custody
+            record["candidate_id"]: record for record in result.candidate_custody
         }
         assert custody_by_id["mem_belief"]["filter_reason"] == "regrounding_filtered"
         assert custody_by_id["mem_belief"]["score_status"] == "filtered_before_scoring"
@@ -1723,7 +2645,15 @@ async def test_pipeline_high_stakes_filters_derived_memory_and_workspace_rollup(
 @pytest.mark.asyncio
 async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None:
     provider = PipelineProvider()
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.7),
     )
@@ -1755,7 +2685,8 @@ async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None
         assert result.degraded_mode is False
         assert result.detected_needs == []
         assert any(
-            request.metadata.get("purpose") == "need_detection" for request in provider.requests
+            request.metadata.get("purpose") == "need_detection"
+            for request in provider.requests
         )
         assert any(
             request.metadata.get("purpose") == "applicability_scoring"
@@ -1763,18 +2694,19 @@ async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None
         )
         returned_ids = {candidate["id"] for candidate in result.raw_candidates}
         assert returned_ids == {"mem_conv", "mem_user"}
-        assert set(result.composed_context.selected_memory_ids) == {"mem_conv", "mem_user"}
+        assert set(result.composed_context.selected_memory_ids) == {
+            "mem_conv",
+            "mem_user",
+        }
         assert result.retrieval_sufficiency is not None
         assert result.retrieval_sufficiency.state == "retrieval_sufficient"
         assert result.retrieval_sufficiency.scored_candidate_count == 2
         custody_by_id = {
-            record["candidate_id"]: record
-            for record in result.candidate_custody
+            record["candidate_id"]: record for record in result.candidate_custody
         }
         assert set(custody_by_id) == {"mem_conv", "mem_user"}
         assert all(
-            record["score_status"] == "scored"
-            for record in custody_by_id.values()
+            record["score_status"] == "scored" for record in custody_by_id.values()
         )
         assert result.stage_timings["need_detection"] >= 0.0
         assert result.stage_timings["candidate_search"] >= 0.0
@@ -1787,10 +2719,22 @@ async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None
     ("active_space_id", "boundary_mode", "expected_ids"),
     [
         (None, None, {"mem_unscoped", "mem_focus", "mem_tagged"}),
-        ("space_focus", SpaceBoundaryMode.FOCUS, {"mem_unscoped", "mem_focus", "mem_tagged"}),
-        ("space_vault", SpaceBoundaryMode.PRIVACY_VAULT, {"mem_unscoped", "mem_vault", "mem_tagged"}),
+        (
+            "space_focus",
+            SpaceBoundaryMode.FOCUS,
+            {"mem_unscoped", "mem_focus", "mem_tagged"},
+        ),
+        (
+            "space_vault",
+            SpaceBoundaryMode.PRIVACY_VAULT,
+            {"mem_unscoped", "mem_vault", "mem_tagged"},
+        ),
         ("space_severed", SpaceBoundaryMode.SEVERANCE, {"mem_severed"}),
-        ("space_tagged", SpaceBoundaryMode.TAGGED, {"mem_unscoped", "mem_focus", "mem_tagged"}),
+        (
+            "space_tagged",
+            SpaceBoundaryMode.TAGGED,
+            {"mem_unscoped", "mem_focus", "mem_tagged"},
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -1800,7 +2744,15 @@ async def test_pipeline_small_corpus_shortcut_enforces_space_boundaries(
     expected_ids: set[str],
 ) -> None:
     provider = PipelineProvider()
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.7),
     )
@@ -1871,7 +2823,15 @@ async def test_pipeline_small_corpus_shortcut_enforces_space_boundaries(
 @pytest.mark.asyncio
 async def test_pipeline_small_corpus_shortcut_composes_all_eligible_memories() -> None:
     provider = PipelineProvider()
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.7),
     )
@@ -1906,7 +2866,15 @@ async def test_pipeline_small_corpus_shortcut_composes_all_eligible_memories() -
 @pytest.mark.asyncio
 async def test_pipeline_small_corpus_shortcut_sets_trace_flag() -> None:
     provider = PipelineProvider()
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.7),
     )
@@ -1916,6 +2884,7 @@ async def test_pipeline_small_corpus_shortcut_sets_trace_flag() -> None:
             memory_id="mem_1",
             canonical_text="retry loop websocket backoff",
             scope=MemoryScope.CONVERSATION,
+            language_codes=["en"],
         )
         trace = RetrievalTrace(
             query_text="retry loop websocket backoff",
@@ -1940,6 +2909,16 @@ async def test_pipeline_small_corpus_shortcut_sets_trace_flag() -> None:
         assert trace.degraded_mode is False
         assert trace.need_detection is not None
         assert trace.need_detection.degraded_mode is False
+        assert [
+            row.model_dump(mode="json")
+            for row in trace.need_detection.content_language_profile
+        ] == [
+            {
+                "language_code": "en",
+                "memory_count": 1,
+                "last_seen_at": "2026-04-05T12:00:00+00:00",
+            }
+        ]
         assert trace.need_detection.duration_ms >= 0.0
         assert trace.candidate_search is not None
         assert trace.candidate_search.total_after_fusion == 1
@@ -1952,7 +2931,191 @@ async def test_pipeline_small_corpus_shortcut_sets_trace_flag() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_small_corpus_exact_recall_includes_verbatim_evidence_search_windows() -> None:
+async def test_pipeline_small_corpus_degraded_trace_preserves_language_profile() -> (
+    None
+):
+    provider = FailingPipelineProvider("need_detection")
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
+        provider=provider,
+        settings=_settings(small_corpus_token_threshold_ratio=0.7),
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+            language_codes=["en"],
+        )
+        trace = RetrievalTrace(
+            query_text="retry loop websocket backoff",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-09T12:00:00Z",
+        )
+
+        result = await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"},
+            ],
+            trace=trace,
+        )
+
+        assert result.small_corpus_mode is True
+        assert result.degraded_mode is True
+        assert trace.need_detection is not None
+        assert trace.need_detection.degraded_mode is True
+        assert [
+            row.model_dump(mode="json")
+            for row in trace.need_detection.content_language_profile
+        ] == [
+            {
+                "language_code": "en",
+                "memory_count": 1,
+                "last_seen_at": "2026-04-05T12:00:00+00:00",
+            }
+        ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_passes_user_communication_profile_to_need_detection_and_trace() -> (
+    None
+):
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["retry loop websocket backoff"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "retry loop websocket backoff",
+                    "fts_phrase": "retry loop websocket backoff",
+                }
+            ],
+            "query_language": "ca",
+            "answer_language": "es",
+            "query_type": "default",
+            "retrieval_levels": [0],
+        },
+        score_map={"mem_1": 0.9},
+    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
+        provider=provider,
+        settings=_settings(small_corpus_token_threshold_ratio=0.0),
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+            language_codes=["en"],
+        )
+        source_ref = LanguageProfileSourceRef(
+            source_kind="source_message",
+            conversation_id="cnv_1",
+            source_message_id="msg_lang",
+        )
+        await CommunicationProfileRepository(
+            connection,
+            FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)),
+        ).upsert_user_language_profile(
+            context,
+            UserCommunicationProfile(
+                observed_user_languages=[
+                    ObservedUserLanguage(
+                        language_code="ca",
+                        message_count=3,
+                        source_refs=[source_ref],
+                        confidence=0.85,
+                    )
+                ],
+                explicit_language_preferences=[
+                    ExplicitLanguagePreference(
+                        language_code="es",
+                        preference_kind="default_answer_language",
+                        context_label="ordinary_chat",
+                        source_refs=[source_ref],
+                        confidence=0.92,
+                    )
+                ],
+            ),
+            scope=MemoryScope.CHARACTER,
+        )
+        trace = RetrievalTrace(
+            query_text="retry loop websocket backoff",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-09T12:00:00Z",
+        )
+
+        result = await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"},
+            ],
+            trace=trace,
+        )
+
+        need_prompt = next(
+            request.messages[1].content
+            for request in provider.requests
+            if request.metadata.get("purpose") == "need_detection"
+        )
+        assert "<user_communication_profile>" in need_prompt
+        assert (
+            "observed_user_languages: ca: 3 observed user-authored messages"
+            in need_prompt
+        )
+        assert (
+            "explicit_language_preferences: es/default_answer_language/ordinary_chat"
+            in need_prompt
+        )
+        assert result.retrieval_plan.query_language == "ca"
+        assert result.retrieval_plan.answer_language == "es"
+        assert trace.need_detection is not None
+        assert trace.need_detection.user_communication_profile is not None
+        assert (
+            trace.need_detection.user_communication_profile.observed_language_codes
+            == ["ca"]
+        )
+        assert (
+            trace.need_detection.user_communication_profile.preference_language_codes
+            == ["es"]
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_small_corpus_exact_recall_includes_verbatim_evidence_search_windows() -> (
+    None
+):
     from atagia.core.repositories import MessageRepository
 
     provider = PipelineProvider(
@@ -1973,7 +3136,15 @@ async def test_pipeline_small_corpus_exact_recall_includes_verbatim_evidence_sea
             "raw_context_access_mode": "verbatim",
         },
     )
-    connection, _memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        _memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.7),
     )
@@ -2019,7 +3190,97 @@ async def test_pipeline_small_corpus_exact_recall_includes_verbatim_evidence_sea
 
 
 @pytest.mark.asyncio
-async def test_pipeline_backfills_source_quote_for_selected_memory_source_message() -> None:
+async def test_pipeline_hydrates_default_source_quote_for_selected_memory_source_message() -> (
+    None
+):
+    from atagia.core.repositories import MessageRepository
+
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["Nia cedar notebook"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "Nia cedar notebook",
+                    "fts_phrase": "Nia cedar notebook",
+                }
+            ],
+            "query_type": "default",
+            "retrieval_levels": [0],
+        },
+        score_map={"mem_notebook": 0.95},
+    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
+        mode_id="general_qa",
+        provider=provider,
+    )
+    try:
+        messages = MessageRepository(
+            connection,
+            FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)),
+        )
+        await messages.create_message(
+            message_id="msg_notebook_source",
+            conversation_id="cnv_1",
+            role="user",
+            seq=None,
+            text="Nia keeps the cedar notebook in her carry-on because it has the gate checklist.",
+            occurred_at="2026-02-02T15:45:00+00:00",
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="general_qa",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Nia keeps a cedar notebook with a gate checklist.",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            payload={"source_message_ids": ["msg_notebook_source"]},
+            memory_id="mem_notebook",
+        )
+
+        result = await pipeline.execute(
+            message_text="Why does Nia keep that notebook nearby?",
+            conversation_context=context.model_copy(
+                update={"assistant_mode_id": "general_qa"}
+            ),
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {
+                    "id": "msg_current",
+                    "conversation_id": "cnv_1",
+                    "role": "user",
+                    "text": "Why does Nia keep that notebook nearby?",
+                },
+            ],
+        )
+
+        assert "mem_notebook" in result.composed_context.selected_memory_ids
+        assert (
+            "source_quote: user @ 2026-02-02T15:45:00+00:00 seq 1: "
+            "Nia keeps the cedar notebook in her carry-on because it has the gate checklist."
+        ) in result.composed_context.memory_block
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_backfills_source_quote_for_selected_memory_source_message() -> (
+    None
+):
     from atagia.core.repositories import MessageRepository
 
     provider = PipelineProvider(
@@ -2040,7 +3301,15 @@ async def test_pipeline_backfills_source_quote_for_selected_memory_source_messag
         },
         score_map={"mem_job_loss": 0.95},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         mode_id="general_qa",
         provider=provider,
     )
@@ -2078,7 +3347,9 @@ async def test_pipeline_backfills_source_quote_for_selected_memory_source_messag
 
         result = await pipeline.execute(
             message_text="When did Jon lose his job as a banker?",
-            conversation_context=context.model_copy(update={"assistant_mode_id": "general_qa"}),
+            conversation_context=context.model_copy(
+                update={"assistant_mode_id": "general_qa"}
+            ),
             resolved_policy=resolved_policy,
             cold_start=False,
             conversation_messages=[
@@ -2087,13 +3358,18 @@ async def test_pipeline_backfills_source_quote_for_selected_memory_source_messag
         )
 
         assert "mem_job_loss" in result.composed_context.selected_memory_ids
-        assert "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 1: Jon: Lost my job as a banker yesterday" in result.composed_context.memory_block
+        assert (
+            "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 1: Jon: Lost my job as a banker yesterday"
+            in result.composed_context.memory_block
+        )
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_pipeline_does_not_backfill_source_quote_from_other_conversation() -> None:
+async def test_pipeline_does_not_backfill_source_quote_from_other_conversation() -> (
+    None
+):
     from atagia.core.repositories import MessageRepository
 
     provider = PipelineProvider(
@@ -2114,7 +3390,15 @@ async def test_pipeline_does_not_backfill_source_quote_from_other_conversation()
         },
         score_map={"mem_cross_chat_source": 0.95},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         mode_id="general_qa",
         provider=provider,
     )
@@ -2122,7 +3406,9 @@ async def test_pipeline_does_not_backfill_source_quote_from_other_conversation()
         clock = FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc))
         conversations = ConversationRepository(connection, clock)
         messages = MessageRepository(connection, clock)
-        await conversations.create_conversation("cnv_other", "usr_1", "wrk_1", "general_qa", "Other Chat")
+        await conversations.create_conversation(
+            "cnv_other", "usr_1", "wrk_1", "general_qa", "Other Chat"
+        )
         await messages.create_message(
             message_id="msg_other_source",
             conversation_id="cnv_other",
@@ -2152,7 +3438,9 @@ async def test_pipeline_does_not_backfill_source_quote_from_other_conversation()
 
         result = await pipeline.execute(
             message_text="When did Jon lose his job as a banker?",
-            conversation_context=context.model_copy(update={"assistant_mode_id": "general_qa"}),
+            conversation_context=context.model_copy(
+                update={"assistant_mode_id": "general_qa"}
+            ),
             resolved_policy=resolved_policy,
             cold_start=False,
             conversation_messages=[
@@ -2174,7 +3462,15 @@ async def test_pipeline_does_not_backfill_source_quote_from_other_conversation()
 @pytest.mark.asyncio
 async def test_pipeline_small_corpus_shortcut_enforces_privacy_ceiling() -> None:
     provider = PipelineProvider()
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.7),
     )
@@ -2229,9 +3525,19 @@ async def test_pipeline_small_corpus_shortcut_enforces_privacy_ceiling() -> None
 
 
 @pytest.mark.asyncio
-async def test_trusted_private_retrieval_bypasses_public_only_cold_start_and_small_corpus() -> None:
+async def test_trusted_private_retrieval_bypasses_public_only_cold_start_and_small_corpus() -> (
+    None
+):
     provider = PipelineProvider(score_map={"mem_private": 0.95})
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=1.0),
     )
@@ -2277,7 +3583,15 @@ async def test_trusted_private_retrieval_bypasses_public_only_cold_start_and_sma
 @pytest.mark.asyncio
 async def test_pipeline_small_corpus_shortcut_excludes_pending_memories() -> None:
     provider = PipelineProvider()
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.7),
     )
@@ -2321,7 +3635,9 @@ async def test_pipeline_small_corpus_shortcut_excludes_pending_memories() -> Non
 
 
 @pytest.mark.asyncio
-async def test_pipeline_exact_recall_composes_scored_candidates_up_to_rerank_budget() -> None:
+async def test_pipeline_exact_recall_composes_scored_candidates_up_to_rerank_budget() -> (
+    None
+):
     provider = PipelineProvider(
         need_response={
             "needs": [],
@@ -2339,7 +3655,15 @@ async def test_pipeline_exact_recall_composes_scored_candidates_up_to_rerank_bud
             "exact_facets": ["other_verbatim"],
         },
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.0),
     )
@@ -2374,9 +3698,110 @@ async def test_pipeline_exact_recall_composes_scored_candidates_up_to_rerank_bud
 
 
 @pytest.mark.asyncio
-async def test_pipeline_degraded_need_detection_composes_scored_candidates_for_recovery() -> None:
+async def test_pipeline_exact_recall_plan_exposes_anchor_only_fts_materialization() -> (
+    None
+):
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["service account for Falcon"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "service account for Falcon",
+                    "fts_phrase": "service account Falcon rotation owner",
+                    "must_keep_terms": ["Falcon", "SA42"],
+                }
+            ],
+            "query_type": "slot_fill",
+            "retrieval_levels": [0],
+            "exact_recall_needed": True,
+            "exact_facets": ["code"],
+        },
+        score_map={"mem_falcon_service_account": 0.95},
+    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
+        provider=provider,
+        settings=_settings(small_corpus_token_threshold_ratio=0.0),
+    )
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_falcon_service_account",
+            canonical_text="Falcon uses SA42 for deployment approvals.",
+            scope=MemoryScope.CONVERSATION,
+        )
+
+        result = await pipeline.execute(
+            message_text="Which service account did Falcon use?",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "Which service account did Falcon use?"},
+            ],
+        )
+
+        sub_query = result.retrieval_plan.sub_query_plans[0]
+        assert result.retrieval_plan.exact_recall_mode is True
+        assert sub_query.fts_queries == [
+            "falcon sa42 service account rotation owner",
+            "service account falcon rotation owner sa42",
+            "falcon sa42",
+            "service OR account OR falcon OR rotation OR owner OR sa42",
+        ]
+        assert sub_query.fts_query_kinds == [
+            "anchor_first_and",
+            "sparse_and",
+            "anchor_only_and",
+            "broad_or",
+        ]
+        assert {candidate["id"] for candidate in result.raw_candidates} == {
+            "mem_falcon_service_account",
+        }
+        fts_matches = result.raw_candidates[0]["fts_query_matches"]
+        assert {
+            ("falcon sa42", "anchor_only_and", "implicit_and"),
+            (
+                "service OR account OR falcon OR rotation OR owner OR sa42",
+                "broad_or",
+                "explicit_or",
+            ),
+        }.issubset(
+            {
+                (match["query"], match["kind"], match["match_mode"])
+                for match in fts_matches
+            }
+        )
+        assert result.composed_context.selected_memory_ids == [
+            "mem_falcon_service_account",
+        ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_degraded_need_detection_composes_scored_candidates_for_recovery() -> (
+    None
+):
     provider = FailingPipelineProvider("need_detection")
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.0),
     )
@@ -2415,7 +3840,15 @@ async def test_pipeline_large_corpus_takes_normal_path() -> None:
     # shortcut declines to fire (coding_debug budget is 5300 tokens).
     long_text = "retry loop websocket backoff " * 2000
     provider = PipelineProvider(score_map={"mem_large": 0.9})
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.7),
     )
@@ -2439,7 +3872,8 @@ async def test_pipeline_large_corpus_takes_normal_path() -> None:
 
         assert result.small_corpus_mode is False
         assert any(
-            request.metadata.get("purpose") == "need_detection" for request in provider.requests
+            request.metadata.get("purpose") == "need_detection"
+            for request in provider.requests
         )
     finally:
         await connection.close()
@@ -2448,7 +3882,15 @@ async def test_pipeline_large_corpus_takes_normal_path() -> None:
 @pytest.mark.asyncio
 async def test_pipeline_small_corpus_disabled_when_ratio_is_zero() -> None:
     provider = PipelineProvider()
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
         settings=_settings(small_corpus_token_threshold_ratio=0.0),
     )
@@ -2472,7 +3914,8 @@ async def test_pipeline_small_corpus_disabled_when_ratio_is_zero() -> None:
 
         assert result.small_corpus_mode is False
         assert any(
-            request.metadata.get("purpose") == "need_detection" for request in provider.requests
+            request.metadata.get("purpose") == "need_detection"
+            for request in provider.requests
         )
     finally:
         await connection.close()
@@ -2486,7 +3929,15 @@ async def test_pipeline_small_corpus_disabled_when_ratio_is_zero() -> None:
 @pytest.mark.asyncio
 async def test_pipeline_degrades_when_need_detector_fails() -> None:
     provider = FailingPipelineProvider("need_detection", score_map={"mem_1": 0.85})
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
     )
     try:
@@ -2525,7 +3976,15 @@ async def test_pipeline_degrades_when_need_detector_fails() -> None:
 @pytest.mark.asyncio
 async def test_pipeline_degraded_mode_trace_is_recorded() -> None:
     provider = FailingPipelineProvider("need_detection", score_map={"mem_1": 0.85})
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
     )
     try:
@@ -2567,7 +4026,15 @@ async def test_pipeline_degraded_mode_trace_is_recorded() -> None:
 @pytest.mark.asyncio
 async def test_pipeline_base_search_runs_even_when_need_detector_fails() -> None:
     provider = FailingPipelineProvider("need_detection")
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
     )
     try:
@@ -2615,7 +4082,15 @@ async def test_pipeline_merges_base_and_enriched_candidates() -> None:
         },
         score_map={"mem_base": 0.8, "mem_enriched": 0.9},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
     )
     try:
@@ -2669,7 +4144,15 @@ async def test_pipeline_base_candidates_are_deduped_against_enriched() -> None:
         },
         score_map={"mem_1": 0.9},
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         provider=provider,
     )
     try:
@@ -2737,7 +4220,9 @@ def test_regrounding_requirements_keep_grounded_l0_summary_chunks() -> None:
         payload_json={
             "summary_kind": SummaryViewKind.CONVERSATION_CHUNK.value,
             "hierarchy_level": 0,
-            "source_excerpt_messages": [{"role": "user", "text": "Concrete transcript."}],
+            "source_excerpt_messages": [
+                {"role": "user", "text": "Concrete transcript."}
+            ],
         },
     )
     episode = _candidate_record(
@@ -2747,7 +4232,9 @@ def test_regrounding_requirements_keep_grounded_l0_summary_chunks() -> None:
         payload_json={
             "summary_kind": SummaryViewKind.EPISODE.value,
             "hierarchy_level": 1,
-            "source_excerpt_messages": [{"role": "user", "text": "Concrete transcript."}],
+            "source_excerpt_messages": [
+                {"role": "user", "text": "Concrete transcript."}
+            ],
         },
     )
 
@@ -2840,7 +4327,9 @@ def test_default_queries_do_not_expand_context_items_without_recovery_need() -> 
 
 
 @pytest.mark.asyncio
-async def test_pipeline_verbatim_evidence_search_enabled_contributes_to_exact_recall_trace() -> None:
+async def test_pipeline_verbatim_evidence_search_enabled_contributes_to_exact_recall_trace() -> (
+    None
+):
     """End-to-end Wave 1 batch 2 (1-C + 1-D): raw evidence reaches the trace.
 
     The need detector surfaces exact recall, the planner propagates it,
@@ -2867,9 +4356,15 @@ async def test_pipeline_verbatim_evidence_search_enabled_contributes_to_exact_re
         },
         score_map={},
     )
-    connection, _memories, _contracts, pipeline, _provider, resolved_policy, context = (
-        await _build_runtime(mode_id="general_qa", provider=provider)
-    )
+    (
+        connection,
+        _memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(mode_id="general_qa", provider=provider)
     try:
         messages = MessageRepository(
             connection,
@@ -2919,7 +4414,84 @@ async def test_pipeline_verbatim_evidence_search_enabled_contributes_to_exact_re
             for candidate in result.raw_candidates
             if candidate.get("is_verbatim_evidence_window")
         ]
-        assert evidence_windows, "verbatim evidence search window should reach the raw_candidates list"
+        assert evidence_windows, (
+            "verbatim evidence search window should reach the raw_candidates list"
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_traces_temporary_exact_recall_scaffolding() -> None:
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": ["What country is Caroline's grandma from?"],
+            "sparse_query_hints": [
+                {
+                    "sub_query_text": "What country is Caroline's grandma from?",
+                    "fts_phrase": "What country is Caroline's grandma from?",
+                }
+            ],
+            "query_type": "default",
+            "retrieval_levels": [0],
+            "exact_recall_needed": False,
+            "exact_facets": [],
+        },
+        unknown_exact_review_response={
+            "is_exact_value_lookup": True,
+            "sub_query_text": "Caroline grandma country",
+            "fts_phrase": "Caroline grandma country",
+            "exact_facets": ["location", "person_name"],
+            "must_keep_terms": ["Caroline", "grandma", "country"],
+            "quoted_phrases": [],
+        },
+        score_map={"mem_country": 0.9},
+    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(mode_id="general_qa", provider=provider)
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_country",
+            canonical_text="Caroline's grandma is from Norway.",
+            scope=MemoryScope.CONVERSATION,
+        )
+        trace = RetrievalTrace(
+            query_text="What country is Caroline's grandma from?",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-09T12:00:00Z",
+        )
+
+        result = await pipeline.execute(
+            message_text="What country is Caroline's grandma from?",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "What country is Caroline's grandma from?"},
+            ],
+            trace=trace,
+        )
+
+        assert result.retrieval_plan.exact_recall_mode is True
+        assert trace.need_detection is not None
+        need_mechanisms = {
+            event.mechanism for event in trace.need_detection.temporary_scaffolding
+        }
+        root_mechanisms = {event.mechanism for event in trace.temporary_scaffolding}
+        assert "unknown_only_exact_value_contract_review" in need_mechanisms
+        assert "unknown_only_exact_value_contract_review" in root_mechanisms
+        assert "must_keep_tail_exact_recall_backoff" in root_mechanisms
     finally:
         await connection.close()
 
@@ -2948,9 +4520,15 @@ async def test_pipeline_exact_recall_prefers_verbatim_pins_over_summaries() -> N
             "vbp_1": 0.95,
         },
     )
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
-        provider=provider
-    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
     try:
         await memories.upsert_summary_mirror(
             user_id="usr_1",
@@ -2967,7 +4545,9 @@ async def test_pipeline_exact_recall_prefers_verbatim_pins_over_summaries() -> N
             assistant_mode_id="coding_debug",
             privacy_level=0,
         )
-        pins = VerbatimPinRepository(connection, FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)))
+        pins = VerbatimPinRepository(
+            connection, FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc))
+        )
         await pins.create_verbatim_pin(
             user_id="usr_1",
             scope=MemoryScope.CONVERSATION,
@@ -3012,9 +4592,15 @@ async def test_pipeline_exact_recall_prefers_verbatim_pins_over_summaries() -> N
 
 @pytest.mark.asyncio
 async def test_summary_support_regrounding_promotes_existing_filtered_support() -> None:
-    connection, _memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
-        mode_id="general_qa"
-    )
+    (
+        connection,
+        _memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(mode_id="general_qa")
     try:
         summary = _candidate_record(
             memory_id="sum_episode",
@@ -3052,9 +4638,15 @@ async def test_summary_support_regrounding_promotes_existing_filtered_support() 
 
 @pytest.mark.asyncio
 async def test_summary_support_regrounding_runs_for_under_specified_requests() -> None:
-    connection, _memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
-        mode_id="general_qa"
-    )
+    (
+        connection,
+        _memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(mode_id="general_qa")
     try:
         summary = _candidate_record(
             memory_id="sum_episode",
@@ -3104,9 +4696,15 @@ async def test_summary_support_regrounding_runs_for_under_specified_requests() -
 
 @pytest.mark.asyncio
 async def test_summary_support_regrounding_fetches_missing_support_by_id() -> None:
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
-        mode_id="general_qa"
-    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(mode_id="general_qa")
     try:
         await _seed_memory(
             memories,
@@ -3151,10 +4749,18 @@ async def test_summary_support_regrounding_fetches_missing_support_by_id() -> No
 
 
 @pytest.mark.asyncio
-async def test_summary_support_regrounding_rejects_cross_persona_fetched_support() -> None:
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
-        mode_id="general_qa"
-    )
+async def test_summary_support_regrounding_rejects_cross_persona_fetched_support() -> (
+    None
+):
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(mode_id="general_qa")
     try:
         await memories.create_memory_object(
             user_id="usr_1",
@@ -3200,9 +4806,15 @@ async def test_summary_support_regrounding_rejects_cross_persona_fetched_support
 
 @pytest.mark.asyncio
 async def test_summary_support_regrounding_does_not_promote_filtered_source() -> None:
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
-        mode_id="general_qa"
-    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(mode_id="general_qa")
     try:
         await memories.create_memory_object(
             user_id="usr_1",
@@ -3246,9 +4858,15 @@ async def test_summary_support_regrounding_does_not_promote_filtered_source() ->
 
 @pytest.mark.asyncio
 async def test_summary_support_regrounding_caps_total_promotions() -> None:
-    connection, memories, _contracts, pipeline, _provider, resolved_policy, context = await _build_runtime(
-        mode_id="general_qa"
-    )
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(mode_id="general_qa")
     try:
         support_ids = [
             "mem_support_a1",
@@ -3327,7 +4945,9 @@ async def test_summary_support_regrounding_caps_total_promotions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_summary_support_regrounding_reaches_composer(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_pipeline_summary_support_regrounding_reaches_composer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     message_text = "What was the root cause of the connection pool exhaustion?"
     provider = PipelineProvider(
         need_response={
@@ -3350,7 +4970,15 @@ async def test_pipeline_summary_support_regrounding_reaches_composer(monkeypatch
             "mem_support_b": 0.90,
         },
     )
-    connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(
         mode_id="general_qa",
         provider=provider,
     )
@@ -3396,7 +5024,11 @@ async def test_pipeline_summary_support_regrounding_reaches_composer(monkeypatch
 
         call_count = 0
 
-        async def fake_search(_plan: RetrievalPlan, _user_id: str) -> list[dict[str, object]]:
+        async def fake_search(
+            _plan: RetrievalPlan,
+            _user_id: str,
+            **_kwargs: object,
+        ) -> list[dict[str, object]]:
             nonlocal call_count
             call_count += 1
             return [] if call_count == 1 else candidates
