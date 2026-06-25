@@ -156,10 +156,9 @@ class ContextComposer:
                 self._coerce_scored_candidate(candidate)
                 for candidate in scored_candidates
             )
-            if str(candidate.memory_object.get("canonical_text", "")).strip()
-            and self._presence_boundary_allowed(candidate, active_presence_id)
-            and candidate_allows_intimacy_boundary(
-                candidate.memory_object,
+            if self.coercion_admits(
+                candidate,
+                active_presence_id=active_presence_id,
                 allow_intimacy_context=resolved_policy.allow_intimacy_context,
             )
         ]
@@ -1039,6 +1038,61 @@ class ContextComposer:
                 reserve(support)
 
         return reserved
+
+    @classmethod
+    def exhaustive_coverage_floor(
+        cls,
+        scored_candidates: list[ScoredCandidate | dict[str, Any]],
+        *,
+        active_presence_id: str | None,
+        allow_intimacy_context: bool,
+    ) -> int:
+        """Return the exhaustive coverage item floor for composer-admissible rows."""
+        coerced_candidates = [
+            candidate
+            for candidate in (
+                cls._coerce_scored_candidate(candidate) for candidate in scored_candidates
+            )
+            if cls.coercion_admits(
+                candidate,
+                active_presence_id=active_presence_id,
+                allow_intimacy_context=allow_intimacy_context,
+            )
+        ]
+        if not coerced_candidates:
+            return 0
+        windows = [
+            window
+            for window in cls._near_tie_verbatim_evidence_windows(coerced_candidates)
+            if not cls._is_summary_like_candidate(window)
+        ]
+        covered: set[str] = set()
+        for window in windows:
+            if cls._exhaustive_index_admits(window):
+                covered |= cls._coverage_member_keys(window)
+        members: set[str] = set()
+        for candidate in coerced_candidates:
+            if cls._exhaustive_index_admits(candidate):
+                members |= cls._coverage_member_keys(candidate)
+        raw_floor = len(windows) + len(members - covered)
+        return min(len(coerced_candidates), raw_floor)
+
+    @classmethod
+    def coercion_admits(
+        cls,
+        candidate: ScoredCandidate,
+        *,
+        active_presence_id: str | None,
+        allow_intimacy_context: bool,
+    ) -> bool:
+        return (
+            bool(str(candidate.memory_object.get("canonical_text", "")).strip())
+            and cls._presence_boundary_allowed(candidate, active_presence_id)
+            and candidate_allows_intimacy_boundary(
+                candidate.memory_object,
+                allow_intimacy_context=allow_intimacy_context,
+            )
+        )
 
     @staticmethod
     def _source_coverage_reserve_applies(

@@ -4533,12 +4533,54 @@ def _member_candidate(
     )
 
 
+def _verbatim_window_candidate(
+    memory_id: str,
+    *,
+    final_score: float,
+    members: list[tuple[str, str]] | None = None,
+) -> ScoredCandidate:
+    payload: dict = {
+        "source_kind_variant": "conversation_window",
+        "source_message_ids": [f"msg_{memory_id}"],
+    }
+    if members is not None:
+        payload["coverage_members"] = [
+            {"member_key": member_key, "display_text": display_text}
+            for member_key, display_text in members
+        ]
+    return _candidate(
+        memory_id,
+        final_score=final_score,
+        canonical_text=f"{memory_id} conversation window evidence.",
+        object_type="evidence",
+        payload_json=payload,
+    )
+
+
+def _source_grounded_candidate(
+    memory_id: str,
+    *,
+    final_score: float,
+) -> ScoredCandidate:
+    return _candidate(
+        memory_id,
+        final_score=final_score,
+        canonical_text=f"{memory_id} direct supporting evidence.",
+        object_type="evidence",
+        payload_json={
+            "source_message_ids": [f"msg_{memory_id}"],
+            "coverage_members": [],
+        },
+    )
+
+
 def _exhaustive_compose(
     composer: ContextComposer,
     candidates: list[ScoredCandidate],
     *,
     final_context_items: int,
     context_budget_tokens: int = 5000,
+    enable_final_answer_evidence_pack: bool = False,
 ):
     return composer.compose(
         scored_candidates=candidates,
@@ -4554,6 +4596,7 @@ def _exhaustive_compose(
         coverage_mode="exhaustive_known_set",
         source_precision="required",
         enable_evidence_obligation_coverage=True,
+        enable_final_answer_evidence_pack=enable_final_answer_evidence_pack,
     )
 
 
@@ -4638,6 +4681,169 @@ def test_exhaustive_selects_more_members_than_default_with_expanded_budget() -> 
         display for _, display in members
     }
     assert len(context.selected_memory_ids) == len(members)
+
+
+def test_exhaustive_keeps_reserved_windows_and_all_member_carriers() -> None:
+    composer = _composer()
+    members = [(f"m{i}", f"Member {i}") for i in range(5)]
+    windows = [
+        _verbatim_window_candidate(f"vew_{index}", final_score=0.90)
+        for index in range(3)
+    ]
+    member_carriers = [
+        _member_candidate(
+            f"mem_{member_key}",
+            final_score=0.82 - 0.01 * index,
+            canonical_text=f"{display} is part of the set.",
+            members=[(member_key, display)],
+            source_message_ids=[f"msg_{member_key}"],
+        )
+        for index, (member_key, display) in enumerate(members)
+    ]
+    candidates = [
+        *windows,
+        *member_carriers,
+        _source_grounded_candidate("mem_direct", final_score=0.95),
+    ]
+
+    context = _exhaustive_compose(
+        composer,
+        candidates,
+        final_context_items=len(windows) + len(members),
+    )
+
+    selected = set(context.selected_memory_ids)
+    assert {window.memory_id for window in windows} <= selected
+    assert {carrier.memory_id for carrier in member_carriers} <= selected
+    assert {item["display_text"] for item in context.allowed_values} == {
+        display for _, display in members
+    }
+
+
+def test_exhaustive_answer_pack_keeps_reserved_windows_and_members() -> None:
+    composer = _composer()
+    members = [(f"m{i}", f"Member {i}") for i in range(5)]
+    windows = [
+        _verbatim_window_candidate(f"vew_pack_{index}", final_score=0.90)
+        for index in range(3)
+    ]
+    member_carriers = [
+        _member_candidate(
+            f"mem_pack_{member_key}",
+            final_score=0.82 - 0.01 * index,
+            canonical_text=f"{display} is part of the set.",
+            members=[(member_key, display)],
+            source_message_ids=[f"msg_pack_{member_key}"],
+        )
+        for index, (member_key, display) in enumerate(members)
+    ]
+
+    context = _exhaustive_compose(
+        composer,
+        [
+            *windows,
+            *member_carriers,
+            _source_grounded_candidate("mem_pack_direct", final_score=0.95),
+        ],
+        final_context_items=len(windows) + len(members),
+        enable_final_answer_evidence_pack=True,
+    )
+
+    selected = set(context.selected_memory_ids)
+    assert {window.memory_id for window in windows} <= selected
+    assert {carrier.memory_id for carrier in member_carriers} <= selected
+
+
+def test_exhaustive_window_carried_member_does_not_need_redundant_carrier() -> None:
+    composer = _composer()
+    window = _verbatim_window_candidate(
+        "vew_alpha",
+        final_score=0.90,
+        members=[("alpha", "Subject Alpha")],
+    )
+    alpha_carrier = _member_candidate(
+        "mem_alpha",
+        final_score=0.82,
+        canonical_text="Subject Alpha is part of the set.",
+        members=[("alpha", "Subject Alpha")],
+        source_message_ids=["msg_alpha"],
+    )
+    beta_carrier = _member_candidate(
+        "mem_beta",
+        final_score=0.80,
+        canonical_text="Subject Beta is part of the set.",
+        members=[("beta", "Subject Beta")],
+        source_message_ids=["msg_beta"],
+    )
+    candidates = [
+        window,
+        alpha_carrier,
+        beta_carrier,
+        _source_grounded_candidate("mem_direct", final_score=0.95),
+    ]
+
+    assert (
+        ContextComposer.exhaustive_coverage_floor(
+            candidates,
+            active_presence_id=None,
+            allow_intimacy_context=True,
+        )
+        == 2
+    )
+    context = _exhaustive_compose(composer, candidates, final_context_items=2)
+
+    assert context.selected_memory_ids == ["vew_alpha", "mem_beta"]
+    assert "mem_alpha" not in context.selected_memory_ids
+    assert {item["display_text"] for item in context.allowed_values} == {
+        "Subject Alpha",
+        "Subject Beta",
+    }
+
+
+def test_exhaustive_floor_matches_composer_coercion_for_window_gate() -> None:
+    composer = _composer()
+    blocked_direct = _source_grounded_candidate("mem_blocked_direct", final_score=1.0)
+    blocked_direct.memory_object["intimacy_boundary"] = "safety_blocked"
+    members = [(f"m{i}", f"Member {i}") for i in range(5)]
+    windows = [
+        _verbatim_window_candidate(f"vew_coerced_{index}", final_score=0.60)
+        for index in range(3)
+    ]
+    member_carriers = [
+        _member_candidate(
+            f"mem_coerced_{member_key}",
+            final_score=0.82 - 0.01 * index,
+            canonical_text=f"{display} is part of the set.",
+            members=[(member_key, display)],
+            source_message_ids=[f"msg_coerced_{member_key}"],
+        )
+        for index, (member_key, display) in enumerate(members)
+    ]
+    candidates = [
+        blocked_direct,
+        *windows,
+        *member_carriers,
+        _source_grounded_candidate("mem_direct", final_score=0.70),
+    ]
+
+    assert (
+        ContextComposer.exhaustive_coverage_floor(
+            candidates,
+            active_presence_id=None,
+            allow_intimacy_context=True,
+        )
+        == len(windows) + len(members)
+    )
+    context = _exhaustive_compose(
+        composer,
+        candidates,
+        final_context_items=len(windows) + len(members),
+    )
+
+    selected = set(context.selected_memory_ids)
+    assert {window.memory_id for window in windows} <= selected
+    assert {carrier.memory_id for carrier in member_carriers} <= selected
+    assert "mem_blocked_direct" not in selected
 
 
 def test_exhaustive_single_carrier_covers_two_members() -> None:

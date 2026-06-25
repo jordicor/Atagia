@@ -4398,6 +4398,55 @@ def _member_scored_candidate(memory_id: str, member_key: str) -> ScoredCandidate
     )
 
 
+def _verbatim_window_scored_candidate(
+    memory_id: str,
+    *,
+    final_score: float = 0.9,
+) -> ScoredCandidate:
+    return ScoredCandidate(
+        memory_id=memory_id,
+        memory_object={
+            "id": memory_id,
+            "object_type": "evidence",
+            "canonical_text": f"{memory_id} source conversation window.",
+            "payload_json": {
+                "source_kind_variant": "conversation_window",
+                "source_message_ids": [f"msg_{memory_id}"],
+            },
+        },
+        llm_applicability=0.7,
+        retrieval_score=0.6,
+        vitality_boost=0.0,
+        confirmation_boost=0.0,
+        need_boost=0.0,
+        penalty=0.0,
+        final_score=final_score,
+    )
+
+
+def _source_grounded_scored_candidate(
+    memory_id: str,
+    *,
+    final_score: float,
+) -> ScoredCandidate:
+    return ScoredCandidate(
+        memory_id=memory_id,
+        memory_object={
+            "id": memory_id,
+            "object_type": "evidence",
+            "canonical_text": f"{memory_id} direct supporting evidence.",
+            "payload_json": {"source_message_ids": [f"msg_{memory_id}"]},
+        },
+        llm_applicability=0.7,
+        retrieval_score=0.6,
+        vitality_boost=0.0,
+        confirmation_boost=0.0,
+        need_boost=0.0,
+        penalty=0.0,
+        final_score=final_score,
+    )
+
+
 def test_exhaustive_mode_expands_scoring_budget() -> None:
     manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
     policy = PolicyResolver().resolve(manifest, None, None)
@@ -4431,6 +4480,81 @@ def test_exhaustive_mode_expands_final_context_items_to_member_count() -> None:
 
     assert policy.retrieval_params.final_context_items == 8
     assert expanded.retrieval_params.final_context_items == 12
+
+
+def test_exhaustive_mode_expands_final_context_items_for_reserved_windows() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    policy = policy.model_copy(
+        update={
+            "retrieval_params": policy.retrieval_params.model_copy(
+                update={"final_context_items": 4}
+            )
+        }
+    )
+    plan = _exhaustive_plan().model_copy(
+        update={"answer_shape": "list", "source_precision": "required"}
+    )
+    scored = [
+        *[
+            _verbatim_window_scored_candidate(f"vew_{index}", final_score=0.90)
+            for index in range(3)
+        ],
+        *[
+            _member_scored_candidate(f"mem_{index}", f"member{index}")
+            for index in range(5)
+        ],
+        _source_grounded_scored_candidate("mem_direct", final_score=0.95),
+    ]
+
+    expanded = RetrievalPipeline._expand_exhaustive_coverage_budget(
+        policy,
+        plan,
+        scored,
+    )
+
+    assert policy.retrieval_params.final_context_items == 4
+    assert expanded.retrieval_params.final_context_items == 8
+
+
+def test_exhaustive_budget_floor_uses_composer_coercion() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    policy = policy.model_copy(
+        update={
+            "retrieval_params": policy.retrieval_params.model_copy(
+                update={"final_context_items": 4}
+            )
+        }
+    )
+    plan = _exhaustive_plan().model_copy(
+        update={"answer_shape": "list", "source_precision": "required"}
+    )
+    blocked_direct = _source_grounded_scored_candidate(
+        "mem_blocked_direct",
+        final_score=1.0,
+    )
+    blocked_direct.memory_object["intimacy_boundary"] = "safety_blocked"
+    scored = [
+        blocked_direct,
+        *[
+            _verbatim_window_scored_candidate(f"vew_{index}", final_score=0.60)
+            for index in range(3)
+        ],
+        *[
+            _member_scored_candidate(f"mem_{index}", f"member{index}")
+            for index in range(5)
+        ],
+        _source_grounded_scored_candidate("mem_direct", final_score=0.70),
+    ]
+
+    expanded = RetrievalPipeline._expand_exhaustive_coverage_budget(
+        policy,
+        plan,
+        scored,
+    )
+
+    assert expanded.retrieval_params.final_context_items == 8
 
 
 def test_exhaustive_budget_expansion_bounded_by_candidate_count() -> None:

@@ -227,6 +227,7 @@ def test_memory_extraction_cards_use_engine_prompt() -> None:
     # Identity: the benchmark's champion builders ARE the engine builders.
     assert bench.build_candidate_prompt is engine.build_candidate_prompt
     assert bench.build_enrichment_prompt is engine.build_enrichment_prompt
+    assert bench._CARD_SYSTEM_PROMPTS is engine._CARD_SYSTEM_PROMPTS
 
     from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
     from atagia.models.schemas_memory import ExtractionConversationContext

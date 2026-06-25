@@ -14,6 +14,33 @@ from benchmarks.memory_extraction_cards.compare import (
     parse_temporal_card_output,
     score_output,
 )
+from atagia.memory.extraction_cards import _CARD_SYSTEM_PROMPTS
+
+
+_LINE_ONLY_CARD_SYSTEM_PROMPT = (
+    "Extract durable memory as plain-text card lines. "
+    "Write only the requested lines. No JSON. No explanation."
+)
+_COVERAGE_MEMBERS_CARD_SYSTEM_PROMPT = (
+    "Extract durable memory in the exact format the task shows. "
+    "Write only the requested lines, and write nothing for a candidate the task "
+    "resolves as having none. No explanation."
+)
+
+
+def test_memory_extraction_card_system_prompts_are_card_specific() -> None:
+    assert _CARD_SYSTEM_PROMPTS["coverage_members"] == (
+        _COVERAGE_MEMBERS_CARD_SYSTEM_PROMPT
+    )
+    for card_name in (
+        "candidate",
+        "kind_scope",
+        "evidence",
+        "index",
+        "temporal",
+        "belief",
+    ):
+        assert _CARD_SYSTEM_PROMPTS[card_name] == _LINE_ONLY_CARD_SYSTEM_PROMPT
 
 
 def test_memory_extraction_cards_case_set_loads() -> None:

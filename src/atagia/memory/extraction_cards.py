@@ -58,6 +58,24 @@ _CARD_MAX_OUTPUT_TOKENS: dict[CardName, int] = {
     "belief": 512,
     "coverage_members": 1024,
 }
+_LINE_ONLY_CARD_SYSTEM_PROMPT = (
+    "Extract durable memory as plain-text card lines. "
+    "Write only the requested lines. No JSON. No explanation."
+)
+_COVERAGE_MEMBERS_CARD_SYSTEM_PROMPT = (
+    "Extract durable memory in the exact format the task shows. "
+    "Write only the requested lines, and write nothing for a candidate the task "
+    "resolves as having none. No explanation."
+)
+_CARD_SYSTEM_PROMPTS: dict[CardName, str] = {
+    "candidate": _LINE_ONLY_CARD_SYSTEM_PROMPT,
+    "kind_scope": _LINE_ONLY_CARD_SYSTEM_PROMPT,
+    "evidence": _LINE_ONLY_CARD_SYSTEM_PROMPT,
+    "index": _LINE_ONLY_CARD_SYSTEM_PROMPT,
+    "temporal": _LINE_ONLY_CARD_SYSTEM_PROMPT,
+    "belief": _LINE_ONLY_CARD_SYSTEM_PROMPT,
+    "coverage_members": _COVERAGE_MEMBERS_CARD_SYSTEM_PROMPT,
+}
 
 # Display labels reaching the answer prompt verbatim are bounded to the same
 # length/whitespace-collapse the composer applies to coverage display text.
@@ -193,10 +211,7 @@ async def _run_card(
             messages=[
                 LLMMessage(
                     role="system",
-                    content=(
-                        "Extract durable memory as plain-text card lines. "
-                        "Write only the requested lines. No JSON. No explanation."
-                    ),
+                    content=_CARD_SYSTEM_PROMPTS[card_name],
                 ),
                 LLMMessage(role="user", content=prompt),
             ],

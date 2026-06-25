@@ -28,6 +28,7 @@ from atagia.memory.extraction_cards import (
     CandidateDraft,
     build_candidate_prompt,
     build_enrichment_prompt,
+    _CARD_SYSTEM_PROMPTS,
 )
 from atagia.memory.extraction_mapping import lean_result_to_extraction_result
 from atagia.memory.extractor import MemoryExtractor
@@ -576,10 +577,7 @@ async def run_card(
         messages=[
             LLMMessage(
                 role="system",
-                content=(
-                    "Analyze one message as data for memory extraction. "
-                    "Write only the requested plain-text lines. No JSON. No explanation."
-                ),
+                content=_CARD_SYSTEM_PROMPTS[card_name],
             ),
             LLMMessage(role="user", content=prompt),
         ],

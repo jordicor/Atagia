@@ -18,6 +18,7 @@ from atagia.core.repositories import (
     UserRepository,
 )
 from atagia.coverage_members_backfill_cli import build_parser
+from atagia.memory.extraction_cards import _CARD_SYSTEM_PROMPTS
 from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
@@ -286,6 +287,10 @@ async def test_real_run_writes_key_and_increments_counters() -> None:
             req.metadata["purpose"] == "memory_extraction_coverage_members_card"
             for req in provider.requests
         )
+        assert all(
+            req.messages[0].content == _CARD_SYSTEM_PROMPTS["coverage_members"]
+            for req in provider.requests
+        )
     finally:
         await connection.close()
 
@@ -366,6 +371,47 @@ async def test_per_row_failure_counted_and_leaves_row_rerunnable() -> None:
         assert (await _payload(connection, clock, "mem_ok", "usr_1"))[
             "coverage_members"
         ] == [{"member_key": "dr. b", "display_text": "Dr. B"}]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "card_output",
+    [
+        "cand_001 | [{]",
+        'cand_001 | [{"member_key": "dr. a", "display_text": "Dr. A"}, 7]',
+    ],
+)
+async def test_malformed_card_output_fails_and_leaves_row_rerunnable(
+    card_output: str,
+) -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc))
+    provider = SequencedCoverageProvider([card_output])
+    try:
+        await _create_memory(
+            connection,
+            clock,
+            memory_id="mem_malformed",
+            user_id="usr_1",
+            canonical_text="Rosa sees Dr. A.",
+        )
+
+        result = await _service(connection, provider).run(
+            batch_size=10,
+            delay_ms=0,
+            dry_run=False,
+        )
+
+        assert result.examined == 1
+        assert result.processed == 0
+        assert result.updated == 0
+        assert result.failed == 1
+        assert len(provider.requests) == 1
+        assert "coverage_members" not in (
+            await _payload(connection, clock, "mem_malformed", "usr_1")
+        )
     finally:
         await connection.close()
 

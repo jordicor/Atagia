@@ -28,6 +28,7 @@ from atagia.memory.extraction_cards import (
     build_enrichment_prompt,
     parse_coverage_members_card_output,
     _CARD_MAX_OUTPUT_TOKENS,
+    _CARD_SYSTEM_PROMPTS,
 )
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.models.schemas_memory import (
@@ -53,12 +54,6 @@ _COVERAGE_MEMBERS_PAYLOAD_KEY = "coverage_members"
 # the card output. A single fixed default keeps the backfill from depending on
 # every stored row's ``assistant_mode_id`` being a valid retrieval profile.
 _DEFAULT_PROFILE_ID = RetrievalProfileId.GENERAL_QA
-# Match the synchronous card system prompt verbatim (see ``_run_card`` in
-# ``extraction_cards``) so the single-card replay is faithful to ingest.
-_CARD_SYSTEM_PROMPT = (
-    "Extract durable memory as plain-text card lines. "
-    "Write only the requested lines. No JSON. No explanation."
-)
 _CANDIDATE_ID = "cand_001"
 
 _BACKFILL_STATUSES = frozenset(
@@ -233,7 +228,10 @@ class CoverageMembersBackfillService:
         request = LLMCompletionRequest(
             model=self._card_model,
             messages=[
-                LLMMessage(role="system", content=_CARD_SYSTEM_PROMPT),
+                LLMMessage(
+                    role="system",
+                    content=_CARD_SYSTEM_PROMPTS["coverage_members"],
+                ),
                 LLMMessage(role="user", content=prompt),
             ],
             max_output_tokens=_CARD_MAX_OUTPUT_TOKENS["coverage_members"],
@@ -244,7 +242,12 @@ class CoverageMembersBackfillService:
             },
         )
         response = await self._llm_client.complete(request)
-        parsed, _malformed = parse_coverage_members_card_output(response.output_text)
+        parsed, malformed = parse_coverage_members_card_output(response.output_text)
+        if malformed:
+            entry_word = "entry" if malformed == 1 else "entries"
+            raise ValueError(
+                f"coverage-members card returned {malformed} malformed {entry_word}"
+            )
         return list(parsed.get(_CANDIDATE_ID) or ())
 
     async def _write_members(

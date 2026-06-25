@@ -2296,29 +2296,27 @@ class RetrievalPipeline:
         retrieval_plan: RetrievalPlan,
         scored_candidates: list[ScoredCandidate],
     ) -> ResolvedRetrievalPolicy:
-        """Raise final_context_items to fit every distinct exhaustive member.
+        """Raise final_context_items to fit exhaustive reserved coverage slots.
 
-        For ``exhaustive_known_set`` mode, count the distinct coverage member
-        keys carried by the scored candidates (using the composer's shared
-        resolution ladder) and raise ``final_context_items`` so each member can
-        be selected. The physical token budget still governs admission via the
+        For ``exhaustive_known_set`` mode, mirror the composer's reservation over
+        the same admissible candidate set and raise ``final_context_items`` so
+        near-tie verbatim evidence windows do not consume slots needed by member
+        carriers. The physical token budget still governs admission via the
         selector, so members that do not fit become missing_slots, never a crash.
         This runs before the explicit-cap helper so ablation overrides still win.
         """
         if retrieval_plan.coverage_mode != "exhaustive_known_set":
             return resolved_policy
-        member_keys: set[str] = set()
-        for candidate in scored_candidates:
-            member_keys |= ContextComposer._coverage_member_keys(candidate)
-        distinct_member_count = len(member_keys)
-        if distinct_member_count <= 0:
+        coverage_floor = ContextComposer.exhaustive_coverage_floor(
+            scored_candidates,
+            active_presence_id=retrieval_plan.active_presence_id,
+            allow_intimacy_context=resolved_policy.allow_intimacy_context,
+        )
+        if coverage_floor <= 0:
             return resolved_policy
-        target_items = min(
-            len(scored_candidates),
-            max(
-                resolved_policy.retrieval_params.final_context_items,
-                distinct_member_count,
-            ),
+        target_items = max(
+            resolved_policy.retrieval_params.final_context_items,
+            coverage_floor,
         )
         if target_items <= resolved_policy.retrieval_params.final_context_items:
             return resolved_policy
