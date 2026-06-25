@@ -28,7 +28,7 @@ from atagia.memory.context_envelope import (
     allocate_context_envelope_budget,
 )
 from atagia.memory.coverage_expander import CoverageExpansionPlan, CoverageExpander
-from atagia.memory.need_detector import NeedDetector
+from atagia.memory.need_detector import NeedCardCall, NeedDetector
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.memory.retrieval_diagnostics import build_retrieval_sufficiency_diagnostic
 from atagia.memory.retrieval_custody import build_candidate_custody
@@ -37,6 +37,7 @@ from atagia.memory.retrieval_planner import (
     build_retrieval_fts_queries,
 )
 from atagia.models.schemas_memory import (
+    AdaptiveGateStatus,
     CandidateSearchTrace,
     ComposedContext,
     CompositionTrace,
@@ -46,10 +47,12 @@ from atagia.models.schemas_memory import (
     FacetSupportObligationTrace,
     FacetSupportTrace,
     FtsQueryExecutionCount,
+    MemoryDependence,
     MemoryObjectType,
     MemoryScope,
     MemoryStatus,
     NeedTrigger,
+    NeedCardCallTrace,
     NeedDetectionTrace,
     PlannedSubQuery,
     QueryIntelligenceResult,
@@ -125,6 +128,23 @@ def _default_query_intelligence(message_text: str) -> QueryIntelligenceResult:
         raw_context_access_mode="normal",
         retrieval_levels=[0],
     )
+
+
+def _build_need_card_call_traces(
+    calls: list[NeedCardCall],
+) -> list[NeedCardCallTrace]:
+    return [
+        NeedCardCallTrace(
+            card_name=call.card_name,
+            model=call.model,
+            prompt=call.prompt,
+            raw_output=call.raw_output,
+            parsed=call.parsed,
+            parse_valid=call.parse_valid,
+            error=call.error,
+        )
+        for call in calls
+    ]
 
 
 def _build_runtime_alias_groups(
@@ -349,6 +369,7 @@ class RetrievalPipeline:
         workspace_rollup: dict[str, Any] | None = None,
         conversation_messages: list[dict[str, Any]] | None = None,
         trace: RetrievalTrace | None = None,
+        adaptive_retrieval: bool = False,
     ) -> PipelineResult:
         effective_ablation = ablation or AblationConfig()
         configured_policy = self._override_policy(resolved_policy, effective_ablation)
@@ -375,25 +396,43 @@ class RetrievalPipeline:
                 },
             )
 
-        if await self._is_empty_clean_turn(
-            conversation_context=conversation_context,
-            resolved_policy=effective_policy,
-            cold_start=effective_cold_start,
-            transcript=transcript,
-            message_text=message_text,
-            workspace_rollup=workspace_rollup,
-            ablation=effective_ablation,
-        ):
-            return await self._execute_empty_clean_turn(
-                message_text=message_text,
+        # The empty-clean shortcut must still surface a seeded character/
+        # workspace rollup on a cold first turn, so resolve the effective
+        # rollup once up front and feed it into both the classification and
+        # the fast-path composition. On warm turns the empty-clean guard short
+        # circuits before this lookup runs.
+        empty_clean_candidate = (
+            effective_cold_start
+            and workspace_rollup is None
+            and not conversation_context.recent_messages
+            and self._transcript_is_first_user_turn(transcript, message_text)
+        )
+        empty_clean_rollup: dict[str, Any] | None = None
+        if empty_clean_candidate:
+            empty_clean_rollup = await self._measure_stage(
+                stage_timings,
+                "workspace_rollup_lookup",
+                self._resolve_workspace_rollup(
+                    conversation_context=conversation_context,
+                    ablation=effective_ablation,
+                ),
+            )
+            if await self._is_empty_clean_turn(
                 conversation_context=conversation_context,
                 resolved_policy=effective_policy,
-                effective_ablation=effective_ablation,
-                transcript=transcript,
-                stage_timings=stage_timings,
-                trace=trace,
-                pipeline_start=pipeline_start,
-            )
+                ablation=effective_ablation,
+            ):
+                return await self._execute_empty_clean_turn(
+                    message_text=message_text,
+                    conversation_context=conversation_context,
+                    resolved_policy=effective_policy,
+                    effective_ablation=effective_ablation,
+                    transcript=transcript,
+                    workspace_rollup=empty_clean_rollup,
+                    stage_timings=stage_timings,
+                    trace=trace,
+                    pipeline_start=pipeline_start,
+                )
 
         # Wave 1-A: Small-corpus shortcut. When the full eligible corpus fits
         # inside the context budget there is nothing to rank, so we build the
@@ -501,6 +540,7 @@ class RetrievalPipeline:
                     fts_query_audit=base_fts_query_audit,
                 )
             )
+            need_card_calls: list[NeedCardCall] = []
             need_start = perf_counter() if trace is not None else 0.0
             try:
                 try:
@@ -527,6 +567,7 @@ class RetrievalPipeline:
                                 ),
                                 purpose="need_detection",
                             ),
+                            card_call_trace_sink=need_card_calls,
                         ),
                     )
                 except Exception as exc:
@@ -559,6 +600,7 @@ class RetrievalPipeline:
                             user_communication_profile=_build_user_communication_profile_trace(
                                 user_communication_profile,
                             ),
+                            card_calls=_build_need_card_call_traces(need_card_calls),
                         )
                 else:
                     detected_needs = list(query_intelligence.needs)
@@ -579,6 +621,7 @@ class RetrievalPipeline:
                             ],
                             query_language=query_intelligence.query_language,
                             answer_language=query_intelligence.answer_language,
+                            memory_dependence=query_intelligence.memory_dependence,
                             content_language_profile=_build_content_language_profile_trace(
                                 content_language_profile,
                             ),
@@ -608,6 +651,7 @@ class RetrievalPipeline:
                                 for facet in query_intelligence.exact_facets
                             ],
                             temporary_scaffolding=query_intelligence.temporary_scaffolding,
+                            card_calls=_build_need_card_call_traces(need_card_calls),
                         )
                 # Need detection (LLM) has finished. Join the base-search task
                 # NOW, before any further DB work (enriched planning/search)
@@ -628,6 +672,45 @@ class RetrievalPipeline:
                 # interrupted, never leave the base-search task orphaned. This
                 # is a no-op once the task has already been awaited above.
                 await self._drain_overlap_task(base_search_task)
+            # Adaptive retrieval gate (decision point). Need detection succeeded
+            # and the base-search task is joined; the expensive enriched
+            # planning/search/scoring/composition stages have NOT started. When
+            # the flag is on, the turn is non-degraded, and the classification
+            # is world/conversation (no dependence on stored memory), short-
+            # circuit them entirely. Exact recall is a stronger signal than a
+            # coarse world/conversation classification: if another card says the
+            # answer needs a specific remembered detail, retrieve. Degraded mode
+            # never reaches here with gate authority because the gate requires
+            # ``not degraded_mode``, and the MIXED/PERSONAL classes fall through
+            # to full retrieval (uncertainty -> retrieve).
+            gate_skip = (
+                adaptive_retrieval
+                and not degraded_mode
+                and not query_intelligence.exact_recall_needed
+                and query_intelligence.memory_dependence
+                in (MemoryDependence.WORLD, MemoryDependence.CONVERSATION)
+            )
+            if gate_skip:
+                logger.info(
+                    "adaptive_gate_skip user_id=%s conversation_id=%s "
+                    "classification=%s discarded_base_candidates=%d",
+                    conversation_context.user_id,
+                    conversation_context.conversation_id,
+                    query_intelligence.memory_dependence.value,
+                    len(base_candidates),
+                )
+                return await self._execute_adaptive_gate_skip(
+                    message_text=message_text,
+                    conversation_context=conversation_context,
+                    resolved_policy=effective_policy,
+                    effective_ablation=effective_ablation,
+                    transcript=transcript,
+                    query_intelligence=query_intelligence,
+                    detected_needs=detected_needs,
+                    stage_timings=stage_timings,
+                    trace=trace,
+                    pipeline_start=pipeline_start,
+                )
             if trace is not None:
                 trace.raw_context_access_mode = (
                     query_intelligence.raw_context_access_mode
@@ -788,11 +871,9 @@ class RetrievalPipeline:
         lookups_task = asyncio.create_task(
             self._post_scoring_lookups(
                 conversation_context=conversation_context,
-                retrieval_plan=retrieval_plan,
                 effective_policy=effective_policy,
                 effective_ablation=effective_ablation,
                 character_id=character_id,
-                workspace_rollup=workspace_rollup,
                 stage_timings=stage_timings,
             )
         )
@@ -819,7 +900,9 @@ class RetrievalPipeline:
                         detected_needs=detected_needs,
                         retrieval_plan=retrieval_plan,
                         trace=trace,
-                        applicability_gate_mode=effective_ablation.applicability_gate_mode,
+                        applicability_gate_mode=(
+                            effective_ablation.applicability_gate_mode
+                        ),
                     ),
                 )
         except BaseException:
@@ -875,6 +958,11 @@ class RetrievalPipeline:
             degraded_mode=degraded_mode,
             detected_needs=detected_needs,
             item_count=len(scored_candidates),
+        )
+        composition_policy = self._expand_exhaustive_coverage_budget(
+            composition_policy,
+            retrieval_plan,
+            scored_candidates,
         )
         composition_policy = self._cap_explicit_final_context_items(
             composition_policy,
@@ -954,6 +1042,10 @@ class RetrievalPipeline:
             trace.degraded_mode = degraded_mode
             trace.total_duration_ms = (perf_counter() - pipeline_start) * 1000.0
 
+        # Full retrieval ran. When the flag is on the gate had authority but
+        # kept retrieval (PERSONAL/MIXED, or WORLD/CONVERSATION under degraded
+        # mode where the gate has no authority); when the flag is off the
+        # classification is recorded but no action was taken (shadow mode).
         return PipelineResult(
             detected_needs=detected_needs,
             retrieval_plan=retrieval_plan,
@@ -968,17 +1060,21 @@ class RetrievalPipeline:
             trace=trace,
             small_corpus_mode=False,
             degraded_mode=degraded_mode,
+            adaptive_gate_status=(
+                AdaptiveGateStatus.RETRIEVED
+                if adaptive_retrieval
+                else AdaptiveGateStatus.OFF_SHADOW
+            ),
+            adaptive_gate_classification=query_intelligence.memory_dependence,
         )
 
     async def _post_scoring_lookups(
         self,
         *,
         conversation_context: ExtractionConversationContext,
-        retrieval_plan: RetrievalPlan,
         effective_policy: ResolvedRetrievalPolicy,
         effective_ablation: AblationConfig,
         character_id: str | None,
-        workspace_rollup: dict[str, Any] | None,
         stage_timings: dict[str, float],
     ) -> tuple[
         dict[str, dict[str, Any]],
@@ -991,8 +1087,8 @@ class RetrievalPipeline:
         concurrently with the applicability-scoring LLM call. The three lookups
         share one aiosqlite connection, so they must run one after another
         (never as concurrent SQL). None of them consume ``scored_candidates`` —
-        they only need ``conversation_context``/``retrieval_plan`` — so they are
-        safe to start before scoring completes.
+        they only need ``conversation_context`` — so they are safe to start
+        before scoring completes.
         """
         if effective_ablation.skip_contract_memory:
             current_contract: dict[str, dict[str, Any]] = {}
@@ -1060,8 +1156,6 @@ class RetrievalPipeline:
             "workspace_rollup_lookup",
             self._resolve_workspace_rollup(
                 conversation_context=conversation_context,
-                retrieval_plan=retrieval_plan,
-                workspace_rollup=workspace_rollup,
                 ablation=effective_ablation,
             ),
         )
@@ -1072,19 +1166,15 @@ class RetrievalPipeline:
         *,
         conversation_context: ExtractionConversationContext,
         resolved_policy: ResolvedRetrievalPolicy,
-        cold_start: bool,
-        transcript: list[dict[str, Any]],
-        message_text: str,
-        workspace_rollup: dict[str, Any] | None,
         ablation: AblationConfig,
     ) -> bool:
-        """Return True when there is no visible context worth retrieving."""
-        if not cold_start or workspace_rollup is not None:
-            return False
-        if not self._transcript_is_first_user_turn(transcript, message_text):
-            return False
-        if conversation_context.recent_messages:
-            return False
+        """Return True when the fast path can compose context without retrieval.
+
+        The cold-start / first-user-turn / no-recent-messages gate is evaluated
+        by the caller; a seeded character/workspace rollup does not disqualify
+        the fast path because it is rendered directly without any retrieval LLM
+        calls. Only a visible interaction contract forces the full pipeline.
+        """
         return not await self._has_visible_contract_context(
             conversation_context=conversation_context,
             resolved_policy=resolved_policy,
@@ -1145,11 +1235,17 @@ class RetrievalPipeline:
         resolved_policy: ResolvedRetrievalPolicy,
         effective_ablation: AblationConfig,
         transcript: list[dict[str, Any]],
+        workspace_rollup: dict[str, Any] | None,
         stage_timings: dict[str, float],
         trace: RetrievalTrace | None,
         pipeline_start: float,
     ) -> PipelineResult:
-        """Compose an empty context without any LLM-backed retrieval stages."""
+        """Compose context without any LLM-backed retrieval stages.
+
+        A pre-resolved character/workspace rollup is still rendered here so a
+        seeded greeting turn surfaces its ``[Workspace Context]`` block; only
+        the retrieval LLM stages are skipped.
+        """
         query_intelligence = _default_query_intelligence(message_text)
         retrieval_plan = await self._measure_stage(
             stage_timings,
@@ -1174,7 +1270,7 @@ class RetrievalPipeline:
         stage_timings["applicability_scoring"] = 0.0
         stage_timings["contract_lookup"] = 0.0
         stage_timings["state_lookup"] = 0.0
-        stage_timings["workspace_rollup_lookup"] = 0.0
+        stage_timings.setdefault("workspace_rollup_lookup", 0.0)
 
         current_contract: dict[str, dict[str, Any]] = {}
         user_state: dict[str, Any] = {}
@@ -1188,7 +1284,7 @@ class RetrievalPipeline:
                 retrieval_plan=retrieval_plan,
                 scored_candidates=[],
                 current_contract=current_contract,
-                workspace_rollup=None,
+                workspace_rollup=workspace_rollup,
                 user_state=user_state,
                 resolved_policy=resolved_policy,
                 conversation_messages=transcript,
@@ -1294,6 +1390,214 @@ class RetrievalPipeline:
             trace=trace,
             small_corpus_mode=False,
             degraded_mode=False,
+            # This shortcut runs before need detection, so the gate never had a
+            # classification to act on.
+            adaptive_gate_status=AdaptiveGateStatus.NOT_APPLICABLE,
+            adaptive_gate_classification=None,
+        )
+
+    async def _execute_adaptive_gate_skip(
+        self,
+        *,
+        message_text: str,
+        conversation_context: ExtractionConversationContext,
+        resolved_policy: ResolvedRetrievalPolicy,
+        effective_ablation: AblationConfig,
+        transcript: list[dict[str, Any]],
+        query_intelligence: QueryIntelligenceResult,
+        detected_needs: list[Any],
+        stage_timings: dict[str, float],
+        trace: RetrievalTrace | None,
+        pipeline_start: float,
+    ) -> PipelineResult:
+        """Compose context for a gate-skipped turn (D4).
+
+        Need detection already ran and classified the turn as not depending on
+        stored memory (``world``/``conversation``). The base candidates are
+        DISCARDED (injecting them is the distractor failure mode the gate exists
+        to avoid). The cheap interaction-contract SQL read still runs so the
+        contract block survives; state and workspace-rollup lookups are skipped
+        (matching the fast path: contract only). Composition uses the REAL
+        ``query_intelligence`` so ``query_language``/``answer_language`` flow
+        into ``source_retrieval_plan`` and the answer-language guidance keeps
+        working truthfully.
+        """
+        character_id = _effective_character_id(conversation_context)
+        # Build the plan from the real query intelligence so the response
+        # language guidance and source plan reflect the actual turn.
+        retrieval_plan = await self._measure_stage(
+            stage_timings,
+            "enriched_planning",
+            self._build_plan(
+                message_text=message_text,
+                query_intelligence=query_intelligence,
+                conversation_context=conversation_context,
+                resolved_policy=resolved_policy,
+                cold_start=False,
+                ablation=effective_ablation,
+            ),
+        )
+        # Zero the stages the gate short-circuited so downstream telemetry stays
+        # consistent with the full and fast variants. Base planning genuinely ran
+        # for this turn, so the aggregate "planning" key sums both lanes exactly
+        # like the full path (see the aggregate block in ``execute``).
+        stage_timings["planning"] = stage_timings.get(
+            "base_planning", 0.0
+        ) + stage_timings.get("enriched_planning", 0.0)
+        stage_timings["enriched_candidate_search"] = 0.0
+        stage_timings["coverage_candidate_expansion"] = 0.0
+        stage_timings["llm_coverage_expansion"] = 0.0
+        # Base candidates were searched (timing already recorded) but are
+        # discarded; the effective candidate_search cost is the base lane only.
+        stage_timings["candidate_search"] = stage_timings.get(
+            "base_candidate_search", 0.0
+        )
+        stage_timings["applicability_scoring"] = 0.0
+        stage_timings["state_lookup"] = 0.0
+        stage_timings["workspace_rollup_lookup"] = 0.0
+
+        # Contract-only lookup: same stage and predicates the full path uses, so
+        # the contract block admits exactly what normal retrieval would.
+        if effective_ablation.skip_contract_memory:
+            current_contract: dict[str, dict[str, Any]] = {}
+            stage_timings["contract_lookup"] = 0.0
+        else:
+            current_contract = await self._measure_stage(
+                stage_timings,
+                "contract_lookup",
+                self._contract_projector.get_current_contract(
+                    conversation_context.user_id,
+                    conversation_context.assistant_mode_id,
+                    conversation_context.workspace_id,
+                    conversation_context.conversation_id,
+                    user_persona_id=conversation_context.user_persona_id,
+                    platform_id=conversation_context.platform_id,
+                    character_id=character_id,
+                    incognito=conversation_context.incognito,
+                    remember_across_chats=conversation_context.remember_across_chats,
+                    remember_across_devices=conversation_context.remember_across_devices,
+                    sensitivity_gates_enabled=privacy_sql_filters_disabled(
+                        effective_ablation,
+                    ),
+                    allow_private_sensitivity=effective_allow_private_for_sql_repository(
+                        resolved_policy,
+                        effective_ablation,
+                    ),
+                    active_space_id=conversation_context.active_space_id,
+                    active_space_boundary_mode=conversation_context.active_space_boundary_mode,
+                    active_mind_id=conversation_context.active_mind_id,
+                    mind_topology=conversation_context.mind_topology,
+                    active_embodiment_id=conversation_context.active_embodiment_id,
+                    active_realm_id=conversation_context.active_realm_id,
+                ),
+            )
+
+        user_state: dict[str, Any] = {}
+        composition_start = perf_counter() if trace is not None else 0.0
+        composed_context = await self._measure_stage(
+            stage_timings,
+            "context_composition",
+            self._compose_context(
+                user_id=conversation_context.user_id,
+                message_text=message_text,
+                retrieval_plan=retrieval_plan,
+                scored_candidates=[],
+                current_contract=current_contract,
+                workspace_rollup=None,
+                user_state=user_state,
+                resolved_policy=resolved_policy,
+                conversation_messages=transcript,
+                composer_strategy=effective_ablation.composer_strategy,
+                enable_evidence_obligation_coverage=(
+                    effective_ablation.enable_evidence_obligation_coverage
+                ),
+                enable_evidence_packets=False,
+                enable_final_answer_evidence_pack=(
+                    effective_ablation.enable_final_answer_evidence_pack
+                ),
+            ),
+        )
+        if effective_ablation.skip_contract_memory:
+            composed_context = self._without_contract_block(composed_context)
+
+        raw_candidates: list[dict[str, Any]] = []
+        filtered_candidates: list[dict[str, Any]] = []
+        scored_candidates: list[ScoredCandidate] = []
+        candidate_custody = build_candidate_custody(
+            raw_candidates=raw_candidates,
+            filtered_candidates=filtered_candidates,
+            shortlist=[],
+            scored_candidates=scored_candidates,
+            selected_memory_ids=list(composed_context.selected_memory_ids),
+            retrieval_plan=retrieval_plan,
+            filter_reasons_by_id={},
+        )
+        retrieval_sufficiency = build_retrieval_sufficiency_diagnostic(
+            raw_candidates=raw_candidates,
+            filtered_candidates=filtered_candidates,
+            shortlist=[],
+            scored_candidates=scored_candidates,
+            retrieval_plan=retrieval_plan,
+            contradiction_tension_threshold=self._settings.belief_tension_threshold,
+        )
+
+        if trace is not None:
+            trace.raw_context_access_mode = query_intelligence.raw_context_access_mode
+            # The real need-detection trace was already recorded during the
+            # overlap window; only fill in the remaining sections.
+            trace.candidate_search = self._build_candidate_search_trace(
+                raw_candidates,
+                retrieval_plan,
+                0.0,
+                [],
+            )
+            trace.policy_filter_audit = self._build_policy_filter_audit(
+                effective_ablation.privacy_enforcement,
+                {},
+            )
+            trace.scoring = self._build_scoring_trace(
+                raw_candidates,
+                filtered_candidates,
+                scored_candidates,
+                0.0,
+            )
+            trace.retrieval_sufficiency = retrieval_sufficiency
+            trace.composition = self._build_composition_trace(
+                composed_context,
+                resolved_policy,
+                (perf_counter() - composition_start) * 1000.0,
+            )
+            trace.custody = self._build_custody_trace(
+                raw_candidates=raw_candidates,
+                filtered_candidates=filtered_candidates,
+                scored_candidates=scored_candidates,
+                candidate_custody=candidate_custody,
+                selected_memory_ids=list(composed_context.selected_memory_ids),
+                retrieval_sufficiency=retrieval_sufficiency,
+            )
+            trace.runtime_diagnostics = RequestRuntimeDiagnosticsTrace(
+                stage_timings_ms=self._nonnegative_float_map(stage_timings),
+                hydration_timings_ms=self._hydration_timings(stage_timings),
+            )
+            trace.degraded_mode = False
+            trace.total_duration_ms = (perf_counter() - pipeline_start) * 1000.0
+
+        return PipelineResult(
+            detected_needs=detected_needs,
+            retrieval_plan=retrieval_plan,
+            raw_candidates=raw_candidates,
+            scored_candidates=scored_candidates,
+            candidate_custody=candidate_custody,
+            retrieval_sufficiency=retrieval_sufficiency,
+            composed_context=composed_context,
+            current_contract=current_contract,
+            user_state=user_state,
+            stage_timings=stage_timings,
+            trace=trace,
+            small_corpus_mode=False,
+            degraded_mode=False,
+            adaptive_gate_status=AdaptiveGateStatus.SKIPPED,
+            adaptive_gate_classification=query_intelligence.memory_dependence,
         )
 
     # ------------------------------------------------------------------
@@ -1679,7 +1983,9 @@ class RetrievalPipeline:
                     detected_needs=detected_needs,
                     retrieval_plan=retrieval_plan,
                     trace=trace,
-                    applicability_gate_mode=effective_ablation.applicability_gate_mode,
+                    applicability_gate_mode=(
+                        effective_ablation.applicability_gate_mode
+                    ),
                 ),
             )
         if trace is not None:
@@ -1772,8 +2078,6 @@ class RetrievalPipeline:
             "workspace_rollup_lookup",
             self._resolve_workspace_rollup(
                 conversation_context=conversation_context,
-                retrieval_plan=retrieval_plan,
-                workspace_rollup=workspace_rollup,
                 ablation=effective_ablation,
             ),
         )
@@ -1866,6 +2170,10 @@ class RetrievalPipeline:
             trace=trace,
             small_corpus_mode=True,
             degraded_mode=degraded_mode,
+            # The small-corpus shortcut runs before need detection, so the gate
+            # never had a classification to act on.
+            adaptive_gate_status=AdaptiveGateStatus.NOT_APPLICABLE,
+            adaptive_gate_classification=None,
         )
 
     @staticmethod
@@ -1912,10 +2220,17 @@ class RetrievalPipeline:
             getattr(need, "need_type", None) in recovery_needs
             for need in detected_needs
         )
+        # Exhaustive known-set lists must score every candidate so members ranked
+        # beyond the default rerank_top_k survive into scoring (rerank_top_k feeds
+        # early_diversity_select, which caps the shortlist before scoring).
+        exhaustive_coverage = (
+            retrieval_plan.coverage_mode == "exhaustive_known_set"
+        )
         if (
             not retrieval_plan.exact_recall_mode
             and not degraded_mode
             and not need_expansion
+            and not exhaustive_coverage
         ):
             return resolved_policy
         if item_count <= resolved_policy.retrieval_params.rerank_top_k:
@@ -1964,6 +2279,45 @@ class RetrievalPipeline:
             max(
                 resolved_policy.retrieval_params.final_context_items,
                 target_ceiling,
+            ),
+        )
+        if target_items <= resolved_policy.retrieval_params.final_context_items:
+            return resolved_policy
+        expanded_retrieval = resolved_policy.retrieval_params.model_copy(
+            update={"final_context_items": target_items}
+        )
+        return resolved_policy.model_copy(
+            update={"retrieval_params": expanded_retrieval}
+        )
+
+    @staticmethod
+    def _expand_exhaustive_coverage_budget(
+        resolved_policy: ResolvedRetrievalPolicy,
+        retrieval_plan: RetrievalPlan,
+        scored_candidates: list[ScoredCandidate],
+    ) -> ResolvedRetrievalPolicy:
+        """Raise final_context_items to fit every distinct exhaustive member.
+
+        For ``exhaustive_known_set`` mode, count the distinct coverage member
+        keys carried by the scored candidates (using the composer's shared
+        resolution ladder) and raise ``final_context_items`` so each member can
+        be selected. The physical token budget still governs admission via the
+        selector, so members that do not fit become missing_slots, never a crash.
+        This runs before the explicit-cap helper so ablation overrides still win.
+        """
+        if retrieval_plan.coverage_mode != "exhaustive_known_set":
+            return resolved_policy
+        member_keys: set[str] = set()
+        for candidate in scored_candidates:
+            member_keys |= ContextComposer._coverage_member_keys(candidate)
+        distinct_member_count = len(member_keys)
+        if distinct_member_count <= 0:
+            return resolved_policy
+        target_items = min(
+            len(scored_candidates),
+            max(
+                resolved_policy.retrieval_params.final_context_items,
+                distinct_member_count,
             ),
         )
         if target_items <= resolved_policy.retrieval_params.final_context_items:
@@ -2578,13 +2932,10 @@ class RetrievalPipeline:
         self,
         *,
         conversation_context: ExtractionConversationContext,
-        retrieval_plan: RetrievalPlan,
-        workspace_rollup: dict[str, Any] | None,
         ablation: AblationConfig,
     ) -> dict[str, Any] | None:
         if ablation.skip_workspace_rollup:
             return None
-        _ = retrieval_plan, workspace_rollup
         if (
             conversation_context.incognito
             or not conversation_context.remember_across_chats

@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
 from benchmarks.atagia_bench.adapter import (
     AtagiaBenchAdapter,
+    AtagiaBenchConversation,
     AtagiaBenchDataset,
+    AtagiaBenchPersona,
+    AtagiaBenchPersonaData,
     AtagiaBenchQuestion,
 )
 from benchmarks.atagia_bench.graders import GradeResult
@@ -12,6 +21,7 @@ from benchmarks.atagia_bench.runner import (
     AtagiaBenchRunner,
     AtagiaQuestionResult,
 )
+from benchmarks.scorer import LLMJudgeScorer
 from benchmarks.trusted_eval import (
     TRUSTED_EVALUATION_PROMPT_NOTE,
     TRUSTED_EVALUATION_PRIVACY_OFF_PROMPT_NOTE,
@@ -20,7 +30,13 @@ from benchmarks.trusted_eval import (
 )
 from atagia.models.schemas_memory import RetrievalTrace
 from atagia.models.schemas_replay import AblationConfig
-from atagia.services.llm_client import LLMError
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMCompletionResponse,
+    LLMError,
+    LLMProvider,
+)
 
 
 def _bucket(
@@ -131,6 +147,155 @@ def _question() -> AtagiaBenchQuestion:
         evidence_turn_ids=["turn_1"],
         grader="exact_match",
     )
+
+
+def _persona_data(question: AtagiaBenchQuestion | None = None) -> AtagiaBenchPersonaData:
+    return AtagiaBenchPersonaData(
+        persona=AtagiaBenchPersona(
+            persona_id="persona_1",
+            display_name="Persona One",
+            age=30,
+            occupation="tester",
+            profile="profile",
+            assistant_modes=["general_qa"],
+            conversation_count=1,
+            test_scenarios=[],
+        ),
+        conversations=[
+            AtagiaBenchConversation(
+                conversation_id="cnv_1",
+                assistant_mode_id="general_qa",
+                timestamp_base="2026-01-01T00:00:00Z",
+            )
+        ],
+        questions=[question or _question()],
+    )
+
+
+class _FakeClock:
+    def now(self) -> datetime:
+        return datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+class _RawTimeoutChatEngine:
+    runtime = SimpleNamespace(clock=_FakeClock())
+
+    async def chat(self, **kwargs: object) -> object:
+        raise httpx.ReadTimeout(
+            "chat read timed out",
+            request=httpx.Request("POST", "https://provider.test/chat"),
+        )
+
+
+class _SuccessfulChatEngine:
+    runtime = SimpleNamespace(clock=_FakeClock())
+
+    async def chat(self, **kwargs: object) -> object:
+        return SimpleNamespace(
+            response_text="Answer",
+            composed_context=SimpleNamespace(selected_memory_ids=[]),
+            debug={},
+            retrieval_event_id="ret_1",
+        )
+
+
+class _RawTimeoutProvider(LLMProvider):
+    name = "raw-timeout"
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        raise httpx.ReadTimeout(
+            "judge read timed out",
+            request=httpx.Request("POST", "https://provider.test/chat"),
+        )
+
+
+def _runner() -> AtagiaBenchRunner:
+    return AtagiaBenchRunner(
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+    )
+
+
+def _question_run_kwargs(
+    question: AtagiaBenchQuestion,
+) -> dict[str, object]:
+    return {
+        "user_id": "bench-user",
+        "persona_data": _persona_data(question),
+        "question": question,
+        "ablation": None,
+        "turn_message_ids": {"turn_1": "msg_1"},
+        "trusted_evaluation": False,
+        "trusted_activation_count": 0,
+    }
+
+
+def _raw_timeout_judge() -> LLMJudgeScorer:
+    return LLMJudgeScorer(
+        LLMClient(
+            provider_name="raw-timeout",
+            providers=[_RawTimeoutProvider()],
+        ),
+        judge_model="judge-model",
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_question_tolerates_raw_transport_timeout_in_chat() -> None:
+    runner = _runner()
+    question = _question()
+
+    result = await runner._run_question(
+        _RawTimeoutChatEngine(),
+        judge=_raw_timeout_judge(),
+        **_question_run_kwargs(question),
+    )
+
+    assert result.grade.passed is False
+    assert result.grade.score == 0.0
+    assert "Retrieval failed" in result.grade.reason
+    assert "ReadTimeout" in result.grade.reason
+    assert result.trace["failure_stage"] == "retrieval"
+    assert result.trace["diagnosis_bucket"] == "retrieval_failed"
+    assert result.trace["retrieval_failure"]["exception_class"] == "ReadTimeout"
+
+
+@pytest.mark.asyncio
+async def test_run_question_tolerates_raw_transport_timeout_in_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    question = _question().model_copy(
+        update={
+            "answer_type": "llm_judge",
+            "grader": "llm_judge",
+        },
+    )
+
+    async def fake_trace(*args: object, **kwargs: object) -> dict[str, object]:
+        return {
+            "diagnosis_bucket": "answer_policy_or_grading",
+            "sufficiency_diagnostic": "answer_policy_or_grading",
+            "selected_memory_ids": [],
+        }
+
+    monkeypatch.setattr(runner, "_build_question_trace_from_chat_result", fake_trace)
+
+    result = await runner._run_question(
+        _SuccessfulChatEngine(),
+        judge=_raw_timeout_judge(),
+        **_question_run_kwargs(question),
+    )
+
+    assert result.grade.passed is False
+    assert result.grade.score == 0.0
+    assert "Judge call failed" in result.grade.reason
+    assert "ReadTimeout" in result.grade.reason
+    assert result.trace["failure_stage"] == "judge"
+    assert result.trace["diagnosis_bucket"] == "judge_failed"
+    assert result.trace["judge_failure"]["exception_class"] == "ReadTimeout"
 
 
 def test_privacy_off_question_uses_private_fact_as_expected_answer() -> None:

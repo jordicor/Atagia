@@ -47,6 +47,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         site_url: str,
         app_name: str,
         base_url: str | None = None,
+        request_timeout_seconds: float | None = None,
         client: AsyncOpenAI | None = None,
     ) -> None:
         super().__init__(
@@ -56,6 +57,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                 "HTTP-Referer": site_url,
                 "X-Title": app_name,
             },
+            request_timeout_seconds=request_timeout_seconds,
             client=client,
         )
 

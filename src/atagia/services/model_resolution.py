@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import logging
 from typing import Any
 
+from atagia.core.env import env_bool_optional
+
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,8 @@ PROVIDER_SLUG_TO_NAME = {
     "anthropic": "anthropic",
     "openai": "openai",
     "google": "gemini",
+    "kimi": "kimi",
+    "minimax": "minimax",
     "openrouter": "openrouter",
 }
 PROVIDER_NAME_TO_SLUG = {
@@ -23,13 +27,17 @@ PROVIDER_NAME_TO_SLUG = {
     "openai": "openai",
     "gemini": "google",
     "google": "google",
+    "kimi": "kimi",
+    "minimax": "minimax",
     "openrouter": "openrouter",
 }
 SUPPORTED_PROVIDER_SLUGS = tuple(PROVIDER_SLUG_TO_NAME)
 
 DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
 OPENROUTER_FLASH_LITE_MODEL = "openrouter/google/gemini-3.1-flash-lite"
+OPENROUTER_MINIMAX_M3_MODEL = "openrouter/minimax/minimax-m3"
 OPENROUTER_DEEPSEEK_V4_FLASH_MODEL = "openrouter/deepseek/deepseek-v4-flash"
+MINIMAX_M3_MODEL = "minimax/MiniMax-M3"
 DEFAULT_STRUCTURED_OUTPUT_RESCUE_MODEL = "anthropic/claude-opus-4-7"
 
 
@@ -65,6 +73,10 @@ class ComponentSpec:
     @property
     def intimacy_env_var(self) -> str:
         return f"ATAGIA_LLM_INTIMACY_MODEL__{self.component_id.upper()}"
+
+    @property
+    def examples_env_var(self) -> str:
+        return f"ATAGIA_LLM_EXAMPLES__{self.component_id.upper()}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,23 +115,35 @@ INTIMACY_CATEGORY_ENV_VARS = {
 }
 
 COMPONENT_SPECS: tuple[ComponentSpec, ...] = (
-    ComponentSpec("extractor", "ingest", OPENROUTER_FLASH_LITE_MODEL),
-    ComponentSpec("text_chunker", "ingest", OPENROUTER_FLASH_LITE_MODEL),
-    ComponentSpec("compactor", "ingest", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("extractor", "ingest", MINIMAX_M3_MODEL),
+    ComponentSpec("text_chunker", "ingest", MINIMAX_M3_MODEL),
+    ComponentSpec("compactor", "ingest", MINIMAX_M3_MODEL),
     ComponentSpec("summary_privacy_judge", "ingest", "anthropic/claude-sonnet-4-6"),
     ComponentSpec("summary_privacy_refiner", "ingest", "anthropic/claude-sonnet-4-6"),
-    ComponentSpec("belief_reviser", "ingest", OPENROUTER_FLASH_LITE_MODEL),
-    ComponentSpec("contract_projection", "ingest", OPENROUTER_FLASH_LITE_MODEL),
-    ComponentSpec("graph_projection", "ingest", OPENROUTER_FLASH_LITE_MODEL),
-    ComponentSpec("consequence_builder", "ingest", OPENROUTER_FLASH_LITE_MODEL),
-    ComponentSpec("consequence_detector", "ingest", OPENROUTER_FLASH_LITE_MODEL),
-    ComponentSpec("topic_working_set", "ingest", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("belief_reviser", "ingest", MINIMAX_M3_MODEL),
+    ComponentSpec("contract_projection", "ingest", MINIMAX_M3_MODEL),
+    ComponentSpec("graph_projection", "ingest", MINIMAX_M3_MODEL),
+    ComponentSpec("consequence_builder", "ingest", MINIMAX_M3_MODEL),
+    ComponentSpec("consequence_detector", "ingest", MINIMAX_M3_MODEL),
+    ComponentSpec("topic_working_set", "ingest", MINIMAX_M3_MODEL),
     ComponentSpec("consent_confirmation", "ingest", "anthropic/claude-sonnet-4-6"),
-    ComponentSpec("intent_classifier", "ingest", OPENROUTER_FLASH_LITE_MODEL),
-    ComponentSpec("extraction_watchdog", "ingest", OPENROUTER_FLASH_LITE_MODEL),
-    ComponentSpec("initial_context_package_curation", "ingest", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("intent_classifier", "ingest", MINIMAX_M3_MODEL),
+    ComponentSpec("extraction_watchdog", "ingest", MINIMAX_M3_MODEL),
+    ComponentSpec("initial_context_package_curation", "ingest", MINIMAX_M3_MODEL),
     ComponentSpec("export_anonymizer", "ingest", "anthropic/claude-sonnet-4-6"),
-    ComponentSpec("need_detector", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("need_detector_needs", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("need_detector_language", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("need_detector_memory", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("need_detector_exact", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("need_detector_shape", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("need_detector_facets", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("need_detector_callback", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec("need_detector_search_words", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
+    ComponentSpec(
+        "need_detector_search_words_other_language",
+        "retrieval",
+        OPENROUTER_FLASH_LITE_MODEL,
+    ),
     ComponentSpec("coverage_expander", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("applicability_scorer", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
     ComponentSpec("context_staleness", "retrieval", OPENROUTER_FLASH_LITE_MODEL),
@@ -130,6 +154,8 @@ COMPONENT_SPECS: tuple[ComponentSpec, ...] = (
 COMPONENTS_BY_ID = {spec.component_id: spec for spec in COMPONENT_SPECS}
 
 PURPOSE_TO_COMPONENT_ID = {
+    "applicability_date_card": "applicability_scorer",
+    "applicability_relevance_card": "applicability_scorer",
     "applicability_scoring": "applicability_scorer",
     "answer_abstention_legitimacy_verification": "answer_postcondition",
     "answer_evidence_use_verification": "answer_postcondition",
@@ -137,6 +163,12 @@ PURPOSE_TO_COMPONENT_ID = {
     "belief_revision": "belief_reviser",
     "chat_reply": "chat",
     "consequence_detection": "consequence_detector",
+    "consequence_action_card": "consequence_detector",
+    "consequence_gate_card": "consequence_detector",
+    "consequence_language_card": "consequence_detector",
+    "consequence_link_card": "consequence_detector",
+    "consequence_outcome_card": "consequence_detector",
+    "consequence_sentiment_card": "consequence_detector",
     "consequence_tendency_inference": "consequence_builder",
     "consent_confirmation_intent": "consent_confirmation",
     "context_cache_signal_detection": "context_staleness",
@@ -150,19 +182,38 @@ PURPOSE_TO_COMPONENT_ID = {
     "intent_classifier_claim_key_equivalence": "intent_classifier",
     "intent_classifier_explicit": "intent_classifier",
     "memory_extraction": "extractor",
-    "need_detection": "need_detector",
-    "need_detection_degraded_exact_contract_review": "need_detector",
-    "need_detection_multi_facet_exact_review": "need_detector",
-    "need_detection_unknown_only_contract_review": "need_detector",
+    "memory_extraction_candidate_card": "extractor",
+    "memory_extraction_kind_scope_card": "extractor",
+    "memory_extraction_evidence_card": "extractor",
+    "memory_extraction_index_card": "extractor",
+    "memory_extraction_temporal_card": "extractor",
+    "memory_extraction_belief_card": "extractor",
+    "memory_extraction_coverage_members_card": "extractor",
+    "need_detection_needs_card": "need_detector_needs",
+    "need_detection_language_card": "need_detector_language",
+    "need_detection_memory_card": "need_detector_memory",
+    "need_detection_exact_card": "need_detector_exact",
+    "need_detection_shape_card": "need_detector_shape",
+    "need_detection_facets_card": "need_detector_facets",
+    "need_detection_callback_card": "need_detector_callback",
+    "need_detection_search_words_card": "need_detector_search_words",
+    "need_detection_search_words_other_language_card": "need_detector_search_words_other_language",
     "retrieval_surface_generation_dry_run": "coverage_expander",
     "coverage_expansion": "coverage_expander",
-    "summary_chunk_segmentation": "compactor",
+    "summary_chunk_segmentation_ranges_card": "compactor",
+    "summary_chunk_segmentation_summaries_card": "compactor",
     "summary_privacy_gate_judge": "summary_privacy_judge",
     "summary_privacy_gate_refine": "summary_privacy_refiner",
     "text_chunking_level1": "text_chunker",
     "thematic_profile_synthesis": "compactor",
     "topic_working_set_update": "topic_working_set",
-    "user_language_profile_update": "extractor",
+    "topic_working_set_route_card": "topic_working_set",
+    "topic_working_set_content_card": "topic_working_set",
+    "topic_working_set_boundary_card": "topic_working_set",
+    "user_language_profile_observed_card": "extractor",
+    "user_language_profile_preference_card": "extractor",
+    "user_language_profile_ability_card": "extractor",
+    "user_language_profile_norm_card": "extractor",
     "workspace_rollup_synthesis": "compactor",
 }
 
@@ -272,6 +323,37 @@ def intimacy_component_env_models_from_env(env: dict[str, str]) -> dict[str, str
         if value is not None:
             values[spec.component_id] = value
     return values
+
+
+def component_env_examples_from_env(env: dict[str, str]) -> dict[str, bool]:
+    """Return per-component prompt-examples overrides from an env mapping.
+
+    A component is present only when its override is set, so an unset component
+    falls back to the global ``card_examples_enabled`` default.
+    """
+    values: dict[str, bool] = {}
+    for spec in COMPONENT_SPECS:
+        override = env_bool_optional(spec.examples_env_var, env)
+        if override is not None:
+            values[spec.component_id] = override
+    return values
+
+
+def examples_enabled_for_component(settings: Any, component_id: str) -> bool:
+    """Resolve whether a card component should include its few-shot examples.
+
+    Per-component override wins; otherwise the global ``card_examples_enabled``
+    default applies. Few-shot demonstrations reliably help small/local models
+    but can hurt larger or reasoning models, so deployments can drop them per
+    component without maintaining a second prompt set.
+    """
+    if component_id not in COMPONENTS_BY_ID:
+        raise ModelResolutionError(f"Unknown LLM component id: {component_id}")
+    overrides = getattr(settings, "llm_component_examples", {}) or {}
+    override = overrides.get(component_id)
+    if override is not None:
+        return bool(override)
+    return bool(getattr(settings, "card_examples_enabled", True))
 
 
 def resolve_component(settings: Any, component_id: str) -> ResolvedComponentModel:
@@ -507,6 +589,8 @@ def validate_required_provider_keys(settings: Any) -> None:
         "anthropic": getattr(settings, "anthropic_api_key", None),
         "openai": getattr(settings, "openai_api_key", None),
         "google": getattr(settings, "google_api_key", None),
+        "kimi": getattr(settings, "kimi_api_key", None),
+        "minimax": getattr(settings, "minimax_api_key", None),
         "openrouter": getattr(settings, "openrouter_api_key", None),
     }
     missing = [
@@ -518,6 +602,8 @@ def validate_required_provider_keys(settings: Any) -> None:
             "anthropic": "ATAGIA_ANTHROPIC_API_KEY",
             "openai": "ATAGIA_OPENAI_API_KEY",
             "google": "ATAGIA_GOOGLE_API_KEY",
+            "kimi": "ATAGIA_KIMI_API_KEY",
+            "minimax": "ATAGIA_MINIMAX_API_KEY",
             "openrouter": "ATAGIA_OPENROUTER_API_KEY",
         }
         hints = ", ".join(env_names[provider] for provider in missing)
@@ -612,7 +698,7 @@ def _invalid_model_spec_message(value: str, *, env_name: str | None) -> str:
     source = f" in {env_name}" if env_name else ""
     return (
         f"Invalid LLM model spec{source}: {value!r}. Expected provider/model where "
-        "provider is one of {anthropic, openai, google, openrouter}. For OpenRouter "
+        "provider is one of {anthropic, openai, google, kimi, minimax, openrouter}. For OpenRouter "
         "use openrouter/vendor/model (e.g. openrouter/deepseek/deepseek-v4-flash)."
     )
 

@@ -320,6 +320,7 @@ async def _get_context_impl(
     space_id: str | None = None,
     incognito: bool = False,
     response_mode: Literal["normal", "fast", "smart_fast"] | None = None,
+    adaptive_retrieval: bool | None = None,
 ) -> str:
     """Retrieve relevant memories for a message as a JSON string."""
     resolved_conversation_id = await _ensure_conversation_id(
@@ -358,6 +359,7 @@ async def _get_context_impl(
         incognito=incognito,
         ablation=AblationConfig(disable_context_cache=True),
         response_mode=response_mode,
+        adaptive_retrieval=adaptive_retrieval,
     )
     return json.dumps(
         {
@@ -382,6 +384,7 @@ async def _get_context_impl(
             "detected_needs": context.detected_needs,
             "stage_timings": context.stage_timings,
             "response_mode": context.response_mode,
+            "adaptive_retrieval": context.adaptive_retrieval,
             "memory_processing": (
                 None
                 if context.memory_processing is None
@@ -1177,6 +1180,7 @@ async def atagia_get_context(
     space_id: str | None = None,
     incognito: bool = False,
     response_mode: Literal["normal", "fast", "smart_fast"] | None = None,
+    adaptive_retrieval: bool | None = None,
     ctx: Context[ServerSession, AtagiaContext] | None = None,
 ) -> str:
     """Retrieve relevant memories for a message. Returns enriched context."""
@@ -1211,6 +1215,7 @@ async def atagia_get_context(
             space_id=space_id or ctx.request_context.lifespan_context.space_id,
             incognito=incognito or ctx.request_context.lifespan_context.incognito,
             response_mode=response_mode,
+            adaptive_retrieval=adaptive_retrieval,
         )
     except _EXPECTED_TOOL_ERRORS as exc:
         return _tool_error(exc)

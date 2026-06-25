@@ -24,4 +24,5 @@ def benchmark_activation_flags(
         "embedding_backend": str(embedding_backend or settings.embedding_backend),
         "graph_projection_enabled": settings.graph_projection_enabled,
         "response_mode": settings.response_mode,
+        "adaptive_retrieval": settings.adaptive_retrieval,
     }

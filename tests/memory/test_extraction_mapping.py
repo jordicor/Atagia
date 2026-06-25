@@ -138,7 +138,9 @@ def test_mapper_applies_server_side_defaults() -> None:
     assert evidence.memory_category is MemoryCategory.UNKNOWN
     assert evidence.informational_mention is None
     assert evidence.subject_presence_ids == []
-    assert evidence.payload == {}
+    # coverage_members is always emitted as the key-presence processed marker;
+    # an evidence candidate with no enumerable members defaults to [].
+    assert evidence.payload == {"coverage_members": []}
     assert evidence.trigger_message_ids == []
     assert evidence.trigger_quote is None
     assert evidence.support_rationale is None

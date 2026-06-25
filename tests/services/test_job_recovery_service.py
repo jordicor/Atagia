@@ -212,6 +212,83 @@ async def test_recovery_requeues_nonterminal_jobs_into_inprocess_streams(
 
 
 @pytest.mark.asyncio
+async def test_recovery_preserves_future_deferred_jobs(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc))
+    backend = InProcessBackend()
+    try:
+        await UserRepository(connection, clock).create_user("usr_1")
+        await _insert_assistant_mode(connection)
+        conversation = await ConversationRepository(connection, clock).create_conversation(
+            "cnv_1",
+            "usr_1",
+            None,
+            "coding_debug",
+            "Tracked chat",
+            platform_id="aurvek",
+        )
+        messages = MessageRepository(connection, clock)
+        await messages.create_message(
+            "aurvek:msg:1",
+            "cnv_1",
+            "user",
+            1,
+            "First message.",
+        )
+        jobs = JobRunRepository(connection, clock)
+        await jobs.create_queued_job(
+            job_id="job_extract_deferred",
+            stream_name=EXTRACT_STREAM_NAME,
+            job_type=JobType.EXTRACT_MEMORY_CANDIDATES.value,
+            user_id="usr_1",
+            conversation_id=str(conversation["id"]),
+            source_message_ids=["aurvek:msg:1"],
+            source_token_estimate=12,
+            size_bucket="small",
+            metadata={"operational_profile": "normal"},
+            platform_id="aurvek",
+        )
+        await jobs.mark_running("job_extract_deferred", attempt_count=1)
+        await jobs.mark_retrying(
+            "job_extract_deferred",
+            attempt_count=1,
+            error_class="TransientLLMError",
+            error_message="provider unavailable",
+            deferred_until="2026-05-05T12:02:00+00:00",
+        )
+
+        result = await JobRecoveryService(
+            connection,
+            clock,
+            settings=settings,
+            storage_backend=backend,
+            operational_profile_loader=OperationalProfileLoader(
+                settings.operational_profiles_dir()
+            ),
+        ).recover_inprocess_stream_jobs()
+        immediate = await backend.stream_read(
+            EXTRACT_STREAM_NAME,
+            WORKER_GROUP_NAME,
+            "test",
+            count=10,
+            block_ms=0,
+        )
+        recovered_job = await jobs.get_job("job_extract_deferred")
+
+        assert result.recovered_jobs == 1
+        assert immediate == []
+        assert len(backend._stream_deferred[EXTRACT_STREAM_NAME]) == 1
+        assert recovered_job is not None
+        assert recovered_job["status"] == JobRunStatus.RETRYING.value
+        assert recovered_job["deferred_until"] == "2026-05-05T12:02:00+00:00"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_recovery_requeues_initial_context_package_refresh_jobs(
     tmp_path: Path,
 ) -> None:

@@ -7,6 +7,7 @@ import inspect
 import json
 from typing import Any
 
+import httpx
 from openai import (
     APIConnectionError,
     APIError,
@@ -30,6 +31,7 @@ from atagia.services.llm_client import (
     LLMStreamEvent,
     OutputLimitExceededError,
     TransientLLMError,
+    retry_after_seconds_from_exception,
 )
 from atagia.services.llm_schema import (
     has_json_schema_nullability,
@@ -74,7 +76,10 @@ def _status_error_to_llm_error(exc: APIStatusError) -> LLMError:
     transient client-request-class 4xx as a typed ``LLMRequestError``.
     """
     if _is_transient_status_error(exc):
-        return TransientLLMError(str(exc))
+        return TransientLLMError(
+            str(exc),
+            retry_after_seconds=retry_after_seconds_from_exception(exc),
+        )
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int) and 400 <= status_code < 500:
         return LLMRequestError(str(exc), status_code=status_code)
@@ -206,6 +211,13 @@ def _empty_content_error(
     label = finish_reason or "unknown"
     return TransientLLMError(
         f"{provider_name} returned no output content (finish_reason={label})"
+    )
+
+
+def _transient_error(exc: BaseException) -> TransientLLMError:
+    return TransientLLMError(
+        str(exc),
+        retry_after_seconds=retry_after_seconds_from_exception(exc),
     )
 
 
@@ -371,24 +383,25 @@ class OpenAICompatibleProvider(LLMProvider):
         base_url: str | None = None,
         embedding_base_url: str | None = None,
         default_headers: dict[str, str] | None = None,
+        request_timeout_seconds: float | None = None,
         client: AsyncOpenAI | None = None,
         embedding_client: AsyncOpenAI | None = None,
     ) -> None:
-        self._client = client or AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            default_headers=default_headers,
-            max_retries=0,
-        )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "default_headers": default_headers,
+            "max_retries": 0,
+        }
+        if request_timeout_seconds is not None:
+            client_kwargs["timeout"] = request_timeout_seconds
+        self._client = client or AsyncOpenAI(**client_kwargs)
         if embedding_client is not None:
             self._embedding_client = embedding_client
         elif embedding_base_url is not None and embedding_base_url != base_url:
-            self._embedding_client = AsyncOpenAI(
-                api_key=api_key,
-                base_url=embedding_base_url,
-                default_headers=default_headers,
-                max_retries=0,
-            )
+            embedding_client_kwargs = dict(client_kwargs)
+            embedding_client_kwargs["base_url"] = embedding_base_url
+            self._embedding_client = AsyncOpenAI(**embedding_client_kwargs)
         else:
             self._embedding_client = self._client
 
@@ -483,12 +496,14 @@ class OpenAICompatibleProvider(LLMProvider):
         except json.JSONDecodeError as exc:
             raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
-            raise TransientLLMError(str(exc)) from exc
+            raise _transient_error(exc) from exc
+        except (httpx.TransportError, TimeoutError, ConnectionError) as exc:
+            raise _transient_error(exc) from exc
         except APIStatusError as exc:
             raise _status_error_to_llm_error(exc) from exc
         except APIError as exc:
             if _is_transient_api_error(exc):
-                raise TransientLLMError(str(exc)) from exc
+                raise _transient_error(exc) from exc
             raise LLMError(str(exc)) from exc
         return self._map_completion_response(request, response)
 
@@ -506,12 +521,14 @@ class OpenAICompatibleProvider(LLMProvider):
         except json.JSONDecodeError as exc:
             raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
-            raise TransientLLMError(str(exc)) from exc
+            raise _transient_error(exc) from exc
+        except (httpx.TransportError, TimeoutError, ConnectionError) as exc:
+            raise _transient_error(exc) from exc
         except APIStatusError as exc:
             raise _status_error_to_llm_error(exc) from exc
         except APIError as exc:
             if _is_transient_api_error(exc):
-                raise TransientLLMError(str(exc)) from exc
+                raise _transient_error(exc) from exc
             raise LLMError(str(exc)) from exc
 
         vectors = [
@@ -531,12 +548,14 @@ class OpenAICompatibleProvider(LLMProvider):
         except json.JSONDecodeError as exc:
             raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
-            raise TransientLLMError(str(exc)) from exc
+            raise _transient_error(exc) from exc
+        except (httpx.TransportError, TimeoutError, ConnectionError) as exc:
+            raise _transient_error(exc) from exc
         except APIStatusError as exc:
             raise _status_error_to_llm_error(exc) from exc
         except APIError as exc:
             if _is_transient_api_error(exc):
-                raise TransientLLMError(str(exc)) from exc
+                raise _transient_error(exc) from exc
             raise LLMError(str(exc)) from exc
 
         usage: dict[str, Any] = {}
@@ -612,12 +631,14 @@ class OpenAICompatibleProvider(LLMProvider):
                 if pending_error is not None:
                     break
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
-            raise TransientLLMError(str(exc)) from exc
+            raise _transient_error(exc) from exc
+        except (httpx.TransportError, TimeoutError, ConnectionError) as exc:
+            raise _transient_error(exc) from exc
         except APIStatusError as exc:
             raise _status_error_to_llm_error(exc) from exc
         except APIError as exc:
             if _is_transient_api_error(exc):
-                raise TransientLLMError(str(exc)) from exc
+                raise _transient_error(exc) from exc
             raise LLMError(str(exc)) from exc
         finally:
             await _close_provider_stream(stream)

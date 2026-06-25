@@ -54,28 +54,9 @@ def _patch_migration_manager(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_extraction_retries_when_language_codes_are_missing_and_echoes_validation_error() -> None:
+async def test_extraction_normalizes_card_language_codes() -> None:
     provider = SequencedExtractionProvider(
         [
-            {
-                "evidences": [
-                    {
-                        "canonical_text": "Tengo alergia a la penicilina.",
-                        "scope": "conversation",
-                        "confidence": 0.91,
-                        "source_kind": "extracted",
-                        "privacy_level": 0,
-                        "payload": {},
-                        "temporal_type": "permanent",
-                        "temporal_confidence": 0.8,
-                    }
-                ],
-                "beliefs": [],
-                "contract_signals": [],
-                "state_updates": [],
-                "mode_guess": None,
-                "nothing_durable": False,
-            },
             {
                 "evidences": [
                     {
@@ -116,13 +97,16 @@ async def test_extraction_retries_when_language_codes_are_missing_and_echoes_val
             resolved_policy=resolved_policy,
         )
 
-        assert len(sequenced_provider.requests) == 2
-        retry_message = sequenced_provider.requests[1].messages[-1].content
-        assert (
-            "language_codes must contain at least one ISO 639-1 code for the language of canonical_text"
-            in retry_message
-        )
-        assert "```" not in retry_message
+        assert len(sequenced_provider.requests) == 7
+        assert [request.metadata.get("purpose") for request in sequenced_provider.requests] == [
+            "memory_extraction_candidate_card",
+            "memory_extraction_kind_scope_card",
+            "memory_extraction_evidence_card",
+            "memory_extraction_index_card",
+            "memory_extraction_temporal_card",
+            "memory_extraction_belief_card",
+            "memory_extraction_coverage_members_card",
+        ]
         assert result.evidences[0].language_codes == ["es"]
     finally:
         await connection.close()

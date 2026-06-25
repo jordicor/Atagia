@@ -28,6 +28,10 @@ class FakeRedisDrainClient:
         del stream_name
         return 0
 
+    async def zcard(self, key: str) -> int:
+        del key
+        return 0
+
     async def aclose(self) -> None:
         return None
 
@@ -187,6 +191,7 @@ class FakeRedisPurgeClient:
         }
         self.acked: list[tuple[str, str, str]] = []
         self.deleted: list[tuple[str, str]] = []
+        self._sorted_sets: dict[str, dict[str, float]] = {}
 
     async def scan_iter(self, match: str = "*"):
         for key in [*self._lists, *self._streams]:
@@ -234,11 +239,120 @@ class FakeRedisPurgeClient:
         ]
         return 1
 
+    async def zrange(self, key: str, start: int, end: int) -> list[str]:
+        del start, end
+        return list(self._sorted_sets.get(key, {}))
+
+    async def zrem(self, key: str, member: str) -> int:
+        members = self._sorted_sets.get(key)
+        if members is None or member not in members:
+            return 0
+        members.pop(member, None)
+        return 1
+
+
+class FakeRedisDeferredClient:
+    def __init__(self, *, fail_promotion: bool = False) -> None:
+        self._streams: dict[str, list[tuple[str, dict[str, str]]]] = {}
+        self._sorted_sets: dict[str, dict[str, float]] = {}
+        self._groups: set[tuple[str, str]] = set()
+        self._next_stream_id = 1
+        self.eval_calls: list[tuple[str, int, tuple[object, ...]]] = []
+        self.fail_promotion = fail_promotion
+
+    async def xgroup_create(
+        self,
+        *,
+        name: str,
+        groupname: str,
+        id: str,
+        mkstream: bool,
+    ) -> None:
+        del id, mkstream
+        self._groups.add((name, groupname))
+        self._streams.setdefault(name, [])
+
+    async def eval(self, script: str, numkeys: int, *args: object) -> int:
+        self.eval_calls.append((script, numkeys, args))
+        keys = [str(value) for value in args[:numkeys]]
+        argv = [str(value) for value in args[numkeys:]]
+        script_lower = script.lower()
+        if "xack" in script_lower and "zadd" in script_lower:
+            deferred_key = keys[1]
+            member = argv[2]
+            score = float(argv[3])
+            self._sorted_sets.setdefault(deferred_key, {})[member] = score
+            return 1
+        if "zrangebyscore" in script_lower and "xadd" in script_lower:
+            if self.fail_promotion:
+                raise RuntimeError("xadd failed")
+            deferred_key, stream_name = keys
+            now = float(argv[0])
+            limit = int(argv[1])
+            candidates = [
+                (score, member)
+                for member, score in self._sorted_sets.get(deferred_key, {}).items()
+                if score <= now
+            ]
+            candidates.sort(key=lambda item: item[0])
+            promoted = 0
+            for _score, member in candidates[:limit]:
+                decoded = json.loads(member)
+                payload_json = decoded.get("payload_json")
+                if not isinstance(payload_json, str):
+                    self._sorted_sets.get(deferred_key, {}).pop(member, None)
+                    continue
+                message_id = f"{self._next_stream_id}-0"
+                self._next_stream_id += 1
+                self._streams.setdefault(stream_name, []).append(
+                    (
+                        message_id,
+                        {"payload": payload_json},
+                    )
+                )
+                self._sorted_sets.get(deferred_key, {}).pop(member, None)
+                promoted += 1
+            return promoted
+        raise AssertionError("Unexpected Redis eval script")
+
+    async def xreadgroup(
+        self,
+        *,
+        groupname: str,
+        consumername: str,
+        streams: dict[str, str],
+        count: int,
+        block: int | None,
+    ) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
+        del groupname, consumername, block
+        stream_name = next(iter(streams))
+        entries = self._streams.get(stream_name, [])[:count]
+        self._streams[stream_name] = self._streams.get(stream_name, [])[count:]
+        return [(stream_name, entries)] if entries else []
+
+    async def zcard(self, key: str) -> int:
+        return len(self._sorted_sets.get(key, {}))
+
+    async def zrange(self, key: str, start: int, end: int) -> list[str]:
+        del start, end
+        return list(self._sorted_sets.get(key, {}))
+
+    async def zrem(self, key: str, member: str) -> int:
+        members = self._sorted_sets.get(key)
+        if members is None or member not in members:
+            return 0
+        members.pop(member, None)
+        return 1
+
 
 def _drain_backend(states: list[tuple[int, int]]) -> RedisBackend:
     backend = object.__new__(RedisBackend)
     backend._client = FakeRedisDrainClient(states)
     backend._stream_groups = {("atagia:test", "atagia-workers")}
+    backend._stream_add_counts = {}
+    backend._stream_read_counts = {}
+    backend._stream_claim_counts = {}
+    backend._stream_ack_counts = {}
     return backend
 
 
@@ -253,6 +367,17 @@ def _purge_backend() -> RedisBackend:
     backend = object.__new__(RedisBackend)
     backend._client = FakeRedisPurgeClient()
     backend._stream_groups = set()
+    return backend
+
+
+def _deferred_backend(*, fail_promotion: bool = False) -> RedisBackend:
+    backend = object.__new__(RedisBackend)
+    backend._client = FakeRedisDeferredClient(fail_promotion=fail_promotion)
+    backend._stream_groups = set()
+    backend._stream_add_counts = {}
+    backend._stream_read_counts = {}
+    backend._stream_claim_counts = {}
+    backend._stream_ack_counts = {}
     return backend
 
 
@@ -416,6 +541,70 @@ async def test_redis_backend_purge_user_jobs_scans_persisted_streams_without_reg
     assert [message_id for message_id, _fields in backend._client._streams["atagia:extract"]] == ["2-0"]
     assert backend._client.acked == [("atagia:extract", "atagia-workers", "1-0")]
     assert backend._client.deleted == [("atagia:extract", "1-0")]
+
+
+@pytest.mark.asyncio
+async def test_redis_backend_stream_defer_promotes_due_message_atomically() -> None:
+    backend = _deferred_backend()
+
+    await backend.stream_defer(
+        "atagia:test",
+        "atagia-workers",
+        "1-0",
+        {
+            "job_id": "job_1",
+            "recent_messages": [],
+            "source_message_ids": [],
+        },
+        delay_seconds=0,
+    )
+
+    assert await backend._client.zcard("stream_deferred:atagia:test") == 1
+    assert backend._stream_ack_counts == {"atagia:test": 1}
+
+    messages = await backend.stream_read(
+        "atagia:test",
+        "atagia-workers",
+        "consumer-1",
+        count=1,
+        block_ms=0,
+    )
+
+    assert [message.payload for message in messages] == [
+        {
+            "job_id": "job_1",
+            "recent_messages": [],
+            "source_message_ids": [],
+        }
+    ]
+    assert await backend._client.zcard("stream_deferred:atagia:test") == 0
+    assert backend._stream_add_counts == {"atagia:test": 1}
+    assert len(backend._client.eval_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_redis_backend_stream_defer_keeps_due_message_when_promotion_fails() -> None:
+    backend = _deferred_backend(fail_promotion=True)
+
+    await backend.stream_defer(
+        "atagia:test",
+        "atagia-workers",
+        "1-0",
+        {"job_id": "job_1"},
+        delay_seconds=0,
+    )
+
+    with pytest.raises(RuntimeError, match="xadd failed"):
+        await backend.stream_read(
+            "atagia:test",
+            "atagia-workers",
+            "consumer-1",
+            count=1,
+            block_ms=0,
+        )
+
+    assert await backend._client.zcard("stream_deferred:atagia:test") == 1
+    assert backend._stream_add_counts == {}
 
 
 @pytest.mark.asyncio

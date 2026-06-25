@@ -1871,6 +1871,7 @@ def test_namespace_scope_clauses_emits_chat_only_when_incognito() -> None:
     )
     assert len(clauses) == 1
     assert "scope_canonical = 'chat'" in clauses[0]
+    assert "user_persona_id IS NULL" in clauses[0]
     assert parameters == [None, "cnv_1"]
 
 
@@ -1885,6 +1886,7 @@ def test_namespace_scope_clauses_emits_chat_only_when_cross_chat_disabled() -> N
     )
     assert len(clauses) == 1
     assert "scope_canonical = 'chat'" in clauses[0]
+    assert "user_persona_id IS NULL" in clauses[0]
 
 
 def test_namespace_scope_clauses_drops_character_when_id_missing() -> None:
@@ -1913,6 +1915,8 @@ def test_namespace_scope_clauses_emits_all_three_when_eligible() -> None:
     )
     assert len(clauses) == 3
     assert "scope_canonical = 'chat'" in clauses[0]
+    assert "user_persona_id IS NULL" in clauses[0]
+    assert "conversation_id = ?" in clauses[0]
     assert "scope_canonical = 'character'" in clauses[1]
     assert "scope_canonical = 'user'" in clauses[2]
     # Each clause produces the parameters expected by the OR-combination.

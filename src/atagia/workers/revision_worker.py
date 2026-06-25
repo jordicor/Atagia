@@ -15,7 +15,7 @@ from atagia.core.config import Settings
 from atagia.core.locking import acquire_belief_lock, belief_lock_key
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
 from atagia.core.storage_backend import StorageBackend
-from atagia.memory.belief_reviser import BeliefReviser, RevisionContext
+from atagia.memory.belief_reviser import BeliefReviser, ClaimKeyMismatchError, RevisionContext
 from atagia.memory.intent_classifier import are_claim_keys_equivalent, is_explicit_user_statement
 from atagia.memory.scope_utils import resolve_scope_identifiers
 from atagia.models.schemas_jobs import (
@@ -371,7 +371,10 @@ class RevisionWorker:
                 user_id=payload.user_id,
             )
             threshold_payload = payload.model_copy(update={"evidence_memory_ids": accumulated_evidence_ids})
-            threshold_preview = await self._preview_belief_revision(threshold_payload)
+            try:
+                threshold_preview = await self._preview_belief_revision(threshold_payload)
+            except ClaimKeyMismatchError as exc:
+                return self._claim_key_mismatch_skip(exc)
             try:
                 popped_evidence_ids = await self._belief_repository.pop_tension_evidence_ids(
                     payload.belief_id,
@@ -397,7 +400,10 @@ class RevisionWorker:
             result["tension_score"] = 0.0
             return result
 
-        preview_decision = await self._preview_belief_revision(payload)
+        try:
+            preview_decision = await self._preview_belief_revision(payload)
+        except ClaimKeyMismatchError as exc:
+            return self._claim_key_mismatch_skip(exc)
         if preview_decision.action.value != "REINFORCE":
             await self._belief_repository.add_tension_evidence_ids(
                 payload.belief_id,
@@ -426,7 +432,10 @@ class RevisionWorker:
                 user_id=payload.user_id,
             )
             threshold_payload = payload.model_copy(update={"evidence_memory_ids": accumulated_evidence_ids})
-            threshold_preview = await self._preview_belief_revision(threshold_payload)
+            try:
+                threshold_preview = await self._preview_belief_revision(threshold_payload)
+            except ClaimKeyMismatchError as exc:
+                return self._claim_key_mismatch_skip(exc)
             try:
                 popped_evidence_ids = await self._belief_repository.pop_tension_evidence_ids(
                     payload.belief_id,
@@ -457,6 +466,31 @@ class RevisionWorker:
         result["signal_type"] = signal_type
         result["tension_score"] = tension_score
         return result
+
+    @staticmethod
+    def _claim_key_mismatch_skip(exc: ClaimKeyMismatchError) -> dict[str, Any]:
+        """Build the skip status for a defensive claim-key mismatch at preview.
+
+        Defense-in-depth only: Layer (b) trusts the match on every live revision
+        path, so this fires only if a future caller reaches preview with the bit
+        unset and the non-deterministic equivalence flips. Preserve the tension
+        buffer (do not pop/reset), surface the anomaly, and convert a fatal abort
+        into a bounded per-belief skip.
+        """
+        logger.warning(
+            "Skipping belief revision: claim_key not equivalent at preview "
+            "for belief_id=%s current_claim_key=%s payload_claim_key=%s "
+            "(tension buffer preserved)",
+            exc.belief_id,
+            exc.current_claim_key,
+            exc.payload_claim_key,
+        )
+        return {
+            "status": "skipped_claim_key_mismatch",
+            "belief_id": exc.belief_id,
+            "current_claim_key": exc.current_claim_key,
+            "payload_claim_key": exc.payload_claim_key,
+        }
 
     async def _execute_belief_revision(
         self,
@@ -523,6 +557,7 @@ class RevisionWorker:
                 scope=MemoryScope(payload.scope),
                 isolated_mode=payload.isolated_mode,
             ),
+            claim_key_already_validated=payload.claim_key_already_validated,
         )
 
     async def _post_revision_tension_update(
@@ -560,7 +595,12 @@ class RevisionWorker:
         existing_belief_id = self._select_external_belief_id(active_beliefs, payload)
         if existing_belief_id is not None:
             return await self._revise_existing_belief(
-                payload.model_copy(update={"belief_id": existing_belief_id}),
+                payload.model_copy(
+                    update={
+                        "belief_id": existing_belief_id,
+                        "claim_key_already_validated": True,
+                    }
+                ),
             )
 
         if same_message_beliefs and explicit_user_statement:

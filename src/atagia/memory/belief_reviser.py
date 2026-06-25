@@ -46,6 +46,30 @@ from atagia.services.model_resolution import resolve_component_model
 STABILITY_DELTA_PER_EVIDENCE = 0.03
 logger = logging.getLogger(__name__)
 
+
+class ClaimKeyMismatchError(Exception):
+    """Revision claim_key is not semantically equivalent to the belief claim_key.
+
+    Deliberately NOT part of the LLMError hierarchy: a claim-key mismatch is a
+    semantic binding inconsistency, not an LLM transport/output failure. Callers
+    that have already validated the match (the only live revision path) catch this
+    to convert a catastrophic whole-ingest abort into a bounded per-belief skip.
+    """
+
+    def __init__(
+        self,
+        *,
+        belief_id: str,
+        current_claim_key: str,
+        payload_claim_key: str,
+    ) -> None:
+        self.belief_id = belief_id
+        self.current_claim_key = current_claim_key
+        self.payload_claim_key = payload_claim_key
+        super().__init__(
+            "Revision claim_key is not semantically equivalent to the current belief claim_key"
+        )
+
 REVISION_PROMPT_TEMPLATE = """You are deciding how an assistant memory belief should revise in light of new evidence.
 
 Return JSON only, matching the schema exactly.
@@ -222,10 +246,13 @@ class BeliefReviser:
         belief_id: str,
         new_evidence: list[dict[str, Any]],
         context: RevisionContext | dict[str, Any],
+        *,
+        claim_key_already_validated: bool = False,
     ) -> RevisionDecision:
         revision_context, belief_row, current_version = await self._load_revision_state(
             belief_id,
             context,
+            validate_claim_key=not claim_key_already_validated,
         )
         return await self._decide_action(
             belief_id=belief_id,
@@ -280,8 +307,10 @@ class BeliefReviser:
             str(current_version["claim_key"]),
             revision_context.claim_key,
         ):
-            raise ValueError(
-                "Revision claim_key is not semantically equivalent to the current belief claim_key"
+            raise ClaimKeyMismatchError(
+                belief_id=belief_id,
+                current_claim_key=str(current_version["claim_key"]),
+                payload_claim_key=revision_context.claim_key,
             )
         return revision_context, belief_row, current_version
 

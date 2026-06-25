@@ -39,6 +39,7 @@ from atagia.memory.policy_manifest import (
 from atagia.models.schemas_api import MemorySummary
 from atagia.models.schemas_cache import ContextCacheEntry
 from atagia.models.schemas_memory import (
+    AdaptiveGateStatus,
     ComposedContext,
     RequestRuntimeDiagnosticsTrace,
     ResolvedOperationalProfile,
@@ -176,6 +177,7 @@ class ContextCacheService:
         authenticated_user_privilege_level: str | None = None,
         authenticated_user_is_atagia_master: bool = False,
         response_mode: ResponseMode = ResponseMode.NORMAL,
+        adaptive_retrieval: bool = False,
     ) -> AdaptiveContextResolution:
         cache_generation = await self.runtime.storage_backend.get_cache_generation(
             cache_generation_key(self.runtime.database_path, user_id)
@@ -351,6 +353,7 @@ class ContextCacheService:
                 stored_messages=current_messages,
                 operational_profile=resolved_operational_profile,
                 trace=retrieval_trace,
+                adaptive_retrieval=adaptive_retrieval,
             )
         except Exception as exc:
             db_diagnostics.record_exception(exc)
@@ -358,12 +361,28 @@ class ContextCacheService:
         finally:
             sqlite_restore.restore()
         memory_summaries = build_memory_summaries(pipeline_result)
+        gate_skipped = (
+            pipeline_result.adaptive_gate_status is AdaptiveGateStatus.SKIPPED
+        )
         retrieval_diagnostics_for_guard = self._guard_retrieval_diagnostics(
             pipeline_result
         )
+        # The persisted ``source_retrieval_plan`` is round-tripped through the
+        # strict ``RetrievalPlan`` model by the inspector (``extra="forbid"``), so
+        # it must stay a clean plan dump. The adaptive-gate block lives only on
+        # ``retrieval_diagnostics_for_guard`` (never re-parsed into a strict
+        # model), which is where the answer guard and bench scorer read it.
+        source_retrieval_plan = pipeline_result.retrieval_plan.model_dump(
+            mode="json"
+        )
+        # D6 (cache poisoning protection): a gate-skipped turn composed only the
+        # contract block, never real memory context. Writing it would let a
+        # contract-only view overwrite a good cached memory context, so a
+        # skipped turn never produces a pending cache entry (the cache-hit reuse
+        # path already ran above and is untouched).
         pending_entry: ContextCacheEntry | None = None
         cache_ttl_seconds: int | None = None
-        if cache_allowed:
+        if cache_allowed and not gate_skipped:
             pending_entry = ContextCacheEntry(
                 cache_key=cache_key,
                 user_id=user_id,
@@ -379,9 +398,7 @@ class ContextCacheService:
                 detected_needs=[
                     need.need_type.value for need in pipeline_result.detected_needs
                 ],
-                source_retrieval_plan=pipeline_result.retrieval_plan.model_dump(
-                    mode="json"
-                ),
+                source_retrieval_plan=source_retrieval_plan,
                 retrieval_diagnostics_for_guard=retrieval_diagnostics_for_guard,
                 selected_memory_ids=list(
                     pipeline_result.composed_context.selected_memory_ids
@@ -419,9 +436,7 @@ class ContextCacheService:
             cache_source="sync",
             need_detection_skipped=False,
             cache_key=cache_key,
-            source_retrieval_plan=pipeline_result.retrieval_plan.model_dump(
-                mode="json"
-            ),
+            source_retrieval_plan=source_retrieval_plan,
             scored_candidates=[
                 candidate.model_dump(mode="json")
                 for candidate in pipeline_result.scored_candidates
@@ -591,11 +606,20 @@ class ContextCacheService:
                 items_dropped=0,
             )
         warm_present = warmed_entry is not None
+        # D8: the fast path never calls the need detector, so the gate never
+        # runs here; report it as not applicable.
+        fast_adaptive_gate: dict[str, Any] = {
+            "status": AdaptiveGateStatus.NOT_APPLICABLE.value,
+            "classification": None,
+            "skipped": False,
+            "fast_mode_equivalent": True,
+        }
         source_retrieval_plan: dict[str, Any] = {
             "raw_context_access_mode": "normal",
             "response_mode": response_mode.value,
             "fast_mode": True,
             "smart_fast_warm_entry_present": warm_present,
+            "adaptive_gate": fast_adaptive_gate,
         }
         retrieval_trace = RetrievalTrace(
             query_text=message_text,
@@ -614,6 +638,7 @@ class ContextCacheService:
             "smart_fast_warm_entry_present": warm_present,
             "selected_memory_ids": list(composed_context.selected_memory_ids),
             "selected_memory_count": len(composed_context.selected_memory_ids),
+            "adaptive_gate": fast_adaptive_gate,
         }
         return AdaptiveContextResolution(
             conversation=active_conversation,
@@ -725,6 +750,7 @@ class ContextCacheService:
         ablation: AblationConfig | None,
         prompt_authority_context: PromptAuthorityContext,
         last_retrieval_message_seq: int,
+        adaptive_retrieval: bool = False,
     ) -> None:
         """Run the normal retrieval in the background and warm the smart_fast key.
 
@@ -750,6 +776,7 @@ class ContextCacheService:
                 ablation=ablation,
                 prompt_authority_context=prompt_authority_context,
                 last_retrieval_message_seq=last_retrieval_message_seq,
+                adaptive_retrieval=adaptive_retrieval,
             ),
             name="atagia-smart-fast-warm",
         )
@@ -766,6 +793,7 @@ class ContextCacheService:
         ablation: AblationConfig | None,
         prompt_authority_context: PromptAuthorityContext,
         last_retrieval_message_seq: int,
+        adaptive_retrieval: bool = False,
     ) -> None:
         """Resolve the warm context unguarded, then publish under the guard.
 
@@ -789,23 +817,35 @@ class ContextCacheService:
                     ablation=ablation,
                     prompt_authority_context=prompt_authority_context,
                     response_mode=ResponseMode.SMART_FAST,
+                    adaptive_retrieval=adaptive_retrieval,
                 )
             finally:
                 await close_connection(connection)
+            # D9: a gate veto inside the warm yields ``pending_cache_entry=None``
+            # (D6), so ``publish_pending_cache_entry`` returns False here and no
+            # warm entry is written; the next turn's fast path correctly finds
+            # nothing.
             async with self.user_cache_guard(user_id):
                 published = await self.publish_pending_cache_entry(
                     resolution,
                     last_retrieval_message_seq=last_retrieval_message_seq,
                 )
+            gate_status = resolution.retrieval_diagnostics_for_guard.get(
+                "adaptive_gate", {}
+            )
             logger.info(
                 "smart_fast warm completed user_id=%s conversation_id=%s "
-                "cache_key=%s published=%s selected_memory_ids=%d from_cache=%s",
+                "cache_key=%s published=%s selected_memory_ids=%d from_cache=%s "
+                "adaptive_gate_status=%s",
                 user_id,
                 conversation_id,
                 resolution.cache_key,
                 published,
                 len(resolution.composed_context.selected_memory_ids),
                 resolution.from_cache,
+                gate_status.get("status")
+                if isinstance(gate_status, dict)
+                else None,
             )
         except Exception:
             logger.warning(
@@ -1019,6 +1059,13 @@ class ContextCacheService:
             "user_id": user_id,
             "workspace_id": workspace_id,
         }
+        # D7: ``adaptive_retrieval`` is intentionally NOT part of the cache key.
+        # Cache entries are only ever written from full-retrieval turns (a
+        # gate-skipped turn never publishes, see D6), so their content is
+        # identical regardless of the flag and entries are interchangeable
+        # across flag states. Adding the flag to the key would only fragment the
+        # cache without changing what is stored.
+        #
         # Non-normal modes get their own key space so fast/smart_fast entries
         # never cross-pollute normal-mode reads (and vice versa). Normal-mode
         # keys stay byte-identical to pre-fast-mode keys by omitting the field.
@@ -1230,7 +1277,31 @@ class ContextCacheService:
         )
         diagnostics["selected_evidence_ids"] = selected_evidence_ids
         diagnostics["selected_evidence_count"] = len(selected_evidence_ids)
+        # D5/D10: surface the adaptive gate status to the answer guard. A
+        # gate-skipped turn is flagged ``fast_mode_equivalent`` so the guard
+        # treats it like a fast-mode turn (no evidence obligations), via an
+        # explicit branch rather than relying on absent diagnostics.
+        diagnostics["adaptive_gate"] = ContextCacheService._adaptive_gate_info(
+            pipeline_result
+        )
         return {key: value for key, value in diagnostics.items() if value is not None}
+
+    @staticmethod
+    def _adaptive_gate_info(pipeline_result: PipelineResult) -> dict[str, Any]:
+        """Build the compact adaptive-gate diagnostics block."""
+        status = pipeline_result.adaptive_gate_status
+        classification = pipeline_result.adaptive_gate_classification
+        return {
+            "status": status.value,
+            "classification": (
+                classification.value if classification is not None else None
+            ),
+            "skipped": status is AdaptiveGateStatus.SKIPPED,
+            # A skipped turn answers from contract + transcript + prepared
+            # context only, exactly like a fast-mode turn, so the guard must not
+            # apply evidence obligations to it.
+            "fast_mode_equivalent": status is AdaptiveGateStatus.SKIPPED,
+        }
 
     @staticmethod
     def _answer_evidence_diagnostics(

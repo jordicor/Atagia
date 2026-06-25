@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
 from atagia.memory.belief_reviser import RevisionDecision
 from atagia.models.schemas_memory import (
@@ -16,7 +14,6 @@ from atagia.models.schemas_memory import (
     MemoryScope,
     PlannedSubQuery,
     QueryIntelligenceResult,
-    QueryPlanCore,
     RetrievalPlan,
 )
 
@@ -120,74 +117,6 @@ def test_extraction_defaults_temporal_confidence_when_temporal_fields_are_explic
     )
 
     assert result.evidences[0].temporal_confidence == pytest.approx(0.6)
-
-
-def test_query_plan_core_schema_is_much_smaller_than_rich_result() -> None:
-    core_schema = json.dumps(TypeAdapter(QueryPlanCore).json_schema())
-    rich_schema = json.dumps(TypeAdapter(QueryIntelligenceResult).json_schema())
-
-    # The lean schema must stay well under the cap and a wide margin below the
-    # rich schema, because the medium-model JSON failures came from the rich
-    # contract (structured anchors + cross-field validators).
-    assert len(core_schema) < 3500
-    assert len(core_schema) < len(rich_schema) - 1500
-
-
-def test_query_plan_core_enforces_per_field_validation() -> None:
-    # Empty sub_queries is a shape error and must still raise.
-    with pytest.raises(ValidationError):
-        QueryPlanCore.model_validate({"sub_queries": []})
-
-    # Duplicate exact_facets is a shape error and must still raise.
-    with pytest.raises(ValidationError):
-        QueryPlanCore.model_validate(
-            {
-                "sub_queries": ["x"],
-                "exact_facets": [ExactFacet.DATE.value, ExactFacet.DATE.value],
-            }
-        )
-
-    # Out-of-range retrieval level is a shape error and must still raise.
-    with pytest.raises(ValidationError):
-        QueryPlanCore.model_validate(
-            {"sub_queries": ["x"], "retrieval_levels": [9]}
-        )
-
-
-def test_query_plan_core_does_not_raise_on_broken_hint_linkage() -> None:
-    # The rich result raises when a hint references a non-existent sub_query;
-    # the lean core must accept it so server-side repair can re-link it.
-    core = QueryPlanCore.model_validate(
-        {
-            "query_type": "slot_fill",
-            "sub_queries": ["real sub query"],
-            "sparse_query_hints": [
-                {
-                    "sub_query_text": "does not exist",
-                    "fts_phrase": "foo bar",
-                    "must_keep_terms": ["foo"],
-                }
-            ],
-            "exact_recall_needed": True,
-            "exact_facets": [ExactFacet.DATE.value],
-        }
-    )
-
-    assert core.sparse_query_hints[0].sub_query_text == "does not exist"
-    assert core.exact_recall_needed is True
-
-
-def test_query_plan_core_normalizes_optional_language_codes() -> None:
-    core = QueryPlanCore.model_validate(
-        {
-            "sub_queries": ["que idioma uso"],
-            "query_language": " ES ",
-            "answer_language": "CA",
-        }
-    )
-
-    assert core.query_language == "es"
-    assert core.answer_language == "ca"
 
 
 def test_query_intelligence_exact_facets_enable_exact_recall() -> None:

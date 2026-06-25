@@ -83,21 +83,24 @@ def test_maps_second_conversation(
     assert corrections["conv-42:q4"]["corrected_ground_truth"] == "Correct date"
 
 
-def test_filters_citation_only_errors(
+def test_preserves_citation_only_errors_as_evidence_corrections(
     errors_file: Path, dataset_file: Path
 ) -> None:
     corrections = load_community_corrections(errors_file, dataset_file)
 
-    # WRONG_CITATION entry (locomo_0_qa10 -> conv-26:q11) should be excluded
-    assert "conv-26:q11" not in corrections
+    # WRONG_CITATION entries still matter for source-aware judging because
+    # correct_evidence changes the official oracle packet.
+    assert corrections["conv-26:q11"]["corrected_ground_truth"] == "Original answer"
+    assert corrections["conv-26:q11"]["corrected_evidence_turn_ids"] == ["D3:2"]
+    assert corrections["conv-26:q11"]["original_evidence_turn_ids"] == ["D3:1"]
 
 
-def test_total_count_excludes_citation_only(
+def test_total_count_includes_citation_only(
     errors_file: Path, dataset_file: Path
 ) -> None:
     corrections = load_community_corrections(errors_file, dataset_file)
 
-    assert len(corrections) == 2
+    assert len(corrections) == 3
 
 
 def test_preserves_metadata_fields(
@@ -109,6 +112,7 @@ def test_preserves_metadata_fields(
     assert entry["original_ground_truth"] == "Rainbow flag, transgender symbol"
     assert entry["error_type"] == "HALLUCINATION"
     assert entry["source"] == "community/dial481/locomo-audit"
+    assert entry["corrected_evidence_turn_ids"] == ["D14:15"]
 
 
 def test_our_corrections_override_community(

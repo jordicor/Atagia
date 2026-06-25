@@ -36,6 +36,10 @@ from atagia.services.llm_client import (
 )
 from atagia.workers.graph_sync_worker import GraphSyncWorker
 from atagia.workers.ingest_worker import IngestWorker
+from tests.extraction_payload_support import (
+    is_memory_extraction_card_purpose,
+    memory_extraction_card_output_from_payload,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -50,19 +54,20 @@ class PurposeProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = request.metadata.get("purpose")
-        if purpose == "memory_extraction":
-            return self._response(request, {"nothing_durable": True})
-        if purpose == "consequence_detection":
-            return self._response(
-                request,
-                {
-                    "is_consequence": False,
-                    "action_description": "",
-                    "outcome_description": "",
-                    "outcome_sentiment": "neutral",
-                    "confidence": 0.0,
-                    "likely_action_message_id": None,
-                },
+        if is_memory_extraction_card_purpose(purpose):
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=memory_extraction_card_output_from_payload(
+                    {"candidates": [], "nothing_durable": True},
+                    purpose,
+                ),
+            )
+        if purpose == "consequence_gate_card":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="no",
             )
         if purpose == "graph_projection":
             return self._response(

@@ -1,19 +1,25 @@
-"""Offline Topic Working Set updates driven by structured LLM plans."""
+"""Offline Topic Working Set updates driven by small LLM cards."""
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+import logging
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
-from atagia.core.llm_output_limits import TOPIC_WORKING_SET_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import MessageRepository
 from atagia.core.topic_repository import TopicRepository
-from atagia.memory.intimacy_boundary_policy import strongest_intimacy_boundary
+from atagia.memory.card_prompt import compose_card_prompt
+from atagia.memory.intimacy_boundary_policy import (
+    normalize_intimacy_boundary,
+    strongest_intimacy_boundary,
+)
 from atagia.models.schemas_memory import IntimacyBoundary
 from atagia.services.llm_client import (
     LLMClient,
@@ -21,7 +27,12 @@ from atagia.services.llm_client import (
     LLMMessage,
     known_intimacy_context_metadata,
 )
-from atagia.services.model_resolution import resolve_component_model
+from atagia.services.model_resolution import (
+    examples_enabled_for_component,
+    resolve_component_model,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class TopicUpdateActionType(StrEnum):
@@ -40,6 +51,54 @@ _TOPIC_FLOAT_SENTINEL = -1.0
 _TOPIC_INT_SENTINEL = -1
 _TOPIC_BOUNDARY_SENTINEL = ""
 _INTIMACY_BOUNDARY_VALUES = {boundary.value for boundary in IntimacyBoundary}
+
+TopicWorkingSetCardName = Literal["route", "content", "boundary"]
+
+TOPIC_WORKING_SET_CARD_CONCURRENCY = 2
+
+_CARD_PURPOSES: dict[TopicWorkingSetCardName, str] = {
+    "route": "topic_working_set_route_card",
+    "content": "topic_working_set_content_card",
+    "boundary": "topic_working_set_boundary_card",
+}
+_CARD_MAX_OUTPUT_TOKENS: dict[TopicWorkingSetCardName, int] = {
+    "route": 192,
+    "content": 512,
+    "boundary": 192,
+}
+_MAX_TOPIC_CARD_ACTIONS = 6
+_CONTENT_ACTIONS = {TopicUpdateActionType.CREATE, TopicUpdateActionType.UPDATE}
+
+
+@dataclass(frozen=True, slots=True)
+class _TopicRoute:
+    action: TopicUpdateActionType
+    target_id: str
+    source_message_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TopicContent:
+    title: str | None = None
+    summary: str | None = None
+    active_goal: str | None = None
+    open_questions: tuple[str, ...] = ()
+    decisions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _TopicBoundary:
+    boundary: IntimacyBoundary
+    privacy_level: int | None = None
+    confidence: float = 0.7
+
+
+@dataclass(frozen=True, slots=True)
+class _TopicCardPlan:
+    routes: tuple[_TopicRoute, ...]
+    contents: dict[str, _TopicContent] = field(default_factory=dict)
+    boundaries: dict[str, _TopicBoundary] = field(default_factory=dict)
+    artifacts: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 class TopicUpdateAction(BaseModel):
@@ -176,6 +235,12 @@ class TopicWorkingSetUpdater:
         self._message_repository = message_repository
         resolved_settings = settings or Settings.from_env()
         self._model = resolve_component_model(resolved_settings, "topic_working_set")
+        self._include_examples = examples_enabled_for_component(
+            resolved_settings, "topic_working_set"
+        )
+        self._card_models = {
+            card_name: self._model for card_name in _CARD_PURPOSES
+        }
 
     async def update_from_messages(
         self,
@@ -221,40 +286,501 @@ class TopicWorkingSetUpdater:
         snapshot: dict[str, Any],
         messages: list[dict[str, Any]],
     ) -> TopicWorkingSetPlan:
-        prompt = self._build_prompt(
+        existing_routes = await self._run_existing_route_card(
+            user_id=user_id,
             conversation_id=conversation_id,
             snapshot=snapshot,
             messages=messages,
         )
-        request = LLMCompletionRequest(
-            model=self._model,
+        uncovered_messages = self._messages_not_covered_by_routes(
+            messages,
+            existing_routes,
+        )
+        new_routes = (
+            await self._run_new_topic_track_card(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                snapshot=snapshot,
+                messages=uncovered_messages,
+            )
+            if uncovered_messages
+            else ()
+        )
+        routes = _dedupe_routes([*existing_routes, *new_routes])
+        if not routes:
+            return TopicWorkingSetPlan(actions=[], nothing_to_update=True)
+
+        content_routes = tuple(
+            route for route in routes if route.action in _CONTENT_ACTIONS
+        )
+        contents = await self._run_content_cards(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            snapshot=snapshot,
+            messages=messages,
+            routes=content_routes,
+        )
+        boundaries = await self._run_boundary_cards(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            snapshot=snapshot,
+            messages=messages,
+            routes=content_routes,
+            contents=contents,
+        )
+        artifacts = self._artifact_ids_from_route_messages(messages, tuple(routes))
+        return _topic_card_plan_to_structured_plan(
+            _TopicCardPlan(
+                routes=tuple(routes),
+                contents=contents,
+                boundaries=boundaries,
+                artifacts=artifacts,
+            )
+        )
+
+    async def _run_existing_route_card(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        snapshot: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> tuple[_TopicRoute, ...]:
+        request = self._card_request(
+            card_name="route",
+            user_id=user_id,
+            conversation_id=conversation_id,
+            prompt=self._build_existing_route_prompt(
+                conversation_id=conversation_id,
+                snapshot=snapshot,
+                messages=messages,
+            ),
+            snapshot=snapshot,
+        )
+        response = await self._llm_client.complete(request)
+        return tuple(
+            route
+            for route in _parse_route_card_output(
+                response.output_text,
+                valid_topic_ids=_topic_ids_from_snapshot(snapshot),
+                valid_message_ids=_message_ids_from_messages(messages),
+                conversation_id=conversation_id,
+            )
+            if route.action is not TopicUpdateActionType.CREATE
+        )
+
+    async def _run_new_topic_track_card(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        snapshot: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> tuple[_TopicRoute, ...]:
+        request = self._card_request(
+            card_name="route",
+            user_id=user_id,
+            conversation_id=conversation_id,
+            prompt=self._build_new_topic_track_prompt(
+                conversation_id=conversation_id,
+                snapshot=snapshot,
+                messages=messages,
+            ),
+            snapshot=snapshot,
+        )
+        response = await self._llm_client.complete(request)
+        return _parse_new_topic_track_output(
+            response.output_text,
+            valid_message_ids=_message_ids_from_messages(messages),
+            conversation_id=conversation_id,
+        )
+
+    async def _run_content_cards(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        snapshot: dict[str, Any],
+        messages: list[dict[str, Any]],
+        routes: tuple[_TopicRoute, ...],
+    ) -> dict[str, _TopicContent]:
+        if not routes:
+            return {}
+        topics_by_id = _topics_by_id_from_snapshot(snapshot)
+        semaphore = asyncio.Semaphore(TOPIC_WORKING_SET_CARD_CONCURRENCY)
+
+        async def run_card(route: _TopicRoute) -> tuple[str, _TopicContent]:
+            async with semaphore:
+                request = self._card_request(
+                    card_name="content",
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    prompt=self._build_content_prompt(
+                        conversation_id=conversation_id,
+                        snapshot=snapshot,
+                        messages=messages,
+                        route=route,
+                        existing_topic=topics_by_id.get(route.target_id),
+                    ),
+                    snapshot=snapshot,
+                    target_id=route.target_id,
+                )
+                response = await self._llm_client.complete(request)
+                return route.target_id, _parse_content_card_output(response.output_text)
+
+        results = await asyncio.gather(*(run_card(route) for route in routes))
+        return {target_id: content for target_id, content in results}
+
+    async def _run_boundary_cards(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        snapshot: dict[str, Any],
+        messages: list[dict[str, Any]],
+        routes: tuple[_TopicRoute, ...],
+        contents: dict[str, _TopicContent],
+    ) -> dict[str, _TopicBoundary]:
+        if not routes:
+            return {}
+        semaphore = asyncio.Semaphore(TOPIC_WORKING_SET_CARD_CONCURRENCY)
+
+        async def run_card(route: _TopicRoute) -> tuple[str, _TopicBoundary | None]:
+            async with semaphore:
+                request = self._card_request(
+                    card_name="boundary",
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    prompt=self._build_target_boundary_prompt(
+                        conversation_id=conversation_id,
+                        messages=messages,
+                        route=route,
+                        content=contents.get(route.target_id, _TopicContent()),
+                    ),
+                    snapshot=snapshot,
+                    target_id=route.target_id,
+                )
+                response = await self._llm_client.complete(request)
+                boundaries = _parse_boundary_card_output(
+                    response.output_text,
+                    valid_target_ids={route.target_id},
+                )
+                return route.target_id, boundaries.get(route.target_id)
+
+        results = await asyncio.gather(*(run_card(route) for route in routes))
+        return {
+            target_id: boundary
+            for target_id, boundary in results
+            if boundary is not None
+        }
+
+    def _card_request(
+        self,
+        *,
+        card_name: TopicWorkingSetCardName,
+        user_id: str,
+        conversation_id: str,
+        prompt: str,
+        snapshot: dict[str, Any],
+        target_id: str | None = None,
+    ) -> LLMCompletionRequest:
+        purpose = _CARD_PURPOSES[card_name]
+        metadata: dict[str, Any] = {
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "purpose": purpose,
+            "topic_working_set_card": card_name,
+            **self._intimacy_metadata_from_snapshot(snapshot),
+        }
+        if target_id is not None:
+            metadata["topic_working_set_target_id"] = target_id
+        return LLMCompletionRequest(
+            model=self._card_models[card_name],
             messages=[
                 LLMMessage(
                     role="system",
-                    content="Maintain conversation topic working sets as structured JSON.",
+                    content=(
+                        "Keep track of the topics in this conversation, using the data below. "
+                        "Write only the requested plain-text lines. No JSON. No explanation."
+                    ),
                 ),
                 LLMMessage(role="user", content=prompt),
             ],
-            max_output_tokens=TOPIC_WORKING_SET_MAX_OUTPUT_TOKENS,
-            response_schema=TopicWorkingSetPlan.model_json_schema(),
-            metadata={
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "purpose": "topic_working_set_update",
-                **self._intimacy_metadata_from_snapshot(snapshot),
-            },
+            max_output_tokens=_CARD_MAX_OUTPUT_TOKENS[card_name],
+            metadata=metadata,
         )
-        return await self._llm_client.complete_structured(request, TopicWorkingSetPlan)
 
-    def _build_prompt(
+    def _build_existing_route_prompt(
         self,
         *,
         conversation_id: str,
         snapshot: dict[str, Any],
         messages: list[dict[str, Any]],
     ) -> str:
-        boundary_values = ", ".join(boundary.value for boundary in IntimacyBoundary)
-        message_payload = [
+        instruction_head = "\n".join(
+            [
+                "Decide whether this message batch changes one of the topics we are already tracking.",
+                "Only consider existing topics from the snapshot.",
+                "Never create a new topic in this card.",
+                "Write one line per touched existing topic, or exactly: none",
+                "Allowed actions:",
+                "update = the same topic continues and should remain active",
+                "park = the user pauses, postpones, defers, or puts this topic aside",
+                "reopen = the user resumes a parked topic",
+                "close = the user says this topic is done, finished, resolved, or no longer active",
+                "Format: action topic_id message_id [message_id ...]",
+                "Use only topic ids from the snapshot.",
+                "Use only message ids from the provided messages.",
+                "Do not write titles, summaries, goals, privacy, artifacts, or status fields.",
+            ]
+        )
+        examples_block = "\n".join(
+            [
+                "Snapshot topic tpc_42 (invoice cleanup); user says 'also add vendor IDs to the invoice audit notes' in msg_8.",
+                "update tpc_42 msg_8",
+                "Snapshot topic tpc_7 (model comparison); user says 'let's pause that comparison until the run finishes' in msg_3.",
+                "park tpc_7 msg_3",
+                "Snapshot has a parked topic tpc_11 (moving plan); user says 'back to the moving plan' in msg_5.",
+                "reopen tpc_11 msg_5",
+                "Snapshot topic tpc_19 (bug triage); user says 'that bug is fixed, we can close it' in msg_2.",
+                "close tpc_19 msg_2",
+                "No snapshot topic matches, or the batch is only a greeting.",
+                "none",
+            ]
+        )
+        body = compose_card_prompt(
+            instruction_head,
+            examples_block,
+            include_examples=self._include_examples,
+        )
+        return "\n".join(
+            [
+                body,
+                f"conversation_id={conversation_id}",
+                "<existing_topic_snapshot>",
+                json_utils.dumps(snapshot, indent=2, sort_keys=True),
+                "</existing_topic_snapshot>",
+                "<messages>",
+                json_utils.dumps(self._message_payload(messages), indent=2, sort_keys=True),
+                "</messages>",
+            ]
+        )
+
+    def _build_new_topic_track_prompt(
+        self,
+        *,
+        conversation_id: str,
+        snapshot: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> str:
+        instruction_head = "\n".join(
+            [
+                "This card only sees messages not already assigned to an existing topic.",
+                "Decide whether these remaining messages introduce one new local topic.",
+                "Default answer: track.",
+                "Write ignore only when there is no local subject to carry forward.",
+                "Ignore pure greetings, thanks, empty chatter, or non-subject fragments.",
+                "Track any subject the assistant may need as local conversation context.",
+                "Track tasks, decisions, problems, plans, personal situations, attachments, and ongoing discussions.",
+                "Track private or sensitive subjects too; privacy is handled by a later card.",
+                "Write exactly one line.",
+                "Format when tracking: track message_id [message_id ...]",
+                "Otherwise write exactly: ignore",
+                "Use only message ids from the provided messages.",
+                "Do not write titles, summaries, goals, privacy, artifacts, or status fields.",
+            ]
+        )
+        examples_block = "\n".join(
+            [
+                "Remaining message msg_1: 'I want to plan a quiet birthday dinner next month.'",
+                "track msg_1",
+                "Remaining messages msg_2 and msg_3 describe a new bug and how to reproduce it.",
+                "track msg_2 msg_3",
+                "Remaining message: 'Thanks, that helps.'",
+                "ignore",
+            ]
+        )
+        body = compose_card_prompt(
+            instruction_head,
+            examples_block,
+            include_examples=self._include_examples,
+        )
+        return "\n".join(
+            [
+                body,
+                f"conversation_id={conversation_id}",
+                "<existing_topic_snapshot>",
+                json_utils.dumps(snapshot, indent=2, sort_keys=True),
+                "</existing_topic_snapshot>",
+                "<uncovered_messages>",
+                json_utils.dumps(self._message_payload(messages), indent=2, sort_keys=True),
+                "</uncovered_messages>",
+            ]
+        )
+
+    def _build_content_prompt(
+        self,
+        *,
+        conversation_id: str,
+        snapshot: dict[str, Any],
+        messages: list[dict[str, Any]],
+        route: _TopicRoute,
+        existing_topic: dict[str, Any] | None,
+    ) -> str:
+        source_messages = self._messages_for_route(messages, route)
+        instruction_head = "\n".join(
+            [
+                "Write content fields for one topic.",
+                "Write only fields that should be created or changed. If no content field should change, write exactly: none",
+                "Do not write JSON.",
+                "Do not invent decisions or open questions.",
+                "decision means the conversation settled or chose something.",
+                "question means something is still unresolved.",
+                "For an update, omit any field that should stay as-is.",
+                "For a create, title is required.",
+                "Use neutral titles for sensitive topics; privacy is handled by another card.",
+                "Allowed field lines:",
+                "title: short stable topic label",
+                "summary: one concise sentence",
+                "goal: current active goal, if any",
+                "question: one unresolved question",
+                "decision: one settled decision",
+            ]
+        )
+        examples_block = "\n".join(
+            [
+                "Create for a fresh planning thread.",
+                "title: Garden shed build",
+                "summary: The user is planning to build a backyard shed.",
+                "goal: Pick materials within budget.",
+                "Create with one open issue and one settled choice.",
+                "title: Trip booking",
+                "question: Which dates work for the flights?",
+                "decision: Book the seaside hotel.",
+                "Update that changes only the goal.",
+                "goal: Finish the draft before review.",
+                "Nothing changed.",
+                "none",
+            ]
+        )
+        body = compose_card_prompt(
+            instruction_head,
+            examples_block,
+            include_examples=self._include_examples,
+        )
+        lines = [
+            body,
+            f"conversation_id={conversation_id}",
+            f"action={route.action.value}",
+            f"target_id={route.target_id}",
+        ]
+        if existing_topic is not None:
+            lines.extend(
+                [
+                    "<existing_target_topic>",
+                    json_utils.dumps(existing_topic, indent=2, sort_keys=True),
+                    "</existing_target_topic>",
+                ]
+            )
+        lines.extend(
+            [
+                "<source_messages>",
+                json_utils.dumps(
+                    self._message_payload(source_messages),
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "</source_messages>",
+                "<full_existing_topic_snapshot>",
+                json_utils.dumps(snapshot, indent=2, sort_keys=True),
+                "</full_existing_topic_snapshot>",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _build_target_boundary_prompt(
+        self,
+        *,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+        route: _TopicRoute,
+        content: _TopicContent,
+    ) -> str:
+        content_payload = {
+            "title": content.title,
+            "summary": content.summary,
+            "active_goal": content.active_goal,
+            "open_questions": list(content.open_questions),
+            "decisions": list(content.decisions),
+        }
+        route_payload = {
+            "action": route.action.value,
+            "target_id": route.target_id,
+            "source_message_ids": list(route.source_message_ids),
+        }
+        instruction_head = "\n".join(
+            [
+                "Decide how private one topic is. Pick the closest privacy label for it.",
+                "Always write one line. Never write none.",
+                "Do not write JSON.",
+                "Use ordinary unless the topic itself is private romantic/intimate context, a stated relationship boundary, or ambiguous intimate context.",
+                "If intimate context is present but the exact label is unclear, use ambiguous_intimate.",
+                "Privacy labels:",
+                "ordinary = an everyday topic with nothing private or intimate.",
+                "romantic_private = a private romantic relationship matter.",
+                "intimacy_private = a private intimate or sexual matter.",
+                "intimacy_preference_private = a private personal preference about intimacy.",
+                "intimacy_boundary = a personal limit the user wants respected.",
+                "ambiguous_intimate = clearly intimate but you cannot tell which label fits, use when unsure.",
+                "safety_blocked = content must be blocked for safety.",
+                "privacy_level says how sensitive the topic is:",
+                "0 = public, nothing private.",
+                "1 = mildly private.",
+                "2 = clearly private.",
+                "3 = highly sensitive.",
+                "For any non-ordinary privacy label, use at least 2 for how sensitive it is.",
+                "Format: target_id privacy_label privacy_level confidence",
+            ]
+        )
+        examples_block = "\n".join(
+            [
+                "An everyday topic about grocery shopping.",
+                "tmp1 ordinary 0 0.7",
+                "A private romantic relationship matter.",
+                "tpc_private romantic_private 2 0.8",
+                "A topic where the user states a personal limit they want respected.",
+                "tmp2 intimacy_boundary 2 0.8",
+                "Clearly intimate but the exact label is unclear.",
+                "tpc_unclear ambiguous_intimate 2 0.7",
+            ]
+        )
+        body = compose_card_prompt(
+            instruction_head,
+            examples_block,
+            include_examples=self._include_examples,
+        )
+        return "\n".join(
+            [
+                body,
+                f"conversation_id={conversation_id}",
+                "<target_route>",
+                json_utils.dumps(route_payload, indent=2, sort_keys=True),
+                "</target_route>",
+                "<target_content_draft>",
+                json_utils.dumps(content_payload, indent=2, sort_keys=True),
+                "</target_content_draft>",
+                "<source_messages>",
+                json_utils.dumps(
+                    self._message_payload(self._messages_for_route(messages, route)),
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "</source_messages>",
+            ]
+        )
+
+    def _message_payload(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
             {
                 "id": str(message["id"]),
                 "seq": message.get("seq"),
@@ -268,50 +794,62 @@ class TopicWorkingSetUpdater:
             }
             for message in messages
         ]
-        return "\n".join(
-            [
-                "Update the read-only Topic Working Set for this conversation.",
-                "Return only JSON matching the provided schema.",
-                "Do not include markdown fences, preambles, tags, or explanations.",
-                "Anything outside the first JSON object will be ignored.",
-                "Do not create dataset-specific or benchmark-specific topics.",
-                "Prefer updating existing topics when the new messages continue the same thread.",
-                "Use source_message_ids only from the provided message IDs.",
-                (
-                    "Use wire sentinels when a field is not applicable or should "
-                    "not be changed: omit any field other than action, or use "
-                    '"" for absent string fields; -1.0 for absent confidence '
-                    "fields; -1 for absent privacy_level."
-                ),
-                (
-                    'intimacy_boundary="" means not provided/no boundary change; '
-                    'intimacy_boundary="ordinary" means explicitly ordinary.'
-                ),
-                f"Valid intimacy_boundary values are exactly: {boundary_values}.",
-                (
-                    "For each created or updated topic, set intimacy_boundary "
-                    "semantically. Use ordinary unless the topic itself is private "
-                    "romantic/intimate context, an intimacy boundary, or "
-                    "ambiguous intimate context."
-                ),
-                (
-                    "For non-ordinary intimacy_boundary values, set privacy_level "
-                    "to at least 2 and avoid exposing sensitive wording in "
-                    "topic titles where a neutral local label is enough."
-                ),
-                (
-                    "Use artifact_ids only from provided artifact_refs when a topic "
-                    "depends on an attachment."
-                ),
-                f"conversation_id={conversation_id}",
-                "<existing_topic_snapshot>",
-                json_utils.dumps(snapshot, indent=2, sort_keys=True),
-                "</existing_topic_snapshot>",
-                "<messages>",
-                json_utils.dumps(message_payload, indent=2, sort_keys=True),
-                "</messages>",
-            ]
-        )
+
+    def _messages_for_route(
+        self,
+        messages: list[dict[str, Any]],
+        route: _TopicRoute,
+    ) -> list[dict[str, Any]]:
+        selected_ids = set(route.source_message_ids)
+        return [
+            message
+            for message in messages
+            if str(message.get("id") or "") in selected_ids
+        ]
+
+    @staticmethod
+    def _messages_not_covered_by_routes(
+        messages: list[dict[str, Any]],
+        routes: tuple[_TopicRoute, ...],
+    ) -> list[dict[str, Any]]:
+        covered_message_ids = {
+            message_id
+            for route in routes
+            for message_id in route.source_message_ids
+        }
+        return [
+            message
+            for message in messages
+            if str(message.get("id") or "") not in covered_message_ids
+        ]
+
+    @staticmethod
+    def _artifact_ids_from_route_messages(
+        messages: list[dict[str, Any]],
+        routes: tuple[_TopicRoute, ...],
+    ) -> dict[str, tuple[str, ...]]:
+        messages_by_id = {
+            str(message["id"]): message
+            for message in messages
+            if message.get("id")
+        }
+        artifacts_by_target: dict[str, tuple[str, ...]] = {}
+        for route in routes:
+            artifact_ids: list[str] = []
+            seen: set[str] = set()
+            for message_id in route.source_message_ids:
+                message = messages_by_id.get(message_id)
+                if message is None:
+                    continue
+                for artifact_ref in TopicWorkingSetUpdater._message_artifact_refs(message):
+                    artifact_id = str(artifact_ref.get("artifact_id") or "").strip()
+                    if not artifact_id or artifact_id in seen:
+                        continue
+                    seen.add(artifact_id)
+                    artifact_ids.append(artifact_id)
+            if artifact_ids:
+                artifacts_by_target[route.target_id] = tuple(artifact_ids)
+        return artifacts_by_target
 
     @staticmethod
     def _message_text_for_topic_prompt(message: dict[str, Any]) -> str:
@@ -321,7 +859,7 @@ class TopicWorkingSetUpdater:
         if placeholder:
             return placeholder
         return (
-            "[Message omitted from Topic Working Set raw processing | "
+            "[Message omitted from topic tracking | "
             f"id={message.get('id')} "
             f"seq={message.get('seq')} "
             f"role={message.get('role')} "
@@ -644,6 +1182,400 @@ class TopicWorkingSetUpdater:
         if not seqs:
             return None, None
         return min(seqs), max(seqs)
+
+
+def _parse_route_card_output(
+    text: str,
+    *,
+    valid_topic_ids: set[str],
+    valid_message_ids: tuple[str, ...],
+    conversation_id: str | None = None,
+) -> tuple[_TopicRoute, ...]:
+    valid_message_id_set = set(valid_message_ids)
+    lines = _card_lines(text)
+    if _lines_are_none(lines):
+        return ()
+    routes: list[_TopicRoute] = []
+    seen: set[tuple[str, str]] = set()
+    create_aliases: set[str] = set()
+    for line in lines:
+        tokens = _line_tokens(line)
+        if len(tokens) < 2:
+            continue
+        action = _route_action_or_none(tokens[0])
+        if action is None:
+            continue
+        target_id = tokens[1]
+        if action is TopicUpdateActionType.CREATE:
+            if not _is_temp_topic_target(target_id) or target_id in create_aliases:
+                continue
+            create_aliases.add(target_id)
+        elif target_id not in valid_topic_ids:
+            continue
+        source_message_ids = _valid_message_ids_from_tokens(
+            tokens[2:],
+            valid_message_id_set=valid_message_id_set,
+        )
+        if not source_message_ids:
+            logger.warning(
+                "Dropping topic route line with no valid message ids "
+                "(conversation_id=%s): %r",
+                conversation_id,
+                line,
+            )
+            continue
+        key = (action.value, target_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        routes.append(
+            _TopicRoute(
+                action=action,
+                target_id=target_id,
+                source_message_ids=tuple(source_message_ids),
+            )
+        )
+        if len(routes) >= _MAX_TOPIC_CARD_ACTIONS:
+            break
+    return tuple(routes)
+
+
+def _parse_new_topic_track_output(
+    text: str,
+    *,
+    valid_message_ids: tuple[str, ...],
+    conversation_id: str | None = None,
+) -> tuple[_TopicRoute, ...]:
+    lines = _card_lines(text)
+    if not lines:
+        return ()
+    if all(
+        line.strip("`*_.,;[](){}\"'").casefold() in {"ignore", "none"}
+        for line in lines
+    ):
+        return ()
+    valid_message_id_set = set(valid_message_ids)
+    routes: list[_TopicRoute] = []
+    for line in lines:
+        tokens = _line_tokens(line)
+        if not tokens or _clean_atom(tokens[0]) != "track":
+            continue
+        source_message_ids = _valid_message_ids_from_tokens(
+            tokens[1:],
+            valid_message_id_set=valid_message_id_set,
+        )
+        if not source_message_ids:
+            logger.warning(
+                "Dropping new-topic track line with no valid message ids "
+                "(conversation_id=%s): %r",
+                conversation_id,
+                line,
+            )
+            continue
+        routes.append(
+            _TopicRoute(
+                action=TopicUpdateActionType.CREATE,
+                target_id=f"tmp{len(routes) + 1}",
+                source_message_ids=tuple(source_message_ids),
+            )
+        )
+        break
+    return tuple(routes)
+
+
+def _dedupe_routes(routes: list[_TopicRoute]) -> tuple[_TopicRoute, ...]:
+    deduped: list[_TopicRoute] = []
+    seen: set[tuple[str, str]] = set()
+    for route in routes:
+        key = (route.action.value, route.target_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(route)
+    return tuple(deduped)
+
+
+def _parse_content_card_output(text: str) -> _TopicContent:
+    lines = _card_lines(text)
+    if _lines_are_none(lines):
+        return _TopicContent()
+    title: str | None = None
+    summary: str | None = None
+    active_goal: str | None = None
+    open_questions: list[str] = []
+    decisions: list[str] = []
+    for line in lines:
+        if ":" not in line:
+            continue
+        raw_key, raw_value = line.split(":", 1)
+        key = _clean_atom(raw_key)
+        value = _clean_text_value(raw_value)
+        if not value:
+            continue
+        if key == "title":
+            title = value
+        elif key == "summary":
+            summary = value
+        elif key in {"goal", "active_goal"}:
+            active_goal = value
+        elif key in {"question", "open_question"}:
+            open_questions.append(value)
+        elif key == "decision":
+            decisions.append(value)
+    return _TopicContent(
+        title=title,
+        summary=summary,
+        active_goal=active_goal,
+        open_questions=tuple(_dedupe_texts(open_questions)),
+        decisions=tuple(_dedupe_texts(decisions)),
+    )
+
+
+def _parse_boundary_card_output(
+    text: str,
+    *,
+    valid_target_ids: set[str],
+) -> dict[str, _TopicBoundary]:
+    lines = _card_lines(text)
+    if _lines_are_none(lines):
+        return {}
+    boundaries: dict[str, _TopicBoundary] = {}
+    for line in lines:
+        tokens = _line_tokens(line)
+        if len(tokens) < 2:
+            continue
+        target_id = tokens[0]
+        if target_id not in valid_target_ids or target_id in boundaries:
+            continue
+        boundary = normalize_intimacy_boundary(tokens[1])
+        privacy_level = _int_or_none(tokens[2] if len(tokens) >= 3 else None)
+        confidence = _float_or_none(tokens[3] if len(tokens) >= 4 else None)
+        boundaries[target_id] = _TopicBoundary(
+            boundary=boundary,
+            privacy_level=_clamp_privacy_level(privacy_level),
+            confidence=_clamp_confidence(confidence, default=0.7),
+        )
+    return boundaries
+
+
+def _topic_card_plan_to_structured_plan(card_plan: _TopicCardPlan) -> TopicWorkingSetPlan:
+    actions: list[TopicUpdateAction] = []
+    for route in card_plan.routes:
+        content = card_plan.contents.get(route.target_id, _TopicContent())
+        boundary = card_plan.boundaries.get(route.target_id)
+        artifact_ids = list(card_plan.artifacts.get(route.target_id, ()))
+        source_message_ids = list(route.source_message_ids)
+        if route.action is TopicUpdateActionType.CREATE:
+            if content.title is None:
+                continue
+            boundary_value, privacy_level, boundary_confidence = _boundary_fields_for_action(
+                route,
+                boundary,
+            )
+            actions.append(
+                TopicUpdateAction(
+                    action=TopicUpdateActionType.CREATE,
+                    title=content.title,
+                    summary=content.summary or _TOPIC_STRING_SENTINEL,
+                    active_goal=content.active_goal or _TOPIC_STRING_SENTINEL,
+                    open_questions=list(content.open_questions),
+                    decisions=list(content.decisions),
+                    artifact_ids=artifact_ids,
+                    source_message_ids=source_message_ids,
+                    privacy_level=privacy_level,
+                    intimacy_boundary=boundary_value,
+                    intimacy_boundary_confidence=boundary_confidence,
+                )
+            )
+            continue
+
+        if route.action is TopicUpdateActionType.UPDATE:
+            boundary_value, privacy_level, boundary_confidence = _boundary_fields_for_action(
+                route,
+                boundary,
+            )
+            actions.append(
+                TopicUpdateAction(
+                    action=TopicUpdateActionType.UPDATE,
+                    topic_id=route.target_id,
+                    title=content.title or _TOPIC_STRING_SENTINEL,
+                    summary=content.summary or _TOPIC_STRING_SENTINEL,
+                    active_goal=content.active_goal or _TOPIC_STRING_SENTINEL,
+                    open_questions=list(content.open_questions),
+                    decisions=list(content.decisions),
+                    artifact_ids=artifact_ids,
+                    source_message_ids=source_message_ids,
+                    privacy_level=privacy_level,
+                    intimacy_boundary=boundary_value,
+                    intimacy_boundary_confidence=boundary_confidence,
+                )
+            )
+            continue
+
+        actions.append(
+            TopicUpdateAction(
+                action=route.action,
+                topic_id=route.target_id,
+                artifact_ids=artifact_ids,
+                source_message_ids=source_message_ids,
+            )
+        )
+    return TopicWorkingSetPlan(actions=actions, nothing_to_update=not actions)
+
+
+def _boundary_fields_for_action(
+    route: _TopicRoute,
+    boundary: _TopicBoundary | None,
+) -> tuple[str, int, float]:
+    if boundary is None:
+        if route.action is TopicUpdateActionType.CREATE:
+            return IntimacyBoundary.ORDINARY.value, 0, 0.0
+        return _TOPIC_BOUNDARY_SENTINEL, _TOPIC_INT_SENTINEL, _TOPIC_FLOAT_SENTINEL
+
+    privacy_level = boundary.privacy_level
+    if boundary.boundary is not IntimacyBoundary.ORDINARY:
+        privacy_level = max(int(privacy_level or 0), 2)
+    elif route.action is TopicUpdateActionType.UPDATE:
+        privacy_level = _TOPIC_INT_SENTINEL
+    elif privacy_level is None:
+        privacy_level = 0
+    return boundary.boundary.value, int(privacy_level), boundary.confidence
+
+
+def _route_action_or_none(value: str) -> TopicUpdateActionType | None:
+    try:
+        action = TopicUpdateActionType(_clean_atom(value))
+    except ValueError:
+        return None
+    if action is TopicUpdateActionType.NOOP:
+        return None
+    return action
+
+
+def _topic_ids_from_snapshot(snapshot: dict[str, Any]) -> set[str]:
+    return {
+        str(topic.get("id"))
+        for topic in [
+            *(snapshot.get("active_topics") or []),
+            *(snapshot.get("parked_topics") or []),
+        ]
+        if isinstance(topic, dict) and topic.get("id")
+    }
+
+
+def _topics_by_id_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    topics: dict[str, dict[str, Any]] = {}
+    for topic in [
+        *(snapshot.get("active_topics") or []),
+        *(snapshot.get("parked_topics") or []),
+    ]:
+        if isinstance(topic, dict) and topic.get("id"):
+            topics[str(topic["id"])] = topic
+    return topics
+
+
+def _message_ids_from_messages(messages: list[dict[str, Any]]) -> tuple[str, ...]:
+    return tuple(str(message["id"]) for message in messages if message.get("id"))
+
+
+def _valid_message_ids_from_tokens(
+    tokens: list[str],
+    *,
+    valid_message_id_set: set[str],
+) -> tuple[str, ...]:
+    ids: list[str] = []
+    for token in tokens:
+        if token not in valid_message_id_set or token in ids:
+            continue
+        ids.append(token)
+    return tuple(ids)
+
+
+def _is_temp_topic_target(value: str) -> bool:
+    cleaned = value.strip()
+    return cleaned.startswith("tmp") and all(
+        character.isalnum() or character == "_" for character in cleaned
+    )
+
+
+def _card_lines(text: str) -> list[str]:
+    normalized = (
+        text.strip()
+        .replace("<TAB>", " ")
+        .replace("<tab>", " ")
+        .replace("\\t", " ")
+        .replace("\t", " ")
+    )
+    return [line.strip().strip("-* ").strip() for line in normalized.splitlines() if line.strip()]
+
+
+def _lines_are_none(lines: list[str]) -> bool:
+    return not lines or any(_clean_atom(line) == "none" for line in lines)
+
+
+def _line_tokens(line: str) -> list[str]:
+    normalized = line
+    for separator in ("<TAB>", "<tab>", "\\t", "\t", "|", ",", ";", ":", "->"):
+        normalized = normalized.replace(separator, " ")
+    return [_clean_identifier(piece) for piece in normalized.split() if _clean_identifier(piece)]
+
+
+def _clean_identifier(value: str) -> str:
+    return value.strip().strip("`*_.,;[](){}\"'")
+
+
+def _clean_atom(value: str) -> str:
+    return _clean_identifier(value).casefold()
+
+
+def _clean_text_value(value: str) -> str:
+    text = value.strip().strip("` ").strip()
+    if _clean_atom(text) in {"none", "null", "n/a", "na"}:
+        return ""
+    return text
+
+
+def _dedupe_texts(values: list[str]) -> list[str]:
+    rows: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = value.strip()
+        key = text.casefold()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        rows.append(text)
+    return rows
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamp_privacy_level(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return min(max(int(value), 0), 3)
+
+
+def _clamp_confidence(value: float | None, *, default: float) -> float:
+    if value is None:
+        return default
+    return min(max(float(value), 0.0), 1.0)
 
 
 def _status_for_action(action: TopicUpdateActionType) -> str | None:

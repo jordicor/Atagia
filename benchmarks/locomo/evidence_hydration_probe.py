@@ -13,13 +13,14 @@ from typing import Any, Iterable
 
 from benchmarks.artifact_hash import sha256_file_if_exists
 from benchmarks.json_artifacts import write_json_atomic
+from benchmarks.output_root import bench_output_root
 from benchmarks.locomo.adapter import LoCoMoAdapter
 from benchmarks.locomo.failure_ledger import ReportSpec, parse_report_spec
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DATA_PATH = _PROJECT_ROOT / "benchmarks" / "data" / "locomo10.json"
-_DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "docs" / "tmp"
+_DEFAULT_OUTPUT_DIR = bench_output_root() / "locomo"
 _CATEGORY_NAMES = {
     1: "single-hop",
     2: "multi-hop",

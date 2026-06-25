@@ -280,6 +280,10 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "finished_at",
             "last_heartbeat_at",
             "duration_ms",
+            "deferred_until",
+            "transient_defer_count",
+            "first_deferred_at",
+            "last_deferred_at",
             "error_class",
             "error_message",
             "metadata_json",
@@ -1844,6 +1848,10 @@ async def test_migration_0031_adds_redesign_identity_columns() -> None:
             "character_id",
             "incognito_snapshot",
             "policy_snapshot_json",
+            "deferred_until",
+            "transient_defer_count",
+            "first_deferred_at",
+            "last_deferred_at",
         }.issubset(worker_columns)
 
         embedding_columns = await column_names("memory_embedding_metadata")

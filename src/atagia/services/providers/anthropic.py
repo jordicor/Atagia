@@ -29,6 +29,7 @@ from atagia.services.llm_client import (
     LLMStreamEvent,
     OutputLimitExceededError,
     TransientLLMError,
+    retry_after_seconds_from_exception,
 )
 from atagia.services.llm_schema import strip_json_schema_nullability
 
@@ -46,7 +47,10 @@ def _anthropic_status_error(exc: APIStatusError) -> LLMError:
     """
     status_code = int(getattr(exc, "status_code", 0) or 0)
     if status_code in _ANTHROPIC_TRANSIENT_STATUS_CODES:
-        return TransientLLMError(str(exc))
+        return TransientLLMError(
+            str(exc),
+            retry_after_seconds=retry_after_seconds_from_exception(exc),
+        )
     if 400 <= status_code < 500:
         return LLMRequestError(str(exc), status_code=status_code)
     return LLMError(str(exc))
@@ -128,6 +132,13 @@ def _empty_content_error(stop_reason: str | None) -> TransientLLMError:
     label = stop_reason or "unknown"
     return TransientLLMError(
         f"Anthropic returned no output content (stop_reason={label})"
+    )
+
+
+def _transient_error(exc: BaseException) -> TransientLLMError:
+    return TransientLLMError(
+        str(exc),
+        retry_after_seconds=retry_after_seconds_from_exception(exc),
     )
 
 
@@ -363,7 +374,7 @@ class AnthropicProvider(LLMProvider):
         try:
             response = await self._client.messages.create(**kwargs)
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
-            raise TransientLLMError(str(exc)) from exc
+            raise _transient_error(exc) from exc
         except APIStatusError as exc:
             raise _anthropic_status_error(exc) from exc
         except APIError as exc:
@@ -486,7 +497,7 @@ class AnthropicProvider(LLMProvider):
                 elif stop_reason is not None and not emitted_output_or_tool:
                     pending_error = _empty_content_error(stop_reason)
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
-            raise TransientLLMError(str(exc)) from exc
+            raise _transient_error(exc) from exc
         except APIStatusError as exc:
             raise _anthropic_status_error(exc) from exc
         except APIError as exc:

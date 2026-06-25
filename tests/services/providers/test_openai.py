@@ -69,12 +69,15 @@ class FakeRaisingStream:
 
 
 class FakeEmbeddings:
-    def __init__(self, result=None) -> None:
+    def __init__(self, result=None, error=None) -> None:
         self.result = result
+        self.error = error
         self.calls: list[dict] = []
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
         return self.result
 
 
@@ -116,6 +119,38 @@ def _api_error(message: str) -> openai.APIError:
         request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
         body=None,
     )
+
+
+def _read_timeout(message: str = "read timed out") -> httpx.ReadTimeout:
+    return httpx.ReadTimeout(
+        message,
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+    )
+
+
+def test_openai_provider_passes_timeout_to_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            response = SimpleNamespace(
+                model="gpt-5-mini",
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=None,
+                model_dump=lambda: {},
+            )
+            self.chat = SimpleNamespace(
+                completions=FakeChatCompletions(create_result=response)
+            )
+            self.embeddings = FakeEmbeddings()
+
+    monkeypatch.setattr("atagia.services.providers.openai.AsyncOpenAI", FakeAsyncOpenAI)
+
+    OpenAIProvider(api_key="test", request_timeout_seconds=33.5)
+
+    assert captured["timeout"] == 33.5
+    assert captured["max_retries"] == 0
 
 
 async def _collect_stream_events_and_error(provider: OpenAIProvider):
@@ -735,6 +770,61 @@ async def test_openai_maps_retryable_and_permanent_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openai_maps_raw_httpx_timeouts_as_transient() -> None:
+    completion_provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(
+            FakeChatCompletions(error=_read_timeout("completion timed out")),
+            FakeEmbeddings(),
+        ),
+    )
+    embedding_provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(
+            FakeChatCompletions(),
+            FakeEmbeddings(error=_read_timeout("embedding timed out")),
+        ),
+    )
+    stream_create_provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(
+            FakeChatCompletions(error=_read_timeout("stream create timed out")),
+            FakeEmbeddings(),
+        ),
+    )
+    stream = FakeRaisingStream(_read_timeout("stream iteration timed out"))
+    stream_iteration_provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(FakeChatCompletions(stream), FakeEmbeddings()),
+    )
+
+    with pytest.raises(TransientLLMError, match="completion timed out"):
+        await completion_provider.complete(_request())
+    with pytest.raises(TransientLLMError, match="embedding timed out"):
+        await embedding_provider.embed(
+            LLMEmbeddingRequest(
+                model="text-embedding-3-small",
+                input_texts=["a"],
+            )
+        )
+
+    create_events, create_error = await _collect_stream_events_and_error(
+        stream_create_provider,
+    )
+    assert create_events == []
+    assert isinstance(create_error, TransientLLMError)
+    assert "stream create timed out" in str(create_error)
+
+    iteration_events, iteration_error = await _collect_stream_events_and_error(
+        stream_iteration_provider,
+    )
+    assert iteration_events == []
+    assert isinstance(iteration_error, TransientLLMError)
+    assert "stream iteration timed out" in str(iteration_error)
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
 async def test_openai_maps_non_transient_4xx_status_error_to_request_error() -> None:
     not_found_error = openai.APIStatusError(
         "not found",
@@ -753,6 +843,28 @@ async def test_openai_maps_non_transient_4xx_status_error_to_request_error() -> 
         await provider.complete(_request())
     assert exc_info.value.status_code == 404
     assert not isinstance(exc_info.value, TransientLLMError)
+
+
+@pytest.mark.asyncio
+async def test_openai_transient_status_error_preserves_retry_after() -> None:
+    rate_limit_error = openai.APIStatusError(
+        "rate limited",
+        response=httpx.Response(
+            429,
+            headers={"Retry-After": "7"},
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={},
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(FakeChatCompletions(error=rate_limit_error), FakeEmbeddings()),
+    )
+
+    with pytest.raises(TransientLLMError) as exc_info:
+        await provider.complete(_request())
+
+    assert exc_info.value.retry_after_seconds == 7.0
 
 
 @pytest.mark.asyncio

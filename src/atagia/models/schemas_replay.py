@@ -8,9 +8,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from atagia.models.schemas_memory import (
+    AdaptiveGateStatus,
     ComposedContext,
     DetectedNeed,
     IntimacyBoundary,
+    MemoryDependence,
     RetrievalPlan,
     RetrievalSufficiencyDiagnostic,
     RetrievalTrace,
@@ -85,6 +87,12 @@ class PipelineResult(BaseModel):
     trace: RetrievalTrace | None = None
     small_corpus_mode: bool = False
     degraded_mode: bool = False
+    # Adaptive retrieval gate observability. The default is shadow (gate
+    # computed a classification but took no action), which keeps every existing
+    # construction valid; the classification is optional because degraded or
+    # gate-free paths may not produce one.
+    adaptive_gate_status: AdaptiveGateStatus = AdaptiveGateStatus.OFF_SHADOW
+    adaptive_gate_classification: MemoryDependence | None = None
 
 
 class ScoreDelta(BaseModel):

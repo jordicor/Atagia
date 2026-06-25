@@ -166,6 +166,27 @@ class JobTrackingService:
             operation,
         )
 
+    async def mark_deferred(
+        self,
+        message: StreamMessage,
+        exc: Exception,
+        *,
+        deferred_until: datetime,
+    ) -> dict[str, Any]:
+        async def operation() -> dict[str, Any]:
+            envelope = JobEnvelope.model_validate(message.payload)
+            row = await self._repository.mark_deferred(
+                envelope.job_id,
+                attempt_count=message.delivery_count,
+                error_class=exc.__class__.__name__,
+                error_message=str(exc),
+                deferred_until=deferred_until.isoformat(),
+            )
+            await self._maybe_auto_pause_after_failure(exc)
+            return row
+
+        return await self._run_repository_operation(operation)
+
     async def mark_skipped(self, message: StreamMessage, *, reason: str | None = None) -> None:
         async def operation() -> None:
             envelope = JobEnvelope.model_validate(message.payload)

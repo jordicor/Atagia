@@ -38,6 +38,7 @@ from atagia.memory.metrics_computer import MetricsComputer, normalize_time_bucke
 from atagia.memory.policy_manifest import ManifestLoader
 from atagia.models.schemas_api import AdminMetricsComputeRequest
 from atagia.models.schemas_api import (
+    AdminCoverageMembersBackfillRequest,
     AdminEmbeddingBackfillRequest,
     AdminMemoryCoordinateCorrectionRequest,
     AdminReviewActionResponse,
@@ -60,6 +61,10 @@ from atagia.models.schemas_replay import (
 from atagia.services.llm_client import LLMClient, LLMRunGuardError
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.embedding_backfill_service import EmbeddingBackfillResult, EmbeddingBackfillService
+from atagia.services.coverage_members_backfill_service import (
+    CoverageMembersBackfillResult,
+    CoverageMembersBackfillService,
+)
 from atagia.services.admin_rebuild_service import AdminRebuildService, RebuildResult
 from atagia.services.errors import DeletionConfirmationError, MemoryNotFoundError
 from atagia.services.job_tracking_service import JobTrackingService
@@ -431,6 +436,43 @@ async def backfill_embeddings(
         auth_context,
         action="backfill_embeddings",
         target_type="embeddings",
+        target_id=payload.user_id or "all_users",
+        metadata=result.model_dump(mode="json"),
+    )
+    return result
+
+
+@router.post("/memory/coverage/backfill")
+async def backfill_coverage_members(
+    payload: AdminCoverageMembersBackfillRequest,
+    auth_context: AuthContext = Depends(get_admin_auth_context),
+    connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
+    settings: Settings = Depends(get_settings),
+    llm_client: LLMClient[Any] = Depends(get_llm_client),
+) -> CoverageMembersBackfillResult:
+    try:
+        result = await CoverageMembersBackfillService(
+            connection=connection,
+            llm_client=llm_client,
+            settings=settings,
+        ).run(
+            batch_size=payload.batch_size,
+            delay_ms=payload.delay_ms,
+            user_id=payload.user_id,
+            dry_run=False,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    await _audit_admin_action(
+        connection,
+        clock,
+        auth_context,
+        action="backfill_coverage_members",
+        target_type="coverage_members",
         target_id=payload.user_id or "all_users",
         metadata=result.model_dump(mode="json"),
     )

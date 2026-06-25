@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
 import logging
 from time import perf_counter
-from typing import Any, Iterator
+from typing import Any, Awaitable, Callable, Iterator, TypeVar
 
 from atagia.services.llm_client import (
     LLMClient,
@@ -18,6 +19,8 @@ from atagia.services.llm_client import (
 )
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 _CURRENT_LLM_CONTEXT: ContextVar[dict[str, Any]] = ContextVar(
@@ -276,6 +279,54 @@ def install_llm_call_recorder(
     client.complete_streamed = complete_streamed  # type: ignore[method-assign]
     client.embed = embed  # type: ignore[method-assign]
     client._benchmark_llm_recorder_installed = True  # type: ignore[attr-defined]
+
+
+def install_llm_call_delay(
+    client: LLMClient[Any],
+    *,
+    delay_seconds: float,
+) -> None:
+    """Serialize one benchmark client's LLM calls and sleep before each call.
+
+    Wraps complete/complete_streamed/embed so every call acquires a shared lock
+    and sleeps ``delay_seconds`` before delegating to the original method. This
+    keeps benchmark traffic under tight provider rate limits. The patch is
+    idempotent per client instance and a no-op for non-positive delays.
+    """
+    if delay_seconds <= 0.0 or getattr(
+        client,
+        "_benchmark_llm_call_delay_installed",
+        False,
+    ):
+        return
+
+    lock = asyncio.Lock()
+    original_complete = client.complete
+    original_complete_streamed = client.complete_streamed
+    original_embed = client.embed
+
+    async def delayed(call: Callable[[], Awaitable[_T]]) -> _T:
+        async with lock:
+            await asyncio.sleep(delay_seconds)
+            return await call()
+
+    async def complete(request: Any) -> Any:
+        return await delayed(lambda: original_complete(request))
+
+    async def complete_streamed(
+        request: Any,
+        *,
+        observer: Any | None = None,
+    ) -> Any:
+        return await delayed(lambda: original_complete_streamed(request, observer=observer))
+
+    async def embed(request: Any) -> Any:
+        return await delayed(lambda: original_embed(request))
+
+    client.complete = complete  # type: ignore[method-assign]
+    client.complete_streamed = complete_streamed  # type: ignore[method-assign]
+    client.embed = embed  # type: ignore[method-assign]
+    client._benchmark_llm_call_delay_installed = True  # type: ignore[attr-defined]
 
 
 def summarize_llm_calls(records: list[dict[str, Any]]) -> dict[str, Any]:

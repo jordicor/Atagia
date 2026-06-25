@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from benchmarks.json_artifacts import write_json_atomic
+from benchmarks.output_root import bench_output_root
 from benchmarks.llm_config import provider_api_key_kwargs
 from benchmarks.llm_metrics import LLMCallRecorder, install_llm_call_recorder
 from atagia import Atagia
@@ -40,7 +41,7 @@ from atagia.services.model_resolution import provider_qualified_model
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
-_DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "docs" / "tmp" / "extractor_diagnostics"
+_DEFAULT_OUTPUT_DIR = bench_output_root() / "locomo" / "extractor_diagnostics"
 
 
 def build_parser() -> argparse.ArgumentParser:

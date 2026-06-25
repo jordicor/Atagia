@@ -28,6 +28,11 @@ _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
 )
 
 
+def _is_need_detection_card_purpose(purpose: object) -> bool:
+    value = str(purpose)
+    return value.startswith("need_detection_") and value.endswith("_card")
+
+
 class ProxyProvider(LLMProvider):
     name = "proxy-tests"
 
@@ -40,40 +45,43 @@ class ProxyProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
-        if purpose == "need_detection":
+        if _is_need_detection_card_purpose(purpose):
+            outputs = {
+                "need_detection_needs_card": "none",
+                "need_detection_language_card": "en\nen",
+                "need_detection_memory_card": "mixed",
+                "need_detection_exact_card": "no",
+                "need_detection_shape_card": "default",
+                "need_detection_facets_card": "none",
+                "need_detection_callback_card": "no",
+                "need_detection_search_words_card": "remember proxy",
+                "need_detection_search_words_other_language_card": "none",
+            }
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "needs": [],
-                        "temporal_range": None,
-                        "sub_queries": ["remember proxy"],
-                        "sparse_query_hints": [
-                            {
-                                "sub_query_text": "remember proxy",
-                                "fts_phrase": "remember proxy",
-                            }
-                        ],
-                        "query_type": "default",
-                        "retrieval_levels": [0],
-                    }
-                ),
+                output_text=outputs[purpose],
             )
-        if purpose == "applicability_scoring":
+        if purpose == "applicability_relevance_card":
             candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
                 request.messages[1].content
             )
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "scores": [
-                            {"score_key": score_key, "llm_applicability": 0.5}
-                            for _memory_id, score_key in candidate_keys
-                        ],
-                    }
+                output_text="\n".join(
+                    f"{score_key} useful" for _memory_id, score_key in candidate_keys
+                ),
+            )
+        if purpose == "applicability_date_card":
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
+                request.messages[1].content
+            )
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="\n".join(
+                    f"{score_key} none" for _memory_id, score_key in candidate_keys
                 ),
             )
         if purpose == "context_cache_signal_detection":
@@ -632,6 +640,175 @@ async def test_openai_proxy_valid_response_mode_header_passes_through(
 
     assert response.status_code == 200
     assert captured["context"]["response_mode"] == "smart_fast"
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_adaptive_retrieval_header_reaches_context(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, dict] = {}
+
+    async def capture_context(self, **kwargs):
+        captured["context"] = kwargs
+        return None
+
+    async def capture_response(self, **kwargs):
+        captured["response"] = kwargs
+        return None
+
+    monkeypatch_targets = (
+        (
+            "atagia.services.openai_proxy_service.SidecarService.get_context",
+            capture_context,
+        ),
+        (
+            "atagia.services.openai_proxy_service.SidecarService.add_response",
+            capture_response,
+        ),
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        for target, replacement in monkeypatch_targets:
+            monkeypatch.setattr(target, replacement)
+        app = create_app(_settings(tmp_path))
+        provider = ProxyProvider()
+        async with app.router.lifespan_context(app):
+            app.state.runtime.llm_client = LLMClient(
+                provider_name=provider.name,
+                providers=[provider],
+            )
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                response = await client.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer service-key",
+                        "X-Atagia-User-Id": "usr_proxy",
+                        "X-Atagia-Platform-Id": "proxy_desktop",
+                        "X-Atagia-Conversation-Id": "cnv_proxy_adaptive_header",
+                        "X-Atagia-Adaptive-Retrieval": "true",
+                    },
+                    json={
+                        "model": "atagia-memory-proxy",
+                        "messages": [{"role": "user", "content": "Hello gate"}],
+                    },
+                )
+
+    assert response.status_code == 200
+    assert captured["context"]["adaptive_retrieval"] is True
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_adaptive_retrieval_metadata_reaches_context(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, dict] = {}
+
+    async def capture_context(self, **kwargs):
+        captured["context"] = kwargs
+        return None
+
+    async def capture_response(self, **kwargs):
+        captured["response"] = kwargs
+        return None
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "atagia.services.openai_proxy_service.SidecarService.get_context",
+            capture_context,
+        )
+        monkeypatch.setattr(
+            "atagia.services.openai_proxy_service.SidecarService.add_response",
+            capture_response,
+        )
+        app = create_app(_settings(tmp_path))
+        provider = ProxyProvider()
+        async with app.router.lifespan_context(app):
+            app.state.runtime.llm_client = LLMClient(
+                provider_name=provider.name,
+                providers=[provider],
+            )
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                response = await client.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer service-key",
+                        "X-Atagia-User-Id": "usr_proxy",
+                    },
+                    json={
+                        "model": "atagia-memory-proxy",
+                        "messages": [{"role": "user", "content": "Hello metadata gate"}],
+                        "metadata": {
+                            "atagia_conversation_id": "cnv_proxy_adaptive_metadata",
+                            "atagia_platform_id": "proxy_desktop",
+                            "atagia_adaptive_retrieval": True,
+                        },
+                    },
+                )
+
+    assert response.status_code == 200
+    assert captured["context"]["adaptive_retrieval"] is True
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_invalid_adaptive_retrieval_header_falls_back_to_default(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, dict] = {}
+
+    async def capture_context(self, **kwargs):
+        captured["context"] = kwargs
+        return None
+
+    async def capture_response(self, **kwargs):
+        captured["response"] = kwargs
+        return None
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "atagia.services.openai_proxy_service.SidecarService.get_context",
+            capture_context,
+        )
+        monkeypatch.setattr(
+            "atagia.services.openai_proxy_service.SidecarService.add_response",
+            capture_response,
+        )
+        app = create_app(_settings(tmp_path))
+        provider = ProxyProvider()
+        async with app.router.lifespan_context(app):
+            app.state.runtime.llm_client = LLMClient(
+                provider_name=provider.name,
+                providers=[provider],
+            )
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                response = await client.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer service-key",
+                        "X-Atagia-User-Id": "usr_proxy",
+                        "X-Atagia-Platform-Id": "proxy_desktop",
+                        "X-Atagia-Conversation-Id": "cnv_proxy_adaptive_bad",
+                        "X-Atagia-Adaptive-Retrieval": "maybe",
+                    },
+                    json={
+                        "model": "atagia-memory-proxy",
+                        "messages": [{"role": "user", "content": "Hello bad gate"}],
+                    },
+                )
+
+    assert response.status_code == 200
+    # An unrecognized value resolves to None so the engine/global default applies.
+    assert captured["context"]["adaptive_retrieval"] is None
 
 
 @pytest.mark.asyncio

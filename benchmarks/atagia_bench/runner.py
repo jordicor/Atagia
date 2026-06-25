@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 from time import perf_counter
 from typing import Any
 
+import httpx
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from benchmarks.activation_flags import benchmark_activation_flags
@@ -34,12 +35,14 @@ from benchmarks.custody_summary import summarize_retrieval_custody
 from benchmarks.json_artifacts import write_json_atomic
 from benchmarks.llm_metrics import (
     LLMCallRecorder,
+    install_llm_call_delay,
     install_llm_call_recorder,
     merge_llm_call_summaries,
 )
 from benchmarks.llm_config import provider_api_key_kwargs
 from benchmarks.migration_metadata import benchmark_migration_metadata
 from benchmarks.numeric_summary import summarize_numeric_values
+from benchmarks.output_root import assert_outside_repo, bench_output_root
 from benchmarks.retained_db_paths import validate_retained_benchmark_db_dir
 from benchmarks.scorer import LLMJudgeScorer
 from benchmarks.source_evidence import source_evidence_from_turns
@@ -74,7 +77,7 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
 _DEFAULT_HOLDOUT_PATH = Path(__file__).resolve().parent / "data" / "holdout_v0.json"
-_DEFAULT_BENCHMARK_DB_DIR = _PROJECT_ROOT / "docs" / "tmp" / "benchmark_dbs"
+_DEFAULT_BENCHMARK_DB_DIR = bench_output_root() / "atagia_bench" / "benchmark_dbs"
 _BENCHMARK_DB_FILENAME = "benchmark.db"
 _BENCHMARK_DB_METADATA_FILENAME = "run_metadata.json"
 
@@ -93,6 +96,22 @@ _TECHNICAL_FAILURE_REASON_PREFIX_BY_STAGE = {
     "answer_generation": "Answer generation failed",
     "judge": "Judge call failed",
 }
+_RAW_PROVIDER_TRANSPORT_ERRORS = (
+    httpx.TransportError,
+    TimeoutError,
+    ConnectionError,
+)
+_RETRIEVAL_TECHNICAL_ERRORS = (
+    LLMError,
+    LLMUnavailableError,
+    StructuredOutputError,
+    *_RAW_PROVIDER_TRANSPORT_ERRORS,
+)
+_JUDGE_TECHNICAL_ERRORS = (
+    LLMError,
+    StructuredOutputError,
+    *_RAW_PROVIDER_TRANSPORT_ERRORS,
+)
 
 
 # ---- Report models ----
@@ -183,6 +202,7 @@ class AtagiaBenchRunner:
         answer_postcondition_guard_enabled: bool = False,
         answer_stance: str = "reactive",
         answer_stance_prompt_variant: str = "baseline",
+        llm_call_delay_ms: int = 0,
     ) -> None:
         self._llm_provider = llm_provider
         self._llm_api_key = llm_api_key
@@ -247,6 +267,7 @@ class AtagiaBenchRunner:
             )
         self._answer_stance = answer_stance
         self._answer_stance_prompt_variant = answer_stance_prompt_variant
+        self._llm_call_delay_ms = max(0, int(llm_call_delay_ms))
 
     async def run(
         self,
@@ -533,6 +554,10 @@ class AtagiaBenchRunner:
             if runtime is None:
                 raise RuntimeError("Atagia runtime unavailable")
             install_llm_call_recorder(runtime.llm_client, llm_recorder)
+            install_llm_call_delay(
+                runtime.llm_client,
+                delay_seconds=self._llm_call_delay_ms / 1000.0,
+            )
 
             user_id = f"bench-{persona_id}"
             await engine.create_user(user_id)
@@ -678,6 +703,10 @@ class AtagiaBenchRunner:
                     if runtime is None:
                         raise RuntimeError("Atagia runtime unavailable")
                     install_llm_call_recorder(runtime.llm_client, llm_recorder)
+                    install_llm_call_delay(
+                        runtime.llm_client,
+                        delay_seconds=self._llm_call_delay_ms / 1000.0,
+                    )
                     judge = LLMJudgeScorer(
                         runtime.llm_client,
                         self._judge_model or chat_model(runtime.settings),
@@ -819,6 +848,7 @@ class AtagiaBenchRunner:
         while candidate.exists():
             suffix += 1
             candidate = base_dir / f"{stem}_{suffix}"
+        assert_outside_repo(candidate)
         candidate.mkdir(parents=True, exist_ok=False)
         return candidate
 
@@ -950,7 +980,7 @@ class AtagiaBenchRunner:
                 ),
             )
             prediction = chat_result.response_text
-        except (LLMError, LLMUnavailableError, StructuredOutputError) as exc:
+        except _RETRIEVAL_TECHNICAL_ERRORS as exc:
             retrieval_time_ms = (perf_counter() - chat_started_at) * 1000.0
             trace_payload = self._basic_question_trace(
                 question=question,
@@ -998,7 +1028,7 @@ class AtagiaBenchRunner:
                 ground_truth=effective_ground_truth,
                 config=grader_config,
             )
-        except (LLMError, StructuredOutputError) as exc:
+        except _JUDGE_TECHNICAL_ERRORS as exc:
             trace_payload = await self._build_question_trace_from_chat_result(
                 engine,
                 user_id=user_id,
@@ -1254,13 +1284,16 @@ class AtagiaBenchRunner:
                 context, context_payload
             ),
             "retrieval_custody": retrieval_custody,
-            "retrieval_trace": {
-                "query_text": question.question_text,
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "timestamp_iso": runtime.clock.now().isoformat(),
-                "source": "real_chat_debug",
-            },
+            "retrieval_trace": (
+                debug.get("retrieval_trace")
+                or {
+                    "query_text": question.question_text,
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "timestamp_iso": runtime.clock.now().isoformat(),
+                    "source": "real_chat_debug",
+                }
+            ),
             "answer_postcondition_guard": debug.get("answer_postcondition_guard"),
             "debug_authority": debug.get("authority"),
         }
@@ -1987,6 +2020,7 @@ class AtagiaBenchRunner:
                 ),
                 "trusted_evaluation": trusted_evaluation,
                 "parallel_personas": parallel_personas,
+                "llm_call_delay_ms": self._llm_call_delay_ms,
                 "keep_db": keep_db,
                 "benchmark_db_dir": (
                     str(Path(benchmark_db_dir).expanduser())
@@ -2163,7 +2197,7 @@ class AtagiaBenchRunner:
     @staticmethod
     def save_report(report: AtagiaBenchReport, output_dir: str | Path) -> Path:
         """Persist a benchmark report as JSON and return its path."""
-        output_path = Path(output_dir).expanduser()
+        output_path = assert_outside_repo(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         report_path = output_path / f"atagia-bench-report-{timestamp}.json"

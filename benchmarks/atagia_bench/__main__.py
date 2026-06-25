@@ -33,6 +33,7 @@ from benchmarks.failure_taxonomy import (
     format_failure_taxonomy_summary,
     save_failure_taxonomy_report,
 )
+from benchmarks.output_root import assert_outside_repo, bench_output_root
 from benchmarks.retained_db_paths import default_benchmark_db_dir
 from atagia.core.config import ANSWER_STANCE_PROMPT_VARIANTS
 from atagia.models.schemas_replay import AblationConfig
@@ -40,10 +41,10 @@ from atagia.services.model_resolution import COMPONENTS_BY_ID
 
 load_dotenv()
 
-_DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
+_DEFAULT_OUTPUT_DIR = bench_output_root() / "atagia_bench"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 _DEFAULT_HOLDOUT_FILE = Path(__file__).resolve().parent / "data" / "holdout_v0.json"
-_DEFAULT_JUDGE_MODEL = "anthropic/claude-opus-4-7"
+_DEFAULT_JUDGE_MODEL = "kimi/kimi-k2.7-code"
 _DEFAULT_PRIVACY_ENFORCEMENT = "off"
 
 
@@ -147,8 +148,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--judge-model",
         default=None,
         help=(
-            "LLM model for scoring; defaults to direct Anthropic "
-            "claude-opus-4-7 for benchmark stability"
+            "LLM model for scoring; defaults to direct Kimi "
+            "kimi-k2.7-code for benchmark judging"
         ),
     )
     parser.add_argument(
@@ -199,7 +200,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="COMPONENT=MODEL",
         help=(
             "Override one Atagia LLM component model. Repeatable. "
-            "Example: need_detector=openrouter/google/gemini-3.1-flash-lite"
+            "Example: need_detector_language=openrouter/google/gemini-3.1-flash-lite"
         ),
     )
     parser.add_argument(
@@ -312,6 +313,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--llm-call-delay-ms",
+        type=int,
+        default=0,
+        help=(
+            "Serialize each benchmark LLM client and sleep this many "
+            "milliseconds before each model call. Useful for direct providers "
+            "with tight rate limits."
+        ),
+    )
+    parser.add_argument(
         "--benchmark-db-dir",
         default=None,
         help="Directory where --keep-db stores reusable benchmark databases.",
@@ -418,6 +429,7 @@ async def _run_async(
 ) -> tuple[
     AtagiaBenchReport, Path, Path | None, Any, Path, Path, Path, dict[str, object]
 ]:
+    assert_outside_repo(args.output)
     holdout_ids = load_holdout_question_ids(args.holdout_file)
     question_ids, exclude_question_ids = _question_filters_for_split(
         explicit_question_ids=_parse_csv_list(args.questions),
@@ -445,6 +457,7 @@ async def _run_async(
         answer_postcondition_guard_enabled=args.answer_postcondition_guard,
         answer_stance=args.answer_stance,
         answer_stance_prompt_variant=args.answer_stance_prompt_variant,
+        llm_call_delay_ms=args.llm_call_delay_ms,
     )
     report = await runner.run(
         persona_ids=_parse_csv_list(args.personas),
@@ -629,6 +642,8 @@ def main() -> None:
         )
     if args.parallel_personas < 1:
         parser.error("--parallel-personas must be at least 1")
+    if args.llm_call_delay_ms < 0:
+        parser.error("--llm-call-delay-ms must be non-negative")
     if args.evaluate_only and args.reuse_db is None:
         parser.error("--evaluate-only requires --reuse-db")
     selected_personas = _parse_csv_list(args.personas)

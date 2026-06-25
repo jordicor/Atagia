@@ -26,7 +26,11 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
-from tests.extraction_payload_support import rich_extraction_payload_to_lean
+from tests.extraction_payload_support import (
+    is_memory_extraction_card_purpose,
+    memory_extraction_card_output_from_payload,
+    rich_extraction_payload_to_lean,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
@@ -50,6 +54,15 @@ class ExtractionProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps({"equivalent": True}),
+            )
+        if is_memory_extraction_card_purpose(request.metadata.get("purpose")):
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=memory_extraction_card_output_from_payload(
+                    self.payload,
+                    request.metadata.get("purpose"),
+                ),
             )
         return LLMCompletionResponse(
             provider=self.name,

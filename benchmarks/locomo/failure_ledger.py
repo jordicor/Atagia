@@ -19,10 +19,10 @@ from atagia.services.answer_postcondition import DEFAULT_ABSTENTION_TEXT
 from benchmarks.artifact_hash import sha256_file_if_exists
 from benchmarks.custody_summary import summarize_retrieval_custody
 from benchmarks.json_artifacts import write_json_atomic
+from benchmarks.output_root import bench_output_root
 
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "docs" / "tmp"
+_DEFAULT_OUTPUT_DIR = bench_output_root() / "locomo"
 _CATEGORY_NAMES = {
     1: "single-hop",
     2: "multi-hop",

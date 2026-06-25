@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from benchmarks.base import BenchmarkAdapter, BenchmarkConversation, BenchmarkDataset, BenchmarkQuestion, BenchmarkTurn
+from benchmarks.source_evidence import normalize_evidence_turn_ids
 
 _SESSION_KEY_PATTERN = re.compile(r"^session_(\d+)$")
 
@@ -97,10 +98,7 @@ class LoCoMoAdapter(BenchmarkAdapter):
                     question_text=str(item.get("question", "")),
                     ground_truth=self._stringify_value(item.get("answer")),
                     category=int(item["category"]),
-                    evidence_turn_ids=[
-                        str(entry)
-                        for entry in evidence
-                    ] if isinstance(evidence, list) else [],
+                    evidence_turn_ids=normalize_evidence_turn_ids(evidence),
                     question_id=f"{conversation_id}:q{index}",
                 )
             )

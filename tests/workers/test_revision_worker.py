@@ -85,6 +85,54 @@ class QueueProvider(LLMProvider):
         raise AssertionError("Embeddings are not used in revision worker tests")
 
 
+class FlipEquivalenceProvider(LLMProvider):
+    """Equivalence True at the first call (match), False if ever re-called.
+
+    Models the conv-26 root cause: the non-deterministic claim-key equivalence
+    LLM flips between match-time and revision-preview time. With Layer (b) the
+    preview must trust the match and never re-call equivalence, so the flip is
+    never observed and the revision succeeds.
+    """
+
+    name = "flip-equivalence-tests"
+
+    def __init__(self, outputs: list[str]) -> None:
+        self.outputs = list(outputs)
+        self.requests: list[LLMCompletionRequest] = []
+        self.equivalence_calls = 0
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.requests.append(request)
+        if request.metadata.get("purpose") == "intent_classifier_explicit":
+            message_text = request.messages[-1].content
+            is_explicit = "I prefer" in message_text or "I also prefer" in message_text
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps(
+                    {"is_explicit": is_explicit, "reasoning": "Test classifier response."}
+                ),
+            )
+        if request.metadata.get("purpose") == "intent_classifier_claim_key_equivalence":
+            self.equivalence_calls += 1
+            equivalent = self.equivalence_calls == 1
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps({"equivalent": equivalent}),
+            )
+        if not self.outputs:
+            raise AssertionError("No queued output left for this test")
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text=self.outputs.pop(0),
+        )
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        raise AssertionError("Embeddings are not used in revision worker tests")
+
+
 class RecordingEmbeddingIndex(EmbeddingIndex):
     def __init__(self) -> None:
         self.upsert_calls: list[tuple[str, str, dict[str, object]]] = []
@@ -135,7 +183,12 @@ def _split_by_scope_output(explanation: str) -> str:
     )
 
 
-async def _build_runtime(outputs: list[str], embedding_index: EmbeddingIndex | None = None):
+async def _build_runtime(
+    outputs: list[str],
+    embedding_index: EmbeddingIndex | None = None,
+    *,
+    provider: LLMProvider | None = None,
+):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 1, 18, 0, tzinfo=timezone.utc))
     await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
@@ -177,7 +230,7 @@ async def _build_runtime(outputs: list[str], embedding_index: EmbeddingIndex | N
         {},
     )
     backend = InProcessBackend()
-    provider = QueueProvider(outputs)
+    provider = provider if provider is not None else QueueProvider(outputs)
     worker = RevisionWorker(
         storage_backend=backend,
         connection=connection,
@@ -1396,5 +1449,179 @@ async def test_promotion_matches_semantically_equivalent_claim_key() -> None:
         assert result.acked == 1
         assert len(belief_rows) == 1
         assert version["support_count"] == 2
+    finally:
+        await connection.close()
+
+
+async def _set_belief_claim_key(connection, belief_id: str, claim_key: str) -> None:
+    await connection.execute(
+        """
+        UPDATE belief_versions
+        SET claim_key = ?
+        WHERE belief_id = ?
+          AND is_current = 1
+        """,
+        (claim_key, belief_id),
+    )
+    await connection.execute(
+        """
+        UPDATE memory_objects
+        SET payload_json = json_set(payload_json, '$.claim_key', ?)
+        WHERE id = ?
+        """,
+        (claim_key, belief_id),
+    )
+    await connection.commit()
+
+
+@pytest.mark.asyncio
+async def test_promotion_path_trusts_match_and_does_not_revalidate_equivalence_at_preview() -> None:
+    # Layer (b): the promotion producer sets claim_key_already_validated=True after
+    # resolving the existing belief via _matching_beliefs_for_claim_key. The preview
+    # must trust that match and never re-call the (flipping) equivalence LLM.
+    provider = FlipEquivalenceProvider(
+        [json.dumps({"action": "REINFORCE", "explanation": "Equivalent claim key, reinforced."})]
+    )
+    connection, backend, memories, beliefs, worker = await _build_runtime([], provider=provider)
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        await _set_belief_claim_key(connection, str(belief["id"]), "response_style.debug_response")
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_flip_promotion",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+            claim_key="response_style.debugging",
+        )
+        await backend.stream_add(
+            REVISE_STREAM_NAME,
+            _revision_job(
+                belief_id="",
+                evidence_memory_ids=[str(evidence["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+                claim_key="response_style.debugging",
+            ).model_dump(mode="json"),
+        )
+
+        result = await worker.run_once()
+        cursor = await connection.execute(
+            "SELECT support_count FROM belief_versions WHERE belief_id = ? AND is_current = 1",
+            (belief["id"],),
+        )
+        version = await cursor.fetchone()
+
+        assert result.acked == 1
+        assert result.failed == 0
+        # Equivalence is decided exactly once, at match time. The preview trusts it.
+        assert provider.equivalence_calls == 1
+        assert version["support_count"] == 2
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_preset_belief_id_threshold_revision_trusts_match_without_revalidation() -> None:
+    # Layer (b): ingest emits the belief-branch job with claim_key_already_validated
+    # bound to the match. Drive a contradictory belief to threshold through the real
+    # producer (process_job, pre-set belief_id). The equivalence LLM is never called
+    # at preview, so the flip cannot fire and the revision completes.
+    provider = FlipEquivalenceProvider(
+        [json.dumps({"action": "WEAKEN", "explanation": "Accumulated contradictions reached threshold."})]
+    )
+    connection, _backend, memories, beliefs, worker = await _build_runtime([], provider=provider)
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        await _set_belief_claim_key(connection, str(belief["id"]), "response_style.debug_response")
+        await beliefs.increment_tension(str(belief["id"]), 0.45, user_id="usr_1")
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_flip_preset",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+
+        envelope = _revision_job(
+            belief_id=str(belief["id"]),
+            evidence_memory_ids=[str(evidence["id"])],
+            source_message_id="msg_1",
+            scope=MemoryScope.CONVERSATION.value,
+            claim_key="response_style.debugging",
+            claim_value="verbose",
+        )
+        # The producer (ingest) sets the bit when belief_id is present; emulate the
+        # producer output by validating the match once and binding the bit, exactly
+        # as ingest_worker._emit_revision_jobs does.
+        envelope.payload["claim_key_already_validated"] = True
+
+        result = await worker.process_job(envelope.model_dump(mode="json"))
+
+        assert result is not None
+        assert result["action"] == "WEAKEN"
+        assert result["trigger_tension_score"] == pytest.approx(0.60)
+        # No equivalence call at all: the bit short-circuits validation at preview.
+        assert provider.equivalence_calls == 0
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_key_mismatch_at_preview_skips_and_preserves_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Layer (a), C-beta: force a bit=False preview that mismatches. The worker must
+    # return a skip status, raise no exception, and PRESERVE the tension buffer.
+    provider = FlipEquivalenceProvider([])
+    connection, _backend, memories, beliefs, worker = await _build_runtime([], provider=provider)
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        await _set_belief_claim_key(connection, str(belief["id"]), "response_style.debug_response")
+        await beliefs.increment_tension(str(belief["id"]), 0.45, user_id="usr_1")
+        evidence = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_mismatch_skip",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+        )
+
+        # Force the equivalence LLM to reject so validation fails. The bit is left
+        # False (defensive path): emulate a future caller that reached preview
+        # without trusting the match.
+        async def reject_equivalence(*args, **kwargs) -> bool:
+            del args, kwargs
+            return False
+
+        monkeypatch.setattr(
+            "atagia.memory.belief_reviser.are_claim_keys_equivalent",
+            reject_equivalence,
+        )
+
+        envelope = _revision_job(
+            belief_id=str(belief["id"]),
+            evidence_memory_ids=[str(evidence["id"])],
+            source_message_id="msg_1",
+            scope=MemoryScope.CONVERSATION.value,
+            claim_key="response_style.debugging",
+            claim_value="verbose",
+        )
+        result = await worker.process_job(envelope.model_dump(mode="json"))
+
+        assert result is not None
+        assert result["status"] == "skipped_claim_key_mismatch"
+        assert result["belief_id"] == str(belief["id"])
+        assert result["current_claim_key"] == "response_style.debug_response"
+        assert result["payload_claim_key"] == "response_style.debugging"
+
+        # Buffer and tension must be preserved (not reset/popped) on the skip.
+        belief_row = await memories.get_memory_object(str(belief["id"]), "usr_1")
+        assert belief_row is not None
+        assert belief_row["payload_json"]["tension_evidence_memory_ids"] == [
+            "mem_evidence_mismatch_skip"
+        ]
+        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.60)
     finally:
         await connection.close()

@@ -1,9 +1,8 @@
-"""Need-detector tests for multilingual language-profile rendering."""
+"""Language-profile coverage for parallel-card need detection."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 
 import pytest
@@ -13,7 +12,6 @@ from atagia.core.config import Settings
 from atagia.memory.need_detector import NeedDetector
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.models.schemas_memory import (
-    ExplicitLanguageAbility,
     ExplicitLanguagePreference,
     ExtractionContextMessage,
     ExtractionConversationContext,
@@ -31,27 +29,22 @@ from atagia.services.llm_client import (
 )
 
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
-SYNTHETIC_PERSON_A = "PERSON_A"
-SYNTHETIC_PERSON_B = "PERSON_B"
-SYNTHETIC_ADDRESS = "742 Example Plaza North"
-SYNTHETIC_MEDICATION = "compound_x"
-SYNTHETIC_QUANTITY = "17 mg"
-SYNTHETIC_LOCATION_TOKEN = "UNIT_7"
 
 
-class CannedNeedProvider(LLMProvider):
-    name = "canned-needs"
+class CannedCardProvider(LLMProvider):
+    name = "canned-cards"
 
-    def __init__(self, payload: dict[str, object]) -> None:
-        self.payload = payload
+    def __init__(self, outputs: dict[str, str]) -> None:
+        self.outputs = outputs
         self.requests: list[LLMCompletionRequest] = []
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
+        purpose = str(request.metadata.get("purpose") or "")
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
-            output_text=json.dumps(self.payload),
+            output_text=self.outputs.get(purpose, "none"),
         )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -72,7 +65,10 @@ def _context() -> ExtractionConversationContext:
         workspace_id="wrk_1",
         assistant_mode_id="coding_debug",
         recent_messages=[
-            ExtractionContextMessage(role="assistant", content="I suggested checking websocket middleware."),
+            ExtractionContextMessage(
+                role="assistant",
+                content="I suggested checking websocket middleware.",
+            ),
             ExtractionContextMessage(role="user", content="That still did not fix it."),
         ],
     )
@@ -102,459 +98,224 @@ def _settings() -> Settings:
     )
 
 
-def _hint_for_sub_query(result, sub_query_text: str):
-    return next(hint for hint in result.sparse_query_hints if hint.sub_query_text == sub_query_text)
+def _outputs(language: str = "es\nfr") -> dict[str, str]:
+    return {
+        "need_detection_needs_card": "none",
+        "need_detection_language_card": language,
+        "need_detection_memory_card": "personal",
+        "need_detection_exact_card": "yes",
+        "need_detection_shape_card": "slot",
+        "need_detection_facets_card": "location",
+        "need_detection_callback_card": "no",
+        "need_detection_search_words_card": "Claire\nadresse",
+    }
 
 
 @pytest.mark.asyncio
-async def test_need_detector_renders_content_language_profile_block_and_escapes_values() -> None:
-    provider = CannedNeedProvider(
-        {
-            "needs": [],
-            "temporal_range": None,
-            "sub_queries": ["item label"],
-            "sparse_query_hints": [
-                {
-                    "sub_query_text": "item label",
-                    "fts_phrase": "item label",
-                }
-            ],
-            "query_type": "slot_fill",
-            "retrieval_levels": [0],
-        }
-    )
+async def test_language_card_result_controls_query_and_answer_language() -> None:
+    provider = CannedCardProvider(_outputs("es\nfr"))
     detector = NeedDetector(
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         clock=_clock(),
         settings=_settings(),
     )
 
-    await detector.detect(
-        message_text=f"¿Cuál es la etiqueta actual de {SYNTHETIC_PERSON_A}?",
-        role="user",
-        conversation_context=_context(),
-        resolved_policy=_resolved_policy(),
-        content_language_profile=[
-            {
-                "language_code": "en",
-                "memory_count": 14,
-                "last_seen_at": "2026-04-10T12:00:00+00:00",
-            },
-            {
-                "language_code": "es",
-                "memory_count": 3,
-                "last_seen_at": "2026-04-09T08:15:00+00:00 <tag>",
-            },
-        ],
-    )
-
-    prompt = provider.requests[0].messages[1].content
-    assert "<content_language_profile>" in prompt
-    assert "</content_language_profile>" in prompt
-    assert prompt.rfind("<recent_context>") < prompt.rfind("<content_language_profile>")
-    assert "en: 14 memories (last seen 2026-04-10)" in prompt
-    assert "es: 3 memories (last seen 2026-04-09)" in prompt
-    assert "&lt;tag&gt;" in prompt
-
-
-@pytest.mark.asyncio
-async def test_need_detector_renders_empty_content_language_profile_as_none() -> None:
-    provider = CannedNeedProvider(
-        {
-            "needs": [],
-            "temporal_range": None,
-            "sub_queries": ["thanks"],
-            "sparse_query_hints": [
-                {
-                    "sub_query_text": "thanks",
-                    "fts_phrase": "thanks",
-                }
-            ],
-            "query_type": "default",
-            "retrieval_levels": [0],
-        }
-    )
-    detector = NeedDetector(
-        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
-        clock=_clock(),
-        settings=_settings(),
-    )
-
-    await detector.detect(
-        message_text="Thanks, that worked.",
+    result = await detector.detect(
+        message_text="Responde en frances: cual es mi direccion?",
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
         content_language_profile=[],
     )
 
-    prompt = provider.requests[0].messages[1].content
-    assert "<content_language_profile>" in prompt
-    assert "(none)" in prompt
+    assert result.query_language == "es"
+    assert result.answer_language == "fr"
 
 
 @pytest.mark.asyncio
-async def test_need_detector_renders_user_communication_profile_separately_from_content_profile() -> None:
-    provider = CannedNeedProvider(
-        {
-            "needs": [],
-            "temporal_range": None,
-            "sub_queries": ["current user language preference"],
-            "sparse_query_hints": [
-                {
-                    "sub_query_text": "current user language preference",
-                    "fts_phrase": "current user language preference",
-                }
-            ],
-            "query_language": "ca",
-            "answer_language": "es",
-            "query_type": "default",
-            "retrieval_levels": [0],
-        }
+async def test_anchor_card_aliases_are_materialized_for_saved_memory_language() -> None:
+    outputs = _outputs("es\nes")
+    outputs["need_detection_search_words_card"] = "ibuprofeno"
+    outputs["need_detection_search_words_other_language_card"] = (
+        "ibuprofeno => ibuprofen"
     )
+    provider = CannedCardProvider(outputs)
     detector = NeedDetector(
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         clock=_clock(),
         settings=_settings(),
     )
-    source_ref = LanguageProfileSourceRef(
-        source_kind="source_message",
-        conversation_id="cnv_1",
-        source_message_id="msg_lang",
-    )
 
     result = await detector.detect(
-        message_text="Ho podem comentar en castella?",
+        message_text="Cual es mi dosis actual de ibuprofeno?",
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
         content_language_profile=[
             {
                 "language_code": "en",
-                "memory_count": 3,
-                "last_seen_at": "2026-04-05T12:00:00+00:00",
+                "memory_count": 42,
+                "last_seen_at": "2026-04-01T00:00:00+00:00",
             }
         ],
-        user_communication_profile=UserCommunicationProfile(
-            observed_user_languages=[
+    )
+
+    assert [anchor.original_surface for anchor in result.anchors] == ["ibuprofeno"]
+    assert result.sparse_query_hints[0].must_keep_terms == ["ibuprofeno"]
+    assert {
+        request.metadata["purpose"] for request in provider.requests
+    } >= {
+        "need_detection_search_words_card",
+        "need_detection_search_words_other_language_card",
+    }
+    alias = result.anchors[0].aliases[0]
+    assert alias.surface == "ibuprofen"
+    assert alias.alias_language == "en"
+    assert alias.alias_kind == "translation"
+    assert alias.non_evidential is True
+    assert alias.derivation["target_content_languages"] == ["en"]
+
+
+@pytest.mark.asyncio
+async def test_other_language_search_words_card_is_not_called_when_languages_match() -> None:
+    provider = CannedCardProvider(_outputs("es\nes"))
+    detector = NeedDetector(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=_clock(),
+        settings=_settings(),
+    )
+
+    await detector.detect(
+        message_text="Cual es mi direccion?",
+        role="user",
+        conversation_context=_context(),
+        resolved_policy=_resolved_policy(),
+        content_language_profile=[
+            {
+                "language_code": "es",
+                "memory_count": 42,
+                "last_seen_at": "2026-04-01T00:00:00+00:00",
+            }
+        ],
+    )
+
+    purposes = {request.metadata["purpose"] for request in provider.requests}
+    assert "need_detection_search_words_card" in purposes
+    assert "need_detection_search_words_other_language_card" not in purposes
+
+
+@pytest.mark.asyncio
+async def test_other_language_search_words_card_is_not_called_without_search_words() -> None:
+    outputs = _outputs("es\nes")
+    outputs["need_detection_search_words_card"] = "none"
+    provider = CannedCardProvider(outputs)
+    detector = NeedDetector(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=_clock(),
+        settings=_settings(),
+    )
+
+    await detector.detect(
+        message_text="Cual es?",
+        role="user",
+        conversation_context=_context(),
+        resolved_policy=_resolved_policy(),
+        content_language_profile=[
+            {
+                "language_code": "en",
+                "memory_count": 42,
+                "last_seen_at": "2026-04-01T00:00:00+00:00",
+            }
+        ],
+    )
+
+    purposes = {request.metadata["purpose"] for request in provider.requests}
+    assert "need_detection_search_words_card" in purposes
+    assert "need_detection_search_words_other_language_card" not in purposes
+
+
+@pytest.mark.asyncio
+async def test_content_language_profile_is_rendered_for_each_card() -> None:
+    provider = CannedCardProvider(_outputs())
+    detector = NeedDetector(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=_clock(),
+        settings=_settings(),
+    )
+
+    await detector.detect(
+        message_text="Quelle adresse Claire a-t-elle donnee?",
+        role="user",
+        conversation_context=_context(),
+        resolved_policy=_resolved_policy(),
+        content_language_profile=[
+            {
+                "language_code": "en",
+                "memory_count": 12,
+                "last_seen_at": "2026-04-01T00:00:00+00:00",
+            },
+            {
+                "language_code": "unknown",
+                "memory_count": 3,
+                "last_seen_at": "2026-04-02T00:00:00+00:00",
+            },
+        ],
+    )
+
+    for request in provider.requests:
+        prompt = request.messages[1].content
+        assert "Saved memory languages:" in prompt
+        assert "en: 12 memories" in prompt
+        assert "unknown: 3 memories" in prompt
+
+
+@pytest.mark.asyncio
+async def test_user_communication_profile_is_rendered_as_control_plane_only() -> None:
+    provider = CannedCardProvider(_outputs("fr\nfr"))
+    detector = NeedDetector(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=_clock(),
+        settings=_settings(),
+    )
+    source = LanguageProfileSourceRef(
+        source_kind="source_message",
+        source_message_id="msg_profile",
+        conversation_id="cnv_1",
+    )
+    profile = UserCommunicationProfile(
+        observed_user_languages=[
                 ObservedUserLanguage(
-                    language_code="ca",
+                    language_code="fr",
                     message_count=4,
-                    source_refs=[source_ref],
-                    confidence=0.82,
+                    source_refs=[source],
+                    confidence=0.9,
                 )
             ],
             explicit_language_preferences=[
                 ExplicitLanguagePreference(
-                    language_code="es",
-                    preference_kind="default_answer_language",
-                    context_label="ordinary_chat",
-                    source_refs=[source_ref],
-                    confidence=0.93,
+                    language_code="fr",
+                    preference_kind="contextual_answer_language",
+                    context_label="coding_debug",
+                    source_refs=[source],
+                    confidence=0.9,
                 )
             ],
-            explicit_language_abilities=[
-                ExplicitLanguageAbility(
-                    language_code="en",
-                    ability_kind="understands",
-                    source_refs=[source_ref],
-                    confidence=0.91,
-                )
-            ],
-        ),
-    )
-
-    prompt = provider.requests[0].messages[1].content
-    assert "<content_language_profile>" in prompt
-    assert "<user_communication_profile>" in prompt
-    user_profile_block = prompt.split("<user_communication_profile>\n", 1)[1].split(
-        "\n</user_communication_profile>",
-        1,
-    )[0]
-    assert "control_plane_only=true" in user_profile_block
-    assert "not_factual_answer_evidence=true" in user_profile_block
-    assert "observed_user_languages: ca: 4 observed user-authored messages" in user_profile_block
-    assert "explicit_language_preferences: es/default_answer_language/ordinary_chat" in user_profile_block
-    assert "explicit_language_abilities: en/understands" in user_profile_block
-    assert "Use <content_language_profile> for retrieval bridge target decisions." in prompt
-    assert "must not force a bridge target" in prompt
-    assert "from <content_language_profile>" in prompt
-    # query_language/answer_language stay core fields (cheap answer-language
-    # hints), so they flow through the lean plan unchanged.
-    assert result.query_language == "ca"
-    assert result.answer_language == "es"
-
-
-@pytest.mark.asyncio
-async def test_need_detector_prompt_describes_raw_context_access_modes() -> None:
-    provider = CannedNeedProvider(
-        {
-            "needs": [],
-            "temporal_range": None,
-            "sub_queries": ["quote"],
-            "sparse_query_hints": [
-                {
-                    "sub_query_text": "quote",
-                    "fts_phrase": "quote",
-                }
-            ],
-            "query_type": "default",
-            "retrieval_levels": [0],
-        }
-    )
-    detector = NeedDetector(
-        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
-        clock=_clock(),
-        settings=_settings(),
     )
 
     await detector.detect(
-        message_text="Can you quote the exact wording from the attachment?",
+        message_text="Quelle adresse Claire a-t-elle donnee?",
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
         content_language_profile=[],
+        user_communication_profile=profile,
     )
 
     prompt = provider.requests[0].messages[1].content
-    assert "raw_context_access_mode" in prompt
-    assert "`skipped_raw`" in prompt
-    assert "`artifact`" in prompt
-    assert "`verbatim`" in prompt
-
-
-@pytest.mark.asyncio
-async def test_need_detector_preserves_proper_name_anchor_verbatim_across_bridge_variants() -> None:
-    provider = CannedNeedProvider(
-        {
-            "needs": [],
-            "temporal_range": None,
-            "sub_queries": [
-                f"¿Quién es la colega de {SYNTHETIC_PERSON_A}?",
-                f"who is the colleague of {SYNTHETIC_PERSON_A}",
-            ],
-            "sparse_query_hints": [
-                {
-                    "sub_query_text": f"¿Quién es la colega de {SYNTHETIC_PERSON_A}?",
-                    "fts_phrase": f"colega {SYNTHETIC_PERSON_A}",
-                    "must_keep_terms": ["colega", SYNTHETIC_PERSON_A],
-                },
-                {
-                    "sub_query_text": f"who is the colleague of {SYNTHETIC_PERSON_A}",
-                    "fts_phrase": f"colleague {SYNTHETIC_PERSON_A}",
-                    "must_keep_terms": ["colleague", SYNTHETIC_PERSON_A],
-                },
-            ],
-            "query_type": "slot_fill",
-            "retrieval_levels": [0],
-            "exact_recall_needed": True,
-            "exact_facets": ["person_name"],
-        }
+    assert "control_plane_only=true" in prompt
+    assert "not_factual_answer_evidence=true" in prompt
+    assert "observed_user_languages: fr: 4 observed user-authored messages" in prompt
+    assert (
+        "explicit_language_preferences: fr/contextual_answer_language/coding_debug"
+        in prompt
     )
-    detector = NeedDetector(
-        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
-        clock=_clock(),
-        settings=_settings(),
-    )
-
-    result = await detector.detect(
-        message_text=f"¿Quién es la colega de {SYNTHETIC_PERSON_A}?",
-        role="user",
-        conversation_context=_context(),
-        resolved_policy=_resolved_policy(),
-        content_language_profile=[
-            {
-                "language_code": "en",
-                "memory_count": 4,
-                "last_seen_at": "2026-04-10T12:00:00+00:00",
-            }
-        ],
-    )
-
-    spanish_hint = _hint_for_sub_query(result, f"¿Quién es la colega de {SYNTHETIC_PERSON_A}?")
-    english_hint = _hint_for_sub_query(result, f"who is the colleague of {SYNTHETIC_PERSON_A}")
-    assert SYNTHETIC_PERSON_A in spanish_hint.must_keep_terms
-    assert SYNTHETIC_PERSON_A in english_hint.must_keep_terms
-    assert "colega" in spanish_hint.must_keep_terms
-    assert "colega" not in english_hint.must_keep_terms
-    assert "colleague" in english_hint.must_keep_terms
-
-
-@pytest.mark.asyncio
-async def test_need_detector_preserves_full_address_verbatim_in_bridge_variant() -> None:
-    provider = CannedNeedProvider(
-        {
-            "needs": [],
-            "temporal_range": None,
-            "sub_queries": [
-                f"¿Cuál es la direccion de {SYNTHETIC_ADDRESS}?",
-                f"address {SYNTHETIC_ADDRESS}",
-            ],
-            "sparse_query_hints": [
-                {
-                    "sub_query_text": f"¿Cuál es la direccion de {SYNTHETIC_ADDRESS}?",
-                    "fts_phrase": f"direccion {SYNTHETIC_ADDRESS}",
-                    "must_keep_terms": ["direccion", SYNTHETIC_ADDRESS],
-                },
-                {
-                    "sub_query_text": f"address {SYNTHETIC_ADDRESS}",
-                    "fts_phrase": f"address {SYNTHETIC_ADDRESS}",
-                    "must_keep_terms": ["address", SYNTHETIC_ADDRESS],
-                },
-            ],
-            "query_type": "slot_fill",
-            "retrieval_levels": [0],
-            "exact_recall_needed": True,
-            "exact_facets": ["location"],
-        }
-    )
-    detector = NeedDetector(
-        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
-        clock=_clock(),
-        settings=_settings(),
-    )
-
-    result = await detector.detect(
-        message_text=f"¿Cuál es la direccion de {SYNTHETIC_ADDRESS}?",
-        role="user",
-        conversation_context=_context(),
-        resolved_policy=_resolved_policy(),
-        content_language_profile=[
-            {
-                "language_code": "en",
-                "memory_count": 4,
-                "last_seen_at": "2026-04-10T12:00:00+00:00",
-            }
-        ],
-    )
-
-    english_hint = _hint_for_sub_query(result, f"address {SYNTHETIC_ADDRESS}")
-    assert SYNTHETIC_ADDRESS in english_hint.must_keep_terms
-    assert SYNTHETIC_ADDRESS in english_hint.quoted_phrases
-
-
-@pytest.mark.asyncio
-async def test_need_detector_translates_common_noun_but_preserves_quantity_verbatim() -> None:
-    provider = CannedNeedProvider(
-        {
-            "needs": [],
-            "temporal_range": None,
-            "sub_queries": [
-                f"dosis de {SYNTHETIC_MEDICATION} {SYNTHETIC_QUANTITY}",
-                f"dose {SYNTHETIC_MEDICATION} {SYNTHETIC_QUANTITY}",
-            ],
-            "sparse_query_hints": [
-                {
-                    "sub_query_text": f"dosis de {SYNTHETIC_MEDICATION} {SYNTHETIC_QUANTITY}",
-                    "fts_phrase": f"dosis {SYNTHETIC_MEDICATION} {SYNTHETIC_QUANTITY}",
-                    "must_keep_terms": ["dosis", SYNTHETIC_MEDICATION, SYNTHETIC_QUANTITY],
-                },
-                {
-                    "sub_query_text": f"dose {SYNTHETIC_MEDICATION} {SYNTHETIC_QUANTITY}",
-                    "fts_phrase": f"dose {SYNTHETIC_MEDICATION} {SYNTHETIC_QUANTITY}",
-                    "must_keep_terms": ["dose", SYNTHETIC_MEDICATION, SYNTHETIC_QUANTITY],
-                },
-            ],
-            "query_type": "slot_fill",
-            "retrieval_levels": [0],
-            "exact_recall_needed": True,
-            "exact_facets": ["quantity", "medication"],
-        }
-    )
-    detector = NeedDetector(
-        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
-        clock=_clock(),
-        settings=_settings(),
-    )
-
-    result = await detector.detect(
-        message_text=f"dosis de {SYNTHETIC_MEDICATION} {SYNTHETIC_QUANTITY}",
-        role="user",
-        conversation_context=_context(),
-        resolved_policy=_resolved_policy(),
-        content_language_profile=[
-            {
-                "language_code": "en",
-                "memory_count": 4,
-                "last_seen_at": "2026-04-10T12:00:00+00:00",
-            }
-        ],
-    )
-
-    spanish_hint = _hint_for_sub_query(
-        result,
-        f"dosis de {SYNTHETIC_MEDICATION} {SYNTHETIC_QUANTITY}",
-    )
-    english_hint = _hint_for_sub_query(
-        result,
-        f"dose {SYNTHETIC_MEDICATION} {SYNTHETIC_QUANTITY}",
-    )
-    assert SYNTHETIC_QUANTITY in spanish_hint.must_keep_terms
-    assert SYNTHETIC_QUANTITY in english_hint.must_keep_terms
-    assert "dosis" in spanish_hint.must_keep_terms
-    assert "dosis" not in english_hint.must_keep_terms
-    assert "dose" in english_hint.must_keep_terms
-    assert SYNTHETIC_MEDICATION in english_hint.must_keep_terms
-
-
-@pytest.mark.asyncio
-async def test_need_detector_translates_only_common_nouns_in_code_switching_query() -> None:
-    provider = CannedNeedProvider(
-        {
-            "needs": [],
-            "temporal_range": None,
-            "sub_queries": [
-                f"direccion de {SYNTHETIC_PERSON_B} {SYNTHETIC_LOCATION_TOKEN}",
-                f"adresse de {SYNTHETIC_PERSON_B} {SYNTHETIC_LOCATION_TOKEN}",
-            ],
-            "sparse_query_hints": [
-                {
-                    "sub_query_text": f"direccion de {SYNTHETIC_PERSON_B} {SYNTHETIC_LOCATION_TOKEN}",
-                    "fts_phrase": f"direccion {SYNTHETIC_PERSON_B} {SYNTHETIC_LOCATION_TOKEN}",
-                    "must_keep_terms": ["direccion", SYNTHETIC_PERSON_B, SYNTHETIC_LOCATION_TOKEN],
-                },
-                {
-                    "sub_query_text": f"adresse de {SYNTHETIC_PERSON_B} {SYNTHETIC_LOCATION_TOKEN}",
-                    "fts_phrase": f"adresse {SYNTHETIC_PERSON_B} {SYNTHETIC_LOCATION_TOKEN}",
-                    "must_keep_terms": ["adresse", SYNTHETIC_PERSON_B, SYNTHETIC_LOCATION_TOKEN],
-                },
-            ],
-            "query_type": "slot_fill",
-            "retrieval_levels": [0],
-            "exact_recall_needed": True,
-            "exact_facets": ["person_name", "location"],
-        }
-    )
-    detector = NeedDetector(
-        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
-        clock=_clock(),
-        settings=_settings(),
-    )
-
-    result = await detector.detect(
-        message_text=f"direccion de {SYNTHETIC_PERSON_B} {SYNTHETIC_LOCATION_TOKEN}",
-        role="user",
-        conversation_context=_context(),
-        resolved_policy=_resolved_policy(),
-        content_language_profile=[
-            {
-                "language_code": "fr",
-                "memory_count": 4,
-                "last_seen_at": "2026-04-10T12:00:00+00:00",
-            }
-        ],
-    )
-
-    spanish_hint = _hint_for_sub_query(
-        result,
-        f"direccion de {SYNTHETIC_PERSON_B} {SYNTHETIC_LOCATION_TOKEN}",
-    )
-    french_hint = _hint_for_sub_query(
-        result,
-        f"adresse de {SYNTHETIC_PERSON_B} {SYNTHETIC_LOCATION_TOKEN}",
-    )
-    assert SYNTHETIC_PERSON_B in spanish_hint.must_keep_terms
-    assert SYNTHETIC_PERSON_B in french_hint.must_keep_terms
-    assert "direccion" in spanish_hint.must_keep_terms
-    assert "direccion" not in french_hint.must_keep_terms
-    assert "adresse" in french_hint.must_keep_terms

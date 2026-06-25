@@ -11,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from atagia.core.env import env_bool as _env_bool
+from atagia.core.language_codes import normalize_optional_iso_639_1_code
 from atagia.memory.context_envelope import (
     CONTEXT_ENVELOPE_DEFAULT_RATIOS,
     allocate_context_envelope_budget,
@@ -18,12 +19,14 @@ from atagia.memory.context_envelope import (
 from atagia.services.model_resolution import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_STRUCTURED_OUTPUT_RESCUE_MODEL,
+    component_env_examples_from_env,
     component_env_models_from_env,
     intimacy_component_env_models_from_env,
 )
 
 
 _DOTENV_LOADED = False
+DEFAULT_LANGUAGE_CODE = "en"
 RESPONSE_MODES = ("normal", "fast", "smart_fast")
 ANSWER_STANCES = ("reactive", "proactive")
 ANSWER_STANCE_PROMPT_VARIANTS = (
@@ -156,6 +159,16 @@ def _env_optional_str(name: str) -> str | None:
     return normalized or None
 
 
+def _env_language_code(name: str, default: str = DEFAULT_LANGUAGE_CODE) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    code = normalize_optional_iso_639_1_code(value)
+    if code is None:
+        raise ValueError(f"{name} must be an ISO 639-1 language code")
+    return code
+
+
 def _env_ratio_mapping(name: str, default: dict[str, float]) -> dict[str, float]:
     value = os.getenv(name)
     if value is None or not value.strip():
@@ -203,6 +216,10 @@ class Settings:
     worker_circuit_breaker_failure_threshold: int = 20
     worker_circuit_breaker_window_seconds: int = 180
     worker_circuit_breaker_min_failure_ratio: float = 0.8
+    worker_transient_defer_seconds: float = 60.0
+    worker_transient_defer_max_seconds: float = 300.0
+    worker_transient_defer_max_count: int = 12
+    worker_transient_defer_max_age_seconds: float = 3600.0
     llm_run_guard_enabled: bool = True
     llm_run_guard_mode: str = "enforce"
     llm_run_guard_max_total_calls: int | None = None
@@ -229,15 +246,22 @@ class Settings:
     bulk_ingest_llm_run_guard_max_wall_time_seconds: float | None = 14400.0
     anthropic_api_key: str | None = None
     google_api_key: str | None = None
+    kimi_api_key: str | None = None
+    minimax_api_key: str | None = None
     anthropic_base_url: str | None = None
     anthropic_request_timeout_seconds: float = 120.0
+    llm_request_timeout_seconds: float = 120.0
     openai_base_url: str | None = None
     openai_embedding_base_url: str | None = None
+    kimi_base_url: str | None = None
+    minimax_base_url: str | None = None
     openrouter_base_url: str | None = None
     llm_forced_global_model: str | None = None
     llm_ingest_model: str | None = None
     llm_retrieval_model: str | None = None
     llm_component_models: dict[str, str] = field(default_factory=dict)
+    card_examples_enabled: bool = True
+    llm_component_examples: dict[str, bool] = field(default_factory=dict)
     llm_intimacy_ingest_model: str | None = None
     llm_intimacy_retrieval_model: str | None = None
     llm_intimacy_component_models: dict[str, str] = field(default_factory=dict)
@@ -257,6 +281,9 @@ class Settings:
     artifact_blob_storage_path: str = "./data/artifact_blobs"
     allow_admin_export_anonymization: bool = False
     allow_insecure_http: bool = False
+    default_language_code: str = DEFAULT_LANGUAGE_CODE
+    consequence_detector_card_concurrency: int = 2
+    compactor_summary_card_concurrency: int = 4
     embedding_backend: str = "none"
     embedding_model: str | None = None
     embedding_dimension: int = 1536
@@ -334,6 +361,7 @@ class Settings:
     small_corpus_token_threshold_ratio: float = 0.7
     assistant_guidance_enabled: bool = True
     response_mode: str = "normal"
+    adaptive_retrieval: bool = True
     answer_stance: str = "reactive"
     answer_stance_prompt_variant: str = "baseline"
     answer_postcondition_guard_enabled: bool = False
@@ -399,6 +427,18 @@ class Settings:
             raise ValueError(
                 "worker_circuit_breaker_min_failure_ratio must be in the interval [0.0, 1.0]"
             )
+        if self.worker_transient_defer_seconds <= 0:
+            raise ValueError("worker_transient_defer_seconds must be positive")
+        if self.worker_transient_defer_max_seconds <= 0:
+            raise ValueError("worker_transient_defer_max_seconds must be positive")
+        if self.worker_transient_defer_max_seconds < self.worker_transient_defer_seconds:
+            raise ValueError(
+                "worker_transient_defer_max_seconds must be >= worker_transient_defer_seconds"
+            )
+        if self.worker_transient_defer_max_count <= 0:
+            raise ValueError("worker_transient_defer_max_count must be positive")
+        if self.worker_transient_defer_max_age_seconds <= 0:
+            raise ValueError("worker_transient_defer_max_age_seconds must be positive")
         if self.llm_run_guard_mode not in {"off", "audit", "enforce"}:
             raise ValueError("llm_run_guard_mode must be one of: off, audit, enforce")
         for field_name in (
@@ -495,6 +535,10 @@ class Settings:
             raise ValueError(
                 "initial_context_package_curation_max_output_tokens must be positive"
             )
+        if self.consequence_detector_card_concurrency <= 0:
+            raise ValueError("consequence_detector_card_concurrency must be positive")
+        if self.compactor_summary_card_concurrency <= 0:
+            raise ValueError("compactor_summary_card_concurrency must be positive")
         if (
             self.temporary_default_ttl_seconds is not None
             and self.temporary_default_ttl_seconds <= 0
@@ -504,6 +548,8 @@ class Settings:
             raise ValueError("tombstone_retention_days must be positive")
         if self.anthropic_request_timeout_seconds <= 0:
             raise ValueError("anthropic_request_timeout_seconds must be positive")
+        if self.llm_request_timeout_seconds <= 0:
+            raise ValueError("llm_request_timeout_seconds must be positive")
         if self.chunking_extraction_threshold_tokens <= 0:
             raise ValueError("chunking_extraction_threshold_tokens must be positive")
         if self.extraction_watchdog_bounded_retry_max_items <= 0:
@@ -727,14 +773,21 @@ class Settings:
             anthropic_api_key=os.getenv("ATAGIA_ANTHROPIC_API_KEY") or None,
             openai_api_key=os.getenv("ATAGIA_OPENAI_API_KEY") or None,
             openrouter_api_key=os.getenv("ATAGIA_OPENROUTER_API_KEY") or None,
+            kimi_api_key=os.getenv("ATAGIA_KIMI_API_KEY") or None,
+            minimax_api_key=os.getenv("ATAGIA_MINIMAX_API_KEY") or None,
             anthropic_base_url=os.getenv("ATAGIA_ANTHROPIC_BASE_URL") or None,
             anthropic_request_timeout_seconds=float(
                 os.getenv("ATAGIA_ANTHROPIC_REQUEST_TIMEOUT_SECONDS", "120.0")
+            ),
+            llm_request_timeout_seconds=float(
+                os.getenv("ATAGIA_LLM_REQUEST_TIMEOUT_SECONDS", "120.0")
             ),
             openai_base_url=os.getenv("ATAGIA_OPENAI_BASE_URL") or None,
             openai_embedding_base_url=(
                 os.getenv("ATAGIA_OPENAI_EMBEDDING_BASE_URL") or None
             ),
+            kimi_base_url=os.getenv("ATAGIA_KIMI_BASE_URL") or None,
+            minimax_base_url=os.getenv("ATAGIA_MINIMAX_BASE_URL") or None,
             openrouter_base_url=os.getenv("ATAGIA_OPENROUTER_BASE_URL") or None,
             openrouter_site_url=os.getenv(
                 "ATAGIA_OPENROUTER_SITE_URL", "http://localhost"
@@ -745,6 +798,8 @@ class Settings:
             llm_ingest_model=os.getenv("ATAGIA_LLM_INGEST_MODEL") or None,
             llm_retrieval_model=os.getenv("ATAGIA_LLM_RETRIEVAL_MODEL") or None,
             llm_component_models=component_env_models_from_env(os.environ),
+            card_examples_enabled=_env_bool("ATAGIA_CARD_EXAMPLES_ENABLED", True),
+            llm_component_examples=component_env_examples_from_env(os.environ),
             llm_intimacy_ingest_model=os.getenv("ATAGIA_LLM_INTIMACY_INGEST_MODEL")
             or None,
             llm_intimacy_retrieval_model=(
@@ -837,6 +892,18 @@ class Settings:
             ),
             worker_circuit_breaker_min_failure_ratio=float(
                 os.getenv("ATAGIA_WORKER_CIRCUIT_BREAKER_MIN_FAILURE_RATIO", "0.8")
+            ),
+            worker_transient_defer_seconds=float(
+                os.getenv("ATAGIA_WORKER_TRANSIENT_DEFER_SECONDS", "60.0")
+            ),
+            worker_transient_defer_max_seconds=float(
+                os.getenv("ATAGIA_WORKER_TRANSIENT_DEFER_MAX_SECONDS", "300.0")
+            ),
+            worker_transient_defer_max_count=int(
+                os.getenv("ATAGIA_WORKER_TRANSIENT_DEFER_MAX_COUNT", "12")
+            ),
+            worker_transient_defer_max_age_seconds=float(
+                os.getenv("ATAGIA_WORKER_TRANSIENT_DEFER_MAX_AGE_SECONDS", "3600.0")
             ),
             llm_run_guard_enabled=_env_bool("ATAGIA_LLM_RUN_GUARD_ENABLED", True),
             llm_run_guard_mode=os.getenv("ATAGIA_LLM_RUN_GUARD_MODE", "enforce")
@@ -948,6 +1015,13 @@ class Settings:
                 or None
             ),
             allow_insecure_http=_env_bool("ATAGIA_ALLOW_INSECURE_HTTP", False),
+            default_language_code=_env_language_code("ATAGIA_DEFAULT_LANGUAGE_CODE"),
+            consequence_detector_card_concurrency=int(
+                os.getenv("ATAGIA_CONSEQUENCE_DETECTOR_CARD_CONCURRENCY", "2")
+            ),
+            compactor_summary_card_concurrency=int(
+                os.getenv("ATAGIA_COMPACTOR_SUMMARY_CARD_CONCURRENCY", "4")
+            ),
             embedding_backend=os.getenv("ATAGIA_EMBEDDING_BACKEND", "none")
             .strip()
             .lower(),
@@ -1174,6 +1248,7 @@ class Settings:
             response_mode=os.getenv("ATAGIA_RESPONSE_MODE", "normal")
             .strip()
             .lower(),
+            adaptive_retrieval=_env_bool("ATAGIA_ADAPTIVE_RETRIEVAL", True),
             answer_stance=os.getenv("ATAGIA_ANSWER_STANCE", "reactive")
             .strip()
             .lower(),

@@ -55,6 +55,31 @@ _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
 _QUERY = "shared invariant token"
 
 
+def _is_need_detection_card_purpose(purpose: object) -> bool:
+    value = str(purpose)
+    return value.startswith("need_detection_") and value.endswith("_card")
+
+
+def _label_for_score(score: object) -> str:
+    value = float(score)
+    if value <= 0.10:
+        return "drop"
+    if value <= 0.40:
+        return "weak"
+    if value <= 0.65:
+        return "useful"
+    if value <= 0.85:
+        return "strong"
+    return "exact"
+
+
+def _date_card_output(prompt: str) -> str:
+    return "\n".join(
+        f"{score_key} none"
+        for _memory_id, score_key in _CANDIDATE_SCORE_KEY_PATTERN.findall(prompt)
+    )
+
+
 class InvariantProvider(LLMProvider):
     name = "retrieval-invariant-tests"
 
@@ -83,29 +108,61 @@ class InvariantProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
-        if purpose == "need_detection":
+        if _is_need_detection_card_purpose(purpose):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(self.need_response),
+                output_text=self._need_card_output(purpose),
             )
-        if purpose == "applicability_scoring":
+        if purpose == "applicability_relevance_card":
             candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
-            payload = {
-                "scores": [
-                    {"score_key": score_key, "llm_applicability": self.score_map.get(memory_id, 0.7)}
-                    for memory_id, score_key in candidate_keys
-                ],
-            }
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(payload),
+                output_text="\n".join(
+                    f"{score_key} {_label_for_score(self.score_map.get(memory_id, 0.7))}"
+                    for memory_id, score_key in candidate_keys
+                ),
+            )
+        if purpose == "applicability_date_card":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=_date_card_output(request.messages[1].content),
             )
         raise AssertionError(f"Unexpected purpose: {purpose}")
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError("Embeddings are not used in retrieval invariant tests")
+
+    def _need_card_output(self, purpose: str) -> str:
+        if purpose == "need_detection_needs_card":
+            return "none"
+        if purpose == "need_detection_language_card":
+            return "en\nen"
+        if purpose == "need_detection_memory_card":
+            return str(self.need_response.get("memory_dependence") or "mixed")
+        if purpose == "need_detection_exact_card":
+            return "yes" if self.need_response.get("exact_recall_needed") else "no"
+        if purpose == "need_detection_shape_card":
+            return {
+                "slot_fill": "slot",
+                "broad_list": "list",
+                "temporal": "time",
+                "default": "default",
+            }.get(str(self.need_response.get("query_type") or "default"), "default")
+        if purpose == "need_detection_facets_card":
+            facets = self.need_response.get("exact_facets")
+            if not isinstance(facets, list) or not facets:
+                return "none"
+            return "\n".join(str(facet) for facet in facets)
+        if purpose == "need_detection_callback_card":
+            return "yes" if self.need_response.get("callback_bias") else "no"
+        if purpose == "need_detection_search_words_card":
+            return _QUERY
+        if purpose == "need_detection_search_words_other_language_card":
+            return "none"
+        raise AssertionError(f"Unexpected card purpose: {purpose}")
 
 
 def _settings(*, small_corpus_token_threshold_ratio: float = 0.0) -> Settings:
@@ -266,7 +323,7 @@ def _custody_ids(result: PipelineResult) -> set[str]:
 def _score_request_memory_ids(provider: InvariantProvider) -> set[str]:
     memory_ids: set[str] = set()
     for request in provider.requests:
-        if str(request.metadata.get("purpose")) == "applicability_scoring":
+        if str(request.metadata.get("purpose")) == "applicability_relevance_card":
             memory_ids.update(_MEMORY_ID_PATTERN.findall(request.messages[1].content))
     return memory_ids
 

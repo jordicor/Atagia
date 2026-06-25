@@ -46,6 +46,7 @@ from atagia.models.schemas_memory import (
     PlannedSubQuery,
     RetrievalPlan,
     RetrievalTrace,
+    ScoredCandidate,
     SpaceBoundaryMode,
     SummaryViewKind,
     UserCommunicationProfile,
@@ -71,6 +72,22 @@ _MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
+_APPLICABILITY_CARD_PURPOSES = {
+    "applicability_relevance_card",
+    "applicability_date_card",
+}
+
+
+def _is_need_detection_card_purpose(purpose: object) -> bool:
+    value = str(purpose)
+    return value.startswith("need_detection_") and value.endswith("_card")
+
+
+def _has_need_detection_card_request(provider: "PipelineProvider") -> bool:
+    return any(
+        _is_need_detection_card_purpose(request.metadata.get("purpose"))
+        for request in provider.requests
+    )
 
 
 def _score_keys_by_memory_id(prompt: str) -> dict[str, str]:
@@ -80,17 +97,46 @@ def _score_keys_by_memory_id(prompt: str) -> dict[str, str]:
     }
 
 
-def _scores_for_prompt(
+def _label_for_score(score: object) -> str:
+    value = float(score)
+    if value <= 0.10:
+        return "drop"
+    if value <= 0.40:
+        return "weak"
+    if value <= 0.65:
+        return "useful"
+    if value <= 0.85:
+        return "strong"
+    return "exact"
+
+
+def _applicability_card_output(
     prompt: str,
     score_map: dict[str, float],
     *,
     omitted_memory_ids: set[str] | None = None,
-) -> list[dict[str, float | str]]:
+) -> str:
     omitted = omitted_memory_ids or set()
-    return [
-        {"score_key": score_key, "llm_applicability": score_map.get(memory_id, 0.5)}
+    return "\n".join(
+        f"{score_key} {_label_for_score(score_map.get(memory_id, 0.5))}"
         for memory_id, score_key in _score_keys_by_memory_id(prompt).items()
         if memory_id not in omitted
+    )
+
+
+def _date_card_output(prompt: str) -> str:
+    return "\n".join(
+        f"{score_key} none" for score_key in _score_keys_by_memory_id(prompt).values()
+    )
+
+
+def _applicability_relevance_requests(
+    provider: "PipelineProvider",
+) -> list[LLMCompletionRequest]:
+    return [
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "applicability_relevance_card"
     ]
 
 
@@ -167,10 +213,7 @@ class PipelineProvider(LLMProvider):
         self,
         *,
         need_response: dict[str, object] | None = None,
-        anchor_review_response: dict[str, object] | None = None,
         coverage_response: dict[str, object] | None = None,
-        unknown_exact_review_response: dict[str, object] | None = None,
-        multi_facet_exact_review_response: dict[str, object] | None = None,
         score_map: dict[str, float] | None = None,
     ) -> None:
         self.need_response = need_response or {
@@ -186,20 +229,9 @@ class PipelineProvider(LLMProvider):
             "query_type": "default",
             "retrieval_levels": [0],
         }
-        self.anchor_review_response = anchor_review_response or {"anchors": []}
         self.coverage_response = coverage_response or {
             "should_expand": False,
             "missing_facets": [],
-            "sub_queries": [],
-        }
-        self.unknown_exact_review_response = unknown_exact_review_response or {
-            "is_exact_value_lookup": False,
-            "exact_facets": [],
-            "must_keep_terms": [],
-            "quoted_phrases": [],
-        }
-        self.multi_facet_exact_review_response = multi_facet_exact_review_response or {
-            "has_multiple_obligations": False,
             "sub_queries": [],
         }
         self.score_map = dict(score_map or {})
@@ -208,28 +240,26 @@ class PipelineProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
-        if purpose == "need_detection":
+        if purpose.startswith("need_detection_") and purpose.endswith("_card"):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(self.need_response),
+                output_text=self._need_card_output(purpose),
             )
-        if purpose == "need_detection_anchor_review":
+        if purpose == "applicability_relevance_card":
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(self.anchor_review_response),
-            )
-        if purpose == "applicability_scoring":
-            payload = {
-                "scores": _scores_for_prompt(
-                    request.messages[1].content, self.score_map
+                output_text=_applicability_card_output(
+                    request.messages[1].content,
+                    self.score_map,
                 ),
-            }
+            )
+        if purpose == "applicability_date_card":
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(payload),
+                output_text=_date_card_output(request.messages[1].content),
             )
         if purpose == "coverage_expansion":
             return LLMCompletionResponse(
@@ -237,19 +267,60 @@ class PipelineProvider(LLMProvider):
                 model=request.model,
                 output_text=json.dumps(self.coverage_response),
             )
-        if purpose == "need_detection_unknown_only_contract_review":
-            return LLMCompletionResponse(
-                provider=self.name,
-                model=request.model,
-                output_text=json.dumps(self.unknown_exact_review_response),
-            )
-        if purpose == "need_detection_multi_facet_exact_review":
-            return LLMCompletionResponse(
-                provider=self.name,
-                model=request.model,
-                output_text=json.dumps(self.multi_facet_exact_review_response),
-            )
         raise AssertionError(f"Unexpected purpose: {purpose}")
+
+    def _need_card_output(self, purpose: str) -> str:
+        if purpose == "need_detection_needs_card":
+            needs = self.need_response.get("needs")
+            if not isinstance(needs, list) or not needs:
+                return "none"
+            labels = [
+                str(item.get("need_type"))
+                for item in needs
+                if isinstance(item, dict) and item.get("need_type")
+            ]
+            return "\n".join(labels) if labels else "none"
+        if purpose == "need_detection_language_card":
+            return "\n".join(
+                [
+                    str(self.need_response.get("query_language") or "en"),
+                    str(self.need_response.get("answer_language") or "en"),
+                ]
+            )
+        if purpose == "need_detection_memory_card":
+            return str(self.need_response.get("memory_dependence") or "mixed")
+        if purpose == "need_detection_exact_card":
+            return "yes" if self.need_response.get("exact_recall_needed") else "no"
+        if purpose == "need_detection_shape_card":
+            return {
+                "slot_fill": "slot",
+                "broad_list": "list",
+                "temporal": "time",
+                "default": "default",
+            }.get(str(self.need_response.get("query_type") or "default"), "default")
+        if purpose == "need_detection_facets_card":
+            raw_facets = self.need_response.get("exact_facets")
+            if not isinstance(raw_facets, list) or not raw_facets:
+                return "none"
+            mapping = {"other_verbatim": "wording"}
+            return "\n".join(mapping.get(str(facet), str(facet)) for facet in raw_facets)
+        if purpose == "need_detection_callback_card":
+            return "yes" if self.need_response.get("callback_bias") else "no"
+        if purpose == "need_detection_search_words_card":
+            terms: list[str] = []
+            for hint in self.need_response.get("sparse_query_hints") or []:
+                if not isinstance(hint, dict):
+                    continue
+                for field in ("must_keep_terms", "quoted_phrases"):
+                    values = hint.get(field)
+                    if isinstance(values, list):
+                        terms.extend(str(value) for value in values if str(value).strip())
+                if not terms and hint.get("fts_phrase"):
+                    terms.append(str(hint["fts_phrase"]))
+            return "\n".join(terms[:6]) if terms else "none"
+        if purpose == "need_detection_search_words_other_language_card":
+            return "none"
+        raise AssertionError(f"Unexpected card purpose: {purpose}")
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError("Embeddings are not used in retrieval pipeline tests")
@@ -269,7 +340,15 @@ class FailingPipelineProvider(PipelineProvider):
         self._fail_purpose = fail_purpose
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        if str(request.metadata.get("purpose")) == self._fail_purpose:
+        purpose = str(request.metadata.get("purpose"))
+        if purpose == self._fail_purpose or (
+            self._fail_purpose == "applicability_scoring"
+            and purpose in _APPLICABILITY_CARD_PURPOSES
+        ) or (
+            self._fail_purpose == "need_detection"
+            and purpose.startswith("need_detection_")
+            and purpose.endswith("_card")
+        ):
             self.requests.append(request)
             raise LLMError(f"Injected {self._fail_purpose} failure")
         return await super().complete(request)
@@ -290,24 +369,21 @@ class OmitFirstApplicabilityScoreProvider(PipelineProvider):
         self._scoring_calls = 0
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        if str(request.metadata.get("purpose")) != "applicability_scoring":
+        if str(request.metadata.get("purpose")) != "applicability_relevance_card":
             return await super().complete(request)
 
         self.requests.append(request)
         self._scoring_calls += 1
-        payload = {
-            "scores": _scores_for_prompt(
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text=_applicability_card_output(
                 request.messages[1].content,
                 self.score_map,
                 omitted_memory_ids={self._omitted_memory_id}
                 if self._scoring_calls == 1
                 else set(),
             ),
-        }
-        return LLMCompletionResponse(
-            provider=self.name,
-            model=request.model,
-            output_text=json.dumps(payload),
         )
 
 
@@ -326,26 +402,24 @@ class MalformedFirstApplicabilityScoreProvider(PipelineProvider):
         self._scoring_calls = 0
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        if str(request.metadata.get("purpose")) != "applicability_scoring":
+        if str(request.metadata.get("purpose")) != "applicability_relevance_card":
             return await super().complete(request)
 
         self.requests.append(request)
         self._scoring_calls += 1
-        scores: list[dict[str, float | str]] = []
+        lines: list[str] = []
         for memory_id, score_key in _score_keys_by_memory_id(
             request.messages[1].content
         ).items():
             score = self.score_map.get(memory_id, 0.5)
             if self._scoring_calls == 1 and memory_id == self._malformed_memory_id:
-                scores.append(
-                    {"score_key": "candidate_999", "llm_applicability": score}
-                )
+                lines.append(f"candidate_999 {_label_for_score(score)}")
             else:
-                scores.append({"score_key": score_key, "llm_applicability": score})
+                lines.append(f"{score_key} {_label_for_score(score)}")
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
-            output_text=json.dumps({"scores": scores}),
+            output_text="\n".join(lines),
         )
 
 
@@ -362,7 +436,7 @@ class InvalidFirstApplicabilityScoreProvider(PipelineProvider):
         self._scoring_calls = 0
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        if str(request.metadata.get("purpose")) != "applicability_scoring":
+        if str(request.metadata.get("purpose")) != "applicability_relevance_card":
             return await super().complete(request)
 
         self.requests.append(request)
@@ -374,17 +448,15 @@ class InvalidFirstApplicabilityScoreProvider(PipelineProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {"scores": [{"score_key": score_key, "llm_applicability": 2.0}]}
-                ),
+                output_text=f"{score_key} impossible",
             )
-        payload = {
-            "scores": _scores_for_prompt(request.messages[1].content, self.score_map),
-        }
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
-            output_text=json.dumps(payload),
+            output_text=_applicability_card_output(
+                request.messages[1].content,
+                self.score_map,
+            ),
         )
 
 
@@ -561,11 +633,12 @@ async def test_empty_clean_first_turn_skips_llm_retrieval_work() -> None:
 
 
 def _score_request_memory_ids(provider: PipelineProvider) -> list[str]:
+    memory_ids: list[str] = []
     for request in provider.requests:
-        if str(request.metadata.get("purpose")) != "applicability_scoring":
+        if str(request.metadata.get("purpose")) != "applicability_relevance_card":
             continue
-        return _MEMORY_ID_PATTERN.findall(request.messages[1].content)
-    return []
+        memory_ids.extend(_MEMORY_ID_PATTERN.findall(request.messages[1].content))
+    return memory_ids
 
 
 def _slot_fill_plan(
@@ -735,10 +808,7 @@ async def test_pipeline_executes_full_flow() -> None:
         assert result.retrieval_plan.query_type == "broad_list"
         assert [
             sub_query.text for sub_query in result.retrieval_plan.sub_query_plans
-        ] == [
-            "retry loop websocket backoff",
-            "production failure outcome",
-        ]
+        ] == [message_text]
         assert (
             result.retrieval_plan.max_candidates
             >= resolved_policy.retrieval_params.fts_limit
@@ -759,10 +829,7 @@ async def test_pipeline_executes_full_flow() -> None:
         assert trace.facet_support is not None
         assert [
             obligation.status for obligation in trace.facet_support.obligations
-        ] == [
-            "covered",
-            "missing",
-        ]
+        ] == ["covered"]
         assert trace.direct_vs_indirect_provenance is not None
         assert trace.direct_vs_indirect_provenance.direct_recovery_count == 1
         assert trace.direct_vs_indirect_provenance.evidence[0].proof_source == (
@@ -2070,7 +2137,7 @@ async def test_pipeline_retries_partial_applicability_scores_without_crashing() 
         scoring_requests = [
             request
             for request in provider.requests
-            if str(request.metadata.get("purpose")) == "applicability_scoring"
+            if str(request.metadata.get("purpose")) == "applicability_relevance_card"
         ]
         assert len(scoring_requests) == 2
         assert _MEMORY_ID_PATTERN.findall(scoring_requests[1].messages[1].content) == [
@@ -2125,7 +2192,7 @@ async def test_pipeline_retries_malformed_applicability_scores_without_crashing(
         scoring_requests = [
             request
             for request in provider.requests
-            if str(request.metadata.get("purpose")) == "applicability_scoring"
+            if str(request.metadata.get("purpose")) == "applicability_relevance_card"
         ]
         assert len(scoring_requests) == 2
         assert _MEMORY_ID_PATTERN.findall(scoring_requests[1].messages[1].content) == [
@@ -2177,7 +2244,7 @@ async def test_pipeline_retries_invalid_applicability_scores_without_crashing() 
         scoring_requests = [
             request
             for request in provider.requests
-            if str(request.metadata.get("purpose")) == "applicability_scoring"
+            if str(request.metadata.get("purpose")) == "applicability_relevance_card"
         ]
         assert len(scoring_requests) == 2
         assert set(
@@ -2285,10 +2352,7 @@ async def test_pipeline_skip_need_detection_returns_empty_needs_without_llm_call
         assert [
             sub_query.text for sub_query in result.retrieval_plan.sub_query_plans
         ] == [message_text]
-        assert not any(
-            request.metadata.get("purpose") == "need_detection"
-            for request in provider.requests
-        )
+        assert not _has_need_detection_card_request(provider)
     finally:
         await connection.close()
 
@@ -2381,7 +2445,7 @@ async def test_pipeline_skip_applicability_scoring_uses_raw_scores() -> None:
             result.scored_candidates[0].retrieval_score
         )
         assert not any(
-            request.metadata.get("purpose") == "applicability_scoring"
+            request.metadata.get("purpose") in _APPLICABILITY_CARD_PURPOSES
             for request in provider.requests
         )
     finally:
@@ -2509,14 +2573,6 @@ async def test_pipeline_resolves_character_rollup_with_namespace_gates() -> None
                 "created_at": "2026-04-05T12:00:00+00:00",
             },
         )
-        plan = _slot_fill_plan().model_copy(
-            update={
-                "user_persona_id": "persona_writer",
-                "platform_id": "web",
-                "character_id": "char_debug",
-                "remember_across_devices": False,
-            }
-        )
         gated_context = context.model_copy(
             update={
                 "user_persona_id": "persona_writer",
@@ -2528,16 +2584,12 @@ async def test_pipeline_resolves_character_rollup_with_namespace_gates() -> None
 
         row = await pipeline._resolve_workspace_rollup(  # noqa: SLF001
             conversation_context=gated_context,
-            retrieval_plan=plan,
-            workspace_rollup=None,
             ablation=AblationConfig(),
         )
         other_platform_row = await pipeline._resolve_workspace_rollup(  # noqa: SLF001
             conversation_context=gated_context.model_copy(
                 update={"platform_id": "mobile"}
             ),
-            retrieval_plan=plan.model_copy(update={"platform_id": "mobile"}),
-            workspace_rollup=None,
             ablation=AblationConfig(),
         )
 
@@ -2617,7 +2669,7 @@ async def test_pipeline_high_stakes_filters_derived_memory_and_workspace_rollup(
 
         assert result.retrieval_plan.require_evidence_regrounding is True
         assert result.retrieval_plan.query_type == "broad_list"
-        assert len(result.retrieval_plan.sub_query_plans) == 2
+        assert len(result.retrieval_plan.sub_query_plans) == 1
         assert [candidate["id"] for candidate in result.raw_candidates] == [
             "mem_evidence"
         ]
@@ -2684,12 +2736,9 @@ async def test_pipeline_small_corpus_shortcut_scores_eligible_memories() -> None
         assert result.small_corpus_mode is True
         assert result.degraded_mode is False
         assert result.detected_needs == []
+        assert _has_need_detection_card_request(provider)
         assert any(
-            request.metadata.get("purpose") == "need_detection"
-            for request in provider.requests
-        )
-        assert any(
-            request.metadata.get("purpose") == "applicability_scoring"
+            request.metadata.get("purpose") == "applicability_relevance_card"
             for request in provider.requests
         )
         returned_ids = {candidate["id"] for candidate in result.raw_candidates}
@@ -3085,9 +3134,9 @@ async def test_pipeline_passes_user_communication_profile_to_need_detection_and_
         need_prompt = next(
             request.messages[1].content
             for request in provider.requests
-            if request.metadata.get("purpose") == "need_detection"
+            if request.metadata.get("purpose") == "need_detection_language_card"
         )
-        assert "<user_communication_profile>" in need_prompt
+        assert "User communication profile:" in need_prompt
         assert (
             "observed_user_languages: ca: 3 observed user-authored messages"
             in need_prompt
@@ -3752,18 +3801,14 @@ async def test_pipeline_exact_recall_plan_exposes_anchor_only_fts_materializatio
 
         sub_query = result.retrieval_plan.sub_query_plans[0]
         assert result.retrieval_plan.exact_recall_mode is True
-        assert sub_query.fts_queries == [
-            "falcon sa42 service account rotation owner",
-            "service account falcon rotation owner sa42",
-            "falcon sa42",
-            "service OR account OR falcon OR rotation OR owner OR sa42",
-        ]
+        assert sub_query.must_keep_terms == ["Falcon", "SA42"]
         assert sub_query.fts_query_kinds == [
             "anchor_first_and",
             "sparse_and",
             "anchor_only_and",
             "broad_or",
         ]
+        assert "falcon sa42" in sub_query.fts_queries
         assert {candidate["id"] for candidate in result.raw_candidates} == {
             "mem_falcon_service_account",
         }
@@ -3771,7 +3816,7 @@ async def test_pipeline_exact_recall_plan_exposes_anchor_only_fts_materializatio
         assert {
             ("falcon sa42", "anchor_only_and", "implicit_and"),
             (
-                "service OR account OR falcon OR rotation OR owner OR sa42",
+                "which OR service OR account OR did OR falcon OR use OR sa42",
                 "broad_or",
                 "explicit_or",
             ),
@@ -3871,10 +3916,7 @@ async def test_pipeline_large_corpus_takes_normal_path() -> None:
         )
 
         assert result.small_corpus_mode is False
-        assert any(
-            request.metadata.get("purpose") == "need_detection"
-            for request in provider.requests
-        )
+        assert _has_need_detection_card_request(provider)
     finally:
         await connection.close()
 
@@ -3913,10 +3955,7 @@ async def test_pipeline_small_corpus_disabled_when_ratio_is_zero() -> None:
         )
 
         assert result.small_corpus_mode is False
-        assert any(
-            request.metadata.get("purpose") == "need_detection"
-            for request in provider.requests
-        )
+        assert _has_need_detection_card_request(provider)
     finally:
         await connection.close()
 
@@ -3966,7 +4005,7 @@ async def test_pipeline_degrades_when_need_detector_fails() -> None:
         assert [scored.memory_id for scored in result.scored_candidates] == ["mem_1"]
         assert result.composed_context.selected_memory_ids == ["mem_1"]
         assert any(
-            request.metadata.get("purpose") == "applicability_scoring"
+            request.metadata.get("purpose") == "applicability_relevance_card"
             for request in provider.requests
         )
     finally:
@@ -4326,6 +4365,171 @@ def test_default_queries_do_not_expand_context_items_without_recovery_need() -> 
     assert expanded.retrieval_params.final_context_items == 8
 
 
+def _exhaustive_plan() -> RetrievalPlan:
+    plan = _slot_fill_plan(
+        query_text="List all of the entries.",
+        exact_recall_mode=False,
+    )
+    return plan.model_copy(
+        update={"query_type": "broad_list", "coverage_mode": "exhaustive_known_set"}
+    )
+
+
+def _member_scored_candidate(memory_id: str, member_key: str) -> ScoredCandidate:
+    return ScoredCandidate(
+        memory_id=memory_id,
+        memory_object={
+            "id": memory_id,
+            "object_type": "evidence",
+            "canonical_text": f"{member_key} belongs to the set.",
+            "payload_json": {
+                "coverage_members": [
+                    {"member_key": member_key, "display_text": member_key.title()}
+                ]
+            },
+        },
+        llm_applicability=0.7,
+        retrieval_score=0.6,
+        vitality_boost=0.0,
+        confirmation_boost=0.0,
+        need_boost=0.0,
+        penalty=0.0,
+        final_score=0.9,
+    )
+
+
+def test_exhaustive_mode_expands_scoring_budget() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    plan = _exhaustive_plan()
+
+    expanded = RetrievalPipeline._expand_recall_or_recovery_scoring_budget(
+        policy,
+        plan,
+        degraded_mode=False,
+        detected_needs=[],
+        item_count=32,
+    )
+
+    assert policy.retrieval_params.rerank_top_k < 32
+    assert expanded.retrieval_params.rerank_top_k == 32
+
+
+def test_exhaustive_mode_expands_final_context_items_to_member_count() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    plan = _exhaustive_plan()
+    scored = [
+        _member_scored_candidate(f"mem_{i}", f"member{i}") for i in range(12)
+    ]
+
+    expanded = RetrievalPipeline._expand_exhaustive_coverage_budget(
+        policy,
+        plan,
+        scored,
+    )
+
+    assert policy.retrieval_params.final_context_items == 8
+    assert expanded.retrieval_params.final_context_items == 12
+
+
+def test_exhaustive_budget_expansion_bounded_by_candidate_count() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    plan = _exhaustive_plan()
+    # 10 candidates, each carrying many distinct members -> distinct member count
+    # (70) far exceeds both the default final_context_items (8) and the candidate
+    # count (10). The expansion is bounded by the candidate count, since members
+    # beyond the available candidates cannot be admitted anyway.
+    assert policy.retrieval_params.final_context_items == 8
+    scored = [
+        ScoredCandidate(
+            memory_id=f"mem_{i}",
+            memory_object={
+                "id": f"mem_{i}",
+                "object_type": "evidence",
+                "canonical_text": "Several members in one fact.",
+                "payload_json": {
+                    "coverage_members": [
+                        {"member_key": f"m{i}_{j}", "display_text": f"M{i}{j}"}
+                        for j in range(7)
+                    ]
+                },
+            },
+            llm_applicability=0.7,
+            retrieval_score=0.6,
+            vitality_boost=0.0,
+            confirmation_boost=0.0,
+            need_boost=0.0,
+            penalty=0.0,
+            final_score=0.9,
+        )
+        for i in range(10)
+    ]
+
+    expanded = RetrievalPipeline._expand_exhaustive_coverage_budget(
+        policy,
+        plan,
+        scored,
+    )
+
+    assert expanded.retrieval_params.final_context_items == 10
+
+
+def test_non_exhaustive_mode_does_not_expand_budgets() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    plan = _slot_fill_plan(exact_recall_mode=False)
+    scored = [
+        _member_scored_candidate(f"mem_{i}", f"member{i}") for i in range(12)
+    ]
+
+    scoring_expanded = RetrievalPipeline._expand_recall_or_recovery_scoring_budget(
+        policy,
+        plan,
+        degraded_mode=False,
+        detected_needs=[],
+        item_count=32,
+    )
+    coverage_expanded = RetrievalPipeline._expand_exhaustive_coverage_budget(
+        policy,
+        plan,
+        scored,
+    )
+
+    assert (
+        scoring_expanded.retrieval_params.rerank_top_k
+        == policy.retrieval_params.rerank_top_k
+    )
+    assert (
+        coverage_expanded.retrieval_params.final_context_items
+        == policy.retrieval_params.final_context_items
+    )
+
+
+def test_exhaustive_budget_expansion_yields_to_explicit_ablation_cap() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    plan = _exhaustive_plan()
+    scored = [
+        _member_scored_candidate(f"mem_{i}", f"member{i}") for i in range(12)
+    ]
+
+    expanded = RetrievalPipeline._expand_exhaustive_coverage_budget(
+        policy,
+        plan,
+        scored,
+    )
+    assert expanded.retrieval_params.final_context_items == 12
+
+    # The explicit ablation cap runs after the coverage expansion and still wins.
+    capped = RetrievalPipeline._cap_explicit_final_context_items(
+        expanded,
+        AblationConfig(override_retrieval_params={"final_context_items": 5}),
+    )
+    assert capped.retrieval_params.final_context_items == 5
+
+
 @pytest.mark.asyncio
 async def test_pipeline_verbatim_evidence_search_enabled_contributes_to_exact_recall_trace() -> (
     None
@@ -4422,7 +4626,7 @@ async def test_pipeline_verbatim_evidence_search_enabled_contributes_to_exact_re
 
 
 @pytest.mark.asyncio
-async def test_pipeline_traces_temporary_exact_recall_scaffolding() -> None:
+async def test_pipeline_exact_recall_comes_from_parallel_cards_without_legacy_review() -> None:
     provider = PipelineProvider(
         need_response={
             "needs": [],
@@ -4432,20 +4636,13 @@ async def test_pipeline_traces_temporary_exact_recall_scaffolding() -> None:
                 {
                     "sub_query_text": "What country is Caroline's grandma from?",
                     "fts_phrase": "What country is Caroline's grandma from?",
+                    "must_keep_terms": ["Caroline", "grandma", "country"],
                 }
             ],
-            "query_type": "default",
+            "query_type": "slot_fill",
             "retrieval_levels": [0],
-            "exact_recall_needed": False,
-            "exact_facets": [],
-        },
-        unknown_exact_review_response={
-            "is_exact_value_lookup": True,
-            "sub_query_text": "Caroline grandma country",
-            "fts_phrase": "Caroline grandma country",
             "exact_facets": ["location", "person_name"],
-            "must_keep_terms": ["Caroline", "grandma", "country"],
-            "quoted_phrases": [],
+            "exact_recall_needed": True,
         },
         score_map={"mem_country": 0.9},
     )
@@ -4485,13 +4682,13 @@ async def test_pipeline_traces_temporary_exact_recall_scaffolding() -> None:
 
         assert result.retrieval_plan.exact_recall_mode is True
         assert trace.need_detection is not None
+        assert trace.need_detection.exact_recall_needed is True
         need_mechanisms = {
             event.mechanism for event in trace.need_detection.temporary_scaffolding
         }
         root_mechanisms = {event.mechanism for event in trace.temporary_scaffolding}
-        assert "unknown_only_exact_value_contract_review" in need_mechanisms
-        assert "unknown_only_exact_value_contract_review" in root_mechanisms
-        assert "must_keep_tail_exact_recall_backoff" in root_mechanisms
+        assert "unknown_only_exact_value_contract_review" not in need_mechanisms
+        assert "unknown_only_exact_value_contract_review" not in root_mechanisms
     finally:
         await connection.close()
 

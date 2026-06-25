@@ -24,6 +24,7 @@ from atagia.core.summary_repository import SummaryRepository
 from atagia.core.storage_backend import InProcessBackend
 from atagia.memory.extractor import MemoryExtractor
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
+from atagia.models.schemas_jobs import JobType, REVISE_STREAM_NAME
 from atagia.models.schemas_memory import (
     ExtractionConversationContext,
     MemoryObjectType,
@@ -48,10 +49,32 @@ from atagia.services.llm_client import (
     StructuredOutputError,
 )
 from atagia.services.llm_run_guard import LLMRunGuardDecision
-from tests.extraction_payload_support import rich_extraction_payload_to_lean
+from tests.extraction_payload_support import (
+    is_memory_extraction_card_purpose,
+    memory_extraction_card_output_from_payload,
+    rich_extraction_payload_to_lean,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+_MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES = {
+    "memory_extraction_kind_scope_card",
+    "memory_extraction_evidence_card",
+    "memory_extraction_index_card",
+    "memory_extraction_temporal_card",
+    "memory_extraction_belief_card",
+    "memory_extraction_coverage_members_card",
+}
+
+
+def _message_sequences_from_last_conversation_messages(prompt: str) -> list[int]:
+    blocks = re.findall(
+        r"<conversation_messages>\s*(.*?)\s*</conversation_messages>",
+        prompt,
+        flags=re.DOTALL,
+    )
+    source = blocks[-1] if blocks else prompt
+    return [int(item) for item in re.findall(r'<message seq="(\d+)"', source)]
 
 
 class NoOpProvider(LLMProvider):
@@ -83,6 +106,15 @@ class ExtractorProvider(LLMProvider):
                 model=request.model,
                 output_text='{"is_explicit": true, "reasoning": "Test classifier response."}',
             )
+        if is_memory_extraction_card_purpose(request.metadata.get("purpose")):
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=memory_extraction_card_output_from_payload(
+                    self.payload,
+                    request.metadata.get("purpose"),
+                ),
+            )
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
@@ -98,43 +130,62 @@ class RebuildReplayProvider(LLMProvider):
 
     def __init__(self) -> None:
         self.requests: list[LLMCompletionRequest] = []
+        self._active_extraction_payload: dict[str, object] | None = None
+        self._active_extraction_consumed: set[str] = set()
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = request.metadata.get("purpose")
-        if purpose == "memory_extraction":
+        if is_memory_extraction_card_purpose(purpose):
             prompt = request.messages[1].content
-            canonical_text = (
-                "Assistant plan"
-                if "Assistant plan" in prompt
-                else "User fact"
-            )
+            if purpose == "memory_extraction_candidate_card":
+                canonical_text = (
+                    "Assistant plan"
+                    if "Assistant plan" in prompt
+                    else "User fact"
+                )
+                self._active_extraction_payload = rich_extraction_payload_to_lean(
+                    {
+                        "evidences": [
+                            {
+                                "canonical_text": canonical_text,
+                                "index_text": f"Context for {canonical_text.lower()} from replayed conversation history.",
+                                "scope": "conversation",
+                                "confidence": 0.92,
+                                "source_kind": "extracted",
+                                "privacy_level": 0,
+                                "language_codes": ["en"],
+                                "payload": {"kind": "fact"},
+                            }
+                        ],
+                        "beliefs": [],
+                        "contract_signals": [],
+                        "state_updates": [],
+                        "mode_guess": None,
+                        "nothing_durable": False,
+                    }
+                )
+                self._active_extraction_consumed = set()
+                output_text = memory_extraction_card_output_from_payload(
+                    self._active_extraction_payload,
+                    purpose,
+                )
+            else:
+                output_text = memory_extraction_card_output_from_payload(
+                    self._active_extraction_payload or {"candidates": []},
+                    purpose,
+                )
+                self._active_extraction_consumed.add(str(purpose))
+                if (
+                    self._active_extraction_consumed
+                    == _MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES
+                ):
+                    self._active_extraction_payload = None
+                    self._active_extraction_consumed = set()
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    rich_extraction_payload_to_lean(
-                        {
-                            "evidences": [
-                                {
-                                    "canonical_text": canonical_text,
-                                    "index_text": f"Context for {canonical_text.lower()} from replayed conversation history.",
-                                    "scope": "conversation",
-                                    "confidence": 0.92,
-                                    "source_kind": "extracted",
-                                    "privacy_level": 0,
-                                    "language_codes": ["en"],
-                                    "payload": {"kind": "fact"},
-                                }
-                            ],
-                            "beliefs": [],
-                            "contract_signals": [],
-                            "state_updates": [],
-                            "mode_guess": None,
-                            "nothing_durable": False,
-                        }
-                    )
-                ),
+                output_text=output_text,
             )
         if purpose == "contract_projection":
             return LLMCompletionResponse(
@@ -142,20 +193,11 @@ class RebuildReplayProvider(LLMProvider):
                 model=request.model,
                 output_text='{"signals": [], "nothing_durable": true}',
             )
-        if purpose == "consequence_detection":
+        if purpose == "consequence_gate_card":
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "is_consequence": False,
-                        "action_description": "",
-                        "outcome_description": "",
-                        "outcome_sentiment": "neutral",
-                        "confidence": 0.0,
-                        "likely_action_message_id": None,
-                    }
-                ),
+                output_text="no",
             )
         if purpose == "intent_classifier_explicit":
             return LLMCompletionResponse(
@@ -175,25 +217,24 @@ class RebuildReplayProvider(LLMProvider):
                 model=request.model,
                 output_text='{"summary_text": "Workspace summary", "cited_memory_ids": []}',
             )
-        if purpose == "summary_chunk_segmentation":
+        if purpose in {
+            "summary_chunk_segmentation_ranges_card",
+            "summary_chunk_segmentation_summaries_card",
+        }:
             prompt = request.messages[1].content
-            message_sequences = [int(item) for item in re.findall(r'<message seq="(\d+)"', prompt)]
+            message_sequences = _message_sequences_from_last_conversation_messages(prompt)
             if not message_sequences:
                 raise AssertionError("Expected message sequences in chunk segmentation prompt")
+            chunk_range = f"{min(message_sequences)}-{max(message_sequences)}"
+            if purpose == "summary_chunk_segmentation_ranges_card":
+                output_text = chunk_range
+            else:
+                # Card 2 is per-range now: emit raw summary text, no label.
+                output_text = "Replay chunk summary."
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "episodes": [
-                            {
-                                "start_seq": min(message_sequences),
-                                "end_seq": max(message_sequences),
-                                "summary_text": "Replay chunk summary.",
-                            }
-                        ]
-                    }
-                ),
+                output_text=output_text,
             )
         if purpose == "episode_synthesis":
             prompt = request.messages[1].content
@@ -251,29 +292,25 @@ class EpisodeOutputLimitReplayProvider(RebuildReplayProvider):
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         purpose = request.metadata.get("purpose")
-        if purpose == "summary_chunk_segmentation":
+        if purpose in {
+            "summary_chunk_segmentation_ranges_card",
+            "summary_chunk_segmentation_summaries_card",
+        }:
             self.requests.append(request)
             prompt = request.messages[1].content
-            message_sequences = [
-                int(item) for item in re.findall(r'<message seq="(\d+)"', prompt)
-            ]
+            message_sequences = _message_sequences_from_last_conversation_messages(prompt)
             if not message_sequences:
                 raise AssertionError("Expected message sequences in chunk segmentation prompt")
+            if purpose == "summary_chunk_segmentation_ranges_card":
+                output_text = "\n".join(f"{sequence}-{sequence}" for sequence in message_sequences)
+            else:
+                # Card 2 is per-range now: one single-message slice per call, so
+                # emit raw summary text for that range, no label.
+                output_text = f"Chunk summary {message_sequences[0]}."
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "episodes": [
-                            {
-                                "start_seq": sequence,
-                                "end_seq": sequence,
-                                "summary_text": f"Chunk summary {sequence}.",
-                            }
-                            for sequence in message_sequences
-                        ]
-                    }
-                ),
+                output_text=output_text,
             )
         if (
             purpose == "episode_synthesis"
@@ -772,7 +809,7 @@ async def test_rebuild_conversation_replays_assistant_messages_for_extraction() 
         extraction_prompts = [
             request.messages[1].content
             for request in provider.requests
-            if request.metadata.get("purpose") == "memory_extraction"
+            if request.metadata.get("purpose") == "memory_extraction_candidate_card"
         ]
         contract_prompts = [
             request.messages[1].content
@@ -833,7 +870,7 @@ async def test_rebuild_conversation_paginates_and_uses_placeholder_recent_contex
         extraction_prompts = [
             request.messages[1].content
             for request in provider.requests
-            if request.metadata.get("purpose") == "memory_extraction"
+            if request.metadata.get("purpose") == "memory_extraction_candidate_card"
         ]
         assistant_prompt = next(prompt for prompt in extraction_prompts if "Assistant plan" in prompt)
         assert result.processed_messages == 3
@@ -1025,7 +1062,8 @@ async def test_rebuild_conversation_can_skip_final_compaction() -> None:
         assert not any(
             request.metadata.get("purpose")
             in {
-                "summary_chunk_segmentation",
+                "summary_chunk_segmentation_ranges_card",
+                "summary_chunk_segmentation_summaries_card",
                 "episode_synthesis",
                 "thematic_profile_synthesis",
                 "workspace_rollup_synthesis",
@@ -1239,6 +1277,86 @@ async def test_admin_rebuild_service_passes_embedding_index_to_revision_worker(
         await service.rebuild_user("usr_1")
 
         assert captured["embedding_index"] is embedding_index
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_conversation_records_claim_key_mismatch_skip_as_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    users = UserRepository(connection, clock)
+    workspaces = WorkspaceRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+
+    class RevisionEnqueuingIngestWorker:
+        def __init__(self, *, storage_backend, **kwargs) -> None:
+            self._storage_backend = storage_backend
+
+        async def process_job(self, payload):
+            await self._storage_backend.stream_add(
+                REVISE_STREAM_NAME,
+                {
+                    "job_id": "job_rebuild_revise_msg_1",
+                    "job_type": JobType.REVISE_BELIEFS.value,
+                    "user_id": "usr_1",
+                    "conversation_id": "cnv_1",
+                    "message_ids": ["msg_1"],
+                    "payload": {},
+                    "created_at": None,
+                },
+            )
+            return {"status": "extracted"}
+
+    class ClaimKeyMismatchRevisionWorker:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def process_job(self, payload):
+            return {
+                "status": "skipped_claim_key_mismatch",
+                "belief_id": "blf_existing",
+                "current_claim_key": "values.helping.others",
+                "payload_claim_key": "motivation.help_others",
+            }
+
+    monkeypatch.setattr(admin_rebuild_module, "IngestWorker", RevisionEnqueuingIngestWorker)
+    monkeypatch.setattr(admin_rebuild_module, "RevisionWorker", ClaimKeyMismatchRevisionWorker)
+
+    try:
+        await users.create_user("usr_1")
+        await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
+        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
+
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=RebuildReplayProvider.name,
+                providers=[RebuildReplayProvider()],
+            ),
+            embedding_index=None,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        result = await service.rebuild_conversation(
+            "usr_1",
+            "cnv_1",
+            skip_final_compaction=True,
+        )
+
+        assert result.status == "rebuilt_partial"
+        assert result.skipped_claim_key_mismatch == 1
+        assert result.revision_jobs_processed == 1
+        # A semantic skip is not a recoverable LLM failure; that tally stays clean.
+        assert result.recoverable_revision_job_failures == 0
+        assert result.recoverable_job_failures == 0
     finally:
         await connection.close()
 

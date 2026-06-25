@@ -256,6 +256,10 @@ async def create_openai_proxy_chat_completion(
         default=None,
         alias="X-Atagia-Response-Mode",
     ),
+    x_atagia_adaptive_retrieval: str | None = Header(
+        default=None,
+        alias="X-Atagia-Adaptive-Retrieval",
+    ),
 ):
     try:
         auth = _authenticate_proxy(request, authorization, x_atagia_user_id)
@@ -290,6 +294,7 @@ async def create_openai_proxy_chat_completion(
                 confirmation_strategy_header=x_atagia_confirmation_strategy,
                 memory_privacy_mode_header=x_atagia_memory_privacy_mode,
                 response_mode_header=x_atagia_response_mode,
+                adaptive_retrieval_header=x_atagia_adaptive_retrieval,
             )
             return StreamingResponse(
                 stream,
@@ -325,6 +330,7 @@ async def create_openai_proxy_chat_completion(
             confirmation_strategy_header=x_atagia_confirmation_strategy,
             memory_privacy_mode_header=x_atagia_memory_privacy_mode,
             response_mode_header=x_atagia_response_mode,
+            adaptive_retrieval_header=x_atagia_adaptive_retrieval,
         )
     except ValueError as exc:
         return _openai_error_response(

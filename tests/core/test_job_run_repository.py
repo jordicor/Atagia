@@ -124,6 +124,7 @@ async def test_job_run_repository_tracks_progress_and_status_transitions() -> No
             attempt_count=2,
             error_class="TransientError",
             error_message="temporary backend issue",
+            deferred_until="2026-05-02T12:01:00+00:00",
         )
 
         retrying = await repository.get_job("job_contract_msg_1")
@@ -131,11 +132,36 @@ async def test_job_run_repository_tracks_progress_and_status_transitions() -> No
         assert retrying["status"] == JobRunStatus.RETRYING.value
         assert retrying["attempt_count"] == 2
         assert retrying["error_class"] == "TransientError"
+        assert retrying["deferred_until"] == "2026-05-02T12:01:00+00:00"
+        clock.advance(seconds=1)
+        first_deferred = await repository.mark_deferred(
+            "job_contract_msg_1",
+            attempt_count=1,
+            error_class="TransientLLMError",
+            error_message="provider unavailable",
+            deferred_until="2026-05-02T12:02:00+00:00",
+        )
+        assert first_deferred["transient_defer_count"] == 1
+        assert first_deferred["first_deferred_at"] == "2026-05-02T12:00:03+00:00"
+        assert first_deferred["last_deferred_at"] == "2026-05-02T12:00:03+00:00"
+        clock.advance(seconds=1)
+        second_deferred = await repository.mark_deferred(
+            "job_contract_msg_1",
+            attempt_count=1,
+            error_class="TransientLLMError",
+            error_message="provider unavailable",
+            deferred_until="2026-05-02T12:03:00+00:00",
+        )
+        assert second_deferred["transient_defer_count"] == 2
+        assert second_deferred["first_deferred_at"] == "2026-05-02T12:00:03+00:00"
+        assert second_deferred["last_deferred_at"] == "2026-05-02T12:00:04+00:00"
         await repository.mark_succeeded("job_contract_msg_1")
         succeeded_after_retry = await repository.get_job("job_contract_msg_1")
         assert succeeded_after_retry is not None
         assert succeeded_after_retry["status"] == JobRunStatus.SUCCEEDED.value
         assert succeeded_after_retry["error_class"] is None
         assert succeeded_after_retry["error_message"] is None
+        assert succeeded_after_retry["deferred_until"] is None
+        assert succeeded_after_retry["transient_defer_count"] == 2
     finally:
         await connection.close()

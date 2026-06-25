@@ -27,12 +27,9 @@ benchmarks/data/
 _blog_engine/
 tools/sync_github/output/
 benchmarks/results/
-# Keep benchmark artifacts trackable in this repo; GitHub mirror sync has its
-# own exclusion rules under tools/sync_github/.
-!benchmarks/results/
-!benchmarks/results/**
-benchmarks/results/.DS_Store
-benchmarks/results/**/.DS_Store
+# benchmarks/results is ignored: large generated runs now live in
+# ../atagia-benchmarks. Re-include the small tracked benchmark input datasets
+# that the top-level `data/` rule (any dir named data/) would otherwise ignore.
 !benchmarks/atagia_bench/data/
 !benchmarks/graph_stress/data/
 

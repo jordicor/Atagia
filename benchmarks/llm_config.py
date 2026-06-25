@@ -16,6 +16,8 @@ def provider_api_key_kwargs(provider: str | None, api_key: str | None) -> dict[s
         "anthropic": "anthropic_api_key",
         "openai": "openai_api_key",
         "google": "google_api_key",
+        "kimi": "kimi_api_key",
+        "minimax": "minimax_api_key",
         "openrouter": "openrouter_api_key",
     }
     return {key_names[provider_slug]: api_key}

@@ -209,12 +209,18 @@ class ChatService:
         authenticated_user_privilege_level: str | None = None,
         authenticated_user_is_atagia_master: bool = False,
         response_mode: ResponseMode | str | None = None,
+        adaptive_retrieval: bool | None = None,
     ) -> ChatResult:
         """Run the full retrieval, generation, persistence, and background-job flow."""
         resolved_response_mode = (
             ResponseMode(self.runtime.settings.response_mode)
             if response_mode is None
             else ResponseMode(response_mode)
+        )
+        resolved_adaptive_retrieval = (
+            self.runtime.settings.adaptive_retrieval
+            if adaptive_retrieval is None
+            else bool(adaptive_retrieval)
         )
         authority_context = normalize_request_authority_context(
             privacy_enforcement=privacy_enforcement,
@@ -450,6 +456,7 @@ class ChatService:
                         operational_signals=operational_signals,
                         ablation=ablation,
                         prompt_authority_context=authority_context,
+                        adaptive_retrieval=resolved_adaptive_retrieval,
                     )
                 else:
                     resolution = await cache_service.resolve_fast_with_connection(
@@ -878,6 +885,7 @@ class ChatService:
                             "context_view_json": composed_context_json,
                             "outcome_json": {
                                 "response_mode": resolved_response_mode.value,
+                                "adaptive_retrieval": resolved_adaptive_retrieval,
                                 "cold_start": cold_start,
                                 "from_cache": resolution.from_cache,
                                 "cache_key": resolution.cache_key,
@@ -981,6 +989,7 @@ class ChatService:
                         ablation=ablation,
                         prompt_authority_context=authority_context,
                         last_retrieval_message_seq=int(user_message["seq"]),
+                        adaptive_retrieval=resolved_adaptive_retrieval,
                     )
 
                 final_window = [
@@ -1178,6 +1187,7 @@ class ChatService:
                 if debug:
                     debug_payload = {
                         "response_mode": resolved_response_mode.value,
+                        "adaptive_retrieval": resolved_adaptive_retrieval,
                         "cold_start": cold_start,
                         "detected_needs": list(resolution.detected_needs),
                         "retrieval_plan": dict(resolution.source_retrieval_plan),

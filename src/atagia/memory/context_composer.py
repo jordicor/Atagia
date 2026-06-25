@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from atagia.core import json_utils
 from atagia.core.clock import Clock
+from atagia.core.text_utils import truncate_inline
 from atagia.memory.high_risk_policy import HighRiskDisclosureAction, disclosure_action
 from atagia.memory.intimacy_boundary_policy import candidate_allows_intimacy_boundary
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
@@ -100,6 +101,13 @@ class ContextComposer:
     EXACT_DIRECT_USER_SOURCE_BOOST = 0.03
     EVIDENCE_OBLIGATION_QUERY_TYPES = frozenset({"temporal", "slot_fill", "broad_list"})
     EVIDENCE_NEAR_TIE_SCORE_RATIO = 0.92
+    # Absolute-score floor for reserving a verbatim evidence window when
+    # source-grounded direct-evidence candidates exist in the pool. A window only
+    # qualifies if its final_score >= best_direct_evidence_score * this ratio.
+    # Distinct from EVIDENCE_NEAR_TIE_SCORE_RATIO (which only compares windows to
+    # each other): this gate prevents low-score, token-heavy windows from being
+    # reserved ahead of tiny high-score direct facts and exhausting the budget.
+    EVIDENCE_WINDOW_VS_DIRECT_SCORE_RATIO = 0.72
     EVIDENCE_OBLIGATION_MAX_WINDOWS = 3
     EVIDENCE_OBLIGATION_MAX_ITEMS = 4
     EVIDENCE_DUPLICATE_SOURCE_SIMILARITY = 0.67
@@ -900,6 +908,7 @@ class ContextComposer:
             source_precision=source_precision,
             exact_recall_mode=exact_recall_mode,
         )
+        exhaustive_coverage = coverage_mode == "exhaustive_known_set"
         if max_items <= 0 or not candidates:
             return []
         if (
@@ -929,7 +938,16 @@ class ContextComposer:
                 candidate
             ):
                 return False
-            if len(reserved) >= min(max_items, cls.EVIDENCE_OBLIGATION_MAX_ITEMS):
+            # Exhaustive lists must be able to reserve one carrier per member, so
+            # the EVIDENCE_OBLIGATION_MAX_ITEMS cap is lifted (bounded only by
+            # max_items, the lifted selection budget). All other modes keep the
+            # 4-item reservation cap byte-identically.
+            reserve_cap = (
+                max_items
+                if exhaustive_coverage
+                else min(max_items, cls.EVIDENCE_OBLIGATION_MAX_ITEMS)
+            )
+            if len(reserved) >= reserve_cap:
                 return False
             if dedupe_evidence_source and any(
                 cls._is_duplicate_evidence_source(candidate, existing)
@@ -943,7 +961,29 @@ class ContextComposer:
         for candidate in cls._near_tie_verbatim_evidence_windows(candidates):
             reserve(candidate)
 
-        if source_coverage_required:
+        if exhaustive_coverage and source_coverage_required:
+            # Coverage-first ranked greedy: reserve one carrier per still-missing
+            # member. A single carrier can cover several members; a reserved
+            # carrier marks ALL its members covered so duplicate carriers of the
+            # same member never consume distinct slots.
+            covered: set[str] = set()
+            for candidate in reserved:
+                if cls._exhaustive_index_admits(candidate):
+                    covered |= cls._coverage_member_keys(candidate)
+            for candidate in cls._rank_source_coverage_candidates(
+                candidates,
+                source_messages_by_id=source_messages_by_id,
+                query_type=query_type,
+                answer_shape=answer_shape,
+            ):
+                if not cls._exhaustive_index_admits(candidate):
+                    continue
+                member_keys = cls._coverage_member_keys(candidate)
+                if not member_keys or member_keys <= covered:
+                    continue
+                if reserve(candidate, dedupe_evidence_source=False):
+                    covered |= member_keys
+        elif source_coverage_required:
             reserved_groups = {
                 cls._coverage_group_key(candidate)
                 for candidate in reserved
@@ -1044,8 +1084,8 @@ class ContextComposer:
                     if answer_shape == "list"
                     else 0.0
                 ),
-                -cls._candidate_source_grounding(candidate),
                 -float(candidate.final_score),
+                -cls._candidate_source_grounding(candidate),
                 candidate.memory_id,
             ),
         )
@@ -1067,6 +1107,15 @@ class ContextComposer:
                 support_map={},
                 allowed_values=[],
                 missing_slots=[],
+            )
+        if coverage_mode == "exhaustive_known_set":
+            return cls._exhaustive_coverage_metadata(
+                candidates=candidates,
+                selected=selected,
+                answer_shape=answer_shape,
+                coverage_mode=coverage_mode,
+                source_precision=source_precision,
+                redact_high_risk_secret_literals=redact_high_risk_secret_literals,
             )
         selected_ids = {candidate.memory_id for candidate in selected}
         source_groups = cls._source_backed_coverage_groups(candidates)
@@ -1146,6 +1195,150 @@ class ContextComposer:
         )
 
     @classmethod
+    def _exhaustive_coverage_metadata(
+        cls,
+        *,
+        candidates: list[ScoredCandidate],
+        selected: list[ScoredCandidate],
+        answer_shape: AnswerShape,
+        coverage_mode: CoverageMode,
+        source_precision: SourcePrecision,
+        redact_high_risk_secret_literals: bool,
+    ) -> _CoverageMetadata:
+        """Member->candidates inverted index for exhaustive known-set coverage.
+
+        Each admitted candidate appears under EVERY member it carries, so a
+        member is covered iff >= 1 of its carriers was selected, and a single
+        multi-member selection covers all of its members. Redaction is decided
+        per member (a member is withheld only if ALL its carriers are withheld).
+        An admitted source-backed carrier that is UNKEYED (no member identity)
+        is unresolved residue that caps the state at ``partial``.
+        """
+        selected_ids = {candidate.memory_id for candidate in selected}
+
+        # Build the inverted index over admitted candidates, and detect unkeyed
+        # source-backed residue (rule #3) that blocks a "complete" claim.
+        member_to_candidates: dict[str, list[ScoredCandidate]] = {}
+        member_display: dict[str, str] = {}
+        clean_member_display: dict[str, str] = {}
+        unkeyed_residue_count = 0
+        for candidate in candidates:
+            if not cls._exhaustive_index_admits(candidate):
+                continue
+            member_keys = cls._coverage_member_keys(candidate)
+            if not member_keys:
+                # Admitted only via the source-backed gate but carrying no member
+                # identity: cannot be proven to be part of the known set.
+                unkeyed_residue_count += 1
+                continue
+            display_map = cls._coverage_member_display_map(candidate)
+            # A withheld carrier's display can be the raw secret literal (legacy
+            # value_* carriers reuse the candidate display text). Such a label
+            # must never reach allowed_values/missing_slots, so the answer-facing
+            # display for a member is sourced ONLY from a clean (non-withheld)
+            # carrier. A member with all-withheld carriers becomes a redacted_gap
+            # whose display is never emitted, so its fallback label is harmless.
+            candidate_withheld = (
+                redact_high_risk_secret_literals
+                and cls._coverage_candidate_withheld(candidate)
+            )
+            for member_key in member_keys:
+                member_to_candidates.setdefault(member_key, []).append(candidate)
+                candidate_display = display_map.get(
+                    member_key,
+                    cls._coverage_display_text(candidate),
+                )
+                if candidate_withheld:
+                    # Only fill from a withheld carrier when nothing is set yet,
+                    # so any later clean carrier overrides it.
+                    member_display.setdefault(member_key, candidate_display)
+                elif member_key not in clean_member_display:
+                    clean_member_display[member_key] = candidate_display
+                    member_display[member_key] = candidate_display
+
+        support_map: dict[str, list[str]] = {}
+        allowed_values: list[dict[str, Any]] = []
+        missing_slots: list[dict[str, Any]] = []
+        covered_member_count = 0
+        redacted_gap_count = 0
+        for member_key, carriers in member_to_candidates.items():
+            selected_carriers = [
+                candidate
+                for candidate in carriers
+                if candidate.memory_id in selected_ids
+            ]
+            clean_selected_carriers = [
+                candidate
+                for candidate in selected_carriers
+                if not (
+                    redact_high_risk_secret_literals
+                    and cls._coverage_candidate_withheld(candidate)
+                )
+            ]
+            normalized_key = cls._coverage_serialized_key(("value", member_key))
+            display_text = member_display[member_key]
+            if clean_selected_carriers:
+                covered_member_count += 1
+                evidence_ids = cls._coverage_support_ids(clean_selected_carriers)
+                for candidate in clean_selected_carriers:
+                    support_map[candidate.memory_id] = evidence_ids
+                allowed_values.append(
+                    {
+                        "display_text": display_text,
+                        "normalized_key": normalized_key,
+                        "evidence_ids": evidence_ids,
+                        "memory_ids": [
+                            candidate.memory_id
+                            for candidate in clean_selected_carriers
+                        ],
+                    }
+                )
+                continue
+            # No clean selected carrier: the member is a gap. If every carrier
+            # is withheld it is a redaction gap (no display); otherwise it is a
+            # genuine missing slot the answer must be told about.
+            if redact_high_risk_secret_literals and all(
+                cls._coverage_candidate_withheld(candidate) for candidate in carriers
+            ):
+                redacted_gap_count += 1
+                continue
+            missing_slots.append(
+                {
+                    "normalized_key": normalized_key,
+                    "display_text": display_text,
+                    "evidence_ids": cls._coverage_support_ids(carriers),
+                    "reason": "coverage_member_not_selected",
+                }
+            )
+
+        if unkeyed_residue_count > 0:
+            missing_slots.append(
+                {
+                    "normalized_key": cls._coverage_serialized_key(
+                        ("unkeyed", "ungrouped_supported_evidence")
+                    ),
+                    "display_text": "ungrouped supported evidence present",
+                    "evidence_ids": [],
+                    "reason": "unkeyed_supported_evidence_present",
+                }
+            )
+
+        state = cls._coverage_state_for_metadata(
+            answer_shape=answer_shape,
+            coverage_mode=coverage_mode,
+            source_precision=source_precision,
+            source_group_count=len(member_to_candidates),
+            selected_group_count=covered_member_count,
+            missing_slot_count=len(missing_slots) + redacted_gap_count,
+        )
+        return _CoverageMetadata(
+            state=state,
+            support_map=support_map,
+            allowed_values=allowed_values,
+            missing_slots=missing_slots,
+        )
+
+    @classmethod
     def _coverage_state_for_metadata(
         cls,
         *,
@@ -1203,8 +1396,29 @@ class ContextComposer:
             return True
         return False
 
+    @classmethod
+    def _exhaustive_index_admits(cls, candidate: ScoredCandidate) -> bool:
+        """Admission rule for the exhaustive member index / reservation.
+
+        Admit iff the candidate carries non-empty member keys AND is not
+        summary-like, OR it already passes the strict source-backed gate.
+
+        The member-keys path is required for member-bearing beliefs, which fail
+        the source-backed gate yet must be enumerable. The ``not summary-like``
+        clause blocks summary-views that can carry a ``value_*`` key but are
+        barred from selection: admitting one would mint a member that can never
+        be selected, producing a phantom missing_slot.
+        """
+        if cls._coverage_member_keys(candidate) and not cls._is_summary_like_candidate(
+            candidate
+        ):
+            return True
+        return cls._is_source_backed_coverage_candidate(candidate)
+
     @staticmethod
     def _coverage_group_has_structured_value(candidate: ScoredCandidate) -> bool:
+        if ContextComposer._coverage_member_keys(candidate):
+            return True
         payload_json = candidate.memory_object.get("payload_json") or {}
         if not isinstance(payload_json, dict):
             return False
@@ -1212,6 +1426,96 @@ class ContextComposer:
             ContextComposer._optional_text(payload_json.get(key)) is not None
             for key in _COVERAGE_VALUE_PAYLOAD_KEYS
         )
+
+    @staticmethod
+    def _coverage_members_payload(candidate: ScoredCandidate) -> list[Any] | None:
+        """Return the raw ``coverage_members`` list when the key is present.
+
+        Returns ``None`` when the key is absent (legacy/unprocessed row). A
+        present-but-empty list means "processed, no enumerable members" and is
+        returned verbatim so callers can distinguish it from absence.
+        """
+        payload_json = candidate.memory_object.get("payload_json")
+        if not isinstance(payload_json, dict):
+            return None
+        if "coverage_members" not in payload_json:
+            return None
+        members = payload_json["coverage_members"]
+        return members if isinstance(members, list) else []
+
+    @classmethod
+    def _coverage_member_keys(cls, candidate: ScoredCandidate) -> frozenset[str]:
+        """Mechanical resolution ladder for a candidate's member identities.
+
+        Shared by reservation and metadata so they can never disagree:
+          1. ``coverage_members`` key present -> the set of normalized
+             ``member_key`` values (possibly empty).
+          2. else a legacy ``_COVERAGE_VALUE_PAYLOAD_KEYS`` value present ->
+             single-element set with the normalized value (preserving the
+             existing ``("value", normalized)`` grouping shape).
+          3. else -> empty set (treated as UNKEYED by callers).
+        """
+        members = cls._coverage_members_payload(candidate)
+        if members is not None:
+            keys: set[str] = set()
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                member_key = cls._optional_text(member.get("member_key"))
+                if member_key is not None:
+                    keys.add(cls._normalize_coverage_key(member_key))
+            return frozenset(keys)
+
+        payload_json = candidate.memory_object.get("payload_json") or {}
+        if isinstance(payload_json, dict):
+            for key in _COVERAGE_VALUE_PAYLOAD_KEYS:
+                value = cls._optional_text(payload_json.get(key))
+                if value is not None:
+                    return frozenset({cls._normalize_coverage_key(value)})
+        return frozenset()
+
+    @classmethod
+    def _coverage_member_display_map(
+        cls,
+        candidate: ScoredCandidate,
+    ) -> dict[str, str]:
+        """Map each member_key of a candidate to its answer-facing display text.
+
+        For the ``coverage_members`` payload, the display text is the member's
+        own ``display_text``. For the legacy ``value_*`` fallback (rule #2), the
+        single member reuses the candidate-level coverage display text so legacy
+        ``allowed_values`` rendering is byte-identical.
+        """
+        members = cls._coverage_members_payload(candidate)
+        if members is not None:
+            mapping: dict[str, str] = {}
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                member_key = cls._optional_text(member.get("member_key"))
+                if member_key is None:
+                    continue
+                display = cls._optional_text(member.get("display_text"))
+                if display is None:
+                    # No usable label on this member: leave the key absent so the
+                    # caller's canonical-text fallback fires instead of an empty
+                    # label.
+                    continue
+                normalized = cls._normalize_coverage_key(member_key)
+                mapping[normalized] = cls._truncate_inline(display, 160)
+            return mapping
+
+        payload_json = candidate.memory_object.get("payload_json") or {}
+        if isinstance(payload_json, dict):
+            for key in _COVERAGE_VALUE_PAYLOAD_KEYS:
+                value = cls._optional_text(payload_json.get(key))
+                if value is not None:
+                    return {
+                        cls._normalize_coverage_key(value): cls._coverage_display_text(
+                            candidate
+                        )
+                    }
+        return {}
 
     @classmethod
     def _coverage_group_key(cls, candidate: ScoredCandidate) -> tuple[str, ...]:
@@ -2270,6 +2574,23 @@ class ContextComposer:
             if best_score > 0.0
             else best_score
         )
+        # Absolute-score gate: when source-grounded direct-evidence candidates
+        # exist in the pool, a window must clear a fraction of the best direct
+        # evidence score to be reserved. This stops low-score, token-heavy windows
+        # from preempting tiny high-score direct facts under a tight budget. If no
+        # direct evidence exists the gate is inert (window-only cases unaffected).
+        direct_evidence_scores = [
+            float(candidate.final_score)
+            for candidate in candidates
+            if cls._is_source_grounded_evidence_candidate(candidate)
+            and not cls._is_verbatim_evidence_window_candidate(candidate)
+            and not cls._is_summary_like_candidate(candidate)
+        ]
+        if direct_evidence_scores:
+            direct_floor = (
+                max(direct_evidence_scores) * cls.EVIDENCE_WINDOW_VS_DIRECT_SCORE_RATIO
+            )
+            minimum_score = max(minimum_score, direct_floor)
         selected: list[ScoredCandidate] = []
         for candidate in ordered:
             if len(selected) >= cls.EVIDENCE_OBLIGATION_MAX_WINDOWS:
@@ -4157,11 +4478,4 @@ class ContextComposer:
 
     @staticmethod
     def _truncate_inline(text: str, max_chars: int) -> str:
-        if max_chars <= 0:
-            return ""
-        normalized = " ".join(text.split())
-        if len(normalized) <= max_chars:
-            return normalized
-        if max_chars <= 3:
-            return normalized[:max_chars]
-        return f"{normalized[: max_chars - 3].rstrip()}..."
+        return truncate_inline(text, max_chars)

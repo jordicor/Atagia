@@ -159,6 +159,15 @@ class ConsequenceChainBuilder:
                 conversation_context=conversation_context,
                 create_missing=False,
             )
+            if action_memory is not None and not self._is_current_chat_action_memory(
+                action_memory,
+                conversation_context,
+            ):
+                logger.debug(
+                    "Using local consequence action copy instead of cross-scope action memory %s",
+                    action_memory.get("id"),
+                )
+                action_memory = None
             resolving_action = False
             action_text = (
                 str(action_memory["canonical_text"])
@@ -440,6 +449,23 @@ class ConsequenceChainBuilder:
             if row is not None:
                 return dict(row)
         return None
+
+    @staticmethod
+    def _is_current_chat_action_memory(
+        action_memory: dict[str, Any],
+        conversation_context: ExtractionConversationContext,
+    ) -> bool:
+        raw_scope = action_memory.get("scope_canonical") or action_memory.get("scope")
+        scope = str(raw_scope or "").strip()
+        chat_scopes = {
+            MemoryScope.CHAT.value,
+            MemoryScope.CONVERSATION.value,
+            MemoryScope.EPHEMERAL_SESSION.value,
+        }
+        return (
+            scope in chat_scopes
+            and action_memory.get("conversation_id") == conversation_context.conversation_id
+        )
 
     @staticmethod
     def _lookup_queries(base_query: str) -> list[str]:

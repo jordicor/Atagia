@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from time import perf_counter
 from typing import Any
 
+import httpx
 from benchmarks.activation_flags import benchmark_activation_flags
 from benchmarks.artifact_hash import (
     sha256_directory,
@@ -45,9 +46,14 @@ from benchmarks.llm_metrics import (
 )
 from benchmarks.llm_run_guard import LLMRunGuardConfig
 from benchmarks.migration_metadata import benchmark_migration_metadata
+from benchmarks.output_root import assert_outside_repo, bench_output_root
 from benchmarks.retained_db_paths import validate_retained_benchmark_db_dir
 from benchmarks.scorer import LLMJudgeScorer
-from benchmarks.source_evidence import source_evidence_from_turns
+from benchmarks.source_evidence import (
+    normalize_evidence_turn_ids,
+    source_evidence_from_turns,
+    validate_evidence_turn_ids,
+)
 from benchmarks.trusted_eval import (
     activate_trusted_evaluation_memories,
     trusted_evaluation_ablation,
@@ -60,6 +66,7 @@ from atagia.core.repositories import (
 )
 from atagia.core.storage_backend import StorageDrainSnapshot
 from atagia.core.timestamps import normalize_optional_timestamp
+from atagia.models.schemas_jobs import WorkerControlMode
 from atagia.models.schemas_replay import AblationConfig
 from atagia.services.admin_rebuild_service import AdminRebuildService, RebuildResult
 from atagia.services.artifact_service import ArtifactService
@@ -121,24 +128,59 @@ _TECHNICAL_FAILURE_REASON_PREFIX_BY_STAGE = {
     "answer_generation": "Answer generation failed",
     "judge": "Judge call failed",
 }
+_RAW_PROVIDER_TRANSPORT_ERRORS = (
+    httpx.TransportError,
+    TimeoutError,
+    ConnectionError,
+)
+_RETRIEVAL_TECHNICAL_ERRORS = (
+    LLMError,
+    LLMUnavailableError,
+    StructuredOutputError,
+    *_RAW_PROVIDER_TRANSPORT_ERRORS,
+)
+_JUDGE_TECHNICAL_ERRORS = (
+    LLMError,
+    StructuredOutputError,
+    *_RAW_PROVIDER_TRANSPORT_ERRORS,
+)
 
 
 def _apply_corrections(
     questions: list[BenchmarkQuestion],
     corrections: dict[str, Any],
 ) -> list[BenchmarkQuestion]:
-    """Substitute ground truths from a corrections overlay."""
+    """Substitute corrected ground truths and official evidence ids."""
     if not corrections:
         return questions
     result: list[BenchmarkQuestion] = []
     for question in questions:
         correction = corrections.get(question.question_id)
         if correction is not None:
-            question = question.model_copy(
-                update={"ground_truth": correction["corrected_ground_truth"]},
-            )
+            update: dict[str, Any] = {}
+            corrected_ground_truth = correction.get("corrected_ground_truth")
+            if corrected_ground_truth:
+                update["ground_truth"] = corrected_ground_truth
+            corrected_evidence_turn_ids = _correction_evidence_turn_ids(correction)
+            if corrected_evidence_turn_ids:
+                update["evidence_turn_ids"] = corrected_evidence_turn_ids
+            if update:
+                question = question.model_copy(update=update)
         result.append(question)
     return result
+
+
+def _correction_evidence_turn_ids(correction: dict[str, Any]) -> list[str]:
+    """Return corrected oracle evidence ids from supported overlay shapes."""
+    for key in (
+        "corrected_evidence_turn_ids",
+        "correct_evidence",
+        "evidence_turn_ids",
+        "evidence_turn",
+    ):
+        if key in correction:
+            return normalize_evidence_turn_ids(correction.get(key))
+    return []
 
 
 class LoCoMoBenchmark(BenchmarkRunner):
@@ -301,7 +343,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
         effective_benchmark_db_dir: Path | None = None
         if keep_db:
             effective_benchmark_db_dir = validate_retained_benchmark_db_dir(
-                benchmark_db_dir or (_PROJECT_ROOT / "docs" / "tmp" / "benchmark_dbs"),
+                benchmark_db_dir or (bench_output_root() / "locomo" / "benchmark_dbs"),
                 allow_temp_benchmark_db_dir=allow_temp_benchmark_db_dir,
             )
         if reuse_db is not None and reuse_db_dir is not None:
@@ -374,6 +416,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
             selected_conversations,
             scored_categories=scored_categories,
             question_filter=question_filter,
+            require_evidence_packets=require_evidence_packets,
         )
         run_counters = RunCounterAccumulator()
         parallel_limit = min(parallel_conversations, len(conversation_inputs) or 1)
@@ -526,6 +569,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
         *,
         scored_categories: list[int],
         question_filter: set[str] | None,
+        require_evidence_packets: bool,
     ) -> list[tuple[int, BenchmarkConversation, list[BenchmarkQuestion]]]:
         result: list[tuple[int, BenchmarkConversation, list[BenchmarkQuestion]]] = []
         for conversation_index, conversation in enumerate(conversations, start=1):
@@ -539,8 +583,29 @@ class LoCoMoBenchmark(BenchmarkRunner):
                     for question in filtered_questions
                     if question.question_id in question_filter
                 ]
+            if require_evidence_packets:
+                self._validate_question_source_evidence(
+                    conversation,
+                    filtered_questions,
+                )
             result.append((conversation_index, conversation, filtered_questions))
         return result
+
+    @staticmethod
+    def _validate_question_source_evidence(
+        conversation: BenchmarkConversation,
+        questions: Sequence[BenchmarkQuestion],
+    ) -> None:
+        """Validate selected LoCoMo question oracle evidence before a run."""
+        for question in questions:
+            validate_evidence_turn_ids(
+                evidence_turn_ids=question.evidence_turn_ids,
+                turns=conversation.turns,
+                dataset_name="LoCoMo",
+                question_id=question.question_id,
+                conversation_id=conversation.conversation_id,
+                require_non_empty=True,
+            )
 
     async def _run_conversations_sequential(
         self,
@@ -2408,6 +2473,10 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 runtime = question_engine.runtime
                 if runtime is None:
                     raise RuntimeError("Atagia runtime was unexpectedly unavailable")
+                await question_engine.set_worker_control(
+                    WorkerControlMode.PAUSE_NEW_JOBS,
+                    reason="LoCoMo question snapshots discard post-response memory work",
+                )
                 install_llm_call_recorder(runtime.llm_client, llm_recorder)
                 judge = LLMJudgeScorer(
                     runtime.llm_client,
@@ -2492,7 +2561,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                     ),
                 )
                 prediction = chat_result.response_text
-            except (LLMError, LLMUnavailableError, StructuredOutputError) as exc:
+            except _RETRIEVAL_TECHNICAL_ERRORS as exc:
                 retrieval_time_ms = (perf_counter() - chat_started_at) * 1000.0
                 trace_payload = self._basic_question_trace(
                     question=question,
@@ -2538,7 +2607,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                     ground_truth=question.ground_truth,
                     source_evidence=source_evidence,
                 )
-            except (LLMError, StructuredOutputError) as exc:
+            except _JUDGE_TECHNICAL_ERRORS as exc:
                 trace_payload = await self._build_question_trace_from_chat_result(
                     engine,
                     user_id=user_id,
@@ -2803,7 +2872,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
     def _source_evidence_for_question(
         conversation: BenchmarkConversation,
         question: BenchmarkQuestion,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         return source_evidence_from_turns(
             evidence_turn_ids=question.evidence_turn_ids,
             turns=conversation.turns,
@@ -2813,7 +2882,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
     @staticmethod
     def _grade_context_for_question(
         question: BenchmarkQuestion,
-        source_evidence: list[dict[str, str]],
+        source_evidence: list[dict[str, Any]],
     ) -> dict[str, Any]:
         source_turn_ids = [
             str(item.get("turn_id") or "")
@@ -3502,7 +3571,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
     @staticmethod
     def save_report(report: BenchmarkReport, output_dir: str | Path) -> Path:
         """Persist a benchmark report as JSON and return its path."""
-        output_path = Path(output_dir).expanduser()
+        output_path = assert_outside_repo(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         report_path = output_path / f"locomo-report-{timestamp}.json"
@@ -4117,7 +4186,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
         base_dir = (
             Path(benchmark_db_dir).expanduser()
             if benchmark_db_dir is not None
-            else _PROJECT_ROOT / "docs" / "tmp" / "benchmark_dbs"
+            else bench_output_root() / "locomo" / "benchmark_dbs"
         )
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         stem = f"locomo_{_safe_path_component(conversation_id)}_{timestamp}"
@@ -4126,6 +4195,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
         while candidate.exists():
             suffix += 1
             candidate = base_dir / f"{stem}_{suffix}"
+        assert_outside_repo(candidate)
         candidate.mkdir(parents=True, exist_ok=False)
         return candidate
 

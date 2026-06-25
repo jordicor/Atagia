@@ -41,6 +41,24 @@ _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
 )
 
 
+def _is_need_detection_card_purpose(purpose: object) -> bool:
+    value = str(purpose)
+    return value.startswith("need_detection_") and value.endswith("_card")
+
+
+def _label_for_score(score: object) -> str:
+    value = float(score)
+    if value <= 0.10:
+        return "drop"
+    if value <= 0.40:
+        return "weak"
+    if value <= 0.65:
+        return "useful"
+    if value <= 0.85:
+        return "strong"
+    return "exact"
+
+
 class ReplayProvider(LLMProvider):
     name = "replay-service-tests"
 
@@ -51,41 +69,45 @@ class ReplayProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
-        if purpose == "need_detection":
+        if _is_need_detection_card_purpose(purpose):
+            outputs = {
+                "need_detection_needs_card": "none",
+                "need_detection_language_card": "en\nen",
+                "need_detection_memory_card": "mixed",
+                "need_detection_exact_card": "no",
+                "need_detection_shape_card": "default",
+                "need_detection_facets_card": "none",
+                "need_detection_callback_card": "no",
+                "need_detection_search_words_card": "retry loop",
+                "need_detection_search_words_other_language_card": "none",
+            }
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "needs": [],
-                        "temporal_range": None,
-                        "sub_queries": ["retry loop"],
-                        "sparse_query_hints": [
-                            {
-                                "sub_query_text": "retry loop",
-                                "fts_phrase": "retry loop",
-                            }
-                        ],
-                        "query_type": "default",
-                        "retrieval_levels": [0],
-                    }
-                ),
+                output_text=outputs[purpose],
             )
-        if purpose == "applicability_scoring":
+        if purpose == "applicability_relevance_card":
             candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
                 request.messages[1].content
             )
-            payload = {
-                "scores": [
-                    {
-                        "score_key": score_key,
-                        "llm_applicability": self.score_map.get(memory_id, 0.5),
-                    }
-                    for memory_id, score_key in candidate_keys
-                ],
-            }
             return LLMCompletionResponse(
-                provider=self.name, model=request.model, output_text=json.dumps(payload)
+                provider=self.name,
+                model=request.model,
+                output_text="\n".join(
+                    f"{score_key} {_label_for_score(self.score_map.get(memory_id, 0.5))}"
+                    for memory_id, score_key in candidate_keys
+                ),
+            )
+        if purpose == "applicability_date_card":
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
+                request.messages[1].content
+            )
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="\n".join(
+                    f"{score_key} none" for _memory_id, score_key in candidate_keys
+                ),
             )
         raise AssertionError(f"Unexpected purpose: {purpose}")
 

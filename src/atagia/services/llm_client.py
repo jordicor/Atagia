@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
+import math
+import random
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, AsyncIterator, Generic, TypeVar
@@ -102,14 +106,27 @@ class StructuredOutputError(LLMError):
         *,
         details: tuple[str, ...] = (),
         output_text: str | None = None,
+        reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.details = details
         self.output_text = output_text
+        self.reason = reason
 
 
 class TransientLLMError(LLMError):
     """Raised for retryable provider failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = _normalize_retry_after_seconds(
+            retry_after_seconds
+        )
 
 
 class LLMRequestError(LLMError):
@@ -159,6 +176,8 @@ class RetryPolicy:
     attempts: int = 3
     base_delay_seconds: float = 0.5
     max_delay_seconds: float = 4.0
+    retry_delays_seconds: tuple[float, ...] = ()
+    jitter_fraction: float = 0.15
 
 
 # Interactive retrieval gates degrade gracefully (e.g. need detection falls back
@@ -166,18 +185,110 @@ class RetryPolicy:
 # are the exact `request.metadata["purpose"]` strings used by those stages.
 INTERACTIVE_RETRIEVAL_PURPOSES: frozenset[str] = frozenset(
     {
-        "need_detection",
-        "need_detection_anchor_review",
-        "need_detection_multi_facet_exact_review",
-        "need_detection_degraded_exact_contract_review",
-        "need_detection_unknown_only_contract_review",
+        "need_detection_language_card",
+        "need_detection_needs_card",
+        "need_detection_memory_card",
+        "need_detection_exact_card",
+        "need_detection_shape_card",
+        "need_detection_facets_card",
+        "need_detection_callback_card",
+        "need_detection_search_words_card",
+        "need_detection_search_words_other_language_card",
         "applicability_scoring",
+        "applicability_relevance_card",
+        "applicability_date_card",
         "context_cache_signal_detection",
         "coverage_expansion",
     }
 )
 
 _DEFAULT_INTERACTIVE_RETRY_POLICY = RetryPolicy(attempts=2, max_delay_seconds=1.5)
+_DEFAULT_EXTRACTION_RETRY_POLICY = RetryPolicy(
+    attempts=5,
+    base_delay_seconds=1.0,
+    max_delay_seconds=15.0,
+    retry_delays_seconds=(1.0, 3.0, 8.0, 15.0),
+)
+_MEMORY_EXTRACTION_PURPOSES: frozenset[str] = frozenset(
+    {
+        "memory_extraction",
+        "memory_extraction_candidate_card",
+        "memory_extraction_kind_scope_card",
+        "memory_extraction_evidence_card",
+        "memory_extraction_index_card",
+        "memory_extraction_temporal_card",
+        "memory_extraction_belief_card",
+        "memory_extraction_coverage_members_card",
+    }
+)
+_PARTIAL_STREAM_RETRY_PURPOSES: frozenset[str] = _MEMORY_EXTRACTION_PURPOSES
+_CONSEQUENCE_DETECTION_PURPOSES: frozenset[str] = frozenset(
+    {
+        "consequence_detection",
+        "consequence_gate_card",
+        "consequence_action_card",
+        "consequence_outcome_card",
+        "consequence_sentiment_card",
+        "consequence_link_card",
+        "consequence_language_card",
+    }
+)
+_BACKGROUND_DEFERABLE_RETRY_AFTER_PURPOSES: frozenset[str] = frozenset(
+    {
+        *_MEMORY_EXTRACTION_PURPOSES,
+        *_CONSEQUENCE_DETECTION_PURPOSES,
+        "consequence_tendency_inference",
+    }
+)
+
+
+def _normalize_retry_after_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    return max(0.0, seconds)
+
+
+def retry_after_seconds_from_headers(headers: Any) -> float | None:
+    """Parse an HTTP ``Retry-After`` value as seconds when available."""
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    raw_value = getter("retry-after")
+    if raw_value is None:
+        raw_value = getter("Retry-After")
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    numeric = _normalize_retry_after_seconds(text)
+    if numeric is not None:
+        return numeric
+    try:
+        retry_at = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
+def retry_after_seconds_from_exception(exc: BaseException) -> float | None:
+    """Extract ``Retry-After`` from common SDK exception shapes."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) if response is not None else None
+    retry_after = retry_after_seconds_from_headers(headers)
+    if retry_after is not None:
+        return retry_after
+    return retry_after_seconds_from_headers(getattr(exc, "headers", None))
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +450,7 @@ class LLMClient(Generic[T]):
         providers: list[LLMProvider] | None = None,
         retry_policy: RetryPolicy | None = None,
         interactive_retry_policy: RetryPolicy | None = None,
+        extraction_retry_policy: RetryPolicy | None = None,
         allow_unqualified_single_provider_models: bool = False,
         intimacy_fallback_models: dict[str, str] | None = None,
         intimacy_proactive_routing_enabled: bool = False,
@@ -353,6 +465,11 @@ class LLMClient(Generic[T]):
         self._retry_policy = retry_policy or RetryPolicy()
         self._interactive_retry_policy = (
             interactive_retry_policy or _DEFAULT_INTERACTIVE_RETRY_POLICY
+        )
+        self._extraction_retry_policy = (
+            extraction_retry_policy
+            or retry_policy
+            or _DEFAULT_EXTRACTION_RETRY_POLICY
         )
         self._allow_unqualified_single_provider_models = allow_unqualified_single_provider_models
         self._intimacy_fallback_models = dict(intimacy_fallback_models or {})
@@ -505,7 +622,6 @@ class LLMClient(Generic[T]):
         provider, provider_request = self._completion_provider_request(request)
         observer = self._stream_observer(observer)
         retry_policy = self._retry_policy_for(provider_request)
-        delay = retry_policy.base_delay_seconds
         last_error: LLMError | None = None
         for attempt in range(1, retry_policy.attempts + 1):
             emitted_any = False
@@ -561,8 +677,12 @@ class LLMClient(Generic[T]):
                 last_error = exc
                 if attempt == retry_policy.attempts:
                     break
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, retry_policy.max_delay_seconds)
+                await self._sleep_before_retry(
+                    retry_policy,
+                    attempt,
+                    exc,
+                    request=provider_request,
+                )
             except LLMError as exc:
                 await self._close_stream_iterator(stream_iterator)
                 self._guard_record_failure(
@@ -626,7 +746,6 @@ class LLMClient(Generic[T]):
         provider, provider_request = self._completion_provider_request(request)
         observer = self._stream_observer(observer)
         retry_policy = self._retry_policy_for(provider_request)
-        delay = retry_policy.base_delay_seconds
         last_error: LLMError | None = None
         for attempt in range(1, retry_policy.attempts + 1):
             emitted_any = False
@@ -689,13 +808,30 @@ class LLMClient(Generic[T]):
                     exc=exc,
                     latency_ms=(perf_counter() - started_at) * 1000.0,
                 )
-                if emitted_any:
+                can_retry_partial = (
+                    emitted_any
+                    and self._should_retry_after_partial_stream(provider_request)
+                )
+                if emitted_any and not can_retry_partial:
                     raise
                 last_error = exc
                 if attempt == retry_policy.attempts:
                     break
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, retry_policy.max_delay_seconds)
+                if can_retry_partial:
+                    logger.warning(
+                        "Retrying streamed completion after partial transient error "
+                        "purpose=%s model=%s attempt=%s",
+                        provider_request.metadata.get("purpose") or "<unset>",
+                        provider_request.model,
+                        attempt,
+                    )
+                    await self._reset_stream_observer_for_retry(observer, exc)
+                await self._sleep_before_retry(
+                    retry_policy,
+                    attempt,
+                    exc,
+                    request=provider_request,
+                )
             except LLMError as exc:
                 await self._close_stream_iterator(stream_iterator)
                 self._guard_record_failure(
@@ -871,7 +1007,7 @@ class LLMClient(Generic[T]):
     @staticmethod
     async def _reset_stream_observer_for_retry(
         observer: Any | None,
-        error: OutputLimitExceededError,
+        error: LLMError,
     ) -> None:
         if observer is None:
             return
@@ -1157,6 +1293,13 @@ class LLMClient(Generic[T]):
         requested = temperature
         reason: str | None = None
         source = "unset"
+        if profile is not None and profile.omit_temperature:
+            return _ResolvedTemperature(
+                value=None,
+                source="model_profile_omitted",
+                requested=requested,
+                reason=parsed.canonical_model,
+            )
         if temperature is not None:
             value = float(temperature)
             source = "request"
@@ -1248,6 +1391,19 @@ class LLMClient(Generic[T]):
         if parsed.provider_slug == "google":
             if provider_value is not None:
                 metadata["gemini_thinking_level"] = provider_value
+            return metadata
+
+        if parsed.provider_slug in {"kimi", "minimax"}:
+            metadata = self._apply_profile_extra_body(profile, metadata)
+            body = copy.deepcopy(metadata.get("provider_extra_body") or {})
+            if parsed.provider_slug == "minimax" and isinstance(provider_value, str):
+                thinking = body.get("thinking")
+                if not isinstance(thinking, dict):
+                    thinking = {}
+                thinking["type"] = provider_value
+                body["thinking"] = thinking
+            if body:
+                metadata["provider_extra_body"] = body
             return metadata
 
         if parsed.provider_slug == "openrouter":
@@ -1683,7 +1839,6 @@ class LLMClient(Generic[T]):
         call_type: str,
     ) -> Any:
         retry_policy = self._retry_policy_for(request)
-        delay = retry_policy.base_delay_seconds
         last_error: Exception | None = None
         for attempt in range(1, retry_policy.attempts + 1):
             started_at = perf_counter()
@@ -1700,8 +1855,12 @@ class LLMClient(Generic[T]):
                 last_error = exc
                 if attempt == retry_policy.attempts:
                     break
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, retry_policy.max_delay_seconds)
+                await self._sleep_before_retry(
+                    retry_policy,
+                    attempt,
+                    exc,
+                    request=request,
+                )
             except Exception as exc:
                 self._guard_record_failure(
                     request,
@@ -1813,7 +1972,63 @@ class LLMClient(Generic[T]):
         purpose = self._request_purpose(request)
         if purpose is not None and purpose in INTERACTIVE_RETRIEVAL_PURPOSES:
             return self._interactive_retry_policy
+        if purpose is not None and purpose in _PARTIAL_STREAM_RETRY_PURPOSES:
+            return self._extraction_retry_policy
         return self._retry_policy
+
+    async def _sleep_before_retry(
+        self,
+        retry_policy: RetryPolicy,
+        attempt: int,
+        exc: TransientLLMError,
+        *,
+        request: LLMCompletionRequest | LLMEmbeddingRequest,
+    ) -> None:
+        if self._should_defer_long_retry_after(request, retry_policy, exc):
+            raise exc
+        await asyncio.sleep(self._retry_delay_seconds(retry_policy, attempt, exc))
+
+    def _should_defer_long_retry_after(
+        self,
+        request: LLMCompletionRequest | LLMEmbeddingRequest,
+        retry_policy: RetryPolicy,
+        exc: TransientLLMError,
+    ) -> bool:
+        retry_after = exc.retry_after_seconds
+        if retry_after is None or retry_after <= retry_policy.max_delay_seconds:
+            return False
+        return self._request_purpose(request) in _BACKGROUND_DEFERABLE_RETRY_AFTER_PURPOSES
+
+    @staticmethod
+    def _retry_delay_seconds(
+        retry_policy: RetryPolicy,
+        attempt: int,
+        exc: TransientLLMError,
+    ) -> float:
+        retry_after = exc.retry_after_seconds
+        if retry_after is not None:
+            return min(retry_after, retry_policy.max_delay_seconds)
+        if retry_policy.retry_delays_seconds:
+            index = min(max(0, attempt - 1), len(retry_policy.retry_delays_seconds) - 1)
+            delay = float(retry_policy.retry_delays_seconds[index])
+        else:
+            delay = retry_policy.base_delay_seconds * (2 ** max(0, attempt - 1))
+        delay = min(max(0.0, delay), retry_policy.max_delay_seconds)
+        jitter_fraction = max(0.0, retry_policy.jitter_fraction)
+        if delay <= 0.0 or jitter_fraction <= 0.0:
+            return delay
+        jittered = delay * random.uniform(1.0 - jitter_fraction, 1.0 + jitter_fraction)
+        return min(max(0.0, jittered), retry_policy.max_delay_seconds)
+
+    @staticmethod
+    def _should_retry_after_partial_stream(request: LLMCompletionRequest) -> bool:
+        purpose = request.metadata.get("purpose")
+        if not isinstance(purpose, str) or purpose not in _PARTIAL_STREAM_RETRY_PURPOSES:
+            return False
+        mode = request.metadata.get("atagia_partial_stream_retry")
+        if isinstance(mode, str) and mode.strip().lower() == "discard_and_retry":
+            return True
+        return False
 
     @staticmethod
     def _should_retry_without_schema(exc: LLMError, request: LLMCompletionRequest) -> bool:
@@ -1856,11 +2071,13 @@ class LLMClient(Generic[T]):
                     "Provider returned non-JSON structured output after schema fallback",
                     details=exc.details,
                     output_text=response.output_text,
+                    reason="schema_fallback_non_json",
                 ) from exc
             raise StructuredOutputError(
                 "Provider returned non-JSON structured output",
                 details=exc.details,
                 output_text=response.output_text,
+                reason="non_json",
             ) from exc
 
         adapter = TypeAdapter(schema)
@@ -1871,6 +2088,7 @@ class LLMClient(Generic[T]):
                 "Provider returned invalid structured output",
                 details=self._structured_error_details(exc),
                 output_text=response.output_text,
+                reason="schema_validation",
             ) from exc
 
     @classmethod

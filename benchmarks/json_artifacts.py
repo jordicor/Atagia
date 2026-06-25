@@ -7,10 +7,16 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
+from benchmarks.output_root import assert_outside_repo
+
 
 def write_json_atomic(path: str | Path, payload: Any) -> Path:
-    """Write a JSON artifact through a same-directory atomic replacement."""
-    destination = Path(path).expanduser()
+    """Write a JSON artifact through a same-directory atomic replacement.
+
+    Benchmark JSON artifacts must never land inside the repo; this is the shared
+    choke point that enforces it for every benchmark JSON writer.
+    """
+    destination = assert_outside_repo(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
     try:

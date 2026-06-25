@@ -20,6 +20,7 @@ from typing import Any, Iterable
 
 from benchmarks.artifact_hash import sha256_file_if_exists
 from benchmarks.json_artifacts import write_json_atomic
+from benchmarks.output_root import bench_output_root
 from benchmarks.llm_metrics import LLMCallRecorder, install_llm_call_recorder
 from benchmarks.locomo.adapter import LoCoMoAdapter
 from benchmarks.locomo.evidence_hydration_probe import (
@@ -45,9 +46,9 @@ from atagia.services.providers import build_llm_client
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DATA_PATH = _PROJECT_ROOT / "benchmarks" / "data" / "locomo10.json"
-_DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "docs" / "tmp"
+_DEFAULT_OUTPUT_DIR = bench_output_root() / "locomo"
 _DEFAULT_ANSWER_MODEL = "openrouter/openai/gpt-chat-latest"
-_DEFAULT_JUDGE_MODEL = "openrouter/anthropic/claude-opus-4.7"
+_DEFAULT_JUDGE_MODEL = "kimi/kimi-k2.7-code"
 _DEFAULT_VARIANTS = (
     "selected_current",
     "selected_plus_source_non_summary",

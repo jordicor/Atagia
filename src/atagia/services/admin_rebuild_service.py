@@ -60,6 +60,7 @@ RECENT_CONTEXT_MESSAGES = 6
 REBUILD_MESSAGE_PAGE_SIZE = 5000
 REBUILD_STATUS_REBUILT = "rebuilt"
 REBUILD_STATUS_REBUILT_PARTIAL = "rebuilt_partial"
+REVISION_CLAIM_KEY_MISMATCH_STATUS = "skipped_claim_key_mismatch"
 
 
 class RebuildResult(BaseModel):
@@ -87,6 +88,7 @@ class RebuildResult(BaseModel):
     recoverable_graph_job_failures: int = 0
     recoverable_revision_job_failures: int = 0
     recoverable_compaction_job_failures: int = 0
+    skipped_claim_key_mismatch: int = 0
     llm_guard: dict[str, Any] | None = None
 
 
@@ -680,6 +682,18 @@ class AdminRebuildService:
         elif stage == "compaction":
             result.recoverable_compaction_job_failures += 1
 
+    @staticmethod
+    def _record_claim_key_mismatch_skip(
+        result: RebuildResult,
+        job_result: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(job_result, dict):
+            return
+        if job_result.get("status") != REVISION_CLAIM_KEY_MISMATCH_STATUS:
+            return
+        result.skipped_claim_key_mismatch += 1
+        result.status = REBUILD_STATUS_REBUILT_PARTIAL
+
     async def _drain_stream(
         self,
         storage_backend: InProcessBackend,
@@ -716,6 +730,7 @@ class AdminRebuildService:
                     await self._job_tracking.mark_failed(message, exc)
                     raise
                 if processed:
+                    self._record_claim_key_mismatch_skip(result, job_result)
                     await self._job_tracking.mark_succeeded(
                         message,
                         metadata=job_result if isinstance(job_result, dict) else None,

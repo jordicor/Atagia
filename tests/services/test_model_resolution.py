@@ -8,6 +8,7 @@ import pytest
 
 from atagia.services.model_resolution import (
     COMPONENTS_BY_ID,
+    MINIMAX_M3_MODEL,
     ModelResolutionError,
     OPENROUTER_DEEPSEEK_V4_FLASH_MODEL,
     OPENROUTER_FLASH_LITE_MODEL,
@@ -42,6 +43,8 @@ class ResolutionSettings:
     anthropic_api_key: str | None = None
     openai_api_key: str | None = None
     google_api_key: str | None = None
+    kimi_api_key: str | None = None
+    minimax_api_key: str | None = None
     openrouter_api_key: str | None = None
 
 
@@ -61,6 +64,24 @@ def test_parse_model_spec_preserves_openrouter_vendor_segment() -> None:
     assert parsed.provider_name == "openrouter"
     assert parsed.request_model == "deepseek/deepseek-v4-flash"
     assert parsed.thinking_level == "high"
+
+
+def test_parse_model_spec_accepts_direct_minimax_provider() -> None:
+    parsed = parse_model_spec("minimax/MiniMax-M3")
+
+    assert parsed.provider_slug == "minimax"
+    assert parsed.provider_name == "minimax"
+    assert parsed.request_model == "MiniMax-M3"
+    assert parsed.canonical_spec == "minimax/MiniMax-M3"
+
+
+def test_parse_model_spec_accepts_direct_kimi_provider() -> None:
+    parsed = parse_model_spec("kimi/kimi-k2.7-code")
+
+    assert parsed.provider_slug == "kimi"
+    assert parsed.provider_name == "kimi"
+    assert parsed.request_model == "kimi-k2.7-code"
+    assert parsed.canonical_spec == "kimi/kimi-k2.7-code"
 
 
 def test_openrouter_provider_qualifies_google_vendor_models() -> None:
@@ -105,7 +126,10 @@ def test_resolution_precedence_forced_component_category_default() -> None:
 
     assert resolve_component_model(settings, "extractor") == "openai/gpt-5-mini"
     assert resolve_component_model(settings, "belief_reviser") == "anthropic/claude-haiku-4-5"
-    assert resolve_component_model(settings, "need_detector") == "google/gemini-3-flash-preview"
+    assert (
+        resolve_component_model(settings, "need_detector_language")
+        == "google/gemini-3-flash-preview"
+    )
     assert resolve_component_model(settings, "chat") == OPENROUTER_DEEPSEEK_V4_FLASH_MODEL
 
     forced = ResolutionSettings(
@@ -123,18 +147,23 @@ def test_required_provider_keys_include_mixed_defaults_and_embeddings() -> None:
         embedding_model="openai/text-embedding-3-small",
     )
 
-    assert required_provider_slugs(settings) == {"anthropic", "openrouter", "openai"}
+    assert required_provider_slugs(settings) == {
+        "anthropic",
+        "minimax",
+        "openai",
+        "openrouter",
+    }
 
     with pytest.raises(ModelResolutionError, match="ATAGIA_ANTHROPIC_API_KEY"):
         validate_required_provider_keys(settings)
 
 
-def test_resolve_component_uses_openrouter_flashlite_for_extractor() -> None:
+def test_resolve_component_uses_direct_minimax_m3_for_extractor() -> None:
     resolved = resolve_component(ResolutionSettings(), "extractor")
 
-    assert resolved.parsed.canonical_model == OPENROUTER_FLASH_LITE_MODEL
-    assert resolved.parsed.provider_slug == "openrouter"
-    assert resolved.parsed.request_model == "google/gemini-3.1-flash-lite"
+    assert resolved.parsed.canonical_model == MINIMAX_M3_MODEL
+    assert resolved.parsed.provider_slug == "minimax"
+    assert resolved.parsed.request_model == "MiniMax-M3"
     assert resolved.provenance == "default"
 
 
@@ -220,8 +249,8 @@ def test_chat_defaults_to_deepseek_v4_flash_for_dev_cost() -> None:
     assert resolved.parsed.canonical_model == OPENROUTER_DEEPSEEK_V4_FLASH_MODEL
 
 
-def test_default_flashlite_migration_scope_is_explicit() -> None:
-    migrated_component_ids = {
+def test_default_model_scope_is_explicit() -> None:
+    minimax_ingest_component_ids = {
         "extractor",
         "text_chunker",
         "compactor",
@@ -232,15 +261,29 @@ def test_default_flashlite_migration_scope_is_explicit() -> None:
         "consequence_detector",
         "topic_working_set",
         "intent_classifier",
+        "extraction_watchdog",
         "initial_context_package_curation",
-        "need_detector",
+    }
+    flashlite_retrieval_component_ids = {
+        "need_detector_needs",
+        "need_detector_language",
+        "need_detector_memory",
+        "need_detector_exact",
+        "need_detector_shape",
+        "need_detector_facets",
+        "need_detector_callback",
+        "need_detector_search_words",
+        "need_detector_search_words_other_language",
         "coverage_expander",
         "applicability_scorer",
         "context_staleness",
         "metrics_computer",
     }
 
-    for component_id in migrated_component_ids:
+    for component_id in minimax_ingest_component_ids:
+        assert COMPONENTS_BY_ID[component_id].default_model == MINIMAX_M3_MODEL
+
+    for component_id in flashlite_retrieval_component_ids:
         assert COMPONENTS_BY_ID[component_id].default_model == OPENROUTER_FLASH_LITE_MODEL
 
 
@@ -255,13 +298,62 @@ def test_coverage_expansion_purpose_maps_to_component() -> None:
     assert component_id_for_llm_purpose("coverage_expansion") == "coverage_expander"
 
 
-def test_multi_facet_exact_review_purpose_maps_to_need_detector() -> None:
-    assert component_id_for_llm_purpose("need_detection_multi_facet_exact_review") == (
-        "need_detector"
+def test_coverage_members_card_purpose_is_wired_like_other_extraction_cards() -> None:
+    """Guard against the silent-misroute class (cf. commit 227c2e3).
+
+    A new extraction card mints a new LLM purpose that must be registered in
+    every purpose map, exactly like the other extraction cards: component
+    resolution (extractor), semantic temperature, and the extraction-grade
+    partial-stream retry set.
+    """
+
+    from atagia.services.llm_client import _PARTIAL_STREAM_RETRY_PURPOSES
+    from atagia.services.llm_temperature import PURPOSE_TEMPERATURES, purpose_temperature
+
+    purpose = "memory_extraction_coverage_members_card"
+    belief_purpose = "memory_extraction_belief_card"
+
+    # Component resolution: maps to the extractor component like its siblings.
+    assert component_id_for_llm_purpose(purpose) == "extractor"
+    assert component_id_for_llm_purpose(purpose) == component_id_for_llm_purpose(
+        belief_purpose
     )
-    assert component_id_for_llm_purpose("need_detection_unknown_only_contract_review") == (
-        "need_detector"
+
+    # Temperature: the same semantic temperature the other extraction cards use.
+    assert purpose_temperature(purpose) == PURPOSE_TEMPERATURES[belief_purpose]
+
+    # Partial-stream retry: extraction-grade retry coverage.
+    assert purpose in _PARTIAL_STREAM_RETRY_PURPOSES
+
+
+def test_need_detection_card_purposes_map_to_card_components() -> None:
+    assert component_id_for_llm_purpose("need_detection_needs_card") == (
+        "need_detector_needs"
     )
+    assert component_id_for_llm_purpose("need_detection_language_card") == (
+        "need_detector_language"
+    )
+    assert component_id_for_llm_purpose("need_detection_memory_card") == (
+        "need_detector_memory"
+    )
+    assert component_id_for_llm_purpose("need_detection_exact_card") == (
+        "need_detector_exact"
+    )
+    assert component_id_for_llm_purpose("need_detection_shape_card") == (
+        "need_detector_shape"
+    )
+    assert component_id_for_llm_purpose("need_detection_facets_card") == (
+        "need_detector_facets"
+    )
+    assert component_id_for_llm_purpose("need_detection_callback_card") == (
+        "need_detector_callback"
+    )
+    assert component_id_for_llm_purpose("need_detection_search_words_card") == (
+        "need_detector_search_words"
+    )
+    assert component_id_for_llm_purpose(
+        "need_detection_search_words_other_language_card"
+    ) == ("need_detector_search_words_other_language")
 
 
 def test_answer_postcondition_purpose_maps_to_component() -> None:
@@ -308,6 +400,36 @@ def test_structured_output_rescue_provider_key_is_required() -> None:
         validate_required_provider_keys(settings)
 
 
+def test_direct_minimax_provider_key_is_required_when_used() -> None:
+    settings = ResolutionSettings(llm_forced_global_model="minimax/MiniMax-M3")
+
+    assert required_provider_slugs(settings) == {"minimax"}
+    with pytest.raises(ModelResolutionError, match="ATAGIA_MINIMAX_API_KEY"):
+        validate_required_provider_keys(settings)
+
+    validate_required_provider_keys(
+        ResolutionSettings(
+            llm_forced_global_model="minimax/MiniMax-M3",
+            minimax_api_key="minimax-key",
+        )
+    )
+
+
+def test_direct_kimi_provider_key_is_required_when_used() -> None:
+    settings = ResolutionSettings(llm_forced_global_model="kimi/kimi-k2.7-code")
+
+    assert required_provider_slugs(settings) == {"kimi"}
+    with pytest.raises(ModelResolutionError, match="ATAGIA_KIMI_API_KEY"):
+        validate_required_provider_keys(settings)
+
+    validate_required_provider_keys(
+        ResolutionSettings(
+            llm_forced_global_model="kimi/kimi-k2.7-code",
+            kimi_api_key="kimi-key",
+        )
+    )
+
+
 def test_provider_qualified_model_maps_legacy_cli_aliases() -> None:
     assert provider_qualified_model("gemini", "gemini-3-flash-preview") == (
         "google/gemini-3-flash-preview"
@@ -318,3 +440,5 @@ def test_provider_qualified_model_maps_legacy_cli_aliases() -> None:
     assert provider_qualified_model("openai", "openai/gpt-5-mini,high") == (
         "openai/gpt-5-mini,high"
     )
+    assert provider_qualified_model("minimax", "MiniMax-M3") == "minimax/MiniMax-M3"
+    assert provider_qualified_model("kimi", "kimi-k2.7-code") == "kimi/kimi-k2.7-code"

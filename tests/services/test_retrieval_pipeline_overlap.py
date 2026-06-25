@@ -68,7 +68,16 @@ class _TimedLLMProvider(PipelineProvider):
         self.timed_end: float | None = None
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        if str(request.metadata.get("purpose")) == self._timed_purpose:
+        purpose = str(request.metadata.get("purpose"))
+        timed_match = purpose == self._timed_purpose or (
+            self._timed_purpose == "need_detection"
+            and purpose.startswith("need_detection_")
+            and purpose.endswith("_card")
+        ) or (
+            self._timed_purpose == "applicability_scoring"
+            and purpose == "applicability_relevance_card"
+        )
+        if timed_match:
             self.timed_start = asyncio.get_event_loop().time()
             await asyncio.sleep(_LLM_SLEEP_S)
             response = await super().complete(request)

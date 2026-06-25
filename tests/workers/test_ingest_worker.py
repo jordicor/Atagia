@@ -17,6 +17,7 @@ from atagia.core.communication_profile_repository import CommunicationProfileRep
 from atagia.core.config import Settings
 from atagia.core.contract_repository import ContractDimensionRepository
 from atagia.core.db_sqlite import initialize_database
+from atagia.core.job_run_repository import JobRunRepository
 from atagia.core.locking import acquire_belief_lock
 from atagia.core.repositories import (
     ConversationRepository,
@@ -39,6 +40,7 @@ from atagia.models.schemas_jobs import (
     JobType,
     MessageJobPayload,
     REVISE_STREAM_NAME,
+    RevisionJobPayload,
     WorkerControlMode,
     WORKER_GROUP_NAME,
 )
@@ -62,14 +64,51 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
     StructuredOutputError,
+    TransientLLMError,
 )
 from atagia.services.worker_control_service import WorkerControlService
 from atagia.workers.contract_worker import ContractWorker
 from atagia.workers.ingest_worker import IngestWorker
-from tests.extraction_payload_support import rich_extraction_json_to_lean
+from tests.extraction_payload_support import (
+    is_memory_extraction_card_purpose,
+    memory_extraction_card_output_from_payload,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+
+
+def _is_need_detection_card_purpose(purpose: object) -> bool:
+    value = str(purpose)
+    return value.startswith("need_detection_") and value.endswith("_card")
+
+
+_LANGUAGE_PROFILE_CARD_PURPOSES = {
+    "user_language_profile_observed_card",
+    "user_language_profile_preference_card",
+    "user_language_profile_ability_card",
+    "user_language_profile_norm_card",
+}
+
+_EMPTY_LANGUAGE_PROFILE_CARD_OUTPUTS = {
+    "user_language_profile_observed_card": "none",
+    "user_language_profile_preference_card": "none",
+    "user_language_profile_ability_card": "none",
+    "user_language_profile_norm_card": "none",
+}
+
+_MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES = {
+    "memory_extraction_kind_scope_card",
+    "memory_extraction_evidence_card",
+    "memory_extraction_index_card",
+    "memory_extraction_temporal_card",
+    "memory_extraction_belief_card",
+    "memory_extraction_coverage_members_card",
+}
+
+
+def _is_language_profile_card_purpose(purpose: object) -> bool:
+    return str(purpose) in _LANGUAGE_PROFILE_CARD_PURPOSES
 
 
 class QueueProvider(LLMProvider):
@@ -78,65 +117,36 @@ class QueueProvider(LLMProvider):
     def __init__(self, outputs: list[str]) -> None:
         self.outputs = list(outputs)
         self.requests: list[LLMCompletionRequest] = []
+        self._active_language_profile_outputs: dict[str, str] | None = None
+        self._active_language_profile_consumed: set[str] = set()
+        self._active_extraction_payload: str | None = None
+        self._active_extraction_consumed: set[str] = set()
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
+        if _is_need_detection_card_purpose(request.metadata.get("purpose")):
+            outputs = {
+                "need_detection_needs_card": "none",
+                "need_detection_language_card": "en\nen",
+                "need_detection_memory_card": "mixed",
+                "need_detection_exact_card": "no",
+                "need_detection_shape_card": "default",
+                "need_detection_facets_card": "none",
+                "need_detection_callback_card": "no",
+                "need_detection_search_words_card": "retry loop",
+                "need_detection_search_words_other_language_card": "none",
+            }
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=outputs[str(request.metadata.get("purpose"))],
+            )
         if request.metadata.get("purpose") == "retrieval_surface_generation_dry_run":
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
                     {"surfaces": self._retrieval_surface_payloads(request)}
-                ),
-            )
-        if request.metadata.get("purpose") == "need_detection":
-            if not self.outputs:
-                raise AssertionError("No queued output left for this test")
-            output_text = self.outputs.pop(0)
-            payload = json.loads(output_text)
-            if isinstance(payload, list):
-                output_text = json.dumps(
-                    {
-                        "needs": payload,
-                        "temporal_range": None,
-                        "sub_queries": ["retry loop"],
-                        "sparse_query_hints": [
-                            {
-                                "sub_query_text": "retry loop",
-                                "fts_phrase": "retry loop",
-                            }
-                        ],
-                        "query_type": "default",
-                        "retrieval_levels": [0],
-                    }
-                )
-            return LLMCompletionResponse(
-                provider=self.name,
-                model=request.model,
-                output_text=output_text,
-            )
-        if request.metadata.get("purpose") == "need_detection_unknown_only_contract_review":
-            return LLMCompletionResponse(
-                provider=self.name,
-                model=request.model,
-                output_text=json.dumps(
-                    {
-                        "is_exact_value_lookup": False,
-                        "exact_facets": [],
-                        "must_keep_terms": [],
-                        "quoted_phrases": [],
-                    }
-                ),
-            )
-        if request.metadata.get("purpose") == "need_detection_multi_facet_exact_review":
-            return LLMCompletionResponse(
-                provider=self.name,
-                model=request.model,
-                output_text=json.dumps(
-                    {
-                        "has_multiple_obligations": False,
-                        "sub_queries": [],
-                    }
                 ),
             )
         if request.metadata.get("purpose") == "intent_classifier_explicit":
@@ -156,20 +166,11 @@ class QueueProvider(LLMProvider):
                 model=request.model,
                 output_text=json.dumps({"equivalent": True}),
             )
-        if request.metadata.get("purpose") == "consequence_detection":
+        if request.metadata.get("purpose") == "consequence_gate_card":
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "is_consequence": False,
-                        "action_description": "",
-                        "outcome_description": "",
-                        "outcome_sentiment": "neutral",
-                        "confidence": 0.0,
-                        "likely_action_message_id": None,
-                    }
-                ),
+                output_text="no",
             )
         if request.metadata.get("purpose") == "consequence_tendency_inference":
             return LLMCompletionResponse(
@@ -177,10 +178,74 @@ class QueueProvider(LLMProvider):
                 model=request.model,
                 output_text=json.dumps({"tendency_text": ""}),
             )
-        if request.metadata.get("purpose") == "user_language_profile_update":
-            output_text = _empty_user_language_profile_update_json()
-            if self.outputs and _is_user_language_profile_update_json(self.outputs[0]):
-                output_text = self.outputs.pop(0)
+        if request.metadata.get("purpose") == "chat_reply":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="Check the retry guard first.",
+            )
+        if _is_language_profile_card_purpose(request.metadata.get("purpose")):
+            purpose = str(request.metadata.get("purpose"))
+            if self._active_language_profile_outputs is None:
+                output_bundle = _EMPTY_LANGUAGE_PROFILE_CARD_OUTPUTS
+                if self.outputs and _is_user_language_profile_card_output_bundle(
+                    self.outputs[0]
+                ):
+                    output_bundle = {
+                        **_EMPTY_LANGUAGE_PROFILE_CARD_OUTPUTS,
+                        **json.loads(self.outputs.pop(0)),
+                    }
+                self._active_language_profile_outputs = output_bundle
+                self._active_language_profile_consumed = set()
+            output_text = self._active_language_profile_outputs[purpose]
+            self._active_language_profile_consumed.add(purpose)
+            if (
+                self._active_language_profile_consumed
+                == _LANGUAGE_PROFILE_CARD_PURPOSES
+            ):
+                self._active_language_profile_outputs = None
+                self._active_language_profile_consumed = set()
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=output_text,
+            )
+        if is_memory_extraction_card_purpose(request.metadata.get("purpose")):
+            purpose = str(request.metadata.get("purpose"))
+            if purpose == "memory_extraction_candidate_card":
+                if not self.outputs:
+                    raise AssertionError("No queued output left for this test")
+                if self.outputs[0] == "__llm_error__":
+                    raise LLMError("provider failed")
+                if self.outputs[0] == "__transient_provider_unavailable__":
+                    raise TransientLLMError(
+                        "provider unavailable",
+                        retry_after_seconds=120.0,
+                    )
+                self._active_extraction_payload = self.outputs.pop(0)
+                self._active_extraction_consumed = set()
+                output_text = memory_extraction_card_output_from_payload(
+                    self._active_extraction_payload,
+                    purpose,
+                )
+                if output_text == "none" or "|" not in output_text:
+                    self._active_extraction_payload = None
+                return LLMCompletionResponse(
+                    provider=self.name,
+                    model=request.model,
+                    output_text=output_text,
+                )
+            output_text = memory_extraction_card_output_from_payload(
+                self._active_extraction_payload or {"candidates": []},
+                purpose,
+            )
+            self._active_extraction_consumed.add(purpose)
+            if (
+                self._active_extraction_consumed
+                == _MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES
+            ):
+                self._active_extraction_payload = None
+                self._active_extraction_consumed = set()
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
@@ -188,9 +253,14 @@ class QueueProvider(LLMProvider):
             )
         if not self.outputs:
             raise AssertionError("No queued output left for this test")
+        if self.outputs[0] == "__llm_error__":
+            raise LLMError("provider failed")
+        if self.outputs[0] == "__transient_provider_unavailable__":
+            raise TransientLLMError(
+                "provider unavailable",
+                retry_after_seconds=120.0,
+            )
         output_text = self.outputs.pop(0)
-        if request.metadata.get("purpose") == "memory_extraction":
-            output_text = rich_extraction_json_to_lean(output_text)
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
@@ -285,33 +355,14 @@ def _persisted_surface_plan(
     )
 
 
-def _empty_user_language_profile_update_json() -> str:
-    return json.dumps(
-        {
-            "observed_user_languages": [],
-            "explicit_language_preferences": [],
-            "explicit_language_abilities": [],
-            "contextual_norms": [],
-            "external_content_language_codes": [],
-        }
-    )
-
-
-def _is_user_language_profile_update_json(output_text: str) -> bool:
+def _is_user_language_profile_card_output_bundle(output_text: str) -> bool:
     try:
         payload = json.loads(output_text)
     except json.JSONDecodeError:
         return False
     if not isinstance(payload, dict):
         return False
-    language_profile_fields = {
-        "observed_user_languages",
-        "explicit_language_preferences",
-        "explicit_language_abilities",
-        "contextual_norms",
-        "external_content_language_codes",
-    }
-    return bool(language_profile_fields & set(payload))
+    return bool(_LANGUAGE_PROFILE_CARD_PURPOSES & set(payload))
 
 
 def _public_extraction_payload() -> str:
@@ -559,7 +610,7 @@ async def test_ingest_worker_retrieval_packet_constructor_wiring(
         _clock,
         _backend,
         _provider,
-        _memories,
+        memories,
         ingest_worker,
         _contract_worker,
         _message,
@@ -633,20 +684,12 @@ async def test_ingest_worker_retrieval_packet_flags_control_calls_and_writes(
 async def test_ingest_worker_updates_user_language_profile_after_ingest() -> None:
     language_profile_update = json.dumps(
         {
-            "observed_user_languages": [
-                {"language_code": "es", "confidence": 0.9}
-            ],
-            "explicit_language_preferences": [
-                {
-                    "language_code": "es",
-                    "preference_kind": "default_answer_language",
-                    "context_label": "ordinary_chat",
-                    "confidence": 0.93,
-                }
-            ],
-            "explicit_language_abilities": [],
-            "contextual_norms": [],
-            "external_content_language_codes": [],
+            "user_language_profile_observed_card": "es",
+            "user_language_profile_preference_card": (
+                "default_answer_language es ordinary_chat"
+            ),
+            "user_language_profile_ability_card": "none",
+            "user_language_profile_norm_card": "none",
         }
     )
     (
@@ -678,7 +721,7 @@ async def test_ingest_worker_updates_user_language_profile_after_ingest() -> Non
         assert [row.language_code for row in profile.observed_user_languages] == ["es"]
         assert profile.explicit_language_preferences[0].preference_kind == "default_answer_language"
         assert any(
-            request.metadata.get("purpose") == "user_language_profile_update"
+            request.metadata.get("purpose") in _LANGUAGE_PROFILE_CARD_PURPOSES
             for request in provider.requests
         )
     finally:
@@ -880,7 +923,10 @@ async def test_ingest_worker_processes_stream_job_and_acks() -> None:
         [payload]
     )
     try:
-        await backend.stream_add(EXTRACT_STREAM_NAME, _extract_job(str(message["id"])).model_dump(mode="json"))
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"])).model_dump(mode="json"),
+        )
 
         result = await ingest_worker.run_once()
         pending = backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)]
@@ -899,10 +945,16 @@ async def test_ingest_worker_processes_stream_job_and_acks() -> None:
 @pytest.mark.asyncio
 async def test_ingest_worker_does_not_ack_failed_job() -> None:
     connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
-        ["not-json"]
+        ["__llm_error__"]
     )
     try:
-        await backend.stream_add(EXTRACT_STREAM_NAME, _extract_job(str(message["id"])).model_dump(mode="json"))
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(
+                str(message["id"]),
+                message_text="I am on vacation this week.",
+            ).model_dump(mode="json"),
+        )
 
         result = await ingest_worker.run_once()
         pending = backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)]
@@ -916,28 +968,209 @@ async def test_ingest_worker_does_not_ack_failed_job() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_succeeds_when_extraction_retry_recovers_invalid_output() -> None:
-    payload = json.dumps(
-        {
-            "evidences": [
-                {
-                    "canonical_text": "I prefer concise debugging answers for retry issues",
-                    "scope": "assistant_mode",
-                    "confidence": 0.92,
-                    "source_kind": "extracted",
-                    "privacy_level": 1,
-                    "payload": {"kind": "preference"},
-                }
-            ],
-            "beliefs": [],
-            "contract_signals": [],
-            "state_updates": [],
-            "mode_guess": None,
-            "nothing_durable": False,
-        }
+async def test_ingest_worker_defers_transient_provider_failures_without_dead_lettering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("atagia.services.llm_client.asyncio.sleep", fake_sleep)
+    (
+        connection,
+        clock,
+        backend,
+        _provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
+        ["__transient_provider_unavailable__"],
+        settings=_settings(
+            worker_transient_defer_seconds=60.0,
+            worker_transient_defer_max_seconds=90.0,
+        ),
     )
+    try:
+        job = _extract_job(str(message["id"]))
+        await JobRunRepository(connection, clock).create_queued_job(
+            job_id=job.job_id,
+            stream_name=EXTRACT_STREAM_NAME,
+            job_type=JobType.EXTRACT_MEMORY_CANDIDATES.value,
+            user_id=job.user_id,
+            conversation_id=job.conversation_id,
+            source_message_ids=job.message_ids,
+            source_token_estimate=12,
+            size_bucket="small",
+        )
+        await backend.stream_add(EXTRACT_STREAM_NAME, job.model_dump(mode="json"))
+
+        result = await ingest_worker.run_once()
+        deferred_job = await JobRunRepository(connection, clock).get_job(job.job_id)
+        immediate = await backend.stream_read(
+            EXTRACT_STREAM_NAME,
+            WORKER_GROUP_NAME,
+            "probe",
+            count=1,
+            block_ms=0,
+        )
+
+        assert result.deferred == 1
+        assert result.failed == 0
+        assert result.dead_lettered == 0
+        assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
+        assert len(backend._stream_deferred[EXTRACT_STREAM_NAME]) == 1
+        assert immediate == []
+        assert await memories.list_for_user("usr_1") == []
+        assert deferred_job is not None
+        assert deferred_job["status"] == "retrying"
+        assert deferred_job["attempt_count"] == 1
+        assert deferred_job["deferred_until"] == "2026-03-31T04:01:30+00:00"
+        assert deferred_job["transient_defer_count"] == 1
+        assert deferred_job["first_deferred_at"] == "2026-03-31T04:00:00+00:00"
+        assert deferred_job["last_deferred_at"] == "2026-03-31T04:00:00+00:00"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_worker_dead_letters_after_transient_defer_budget_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("atagia.services.llm_client.asyncio.sleep", fake_sleep)
+    (
+        connection,
+        clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
+        ["__transient_provider_unavailable__"],
+        settings=_settings(
+            worker_transient_defer_seconds=60.0,
+            worker_transient_defer_max_seconds=90.0,
+            worker_transient_defer_max_count=2,
+            worker_transient_defer_max_age_seconds=3600.0,
+        ),
+    )
+    try:
+        job = _extract_job(str(message["id"]))
+        repository = JobRunRepository(connection, clock)
+        await repository.create_queued_job(
+            job_id=job.job_id,
+            stream_name=EXTRACT_STREAM_NAME,
+            job_type=JobType.EXTRACT_MEMORY_CANDIDATES.value,
+            user_id=job.user_id,
+            conversation_id=job.conversation_id,
+            source_message_ids=job.message_ids,
+            source_token_estimate=12,
+            size_bucket="small",
+        )
+        await backend.stream_add(EXTRACT_STREAM_NAME, job.model_dump(mode="json"))
+
+        first = await ingest_worker.run_once()
+        backend._stream_deferred[EXTRACT_STREAM_NAME][0]["due_at"] = 0.0
+        second = await ingest_worker.run_once()
+        backend._stream_deferred[EXTRACT_STREAM_NAME][0]["due_at"] = 0.0
+        third = await ingest_worker.run_once()
+        dead_letter = await backend.dequeue_job(
+            f"dead_letter:{EXTRACT_STREAM_NAME}",
+            timeout_seconds=0,
+        )
+        stored_job = await repository.get_job(job.job_id)
+
+        assert first.deferred == 1
+        assert second.deferred == 1
+        assert third.deferred == 0
+        assert third.failed == 1
+        assert third.dead_lettered == 1
+        assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
+        assert backend._stream_deferred.get(EXTRACT_STREAM_NAME) is None
+        assert dead_letter is not None
+        assert dead_letter["delivery_count"] == 1
+        assert "transient defer budget exhausted" in dead_letter["error"]
+        assert stored_job is not None
+        assert stored_job["status"] == "dead_lettered"
+        assert stored_job["transient_defer_count"] == 3
+        assert stored_job["deferred_until"] is None
+        assert stored_job["error_class"] == "TransientDeferBudgetExceededError"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_worker_dead_letters_after_transient_defer_age_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("atagia.services.llm_client.asyncio.sleep", fake_sleep)
+    (
+        connection,
+        clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
+        ["__transient_provider_unavailable__"],
+        settings=_settings(
+            worker_transient_defer_seconds=60.0,
+            worker_transient_defer_max_seconds=90.0,
+            worker_transient_defer_max_count=99,
+            worker_transient_defer_max_age_seconds=30.0,
+        ),
+    )
+    try:
+        job = _extract_job(str(message["id"]))
+        repository = JobRunRepository(connection, clock)
+        await repository.create_queued_job(
+            job_id=job.job_id,
+            stream_name=EXTRACT_STREAM_NAME,
+            job_type=JobType.EXTRACT_MEMORY_CANDIDATES.value,
+            user_id=job.user_id,
+            conversation_id=job.conversation_id,
+            source_message_ids=job.message_ids,
+            source_token_estimate=12,
+            size_bucket="small",
+        )
+        await backend.stream_add(EXTRACT_STREAM_NAME, job.model_dump(mode="json"))
+
+        first = await ingest_worker.run_once()
+        clock.advance(seconds=31)
+        backend._stream_deferred[EXTRACT_STREAM_NAME][0]["due_at"] = 0.0
+        second = await ingest_worker.run_once()
+        dead_letter = await backend.dequeue_job(
+            f"dead_letter:{EXTRACT_STREAM_NAME}",
+            timeout_seconds=0,
+        )
+        stored_job = await repository.get_job(job.job_id)
+
+        assert first.deferred == 1
+        assert second.failed == 1
+        assert second.dead_lettered == 1
+        assert dead_letter is not None
+        assert "transient defer budget exhausted" in dead_letter["error"]
+        assert stored_job is not None
+        assert stored_job["transient_defer_count"] == 2
+        assert stored_job["status"] == "dead_lettered"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_worker_tolerates_malformed_card_output_as_no_durable_memory() -> None:
     connection, _clock, backend, _provider, memories, ingest_worker, _contract_worker, message = await _build_runtime(
-        ["not-json", payload]
+        ["not-json"]
     )
     try:
         await backend.stream_add(EXTRACT_STREAM_NAME, _extract_job(str(message["id"])).model_dump(mode="json"))
@@ -949,7 +1182,7 @@ async def test_ingest_worker_succeeds_when_extraction_retry_recovers_invalid_out
         assert result.failed == 0
         assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
         stored = await memories.list_for_user("usr_1")
-        assert len(stored) == 1
+        assert stored == []
     finally:
         await connection.close()
 
@@ -957,7 +1190,7 @@ async def test_ingest_worker_succeeds_when_extraction_retry_recovers_invalid_out
 @pytest.mark.asyncio
 async def test_ingest_worker_dead_letters_after_max_failed_deliveries() -> None:
     connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
-        ["not-json", "not-json", "not-json"]
+        ["__llm_error__"]
     )
     try:
         await backend.stream_add(EXTRACT_STREAM_NAME, _extract_job(str(message["id"])).model_dump(mode="json"))
@@ -979,7 +1212,7 @@ async def test_ingest_worker_dead_letters_after_max_failed_deliveries() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_dead_letter_includes_structured_error_details_after_retry_budget_exhaustion() -> None:
+async def test_ingest_worker_card_assembly_drops_invalid_temporal_bounds() -> None:
     invalid_payload = json.dumps(
         {
             "evidences": [],
@@ -1003,28 +1236,29 @@ async def test_ingest_worker_dead_letter_includes_structured_error_details_after
             "nothing_durable": False,
         }
     )
-    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
-        [invalid_payload] * 9,
-        structured_output_retry_attempts=0,
+    connection, _clock, backend, _provider, memories, ingest_worker, _contract_worker, message = await _build_runtime(
+        [invalid_payload],
     )
     try:
-        await backend.stream_add(EXTRACT_STREAM_NAME, _extract_job(str(message["id"])).model_dump(mode="json"))
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(
+                str(message["id"]),
+                message_text="I am on vacation this week.",
+            ).model_dump(mode="json"),
+        )
 
-        first = await ingest_worker.run_once()
-        second = await ingest_worker.run_once()
-        third = await ingest_worker.run_once()
+        result = await ingest_worker.run_once()
         dead_letter = await backend.dequeue_job(f"dead_letter:{EXTRACT_STREAM_NAME}", timeout_seconds=0)
+        stored = await memories.list_for_user("usr_1")
 
-        assert first.failed == 1
-        assert second.failed == 1
-        assert third.failed == 1
-        assert third.dead_lettered == 1
+        assert result.acked == 1
+        assert result.failed == 0
+        assert result.dead_lettered == 0
         assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
-        assert dead_letter is not None
-        assert dead_letter["error"] == "Provider returned invalid structured output"
-        assert dead_letter["error_details"] == [
-            "$.candidates[0].temporal_status: Value error, valid_from_iso must be <= valid_to_iso"
-        ]
+        assert dead_letter is None
+        assert len(stored) == 1
+        assert stored[0]["temporal_type"] == "unknown"
     finally:
         await connection.close()
 
@@ -1316,6 +1550,79 @@ async def test_ingest_skips_revision_when_disabled() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing_belief_id", "expected_validated", "expected_belief_id"),
+    [
+        ("mem_existing_match", True, "mem_existing_match"),
+        (None, False, ""),
+    ],
+)
+async def test_ingest_marks_belief_revision_claim_key_validated_by_match(
+    existing_belief_id: str | None,
+    expected_validated: bool,
+    expected_belief_id: str,
+) -> None:
+    """Producer-side: the belief-branch revision job must carry
+    ``claim_key_already_validated=bool(existing_belief_id)`` so the consumer
+    can skip the re-validation it has already implicitly performed."""
+    persisted = [
+        {
+            "id": "mem_belief_1",
+            "object_type": MemoryObjectType.BELIEF.value,
+            "scope": "assistant_mode",
+            "payload_json": {
+                "claim_key": "response_style.debugging",
+                "claim_value": "concise_actionable",
+            },
+        }
+    ]
+
+    async def fake_extract(*args, **kwargs):
+        del args, kwargs
+        return ExtractionPersistenceDetails(
+            result=ExtractionResult(nothing_durable=False),
+            persisted=persisted,
+            chunk_plan=_test_chunk_plan(),
+        )
+
+    async def skip_side_effects(*args, **kwargs) -> None:
+        del args, kwargs
+
+    async def fake_find_existing_belief_id(*args, **kwargs) -> str | None:
+        del args, kwargs
+        return existing_belief_id
+
+    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+        [],
+    )
+    try:
+        ingest_worker._extractor.extract_with_persistence_and_chunk_plan = fake_extract
+        ingest_worker._process_consequence_detection = skip_side_effects
+        ingest_worker._maybe_enqueue_conversation_compaction = skip_side_effects
+        ingest_worker._find_existing_belief_id = fake_find_existing_belief_id
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"])).model_dump(mode="json"),
+        )
+
+        result = await ingest_worker.run_once()
+        revision_job = await backend.dequeue_job(
+            f"stream:{REVISE_STREAM_NAME}",
+            timeout_seconds=0,
+        )
+
+        assert result.acked == 1
+        assert revision_job is not None
+
+        payload = RevisionJobPayload.model_validate(revision_job["payload"]["payload"])
+        assert payload.claim_key == "response_style.debugging"
+        assert payload.claim_key_already_validated is expected_validated
+        assert payload.belief_id == expected_belief_id
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_ingest_treats_non_json_after_schema_fallback_as_noop(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1324,6 +1631,7 @@ async def test_ingest_treats_non_json_after_schema_fallback_as_noop(
         raise StructuredOutputError(
             "Provider returned non-JSON structured output after schema fallback",
             details=("$: Response was not valid JSON.",),
+            reason="schema_fallback_non_json",
         )
 
     async def skip_side_effects(*args, **kwargs) -> None:
@@ -1702,8 +2010,6 @@ def test_chat_reply_enqueues_stream_jobs_and_worker_processes_extraction(tmp_pat
     )
     provider = QueueProvider(
         [
-            json.dumps([]),
-            "Check the retry guard first.",
             json.dumps(
                 {
                     "evidences": [

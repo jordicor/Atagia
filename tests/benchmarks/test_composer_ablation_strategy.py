@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from benchmarks.atagia_bench.__main__ import (
     _benchmark_ablation as build_atagia_bench_ablation,
+    _build_parser as build_atagia_bench_parser,
     _parse_ablation as parse_atagia_bench_ablation,
 )
 from benchmarks.atagia_bench.adapter import AtagiaBenchDataset
@@ -77,6 +78,19 @@ def test_atagia_bench_privacy_enforcement_defaults_to_off() -> None:
     assert ablation == AblationConfig(privacy_enforcement="off")
 
 
+def test_atagia_bench_llm_call_delay_flag_parses() -> None:
+    args = build_atagia_bench_parser().parse_args(
+        [
+            "--provider",
+            "minimax",
+            "--llm-call-delay-ms",
+            "1000",
+        ]
+    )
+
+    assert args.llm_call_delay_ms == 1000
+
+
 def test_locomo_privacy_enforcement_defaults_to_off() -> None:
     ablation = build_locomo_ablation(None, None)
 
@@ -89,6 +103,7 @@ def test_atagia_bench_report_config_records_composer_strategy_ablation() -> None
         llm_api_key="test-openai-key",
         llm_model="answer-model",
         judge_model="judge-model",
+        llm_call_delay_ms=250,
     )
 
     report = runner._build_report(
@@ -106,3 +121,4 @@ def test_atagia_bench_report_config_records_composer_strategy_ablation() -> None
     )
 
     assert report.config["ablation_config"]["composer_strategy"] == "budgeted_marginal"
+    assert report.config["llm_call_delay_ms"] == 250

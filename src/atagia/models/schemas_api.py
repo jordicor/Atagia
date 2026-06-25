@@ -318,6 +318,10 @@ class ChatReplyRequest(BaseModel):
     # Per-turn latency/quality override. ``None`` falls back to the global
     # ``response_mode`` setting (default ``normal``).
     response_mode: ResponseMode | None = None
+    # Per-turn adaptive retrieval gate override, orthogonal to ``response_mode``.
+    # ``None`` falls back to the global ``adaptive_retrieval`` setting
+    # (default OFF).
+    adaptive_retrieval: bool | None = None
 
     @field_validator("message_occurred_at")
     @classmethod
@@ -462,6 +466,10 @@ class SidecarContextRequest(BaseModel):
     # Per-turn latency/quality override. ``None`` falls back to the global
     # ``response_mode`` setting (default ``normal``).
     response_mode: ResponseMode | None = None
+    # Per-turn adaptive retrieval gate override, orthogonal to ``response_mode``.
+    # ``None`` falls back to the global ``adaptive_retrieval`` setting
+    # (default OFF).
+    adaptive_retrieval: bool | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -973,6 +981,9 @@ class ContextResult(BaseModel):
     cache_source: Literal["sync", "cache_hit"] | None = None
     need_detection_skipped: bool = False
     response_mode: Literal["normal", "fast", "smart_fast"] = "normal"
+    # Echoes the resolved adaptive retrieval gate flag for this turn (request
+    # override else global default). A documented no-op in fast/smart_fast.
+    adaptive_retrieval: bool = False
     memory_processing: MemoryProcessingStatus | None = None
 
 
@@ -1504,6 +1515,16 @@ class AdminMetricsComputeRequest(BaseModel):
 
 class AdminEmbeddingBackfillRequest(BaseModel):
     """Request payload for admin-triggered embedding backfill."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_size: int = Field(default=100, ge=1)
+    delay_ms: int = Field(default=0, ge=0)
+    user_id: str | None = None
+
+
+class AdminCoverageMembersBackfillRequest(BaseModel):
+    """Request payload for admin-triggered coverage-members backfill."""
 
     model_config = ConfigDict(extra="forbid")
 

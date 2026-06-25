@@ -3078,7 +3078,13 @@ def test_fact_facets_and_base_preserve_values_with_shared_quote_once() -> None:
                 final_score=0.96,
                 canonical_text="Caroline said she lived in Paris and Rome.",
                 object_type="evidence",
-                payload_json={"source_message_ids": ["msg_combo"]},
+                payload_json={
+                    "source_message_ids": ["msg_combo"],
+                    "coverage_members": [
+                        {"member_key": "paris", "display_text": "Paris"},
+                        {"member_key": "rome", "display_text": "Rome"},
+                    ],
+                },
                 evidence_packets=[shared_packet],
             ),
             _candidate(
@@ -4308,3 +4314,778 @@ def test_fact_facet_span_coadmission_renders_source_span_as_primary_context() ->
         "fact_facet_pointer: usr_1 / rate_limit: 100 requests per minute"
         in context.memory_block
     )
+
+
+def _oversized_window(memory_id: str, source_msg: str, *, final_score: float):
+    # Verbatim conversation window: many times the token cost of a tiny direct
+    # fact, but low score. Sized so a single window admitted ahead of the facts
+    # consumes enough of the budget to evict a gold fact (the ben-q09 symptom).
+    filler = "unrelated logistics scheduling travel weather chitchat " * 8
+    return _candidate(
+        memory_id,
+        final_score=final_score,
+        canonical_text=filler,
+        object_type="evidence",
+        payload_json={
+            "source_kind_variant": "conversation_window",
+            "source_message_ids": [source_msg],
+        },
+    )
+
+
+def test_evidence_obligation_window_gate_preserves_tiny_direct_facts() -> None:
+    # ben-q09 shape: two tiny high-score source-message-backed direct facts must
+    # survive even though several oversized low-score verbatim windows are present.
+    # Without the absolute-score gate the windows are reserved first and exhaust
+    # the budget, evicting the gold facts.
+    composer = _composer()
+    context = composer.compose(
+        scored_candidates=[
+            _candidate(
+                "mem_manager",
+                final_score=0.98,
+                canonical_text="Caroline's manager is Diane.",
+                object_type="evidence",
+                payload_json={"source_message_ids": ["msg_manager"]},
+            ),
+            _candidate(
+                "mem_role",
+                final_score=0.98,
+                canonical_text="Caroline works as a data analyst.",
+                object_type="evidence",
+                payload_json={"source_message_ids": ["msg_role"]},
+            ),
+            _oversized_window("vew_window_a", "msg_w_a", final_score=0.29),
+            _oversized_window("vew_window_b", "msg_w_b", final_score=0.28),
+            _oversized_window("vew_window_c", "msg_w_c", final_score=0.27),
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=_policy_with_final_context_items(200, 8),
+        conversation_messages=[],
+        query_text="Who is Caroline's manager?",
+        query_type="slot_fill",
+        answer_shape="single_fact",
+        coverage_mode="current_state",
+        source_precision="required",
+        enable_evidence_obligation_coverage=True,
+        fact_facet_span_coadmission_enabled=True,
+    )
+
+    assert "mem_manager" in context.selected_memory_ids
+    assert "mem_role" in context.selected_memory_ids
+    assert "vew_window_a" not in context.selected_memory_ids
+    assert "vew_window_b" not in context.selected_memory_ids
+    assert "vew_window_c" not in context.selected_memory_ids
+
+
+def test_evidence_obligation_window_gate_inert_without_direct_evidence() -> None:
+    # Temporal query (an EVIDENCE_OBLIGATION_QUERY_TYPE) with no source-grounded
+    # direct evidence in the pool: the absolute-score gate must degrade gracefully
+    # and the near-tie windows still qualify exactly as before.
+    reserved = ContextComposer._evidence_obligation_candidates(
+        [
+            _candidate(
+                "vew_conv_10_12",
+                final_score=0.90,
+                canonical_text="[user] The appointment was moved to Tuesday.",
+                object_type="evidence",
+                payload_json={
+                    "source_kind_variant": "conversation_window",
+                    "source_message_ids": ["msg_10", "msg_11", "msg_12"],
+                },
+            ),
+            # A weak distractor with no source ids -> grounding 0.0 -> not
+            # "direct evidence", so the gate stays inert.
+            _candidate(
+                "mem_distractor",
+                final_score=0.30,
+                canonical_text="A compact but unrelated scheduling preference.",
+            ),
+            _candidate(
+                "vew_conv_20_22",
+                final_score=0.84,
+                canonical_text="[assistant] Later they confirmed Tuesday morning.",
+                object_type="evidence",
+                payload_json={
+                    "source_kind_variant": "conversation_window",
+                    "source_message_ids": ["msg_20", "msg_21", "msg_22"],
+                },
+            ),
+        ],
+        max_items=8,
+        query_type="temporal",
+        answer_shape="temporal",
+        coverage_mode="current_state",
+        source_precision="preferred",
+        exact_recall_mode=False,
+        source_messages_by_id={},
+    )
+
+    reserved_ids = [candidate.memory_id for candidate in reserved]
+    # Window-vs-window near-tie: 0.84 >= 0.90 * 0.92 = 0.828, so both windows qualify.
+    assert "vew_conv_10_12" in reserved_ids
+    assert "vew_conv_20_22" in reserved_ids
+
+
+def test_source_coverage_ranking_prefers_structured_value_then_score() -> None:
+    # Guards the higher sort keys (A2 only swapped the 4th/5th): a structured-value
+    # fact must outrank a non-structured source-backed candidate even when the
+    # latter has a higher final_score and higher grounding.
+    structured = _candidate(
+        "mem_structured",
+        final_score=0.50,
+        canonical_text="Caroline lived in Rome.",
+        object_type="evidence",
+        payload_json={
+            "source_message_ids": ["msg_rome"],
+            "value_norm_key": "rome",
+            "value_text": "Rome",
+        },
+    )
+    # Higher score and higher grounding (conversation_window -> 1.0), but no
+    # structured value -> must rank after the structured-value fact.
+    ungrounded_window = _candidate(
+        "vew_window",
+        final_score=0.99,
+        canonical_text="Caroline talked at length about many cities once.",
+        object_type="evidence",
+        payload_json={
+            "source_kind_variant": "conversation_window",
+            "source_message_ids": ["msg_window"],
+        },
+    )
+
+    ranked = ContextComposer._rank_source_coverage_candidates(
+        [ungrounded_window, structured],
+        source_messages_by_id={},
+        query_type="broad_list",
+        answer_shape="list",
+    )
+
+    assert ranked[0].memory_id == "mem_structured"
+
+
+def test_source_coverage_ranking_score_beats_grounding_tiebreak() -> None:
+    # A2: with structured-value and source-backed tied, -final_score now precedes
+    # -grounding, so the higher-score lower-grounding fact ranks first.
+    high_score_low_grounding = _candidate(
+        "mem_high_score",
+        final_score=0.98,
+        canonical_text="Caroline's manager is Diane.",
+        object_type="evidence",
+        payload_json={"source_message_ids": ["msg_manager"]},  # grounding 0.85
+    )
+    low_score_high_grounding = _candidate(
+        "vew_window",
+        final_score=0.29,
+        canonical_text="A long unrelated conversation window.",
+        object_type="evidence",
+        payload_json={
+            "source_kind_variant": "conversation_window",  # grounding 1.0
+            "source_message_ids": ["msg_window"],
+        },
+    )
+
+    ranked = ContextComposer._rank_source_coverage_candidates(
+        [low_score_high_grounding, high_score_low_grounding],
+        source_messages_by_id={},
+        query_type="slot_fill",
+        answer_shape="single_fact",
+    )
+
+    assert ranked[0].memory_id == "mem_high_score"
+
+
+# ---------------------------------------------------------------------------
+# Phase B: exhaustive_known_set coverage-member selection and metadata.
+# ---------------------------------------------------------------------------
+
+
+def _member_candidate(
+    memory_id: str,
+    *,
+    final_score: float,
+    canonical_text: str,
+    members: list[tuple[str, str]],
+    object_type: str = "evidence",
+    source_message_ids: list[str] | None = None,
+    extra_payload: dict | None = None,
+    llm_applicability: float = 0.7,
+) -> ScoredCandidate:
+    payload: dict = {
+        "coverage_members": [
+            {"member_key": member_key, "display_text": display_text}
+            for member_key, display_text in members
+        ]
+    }
+    if source_message_ids is not None:
+        payload["source_message_ids"] = source_message_ids
+    if extra_payload:
+        payload.update(extra_payload)
+    return _candidate(
+        memory_id,
+        final_score=final_score,
+        canonical_text=canonical_text,
+        object_type=object_type,
+        payload_json=payload,
+        llm_applicability=llm_applicability,
+    )
+
+
+def _exhaustive_compose(
+    composer: ContextComposer,
+    candidates: list[ScoredCandidate],
+    *,
+    final_context_items: int,
+    context_budget_tokens: int = 5000,
+):
+    return composer.compose(
+        scored_candidates=candidates,
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=_policy_with_final_context_items(
+            context_budget_tokens, final_context_items
+        ),
+        conversation_messages=[],
+        query_text="List all of the entries.",
+        query_type="broad_list",
+        answer_shape="list",
+        coverage_mode="exhaustive_known_set",
+        source_precision="required",
+        enable_evidence_obligation_coverage=True,
+    )
+
+
+def test_exhaustive_selects_all_members_despite_duplicate_carriers() -> None:
+    composer = _composer()
+    context = _exhaustive_compose(
+        composer,
+        [
+            _member_candidate(
+                "mem_alpha_1",
+                final_score=0.97,
+                canonical_text="Subject A is part of the set.",
+                members=[("alpha", "Subject A")],
+                source_message_ids=["msg_a1"],
+            ),
+            _member_candidate(
+                "mem_alpha_2",
+                final_score=0.96,
+                canonical_text="Subject A is again part of the set.",
+                members=[("alpha", "Subject A")],
+                source_message_ids=["msg_a2"],
+            ),
+            _member_candidate(
+                "mem_alpha_3",
+                final_score=0.95,
+                canonical_text="Subject A is mentioned a third time.",
+                members=[("alpha", "Subject A")],
+                source_message_ids=["msg_a3"],
+            ),
+            _member_candidate(
+                "mem_beta",
+                final_score=0.50,
+                canonical_text="Subject B is part of the set.",
+                members=[("beta", "Subject B")],
+                source_message_ids=["msg_b"],
+            ),
+            _member_candidate(
+                "mem_gamma",
+                final_score=0.45,
+                canonical_text="Subject C is part of the set.",
+                members=[("gamma", "Subject C")],
+                source_message_ids=["msg_c"],
+            ),
+        ],
+        final_context_items=3,
+    )
+
+    assert context.coverage_state == "complete"
+    display = {item["display_text"] for item in context.allowed_values}
+    assert display == {"Subject A", "Subject B", "Subject C"}
+    selected = set(context.selected_memory_ids)
+    assert "mem_beta" in selected
+    assert "mem_gamma" in selected
+    # Exactly one carrier of the duplicated member is needed.
+    alpha_carriers = {"mem_alpha_1", "mem_alpha_2", "mem_alpha_3"}
+    assert len(selected & alpha_carriers) == 1
+
+
+def test_exhaustive_selects_more_members_than_default_with_expanded_budget() -> None:
+    composer = _composer()
+    members = [(f"m{i}", f"Member {i}") for i in range(7)]
+    candidates = [
+        _member_candidate(
+            f"mem_{member_key}",
+            final_score=0.9 - 0.05 * index,
+            canonical_text=f"{display} is part of the set.",
+            members=[(member_key, display)],
+            source_message_ids=[f"msg_{member_key}"],
+        )
+        for index, (member_key, display) in enumerate(members)
+    ]
+    # The pipeline raises final_context_items to the distinct member count before
+    # composing (see _expand_exhaustive_coverage_budget). With that expansion in
+    # effect, every member must survive the reservation cap and be selected. The
+    # pipeline-level expansion itself is asserted in the retrieval_pipeline tests.
+    context = _exhaustive_compose(
+        composer, candidates, final_context_items=len(members)
+    )
+
+    assert context.coverage_state == "complete"
+    assert {item["display_text"] for item in context.allowed_values} == {
+        display for _, display in members
+    }
+    assert len(context.selected_memory_ids) == len(members)
+
+
+def test_exhaustive_single_carrier_covers_two_members() -> None:
+    composer = _composer()
+    context = _exhaustive_compose(
+        composer,
+        [
+            _member_candidate(
+                "mem_combo",
+                final_score=0.97,
+                canonical_text="Subject A and Subject B are both in the set.",
+                members=[("alpha", "Subject A"), ("beta", "Subject B")],
+                source_message_ids=["msg_combo"],
+            ),
+            _member_candidate(
+                "mem_gamma",
+                final_score=0.40,
+                canonical_text="Subject C is in the set.",
+                members=[("gamma", "Subject C")],
+                source_message_ids=["msg_c"],
+            ),
+        ],
+        final_context_items=5,
+    )
+
+    assert context.coverage_state == "complete"
+    assert {item["display_text"] for item in context.allowed_values} == {
+        "Subject A",
+        "Subject B",
+        "Subject C",
+    }
+    # The multi-member carrier is reserved/selected exactly once.
+    assert context.selected_memory_ids.count("mem_combo") == 1
+    # And it covers both of its members.
+    combo_keys = {
+        item["normalized_key"]
+        for item in context.allowed_values
+        if "mem_combo" in item["memory_ids"]
+    }
+    assert combo_keys == {"value|alpha", "value|beta"}
+
+
+def test_exhaustive_member_bearing_belief_is_admitted_and_counted() -> None:
+    composer = _composer()
+    # A belief carries members but is NOT source-backed (no packets, no source
+    # message ids, object_type belief). It must still be admitted + counted via
+    # the member-keys admission path.
+    belief = _member_candidate(
+        "blf_member",
+        final_score=0.95,
+        canonical_text="The assistant believes Subject A belongs to the set.",
+        members=[("alpha", "Subject A")],
+        object_type="belief",
+    )
+    assert not ContextComposer._is_source_backed_coverage_candidate(belief)
+    assert ContextComposer._exhaustive_index_admits(belief)
+
+    context = _exhaustive_compose(
+        composer,
+        [
+            belief,
+            _member_candidate(
+                "mem_beta",
+                final_score=0.40,
+                canonical_text="Subject B belongs to the set.",
+                members=[("beta", "Subject B")],
+                source_message_ids=["msg_b"],
+            ),
+        ],
+        final_context_items=5,
+    )
+
+    assert "blf_member" in context.selected_memory_ids
+    assert {item["display_text"] for item in context.allowed_values} == {
+        "Subject A",
+        "Subject B",
+    }
+    assert context.coverage_state == "complete"
+
+
+def test_exhaustive_unkeyed_source_backed_evidence_caps_at_partial() -> None:
+    composer = _composer()
+    context = _exhaustive_compose(
+        composer,
+        [
+            _member_candidate(
+                "mem_alpha",
+                final_score=0.96,
+                canonical_text="Subject A belongs to the set.",
+                members=[("alpha", "Subject A")],
+                source_message_ids=["msg_a"],
+            ),
+            # Source-backed evidence with NO coverage_members key and no value_*
+            # key: unkeyed residue that blocks a "complete" claim.
+            _candidate(
+                "mem_unkeyed",
+                final_score=0.94,
+                canonical_text="Some supporting context that was never processed.",
+                object_type="evidence",
+                payload_json={"source_message_ids": ["msg_unkeyed"]},
+            ),
+        ],
+        final_context_items=5,
+    )
+
+    assert context.coverage_state == "partial"
+    assert any(
+        slot["reason"] == "unkeyed_supported_evidence_present"
+        for slot in context.missing_slots
+    )
+    assert "Subject A" in {item["display_text"] for item in context.allowed_values}
+
+
+def test_exhaustive_summary_with_member_key_does_not_mint_phantom_member() -> None:
+    composer = _composer()
+    # A summary-view carries a value_* key (rule #2) but is barred from
+    # selection. It must NOT be admitted to the index, so it cannot mint a
+    # phantom member that would flip complete -> partial.
+    context = _exhaustive_compose(
+        composer,
+        [
+            _member_candidate(
+                "mem_alpha",
+                final_score=0.50,
+                canonical_text="Subject A belongs to the set.",
+                members=[("alpha", "Subject A")],
+                source_message_ids=["msg_a"],
+            ),
+            _candidate(
+                "sum_phantom",
+                final_score=0.97,
+                canonical_text="A summary mentions Subject Z exists somewhere.",
+                object_type="summary_view",
+                payload_json={
+                    "source_message_ids": ["msg_z"],
+                    "value_norm_key": "zeta",
+                    "value_text": "Subject Z",
+                },
+            ),
+        ],
+        final_context_items=5,
+    )
+
+    assert context.coverage_state == "complete"
+    display = {item["display_text"] for item in context.allowed_values}
+    assert display == {"Subject A"}
+    assert "Subject Z" not in display
+    assert context.missing_slots == []
+
+
+def test_exhaustive_member_with_clean_and_withheld_carriers_is_covered() -> None:
+    composer = _composer()
+    withheld_carrier = _member_candidate(
+        "mem_alpha_secret",
+        final_score=0.99,
+        canonical_text="Subject A's secret is K8sN0d3Jump!2024.",
+        members=[("alpha", "Subject A")],
+        source_message_ids=["msg_secret"],
+        extra_payload={
+            "value_norm_key": "K8sN0d3Jump!2024",
+            "value_text": "K8sN0d3Jump!2024",
+        },
+    )
+    withheld_carrier.memory_object.update(
+        {
+            "privacy_level": 3,
+            "memory_category": "pin_or_password",
+            "preserve_verbatim": True,
+        }
+    )
+    clean_carrier = _member_candidate(
+        "mem_alpha_clean",
+        final_score=0.98,
+        canonical_text="Subject A belongs to the set.",
+        members=[("alpha", "Subject A")],
+        source_message_ids=["msg_clean"],
+    )
+
+    context = _exhaustive_compose(
+        composer,
+        [withheld_carrier, clean_carrier],
+        final_context_items=5,
+    )
+
+    # A clean carrier of the member is selected -> the member is covered, NOT a
+    # redaction gap.
+    assert context.coverage_state == "complete"
+    assert "Subject A" in {item["display_text"] for item in context.allowed_values}
+    assert context.missing_slots == []
+
+
+def test_exhaustive_covered_member_never_uses_withheld_value_display() -> None:
+    composer = _composer()
+    secret_label = "K8sN0d3Jump!2024"
+    # Two value_* carriers of the SAME member (normalized value "rome"): the
+    # higher-ranked one is withheld and its display text is a secret-tagged
+    # literal; the other is clean. With at least one clean selected carrier the
+    # member is covered, and its answer-facing display must come from the clean
+    # carrier, never the withheld carrier's secret display.
+    withheld_first = _candidate(
+        "mem_rome_secret",
+        final_score=0.99,
+        canonical_text=f"The rome credential is {secret_label}.",
+        object_type="evidence",
+        payload_json={
+            "source_message_ids": ["msg_secret"],
+            "value_norm_key": "rome",
+            "value_text": secret_label,
+        },
+    )
+    withheld_first.memory_object.update(
+        {
+            "privacy_level": 3,
+            "memory_category": "pin_or_password",
+            "preserve_verbatim": True,
+        }
+    )
+    clean_carrier = _candidate(
+        "mem_rome_clean",
+        final_score=0.98,
+        canonical_text="Caroline lived in Rome.",
+        object_type="evidence",
+        payload_json={
+            "source_message_ids": ["msg_clean"],
+            "value_norm_key": "rome",
+            "value_text": "Rome",
+        },
+    )
+
+    context = _exhaustive_compose(
+        composer,
+        [withheld_first, clean_carrier],
+        final_context_items=5,
+    )
+
+    assert context.coverage_state == "complete"
+    assert "Rome" in {item["display_text"] for item in context.allowed_values}
+    leaked = json.dumps(
+        {
+            "allowed_values": context.allowed_values,
+            "missing_slots": context.missing_slots,
+            "answer_support": answer_support_prompt_payload(context),
+        }
+    )
+    assert secret_label not in leaked
+
+
+def test_exhaustive_missing_member_never_uses_withheld_value_display() -> None:
+    composer = _composer()
+    secret_label = "K8sN0d3Jump!2024"
+    # A genuine gap: member "rome" has a withheld value_* carrier (display = a
+    # secret literal) AND a clean value_* carrier, but neither fits the tiny
+    # budget. The named missing slot must use the clean carrier's display, never
+    # the withheld secret literal.
+    alpha_clean = _member_candidate(
+        "mem_alpha",
+        final_score=0.99,
+        canonical_text="Subject Alpha belongs to the set.",
+        members=[("alpha", "Subject Alpha")],
+        source_message_ids=["msg_a"],
+    )
+    withheld_rome = _candidate(
+        "mem_rome_secret",
+        final_score=0.50,
+        canonical_text=f"The rome credential is {secret_label}.",
+        object_type="evidence",
+        payload_json={
+            "source_message_ids": ["msg_b1"],
+            "value_norm_key": "rome",
+            "value_text": secret_label,
+        },
+    )
+    withheld_rome.memory_object.update(
+        {
+            "privacy_level": 3,
+            "memory_category": "pin_or_password",
+            "preserve_verbatim": True,
+        }
+    )
+    clean_rome = _candidate(
+        "mem_rome_clean",
+        final_score=0.40,
+        canonical_text="Caroline lived in Rome. " * 60,
+        object_type="evidence",
+        payload_json={
+            "source_message_ids": ["msg_b2"],
+            "value_norm_key": "rome",
+            "value_text": "Rome",
+        },
+    )
+
+    context = _exhaustive_compose(
+        composer,
+        [alpha_clean, withheld_rome, clean_rome],
+        final_context_items=6,
+        context_budget_tokens=360,
+    )
+
+    assert context.coverage_state == "partial"
+    missing_display = {slot["display_text"] for slot in context.missing_slots}
+    assert "Rome" in missing_display
+    leaked = json.dumps(
+        {
+            "allowed_values": context.allowed_values,
+            "missing_slots": context.missing_slots,
+            "answer_support": answer_support_prompt_payload(context),
+        }
+    )
+    assert secret_label not in leaked
+
+
+def test_exhaustive_member_null_display_falls_back_to_canonical_text() -> None:
+    composer = _composer()
+    # A processed member whose display_text is null must fall back to the
+    # candidate canonical text, not surface an empty label.
+    candidate = _candidate(
+        "mem_alpha",
+        final_score=0.95,
+        canonical_text="Subject Alpha is part of the set.",
+        object_type="evidence",
+        payload_json={
+            "source_message_ids": ["msg_a"],
+            "coverage_members": [{"member_key": "alpha", "display_text": None}],
+        },
+    )
+
+    context = _exhaustive_compose(composer, [candidate], final_context_items=5)
+
+    assert context.coverage_state == "complete"
+    displays = [item["display_text"] for item in context.allowed_values]
+    assert displays == ["Subject Alpha is part of the set."]
+    assert "" not in displays
+
+
+def test_exhaustive_budget_too_small_reports_missing_members() -> None:
+    composer = _composer()
+    members = [(f"m{i}", f"Member {i}") for i in range(6)]
+    candidates = [
+        _member_candidate(
+            f"mem_{member_key}",
+            final_score=0.9 - 0.05 * index,
+            canonical_text=f"{display} is part of the set. " * 12,
+            members=[(member_key, display)],
+            source_message_ids=[f"msg_{member_key}"],
+        )
+        for index, (member_key, display) in enumerate(members)
+    ]
+    # Tiny token budget: only some members fit. The rest become missing_slots,
+    # never a RuntimeError.
+    context = _exhaustive_compose(
+        composer,
+        candidates,
+        final_context_items=6,
+        context_budget_tokens=320,
+    )
+
+    assert context.coverage_state == "partial"
+    assert context.allowed_values  # at least one member fit
+    assert context.missing_slots  # at least one member did not
+    covered = {item["display_text"] for item in context.allowed_values}
+    missing = {slot["display_text"] for slot in context.missing_slots}
+    # Every declared member is either covered or named as missing.
+    assert covered | missing == {display for _, display in members}
+    assert covered.isdisjoint(missing)
+
+
+def test_exhaustive_all_members_dropped_is_insufficient() -> None:
+    composer = _composer()
+    members = [(f"m{i}", f"Member {i}") for i in range(4)]
+    candidates = [
+        _member_candidate(
+            f"mem_{member_key}",
+            final_score=0.9 - 0.05 * index,
+            canonical_text=f"{display} is part of the set. " * 40,
+            members=[(member_key, display)],
+            source_message_ids=[f"msg_{member_key}"],
+        )
+        for index, (member_key, display) in enumerate(members)
+    ]
+    # Token budget below even one member's footprint after the fixed blocks:
+    # nothing fits -> insufficient, and never a RuntimeError.
+    context = _exhaustive_compose(
+        composer,
+        candidates,
+        final_context_items=4,
+        context_budget_tokens=120,
+    )
+
+    assert context.coverage_state == "insufficient"
+    assert context.allowed_values == []
+
+
+def test_exhaustive_coverage_independent_of_ranking_and_budget_property() -> None:
+    composer = _composer()
+    # Property/invariant check: N members, D duplicate carriers, adversarial
+    # ranking (duplicates ranked above unique members), varying budget. When all
+    # members fit, all are covered and the state is complete; otherwise the
+    # state is an honest partial/insufficient and every member is accounted for.
+    member_count = 5
+    members = [(f"m{i}", f"Member {i}") for i in range(member_count)]
+    candidates: list[ScoredCandidate] = []
+    # Three near-duplicate carriers of the first member, ranked highest.
+    for dup in range(3):
+        candidates.append(
+            _member_candidate(
+                f"mem_m0_dup{dup}",
+                final_score=0.99 - 0.001 * dup,
+                canonical_text="Member 0 is part of the set.",
+                members=[("m0", "Member 0")],
+                source_message_ids=[f"msg_m0_{dup}"],
+            )
+        )
+    # Remaining members ranked below the duplicates.
+    for index, (member_key, display) in enumerate(members[1:], start=1):
+        candidates.append(
+            _member_candidate(
+                f"mem_{member_key}",
+                final_score=0.5 - 0.01 * index,
+                canonical_text=f"{display} is part of the set.",
+                members=[(member_key, display)],
+                source_message_ids=[f"msg_{member_key}"],
+            )
+        )
+
+    all_member_displays = {display for _, display in members}
+
+    for final_context_items in (1, 2, 3, member_count, member_count + 5):
+        for context_budget_tokens in (200, 600, 5000):
+            context = _exhaustive_compose(
+                composer,
+                candidates,
+                final_context_items=final_context_items,
+                context_budget_tokens=context_budget_tokens,
+            )
+            covered = {item["display_text"] for item in context.allowed_values}
+            missing = {
+                slot["display_text"]
+                for slot in context.missing_slots
+                if slot["reason"] != "unkeyed_supported_evidence_present"
+            }
+            # Coverage and missing partitions never overlap.
+            assert covered.isdisjoint(missing)
+            if context.coverage_state == "complete":
+                assert covered == all_member_displays
+                assert missing == set()
+            elif context.coverage_state == "partial":
+                assert covered
+                assert covered | missing == all_member_displays
+            else:
+                assert context.coverage_state == "insufficient"
+                assert covered == set()

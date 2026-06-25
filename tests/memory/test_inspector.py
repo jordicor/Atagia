@@ -23,7 +23,11 @@ from atagia.core.presence_repository import PresenceRepository
 from atagia.core.realm_repository import RealmRepository
 from atagia.core.retrieval_event_repository import AdminAuditRepository, RetrievalEventRepository
 from atagia.core.space_repository import SpaceRepository
-from atagia.memory.inspector import MemoryInspector, _boundary_explanation
+from atagia.memory.inspector import (
+    MemoryInspector,
+    _boundary_explanation,
+    _retrieval_plan_from_event,
+)
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import (
     CrossRealmMode,
@@ -257,6 +261,54 @@ def test_boundary_explanation_includes_allowed_realm_bridge_attribution() -> Non
     assert explanation["decision"] == "allowed"
     assert explanation["blocked_reasons"] == []
     assert explanation["attribution_reasons"] == ["allowed_by_realm_bridge_attributed"]
+
+
+def test_retrieval_plan_from_event_round_trips_clean_plan_dump() -> None:
+    """A production-shaped retrieval-plan dump must round-trip for the inspector.
+
+    ``RetrievalPlan`` is strict (``extra="forbid"``), so the persisted
+    ``retrieval_plan_json`` has to stay a clean plan dump. The adaptive-gate
+    block lives only on ``retrieval_diagnostics_for_guard``; it must never be
+    injected into the plan, or coordinate-trace reconstruction silently breaks
+    for every event that falls back to event-plan reconstruction.
+    """
+    event = {
+        "assistant_mode_id": "coding_debug",
+        "conversation_id": "cnv_1",
+        "retrieval_plan_json": {
+            "fts_queries": ["retry queue"],
+            "skip_retrieval": False,
+        },
+    }
+    plan, error = _retrieval_plan_from_event(event)
+    assert error is None
+    assert plan is not None
+    assert plan.fts_queries == ["retry queue"]
+
+
+def test_retrieval_plan_from_event_rejects_adaptive_gate_pollution() -> None:
+    """An ``adaptive_gate`` key in the persisted plan breaks strict round-trip.
+
+    This locks in why the gate block must stay out of ``source_retrieval_plan``:
+    if it leaks back in, the inspector cannot reconstruct the coordinate trace
+    and reports the source as unavailable for every affected decision.
+    """
+    event = {
+        "assistant_mode_id": "coding_debug",
+        "conversation_id": "cnv_1",
+        "retrieval_plan_json": {
+            "fts_queries": ["retry queue"],
+            "skip_retrieval": False,
+            "adaptive_gate": {
+                "status": "skipped",
+                "classification": "world",
+            },
+        },
+    }
+    plan, error = _retrieval_plan_from_event(event)
+    assert plan is None
+    assert error is not None
+    assert error.startswith("retrieval_plan_unparseable:")
 
 
 @pytest.mark.asyncio

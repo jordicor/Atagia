@@ -91,6 +91,63 @@ def test_workers_can_be_enabled_explicitly(monkeypatch) -> None:
     assert settings.workers_enabled is True
 
 
+def test_default_language_code_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ATAGIA_DEFAULT_LANGUAGE_CODE", raising=False)
+    assert Settings.from_env().default_language_code == "en"
+
+    monkeypatch.setenv("ATAGIA_DEFAULT_LANGUAGE_CODE", " ES ")
+    assert Settings.from_env().default_language_code == "es"
+
+
+def test_default_language_code_rejects_invalid_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_DEFAULT_LANGUAGE_CODE", "jp")
+
+    with pytest.raises(ValueError, match="ATAGIA_DEFAULT_LANGUAGE_CODE"):
+        Settings.from_env()
+
+
+def test_consequence_detector_card_concurrency_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ATAGIA_CONSEQUENCE_DETECTOR_CARD_CONCURRENCY", raising=False)
+    assert Settings.from_env().consequence_detector_card_concurrency == 2
+
+    monkeypatch.setenv("ATAGIA_CONSEQUENCE_DETECTOR_CARD_CONCURRENCY", "1")
+    assert Settings.from_env().consequence_detector_card_concurrency == 1
+
+
+def test_consequence_detector_card_concurrency_rejects_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_CONSEQUENCE_DETECTOR_CARD_CONCURRENCY", "0")
+
+    with pytest.raises(ValueError, match="consequence_detector_card_concurrency"):
+        Settings.from_env()
+
+
+def test_compactor_summary_card_concurrency_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ATAGIA_COMPACTOR_SUMMARY_CARD_CONCURRENCY", raising=False)
+    assert Settings.from_env().compactor_summary_card_concurrency == 4
+
+    monkeypatch.setenv("ATAGIA_COMPACTOR_SUMMARY_CARD_CONCURRENCY", "1")
+    assert Settings.from_env().compactor_summary_card_concurrency == 1
+
+
+def test_compactor_summary_card_concurrency_rejects_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_COMPACTOR_SUMMARY_CARD_CONCURRENCY", "0")
+
+    with pytest.raises(ValueError, match="compactor_summary_card_concurrency"):
+        Settings.from_env()
+
+
 def test_episode_synthesis_max_episodes_default_and_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -163,6 +220,30 @@ def test_openai_embedding_base_url_can_be_overridden(
 
     assert settings.openai_base_url == "http://completion.test/v1"
     assert settings.openai_embedding_base_url == "http://embedding.test/v1"
+
+
+def test_minimax_provider_settings_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_MINIMAX_API_KEY", "minimax-key")
+    monkeypatch.setenv("ATAGIA_MINIMAX_BASE_URL", "https://mini.example/v1")
+
+    settings = Settings.from_env()
+
+    assert settings.minimax_api_key == "minimax-key"
+    assert settings.minimax_base_url == "https://mini.example/v1"
+
+
+def test_kimi_provider_settings_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_KIMI_API_KEY", "kimi-key")
+    monkeypatch.setenv("ATAGIA_KIMI_BASE_URL", "https://kimi.example/v1")
+
+    settings = Settings.from_env()
+
+    assert settings.kimi_api_key == "kimi-key"
+    assert settings.kimi_base_url == "https://kimi.example/v1"
 
 
 def test_embedding_retrieval_settings_can_be_overridden(
@@ -681,6 +762,29 @@ def test_anthropic_request_timeout_can_be_overridden(monkeypatch) -> None:
 
 def test_anthropic_request_timeout_rejects_invalid_value(monkeypatch) -> None:
     monkeypatch.setenv("ATAGIA_ANTHROPIC_REQUEST_TIMEOUT_SECONDS", "0")
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+def test_worker_transient_defer_budget_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_WORKER_TRANSIENT_DEFER_MAX_COUNT", "5")
+    monkeypatch.setenv("ATAGIA_WORKER_TRANSIENT_DEFER_MAX_AGE_SECONDS", "1800.5")
+
+    settings = Settings.from_env()
+
+    assert settings.worker_transient_defer_max_count == 5
+    assert settings.worker_transient_defer_max_age_seconds == pytest.approx(1800.5)
+
+
+def test_worker_transient_defer_budget_rejects_invalid_values(monkeypatch) -> None:
+    monkeypatch.setenv("ATAGIA_WORKER_TRANSIENT_DEFER_MAX_COUNT", "0")
+
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+    monkeypatch.setenv("ATAGIA_WORKER_TRANSIENT_DEFER_MAX_COUNT", "1")
+    monkeypatch.setenv("ATAGIA_WORKER_TRANSIENT_DEFER_MAX_AGE_SECONDS", "0")
 
     with pytest.raises(ValueError):
         Settings.from_env()

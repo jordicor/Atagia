@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 
 
@@ -12,6 +13,18 @@ def normalize_optional_timestamp(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def parse_optional_datetime(value: Any) -> datetime | None:
+    """Parse an optional ISO timestamp, accepting trailing ``Z`` as UTC."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def resolve_message_occurred_at(message: Mapping[str, Any]) -> str | None:

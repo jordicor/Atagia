@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
 import logging
 from typing import Any
 
@@ -16,6 +17,7 @@ from atagia.core.config import Settings
 from atagia.core.ids import new_job_id
 from atagia.core.initial_context_package_repository import InitialContextPackageRepository
 from atagia.core.storage_backend import StorageBackend
+from atagia.core.timestamps import parse_optional_datetime
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
@@ -78,6 +80,12 @@ MAX_STREAM_DELIVERIES = 3
 CONSEQUENCE_CONFIDENCE_THRESHOLD = 0.5
 CONVERSATION_CHUNK_TRIGGER_MESSAGES = 10
 COMPACTION_ENQUEUE_DEDUPE_TTL_SECONDS = 3600
+_TRANSIENT_OUTCOME_DEFERRED = "deferred"
+_TRANSIENT_OUTCOME_DEAD_LETTERED = "dead_lettered"
+
+
+class TransientDeferBudgetExceededError(RuntimeError):
+    """Raised when a job exhausts its durable transient-deferral budget."""
 
 
 class IngestWorker:
@@ -164,6 +172,7 @@ class IngestWorker:
             llm_client=llm_client,
             clock=clock,
             settings=resolved_settings,
+            profile_repository=self._communication_profile_repository,
         )
         self._consequence_builder = ConsequenceChainBuilder(
             connection=connection,
@@ -206,6 +215,7 @@ class IngestWorker:
 
         acked = 0
         failed = 0
+        deferred = 0
         dead_lettered = 0
         for message in messages:
             try:
@@ -219,6 +229,17 @@ class IngestWorker:
                 )
                 acked += 1
             except Exception as exc:
+                transient_outcome = await self._handle_transient_provider_failure(
+                    message,
+                    exc,
+                )
+                if transient_outcome == _TRANSIENT_OUTCOME_DEFERRED:
+                    deferred += 1
+                    continue
+                if transient_outcome == _TRANSIENT_OUTCOME_DEAD_LETTERED:
+                    failed += 1
+                    dead_lettered += 1
+                    continue
                 failed += 1
                 self._log_job_failure(message, exc)
                 if await self._dead_letter_if_exhausted(message, exc):
@@ -229,6 +250,7 @@ class IngestWorker:
             received=len(messages),
             acked=acked,
             failed=failed,
+            deferred=deferred,
             dead_lettered=dead_lettered,
         )
 
@@ -405,7 +427,7 @@ class IngestWorker:
             persisted = extraction_details.persisted
             chunk_plan = extraction_details.chunk_plan
         except StructuredOutputError as exc:
-            if "after schema fallback" not in str(exc):
+            if exc.reason != "schema_fallback_non_json":
                 raise
             details = "; ".join(exc.details) if exc.details else str(exc)
             logger.warning(
@@ -453,6 +475,93 @@ class IngestWorker:
             job_payload=job_payload,
         )
 
+    async def _handle_transient_provider_failure(
+        self,
+        message: StreamMessage,
+        exc: Exception,
+    ) -> str | None:
+        if not isinstance(exc, TransientLLMError):
+            return None
+        delay_seconds = self._transient_defer_delay_seconds(exc)
+        now = self._clock.now()
+        deferred_until = now + timedelta(seconds=delay_seconds)
+        logger.warning(
+            "Deferring extraction job after transient provider failure "
+            "message_id=%s delivery_count=%s delay_seconds=%.2f error=%s",
+            message.message_id,
+            message.delivery_count,
+            delay_seconds,
+            exc.__class__.__name__,
+        )
+        deferred_job = await self._job_tracking.mark_deferred(
+            message,
+            exc,
+            deferred_until=deferred_until,
+        )
+        if self._transient_defer_budget_exhausted(deferred_job, now):
+            await self._dead_letter_transient_defer_budget_exhausted(
+                message,
+                exc,
+                deferred_job,
+            )
+            return _TRANSIENT_OUTCOME_DEAD_LETTERED
+        await self._storage_backend.stream_defer(
+            EXTRACT_STREAM_NAME,
+            WORKER_GROUP_NAME,
+            message.message_id,
+            message.payload,
+            delay_seconds=delay_seconds,
+        )
+        return _TRANSIENT_OUTCOME_DEFERRED
+
+    def _transient_defer_delay_seconds(self, exc: Exception) -> float:
+        retry_after = (
+            exc.retry_after_seconds if isinstance(exc, TransientLLMError) else None
+        )
+        if retry_after is None:
+            retry_after = self._settings.worker_transient_defer_seconds
+        retry_after = max(1.0, float(retry_after))
+        return min(retry_after, self._settings.worker_transient_defer_max_seconds)
+
+    def _transient_defer_budget_exhausted(
+        self,
+        deferred_job: dict[str, Any],
+        now: datetime,
+    ) -> bool:
+        defer_count = int(deferred_job.get("transient_defer_count") or 0)
+        if defer_count > self._settings.worker_transient_defer_max_count:
+            return True
+        first_deferred_at = parse_optional_datetime(deferred_job.get("first_deferred_at"))
+        if first_deferred_at is None:
+            return False
+        age_seconds = max(0.0, (now - first_deferred_at).total_seconds())
+        return age_seconds > self._settings.worker_transient_defer_max_age_seconds
+
+    async def _dead_letter_transient_defer_budget_exhausted(
+        self,
+        message: StreamMessage,
+        original_error: TransientLLMError,
+        deferred_job: dict[str, Any],
+    ) -> None:
+        defer_count = int(deferred_job.get("transient_defer_count") or 0)
+        first_deferred_at = str(deferred_job.get("first_deferred_at") or "")
+        budget_error = TransientDeferBudgetExceededError(
+            "transient defer budget exhausted "
+            f"(defer_count={defer_count}, "
+            f"max_count={self._settings.worker_transient_defer_max_count}, "
+            f"first_deferred_at={first_deferred_at}, "
+            f"max_age_seconds={self._settings.worker_transient_defer_max_age_seconds}): "
+            f"{original_error}"
+        )
+        self._log_job_failure(message, budget_error)
+        await self._enqueue_dead_letter(message, budget_error)
+        await self._storage_backend.stream_ack(
+            EXTRACT_STREAM_NAME,
+            WORKER_GROUP_NAME,
+            message.message_id,
+        )
+        await self._job_tracking.mark_dead_lettered(message, budget_error)
+
     async def _update_user_communication_profile(
         self,
         *,
@@ -468,7 +577,7 @@ class IngestWorker:
             )
         except Exception as exc:
             logger.warning(
-                "user_language_profile_update_failed_skipping",
+                "user_language_profile_cards_failed_skipping",
                 extra={
                     "user_id": context.user_id,
                     "conversation_id": context.conversation_id,
@@ -551,6 +660,7 @@ class IngestWorker:
                 envelope=envelope,
                 payload=RevisionJobPayload(
                     belief_id=existing_belief_id or "",
+                    claim_key_already_validated=bool(existing_belief_id),
                     claim_key=claim_key,
                     claim_value=json_utils.dumps(
                         payload_json.get("claim_value"),
@@ -1153,6 +1263,20 @@ class IngestWorker:
     ) -> bool:
         if message.delivery_count < MAX_STREAM_DELIVERIES:
             return False
+        await self._enqueue_dead_letter(message, exc)
+        await self._storage_backend.stream_ack(
+            EXTRACT_STREAM_NAME,
+            WORKER_GROUP_NAME,
+            message.message_id,
+        )
+        await self._job_tracking.mark_dead_lettered(message, exc)
+        return True
+
+    async def _enqueue_dead_letter(
+        self,
+        message: StreamMessage,
+        exc: Exception,
+    ) -> None:
         await self._storage_backend.enqueue_job(
             f"dead_letter:{EXTRACT_STREAM_NAME}",
             {
@@ -1164,13 +1288,6 @@ class IngestWorker:
                 "error_details": list(exc.details) if isinstance(exc, StructuredOutputError) else [],
             },
         )
-        await self._storage_backend.stream_ack(
-            EXTRACT_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            message.message_id,
-        )
-        await self._job_tracking.mark_dead_lettered(message, exc)
-        return True
 
     async def _enqueue_tracked_job(self, stream_name: str, job: JobEnvelope) -> None:
         await self._job_tracking.create_queued_job(stream_name, job)

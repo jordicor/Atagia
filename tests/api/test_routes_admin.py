@@ -37,9 +37,23 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.embeddings import EmbeddingIndex
+from tests.extraction_payload_support import (
+    is_memory_extraction_card_purpose,
+    memory_extraction_card_output_from_payload,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+
+
+def _message_sequences_from_last_conversation_messages(prompt: str) -> list[int]:
+    blocks = re.findall(
+        r"<conversation_messages>\s*(.*?)\s*</conversation_messages>",
+        prompt,
+        flags=re.DOTALL,
+    )
+    source = blocks[-1] if blocks else prompt
+    return [int(item) for item in re.findall(r'<message seq="(\d+)"', source)]
 
 
 class QueueProvider(LLMProvider):
@@ -48,31 +62,48 @@ class QueueProvider(LLMProvider):
     def __init__(self, outputs: dict[str, list[str]]) -> None:
         self.outputs = {key: list(value) for key, value in outputs.items()}
         self.requests: list[LLMCompletionRequest] = []
+        self._active_extraction_payload: str | None = None
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
+        if is_memory_extraction_card_purpose(purpose):
+            if purpose == "memory_extraction_candidate_card":
+                queue = self.outputs.get("memory_extraction", [])
+                if not queue:
+                    raise AssertionError("No queued extraction payload left")
+                self._active_extraction_payload = queue.pop(0)
+            if self._active_extraction_payload is None:
+                raise AssertionError("No active extraction payload for card output")
+            output_text = memory_extraction_card_output_from_payload(
+                self._active_extraction_payload,
+                purpose,
+            )
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=output_text,
+            )
         queue = self.outputs.get(purpose, [])
         if not queue:
-            if purpose == "summary_chunk_segmentation":
+            if purpose in {
+                "summary_chunk_segmentation_ranges_card",
+                "summary_chunk_segmentation_summaries_card",
+            }:
                 prompt = request.messages[1].content
-                message_sequences = [int(item) for item in re.findall(r'<message seq="(\d+)"', prompt)]
+                message_sequences = _message_sequences_from_last_conversation_messages(prompt)
                 if not message_sequences:
                     raise AssertionError("Expected message sequences in chunk segmentation prompt")
+                chunk_range = f"{min(message_sequences)}-{max(message_sequences)}"
+                if purpose == "summary_chunk_segmentation_ranges_card":
+                    output_text = chunk_range
+                else:
+                    # Card 2 is per-range now: emit raw summary text, no label.
+                    output_text = "Admin rebuild chunk summary."
                 return LLMCompletionResponse(
                     provider=self.name,
                     model=request.model,
-                    output_text=json.dumps(
-                        {
-                            "episodes": [
-                                {
-                                    "start_seq": min(message_sequences),
-                                    "end_seq": max(message_sequences),
-                                    "summary_text": "Admin rebuild chunk summary.",
-                                }
-                            ]
-                        }
-                    ),
+                    output_text=output_text,
                 )
             if purpose == "episode_synthesis":
                 prompt = request.messages[1].content
@@ -874,14 +905,9 @@ def test_admin_can_compact_conversation_and_workspace(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     provider = QueueProvider(
         {
-            "summary_chunk_segmentation": [
-                json.dumps(
-                    {
-                        "episodes": [
-                            {"start_seq": 1, "end_seq": 2, "summary_text": "Debugging episode summary."}
-                        ]
-                    }
-                )
+            "summary_chunk_segmentation_ranges_card": ["1-2"],
+            "summary_chunk_segmentation_summaries_card": [
+                "Debugging episode summary."
             ],
             "workspace_rollup_synthesis": [
                 json.dumps(
@@ -1026,3 +1052,139 @@ def test_admin_embeddings_backfill_route_returns_counters_and_honors_user_id(tmp
                 "user_id": "usr_1",
             }
             assert runtime.embedding_index.upsert_calls[0][0] == "mem_usr_1"
+
+
+class CoverageMembersProvider(LLMProvider):
+    """Provider returning a fixed coverage-members card line."""
+
+    name = "admin-coverage-members-tests"
+
+    def __init__(self, output_text: str) -> None:
+        self.output_text = output_text
+        self.requests: list[LLMCompletionRequest] = []
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.requests.append(request)
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text=self.output_text,
+        )
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        raise AssertionError("Embeddings are not used by coverage members backfill")
+
+
+def _create_backfill_memory(client: TestClient, *, user_id: str, conversation_id: str, memory_id: str, text: str) -> None:
+    runtime = client.app.state.runtime
+    with _connection(client) as connection:
+        users = UserRepository(connection, runtime.clock)
+        conversations = ConversationRepository(connection, runtime.clock)
+        memories = MemoryObjectRepository(connection, runtime.clock)
+        client.portal.call(users.create_user, user_id)
+        client.portal.call(
+            conversations.create_conversation,
+            conversation_id,
+            user_id,
+            None,
+            "coding_debug",
+            "Chat",
+        )
+        client.portal.call(
+            lambda: memories.create_memory_object(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                assistant_mode_id="coding_debug",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.CONVERSATION,
+                canonical_text=text,
+                source_kind=MemorySourceKind.EXTRACTED,
+                confidence=0.8,
+                privacy_level=0,
+                status=MemoryStatus.ACTIVE,
+                memory_id=memory_id,
+            )
+        )
+
+
+def test_admin_coverage_backfill_route_requires_auth(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/admin/memory/coverage/backfill",
+            json={"batch_size": 10, "delay_ms": 0},
+        )
+        assert response.status_code == 401
+
+
+def test_admin_coverage_backfill_route_rejects_bad_args(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        # batch_size below the Pydantic floor is rejected at the boundary (422).
+        response = client.post(
+            "/v1/admin/memory/coverage/backfill",
+            headers={"Authorization": "Bearer admin-key"},
+            json={"batch_size": 0, "delay_ms": 0},
+        )
+        assert response.status_code == 422
+
+
+def test_admin_coverage_backfill_route_returns_counters_and_honors_user_id(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    provider = CoverageMembersProvider(
+        'cand_001 | [{"member_key": "dr. mendez", "display_text": "Dr. Mendez"}]'
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime
+        runtime.clock = FrozenClock(datetime(2026, 4, 5, 10, 0, tzinfo=timezone.utc))
+        runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        _create_backfill_memory(
+            client,
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            memory_id="mem_usr_1",
+            text="Rosa sees Dr. Mendez.",
+        )
+        _create_backfill_memory(
+            client,
+            user_id="usr_2",
+            conversation_id="cnv_2",
+            memory_id="mem_usr_2",
+            text="Leave me alone.",
+        )
+
+        response = client.post(
+            "/v1/admin/memory/coverage/backfill",
+            headers={"Authorization": "Bearer admin-key"},
+            json={"batch_size": 10, "delay_ms": 0, "user_id": "usr_1"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "examined": 1,
+            "processed": 1,
+            "updated": 1,
+            "skipped": 0,
+            "failed": 0,
+            "dry_run": False,
+            "batch_size": 10,
+            "delay_ms": 0,
+            "user_id": "usr_1",
+        }
+        assert len(provider.requests) == 1
+        assert (
+            provider.requests[0].metadata["purpose"]
+            == "memory_extraction_coverage_members_card"
+        )
+        with _connection(client) as connection:
+            memories = MemoryObjectRepository(connection, runtime.clock)
+            row_1 = client.portal.call(memories.get_memory_object, "mem_usr_1", "usr_1")
+            row_2 = client.portal.call(memories.get_memory_object, "mem_usr_2", "usr_2")
+        assert row_1["payload_json"]["coverage_members"] == [
+            {"member_key": "dr. mendez", "display_text": "Dr. Mendez"}
+        ]
+        # The other user's row was not touched (no key written).
+        assert "coverage_members" not in row_2["payload_json"]

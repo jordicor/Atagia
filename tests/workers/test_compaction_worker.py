@@ -14,6 +14,7 @@ from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository, WorkspaceRepository
 from atagia.core.storage_backend import InProcessBackend
 from atagia.core.summary_repository import SummaryRepository
+from atagia.memory.compactor import COMPACTION_VALIDATION_MAX_CORRECTIVE_RETRIES
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
@@ -40,6 +41,24 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 
 
+def _segmentation_card_outputs(
+    *windows: list[tuple[int, int, str]],
+) -> dict[str, list[str]]:
+    # Card 2 now issues one call per range, emitting raw summary text keyed by
+    # range. Card 1 stays one call per window, FIFO by purpose.
+    outputs: dict[str, list[str]] = {
+        "summary_chunk_segmentation_ranges_card": [
+            "\n".join(f"{start_seq}-{end_seq}" for start_seq, end_seq, _summary in window)
+            for window in windows
+        ],
+    }
+    for window in windows:
+        for start_seq, end_seq, summary in window:
+            key = f"summary_chunk_segmentation_summaries_card:{start_seq}-{end_seq}"
+            outputs.setdefault(key, []).append(summary)
+    return outputs
+
+
 class QueueProvider(LLMProvider):
     name = "compaction-worker-tests"
 
@@ -58,9 +77,18 @@ class QueueProvider(LLMProvider):
         purpose = str(request.metadata.get("purpose"))
         if purpose in self.failing_purposes:
             raise RuntimeError(f"synthetic failure for {purpose}")
-        queue = self.outputs.get(purpose, [])
+        # The summary card runs one concurrent call per range; queued outputs are
+        # keyed by range so concurrent calls cannot pop FIFO into the wrong range.
+        if purpose == "summary_chunk_segmentation_summaries_card":
+            key = (
+                f"{purpose}:{request.metadata['range_start']}-"
+                f"{request.metadata['range_end']}"
+            )
+        else:
+            key = purpose
+        queue = self.outputs.get(key, [])
         if not queue:
-            raise AssertionError(f"No queued output left for purpose {purpose}")
+            raise AssertionError(f"No queued output left for {key}")
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
@@ -152,17 +180,7 @@ def _compaction_job(*, job_kind: str, privacy_enforcement: str = "enforce") -> J
 @pytest.mark.asyncio
 async def test_compaction_worker_processes_conversation_chunk_job() -> None:
     connection, backend, messages, summaries, _memories, worker = await _build_runtime(
-        {
-            "summary_chunk_segmentation": [
-                json.dumps(
-                    {
-                        "episodes": [
-                            {"start_seq": 1, "end_seq": 2, "summary_text": "Patch-first debugging summary."}
-                        ]
-                    }
-                )
-            ]
-        }
+        _segmentation_card_outputs([(1, 2, "Patch-first debugging summary.")])
     )
     try:
         await _seed_messages(messages)
@@ -181,21 +199,7 @@ async def test_compaction_worker_processes_conversation_chunk_job() -> None:
 @pytest.mark.asyncio
 async def test_compaction_refresh_preserves_privacy_enforcement_variant() -> None:
     connection, backend, messages, _summaries, _memories, worker = await _build_runtime(
-        {
-            "summary_chunk_segmentation": [
-                json.dumps(
-                    {
-                        "episodes": [
-                            {
-                                "start_seq": 1,
-                                "end_seq": 2,
-                                "summary_text": "Privacy-off summary.",
-                            }
-                        ]
-                    }
-                )
-            ]
-        }
+        _segmentation_card_outputs([(1, 2, "Privacy-off summary.")])
     )
     try:
         await _seed_messages(messages)
@@ -253,17 +257,7 @@ async def test_compaction_worker_skips_temporary_conversation_chunk_job() -> Non
 @pytest.mark.asyncio
 async def test_compaction_worker_runs_for_isolated_conversation_chunk_job() -> None:
     connection, backend, messages, summaries, _memories, worker = await _build_runtime(
-        {
-            "summary_chunk_segmentation": [
-                json.dumps(
-                    {
-                        "episodes": [
-                            {"start_seq": 1, "end_seq": 2, "summary_text": "Isolated conversation summary."}
-                        ]
-                    }
-                )
-            ]
-        }
+        _segmentation_card_outputs([(1, 2, "Isolated conversation summary.")])
     )
     try:
         await connection.execute("UPDATE conversations SET isolated_mode = 1 WHERE id = ?", ("cnv_1",))
@@ -372,8 +366,9 @@ async def test_compaction_worker_rechecks_current_preferences_before_broad_rollu
 
 @pytest.mark.asyncio
 async def test_compaction_worker_dead_letters_after_max_failed_deliveries() -> None:
+    retry_attempts_per_delivery = COMPACTION_VALIDATION_MAX_CORRECTIVE_RETRIES + 1
     connection, backend, messages, _summaries, _memories, worker = await _build_runtime(
-        {"summary_chunk_segmentation": ["not-json"] * 9}
+        {"summary_chunk_segmentation_ranges_card": ["not a range"] * (3 * retry_attempts_per_delivery)}
     )
     try:
         await _seed_messages(messages)
@@ -390,8 +385,8 @@ async def test_compaction_worker_dead_letters_after_max_failed_deliveries() -> N
         assert third.dead_lettered == 1
         assert dead_letter is not None
         assert dead_letter["delivery_count"] == 3
-        assert dead_letter["error_details"][0] == "$: Response was not valid JSON."
-        assert any("No JSON payload found" in detail for detail in dead_letter["error_details"])
+        assert "no valid ranges" in dead_letter["error"]
+        assert dead_letter["error_details"] == []
     finally:
         await connection.close()
 
@@ -400,7 +395,7 @@ async def test_compaction_worker_dead_letters_after_max_failed_deliveries() -> N
 async def test_compaction_worker_handles_llm_failure_gracefully() -> None:
     connection, backend, messages, summaries, _memories, worker = await _build_runtime(
         {},
-        failing_purposes={"summary_chunk_segmentation"},
+        failing_purposes={"summary_chunk_segmentation_ranges_card"},
     )
     try:
         await _seed_messages(messages)
@@ -456,15 +451,7 @@ async def test_compaction_worker_logs_structured_job_failure_without_traceback(
 async def test_compaction_worker_orders_chunk_episode_and_thematic_jobs() -> None:
     connection, backend, messages, summaries, memories, worker = await _build_runtime(
         {
-            "summary_chunk_segmentation": [
-                json.dumps(
-                    {
-                        "episodes": [
-                            {"start_seq": 1, "end_seq": 2, "summary_text": "Patch-first debugging summary."}
-                        ]
-                    }
-                )
-            ],
+            **_segmentation_card_outputs([(1, 2, "Patch-first debugging summary.")]),
             "episode_synthesis": [
                 json.dumps(
                     {

@@ -35,6 +35,7 @@ from atagia.services.llm_client import (
     LLMStreamEvent,
     OutputLimitExceededError,
     TransientLLMError,
+    retry_after_seconds_from_exception,
 )
 from atagia.services.llm_schema import strip_json_schema_nullability
 
@@ -403,18 +404,30 @@ def _map_exception(exc: Exception) -> LLMError:
     if isinstance(exc, json.JSONDecodeError):
         return TransientLLMError("Provider returned a non-JSON HTTP response")
     if isinstance(exc, genai_errors.UnknownApiResponseError):
-        return TransientLLMError(str(exc))
+        return TransientLLMError(
+            str(exc),
+            retry_after_seconds=retry_after_seconds_from_exception(exc),
+        )
     if isinstance(exc, genai_errors.ServerError):
-        return TransientLLMError(str(exc))
+        return TransientLLMError(
+            str(exc),
+            retry_after_seconds=retry_after_seconds_from_exception(exc),
+        )
     if isinstance(exc, genai_errors.APIError):
         status_code = int(getattr(exc, "code", 0) or 0)
         if status_code in _TRANSIENT_STATUS_CODES or status_code >= 500:
-            return TransientLLMError(str(exc))
+            return TransientLLMError(
+                str(exc),
+                retry_after_seconds=retry_after_seconds_from_exception(exc),
+            )
         if 400 <= status_code < 500:
             return LLMRequestError(str(exc), status_code=status_code)
         return LLMError(str(exc))
     if isinstance(exc, (httpx.TransportError, TimeoutError, ConnectionError)):
-        return TransientLLMError(str(exc))
+        return TransientLLMError(
+            str(exc),
+            retry_after_seconds=retry_after_seconds_from_exception(exc),
+        )
     if isinstance(exc, LLMError):
         return exc
     return LLMError(str(exc))
@@ -554,6 +567,7 @@ class GeminiProvider(LLMProvider):
         client: google_genai.Client | None = None,
         vertex_project: str | None = None,
         vertex_location: str | None = None,
+        request_timeout_seconds: float | None = None,
     ) -> None:
         if client is not None:
             self._client = client
@@ -563,6 +577,11 @@ class GeminiProvider(LLMProvider):
         self._client = google_genai.Client(
             api_key=api_key,
             http_options=genai_types.HttpOptions(
+                timeout=(
+                    max(1, int(request_timeout_seconds * 1000))
+                    if request_timeout_seconds is not None
+                    else None
+                ),
                 retry_options=genai_types.HttpRetryOptions(attempts=1),
             ),
         )
@@ -678,7 +697,7 @@ class GeminiProvider(LLMProvider):
         except Exception as exc:
             if not emitted_any:
                 raise _map_exception(exc) from exc
-            pending_error = exc
+            pending_error = _map_exception(exc)
         finally:
             if stream is not None:
                 await _close_provider_stream(stream)

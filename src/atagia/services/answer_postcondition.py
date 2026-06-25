@@ -621,6 +621,10 @@ async def _try_required_answer_evidence_repair(
     output_limit_retry: bool,
     fallback_text: str,
 ) -> GuardedAnswerResult | None:
+    # D10: a fast-mode/gate-skipped turn carries no retrieved answer evidence,
+    # so there is no required-evidence-use obligation to repair.
+    if _retrieval_is_fast_mode_equivalent(retrieval_diagnostics):
+        return None
     answer_evidence_diagnostics = _answer_evidence_diagnostics_for_context(
         composed_context=composed_context,
         retrieval_diagnostics=retrieval_diagnostics,
@@ -2295,12 +2299,39 @@ def _request_with_answer_support_context(
     return request.model_copy(update={"messages": messages})
 
 
+def _retrieval_is_fast_mode_equivalent(
+    retrieval_diagnostics: dict[str, Any] | None,
+) -> bool:
+    """Return True for fast-mode and adaptive-gate-skipped turns (D10).
+
+    Both answer from contract + transcript + prepared context without running
+    memory retrieval, so the guard must not place evidence obligations on them.
+    The signal is explicit (``fast_mode`` for fast/smart_fast, the
+    ``adaptive_gate`` block for a gate-skipped normal turn), never an inferred
+    default from missing diagnostics.
+    """
+    if not isinstance(retrieval_diagnostics, dict):
+        return False
+    if retrieval_diagnostics.get("fast_mode") is True:
+        return True
+    adaptive_gate = retrieval_diagnostics.get("adaptive_gate")
+    return (
+        isinstance(adaptive_gate, dict)
+        and adaptive_gate.get("fast_mode_equivalent") is True
+    )
+
+
 def _should_evaluate_abstention_legitimacy(
     *,
     retrieval_sufficiency: dict[str, Any] | None,
     retrieval_diagnostics: dict[str, Any] | None,
 ) -> bool:
     if not isinstance(retrieval_diagnostics, dict):
+        return False
+    # D10: a gate-skipped (or fast-mode) turn carries no retrieved evidence, so
+    # it is exempt from evidence-obligation/abstention-legitimacy evaluation,
+    # exactly like the fast path.
+    if _retrieval_is_fast_mode_equivalent(retrieval_diagnostics):
         return False
     need_detection = _need_detection_for_guard(retrieval_diagnostics)
     query_type = str(need_detection.get("query_type") or "")
@@ -2333,6 +2364,9 @@ def _should_attempt_supported_answer_repair(
     retrieval_diagnostics: dict[str, Any] | None,
 ) -> bool:
     if not isinstance(retrieval_diagnostics, dict):
+        return False
+    # D10: skip the supported-answer repair for fast-mode/gate-skipped turns.
+    if _retrieval_is_fast_mode_equivalent(retrieval_diagnostics):
         return False
     if _diagnostic_bool(retrieval_sufficiency, "would_abstain"):
         return False
@@ -2515,16 +2549,55 @@ def _supported_obligation_descriptions(
     return descriptions
 
 
+def _missing_members_obligation_description(
+    answer_support: dict[str, Any],
+) -> str | None:
+    """Name the known members that retrieved evidence did not cover.
+
+    Built from ``missing_slots[].display_text`` so the answer model is told an
+    exhaustive list is incomplete. Returns ``None`` when there is nothing to
+    report. This is intentionally independent of ``allowed_values`` so it still
+    fires when every member was dropped (empty ``allowed_values``).
+    """
+    coverage_state = str(answer_support.get("coverage_state") or "").strip()
+    if coverage_state not in {"partial", "insufficient"}:
+        return None
+    missing_slots = answer_support.get("missing_slots")
+    if not isinstance(missing_slots, list):
+        return None
+    display_texts: list[str] = []
+    for slot in missing_slots[:12]:
+        if not isinstance(slot, dict):
+            continue
+        display_text = str(slot.get("display_text") or "").strip()
+        if display_text:
+            display_texts.append(display_text)
+    display_texts = list(dict.fromkeys(display_texts))
+    if not display_texts:
+        return None
+    return (
+        "Known members not covered by retrieved evidence: "
+        + ", ".join(display_texts)
+        + "; state that this list is incomplete."
+    )
+
+
 def _answer_support_obligation_descriptions(
     retrieval_diagnostics: dict[str, Any],
 ) -> list[str]:
     answer_support = retrieval_diagnostics.get("answer_support")
     if not isinstance(answer_support, dict):
         return []
+    descriptions: list[str] = []
+    # Name the missing members BEFORE the allowed_values guard so this honesty
+    # signal still reaches the answer model when every member was dropped (empty
+    # allowed_values → coverage_state == "insufficient").
+    missing_members_obligation = _missing_members_obligation_description(answer_support)
+    if missing_members_obligation is not None:
+        descriptions.append(missing_members_obligation)
     allowed_values = answer_support.get("allowed_values")
     if not isinstance(allowed_values, list):
-        return []
-    descriptions: list[str] = []
+        return descriptions
     for item in allowed_values[:8]:
         if not isinstance(item, dict):
             continue
@@ -2544,12 +2617,15 @@ def _answer_support_obligation_descriptions(
             descriptions.append(f"Use supported value {display_text!r}")
         elif normalized_key:
             descriptions.append(f"Use supported value key {normalized_key!r}")
+    allowed_value_descriptions = (
+        descriptions[1:] if missing_members_obligation is not None else descriptions
+    )
     coverage_state = str(answer_support.get("coverage_state") or "").strip()
-    if coverage_state == "partial" and descriptions:
+    if coverage_state == "partial" and allowed_value_descriptions:
         descriptions.append(
             "State that the answer is the supported subset from retrieved evidence."
         )
-    if bool(answer_support.get("values_truncated")) and descriptions:
+    if bool(answer_support.get("values_truncated")) and allowed_value_descriptions:
         descriptions.append("The shown support values were truncated for prompt size.")
     return descriptions
 

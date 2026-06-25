@@ -47,6 +47,11 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 
 
+def _is_need_detection_card_purpose(purpose: object) -> bool:
+    value = str(purpose)
+    return value.startswith("need_detection_") and value.endswith("_card")
+
+
 class QueueProvider(LLMProvider):
     name = "queue-provider"
 
@@ -57,57 +62,25 @@ class QueueProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = request.metadata.get("purpose")
-        if purpose == "need_detection_anchor_review":
+        if _is_need_detection_card_purpose(purpose):
+            outputs = {
+                "need_detection_needs_card": "none",
+                "need_detection_language_card": "en\nen",
+                "need_detection_memory_card": "mixed",
+                "need_detection_exact_card": "no",
+                "need_detection_shape_card": "default",
+                "need_detection_facets_card": "none",
+                "need_detection_callback_card": "no",
+                "need_detection_search_words_card": "retry loop",
+            }
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps({"anchors": []}),
-            )
-        if purpose == "need_detection_unknown_only_contract_review":
-            return LLMCompletionResponse(
-                provider=self.name,
-                model=request.model,
-                output_text=json.dumps(
-                    {
-                        "is_exact_value_lookup": False,
-                        "exact_facets": [],
-                        "must_keep_terms": [],
-                        "quoted_phrases": [],
-                    }
-                ),
-            )
-        if purpose == "need_detection_multi_facet_exact_review":
-            return LLMCompletionResponse(
-                provider=self.name,
-                model=request.model,
-                output_text=json.dumps(
-                    {
-                        "has_multiple_obligations": False,
-                        "sub_queries": [],
-                    }
-                ),
+                output_text=outputs[str(purpose)],
             )
         if not self.outputs:
             raise AssertionError("No queued LLM output left for this test")
         output_text = self.outputs.pop(0)
-        if purpose == "need_detection":
-            payload = json.loads(output_text)
-            if isinstance(payload, list):
-                output_text = json.dumps(
-                    {
-                        "needs": payload,
-                        "temporal_range": None,
-                        "sub_queries": ["retry loop"],
-                        "sparse_query_hints": [
-                            {
-                                "sub_query_text": "retry loop",
-                                "fts_phrase": "retry loop",
-                            }
-                        ],
-                        "query_type": "default",
-                        "retrieval_levels": [0],
-                    }
-                )
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
@@ -878,9 +851,11 @@ def test_sidecar_ingest_source_seq_preserves_backfill_order(tmp_path: Path) -> N
 
 def test_chat_reply_runs_full_flow_and_returns_response(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
+    # First turn with no stored memories/contracts is an empty-clean cold start,
+    # so the pipeline composes an empty context and skips need detection. The
+    # only LLM call is chat_reply.
     provider = QueueProvider(
         [
-            json.dumps([]),
             "Check the retry guard first.",
         ]
     )
@@ -926,9 +901,11 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
     tmp_path: Path,
 ) -> None:
     app = create_app(_settings(tmp_path))
+    # First turn with no stored memories/contracts is an empty-clean cold start,
+    # so the pipeline composes an empty context and skips need detection. The
+    # only LLM call is chat_reply.
     provider = QueueProvider(
         [
-            json.dumps([]),
             "Attachment-aware reply.",
         ]
     )

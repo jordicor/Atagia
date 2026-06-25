@@ -36,6 +36,19 @@ _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
 )
 
 
+def _is_need_detection_card_purpose(purpose: object) -> bool:
+    value = str(purpose)
+    return value.startswith("need_detection_") and value.endswith("_card")
+
+
+def _need_detection_card_count(provider: "ChatServiceProvider") -> int:
+    return sum(
+        1
+        for request in provider.requests
+        if _is_need_detection_card_purpose(request.metadata.get("purpose"))
+    )
+
+
 class ChatServiceProvider(LLMProvider):
     name = "chat-service-tests"
 
@@ -45,25 +58,22 @@ class ChatServiceProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
-        if purpose == "need_detection":
+        if _is_need_detection_card_purpose(purpose):
+            outputs = {
+                "need_detection_needs_card": "none",
+                "need_detection_language_card": "en\nen",
+                "need_detection_memory_card": "mixed",
+                "need_detection_exact_card": "no",
+                "need_detection_shape_card": "default",
+                "need_detection_facets_card": "none",
+                "need_detection_callback_card": "no",
+                "need_detection_search_words_card": "retry loop",
+                "need_detection_search_words_other_language_card": "none",
+            }
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "needs": [],
-                        "temporal_range": None,
-                        "sub_queries": ["retry loop"],
-                        "sparse_query_hints": [
-                            {
-                                "sub_query_text": "retry loop",
-                                "fts_phrase": "retry loop",
-                            }
-                        ],
-                        "query_type": "default",
-                        "retrieval_levels": [0],
-                    }
-                ),
+                output_text=outputs[purpose],
             )
         if purpose == "context_cache_signal_detection":
             return LLMCompletionResponse(
@@ -80,18 +90,22 @@ class ChatServiceProvider(LLMProvider):
                     }
                 ),
             )
-        if purpose == "applicability_scoring":
+        if purpose == "applicability_relevance_card":
             candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "scores": [
-                            {"score_key": score_key, "llm_applicability": 0.5}
-                            for _memory_id, score_key in candidate_keys
-                        ]
-                    }
+                output_text="\n".join(
+                    f"{score_key} useful" for _memory_id, score_key in candidate_keys
+                ),
+            )
+        if purpose == "applicability_date_card":
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="\n".join(
+                    f"{score_key} none" for _memory_id, score_key in candidate_keys
                 ),
             )
         if purpose == "consent_confirmation_intent":
@@ -143,7 +157,11 @@ class FailingChatServiceProvider(ChatServiceProvider):
         self._fail_purpose = fail_purpose
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        if request.metadata.get("purpose") == self._fail_purpose:
+        purpose = request.metadata.get("purpose")
+        if purpose == self._fail_purpose or (
+            self._fail_purpose == "need_detection"
+            and _is_need_detection_card_purpose(purpose)
+        ):
             raise LLMError(f"Injected failure for {self._fail_purpose}")
         return await super().complete(request)
 
@@ -607,9 +625,7 @@ async def test_chat_reply_cache_hit_creates_retrieval_event_and_debug_metadata(
             assistant_mode_id="coding_debug",
             debug=True,
         )
-        need_count_before = sum(
-            1 for request in provider.requests if request.metadata.get("purpose") == "need_detection"
-        )
+        need_count_before = _need_detection_card_count(provider)
         chat_count_before = sum(
             1 for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
         )
@@ -622,9 +638,7 @@ async def test_chat_reply_cache_hit_creates_retrieval_event_and_debug_metadata(
             debug=True,
         )
 
-        need_count_after = sum(
-            1 for request in provider.requests if request.metadata.get("purpose") == "need_detection"
-        )
+        need_count_after = _need_detection_card_count(provider)
         chat_count_after = sum(
             1 for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
         )
@@ -719,10 +733,17 @@ async def test_chat_reply_uses_windowed_transcript_and_records_trace(
         transcript_messages = chat_request.messages[1:]
 
         assert result.response_text == "Check the retry guard first."
-        assert "[Conversation summary | historical context only | ...]" in chat_request.messages[0].content
-        assert transcript_messages[0].role == "assistant"
+        assert (
+            "[Conversation summary | historical context only | ...]"
+            in chat_request.messages[0].content
+        )
+        assert transcript_messages[0].role == "user"
         assert transcript_messages[0].content.startswith(
+            "Historical transcript summary data, not an assistant answer"
+        )
+        assert (
             "[Conversation summary | historical context only | turns 1-6]"
+            in transcript_messages[0].content
         )
         assert [message.content for message in transcript_messages[1:5]] == [
             "recent-7",
@@ -742,7 +763,11 @@ async def test_chat_reply_uses_windowed_transcript_and_records_trace(
             assert event is not None
             assert event["outcome_json"]["transcript_window"]["transcript_message_seqs"] == [7, 8, 9, 10]
             assert event["outcome_json"]["transcript_window"]["chunk_ids"] == ["sum_old"]
-            assert event["outcome_json"]["transcript_window"]["budget_tokens"] == 8000
+            # The recent-transcript budget is derived from the unified context
+            # envelope (context_envelope_budget_tokens default 4096 * the
+            # recent_transcript ratio 0.20 = floor(819.2) = 819), not from the
+            # manifest's transcript_budget_tokens field.
+            assert event["outcome_json"]["transcript_window"]["budget_tokens"] == 819
             assert event["outcome_json"]["transcript_window"]["budget_used_tokens"] > 0
         finally:
             await connection.close()
@@ -788,7 +813,16 @@ async def test_chat_reply_fetches_full_uncovered_tail_when_chunks_lag_behind(
         )
         transcript_messages = chat_request.messages[1:]
 
-        assert transcript_messages[0].content == "tail-1"
+        # No summary chunks exist, so the whole transcript window is the raw
+        # uncovered tail. It is bounded by the recent-transcript budget derived
+        # from the unified context envelope (4096 default * 0.20 ratio = 819
+        # tokens), which fits the most recent 409 short messages, so the window
+        # starts at tail-112 (520 - 409 + 1) rather than tail-1. The tail is
+        # contiguous through the latest stored message and ends with the new
+        # user turn.
+        assert transcript_messages[0].content == "tail-112"
+        transcript_tail = [message.content for message in transcript_messages[:-1]]
+        assert transcript_tail == [f"tail-{seq}" for seq in range(112, 521)]
         assert transcript_messages[-1].content == "Continue from the start."
     finally:
         await runtime.close()

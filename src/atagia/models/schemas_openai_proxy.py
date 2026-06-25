@@ -41,6 +41,9 @@ class OpenAIChatCompletionRequest(BaseModel):
     # OpenAI-schema-tolerant (the model already allows extra fields); an
     # explicit field gives enum validation when callers set it directly.
     response_mode: ResponseMode | None = None
+    # Atagia extension: optional per-request adaptive retrieval gate flag,
+    # orthogonal to ``response_mode``. ``None`` falls back to the global default.
+    adaptive_retrieval: bool | None = None
 
 
 class OpenAIModelObject(BaseModel):

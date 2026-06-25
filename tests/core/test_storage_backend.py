@@ -185,6 +185,40 @@ async def test_stream_pending_messages_can_be_reclaimed_before_ack() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_defer_requeues_message_after_delay() -> None:
+    backend = InProcessBackend()
+    await backend.stream_ensure_group("atagia:test", "workers")
+    message_id = await backend.stream_add("atagia:test", {"job_id": "job_1"})
+    first_read = await backend.stream_read(
+        "atagia:test",
+        "workers",
+        "consumer-1",
+        count=1,
+        block_ms=0,
+    )
+
+    await backend.stream_defer(
+        "atagia:test",
+        "workers",
+        message_id,
+        first_read[0].payload,
+        delay_seconds=0,
+    )
+    redelivered = await backend.stream_read(
+        "atagia:test",
+        "workers",
+        "consumer-1",
+        count=1,
+        block_ms=0,
+    )
+
+    assert backend._stream_pending[("atagia:test", "workers")]
+    assert redelivered[0].message_id != message_id
+    assert redelivered[0].payload == {"job_id": "job_1"}
+    assert redelivered[0].delivery_count == 1
+
+
+@pytest.mark.asyncio
 async def test_stream_drain_waits_for_pending_ack() -> None:
     backend = InProcessBackend()
     await backend.stream_ensure_group("atagia:test", "workers")

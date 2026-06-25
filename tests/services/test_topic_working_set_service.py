@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 
 import pytest
@@ -32,18 +31,18 @@ MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 class TopicProvider(LLMProvider):
     name = "topic-service"
 
-    def __init__(self, payloads: list[dict[str, object]]) -> None:
-        self.payloads = list(payloads)
+    def __init__(self, outputs: list[str]) -> None:
+        self.outputs = list(outputs)
         self.requests: list[LLMCompletionRequest] = []
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
-        if not self.payloads:
+        if not self.outputs:
             raise AssertionError("No topic payload queued")
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
-            output_text=json.dumps(self.payloads.pop(0)),
+            output_text=self.outputs.pop(0),
         )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -78,7 +77,7 @@ def _settings(**overrides: object) -> Settings:
     return Settings(**{**asdict(base), **overrides})
 
 
-async def _runtime(payloads: list[dict[str, object]], *, message_count: int = 4):
+async def _runtime(outputs: list[str], *, message_count: int = 4):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 5, 1, 4, 0, tzinfo=timezone.utc))
     await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
@@ -100,7 +99,7 @@ async def _runtime(payloads: list[dict[str, object]], *, message_count: int = 4)
                 {},
             )
         )
-    provider = TopicProvider(payloads)
+    provider = TopicProvider(outputs)
     service = TopicWorkingSetRefreshService(
         connection=connection,
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
@@ -129,20 +128,17 @@ async def test_topic_refresh_waits_until_missing_topic_reaches_message_threshold
 
 @pytest.mark.asyncio
 async def test_topic_refresh_creates_topic_and_records_processed_seq_bounds() -> None:
-    payload = {
-        "actions": [
-            {
-                "action": "create",
-                "title": "Trip planning",
-                "summary": "Keep the current travel-planning thread oriented.",
-                "active_goal": "Decide the next booking step.",
-                "source_message_ids": ["msg_1", "msg_4"],
-                "confidence": 0.82,
-            }
-        ],
-        "nothing_to_update": False,
-    }
-    connection, service, provider, messages = await _runtime([payload], message_count=4)
+    outputs = [
+        "none",
+        "track msg_1 msg_4",
+        (
+            "title: Trip planning\n"
+            "summary: Keep the current travel-planning thread oriented.\n"
+            "goal: Decide the next booking step."
+        ),
+        "tmp1 ordinary 0 0.82",
+    ]
+    connection, service, provider, messages = await _runtime(outputs, message_count=4)
     try:
         result = await service.maybe_refresh_after_message(
             user_id="usr_1",
@@ -154,8 +150,15 @@ async def test_topic_refresh_creates_topic_and_records_processed_seq_bounds() ->
 
         assert result.refreshed is True
         assert result.processed_message_count == 4
-        assert len(provider.requests) == 1
-        assert provider.requests[0].metadata["purpose"] == "topic_working_set_update"
+        assert [
+            request.metadata["purpose"]
+            for request in provider.requests
+        ] == [
+            "topic_working_set_route_card",
+            "topic_working_set_route_card",
+            "topic_working_set_content_card",
+            "topic_working_set_boundary_card",
+        ]
         assert snapshot["active_topics"][0]["title"] == "Trip planning"
         assert snapshot["active_topics"][0]["source_message_start_seq"] == 1
         assert snapshot["active_topics"][0]["source_message_end_seq"] == 4

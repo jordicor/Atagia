@@ -663,6 +663,7 @@ async def chat_reply(
             authenticated_user_privilege_level=payload.authenticated_user_privilege_level,
             authenticated_user_is_atagia_master=payload.authenticated_user_is_atagia_master,
             response_mode=payload.response_mode,
+            adaptive_retrieval=payload.adaptive_retrieval,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -831,6 +832,7 @@ async def get_sidecar_context(
             authenticated_user_privilege_level=payload.authenticated_user_privilege_level,
             authenticated_user_is_atagia_master=payload.authenticated_user_is_atagia_master,
             response_mode=payload.response_mode,
+            adaptive_retrieval=payload.adaptive_retrieval,
         )
     except ConversationNotFoundError:
         raise HTTPException(

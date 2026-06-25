@@ -43,6 +43,19 @@ _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
 )
 
 
+def _label_for_score(score: object) -> str:
+    value = float(score)
+    if value <= 0.10:
+        return "drop"
+    if value <= 0.40:
+        return "weak"
+    if value <= 0.65:
+        return "useful"
+    if value <= 0.85:
+        return "strong"
+    return "exact"
+
+
 class MultilingualPipelineProvider(LLMProvider):
     name = "multilingual-pipeline-tests"
 
@@ -50,25 +63,17 @@ class MultilingualPipelineProvider(LLMProvider):
         self,
         *,
         need_response: dict[str, object] | None = None,
-        anchor_review_response: dict[str, object] | None = None,
         score_map: dict[str, float] | None = None,
     ) -> None:
         self.need_response = need_response or {
             "needs": [],
             "temporal_range": None,
-            "sub_queries": [
-                "¿Cuál es la dosis actual de amlodipino de Rosa?",
-                "amlodipine dose for Rosa",
-            ],
+            "sub_queries": ["¿Cuál es la dosis actual de amlodipino de Rosa?"],
             "sparse_query_hints": [
                 {
                     "sub_query_text": "¿Cuál es la dosis actual de amlodipino de Rosa?",
                     "fts_phrase": "amlodipino",
-                },
-                {
-                    "sub_query_text": "amlodipine dose for Rosa",
-                    "fts_phrase": "amlodipine 10 mg",
-                    "must_keep_terms": ["amlodipine", "10 mg"],
+                    "must_keep_terms": ["Rosa", "amlodipino"],
                 },
             ],
             "query_language": "es",
@@ -78,66 +83,99 @@ class MultilingualPipelineProvider(LLMProvider):
             "exact_recall_needed": True,
             "exact_facets": ["medication"],
         }
-        # Structured anchors and translated aliases now come from the
-        # conditional anchor review, not the lean primary plan.
-        self.anchor_review_response = anchor_review_response or {
-            "anchors": [
-                {
-                    "sub_query_text": "¿Cuál es la dosis actual de amlodipino de Rosa?",
-                    "anchor_type": "proper_name",
-                    "original_surface": "Rosa",
-                    "preserve_verbatim": True,
-                    "confidence": 0.95,
-                },
-                {
-                    "sub_query_text": "amlodipine dose for Rosa",
-                    "anchor_type": "concept",
-                    "original_surface": "amlodipino",
-                    "normalized_surface": "amlodipino",
-                    "aliases": [
-                        {
-                            "surface": "amlodipine",
-                            "alias_language": "en",
-                            "alias_kind": "translation",
-                            "confidence": 0.84,
-                        }
-                    ],
-                    "confidence": 0.88,
-                },
-            ],
-        }
         self.score_map = dict(score_map or {})
         self.requests: list[LLMCompletionRequest] = []
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
-        if purpose == "need_detection":
+        if purpose.startswith("need_detection_") and purpose.endswith("_card"):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(self.need_response),
+                output_text=self._need_card_output(purpose),
             )
-        if purpose == "need_detection_anchor_review":
-            return LLMCompletionResponse(
-                provider=self.name,
-                model=request.model,
-                output_text=json.dumps(self.anchor_review_response),
-            )
-        if purpose == "applicability_scoring":
+        if purpose == "applicability_relevance_card":
             candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
-            payload = {
-                "scores": [
-                    {"score_key": score_key, "llm_applicability": self.score_map.get(memory_id, 0.5)}
-                    for memory_id, score_key in candidate_keys
-                ],
-            }
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(payload),
+                output_text="\n".join(
+                    f"{score_key} {_label_for_score(self.score_map.get(memory_id, 0.5))}"
+                    for memory_id, score_key in candidate_keys
+                ),
+            )
+        if purpose == "applicability_date_card":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="\n".join(
+                    f"{score_key} none"
+                    for _memory_id, score_key in _CANDIDATE_SCORE_KEY_PATTERN.findall(
+                        request.messages[1].content
+                    )
+                ),
             )
         raise AssertionError(f"Unexpected purpose: {purpose}")
+
+    def _need_card_output(self, purpose: str) -> str:
+        if purpose == "need_detection_needs_card":
+            needs = self.need_response.get("needs")
+            if not isinstance(needs, list) or not needs:
+                return "none"
+            labels = [
+                str(item.get("need_type"))
+                for item in needs
+                if isinstance(item, dict) and item.get("need_type")
+            ]
+            return "\n".join(labels) if labels else "none"
+        if purpose == "need_detection_language_card":
+            return "\n".join(
+                [
+                    str(self.need_response.get("query_language") or "en"),
+                    str(self.need_response.get("answer_language") or "en"),
+                ]
+            )
+        if purpose == "need_detection_memory_card":
+            return str(self.need_response.get("memory_dependence") or "mixed")
+        if purpose == "need_detection_exact_card":
+            return "yes" if self.need_response.get("exact_recall_needed") else "no"
+        if purpose == "need_detection_shape_card":
+            return {
+                "slot_fill": "slot",
+                "broad_list": "list",
+                "temporal": "time",
+                "default": "default",
+            }.get(str(self.need_response.get("query_type") or "default"), "default")
+        if purpose == "need_detection_facets_card":
+            raw_facets = self.need_response.get("exact_facets")
+            if not isinstance(raw_facets, list) or not raw_facets:
+                return "none"
+            mapping = {"other_verbatim": "wording"}
+            return "\n".join(mapping.get(str(facet), str(facet)) for facet in raw_facets)
+        if purpose == "need_detection_callback_card":
+            return "yes" if self.need_response.get("callback_bias") else "no"
+        if purpose == "need_detection_search_words_card":
+            terms: list[str] = []
+            first_hint = next(
+                (
+                    hint
+                    for hint in self.need_response.get("sparse_query_hints") or []
+                    if isinstance(hint, dict)
+                ),
+                None,
+            )
+            if first_hint is not None:
+                for field in ("must_keep_terms", "quoted_phrases"):
+                    values = first_hint.get(field)
+                    if isinstance(values, list):
+                        terms.extend(str(value) for value in values if str(value).strip())
+                if not terms and first_hint.get("fts_phrase"):
+                    terms.append(str(first_hint["fts_phrase"]))
+            return "\n".join(terms[:6]) if terms else "none"
+        if purpose == "need_detection_search_words_other_language_card":
+            return "none"
+        raise AssertionError(f"Unexpected card purpose: {purpose}")
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError("Embeddings are not used in retrieval pipeline tests")
@@ -247,15 +285,31 @@ async def _seed_memory(
 
 
 def _score_request_memory_ids(provider: MultilingualPipelineProvider) -> list[str]:
+    memory_ids: list[str] = []
     for request in provider.requests:
-        if str(request.metadata.get("purpose")) != "applicability_scoring":
+        if str(request.metadata.get("purpose")) != "applicability_relevance_card":
             continue
-        return _MEMORY_ID_PATTERN.findall(request.messages[1].content)
-    return []
+        memory_ids.extend(_MEMORY_ID_PATTERN.findall(request.messages[1].content))
+    return memory_ids
+
+
+def _language_card_prompt(provider: MultilingualPipelineProvider) -> str:
+    return next(
+        request.messages[1].content
+        for request in provider.requests
+        if str(request.metadata.get("purpose")) == "need_detection_language_card"
+    )
+
+
+def _saved_language_profile_block(prompt: str) -> str:
+    return prompt.split("Saved memory languages:\n", 1)[1].split(
+        "\nUser communication profile:",
+        1,
+    )[0]
 
 
 @pytest.mark.asyncio
-async def test_pipeline_bridges_spanish_query_to_english_memory_via_profile_and_translated_anchor_variant() -> None:
+async def test_pipeline_uses_language_profile_with_parallel_cards_and_literal_anchors() -> None:
     message_text = "¿Cuál es la dosis actual de amlodipino de Rosa?"
     provider = MultilingualPipelineProvider(
         score_map={"mem_english": 0.94},
@@ -267,7 +321,7 @@ async def test_pipeline_bridges_spanish_query_to_english_memory_via_profile_and_
         await _seed_memory(
             memories,
             memory_id="mem_english",
-            canonical_text="amlodipine 10 mg on Tuesdays",
+            canonical_text="Rosa toma amlodipino 10 mg los martes.",
             scope=MemoryScope.CONVERSATION,
             language_codes=["en"],
         )
@@ -309,17 +363,8 @@ async def test_pipeline_bridges_spanish_query_to_english_memory_via_profile_and_
             trace=trace,
         )
 
-        need_request = next(
-            request
-            for request in provider.requests
-            if str(request.metadata.get("purpose")) == "need_detection"
-        )
-        prompt = need_request.messages[1].content
-        assert "<content_language_profile>" in prompt
-        profile_block = prompt.split("<content_language_profile>\n", 1)[1].split(
-            "\n</content_language_profile>",
-            1,
-        )[0]
+        prompt = _language_card_prompt(provider)
+        profile_block = _saved_language_profile_block(prompt)
         assert profile_block == "\n".join(
             [
                 "en: 1 memories (last seen 2026-04-05)",
@@ -331,9 +376,8 @@ async def test_pipeline_bridges_spanish_query_to_english_memory_via_profile_and_
         assert "amlodipine" not in profile_block
         assert [plan.text for plan in result.retrieval_plan.sub_query_plans] == [
             "¿Cuál es la dosis actual de amlodipino de Rosa?",
-            "amlodipine dose for Rosa",
         ]
-        assert "amlodipine 10 mg" in " ".join(result.retrieval_plan.fts_queries)
+        assert "amlodipino" in " ".join(result.retrieval_plan.fts_queries)
         assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_english"]
         assert [candidate.memory_id for candidate in result.scored_candidates] == ["mem_english"]
         assert result.composed_context.selected_memory_ids == ["mem_english"]
@@ -357,26 +401,15 @@ async def test_pipeline_bridges_spanish_query_to_english_memory_via_profile_and_
             },
         ]
         assert [anchor.anchor_type for anchor in trace.need_detection.anchors] == [
-            "proper_name",
-            "concept",
+            "unknown",
+            "unknown",
         ]
         assert trace.need_detection.anchors[0].preserve_verbatim is True
-        assert trace.need_detection.anchors[1].aliases[0].surface == "amlodipine"
-        assert trace.need_detection.anchors[1].aliases[0].non_evidential is True
-        assert len(trace.need_detection.alias_groups) == 1
-        alias_group = trace.need_detection.alias_groups[0]
-        assert alias_group.sub_query_text == "amlodipine dose for Rosa"
-        assert alias_group.anchor_type == "concept"
-        assert alias_group.original_surface == "amlodipino"
-        assert alias_group.anchor_confidence == 0.88
-        assert alias_group.anchor_non_evidential is True
-        assert len(alias_group.aliases) == 1
-        alias = alias_group.aliases[0]
-        assert alias.surface == "amlodipine"
-        assert alias.alias_kind == "translation"
-        assert alias.alias_language == "en"
-        assert alias.confidence == 0.84
-        assert alias.non_evidential is True
+        assert [anchor.original_surface for anchor in trace.need_detection.anchors] == [
+            "Rosa",
+            "amlodipino",
+        ]
+        assert trace.need_detection.alias_groups == []
         assert trace.candidate_search is not None
         fts_execution_sources = [
             execution.source
@@ -410,17 +443,6 @@ async def test_pipeline_traces_unknown_only_language_profile_without_bridge_targ
             "exact_recall_needed": True,
             "exact_facets": ["location"],
         },
-        anchor_review_response={
-            "anchors": [
-                {
-                    "sub_query_text": "dirección del nuevo apartamento de Ben",
-                    "anchor_type": "person",
-                    "original_surface": "Ben",
-                    "preserve_verbatim": True,
-                    "confidence": 0.9,
-                }
-            ],
-        },
     )
     connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
         provider=provider
@@ -448,18 +470,9 @@ async def test_pipeline_traces_unknown_only_language_profile_without_bridge_targ
             trace=trace,
         )
 
-        need_request = next(
-            request
-            for request in provider.requests
-            if str(request.metadata.get("purpose")) == "need_detection"
-        )
-        prompt = need_request.messages[1].content
-        profile_block = prompt.split("<content_language_profile>\n", 1)[1].split(
-            "\n</content_language_profile>",
-            1,
-        )[0]
+        prompt = _language_card_prompt(provider)
+        profile_block = _saved_language_profile_block(prompt)
         assert profile_block == "unknown: 1 memories (last seen 2026-04-05)"
-        assert "It is not a bridge target" in prompt
         assert trace.need_detection is not None
         assert [
             row.model_dump(mode="json")
@@ -471,9 +484,7 @@ async def test_pipeline_traces_unknown_only_language_profile_without_bridge_targ
                 "last_seen_at": "2026-04-05T12:00:00+00:00",
             }
         ]
-        assert trace.need_detection.sub_queries == [
-            "dirección del nuevo apartamento de Ben"
-        ]
+        assert trace.need_detection.sub_queries == [message_text]
         assert trace.need_detection.alias_groups == []
     finally:
         await connection.close()
@@ -499,24 +510,6 @@ async def test_phase8_need_detection_trace_language_profile_is_content_free_and_
             "retrieval_levels": [0],
             "exact_recall_needed": False,
             "exact_facets": [],
-        },
-        anchor_review_response={
-            "anchors": [
-                {
-                    "sub_query_text": "documento alquiler",
-                    "anchor_type": "concept",
-                    "original_surface": "documento alquiler",
-                    "aliases": [
-                        {
-                            "surface": "lease folder bridge marker",
-                            "alias_language": "de",
-                            "alias_kind": "translation",
-                            "confidence": 0.82,
-                        }
-                    ],
-                    "confidence": 0.88,
-                }
-            ],
         },
     )
     connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
@@ -547,7 +540,7 @@ async def test_phase8_need_detection_trace_language_profile_is_content_free_and_
         )
 
         assert trace.need_detection is not None
-        assert trace.need_detection.alias_groups[0].aliases[0].alias_language == "de"
+        assert trace.need_detection.alias_groups == []
         profile_rows = [
             row.model_dump(mode="json")
             for row in trace.need_detection.content_language_profile
@@ -568,7 +561,6 @@ async def test_phase8_need_detection_trace_language_profile_is_content_free_and_
             "mem_profile_en",
             "canonical",
             "lease profile marker",
-            "lease folder bridge marker",
             "documento alquiler",
         ]:
             assert forbidden not in profile_json
@@ -578,7 +570,7 @@ async def test_phase8_need_detection_trace_language_profile_is_content_free_and_
 
 
 @pytest.mark.asyncio
-async def test_pipeline_runtime_alias_lane_recovers_without_using_alias_as_evidence() -> None:
+async def test_pipeline_literal_anchor_lane_recovers_without_alias_evidence() -> None:
     message_text = "¿Cuál es la dosis actual de amlodipino?"
     provider = MultilingualPipelineProvider(
         need_response={
@@ -599,25 +591,6 @@ async def test_pipeline_runtime_alias_lane_recovers_without_using_alias_as_evide
             "exact_recall_needed": True,
             "exact_facets": ["medication"],
         },
-        anchor_review_response={
-            "anchors": [
-                {
-                    "sub_query_text": message_text,
-                    "anchor_type": "concept",
-                    "original_surface": "amlodipino",
-                    "normalized_surface": "amlodipino",
-                    "aliases": [
-                        {
-                            "surface": "amlodipine",
-                            "alias_language": "en",
-                            "alias_kind": "translation",
-                            "confidence": 0.84,
-                        }
-                    ],
-                    "confidence": 0.88,
-                }
-            ],
-        },
         score_map={"mem_english": 0.94},
     )
     connection, memories, _contracts, pipeline, provider, resolved_policy, context = await _build_runtime(
@@ -627,7 +600,7 @@ async def test_pipeline_runtime_alias_lane_recovers_without_using_alias_as_evide
         await _seed_memory(
             memories,
             memory_id="mem_english",
-            canonical_text="Rosa takes amlodipine 10 mg on Tuesdays.",
+            canonical_text="Rosa toma amlodipino 10 mg los martes.",
             scope=MemoryScope.CONVERSATION,
             language_codes=["en"],
         )
@@ -649,7 +622,7 @@ async def test_pipeline_runtime_alias_lane_recovers_without_using_alias_as_evide
 
         assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_english"]
         assert result.composed_context.selected_memory_ids == ["mem_english"]
-        assert "Rosa takes amlodipine 10 mg on Tuesdays." in result.composed_context.memory_block
+        assert "Rosa toma amlodipino 10 mg los martes." in result.composed_context.memory_block
         assert "alias_anchor" not in result.composed_context.memory_block
         assert "runtime_alias_or" not in result.composed_context.memory_block
         assert trace.candidate_search is not None
@@ -658,15 +631,7 @@ async def test_pipeline_runtime_alias_lane_recovers_without_using_alias_as_evide
             for counts in trace.candidate_search.per_subquery_counts
             for execution in counts.fts_query_executions
         ]
-        assert any(
-            execution.source == "alias_anchor"
-            and execution.kind == "runtime_alias_or"
-            and execution.query == "amlodipine"
-            and execution.raw_rows == 1
-            and execution.candidates == 1
-            and execution.non_evidential is True
-            for execution in executions
-        )
+        assert not any(execution.source == "alias_anchor" for execution in executions)
         assert not any(execution.kind == "corpus_near_or" for execution in executions)
     finally:
         await connection.close()
@@ -713,16 +678,8 @@ async def test_pipeline_language_profile_respects_active_space_context() -> None
             conversation_messages=[{"role": "user", "text": message_text}],
         )
 
-        need_request = next(
-            request
-            for request in provider.requests
-            if str(request.metadata.get("purpose")) == "need_detection"
-        )
-        prompt = need_request.messages[1].content
-        profile_block = prompt.split("<content_language_profile>\n", 1)[1].split(
-            "\n</content_language_profile>",
-            1,
-        )[0]
+        prompt = _language_card_prompt(provider)
+        profile_block = _saved_language_profile_block(prompt)
         assert profile_block == "en: 1 memories (last seen 2026-04-05)"
         assert "es:" not in profile_block
     finally:

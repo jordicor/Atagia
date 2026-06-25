@@ -3278,6 +3278,34 @@ def test_exact_recall_fts_queries_add_anchor_only_and_without_changing_default_s
     ]
 
 
+def test_exact_recall_preserves_broad_or_when_noisy_precise_hints_fill_budget() -> None:
+    specs = build_retrieval_fts_query_specs(
+        "did jamie initially share information about",
+        quoted_phrases=["dr nguyen", "march 12th", "february 2nd"],
+        must_keep_terms=[
+            "Jamie",
+            "allergy",
+            "Dr Nguyen",
+            "Taylor",
+            "March 12th",
+            "February 2nd",
+        ],
+        exact_recall=True,
+    )
+
+    assert [(spec.query, spec.kind) for spec in specs] == [
+        ('"dr nguyen"', "quoted_phrase"),
+        ('"march 12th"', "quoted_phrase"),
+        ('"february 2nd"', "quoted_phrase"),
+        ("did jamie initially share information about", "sparse_and"),
+        (
+            "did OR jamie OR initially OR share OR information OR about OR allergy "
+            "OR dr OR nguyen OR taylor OR march OR 12th OR february OR 2nd",
+            "broad_or",
+        ),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_content_bearing_query_finds_candidates_via_or_fallback() -> None:
     """Integration: seed memories and verify a content-bearing query finds them."""

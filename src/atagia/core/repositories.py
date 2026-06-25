@@ -3840,13 +3840,16 @@ class MemoryObjectRepository(BaseRepository):
                 if allow_cross_conversation_chat and cross_chat:
                     clauses.append(
                         f"({prefix}scope_canonical = 'chat' "
-                        f"AND {prefix}user_persona_id IS ?)"
+                        f"AND ({prefix}user_persona_id IS ? "
+                        f"OR ({prefix}user_persona_id IS NULL "
+                        f"AND {prefix}conversation_id = ?)))"
                     )
-                    parameters.append(user_persona_id)
+                    parameters.extend([user_persona_id, conversation_id])
                 else:
                     clauses.append(
                         f"({prefix}scope_canonical = 'chat' "
-                        f"AND {prefix}user_persona_id IS ? "
+                        f"AND ({prefix}user_persona_id IS ? "
+                        f"OR {prefix}user_persona_id IS NULL) "
                         f"AND {prefix}conversation_id = ?)"
                     )
                     parameters.extend([user_persona_id, conversation_id])

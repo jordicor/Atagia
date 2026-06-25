@@ -14,6 +14,7 @@ class ModelProfile:
     default_thinking_level: str | None = None
     temperature_default: float | None = None
     temperature_floor: float | None = None
+    omit_temperature: bool = False
     extra_body: dict[str, Any] | None = None
     extra_kwargs: dict[str, Any] | None = None
 
@@ -118,6 +119,50 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         },
         default_thinking_level="none",
         extra_body={"reasoning": {}},
+    ),
+    "openrouter/minimax/minimax-m3": ModelProfile(
+        thinking_level_map={
+            "none": "none",
+            "minimal": "none",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "high",
+        },
+        default_thinking_level="none",
+        extra_body={"reasoning": {}},
+    ),
+    "minimax/MiniMax-M3": ModelProfile(
+        thinking_level_map={
+            "none": "disabled",
+            "minimal": "disabled",
+            "low": "adaptive",
+            "medium": "adaptive",
+            "high": "adaptive",
+            "xhigh": "adaptive",
+        },
+        default_thinking_level="none",
+        extra_body={"thinking": {"type": "disabled"}},
+    ),
+    "minimax/MiniMax-M2.7-highspeed": ModelProfile(
+        thinking_level_map={
+            "none": "disabled",
+            "minimal": "disabled",
+            "low": "adaptive",
+            "medium": "adaptive",
+            "high": "adaptive",
+            "xhigh": "adaptive",
+        },
+        default_thinking_level="none",
+        extra_body={"thinking": {"type": "disabled"}},
+    ),
+    "kimi/kimi-k2.7-code": ModelProfile(
+        default_thinking_level="none",
+        omit_temperature=True,
+    ),
+    "kimi/kimi-k2.7-code-highspeed": ModelProfile(
+        default_thinking_level="none",
+        omit_temperature=True,
     ),
     "openrouter/openai/gpt-5.5": ModelProfile(
         thinking_level_map={

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from benchmarks.atagia_bench.adapter import AtagiaBenchQuestion
 from benchmarks.atagia_bench.runner import AtagiaBenchRunner
 from benchmarks.source_evidence import source_evidence_from_turns
+from benchmarks.source_evidence import normalize_evidence_turn_ids
+from benchmarks.source_evidence import validate_evidence_turn_ids
 
 
 @dataclass
@@ -17,6 +19,24 @@ class _Turn:
     timestamp: str
     text: str
     session_id: str = ""
+    metadata: dict[str, object] | None = None
+    attachments: list[dict[str, object]] | None = None
+
+
+def test_normalize_evidence_turn_ids_splits_structured_citation_strings() -> None:
+    evidence_turn_ids = normalize_evidence_turn_ids(
+        ["D8:6; D9:17", "D9:1 D4:4 D4:6", "D:11:26", "D30:05"]
+    )
+
+    assert evidence_turn_ids == [
+        "D8:6",
+        "D9:17",
+        "D9:1",
+        "D4:4",
+        "D4:6",
+        "D11:26",
+        "D30:5",
+    ]
 
 
 def test_source_evidence_from_turns_uses_official_evidence_order() -> None:
@@ -46,6 +66,75 @@ def test_source_evidence_from_turns_uses_official_evidence_order() -> None:
     assert [item["turn_id"] for item in evidence] == ["t1", "t2"]
     assert evidence[1]["timestamp"] == "2025-12-02T11:07:00"
     assert evidence[1]["text"] == "She is due in May."
+
+
+def test_source_evidence_from_turns_includes_caption_attachment_text() -> None:
+    turns = [
+        _Turn(
+            turn_id="D1:1",
+            role="user",
+            speaker="Rosa",
+            timestamp="2025-12-02T11:07:00",
+            text="Look at this.",
+            session_id="session_1",
+            metadata={"blip_caption": "a dog-shaped cup"},
+            attachments=[
+                {
+                    "content_text": (
+                        "Visual description of attached image: a dog-shaped cup"
+                    )
+                }
+            ],
+        )
+    ]
+
+    evidence = source_evidence_from_turns(
+        evidence_turn_ids=["D1:1"],
+        turns=turns,
+        conversation_id="conv",
+    )
+
+    assert evidence == [
+        {
+            "turn_id": "D1:1",
+            "conversation_id": "conv",
+            "timestamp": "2025-12-02T11:07:00",
+            "speaker": "Rosa",
+            "role": "user",
+            "text": "Look at this.",
+            "session_id": "session_1",
+            "blip_caption": "a dog-shaped cup",
+            "attachment_text": (
+                "Visual description of attached image: a dog-shaped cup"
+            ),
+        }
+    ]
+
+
+def test_validate_evidence_turn_ids_reports_bad_question() -> None:
+    turns = [
+        _Turn(
+            turn_id="D1:1",
+            role="user",
+            speaker="Rosa",
+            timestamp="2025-12-02T11:07:00",
+            text="Known evidence.",
+        )
+    ]
+
+    try:
+        validate_evidence_turn_ids(
+            evidence_turn_ids=["D1:1", "D1:2"],
+            turns=turns,
+            dataset_name="TestBench",
+            question_id="test-q1",
+            conversation_id="conv",
+        )
+    except ValueError as exc:
+        assert "TestBench question test-q1" in str(exc)
+        assert "D1:2" in str(exc)
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("Expected unresolved evidence validation error")
 
 
 def test_atagia_bench_grade_context_records_source_evidence_without_memory() -> None:

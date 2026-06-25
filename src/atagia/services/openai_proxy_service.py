@@ -90,6 +90,7 @@ class OpenAIProxyIdentity:
     confirmation_strategy: str | None = None
     memory_privacy_mode: str | None = None
     response_mode: str | None = None
+    adaptive_retrieval: bool | None = None
 
 
 @dataclass(slots=True)
@@ -137,6 +138,7 @@ class OpenAIProxyService:
         confirmation_strategy_header: str | None = None,
         memory_privacy_mode_header: str | None = None,
         response_mode_header: str | None = None,
+        adaptive_retrieval_header: str | None = None,
     ) -> dict[str, Any]:
         self._validate_model(request)
         completion_id = _completion_id()
@@ -167,6 +169,7 @@ class OpenAIProxyService:
             confirmation_strategy_header=confirmation_strategy_header,
             memory_privacy_mode_header=memory_privacy_mode_header,
             response_mode_header=response_mode_header,
+            adaptive_retrieval_header=adaptive_retrieval_header,
         )
         latest_user_text = _latest_user_text(request.messages)
         context = await self._context_for_turn_fail_open(identity, latest_user_text)
@@ -209,6 +212,7 @@ class OpenAIProxyService:
         confirmation_strategy_header: str | None = None,
         memory_privacy_mode_header: str | None = None,
         response_mode_header: str | None = None,
+        adaptive_retrieval_header: str | None = None,
     ) -> AsyncIterator[str]:
         self._validate_model(request)
         completion_id = _completion_id()
@@ -239,6 +243,7 @@ class OpenAIProxyService:
             confirmation_strategy_header=confirmation_strategy_header,
             memory_privacy_mode_header=memory_privacy_mode_header,
             response_mode_header=response_mode_header,
+            adaptive_retrieval_header=adaptive_retrieval_header,
         )
         latest_user_text = _latest_user_text(request.messages)
         context = await self._context_for_turn_fail_open(identity, latest_user_text)
@@ -369,6 +374,7 @@ class OpenAIProxyService:
                 confirmation_strategy=identity.confirmation_strategy,
                 memory_privacy_mode=identity.memory_privacy_mode,
                 response_mode=identity.response_mode,
+                adaptive_retrieval=identity.adaptive_retrieval,
             )
         except _HARD_CONTEXT_ERRORS:
             raise
@@ -407,6 +413,7 @@ class OpenAIProxyService:
         confirmation_strategy_header: str | None,
         memory_privacy_mode_header: str | None,
         response_mode_header: str | None,
+        adaptive_retrieval_header: str | None,
     ) -> OpenAIProxyIdentity:
         metadata = request.metadata or {}
         user_id = _first_text(
@@ -564,6 +571,12 @@ class OpenAIProxyService:
                 response_mode,
             )
             response_mode = None
+        adaptive_retrieval = _first_bool(
+            adaptive_retrieval_header,
+            metadata.get("atagia_adaptive_retrieval"),
+            metadata.get("adaptive_retrieval"),
+            request.adaptive_retrieval,
+        )
         resolved_cross_chat_memory = (
             not incognito
             if incognito is not None
@@ -600,6 +613,7 @@ class OpenAIProxyService:
             confirmation_strategy=confirmation_strategy,
             memory_privacy_mode=memory_privacy_mode,
             response_mode=response_mode,
+            adaptive_retrieval=adaptive_retrieval,
         )
 
     def _llm_request(

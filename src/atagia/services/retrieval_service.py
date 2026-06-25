@@ -49,6 +49,7 @@ class RetrievalService:
         authenticated_user_is_atagia_master: bool = False,
         stored_messages: list[dict[str, Any]] | None = None,
         trace: RetrievalTrace | None = None,
+        adaptive_retrieval: bool = False,
     ) -> PipelineResult:
         """Execute the retrieval pipeline for the active conversation state."""
         connection = await self.runtime.open_connection()
@@ -67,6 +68,7 @@ class RetrievalService:
                 authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
                 stored_messages=stored_messages,
                 trace=trace,
+                adaptive_retrieval=adaptive_retrieval,
             )
         finally:
             await connection.close()
@@ -88,6 +90,7 @@ class RetrievalService:
         conversation: dict[str, Any] | None = None,
         stored_messages: list[dict[str, Any]] | None = None,
         trace: RetrievalTrace | None = None,
+        adaptive_retrieval: bool = False,
     ) -> PipelineResult:
         return await self.retrieve_with_connection(
             connection,
@@ -104,6 +107,7 @@ class RetrievalService:
             conversation=conversation,
             stored_messages=stored_messages,
             trace=trace,
+            adaptive_retrieval=adaptive_retrieval,
         )
 
     async def retrieve_with_connection(
@@ -123,6 +127,7 @@ class RetrievalService:
         conversation: dict[str, Any] | None = None,
         stored_messages: list[dict[str, Any]] | None = None,
         trace: RetrievalTrace | None = None,
+        adaptive_retrieval: bool = False,
     ) -> PipelineResult:
         conversations = ConversationRepository(connection, self.runtime.clock)
         users = UserRepository(connection, self.runtime.clock)
@@ -284,6 +289,7 @@ class RetrievalService:
             ablation=retrieval_ablation,
             conversation_messages=transcript,
             trace=trace,
+            adaptive_retrieval=adaptive_retrieval,
         )
 
     async def _attach_topic_snapshot(

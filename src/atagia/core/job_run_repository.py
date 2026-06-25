@@ -142,7 +142,8 @@ class JobRunRepository(BaseRepository):
             SET status = ?,
                 attempt_count = MAX(attempt_count, ?),
                 started_at = COALESCE(started_at, ?),
-                last_heartbeat_at = ?
+                last_heartbeat_at = ?,
+                deferred_until = NULL
             WHERE job_id = ?
             """,
             (
@@ -163,6 +164,7 @@ class JobRunRepository(BaseRepository):
         attempt_count: int,
         error_class: str | None = None,
         error_message: str | None = None,
+        deferred_until: str | None = None,
         commit: bool = True,
     ) -> None:
         await self._mark_terminal_or_retrying(
@@ -171,9 +173,56 @@ class JobRunRepository(BaseRepository):
             attempt_count=attempt_count,
             error_class=error_class,
             error_message=error_message,
+            deferred_until=deferred_until,
             finished=False,
             commit=commit,
         )
+
+    async def mark_deferred(
+        self,
+        job_id: str,
+        *,
+        attempt_count: int,
+        error_class: str | None = None,
+        error_message: str | None = None,
+        deferred_until: str,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        timestamp = self._timestamp()
+        await self._connection.execute(
+            """
+            UPDATE worker_job_runs
+            SET status = ?,
+                attempt_count = MAX(attempt_count, ?),
+                last_heartbeat_at = ?,
+                finished_at = NULL,
+                duration_ms = NULL,
+                error_class = ?,
+                error_message = ?,
+                deferred_until = ?,
+                transient_defer_count = transient_defer_count + 1,
+                first_deferred_at = COALESCE(first_deferred_at, ?),
+                last_deferred_at = ?
+            WHERE job_id = ?
+            """,
+            (
+                JobRunStatus.RETRYING.value,
+                max(1, int(attempt_count)),
+                timestamp,
+                error_class,
+                _truncate_error(error_message),
+                deferred_until,
+                timestamp,
+                timestamp,
+                job_id,
+            ),
+        )
+        if commit:
+            await self._connection.commit()
+        row = await self.get_job(job_id)
+        if row is None:
+            raise RuntimeError(f"Failed to mark worker job run {job_id} deferred")
+        return row
 
     async def mark_succeeded(
         self,
@@ -562,6 +611,7 @@ class JobRunRepository(BaseRepository):
                 finished_at = NULL,
                 last_heartbeat_at = NULL,
                 duration_ms = NULL,
+                deferred_until = NULL,
                 error_class = NULL,
                 error_message = NULL,
                 metadata_json = COALESCE(?, metadata_json)
@@ -606,6 +656,7 @@ class JobRunRepository(BaseRepository):
                 last_heartbeat_at = ?,
                 error_class = NULL,
                 error_message = NULL,
+                deferred_until = NULL,
                 duration_ms = CASE
                     WHEN started_at IS NOT NULL
                     THEN MAX(0.0, (julianday(?) - julianday(started_at)) * 86400000.0)
@@ -634,6 +685,7 @@ class JobRunRepository(BaseRepository):
         attempt_count: int | None = None,
         error_class: str | None = None,
         error_message: str | None = None,
+        deferred_until: str | None = None,
         finished: bool,
         commit: bool,
     ) -> None:
@@ -654,7 +706,8 @@ class JobRunRepository(BaseRepository):
                     ELSE duration_ms
                 END,
                 error_class = ?,
-                error_message = ?
+                error_message = ?,
+                deferred_until = ?
             WHERE job_id = ?
             """,
             (
@@ -668,6 +721,7 @@ class JobRunRepository(BaseRepository):
                 timestamp,
                 error_class,
                 _truncate_error(error_message),
+                deferred_until,
                 job_id,
             ),
         )

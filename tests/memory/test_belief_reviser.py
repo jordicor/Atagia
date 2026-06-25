@@ -17,7 +17,13 @@ from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
 )
-from atagia.memory.belief_reviser import BeliefReviser, RevisionAction, RevisionContext, RevisionDecision
+from atagia.memory.belief_reviser import (
+    BeliefReviser,
+    ClaimKeyMismatchError,
+    RevisionAction,
+    RevisionContext,
+    RevisionDecision,
+)
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
@@ -816,6 +822,85 @@ async def test_successor_embeddings_preserve_safe_index_text_for_protected_verba
         assert len(embedding_index.upsert_calls) == 1
         assert embedding_index.upsert_calls[0][1] == "User account PIN credential."
         assert "4812" not in str(embedding_index.upsert_calls[0])
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_preview_revision_skips_equivalence_llm_when_claim_key_already_validated() -> None:
+    connection, memories, beliefs, reviser = await _build_runtime("REINFORCE")
+    provider = next(iter(reviser._llm_client._providers.values()))  # noqa: SLF001
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        evidence = await _seed_evidence(memories)
+
+        # A textually different claim_key would normally force the equivalence LLM
+        # (the function only short-circuits when keys are byte-identical). With the
+        # match already validated, the preview must trust it and never call the LLM.
+        decision = await reviser.preview_revision(
+            belief_id=str(belief["id"]),
+            new_evidence=[evidence],
+            context=RevisionContext(
+                user_id="usr_1",
+                claim_key="response_style.debug_response",
+                claim_value=json.dumps("terse"),
+                source_message_id="msg_1",
+                assistant_mode_id="coding_debug",
+                workspace_id="wrk_1",
+                conversation_id="cnv_1",
+                scope=MemoryScope.CONVERSATION,
+            ),
+            claim_key_already_validated=True,
+        )
+
+        equivalence_requests = [
+            request
+            for request in provider.requests
+            if request.metadata.get("purpose") == "intent_classifier_claim_key_equivalence"
+        ]
+        assert decision.action == RevisionAction.REINFORCE
+        assert equivalence_requests == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_preview_revision_raises_claim_key_mismatch_when_validation_fails(
+    monkeypatch,
+) -> None:
+    connection, memories, beliefs, reviser = await _build_runtime("REINFORCE")
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        evidence = await _seed_evidence(memories)
+
+        async def reject_equivalence(*args, **kwargs) -> bool:
+            del args, kwargs
+            return False
+
+        monkeypatch.setattr(
+            "atagia.memory.belief_reviser.are_claim_keys_equivalent",
+            reject_equivalence,
+        )
+
+        with pytest.raises(ClaimKeyMismatchError) as excinfo:
+            await reviser.preview_revision(
+                belief_id=str(belief["id"]),
+                new_evidence=[evidence],
+                context=RevisionContext(
+                    user_id="usr_1",
+                    claim_key="response_style.debug_response",
+                    claim_value=json.dumps("terse"),
+                    source_message_id="msg_1",
+                    assistant_mode_id="coding_debug",
+                    workspace_id="wrk_1",
+                    conversation_id="cnv_1",
+                    scope=MemoryScope.CONVERSATION,
+                ),
+            )
+
+        assert excinfo.value.belief_id == str(belief["id"])
+        assert excinfo.value.current_claim_key == "response_style.debugging"
+        assert excinfo.value.payload_claim_key == "response_style.debug_response"
     finally:
         await connection.close()
 

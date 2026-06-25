@@ -23,30 +23,34 @@ cp .env.example .env
 
 ## 1. Required for default runtime
 
-The default model selection routes ingest/retrieval components to OpenRouter
-(stable Gemini Flash-Lite), ordinary chat answers to OpenRouter (DeepSeek v4
-Flash), and privacy/consent/export-sensitive components to Anthropic (Claude
-Sonnet 4.6). Benchmark CLIs also default to direct Anthropic Opus 4.7 for
-judging so evaluator schema/JSON instability does not hide product or retrieval
-failures. The minimum viable configuration therefore needs:
+The default model selection routes ingest and compaction components to direct
+MiniMax M3, retrieval components to OpenRouter (stable Gemini Flash-Lite),
+ordinary chat answers to OpenRouter (DeepSeek v4 Flash), and
+privacy/consent/export-sensitive components to Anthropic (Claude Sonnet 4.6).
+Benchmark CLIs also default to direct Kimi K2.7 Code for judging so evaluator
+schema/JSON instability does not hide product or retrieval failures.
+The minimum viable configuration therefore needs:
 
 | Variable | Default | Required | Description |
 |---|---|---|---|
-| `ATAGIA_ANTHROPIC_API_KEY` | _(unset)_ | Required for default privacy/consent/export components and benchmark judge | API key for Anthropic Claude (used by `summary_privacy_judge`, `summary_privacy_refiner`, `consent_confirmation`, `export_anonymizer`, and benchmark default direct Opus judging). |
-| `ATAGIA_OPENROUTER_API_KEY` | _(unset)_ | Required for default ingest/retrieval/chat components | API key for OpenRouter (used by every default ingest/retrieval component and by the default `chat` component). |
+| `ATAGIA_MINIMAX_API_KEY` | _(unset)_ | Required for default ingest/compaction components | API key or subscription key for direct MiniMax API access (used by default ingest and compaction intelligence such as `extractor`, `text_chunker`, and `compactor`). |
+| `ATAGIA_OPENROUTER_API_KEY` | _(unset)_ | Required for default retrieval/chat components | API key for OpenRouter (used by default retrieval components and by the default `chat` component). |
+| `ATAGIA_ANTHROPIC_API_KEY` | _(unset)_ | Required for default privacy/consent/export components | API key for Anthropic Claude (used by `summary_privacy_judge`, `summary_privacy_refiner`, `consent_confirmation`, and `export_anonymizer`). |
+| `ATAGIA_KIMI_API_KEY` | _(unset)_ | Required for benchmark CLIs with their default judge | API key for direct Kimi API access (used by the default benchmark judge `kimi/kimi-k2.7-code`). |
 
 To run all completion components on a single provider instead, set
 `ATAGIA_LLM_FORCED_GLOBAL_MODEL` (see [LLM model selection](#4-llm-model-selection)) and
 provide only that provider's API key.
 
 For quality and cost balance, prefer role-specific routing over a single
-forced-global model. The defaults route retrieval and ingest intelligence to
+forced-global model. The defaults route ingest and compaction intelligence to
+`minimax/MiniMax-M3`, retrieval intelligence to
 `openrouter/google/gemini-3.1-flash-lite`, cheap ordinary-answer generation to
 `openrouter/deepseek/deepseek-v4-flash`, and privacy/consent/export-sensitive
 components to `anthropic/claude-sonnet-4-6`. For local experiments, point an
 OpenAI-compatible base URL at an Ollama route such as `openai/qwen3-coder:30b`.
 Use the stable `openrouter/google/gemini-3.1-flash-lite` slug, not the
-deprecated `-preview` endpoint.
+deprecated `-preview` endpoint, for retrieval overrides.
 
 ---
 
@@ -73,10 +77,14 @@ deprecated `-preview` endpoint.
 | `ATAGIA_ANTHROPIC_API_KEY` | _(unset)_ | Conditional | API key for Anthropic. Required when any resolved component uses an `anthropic/...` model. |
 | `ATAGIA_OPENAI_API_KEY` | _(unset)_ | Conditional | API key for OpenAI. Required when any component uses an `openai/...` model or for OpenAI-hosted embeddings. |
 | `ATAGIA_GOOGLE_API_KEY` | _(unset)_ | Conditional | API key for Google Gemini. Required when any component uses a `google/...` model. |
+| `ATAGIA_KIMI_API_KEY` | _(unset)_ | Conditional | API key for direct Kimi/Moonshot API access. Required when any component or benchmark judge uses a `kimi/...` model such as `kimi/kimi-k2.7-code`. |
+| `ATAGIA_MINIMAX_API_KEY` | _(unset)_ | Conditional | API key or subscription key for direct MiniMax API access. Required when any component uses a `minimax/...` model such as `minimax/MiniMax-M3`. |
 | `ATAGIA_OPENROUTER_API_KEY` | _(unset)_ | Conditional | API key for OpenRouter. Required when any component uses an `openrouter/...` model. |
 | `ATAGIA_ANTHROPIC_BASE_URL` | _(unset)_ | Optional | Override Anthropic API base URL. |
 | `ATAGIA_OPENAI_BASE_URL` | _(unset)_ | Optional | Override OpenAI API base URL. |
 | `ATAGIA_OPENAI_EMBEDDING_BASE_URL` | _(unset)_ | Optional | Override only the OpenAI-compatible embeddings base URL. When unset, embeddings use `ATAGIA_OPENAI_BASE_URL`. |
+| `ATAGIA_KIMI_BASE_URL` | `https://api.moonshot.ai/v1` | Optional | Override the direct Kimi/Moonshot OpenAI-compatible API base URL. |
+| `ATAGIA_MINIMAX_BASE_URL` | `https://api.minimax.io/v1` | Optional | Override the direct MiniMax OpenAI-compatible API base URL. |
 | `ATAGIA_OPENROUTER_BASE_URL` | _(unset)_ | Optional | Override OpenRouter API base URL. |
 | `ATAGIA_OPENROUTER_SITE_URL` | `http://localhost` | Optional | `HTTP-Referer` header sent to OpenRouter for attribution. |
 | `ATAGIA_OPENROUTER_APP_NAME` | `Atagia` | Optional | `X-Title` header sent to OpenRouter for attribution. |
@@ -84,7 +92,8 @@ deprecated `-preview` endpoint.
 ## 4. LLM model selection
 
 Model specs are provider-qualified: `provider/model[,thinking_level]`, e.g.
-`anthropic/claude-sonnet-4-6` or `openrouter/google/gemini-3.1-flash-lite`.
+`anthropic/claude-sonnet-4-6`, `kimi/kimi-k2.7-code`,
+`minimax/MiniMax-M3`, or `openrouter/minimax/minimax-m3`.
 Resolution order per component: forced-global -> component override ->
 category override -> built-in default.
 
@@ -102,12 +111,31 @@ Ingest: `EXTRACTOR`, `TEXT_CHUNKER`, `COMPACTOR`, `SUMMARY_PRIVACY_JUDGE`,
 `SUMMARY_PRIVACY_REFINER`, `BELIEF_REVISER`, `CONTRACT_PROJECTION`,
 `GRAPH_PROJECTION`, `CONSEQUENCE_BUILDER`, `CONSEQUENCE_DETECTOR`,
 `TOPIC_WORKING_SET`, `CONSENT_CONFIRMATION`, `INTENT_CLASSIFIER`,
-`EXTRACTION_WATCHDOG`, `EXPORT_ANONYMIZER`.
+`EXTRACTION_WATCHDOG`, `INITIAL_CONTEXT_PACKAGE_CURATION`, `EXPORT_ANONYMIZER`.
 
-Retrieval: `NEED_DETECTOR`, `COVERAGE_EXPANDER`, `APPLICABILITY_SCORER`,
-`CONTEXT_STALENESS`, `METRICS_COMPUTER`.
+Retrieval: `NEED_DETECTOR_NEEDS`, `NEED_DETECTOR_LANGUAGE`,
+`NEED_DETECTOR_MEMORY`, `NEED_DETECTOR_EXACT`, `NEED_DETECTOR_SHAPE`,
+`NEED_DETECTOR_FACETS`, `NEED_DETECTOR_CALLBACK`,
+`NEED_DETECTOR_SEARCH_WORDS`, `NEED_DETECTOR_SEARCH_WORDS_OTHER_LANGUAGE`,
+`COVERAGE_EXPANDER`, `APPLICABILITY_SCORER`, `CONTEXT_STALENESS`,
+`METRICS_COMPUTER`.
 
-Chat: `CHAT`.
+Chat: `ANSWER_POSTCONDITION`, `CHAT`.
+
+### Card prompt examples (few-shot demonstrations)
+
+Card prompts (need detection, memory extraction, applicability scoring, topic
+working set, language profile, consequence detection) include a few-shot
+demonstration block by default. Concrete examples reliably help small/local
+models follow the output format and decision, but can hurt larger or reasoning
+models, so the block is toggleable per component without maintaining a second
+prompt set. The instruction and output-format spec are always sent; only the
+demonstration block is gated.
+
+| Variable | Default | Required | Description |
+|---|---|---|---|
+| `ATAGIA_CARD_EXAMPLES_ENABLED` | `true` | Optional | Global default for including the examples block in card prompts. |
+| `ATAGIA_LLM_EXAMPLES__<COMPONENT_ID>` | _(unset)_ | Optional | Per-component override (`true`/`false`). Wins over the global default. Same component IDs as `ATAGIA_LLM_MODEL__<COMPONENT_ID>`; the need-detection cards use the per-card component IDs `NEED_DETECTOR_NEEDS`, `NEED_DETECTOR_LANGUAGE`, `NEED_DETECTOR_MEMORY`, `NEED_DETECTOR_EXACT`, `NEED_DETECTOR_SHAPE`, `NEED_DETECTOR_FACETS`, `NEED_DETECTOR_CALLBACK`, `NEED_DETECTOR_SEARCH_WORDS`, and `NEED_DETECTOR_SEARCH_WORDS_OTHER_LANGUAGE`. |
 
 ### Structured-output repair and rescue
 
@@ -153,7 +181,35 @@ the retained-replay calibrated 4k budget.
 
 ---
 
-## 5. Embeddings
+## 5. Response modes and adaptive retrieval
+
+| Variable | Default | Required | Description |
+|---|---|---|---|
+| `ATAGIA_RESPONSE_MODE` | `normal` | Optional | Default per-turn retrieval scheduling. `normal` runs the full retrieval pipeline synchronously. `fast` skips retrieval entirely and answers from the prepared context (interaction contract, recent transcript, topic working set, initial context package). `smart_fast` answers like `fast` on the current turn and runs a full retrieval in the background to warm the context for the next turn. |
+| `ATAGIA_ADAPTIVE_RETRIEVAL` | `true` | Optional | Enables the adaptive retrieval gate. When on, the need detector classifies each turn's memory dependence (`personal`, `conversation`, `world`, `mixed`); turns classified `world` or `conversation` skip the expensive retrieval stages and answer from the prepared context, while `personal`/`mixed` turns run full retrieval. Adds no extra LLM calls: the classification is part of the existing need-detection call. Set to `false` to force full retrieval on every turn (the classification is still computed and recorded in diagnostics). |
+
+How the two settings combine:
+
+- `normal` + adaptive on: the gate decides per turn whether to retrieve.
+  Uncertain or degraded turns always retrieve.
+- `normal` + adaptive off: full retrieval every turn. The classification is
+  still computed and recorded in diagnostics (shadow mode), with no behavior
+  change.
+- `fast`: never retrieves; the adaptive flag is a documented no-op
+  (diagnostics report `not_applicable`).
+- `smart_fast` + adaptive on: the current turn is unchanged; the background
+  warm is skipped when the gate classifies the turn as not memory-dependent.
+
+Both settings accept per-request overrides: the `response_mode` and
+`adaptive_retrieval` fields on chat/context API requests and the library-mode
+`chat(...)`/`get_context(...)` calls, and the `X-Atagia-Response-Mode` and
+`X-Atagia-Adaptive-Retrieval` headers on the OpenAI-compatible proxy. A
+gate-skipped turn never writes the context cache, and memory extraction still
+runs for every turn regardless of the gate decision.
+
+---
+
+## 6. Embeddings
 
 | Variable | Default | Required | Description |
 |---|---|---|---|
@@ -165,7 +221,7 @@ the retained-replay calibrated 4k budget.
 
 ---
 
-## 6. Intimacy fallback policy
+## 7. Intimacy fallback policy
 
 Atagia supports a category-level and component-level fallback model that
 takes over when the primary model returns a provider policy block or refusal
@@ -198,7 +254,7 @@ override -> category intimacy override.
 
 ---
 
-## 7. Chunking
+## 8. Chunking
 
 | Variable | Default | Required | Description |
 |---|---|---|---|
@@ -207,7 +263,7 @@ override -> category intimacy override.
 
 ---
 
-## 8. Initial context package rollout
+## 9. Initial context package rollout
 
 The initial context package is a prepared, query-independent context layer.
 SQLite remains canonical truth, and normal turns still run query-specific
@@ -227,7 +283,7 @@ package status, and request-path counters; they do not store raw prompt text.
 
 ---
 
-## 9. Worker circuit breaker
+## 10. Worker circuit breaker
 
 Brief reference; see
 [`docs/HOST_SIDECAR_INTEGRATION.md`](HOST_SIDECAR_INTEGRATION.md) for the
@@ -242,7 +298,7 @@ operational behavior and recovery flow.
 
 ---
 
-## 10. Debug and observability
+## 11. Debug and observability
 
 These are intended for local development and benchmark diagnostics. Keep
 disabled in production. When enabled, raw prompt/response artifacts are
@@ -260,7 +316,7 @@ with optional raw request/response bodies.
 
 ---
 
-## 11. Service mode
+## 12. Service mode
 
 Service mode runs Atagia as a FastAPI HTTP service. The library mode trusts
 the caller's `user_id`; the service mode requires an API key.
@@ -280,7 +336,7 @@ the caller's `user_id`; the service mode requires an API key.
 
 ---
 
-## 12. MCP server
+## 13. MCP server
 
 Variables read only by the MCP server entry point (`atagia-mcp`). These are
 typically set in the host's MCP server config (e.g. Claude Desktop's
@@ -300,7 +356,7 @@ typically set in the host's MCP server config (e.g. Claude Desktop's
 
 ---
 
-## 13. Sidecar bridge and client facade
+## 14. Sidecar bridge and client facade
 
 Variables read by `SidecarBridgeConfig.from_env()` and the client facade. They
 let host applications configure the transport and default memory coordinates
@@ -326,9 +382,9 @@ without hardcoding them.
 
 ---
 
-## 14. Example environments
+## 15. Example environments
 
-### 14.1. Minimal single-provider smoke env
+### 15.1. Minimal single-provider smoke env
 
 All completion components routed to one provider via the forced-global
 override. This is useful for smoke testing credentials and plumbing, but it
@@ -343,16 +399,18 @@ ATAGIA_SQLITE_PATH=./data/atagia.db
 ATAGIA_DEBUG=true
 ```
 
-### 14.2. Mixed-provider production env with intimacy fallback
+### 15.2. Mixed-provider production env with intimacy fallback
 
-Default routing (OpenRouter Gemini Flash-Lite for ingest/retrieval, OpenRouter
-DeepSeek v4 Flash for ordinary chat, Anthropic for privacy/consent/export
-components, and direct Anthropic Opus 4.7 for benchmark judging) plus OpenAI
-embeddings, service mode behind an API key, and a per-component intimacy
-fallback for the extractor and compactor.
+Default routing (direct MiniMax M3 for ingest/compaction, OpenRouter Gemini
+Flash-Lite for retrieval, OpenRouter DeepSeek v4 Flash for ordinary chat,
+Anthropic for privacy/consent/export components, and direct Kimi K2.7 Code
+for benchmark judging) plus OpenAI embeddings, service mode behind an API key,
+and a per-component intimacy fallback for the extractor and compactor.
 
 ```env
 ATAGIA_ANTHROPIC_API_KEY=your-anthropic-key
+ATAGIA_MINIMAX_API_KEY=your-minimax-key
+ATAGIA_KIMI_API_KEY=your-kimi-key
 ATAGIA_OPENAI_API_KEY=your-openai-key
 ATAGIA_OPENROUTER_API_KEY=your-openrouter-key
 ATAGIA_EMBEDDING_BACKEND=sqlite_vec
@@ -366,7 +424,7 @@ ATAGIA_LLM_INTIMACY_MODEL__EXTRACTOR=openrouter/z-ai/glm-4.6
 ATAGIA_LLM_INTIMACY_MODEL__COMPACTOR=openrouter/z-ai/glm-4.6
 ```
 
-### 14.3. Local Ollama runtime benchmark env
+### 15.3. Local Ollama runtime benchmark env
 
 Ollama's OpenAI-compatible endpoint can be used through the `openai/...`
 provider namespace. This is a convenient starting point for local

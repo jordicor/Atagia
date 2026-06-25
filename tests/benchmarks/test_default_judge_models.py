@@ -21,10 +21,10 @@ from benchmarks.third_party import __main__ as third_party_cli
         third_party_cli,
     ],
 )
-def test_benchmark_default_judge_is_direct_anthropic_opus_4_7(cli_module) -> None:
+def test_benchmark_default_judge_is_direct_kimi_k27_code(cli_module) -> None:
     args = SimpleNamespace(provider="anthropic", judge_model=None)
 
-    assert cli_module._resolve_judge_model(args) == "anthropic/claude-opus-4-7"
+    assert cli_module._resolve_judge_model(args) == "kimi/kimi-k2.7-code"
 
 
 @pytest.mark.parametrize(
@@ -51,7 +51,7 @@ def test_benchmark_explicit_judge_model_overrides_default(cli_module) -> None:
         third_party_cli,
     ],
 )
-def test_non_anthropic_benchmark_default_judge_stays_direct_anthropic(cli_module) -> None:
+def test_non_kimi_benchmark_default_judge_stays_direct_kimi(cli_module) -> None:
     args = SimpleNamespace(provider="openrouter", judge_model=None)
 
-    assert cli_module._resolve_judge_model(args) == "anthropic/claude-opus-4-7"
+    assert cli_module._resolve_judge_model(args) == "kimi/kimi-k2.7-code"

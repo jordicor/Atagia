@@ -271,6 +271,17 @@ class StorageBackend:
     async def stream_ack(self, stream_name: str, group_name: str, message_id: str) -> None:
         raise NotImplementedError
 
+    async def stream_defer(
+        self,
+        stream_name: str,
+        group_name: str,
+        message_id: str,
+        payload: dict[str, Any],
+        *,
+        delay_seconds: float,
+    ) -> None:
+        raise NotImplementedError
+
     async def stream_ensure_group(self, stream_name: str, group_name: str) -> None:
         raise NotImplementedError
 
@@ -332,6 +343,7 @@ class InProcessBackend(StorageBackend):
     _cache_generations: dict[str, int] = field(default_factory=dict)
     _queues: dict[str, asyncio.Queue[dict[str, Any]]] = field(default_factory=dict)
     _stream_pending: dict[tuple[str, str], dict[str, dict[str, Any]]] = field(default_factory=dict)
+    _stream_deferred: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _stream_groups: set[tuple[str, str]] = field(default_factory=set)
     _stream_add_counts: dict[str, int] = field(default_factory=dict)
     _stream_read_counts: dict[str, int] = field(default_factory=dict)
@@ -549,6 +561,18 @@ class InProcessBackend(StorageBackend):
                     purged += 1
                     if self._pending_job_count > 0:
                         self._pending_job_count -= 1
+        for stream_name, entries in list(self._stream_deferred.items()):
+            retained: list[dict[str, Any]] = []
+            for entry in entries:
+                payload = entry.get("payload") if isinstance(entry, dict) else None
+                if should_drop(payload):
+                    purged += 1
+                    continue
+                retained.append(entry)
+            if retained:
+                self._stream_deferred[stream_name] = retained
+            else:
+                self._stream_deferred.pop(stream_name, None)
         return purged
 
     async def enqueue_job(self, queue_name: str, payload: dict[str, Any]) -> None:
@@ -602,6 +626,8 @@ class InProcessBackend(StorageBackend):
         await self.stream_ensure_group(stream_name, group_name)
         messages: list[StreamMessage] = []
         timeout_seconds = None if block_ms is None else max(0.0, block_ms / 1000)
+        with self._guard:
+            self._promote_due_deferred_locked(stream_name)
         for index in range(count):
             payload = await self.dequeue_job(
                 f"stream:{stream_name}",
@@ -645,6 +671,7 @@ class InProcessBackend(StorageBackend):
         messages: list[StreamMessage] = []
         min_idle_seconds = max(0.0, min_idle_ms / 1000)
         with self._guard:
+            self._promote_due_deferred_locked(stream_name)
             now = monotonic()
             pending = self._stream_pending.setdefault((stream_name, group_name), {})
             claimable = [
@@ -680,9 +707,69 @@ class InProcessBackend(StorageBackend):
                     self._stream_ack_counts.get(stream_name, 0) + 1
                 )
 
+    async def stream_defer(
+        self,
+        stream_name: str,
+        group_name: str,
+        message_id: str,
+        payload: dict[str, Any],
+        *,
+        delay_seconds: float,
+    ) -> None:
+        await self.stream_ensure_group(stream_name, group_name)
+        with self._guard:
+            pending = self._stream_pending.setdefault((stream_name, group_name), {})
+            removed = pending.pop(message_id, None)
+            if removed is not None and self._pending_job_count > 0:
+                self._pending_job_count -= 1
+            if removed is not None:
+                self._stream_ack_counts[stream_name] = (
+                    self._stream_ack_counts.get(stream_name, 0) + 1
+                )
+            self._stream_deferred.setdefault(stream_name, []).append(
+                {
+                    "due_at": monotonic() + max(0.0, delay_seconds),
+                    "payload": copy.deepcopy(payload),
+                }
+            )
+
     async def stream_ensure_group(self, stream_name: str, group_name: str) -> None:
         with self._guard:
             self._stream_groups.add((stream_name, group_name))
+
+    def _promote_due_deferred_locked(self, stream_name: str) -> None:
+        entries = self._stream_deferred.get(stream_name)
+        if not entries:
+            return
+        now = monotonic()
+        ready = [
+            entry
+            for entry in entries
+            if float(entry.get("due_at", 0.0) or 0.0) <= now
+        ]
+        waiting = [
+            entry
+            for entry in entries
+            if float(entry.get("due_at", 0.0) or 0.0) > now
+        ]
+        if waiting:
+            self._stream_deferred[stream_name] = waiting
+        else:
+            self._stream_deferred.pop(stream_name, None)
+        if not ready:
+            return
+        queue = self._queues.setdefault(f"stream:{stream_name}", asyncio.Queue())
+        ready.sort(key=lambda entry: float(entry.get("due_at", 0.0) or 0.0))
+        for entry in ready:
+            queue.put_nowait(
+                {
+                    "message_id": generate_prefixed_id("stm"),
+                    "payload": copy.deepcopy(entry["payload"]),
+                }
+            )
+            self._stream_add_counts[stream_name] = (
+                self._stream_add_counts.get(stream_name, 0) + 1
+            )
 
     async def drain_snapshot(self) -> StorageDrainSnapshot:
         now = monotonic()
@@ -692,6 +779,10 @@ class InProcessBackend(StorageBackend):
                 for queue_name, queue in self._queues.items()
                 if queue_name.startswith("stream:")
             }
+            for stream_name, entries in self._stream_deferred.items():
+                queued_by_stream[stream_name] = (
+                    queued_by_stream.get(stream_name, 0) + len(entries)
+                )
             pending_by_stream: Counter[str] = Counter()
             pending_job_types: Counter[str] = Counter()
             active_job_entries: list[tuple[float, dict[str, Any]]] = []
@@ -851,6 +942,7 @@ class InProcessBackend(StorageBackend):
             self._cache_generations.clear()
             self._queues.clear()
             self._stream_pending.clear()
+            self._stream_deferred.clear()
             self._stream_groups.clear()
             self._stream_add_counts.clear()
             self._stream_read_counts.clear()

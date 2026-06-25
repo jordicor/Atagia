@@ -18,6 +18,8 @@ from atagia.services.model_resolution import (
 )
 from atagia.services.providers.anthropic import AnthropicProvider
 from atagia.services.providers.gemini import GeminiProvider
+from atagia.services.providers.kimi import KimiProvider
+from atagia.services.providers.minimax import MiniMaxProvider
 from atagia.services.providers.openai import OpenAIProvider
 from atagia.services.providers.openrouter import OpenRouterProvider
 
@@ -48,6 +50,23 @@ def build_llm_client(
                 api_key=settings.openai_api_key,
                 base_url=settings.openai_base_url,
                 embedding_base_url=settings.openai_embedding_base_url,
+                request_timeout_seconds=settings.llm_request_timeout_seconds,
+            )
+        )
+    if settings.kimi_api_key:
+        providers.append(
+            KimiProvider(
+                api_key=settings.kimi_api_key,
+                base_url=settings.kimi_base_url,
+                request_timeout_seconds=settings.llm_request_timeout_seconds,
+            )
+        )
+    if settings.minimax_api_key:
+        providers.append(
+            MiniMaxProvider(
+                api_key=settings.minimax_api_key,
+                base_url=settings.minimax_base_url,
+                request_timeout_seconds=settings.llm_request_timeout_seconds,
             )
         )
     if settings.openrouter_api_key:
@@ -57,10 +76,16 @@ def build_llm_client(
                 site_url=settings.openrouter_site_url,
                 app_name=settings.openrouter_app_name,
                 base_url=settings.openrouter_base_url,
+                request_timeout_seconds=settings.llm_request_timeout_seconds,
             )
         )
     if settings.google_api_key:
-        providers.append(GeminiProvider(api_key=settings.google_api_key))
+        providers.append(
+            GeminiProvider(
+                api_key=settings.google_api_key,
+                request_timeout_seconds=settings.llm_request_timeout_seconds,
+            )
+        )
 
     client = LLMClient(
         providers=providers,
@@ -106,6 +131,8 @@ def build_llm_client(
 __all__ = [
     "AnthropicProvider",
     "GeminiProvider",
+    "KimiProvider",
+    "MiniMaxProvider",
     "OpenAIProvider",
     "OpenRouterProvider",
     "build_llm_client",

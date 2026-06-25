@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from math import ceil
-from time import monotonic
+from time import monotonic, time
 from typing import Any
 from uuid import uuid4
 
@@ -46,6 +46,7 @@ CONTEXT_VIEW_OWNER_PREFIX = "context_view_owner:"
 CONTEXT_VIEW_USER_INDEX_PREFIX = "context_view_user:"
 CONTEXT_VIEW_CONVERSATION_OWNER_PREFIX = "context_view_conversation_owner:"
 CONTEXT_VIEW_CONVERSATION_INDEX_PREFIX = "context_view_conversation:"
+STREAM_DEFERRED_PREFIX = "stream_deferred:"
 
 SET_CONTEXT_VIEW_IF_NEWER_SCRIPT = """
 local current_seq = redis.call("get", KEYS[2])
@@ -73,6 +74,36 @@ else
 end
 
 return 1
+"""
+
+DEFER_STREAM_MESSAGE_SCRIPT = """
+local acked = redis.call("xack", KEYS[1], ARGV[1], ARGV[2])
+redis.call("zadd", KEYS[2], tonumber(ARGV[4]), ARGV[3])
+return acked
+"""
+
+PROMOTE_DUE_DEFERRED_STREAM_SCRIPT = """
+local items = redis.call(
+    "zrangebyscore",
+    KEYS[1],
+    0,
+    tonumber(ARGV[1]),
+    "limit",
+    0,
+    tonumber(ARGV[2])
+)
+local promoted = 0
+for _, member in ipairs(items) do
+    local ok, decoded = pcall(cjson.decode, member)
+    if ok and type(decoded) == "table" and type(decoded["payload_json"]) == "string" then
+        redis.call("xadd", KEYS[2], "*", "payload", decoded["payload_json"])
+        redis.call("zrem", KEYS[1], member)
+        promoted = promoted + 1
+    else
+        redis.call("zrem", KEYS[1], member)
+    end
+end
+return promoted
 """
 
 
@@ -313,6 +344,7 @@ class RedisBackend(StorageBackend):
         count: int,
         block_ms: int | None,
     ) -> list[StreamMessage]:
+        await self._promote_due_deferred(stream_name, limit=count)
         response = await self._client.xreadgroup(
             groupname=group_name,
             consumername=consumer_name,
@@ -346,6 +378,7 @@ class RedisBackend(StorageBackend):
         min_idle_ms: int,
         count: int,
     ) -> list[StreamMessage]:
+        await self._promote_due_deferred(stream_name, limit=count)
         response = await self._client.execute_command(
             "XAUTOCLAIM",
             stream_name,
@@ -386,6 +419,38 @@ class RedisBackend(StorageBackend):
                 self._stream_ack_counts.get(stream_name, 0) + 1
             )
 
+    async def stream_defer(
+        self,
+        stream_name: str,
+        group_name: str,
+        message_id: str,
+        payload: dict[str, Any],
+        *,
+        delay_seconds: float,
+    ) -> None:
+        await self.stream_ensure_group(stream_name, group_name)
+        member = json_utils.dumps(
+            {
+                "id": uuid4().hex,
+                "payload_json": json_utils.dumps(payload, sort_keys=True),
+            },
+            sort_keys=True,
+        )
+        removed = await self._client.eval(
+            DEFER_STREAM_MESSAGE_SCRIPT,
+            2,
+            stream_name,
+            self._stream_deferred_key(stream_name),
+            group_name,
+            message_id,
+            member,
+            time() + max(0.0, delay_seconds),
+        )
+        if int(removed or 0) > 0:
+            self._stream_ack_counts[stream_name] = (
+                self._stream_ack_counts.get(stream_name, 0) + 1
+            )
+
     async def stream_ensure_group(self, stream_name: str, group_name: str) -> None:
         try:
             await self._client.xgroup_create(
@@ -404,9 +469,12 @@ class RedisBackend(StorageBackend):
         pending_by_stream: dict[str, int] = {}
         for stream_name, group_name in self._stream_groups:
             pending_count, lag_count = await self._group_backlog(stream_name, group_name)
+            deferred_count = int(
+                await self._client.zcard(self._stream_deferred_key(stream_name)) or 0
+            )
             queued_by_stream[stream_name] = max(
                 queued_by_stream.get(stream_name, 0),
-                lag_count,
+                lag_count + deferred_count,
             )
             pending_by_stream[stream_name] = (
                 pending_by_stream.get(stream_name, 0) + pending_count
@@ -543,6 +611,7 @@ class RedisBackend(StorageBackend):
 
         for stream_name, group_name in list(self._stream_groups):
             purged += await self._purge_stream_entries(stream_name, group_name, should_drop)
+            purged += await self._purge_deferred_stream_entries(stream_name, should_drop)
         async for key in self._client.scan_iter(match="atagia:*"):
             stream_name = str(key)
             if stream_name.startswith("queue:"):
@@ -554,7 +623,49 @@ class RedisBackend(StorageBackend):
             if key_type != "stream":
                 continue
             purged += await self._purge_stream_entries(stream_name, None, should_drop)
+            purged += await self._purge_deferred_stream_entries(stream_name, should_drop)
         return purged
+
+    async def _promote_due_deferred(self, stream_name: str, *, limit: int) -> None:
+        promoted = await self._client.eval(
+            PROMOTE_DUE_DEFERRED_STREAM_SCRIPT,
+            2,
+            self._stream_deferred_key(stream_name),
+            stream_name,
+            time(),
+            max(1, limit),
+        )
+        promoted_count = int(promoted or 0)
+        if promoted_count > 0:
+            self._stream_add_counts[stream_name] = (
+                self._stream_add_counts.get(stream_name, 0) + promoted_count
+            )
+
+    async def _purge_deferred_stream_entries(
+        self,
+        stream_name: str,
+        should_drop: Any,
+    ) -> int:
+        deferred_key = self._stream_deferred_key(stream_name)
+        purged = 0
+        raw_items = await self._client.zrange(deferred_key, 0, -1)
+        for raw in raw_items:
+            try:
+                entry = json_utils.loads(raw)
+                payload_json = entry.get("payload_json")
+                if not isinstance(payload_json, str):
+                    continue
+                payload = json_utils.loads(payload_json)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and should_drop(payload):
+                removed = await self._client.zrem(deferred_key, raw)
+                purged += int(removed or 0)
+        return purged
+
+    @staticmethod
+    def _stream_deferred_key(stream_name: str) -> str:
+        return f"{STREAM_DEFERRED_PREFIX}{stream_name}"
 
     async def _purge_stream_entries(
         self,

@@ -57,6 +57,39 @@ def test_parse_minimal_dataset(tmp_path: Path) -> None:
     assert conversation.questions[0].evidence_turn_ids == ["D1:1"]
 
 
+def test_parse_evidence_citation_strings_into_turn_ids(tmp_path: Path) -> None:
+    data_path = _write_dataset(
+        tmp_path,
+        [
+            {
+                "sample_id": "conv-citations",
+                "conversation": {
+                    "speaker_a": "Alice",
+                    "speaker_b": "Bob",
+                    "session_1": [
+                        {"speaker": "Alice", "dia_id": "D8:6", "text": "Sunset."},
+                        {"speaker": "Bob", "dia_id": "D9:17", "text": "Also sunset."},
+                        {"speaker": "Alice", "dia_id": "D30:5", "text": "Camera."},
+                    ],
+                    "session_1_date_time": "1:56 pm on 8 May, 2023",
+                },
+                "qa": [
+                    {
+                        "question": "What happened?",
+                        "answer": "sunset and camera",
+                        "evidence": ["D8:6; D9:17", "D30:05"],
+                        "category": 1,
+                    }
+                ],
+            }
+        ],
+    )
+
+    question = LoCoMoAdapter(data_path).load().conversations[0].questions[0]
+
+    assert question.evidence_turn_ids == ["D8:6", "D9:17", "D30:5"]
+
+
 def test_parse_image_caption_as_attachment(tmp_path: Path) -> None:
     data_path = _write_dataset(
         tmp_path,

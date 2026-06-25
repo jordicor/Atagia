@@ -4,6 +4,9 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
+from benchmarks.atagia_bench.adapter import AtagiaBenchAdapter
 from benchmarks.atagia_bench.adapter import AtagiaBenchQuestion
 from benchmarks.atagia_bench.graders import GradeResult
 from benchmarks.atagia_bench.runner import (
@@ -14,6 +17,98 @@ from benchmarks.atagia_bench.runner import (
     load_holdout_question_ids,
 )
 from atagia.services.run_counters import RunCounterAccumulator
+
+
+def _write_minimal_atagia_bench_data(
+    tmp_path: Path,
+    *,
+    question: dict[str, object],
+) -> Path:
+    data_dir = tmp_path / "atagia-bench-data"
+    persona_dir = data_dir / "mini_persona"
+    persona_dir.mkdir(parents=True)
+    (data_dir / "personas.json").write_text(
+        json.dumps(
+            [
+                {
+                    "persona_id": "mini_persona",
+                    "display_name": "Mini Persona",
+                    "age": 42,
+                    "occupation": "Tester",
+                    "profile": "Minimal profile.",
+                    "assistant_modes": ["general_qa"],
+                    "conversation_count": 1,
+                    "test_scenarios": ["source evidence validation"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (persona_dir / "conversations.json").write_text(
+        json.dumps(
+            [
+                {
+                    "conversation_id": "mini-conv-1",
+                    "assistant_mode_id": "general_qa",
+                    "timestamp_base": "2025-12-01T10:00:00",
+                    "turns": [
+                        {
+                            "turn_id": "mini-t1",
+                            "role": "user",
+                            "text": "The notebook is red.",
+                            "timestamp": "2025-12-01T10:00:00",
+                        }
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (persona_dir / "questions.json").write_text(
+        json.dumps([question]),
+        encoding="utf-8",
+    )
+    return data_dir
+
+
+def test_atagia_bench_adapter_rejects_llm_judge_without_evidence(
+    tmp_path: Path,
+) -> None:
+    data_dir = _write_minimal_atagia_bench_data(
+        tmp_path,
+        question={
+            "question_id": "mini-q1",
+            "question_text": "What color is the notebook?",
+            "ground_truth": "red",
+            "answer_type": "llm_judge",
+            "category_tags": ["smoke"],
+            "evidence_turn_ids": [],
+            "grader": "llm_judge",
+        },
+    )
+
+    with pytest.raises(ValueError, match="mini-q1.*no evidence_turn_ids"):
+        AtagiaBenchAdapter(data_dir).load()
+
+
+def test_atagia_bench_adapter_rejects_unresolved_evidence_turn_id(
+    tmp_path: Path,
+) -> None:
+    data_dir = _write_minimal_atagia_bench_data(
+        tmp_path,
+        question={
+            "question_id": "mini-q2",
+            "question_text": "What color is the notebook?",
+            "ground_truth": "red",
+            "answer_type": "llm_judge",
+            "category_tags": ["smoke"],
+            "evidence_turn_ids": ["missing-turn"],
+            "grader": "llm_judge",
+        },
+    )
+
+    with pytest.raises(ValueError, match="mini-q2.*missing-turn"):
+        AtagiaBenchAdapter(data_dir).load()
 
 
 def test_load_holdout_question_ids_returns_sorted_unique_values(tmp_path: Path) -> None:
@@ -67,6 +162,7 @@ def test_save_run_manifest_records_dataset_hash_and_question_ids(
     monkeypatch.setenv("ATAGIA_APPLICABILITY_GATE_MODE", "shadow")
     monkeypatch.setenv("ATAGIA_GRAPH_PROJECTION_ENABLED", "true")
     monkeypatch.setenv("ATAGIA_RESPONSE_MODE", "smart_fast")
+    monkeypatch.setenv("ATAGIA_ADAPTIVE_RETRIEVAL", "true")
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     (data_dir / "personas.json").write_text("[]", encoding="utf-8")
@@ -184,6 +280,7 @@ def test_save_run_manifest_records_dataset_hash_and_question_ids(
         "embedding_backend": "sqlite_vec",
         "graph_projection_enabled": True,
         "response_mode": "smart_fast",
+        "adaptive_retrieval": True,
     }
     assert manifest["run_counters"] == {"counts": {}, "labeled_counts": {}}
     assert manifest["result_summary"]["retrieval_time_ms"] == {
@@ -263,7 +360,7 @@ def test_runner_role_specific_model_config_uses_base_as_role_fallback(
         llm_model="gpt-5.5-instant",
         judge_model="gpt-5.4-mini",
         retrieval_model="gpt-5.4-nano",
-        component_models={"need_detector": "gpt-5.4-mini"},
+        component_models={"need_detector_language": "gpt-5.4-mini"},
         manifests_dir=manifests_dir,
         data_dir=data_dir,
     )
@@ -275,7 +372,7 @@ def test_runner_role_specific_model_config_uses_base_as_role_fallback(
         "ingest_model": "openai/gpt-5.5-instant",
         "retrieval_model": "openai/gpt-5.4-nano",
         "answer_model": "openai/gpt-5.5-instant",
-        "component_models": {"need_detector": "openai/gpt-5.4-mini"},
+        "component_models": {"need_detector_language": "openai/gpt-5.4-mini"},
         "answer_stance": "reactive",
         "answer_stance_prompt_variant": "baseline",
         "judge_model": "openai/gpt-5.4-mini",
@@ -284,7 +381,7 @@ def test_runner_role_specific_model_config_uses_base_as_role_fallback(
         "llm_ingest_model": "openai/gpt-5.5-instant",
         "llm_retrieval_model": "openai/gpt-5.4-nano",
         "llm_chat_model": "openai/gpt-5.5-instant",
-        "llm_component_models": {"need_detector": "openai/gpt-5.4-mini"},
+        "llm_component_models": {"need_detector_language": "openai/gpt-5.4-mini"},
     }
 
 

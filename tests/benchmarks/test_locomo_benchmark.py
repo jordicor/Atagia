@@ -10,6 +10,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from benchmarks.base import BenchmarkQuestion, BenchmarkReport, ConversationReport, QuestionResult, ScoreResult
@@ -40,7 +41,11 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.model_resolution import COMPONENTS_BY_ID, resolve_component_model
-from tests.extraction_payload_support import rich_extraction_payload_to_lean
+from tests.extraction_payload_support import (
+    is_memory_extraction_card_purpose,
+    memory_extraction_card_output_from_payload,
+    rich_extraction_payload_to_lean,
+)
 
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
@@ -48,112 +53,161 @@ _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
 )
 
 
+def _message_sequences_from_last_conversation_messages(prompt: str) -> list[int]:
+    blocks = re.findall(
+        r"<conversation_messages>\s*(.*?)\s*</conversation_messages>",
+        prompt,
+        flags=re.DOTALL,
+    )
+    source = blocks[-1] if blocks else prompt
+    return [int(item) for item in re.findall(r'<message seq="(\d+)"', source)]
+
+
+def _is_need_detection_card_purpose(purpose: object) -> bool:
+    value = str(purpose)
+    return value.startswith("need_detection_") and value.endswith("_card")
+
+
+def _is_language_profile_card_purpose(purpose: object) -> bool:
+    value = str(purpose)
+    return value.startswith("user_language_profile_") and value.endswith("_card")
+
+
+_MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES = {
+    "memory_extraction_kind_scope_card",
+    "memory_extraction_evidence_card",
+    "memory_extraction_index_card",
+    "memory_extraction_temporal_card",
+    "memory_extraction_belief_card",
+    "memory_extraction_coverage_members_card",
+}
+
+
 class BenchmarkProvider(LLMProvider):
     name = "locomo-benchmark-tests"
 
     def __init__(self) -> None:
         self.requests: list[LLMCompletionRequest] = []
+        self._active_extraction_payload: dict[str, object] | None = None
+        self._active_extraction_consumed: set[str] = set()
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
-        if purpose == "need_detection":
+        if _is_language_profile_card_purpose(purpose):
+            return self._response(request, "none")
+        if _is_need_detection_card_purpose(purpose):
+            outputs = {
+                "need_detection_needs_card": "none",
+                "need_detection_language_card": "en\nen",
+                "need_detection_memory_card": "mixed",
+                "need_detection_exact_card": "no",
+                "need_detection_shape_card": "default",
+                "need_detection_facets_card": "none",
+                "need_detection_callback_card": "no",
+                "need_detection_search_words_card": "locomo benchmark",
+                "need_detection_search_words_other_language_card": "none",
+            }
             return self._response(
                 request,
-                json.dumps(
-                    {
-                        "needs": [],
-                        "temporal_range": None,
-                        "sub_queries": ["locomo benchmark"],
-                        "sparse_query_hints": [
-                            {
-                                "sub_query_text": "locomo benchmark",
-                                "fts_phrase": "locomo benchmark",
-                            }
-                        ],
-                        "query_type": "default",
-                        "retrieval_levels": [0],
-                    }
+                outputs[purpose],
+            )
+        if purpose == "applicability_relevance_card":
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
+            return self._response(
+                request,
+                "\n".join(
+                    f"{score_key} exact" for _memory_id, score_key in candidate_keys
                 ),
             )
-        if purpose == "applicability_scoring":
+        if purpose == "applicability_date_card":
             candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
-            payload = {
-                "scores": [
-                    {"score_key": score_key, "llm_applicability": 0.9}
-                    for _memory_id, score_key in candidate_keys
-                ]
-            }
-            return self._response(request, json.dumps(payload))
-        if purpose == "memory_extraction":
+            return self._response(
+                request,
+                "\n".join(
+                    f"{score_key} none" for _memory_id, score_key in candidate_keys
+                ),
+            )
+        if is_memory_extraction_card_purpose(purpose):
             message_text = request.messages[-1].content
-            canonical_text = self._extract_canonical_text(message_text)
-            if canonical_text is None:
-                payload = {
-                    "evidences": [],
-                    "beliefs": [],
-                    "contract_signals": [],
-                    "state_updates": [],
-                    "mode_guess": None,
-                    "nothing_durable": True,
-                }
+            if purpose == "memory_extraction_candidate_card":
+                canonical_text = self._extract_canonical_text(message_text)
+                if canonical_text is None:
+                    payload = {
+                        "evidences": [],
+                        "beliefs": [],
+                        "contract_signals": [],
+                        "state_updates": [],
+                        "mode_guess": None,
+                        "nothing_durable": True,
+                    }
+                else:
+                    payload = {
+                        "evidences": [
+                            {
+                                "canonical_text": canonical_text,
+                                "scope": "conversation",
+                                "confidence": 0.95,
+                                "source_kind": "extracted",
+                                "privacy_level": 0,
+                                "language_codes": ["en"],
+                                "payload": {"kind": "fact"},
+                            }
+                        ],
+                        "beliefs": [],
+                        "contract_signals": [],
+                        "state_updates": [],
+                        "mode_guess": None,
+                        "nothing_durable": False,
+                    }
+                self._active_extraction_payload = rich_extraction_payload_to_lean(payload)
+                self._active_extraction_consumed = set()
+                output_text = memory_extraction_card_output_from_payload(
+                    self._active_extraction_payload,
+                    purpose,
+                )
+                if output_text == "none" or "|" not in output_text:
+                    self._active_extraction_payload = None
             else:
-                payload = {
-                    "evidences": [
-                        {
-                            "canonical_text": canonical_text,
-                            "scope": "conversation",
-                            "confidence": 0.95,
-                            "source_kind": "extracted",
-                            "privacy_level": 0,
-                            "language_codes": ["en"],
-                            "payload": {"kind": "fact"},
-                        }
-                    ],
-                    "beliefs": [],
-                    "contract_signals": [],
-                    "state_updates": [],
-                    "mode_guess": None,
-                    "nothing_durable": False,
-                }
-            return self._response(request, json.dumps(rich_extraction_payload_to_lean(payload)))
+                output_text = memory_extraction_card_output_from_payload(
+                    self._active_extraction_payload or {"candidates": []},
+                    purpose,
+                )
+                self._active_extraction_consumed.add(purpose)
+                if (
+                    self._active_extraction_consumed
+                    == _MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES
+                ):
+                    self._active_extraction_payload = None
+                    self._active_extraction_consumed = set()
+            return self._response(request, output_text)
         if purpose == "contract_projection":
             return self._response(
                 request,
                 json.dumps({"signals": [], "nothing_durable": True}),
             )
-        if purpose == "consequence_detection":
+        if purpose == "consequence_gate_card":
             return self._response(
                 request,
-                json.dumps(
-                    {
-                        "is_consequence": False,
-                        "action_description": "",
-                        "outcome_description": "",
-                        "outcome_sentiment": "neutral",
-                        "confidence": 0.0,
-                        "likely_action_message_id": None,
-                    }
-                ),
+                "no",
             )
-        if purpose == "summary_chunk_segmentation":
+        if purpose in {
+            "summary_chunk_segmentation_ranges_card",
+            "summary_chunk_segmentation_summaries_card",
+        }:
             prompt = request.messages[1].content
-            message_sequences = [int(item) for item in re.findall(r'<message seq="(\d+)"', prompt)]
+            message_sequences = _message_sequences_from_last_conversation_messages(prompt)
             start_seq = min(message_sequences) if message_sequences else 1
             end_seq = max(message_sequences) if message_sequences else 1
+            chunk_range = f"{start_seq}-{end_seq}"
+            if purpose == "summary_chunk_segmentation_ranges_card":
+                output_text = chunk_range
+            else:
+                # Card 2 is per-range now: emit raw summary text, no range label.
+                output_text = "Benchmark chunk summary."
             return self._response(
                 request,
-                json.dumps(
-                    {
-                        "episodes": [
-                            {
-                                "start_seq": start_seq,
-                                "end_seq": end_seq,
-                                "summary_text": "Benchmark chunk summary.",
-                            }
-                        ]
-                    }
-                ),
+                output_text,
             )
         if purpose == "episode_synthesis":
             prompt = request.messages[1].content
@@ -182,23 +236,10 @@ class BenchmarkProvider(LLMProvider):
                     }
                 ),
             )
-        if purpose == "topic_working_set_update":
+        if purpose in {"topic_working_set_update", "topic_working_set_route_card"}:
             return self._response(
                 request,
-                json.dumps({"actions": [], "nothing_to_update": True}),
-            )
-        if purpose == "user_language_profile_update":
-            return self._response(
-                request,
-                json.dumps(
-                    {
-                        "observed_user_languages": [],
-                        "explicit_language_preferences": [],
-                        "explicit_language_abilities": [],
-                        "contextual_norms": [],
-                        "external_content_language_codes": [],
-                    }
-                ),
+                "none",
             )
         if purpose == "chat_reply":
             question = request.messages[-1].content
@@ -329,6 +370,48 @@ class AnswerFailingForOneQuestionProvider(BenchmarkProvider):
         ):
             self.answer_failures += 1
             raise LLMError("Answer provider overloaded")
+        return await super().complete(request)
+
+
+class RawTimeoutAnswerProvider(BenchmarkProvider):
+    """Provider whose real chat answer call raises a raw transport timeout."""
+
+    def __init__(self, failing_question_text: str) -> None:
+        super().__init__()
+        self._failing_question_text = failing_question_text
+        self.answer_failures = 0
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        if (
+            request.metadata.get("purpose") == "chat_reply"
+            and request.messages[-1].content == self._failing_question_text
+        ):
+            self.answer_failures += 1
+            raise httpx.ReadTimeout(
+                "answer provider read timed out",
+                request=httpx.Request("POST", "https://provider.test/chat"),
+            )
+        return await super().complete(request)
+
+
+class RawTimeoutJudgeProvider(BenchmarkProvider):
+    """Provider whose judge call raises a raw transport timeout."""
+
+    def __init__(self, failing_question_text: str) -> None:
+        super().__init__()
+        self._failing_question_text = failing_question_text
+        self.judge_failures = 0
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        if (
+            request.metadata.get("purpose") == "benchmark_judge"
+            and request.metadata.get("question") == self._failing_question_text
+        ):
+            self.judge_failures += 1
+            raise httpx.ReadTimeout(
+                "judge provider read timed out",
+                request=httpx.Request("POST", "https://provider.test/chat"),
+            )
         return await super().complete(request)
 
 
@@ -513,7 +596,10 @@ def test_atagia_constructor_phase_overrides_shadow_ambient_component_models(
 ) -> None:
     _clear_ambient_llm_model_env(monkeypatch)
     monkeypatch.setenv("ATAGIA_LLM_MODEL__EXTRACTOR", "openai/env-extractor")
-    monkeypatch.setenv("ATAGIA_LLM_MODEL__NEED_DETECTOR", "openai/env-need")
+    monkeypatch.setenv(
+        "ATAGIA_LLM_MODEL__NEED_DETECTOR_LANGUAGE",
+        "openai/env-need-language",
+    )
     monkeypatch.setenv(
         "ATAGIA_LLM_MODEL__APPLICABILITY_SCORER",
         "openai/env-scorer",
@@ -527,9 +613,12 @@ def test_atagia_constructor_phase_overrides_shadow_ambient_component_models(
     settings = engine._build_settings()
 
     assert settings.llm_component_models["extractor"] == "openai/env-extractor"
-    assert "need_detector" not in settings.llm_component_models
+    assert "need_detector_language" not in settings.llm_component_models
     assert settings.llm_component_models["applicability_scorer"] == "openai/explicit-scorer"
-    assert resolve_component_model(settings, "need_detector") == "openai/retrieval-model,none"
+    assert (
+        resolve_component_model(settings, "need_detector_language")
+        == "openai/retrieval-model,none"
+    )
     assert resolve_component_model(settings, "applicability_scorer") == "openai/explicit-scorer"
 
 
@@ -730,13 +819,13 @@ async def test_benchmark_single_conversation(
     assert sum(
         1
         for request in provider.requests
-        if request.metadata.get("purpose") == "need_detection"
-    ) == 3
+        if _is_need_detection_card_purpose(request.metadata.get("purpose"))
+    ) == 24
     assert sum(
         1
         for request in provider.requests
-        if request.metadata.get("purpose") == "memory_extraction"
-    ) == 12
+        if request.metadata.get("purpose") == "memory_extraction_candidate_card"
+    ) == 6
     assert report.model_info["llm_call_summary"]["total_calls"] > 0
     assert report.conversations[0].results[0].trace["llm_calls"]
 
@@ -844,10 +933,24 @@ async def test_benchmark_routes_models_by_phase_and_component(
         purpose = str(request.metadata.get("purpose"))
         models_by_purpose.setdefault(purpose, set()).add(request.model)
 
-    assert models_by_purpose["memory_extraction"] == {"openai/extractor-model,minimal"}
+    assert models_by_purpose["memory_extraction_candidate_card"] == {
+        "openai/extractor-model,minimal"
+    }
     assert models_by_purpose["contract_projection"] == {"openai/ingest-model,minimal"}
-    assert models_by_purpose["need_detection"] == {"openai/retrieval-model,none"}
-    assert models_by_purpose["applicability_scoring"] == {"openai/retrieval-model,none"}
+    for purpose in (
+        "need_detection_needs_card",
+        "need_detection_language_card",
+        "need_detection_memory_card",
+        "need_detection_exact_card",
+        "need_detection_shape_card",
+        "need_detection_facets_card",
+        "need_detection_callback_card",
+        "need_detection_search_words_card",
+    ):
+        assert models_by_purpose[purpose] == {"openai/retrieval-model,none"}
+    assert models_by_purpose["applicability_relevance_card"] == {
+        "openai/retrieval-model,none"
+    }
     assert models_by_purpose["chat_reply"] == {"openai/answer-model,high"}
     assert models_by_purpose["benchmark_judge"] == {"openai/judge-model,medium"}
 
@@ -870,13 +973,16 @@ async def test_benchmark_routes_models_by_phase_and_component(
     assert report.conversations[0].results[0].trace["real_chat_path"] is True
     assert "answer_generation" not in report.conversations[0].results[0].trace
     llm_calls = report.conversations[0].results[0].trace["llm_calls"]
-    assert {call["purpose"] for call in llm_calls} >= {
-        "need_detection",
-        "applicability_scoring",
+    llm_call_purposes = {call["purpose"] for call in llm_calls}
+    assert "need_detection_language_card" in llm_call_purposes
+    assert llm_call_purposes >= {
+        "applicability_relevance_card",
         "chat_reply",
         "benchmark_judge",
     }
-    assert report.model_info["llm_call_summary"]["by_purpose"]["memory_extraction"]["calls"] == 8
+    assert report.model_info["llm_call_summary"]["by_purpose"][
+        "memory_extraction_candidate_card"
+    ]["calls"] == 6
 
 
 @pytest.mark.asyncio
@@ -906,6 +1012,7 @@ async def test_benchmark_with_ablation(
         conversation: dict[str, object] | None = None,
         stored_messages: list[dict[str, object]] | None = None,
         trace: object | None = None,
+        adaptive_retrieval: bool = False,
     ):
         if message_text == "What color notebooks does Alice keep?":
             observed_ablation.append(ablation)
@@ -925,6 +1032,7 @@ async def test_benchmark_with_ablation(
             conversation=conversation,
             stored_messages=stored_messages,
             trace=trace,
+            adaptive_retrieval=adaptive_retrieval,
         )
 
     monkeypatch.setattr(RetrievalService, "retrieve_with_connection", _capture_retrieve)
@@ -982,13 +1090,13 @@ async def test_benchmark_max_questions_limits_validation_run(
     assert sum(
         1
         for request in provider.requests
-        if request.metadata.get("purpose") == "need_detection"
-    ) == 1
+        if _is_need_detection_card_purpose(request.metadata.get("purpose"))
+    ) == 8
     assert sum(
         1
         for request in provider.requests
-        if request.metadata.get("purpose") == "memory_extraction"
-    ) == 8
+        if request.metadata.get("purpose") == "memory_extraction_candidate_card"
+    ) == 6
 
 
 @pytest.mark.asyncio
@@ -1082,6 +1190,7 @@ async def test_score_question_labels_retrieval_error_without_cancelling_siblings
         conversation: dict[str, object] | None = None,
         stored_messages: list[dict[str, object]] | None = None,
         trace: object | None = None,
+        adaptive_retrieval: bool = False,
     ):
         if message_text == failing_question_text:
             raise LLMError("Retrieval provider overloaded")
@@ -1101,6 +1210,7 @@ async def test_score_question_labels_retrieval_error_without_cancelling_siblings
             conversation=conversation,
             stored_messages=stored_messages,
             trace=trace,
+            adaptive_retrieval=adaptive_retrieval,
         )
 
     monkeypatch.setattr(RetrievalService, "retrieve_with_connection", _fail_one_retrieval)
@@ -1175,6 +1285,41 @@ async def test_score_question_labels_real_chat_error(
 
 
 @pytest.mark.asyncio
+async def test_score_question_tolerates_raw_transport_timeout_in_chat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failing_question_text = "What color notebooks does Alice keep?"
+    provider = RawTimeoutAnswerProvider(failing_question_text)
+    _install_stub_client(monkeypatch, provider)
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await benchmark.run(parallel_questions=2)
+
+    assert provider.answer_failures == 1
+    failed = next(
+        result
+        for result in report.conversations[0].results
+        if result.question.question_text == failing_question_text
+    )
+    assert failed.score_result.score == 0
+    assert "Retrieval failed" in failed.score_result.reasoning
+    assert "ReadTimeout" in failed.score_result.reasoning
+    assert failed.trace["failure_stage"] == "retrieval"
+    assert failed.trace["diagnosis_bucket"] == "retrieval_failed"
+    assert failed.trace["retrieval_failure"]["exception_class"] == "ReadTimeout"
+    assert report.model_info["warning_counts"]["retrieval_failed"] == 1
+    assert report.model_info["failure_stage_counts"] == {"retrieval": 1}
+
+
+@pytest.mark.asyncio
 async def test_score_question_tolerates_judge_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1227,6 +1372,42 @@ async def test_score_question_tolerates_judge_error(
     for result in surviving_results:
         assert "judge_failure" not in result.trace
         assert result.score_result.judge_model == "openai/judge-model"
+
+
+@pytest.mark.asyncio
+async def test_score_question_tolerates_raw_transport_timeout_in_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failing_question_text = "What color notebooks does Alice keep?"
+    provider = RawTimeoutJudgeProvider(failing_question_text)
+    _install_stub_client(monkeypatch, provider)
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    report = await benchmark.run(parallel_questions=2)
+
+    assert provider.judge_failures == 1
+    failed = next(
+        result
+        for result in report.conversations[0].results
+        if result.question.question_text == failing_question_text
+    )
+    assert failed.score_result.score == 0
+    assert "Judge call failed" in failed.score_result.reasoning
+    assert "ReadTimeout" in failed.score_result.reasoning
+    assert failed.score_result.judge_model == "openai/judge-model"
+    assert failed.trace["failure_stage"] == "judge"
+    assert failed.trace["diagnosis_bucket"] == "judge_failed"
+    assert failed.trace["judge_failure"]["exception_class"] == "ReadTimeout"
+    assert report.model_info["warning_counts"]["judge_failed"] == 1
+    assert report.model_info["failure_stage_counts"] == {"judge": 1}
 
 
 @pytest.mark.asyncio
@@ -1367,8 +1548,8 @@ async def test_benchmark_resume_checkpoint_skips_completed_questions(
     assert sum(
         1
         for request in resume_provider.requests
-        if request.metadata.get("purpose") == "need_detection"
-    ) == 1
+        if _is_need_detection_card_purpose(request.metadata.get("purpose"))
+    ) == 8
     checkpoint = BenchmarkReport.model_validate_json(checkpoint_path.read_text())
     assert checkpoint.total_questions == 2
     assert report.model_info["resume_checkpoint"] is True
@@ -1449,6 +1630,7 @@ async def test_benchmark_adaptive_parallel_questions_retries_rate_limit(
         conversation: dict[str, object] | None = None,
         stored_messages: list[dict[str, object]] | None = None,
         trace: object | None = None,
+        adaptive_retrieval: bool = False,
     ):
         nonlocal failures_remaining
         if message_text == failing_question_text and failures_remaining:
@@ -1470,6 +1652,7 @@ async def test_benchmark_adaptive_parallel_questions_retries_rate_limit(
             conversation=conversation,
             stored_messages=stored_messages,
             trace=trace,
+            adaptive_retrieval=adaptive_retrieval,
         )
 
     monkeypatch.setattr(RetrievalService, "retrieve_with_connection", _fail_once_retrieval)
@@ -1708,15 +1891,15 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
     assert sum(
         1
         for request in eval_provider.requests
-        if request.metadata.get("purpose") == "memory_extraction"
-    ) == 2
+        if request.metadata.get("purpose") == "memory_extraction_candidate_card"
+    ) == 0
     assert sum(
         1
         for request in provider.requests
-        if request.metadata.get("purpose") == "memory_extraction"
-    ) == 8
+        if request.metadata.get("purpose") == "memory_extraction_candidate_card"
+    ) == 6
     assert any(
-        request.metadata.get("purpose") == "summary_chunk_segmentation"
+        request.metadata.get("purpose") == "summary_chunk_segmentation_ranges_card"
         for request in provider.requests
     )
 
@@ -1818,11 +2001,11 @@ async def test_benchmark_bulk_resume_rebuilds_completed_db_missing_rebuild_metad
     assert repaired_metadata["rebuild_result"]["status"] == "rebuilt"
     assert repaired_metadata["rebuild_result"]["processed_messages"] == 6
     assert any(
-        request.metadata.get("purpose") == "memory_extraction"
+        request.metadata.get("purpose") == "memory_extraction_candidate_card"
         for request in resume_provider.requests
     )
     assert any(
-        request.metadata.get("purpose") == "summary_chunk_segmentation"
+        request.metadata.get("purpose") == "summary_chunk_segmentation_ranges_card"
         for request in resume_provider.requests
     )
 
@@ -1987,7 +2170,7 @@ async def test_benchmark_bulk_ingest_persists_locomo_image_captions_as_artifacts
     assert any(
         "a photo of a cup with a dog face on it" in request.messages[-1].content
         for request in provider.requests
-        if request.metadata.get("purpose") == "memory_extraction"
+        if request.metadata.get("purpose") == "memory_extraction_candidate_card"
     )
 
 
@@ -2057,6 +2240,7 @@ async def test_benchmark_corrections_overlay_substitutes_ground_truth(
             "conv-test-1:q3": {
                 "original_ground_truth": "green",
                 "corrected_ground_truth": "yellow",
+                "evidence_turn": "D3:2",
                 "reason": "Test correction",
             }
         }),
@@ -2079,6 +2263,139 @@ async def test_benchmark_corrections_overlay_substitutes_ground_truth(
     assert report.total_correct == 3
     assert report.total_questions == 3
     assert report.overall_accuracy == pytest.approx(1.0)
+    lamp_result = next(
+        result
+        for result in report.conversations[0].results
+        if result.question.question_id == "conv-test-1:q3"
+    )
+    assert lamp_result.question.evidence_turn_ids == ["D3:2"]
+    assert lamp_result.trace["grade_context"]["source_turn_ids"] == ["D3:2"]
+
+
+def test_benchmark_corrections_overlay_substitutes_evidence_turn_ids(
+    tmp_path: Path,
+) -> None:
+    """Corrections overlay also replaces the official judge evidence packet."""
+    corrections_path = tmp_path / "corrections.json"
+    corrections_path.write_text(
+        json.dumps(
+            {
+                "conv-test-1:q3": {
+                    "original_ground_truth": "green",
+                    "corrected_ground_truth": "yellow",
+                    "evidence_turn": "D3:2",
+                    "reason": "Test evidence correction",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+        corrections_path=corrections_path,
+    )
+
+    dataset = benchmark._adapter.load()
+    inputs = benchmark._conversation_inputs(
+        dataset.conversations,
+        scored_categories=[1, 2, 3, 4],
+        question_filter={"conv-test-1:q3"},
+        require_evidence_packets=True,
+    )
+
+    corrected_question = inputs[0][2][0]
+    assert corrected_question.ground_truth == "yellow"
+    assert corrected_question.evidence_turn_ids == ["D3:2"]
+
+
+def test_benchmark_corrections_overlay_validates_bad_evidence_turn_ids(
+    tmp_path: Path,
+) -> None:
+    corrections_path = tmp_path / "corrections.json"
+    corrections_path.write_text(
+        json.dumps(
+            {
+                "conv-test-1:q3": {
+                    "corrected_ground_truth": "yellow",
+                    "corrected_evidence_turn_ids": ["D9:9"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+        corrections_path=corrections_path,
+    )
+
+    dataset = benchmark._adapter.load()
+    with pytest.raises(ValueError, match="conv-test-1:q3.*D9:9"):
+        benchmark._conversation_inputs(
+            dataset.conversations,
+            scored_categories=[1, 2, 3, 4],
+            question_filter={"conv-test-1:q3"},
+            require_evidence_packets=True,
+        )
+
+
+def test_benchmark_requires_non_empty_evidence_packets_when_enabled(
+    tmp_path: Path,
+) -> None:
+    data_path = _write_dataset(tmp_path)
+    samples = json.loads(data_path.read_text(encoding="utf-8"))
+    samples[0]["qa"][2]["evidence"] = []
+    data_path.write_text(json.dumps(samples), encoding="utf-8")
+    benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    dataset = benchmark._adapter.load()
+    with pytest.raises(ValueError, match="conv-test-1:q3.*no evidence_turn_ids"):
+        benchmark._conversation_inputs(
+            dataset.conversations,
+            scored_categories=[1, 2, 3, 4],
+            question_filter={"conv-test-1:q3"},
+            require_evidence_packets=True,
+        )
+
+
+def test_locomo_source_evidence_for_question_includes_image_caption(
+    tmp_path: Path,
+) -> None:
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset_with_image_caption(tmp_path),
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    conversation = benchmark._adapter.load().conversations[0]
+    source_evidence = benchmark._source_evidence_for_question(
+        conversation,
+        conversation.questions[0],
+    )
+
+    assert source_evidence[0]["blip_caption"] == (
+        "a photo of a cup with a dog face on it"
+    )
+    assert "Visual description of attached image" in source_evidence[0]["attachment_text"]
 
 
 @pytest.mark.asyncio
@@ -2142,7 +2459,7 @@ async def test_benchmark_can_reuse_retained_ingestion_db_without_persisting_ques
     assert sum(
         1
         for request in provider.requests
-        if request.metadata.get("purpose") == "memory_extraction"
+        if request.metadata.get("purpose") == "memory_extraction_candidate_card"
     ) == 6
 
     eval_provider = BenchmarkProvider()
@@ -2169,8 +2486,8 @@ async def test_benchmark_can_reuse_retained_ingestion_db_without_persisting_ques
     assert sum(
         1
         for request in eval_provider.requests
-        if request.metadata.get("purpose") == "memory_extraction"
-    ) == 2
+        if request.metadata.get("purpose") == "memory_extraction_candidate_card"
+    ) == 0
 
     async with Atagia(
         db_path=retained_db,
@@ -2251,7 +2568,7 @@ async def test_benchmark_can_resume_partial_ingestion_db(
     assert sum(
         1
         for request in resume_provider.requests
-        if request.metadata.get("purpose") == "memory_extraction"
+        if request.metadata.get("purpose") == "memory_extraction_candidate_card"
     ) == 4
 
     async with Atagia(
@@ -2339,8 +2656,8 @@ async def test_benchmark_can_evaluate_reuse_db_dir_in_parallel(
     assert sum(
         1
         for request in eval_provider.requests
-        if request.metadata.get("purpose") == "memory_extraction"
-    ) >= 2
+        if request.metadata.get("purpose") == "memory_extraction_candidate_card"
+    ) == 0
 
 
 @pytest.mark.asyncio
@@ -2662,6 +2979,7 @@ def test_build_run_manifest_includes_reproducibility_fields(
     monkeypatch.setenv("ATAGIA_APPLICABILITY_GATE_MODE", "enforced")
     monkeypatch.setenv("ATAGIA_GRAPH_PROJECTION_ENABLED", "true")
     monkeypatch.setenv("ATAGIA_RESPONSE_MODE", "fast")
+    monkeypatch.setenv("ATAGIA_ADAPTIVE_RETRIEVAL", "true")
     data_path = _write_dataset(tmp_path)
     benchmark = LoCoMoBenchmark(
         data_path=data_path,
@@ -2770,6 +3088,7 @@ def test_build_run_manifest_includes_reproducibility_fields(
         "embedding_backend": "sqlite_vec",
         "graph_projection_enabled": True,
         "response_mode": "fast",
+        "adaptive_retrieval": True,
     }
     assert manifest["run_counters"] == {"counts": {}, "labeled_counts": {}}
     assert manifest["selection"] == {

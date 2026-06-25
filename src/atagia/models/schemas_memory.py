@@ -308,6 +308,33 @@ class NeedTrigger(str, Enum):
     UNDER_SPECIFIED_REQUEST = "under_specified_request"
 
 
+class MemoryDependence(str, Enum):
+    """How much a turn depends on the user's stored memory.
+
+    Drives the adaptive retrieval gate. ``MIXED`` is the conservative default:
+    any omission or doubt resolves to full retrieval (uncertainty -> retrieve).
+    """
+
+    PERSONAL = "personal"
+    CONVERSATION = "conversation"
+    WORLD = "world"
+    MIXED = "mixed"
+
+
+class AdaptiveGateStatus(str, Enum):
+    """Outcome of the adaptive retrieval gate for one turn.
+
+    ``OFF_SHADOW`` means the gate computed and recorded a classification but
+    took no action (flag OFF). ``NOT_APPLICABLE`` covers paths where the gate
+    never runs (fast mode, which never calls the need detector).
+    """
+
+    OFF_SHADOW = "shadow"
+    RETRIEVED = "retrieved"
+    SKIPPED = "skipped"
+    NOT_APPLICABLE = "not_applicable"
+
+
 class ExactFacet(str, Enum):
     """Categories of exact values an exact-recall query may target."""
 
@@ -1154,6 +1181,22 @@ class LeanTemporalStatus(BaseModel):
         return self
 
 
+class CoverageMember(BaseModel):
+    """One asserted member of an enumerable attribute carried by a candidate.
+
+    Emitted by the ``coverage_members`` extraction card for facts that assert an
+    entity as a member of an enumerable set (a person's doctors, a list of
+    cities, contacts, products, ...). ``member_key`` is the normalized identity
+    used to collapse near-duplicate carriers; ``display_text`` is the
+    answer-facing label.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    member_key: str
+    display_text: str
+
+
 class LeanExtractionCandidate(BaseModel):
     """Single durable memory candidate in the model-facing lean contract.
 
@@ -1175,6 +1218,7 @@ class LeanExtractionCandidate(BaseModel):
     support_kind: MemoryEvidenceSupportKind = MemoryEvidenceSupportKind.DIRECT
     claim_key: str | None = None
     claim_value: str | None = None
+    coverage_members: list[CoverageMember] = Field(default_factory=list)
 
     @field_validator("language_codes", mode="before")
     @classmethod
@@ -1656,6 +1700,9 @@ class QueryIntelligenceResult(BaseModel):
     answer_language: str | None = None
     anchors: list[RuntimeAnchor] = Field(default_factory=list)
     query_type: QueryType = "default"
+    # Adaptive retrieval gate classification. MIXED is the conservative default
+    # (uncertainty -> retrieve); every synthetic/degraded plan keeps it MIXED.
+    memory_dependence: MemoryDependence = MemoryDependence.MIXED
     retrieval_levels: list[int] = Field(default_factory=lambda: [0])
     # Wave 1 batch 2 (1-D): exact recall routing. The LLM decides; the
     # pipeline resolves deterministically.
@@ -1794,89 +1841,6 @@ class QueryIntelligenceResult(BaseModel):
                     "broad_list sparse_query_hints must preserve distinct facet anchors across sub_queries"
                 )
         return self
-
-
-# QueryPlanCore is the lean primary need-detection schema. The detailed
-# rationale is kept as a comment (not a docstring) so it does NOT inflate the
-# json_schema the model receives on every interactive turn.
-#
-# It is the small "contract" the primary need-detection LLM call must satisfy.
-# Relative to the rich QueryIntelligenceResult it drops the heavy part of the
-# schema only: the structured `anchors` list with its nested
-# `RuntimeAnchorAlias` arrays-of-objects (about half of the rich JSON schema
-# and the source of the cross-field anchor validators). Anchors are produced
-# by a conditional anchor review and merged back in server-side.
-#
-# Every other rich field is KEPT here because none is neutral when defaulted.
-# `needs` drives retrieval boosts, `temporal_range` drives time filtering,
-# `callback_bias` shapes hints, `retrieval_levels` selects evidence tiers, and
-# `query_language` / `answer_language` are cheap scalars that feed the answer-
-# language hint downstream (dropping them silently disables that feature for
-# every turn). Keeping these scalars costs only a few hundred schema chars; the
-# bloat lived entirely in the structured anchors.
-#
-# It performs per-field shape validation only. It does NOT raise on
-# hint<->sub_query linkage problems; those are repaired mechanically by
-# `need_detector_repair` before the rich object is built, so a medium model
-# that drifts on cross-field linkage degrades gracefully instead of failing
-# the whole structured call.
-class QueryPlanCore(BaseModel):
-    """Lean primary need-detection plan requested from the model."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    needs: list[DetectedNeed] = Field(default_factory=list)
-    temporal_range: TemporalQueryRange | None = None
-    sub_queries: list[str] = Field(min_length=1, max_length=3)
-    callback_bias: bool = False
-    raw_context_access_mode: RawContextAccessMode = "normal"
-    sparse_query_hints: list[SparseQueryHint] = Field(default_factory=list)
-    query_language: str | None = None
-    answer_language: str | None = None
-    query_type: QueryType = "default"
-    memory_needed: bool = True
-    retrieval_levels: list[int] = Field(default_factory=lambda: [0])
-    exact_recall_needed: bool = False
-    exact_facets: list[ExactFacet] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_exact_recall_flag(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        if not data.get("exact_facets"):
-            return data
-        normalized = dict(data)
-        normalized["exact_recall_needed"] = True
-        return normalized
-
-    @field_validator("exact_facets")
-    @classmethod
-    def validate_exact_facets(cls, values: list[ExactFacet]) -> list[ExactFacet]:
-        return _ensure_unique_values(values)
-
-    @field_validator("sub_queries")
-    @classmethod
-    def validate_sub_queries(cls, values: list[str]) -> list[str]:
-        normalized = [value.strip() for value in values if value.strip()]
-        if not normalized:
-            raise ValueError("sub_queries must not be empty")
-        return _ensure_unique_values(normalized)
-
-    @field_validator("query_language", "answer_language", mode="before")
-    @classmethod
-    def validate_language_codes(cls, value: Any) -> str | None:
-        return normalize_optional_iso_639_1_code(value)
-
-    @field_validator("retrieval_levels")
-    @classmethod
-    def validate_retrieval_levels(cls, values: list[int]) -> list[int]:
-        normalized = _ensure_unique_values(values)
-        if not normalized:
-            raise ValueError("retrieval_levels must not be empty")
-        if any(value not in {0, 1, 2} for value in normalized):
-            raise ValueError("retrieval_levels must contain only 0, 1, or 2")
-        return normalized
 
 
 class PlannedSubQuery(BaseModel):
@@ -2525,6 +2489,20 @@ class ContentLanguageProfileTraceRow(BaseModel):
         return normalized or None
 
 
+class NeedCardCallTrace(BaseModel):
+    """Per-card need-detection LLM call IO (observability only)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    card_name: str
+    model: str
+    prompt: str | None = None
+    raw_output: str | None = None
+    parsed: dict[str, Any] = Field(default_factory=dict)
+    parse_valid: bool = False
+    error: str | None = None
+
+
 class NeedDetectionTrace(BaseModel):
     """Trace of the need detection stage."""
 
@@ -2546,12 +2524,16 @@ class NeedDetectionTrace(BaseModel):
     answer_shape: AnswerShape = "open_domain"
     coverage_mode: CoverageMode = "top_support"
     source_precision: SourcePrecision = "preferred"
+    # Adaptive retrieval gate classification recorded for shadow/active analysis.
+    # Defaults to MIXED so existing trace constructions stay valid.
+    memory_dependence: MemoryDependence = MemoryDependence.MIXED
     temporal_range: str | None = None
     retrieval_levels: list[int] = Field(default_factory=lambda: [0])
     degraded_mode: bool = False
     exact_recall_needed: bool = False
     exact_facets: list[str] = Field(default_factory=list)
     temporary_scaffolding: list[TemporaryScaffoldingTrace] = Field(default_factory=list)
+    card_calls: list[NeedCardCallTrace] = Field(default_factory=list)
     duration_ms: float = Field(ge=0.0)
 
 
@@ -2910,6 +2892,10 @@ StructuredOutputDiagnosticEvent = Literal[
     "missing_after_retry",
     "output_limit_drop",
     "output_limit_split",
+    "card_parse_invalid",
+    "card_missing_after_retry",
+    "card_output_limit_drop",
+    "card_output_limit_split",
 ]
 
 

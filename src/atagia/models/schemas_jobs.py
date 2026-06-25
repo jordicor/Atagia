@@ -96,6 +96,7 @@ class WorkerIterationResult:
     received: int = 0
     acked: int = 0
     failed: int = 0
+    deferred: int = 0
     dead_lettered: int = 0
 
 
@@ -202,6 +203,7 @@ class RevisionJobPayload(BaseModel):
     belief_id: str = ""
     claim_key: str = Field(min_length=1)
     claim_value: str
+    claim_key_already_validated: bool = False
     evidence_memory_ids: list[str] = Field(default_factory=list)
     source_message_id: str
     user_id: str

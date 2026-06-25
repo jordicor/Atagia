@@ -169,15 +169,27 @@ def _format_source_evidence(source_evidence: Sequence[dict[str, Any]] | None) ->
         turn_id = str(raw_item.get("turn_id") or "").strip()
         timestamp = str(raw_item.get("timestamp") or "").strip()
         speaker = str(raw_item.get("speaker") or raw_item.get("role") or "").strip()
+        session_id = str(raw_item.get("session_id") or "").strip()
         text = str(raw_item.get("text") or "").strip()
-        if not text:
+        blip_caption = str(raw_item.get("blip_caption") or "").strip()
+        attachment_text = str(raw_item.get("attachment_text") or "").strip()
+        body_parts: list[str] = []
+        if text:
+            body_parts.append(text)
+        if blip_caption:
+            body_parts.append(f"[Image caption]\n{blip_caption}")
+        if attachment_text and attachment_text != blip_caption:
+            body_parts.append(f"[Attachment text]\n{attachment_text}")
+        if not body_parts:
             continue
         header_parts = [f"#{index}"]
         if turn_id:
             header_parts.append(f"turn_id={turn_id}")
+        if session_id:
+            header_parts.append(f"session_id={session_id}")
         if timestamp:
             header_parts.append(f"timestamp={timestamp}")
         if speaker:
             header_parts.append(f"speaker={speaker}")
-        lines.append(f"{' | '.join(header_parts)}\n{text}")
+        lines.append(f"{' | '.join(header_parts)}\n" + "\n\n".join(body_parts))
     return "\n\n".join(lines)

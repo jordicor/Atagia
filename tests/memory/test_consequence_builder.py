@@ -98,14 +98,17 @@ async def _seed_action_memory(
     *,
     memory_id: str = "mem_action",
     message_id: str = "msg_assistant_1",
+    scope: MemoryScope = MemoryScope.CONVERSATION,
+    workspace_id: str | None = "wrk_1",
+    conversation_id: str | None = "cnv_1",
 ) -> dict[str, object]:
     return await memories.create_memory_object(
         user_id="usr_1",
-        workspace_id="wrk_1",
-        conversation_id="cnv_1",
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
         assistant_mode_id="coding_debug",
         object_type=MemoryObjectType.EVIDENCE,
-        scope=MemoryScope.CONVERSATION,
+        scope=scope,
         canonical_text="Suggested a large refactor.",
         source_kind=MemorySourceKind.EXTRACTED,
         confidence=0.83,
@@ -323,6 +326,47 @@ async def test_builder_finds_existing_action_memory_instead_of_creating_new_one(
         assert result.action_memory_id == str(action["id"])
         assert len(after) == len(before) + 2
         assert len(action_like_memories) == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_builder_creates_local_action_copy_for_cross_scope_action_memory() -> None:
+    connection, memories, builder, resolved_policy, context = await _build_runtime(
+        outputs=[json.dumps({"tendency_text": ""})]
+    )
+    try:
+        cross_scope_action = await _seed_action_memory(
+            memories,
+            memory_id="mem_user_action",
+            scope=MemoryScope.USER,
+            workspace_id=None,
+            conversation_id=None,
+        )
+
+        result = await builder.build_chain(
+            ConsequenceSignal(
+                is_consequence=True,
+                action_description="Suggested a large refactor.",
+                outcome_description="Regressions appeared afterwards.",
+                outcome_sentiment="negative",
+                confidence=0.76,
+                likely_action_message_id="msg_assistant_1",
+            ),
+            user_id="usr_1",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+        )
+
+        assert result is not None
+        assert result.action_memory_id != str(cross_scope_action["id"])
+        action = await memories.get_memory_object(result.action_memory_id, "usr_1")
+        assert action is not None
+        assert action["scope_canonical"] == MemoryScope.CHAT.value
+        assert action["conversation_id"] == context.conversation_id
+        cursor = await connection.execute("SELECT COUNT(*) AS count FROM consequence_chains")
+        row = await cursor.fetchone()
+        assert row["count"] == 1
     finally:
         await connection.close()
 

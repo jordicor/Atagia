@@ -806,8 +806,14 @@ async def test_build_llm_client_registers_gemini_and_uses_gemini_embeddings(
         name = "gemini"
         supports_embedding_dimensions = True
 
-        def __init__(self, *, api_key: str) -> None:
+        def __init__(
+            self,
+            *,
+            api_key: str,
+            request_timeout_seconds: float | None = None,
+        ) -> None:
             captured["api_key"] = api_key
+            captured["request_timeout_seconds"] = request_timeout_seconds
 
         async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
             return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
@@ -849,6 +855,7 @@ async def test_build_llm_client_registers_gemini_and_uses_gemini_embeddings(
     )
 
     assert captured["api_key"] == "google-key"
+    assert captured["request_timeout_seconds"] == 120.0
     assert client.provider_name is None
     assert embedding.provider == "gemini"
 
@@ -921,7 +928,7 @@ async def test_gemini_stream_emits_done_before_propagating_error() -> None:
 
     assert [event.type for event in received] == ["text", "done"]
     assert received[1].payload["usage"] == {"input_tokens": 4, "output_tokens": 2}
-    assert isinstance(raised, RuntimeError)
+    assert type(raised) is LLMError
     assert "stream broke" in str(raised)
 
 

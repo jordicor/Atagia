@@ -162,6 +162,7 @@ Redis accelerates queues and caching but is optional.
 - Four memory layers and a three-level hierarchy (verbatim / belief / summary) with mirror retrieval
 - Belief revision with version history; consequence chains; interaction contracts
 - Hybrid retrieval: FTS5 with reciprocal rank fusion, progressive multi-query expansion, diversity reranking, and an optional sqlite-vec semantic lane
+- Adaptive retrieval gate (on by default): turns that only need the model's own knowledge or the visible conversation skip the retrieval stages and answer from the prepared context, with zero added LLM calls; personally anchored or uncertain turns always retrieve
 - Adaptive context cache, immediate working memory, and Topic Working Set
 - Natural memory capture from ordinary conversation, with consent gating and temporal grounding for relative dates
 - Operational profiles (`normal`, `low_power`, `offline`, `emergency`, `disaster`; high-risk opt-in)
@@ -327,17 +328,20 @@ full route list including admin endpoints is in
 
 SQLite is the only required storage dependency. LLM models are configured per
 component with provider-qualified specs such as `anthropic/claude-sonnet-4-6`
-or `openrouter/google/gemini-3.1-flash-lite`. Redis is optional.
+or `minimax/MiniMax-M3`. Redis is optional.
 
-Default runtime expects both `ATAGIA_OPENROUTER_API_KEY` and
-`ATAGIA_ANTHROPIC_API_KEY`: OpenRouter-hosted Gemini Flash-Lite handles ingest
-and retrieval intelligence, OpenRouter-hosted DeepSeek v4 Flash handles cheap
-ordinary chat answers, and Anthropic Claude Sonnet remains the default for
-privacy/consent/export-sensitive components. To run every component on one
-provider, set `ATAGIA_LLM_FORCED_GLOBAL_MODEL`. Use the stable Gemini
-Flash-Lite slug without `-preview`. Structured-output calls perform one
-same-model corrective retry after JSON/schema validation fails, with an
-optional rescue path that escalates only the stuck calls to a stronger model.
+Default runtime expects `ATAGIA_MINIMAX_API_KEY`,
+`ATAGIA_OPENROUTER_API_KEY`, and `ATAGIA_ANTHROPIC_API_KEY`: direct MiniMax M3
+handles ingest and compaction intelligence, OpenRouter-hosted Gemini
+Flash-Lite handles retrieval intelligence, OpenRouter-hosted DeepSeek v4 Flash
+handles cheap ordinary chat answers, and Anthropic Claude Sonnet remains the
+default for privacy/consent/export-sensitive components. Benchmark CLIs with
+their default judge also expect `ATAGIA_KIMI_API_KEY`. To run every component
+on one provider, set `ATAGIA_LLM_FORCED_GLOBAL_MODEL`. Use the stable Gemini
+Flash-Lite slug without `-preview` for retrieval overrides. Structured-output
+calls perform one same-model corrective retry after JSON/schema validation
+fails, with an optional rescue path that escalates only the stuck calls to a
+stronger model.
 Full configuration — embedding backends, model routing, structured output
 repair, intimacy fallback policy, debug LLM I/O — is documented in
 [docs/CONFIGURATION_REFERENCE.md](docs/CONFIGURATION_REFERENCE.md).

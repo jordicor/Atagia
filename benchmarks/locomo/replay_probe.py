@@ -23,6 +23,7 @@ from atagia.models.schemas_replay import AblationConfig
 from atagia.services.model_resolution import COMPONENTS_BY_ID, provider_qualified_model
 from benchmarks.base import BenchmarkConversation
 from benchmarks.json_artifacts import write_json_atomic
+from benchmarks.output_root import assert_outside_repo, bench_output_root
 from benchmarks.llm_config import provider_api_key_kwargs
 from benchmarks.locomo.adapter import LoCoMoAdapter
 
@@ -190,7 +191,7 @@ def _resolve_question(conversation: BenchmarkConversation, args: argparse.Namesp
 def _default_output_path(conversation_id: str, question_id: str) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     safe_question_id = question_id.replace(":", "_")
-    return _PROJECT_ROOT / "docs" / "tmp" / f"locomo_replay_probe_{conversation_id}_{safe_question_id}_{timestamp}.json"
+    return bench_output_root() / "locomo" / f"locomo_replay_probe_{conversation_id}_{safe_question_id}_{timestamp}.json"
 
 
 def _query_tokens(question_text: str) -> list[str]:
@@ -386,6 +387,7 @@ async def _run(args: argparse.Namespace) -> Path:
     conversation = _load_conversation(args.data_path, args.conversation_id)
     question_id, question_text, ground_truth, evidence_turn_ids, category = _resolve_question(conversation, args)
     output_path = Path(args.output).expanduser() if args.output else _default_output_path(args.conversation_id, question_id)
+    assert_outside_repo(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ablation = AblationConfig(
         privacy_enforcement=args.privacy_enforcement,

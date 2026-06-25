@@ -243,6 +243,31 @@ class MidStreamFailureProvider(LLMProvider):
         raise TransientLLMError("stream interrupted")
 
 
+class PartialTransientThenJsonProvider(LLMProvider):
+    name = "partial-then-json"
+
+    def __init__(self) -> None:
+        self.stream_calls = 0
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        return LLMCompletionResponse(provider=self.name, model=request.model)
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        return LLMEmbeddingResponse(
+            provider=self.name,
+            model=request.model,
+            vectors=[LLMEmbeddingVector(index=0, values=[0.1])],
+        )
+
+    async def stream(self, request: LLMCompletionRequest):
+        self.stream_calls += 1
+        if self.stream_calls == 1:
+            yield LLMStreamEvent(type="text", content='{"label":')
+            raise TransientLLMError("stream interrupted")
+        yield LLMStreamEvent(type="text", content='{"label":"ok","score":7}')
+        yield LLMStreamEvent(type="done", payload={"usage": {}})
+
+
 class PostDoneLimitProvider(LLMProvider):
     name = "post-done-limit"
 
@@ -420,6 +445,16 @@ class RecordingObserver:
         _request: LLMCompletionRequest,
     ) -> None:
         self.accumulated_texts.append(accumulated_text)
+
+
+class ResetRecordingObserver(RecordingObserver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reset_errors: list[str] = []
+
+    def reset_for_retry(self, error: LLMError) -> None:
+        self.reset_errors.append(error.__class__.__name__)
+        self.accumulated_texts.clear()
 
 
 class RecordingProvider(LLMProvider):
@@ -979,7 +1014,7 @@ async def test_complete_structured_retries_same_model_before_rescue() -> None:
         _request().model_copy(
             update={
                 "model": "openrouter/deepseek/deepseek-v4-flash",
-                "metadata": {"purpose": "need_detection"},
+                "metadata": {"purpose": "memory_extraction"},
                 "response_schema": StructuredPayload.model_json_schema(),
             }
         ),
@@ -1023,7 +1058,7 @@ async def test_complete_structured_uses_rescue_after_same_model_retry_fails() ->
         _request().model_copy(
             update={
                 "model": "openrouter/deepseek/deepseek-v4-flash",
-                "metadata": {"purpose": "need_detection"},
+                "metadata": {"purpose": "memory_extraction"},
             }
         ),
         StructuredPayload,
@@ -1365,6 +1400,106 @@ async def test_complete_applies_openrouter_flashlite_profile_after_resolution() 
 
 
 @pytest.mark.asyncio
+async def test_complete_applies_openrouter_minimax_m3_profile_after_resolution() -> None:
+    provider = RecordingProvider("openrouter")
+    client = LLMClient(providers=[provider])
+
+    await client.complete(
+        _request().model_copy(
+            update={
+                "model": "openrouter/minimax/minimax-m3",
+            }
+        )
+    )
+
+    assert provider.requests[0].model == "minimax/minimax-m3"
+    assert provider.requests[0].metadata["provider_extra_body"] == {
+        "reasoning": {"effort": "none"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_complete_routes_direct_minimax_m3_after_resolution() -> None:
+    provider = RecordingProvider("minimax")
+    client = LLMClient(providers=[provider])
+
+    await client.complete(
+        _request().model_copy(
+            update={
+                "model": "minimax/MiniMax-M3",
+            }
+        )
+    )
+
+    assert provider.requests[0].model == "MiniMax-M3"
+    assert provider.requests[0].metadata["provider_extra_body"] == {
+        "thinking": {"type": "disabled"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_complete_routes_direct_minimax_m27_highspeed_with_thinking_disabled() -> None:
+    provider = RecordingProvider("minimax")
+    client = LLMClient(providers=[provider])
+
+    await client.complete(
+        _request().model_copy(
+            update={
+                "model": "minimax/MiniMax-M2.7-highspeed",
+            }
+        )
+    )
+
+    assert provider.requests[0].model == "MiniMax-M2.7-highspeed"
+    assert provider.requests[0].metadata["provider_extra_body"] == {
+        "thinking": {"type": "disabled"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_complete_omits_temperature_for_direct_kimi_k27_code() -> None:
+    provider = RecordingProvider("kimi")
+    client = LLMClient(providers=[provider])
+
+    await client.complete(
+        _request().model_copy(
+            update={
+                "model": "kimi/kimi-k2.7-code",
+                "metadata": {"purpose": "benchmark_judge"},
+            }
+        )
+    )
+
+    assert provider.requests[0].model == "kimi-k2.7-code"
+    assert provider.requests[0].temperature is None
+    assert provider.requests[0].metadata["atagia_temperature_source"] == "model_profile_omitted"
+    assert provider.requests[0].metadata["atagia_temperature_reason"] == "kimi/kimi-k2.7-code"
+
+
+@pytest.mark.asyncio
+async def test_complete_omits_temperature_for_direct_kimi_k27_code_highspeed() -> None:
+    provider = RecordingProvider("kimi")
+    client = LLMClient(providers=[provider])
+
+    await client.complete(
+        _request().model_copy(
+            update={
+                "model": "kimi/kimi-k2.7-code-highspeed",
+                "metadata": {"purpose": "topic_working_set_route_card"},
+            }
+        )
+    )
+
+    assert provider.requests[0].model == "kimi-k2.7-code-highspeed"
+    assert provider.requests[0].temperature is None
+    assert provider.requests[0].metadata["atagia_temperature_source"] == "model_profile_omitted"
+    assert (
+        provider.requests[0].metadata["atagia_temperature_reason"]
+        == "kimi/kimi-k2.7-code-highspeed"
+    )
+
+
+@pytest.mark.asyncio
 async def test_complete_applies_local_qwen_sampling_profile() -> None:
     provider = RecordingProvider("openai")
     client = LLMClient(providers=[provider])
@@ -1473,6 +1608,43 @@ async def test_stream_does_not_retry_after_partial_output() -> None:
     with pytest.raises(TransientLLMError):
         await anext(stream)
     assert provider.stream_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_structured_streamed_retries_partial_stream_when_extraction_opts_in() -> None:
+    provider = PartialTransientThenJsonProvider()
+    observer = ResetRecordingObserver()
+    client = LLMClient(
+        provider_name=provider.name,
+        providers=[provider],
+        retry_policy=RetryPolicy(
+            attempts=2,
+            base_delay_seconds=0,
+            max_delay_seconds=0,
+            jitter_fraction=0,
+        ),
+    )
+    request = _request().model_copy(
+        update={
+            "metadata": {
+                "purpose": "memory_extraction",
+                "atagia_partial_stream_retry": "discard_and_retry",
+            },
+            "response_schema": StructuredPayload.model_json_schema(),
+        }
+    )
+
+    payload = await client.complete_structured_streamed(
+        request,
+        StructuredPayload,
+        observer=observer,
+    )
+
+    assert payload.label == "ok"
+    assert payload.score == 7
+    assert provider.stream_calls == 2
+    assert observer.reset_errors == ["TransientLLMError"]
+    assert observer.accumulated_texts == ['{"label":"ok","score":7}']
 
 
 @pytest.mark.asyncio
@@ -1665,7 +1837,7 @@ async def test_interactive_purpose_uses_short_retry_policy() -> None:
     )
 
     with pytest.raises(TransientLLMError):
-        await client.complete(_purpose_request("need_detection"))
+        await client.complete(_purpose_request("need_detection_language_card"))
 
     # Interactive purpose caps at 2 attempts regardless of the base policy.
     assert provider.calls == 2
@@ -1702,11 +1874,118 @@ async def test_unset_purpose_keeps_injected_retry_policy() -> None:
     assert provider.calls == 4
 
 
+@pytest.mark.asyncio
+async def test_retry_after_delay_is_honored_and_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = AlwaysTransientProvider()
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("atagia.services.llm_client.asyncio.sleep", fake_sleep)
+
+    class RetryAfterProvider(AlwaysTransientProvider):
+        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+            self.calls += 1
+            raise TransientLLMError("rate limited", retry_after_seconds=9.0)
+
+    provider = RetryAfterProvider()
+    client = LLMClient(
+        provider_name=provider.name,
+        providers=[provider],
+        retry_policy=RetryPolicy(
+            attempts=2,
+            base_delay_seconds=1,
+            max_delay_seconds=4,
+            jitter_fraction=0,
+        ),
+    )
+
+    with pytest.raises(TransientLLMError):
+        await client.complete(_request())
+
+    assert sleeps == [4]
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_extraction_retry_after_above_cap_propagates_without_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _assert_long_retry_after_propagates_without_sleep(
+        monkeypatch,
+        purpose="memory_extraction",
+    )
+
+
+@pytest.mark.parametrize(
+    "purpose",
+    ["consequence_detection", "consequence_gate_card"],
+)
+@pytest.mark.asyncio
+async def test_background_deferable_retry_after_above_cap_propagates_without_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+    purpose: str,
+) -> None:
+    await _assert_long_retry_after_propagates_without_sleep(
+        monkeypatch,
+        purpose=purpose,
+    )
+
+
+async def _assert_long_retry_after_propagates_without_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    purpose: str,
+) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("atagia.services.llm_client.asyncio.sleep", fake_sleep)
+
+    class RetryAfterProvider(AlwaysTransientProvider):
+        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+            self.calls += 1
+            raise TransientLLMError("rate limited", retry_after_seconds=60.0)
+
+    provider = RetryAfterProvider()
+    client = LLMClient(
+        provider_name=provider.name,
+        providers=[provider],
+        retry_policy=RetryPolicy(
+            attempts=5,
+            base_delay_seconds=1,
+            max_delay_seconds=15,
+            jitter_fraction=0,
+        ),
+    )
+
+    request = _request().model_copy(update={"metadata": {"purpose": purpose}})
+    with pytest.raises(TransientLLMError) as exc_info:
+        await client.complete(request)
+
+    assert exc_info.value.retry_after_seconds == 60.0
+    assert sleeps == []
+    assert provider.calls == 1
+
+
 def test_default_interactive_retry_policy_values() -> None:
     from atagia.services.llm_client import _DEFAULT_INTERACTIVE_RETRY_POLICY
 
     assert _DEFAULT_INTERACTIVE_RETRY_POLICY.attempts == 2
     assert _DEFAULT_INTERACTIVE_RETRY_POLICY.max_delay_seconds == 1.5
+
+
+def test_default_extraction_retry_policy_is_more_patient() -> None:
+    client = LLMClient(provider_name="stub", providers=[RecordingProvider("stub")])
+
+    policy = client._retry_policy_for(_purpose_request("memory_extraction"))
+
+    assert policy.attempts == 5
+    assert policy.retry_delays_seconds == (1.0, 3.0, 8.0, 15.0)
+    assert policy.max_delay_seconds == 15.0
 
 
 def test_retry_policy_for_resolves_interactive_and_default() -> None:

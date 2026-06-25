@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
-import json
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 from atagia.core.clock import FrozenClock
+from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository
 from atagia.core.topic_repository import TopicRepository
 from atagia.memory.topic_working_set import (
+    _TopicContent,
+    _TopicRoute,
+    _parse_route_card_output,
     TopicUpdateAction,
+    TopicUpdateActionType,
     TopicWorkingSetPlan,
     TopicWorkingSetUpdater,
 )
@@ -26,32 +32,84 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
+from benchmarks.topic_working_set_cards.compare import (
+    BenchmarkCase,
+    _build_artifact_prompt,
+)
+from tests.memory.card_leak_guard import assert_prompt_has_no_benchmark_leak
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+
+
+def _prompt_only_updater(*, card_examples_enabled: bool = True) -> TopicWorkingSetUpdater:
+    """Build an updater for pure prompt-construction assertions (no DB needed)."""
+    provider = SequentialTopicProvider([])
+    settings = replace(
+        Settings.from_env(),
+        card_examples_enabled=card_examples_enabled,
+        llm_component_examples={},
+    )
+    return TopicWorkingSetUpdater(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=FrozenClock(datetime(2026, 4, 26, 2, 45, tzinfo=timezone.utc)),
+        topic_repository=cast(Any, None),
+        message_repository=cast(Any, None),
+        settings=settings,
+    )
+
+
+def _live_card_prompts(updater: TopicWorkingSetUpdater) -> dict[str, str]:
+    """Render every live card prompt for a representative route/content/message set."""
+    snapshot = {"active_topics": [], "parked_topics": []}
+    messages = [{"id": "msg_1", "seq": 1, "role": "user", "text": "Plan a budget for the move."}]
+    route = _TopicRoute(
+        action=TopicUpdateActionType.CREATE,
+        target_id="tmp1",
+        source_message_ids=("msg_1",),
+    )
+    content = _TopicContent(title="Moving budget", summary="The user is planning a moving budget.")
+    return {
+        "existing_route": updater._build_existing_route_prompt(
+            conversation_id="cnv_1", snapshot=snapshot, messages=messages
+        ),
+        "new_topic_track": updater._build_new_topic_track_prompt(
+            conversation_id="cnv_1", snapshot=snapshot, messages=messages
+        ),
+        "content": updater._build_content_prompt(
+            conversation_id="cnv_1",
+            snapshot=snapshot,
+            messages=messages,
+            route=route,
+            existing_topic=None,
+        ),
+        "boundary": updater._build_target_boundary_prompt(
+            conversation_id="cnv_1", messages=messages, route=route, content=content
+        ),
+    }
 
 
 class SequentialTopicProvider(LLMProvider):
     name = "topic-working-set"
 
-    def __init__(self, payloads: list[dict[str, object]]) -> None:
-        self.payloads = list(payloads)
+    def __init__(self, outputs: list[str]) -> None:
+        self.outputs = list(outputs)
         self.requests: list[LLMCompletionRequest] = []
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
-        if not self.payloads:
+        if not self.outputs:
             raise AssertionError("No canned topic payload left for this test")
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
-            output_text=json.dumps(self.payloads.pop(0)),
+            output_text=self.outputs.pop(0),
         )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise AssertionError("Embeddings are not used in topic working-set tests")
 
 
-async def _build_runtime(payloads: list[dict[str, object]]):
+async def _build_runtime(outputs: list[str]):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 26, 2, 45, tzinfo=timezone.utc))
     users = UserRepository(connection, clock)
@@ -69,7 +127,7 @@ async def _build_runtime(payloads: list[dict[str, object]]):
     await connection.commit()
     await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "Chat")
     await conversations.create_conversation("cnv_2", "usr_2", None, "coding_debug", "Other")
-    provider = SequentialTopicProvider(payloads)
+    provider = SequentialTopicProvider(outputs)
     updater = TopicWorkingSetUpdater(
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         clock=clock,
@@ -150,24 +208,19 @@ def test_topic_update_action_rejects_invalid_sentinel_replacements() -> None:
 
 @pytest.mark.asyncio
 async def test_topic_updater_creates_topic_and_links_only_valid_source_messages() -> None:
-    payload = {
-        "actions": [
-            {
-                "action": "create",
-                "title": "Benchmark observability",
-                "summary": "Track retained DBs, manifests, and failed-question custody.",
-                "active_goal": "Make benchmark comparisons reproducible.",
-                "open_questions": ["Which failures lacked sufficient evidence?"],
-                "decisions": ["Keep retrieval changes in shadow mode."],
-                "artifact_ids": ["art_manifest", "art_hallucinated"],
-                "source_message_ids": ["msg_1", "msg_other_user", "missing"],
-                "confidence": 0.84,
-                "privacy_level": 0,
-            }
-        ],
-        "nothing_to_update": False,
-    }
-    connection, _clock, messages, topics, updater, provider = await _build_runtime([payload])
+    outputs = [
+        "none",
+        "track msg_1 msg_other_user missing",
+        (
+            "title: Benchmark observability\n"
+            "summary: Track retained DBs, manifests, and failed-question custody.\n"
+            "goal: Make benchmark comparisons reproducible.\n"
+            "question: Which failures lacked sufficient evidence?\n"
+            "decision: Keep retrieval changes in shadow mode."
+        ),
+        "tmp1 ordinary 0 0.84",
+    ]
+    connection, _clock, messages, topics, updater, provider = await _build_runtime(outputs)
     try:
         message = await messages.create_message(
             "msg_1",
@@ -224,35 +277,36 @@ async def test_topic_updater_creates_topic_and_links_only_valid_source_messages(
             ("message", "msg_1"),
             ("artifact", "art_manifest"),
         ]
-        prompt = provider.requests[0].messages[1].content
-        assert "Do not create dataset-specific or benchmark-specific topics." in prompt
-        assert '"artifact_id": "art_manifest"' in prompt
-        assert "run-manifest.json" in prompt
-        assert '"relevance_state": "active_work_material"' in prompt
-        assert "Do not leak this summary text" not in prompt
-        assert "omit any field other than action" in prompt
+        route_prompt = provider.requests[0].messages[1].content
+        new_topic_prompt = provider.requests[1].messages[1].content
+        boundary_prompt = provider.requests[3].messages[1].content
+        assert [
+            request.metadata["purpose"]
+            for request in provider.requests
+        ] == [
+            "topic_working_set_route_card",
+            "topic_working_set_route_card",
+            "topic_working_set_content_card",
+            "topic_working_set_boundary_card",
+        ]
+        assert "Never create a new topic in this card." in route_prompt
+        assert "Default answer: track." in new_topic_prompt
+        assert '"artifact_id": "art_manifest"' in route_prompt
+        assert "run-manifest.json" in route_prompt
+        assert '"relevance_state": "active_work_material"' in route_prompt
+        assert "Do not leak this summary text" not in route_prompt
+        assert "Do not write titles, summaries, goals" in route_prompt
         for boundary in IntimacyBoundary:
-            assert boundary.value in prompt
+            assert boundary.value in boundary_prompt
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
 async def test_topic_updater_parks_existing_topic_from_model_plan() -> None:
-    payload = {
-        "actions": [
-            {
-                "action": "park",
-                "topic_id": "tpc_existing",
-                "summary": "Paused until the Qwen benchmark run finishes.",
-                "source_message_ids": ["msg_2"],
-                "confidence": 0.7,
-                "privacy_level": 0,
-            }
-        ],
-        "nothing_to_update": False,
-    }
-    connection, _clock, messages, topics, updater, _provider = await _build_runtime([payload])
+    connection, _clock, messages, topics, updater, _provider = await _build_runtime(
+        ["park tpc_existing msg_2"]
+    )
     try:
         await topics.create_topic(
             topic_id="tpc_existing",
@@ -280,7 +334,7 @@ async def test_topic_updater_parks_existing_topic_from_model_plan() -> None:
         assert len(changed) == 1
         assert changed[0]["id"] == "tpc_existing"
         assert changed[0]["status"] == "parked"
-        assert changed[0]["summary"] == "Paused until the Qwen benchmark run finishes."
+        assert changed[0]["summary"] == "Running model comparison."
         events = await topics.list_events(user_id="usr_1", conversation_id="cnv_1", topic_id="tpc_existing")
         assert [event["event_type"] for event in events] == ["created", "parked", "source_linked"]
     finally:
@@ -289,8 +343,9 @@ async def test_topic_updater_parks_existing_topic_from_model_plan() -> None:
 
 @pytest.mark.asyncio
 async def test_topic_updater_uses_placeholders_for_raw_policy_restricted_messages() -> None:
-    payload = {"actions": [], "nothing_to_update": True}
-    connection, _clock, messages, _topics, updater, provider = await _build_runtime([payload])
+    connection, _clock, messages, _topics, updater, provider = await _build_runtime(
+        ["none", "ignore"]
+    )
     try:
         message = await messages.create_message(
             "msg_restricted",
@@ -326,18 +381,9 @@ async def test_topic_updater_uses_placeholders_for_raw_policy_restricted_message
 
 @pytest.mark.asyncio
 async def test_topic_updater_ignores_cross_conversation_topic_actions() -> None:
-    payload = {
-        "actions": [
-            {
-                "action": "update",
-                "topic_id": "tpc_other_conv",
-                "summary": "This should not be applied across conversations.",
-                "source_message_ids": ["msg_3"],
-            }
-        ],
-        "nothing_to_update": False,
-    }
-    connection, clock, messages, topics, updater, _provider = await _build_runtime([payload])
+    connection, clock, messages, topics, updater, _provider = await _build_runtime(
+        ["update tpc_other_conv msg_3", "ignore"]
+    )
     try:
         conversations = ConversationRepository(connection, clock)
         await conversations.create_conversation("cnv_other", "usr_1", None, "coding_debug", "Other")
@@ -376,24 +422,9 @@ async def test_topic_updater_ignores_cross_conversation_topic_actions() -> None:
 
 @pytest.mark.asyncio
 async def test_topic_updater_does_not_clear_existing_fields_for_wire_sentinels() -> None:
-    payload = {
-        "actions": [
-            {
-                "action": "update",
-                "topic_id": "tpc_existing",
-                "title": "",
-                "summary": "",
-                "active_goal": "",
-                "confidence": -1.0,
-                "privacy_level": -1,
-                "intimacy_boundary": "",
-                "intimacy_boundary_confidence": -1.0,
-                "source_message_ids": ["msg_5"],
-            }
-        ],
-        "nothing_to_update": False,
-    }
-    connection, _clock, messages, topics, updater, _provider = await _build_runtime([payload])
+    connection, _clock, messages, topics, updater, _provider = await _build_runtime(
+        ["update tpc_existing msg_5", "none", "none"]
+    )
     try:
         await topics.create_topic(
             topic_id="tpc_existing",
@@ -439,19 +470,9 @@ async def test_topic_updater_does_not_clear_existing_fields_for_wire_sentinels()
 
 @pytest.mark.asyncio
 async def test_topic_updater_allows_explicit_ordinary_boundary_update() -> None:
-    payload = {
-        "actions": [
-            {
-                "action": "update",
-                "topic_id": "tpc_existing",
-                "intimacy_boundary": "ordinary",
-                "intimacy_boundary_confidence": 0.6,
-                "source_message_ids": ["msg_6"],
-            }
-        ],
-        "nothing_to_update": False,
-    }
-    connection, _clock, messages, topics, updater, _provider = await _build_runtime([payload])
+    connection, _clock, messages, topics, updater, _provider = await _build_runtime(
+        ["update tpc_existing msg_6", "none", "tpc_existing ordinary 0 0.6"]
+    )
     try:
         await topics.create_topic(
             topic_id="tpc_existing",
@@ -493,21 +514,16 @@ async def test_topic_updater_allows_explicit_ordinary_boundary_update() -> None:
 
 @pytest.mark.asyncio
 async def test_topic_updater_accepts_canonical_non_ordinary_boundary_values() -> None:
-    payload = {
-        "actions": [
-            {
-                "action": "create",
-                "title": "Private boundary discussion",
-                "summary": "Discusses a private relationship boundary.",
-                "intimacy_boundary": "romantic_private",
-                "intimacy_boundary_confidence": 0.82,
-                "privacy_level": 0,
-                "source_message_ids": ["msg_7"],
-            }
-        ],
-        "nothing_to_update": False,
-    }
-    connection, _clock, messages, topics, updater, _provider = await _build_runtime([payload])
+    outputs = [
+        "none",
+        "track msg_7",
+        (
+            "title: Private boundary discussion\n"
+            "summary: Discusses a private relationship boundary."
+        ),
+        "tmp1 romantic_private 0 0.82",
+    ]
+    connection, _clock, messages, topics, updater, _provider = await _build_runtime(outputs)
     try:
         message = await messages.create_message(
             "msg_7",
@@ -537,18 +553,9 @@ async def test_topic_updater_accepts_canonical_non_ordinary_boundary_values() ->
 
 @pytest.mark.asyncio
 async def test_topic_updater_records_progress_when_batch_only_closes_topic() -> None:
-    payload = {
-        "actions": [
-            {
-                "action": "close",
-                "topic_id": "tpc_existing",
-                "summary": "Closed after the user finished the thread.",
-                "source_message_ids": ["msg_4"],
-            }
-        ],
-        "nothing_to_update": False,
-    }
-    connection, _clock, messages, topics, updater, _provider = await _build_runtime([payload])
+    connection, _clock, messages, topics, updater, _provider = await _build_runtime(
+        ["close tpc_existing msg_4"]
+    )
     try:
         await topics.create_topic(
             topic_id="tpc_existing",
@@ -581,3 +588,108 @@ async def test_topic_updater_records_progress_when_batch_only_closes_topic() -> 
         assert snapshot["freshness"]["lag_message_count"] == 0
     finally:
         await connection.close()
+
+
+def test_live_card_prompts_include_examples_by_default() -> None:
+    prompts = _live_card_prompts(_prompt_only_updater(card_examples_enabled=True))
+
+    assert set(prompts) == {"existing_route", "new_topic_track", "content", "boundary"}
+    for prompt in prompts.values():
+        assert "Examples:" in prompt
+
+
+def test_live_card_prompts_omit_examples_when_disabled() -> None:
+    prompts = _live_card_prompts(_prompt_only_updater(card_examples_enabled=False))
+
+    for prompt in prompts.values():
+        assert "Examples:" not in prompt
+
+
+def _artifact_harness_prompt() -> str:
+    # The artifact card is HARNESS-ONLY: there is no engine LLM counterpart
+    # (the engine derives artifact links deterministically in
+    # ``_artifact_ids_from_route_messages``), so the 4-engine-card guard above
+    # cannot see it. It is still on the default-graded shadow path, so its
+    # baked-in few-shot example is a real leak surface and must be guarded too.
+    # Render it against a synthetic dummy case so the only benchmark-derived text
+    # that could appear is a few-shot example, not a real case message echoed
+    # back as input (which would be a false positive).
+    dummy_case = BenchmarkCase(
+        case_id="leak_guard_dummy",
+        conversation_id="cnv_leak_guard_dummy",
+        snapshot={"active_topics": [], "parked_topics": [], "freshness": {"status": "missing"}},
+        messages=[
+            {
+                "id": "msg_leak_guard_dummy",
+                "seq": 1,
+                "role": "user",
+                "text": "PLACEHOLDER_QUERY_TOKEN",
+                "metadata_json": {
+                    "attachments": [
+                        {
+                            "artifact_id": "art_leak_guard_dummy",
+                            "artifact_type": "document",
+                            "source_kind": "upload",
+                        }
+                    ]
+                },
+            }
+        ],
+        expected={"actions": []},
+    )
+    dummy_route = _TopicRoute(
+        action=TopicUpdateActionType.CREATE,
+        target_id="tmp1",
+        source_message_ids=("msg_leak_guard_dummy",),
+    )
+    return _build_artifact_prompt(dummy_case, routes=(dummy_route,))
+
+
+def test_topic_card_prompts_do_not_leak_shadow_benchmark_content() -> None:
+    # The topic working-set cards have their own shadow benchmark; their few-shot
+    # examples must not reuse a benchmark case message or distinctive answer token,
+    # so the benchmark keeps measuring generalization rather than recall of the key.
+    prompts = _live_card_prompts(_prompt_only_updater(card_examples_enabled=True))
+    combined_prompt = "\n".join(prompts.values())
+    assert_prompt_has_no_benchmark_leak(
+        combined_prompt, "benchmarks/topic_working_set_cards/cases.jsonl"
+    )
+
+
+def test_artifact_card_prompt_does_not_leak_shadow_benchmark_content() -> None:
+    # Guard the harness-only artifact card separately (see _artifact_harness_prompt).
+    assert_prompt_has_no_benchmark_leak(
+        _artifact_harness_prompt(), "benchmarks/topic_working_set_cards/cases.jsonl"
+    )
+
+
+def test_boundary_prompt_glosses_every_intimacy_boundary_value() -> None:
+    prompts = _live_card_prompts(_prompt_only_updater(card_examples_enabled=False))
+    boundary_prompt = prompts["boundary"]
+
+    for boundary in IntimacyBoundary:
+        assert boundary.value in boundary_prompt
+
+
+def test_route_card_drops_line_with_zero_valid_message_ids() -> None:
+    routes = _parse_route_card_output(
+        "update tpc_known msg_missing\nupdate tpc_known msg_real",
+        valid_topic_ids={"tpc_known"},
+        valid_message_ids=("msg_real",),
+        conversation_id="cnv_1",
+    )
+
+    assert len(routes) == 1
+    assert routes[0].target_id == "tpc_known"
+    assert routes[0].source_message_ids == ("msg_real",)
+
+
+def test_route_card_drops_only_line_when_no_valid_message_ids() -> None:
+    routes = _parse_route_card_output(
+        "update tpc_known msg_missing",
+        valid_topic_ids={"tpc_known"},
+        valid_message_ids=("msg_real",),
+        conversation_id="cnv_1",
+    )
+
+    assert routes == ()

@@ -9,6 +9,7 @@ import pytest
 from atagia.models.schemas_memory import ComposedContext
 from atagia.services.answer_postcondition import (
     _abstain_result,
+    _answer_support_obligation_descriptions,
     complete_answer_with_postcondition_guard,
 )
 from atagia.services.llm_client import (
@@ -1691,3 +1692,194 @@ async def test_answer_postcondition_keeps_legitimate_abstention() -> None:
     assert result.report.supported_abstention_detected is False
     assert result.report.abstention_legitimacy_verdict is not None
     assert result.report.abstention_legitimacy_verdict.abstention_allowed is True
+
+
+def _missing_members_diagnostics(
+    *,
+    coverage_state: str,
+    allowed_values: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "answer_support": {
+            "answer_shape": "list",
+            "coverage_mode": "exhaustive_known_set",
+            "source_precision": "required",
+            "coverage_state": coverage_state,
+            "allowed_values": allowed_values,
+            "missing_slots": [
+                {
+                    "normalized_key": "value|<member_b>",
+                    "display_text": "Member B",
+                    "evidence_ids": ["memory:mem_b"],
+                    "reason": "coverage_member_not_selected",
+                },
+                {
+                    "normalized_key": "value|<member_c>",
+                    "display_text": "Member C",
+                    "evidence_ids": ["memory:mem_c"],
+                    "reason": "coverage_member_not_selected",
+                },
+            ],
+        }
+    }
+
+
+def test_missing_members_obligation_fires_under_partial_with_allowed_values() -> None:
+    diagnostics = _missing_members_diagnostics(
+        coverage_state="partial",
+        allowed_values=[
+            {
+                "display_text": "Member A",
+                "normalized_key": "value|<member_a>",
+                "evidence_ids": ["memory:mem_a"],
+            }
+        ],
+    )
+
+    descriptions = _answer_support_obligation_descriptions(diagnostics)
+
+    # The missing-members obligation is emitted alongside the allowed_values
+    # subset instruction, not in place of it.
+    assert descriptions[0] == (
+        "Known members not covered by retrieved evidence: Member B, Member C; "
+        "state that this list is incomplete."
+    )
+    assert any(
+        description.startswith("Use supported value 'Member A'")
+        for description in descriptions
+    )
+    assert (
+        "State that the answer is the supported subset from retrieved evidence."
+        in descriptions
+    )
+
+
+def test_missing_members_obligation_fires_under_insufficient_with_empty_allowed_values() -> (
+    None
+):
+    # All members dropped: allowed_values is empty and the old early-return at
+    # `if not isinstance(allowed_values, list): return []` would have produced an
+    # empty list. The obligation must still reach the model.
+    diagnostics = _missing_members_diagnostics(
+        coverage_state="insufficient",
+        allowed_values=[],
+    )
+
+    descriptions = _answer_support_obligation_descriptions(diagnostics)
+
+    assert descriptions == [
+        "Known members not covered by retrieved evidence: Member B, Member C; "
+        "state that this list is incomplete."
+    ]
+    # No allowed_values → no subset instruction, no supported-value lines.
+    assert not any(
+        description.startswith("Use supported value")
+        for description in descriptions
+    )
+    assert (
+        "State that the answer is the supported subset from retrieved evidence."
+        not in descriptions
+    )
+
+
+def test_missing_members_obligation_fires_with_missing_slots_but_no_allowed_values_key() -> (
+    None
+):
+    # The all-dropped payload omits the allowed_values key entirely (the empty
+    # list is dropped by answer_support_prompt_payload). Independence from the
+    # `allowed_values` early-return must hold here too.
+    diagnostics = {
+        "answer_support": {
+            "answer_shape": "list",
+            "coverage_mode": "exhaustive_known_set",
+            "source_precision": "required",
+            "coverage_state": "insufficient",
+            "missing_slots": [
+                {
+                    "normalized_key": "value|<member_b>",
+                    "display_text": "Member B",
+                    "evidence_ids": ["memory:mem_b"],
+                    "reason": "coverage_member_not_selected",
+                }
+            ],
+        }
+    }
+
+    descriptions = _answer_support_obligation_descriptions(diagnostics)
+
+    assert descriptions == [
+        "Known members not covered by retrieved evidence: Member B; "
+        "state that this list is incomplete."
+    ]
+
+
+def _all_members_dropped_context() -> ComposedContext:
+    return ComposedContext(
+        memory_block="[Retrieved Memories]\n(no member-bearing evidence selected)",
+        selected_memory_ids=[],
+        answer_shape="list",
+        coverage_mode="exhaustive_known_set",
+        source_precision="required",
+        coverage_state="insufficient",
+        allowed_values=[],
+        missing_slots=[
+            {
+                "normalized_key": "value|<member_b>",
+                "display_text": "Member B",
+                "evidence_ids": ["memory:mem_b"],
+                "reason": "coverage_member_not_selected",
+            },
+            {
+                "normalized_key": "value|<member_c>",
+                "display_text": "Member C",
+                "evidence_ids": ["memory:mem_c"],
+                "reason": "coverage_member_not_selected",
+            },
+        ],
+        total_tokens_estimate=12,
+        budget_tokens=100,
+        items_included=0,
+        items_dropped=2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_all_members_dropped_abstains_without_empty_answer() -> None:
+    failing_verdict = {
+        **_pass_verdict(),
+        "unsupported_concrete_claims": True,
+        "pass_postcondition": False,
+        "failure_reasons": ["unsupported_concrete_claim"],
+    }
+    provider = AnswerGuardProvider(
+        outputs=["Member B and Member C.", "Still naming dropped members."],
+        verdicts=[failing_verdict, failing_verdict],
+    )
+
+    result = await complete_answer_with_postcondition_guard(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        request=_request(),
+        verifier_model="openai/gpt-5-mini",
+        original_query="What are all of the members?",
+        composed_context=_all_members_dropped_context(),
+        privacy_enforcement="off",
+    )
+
+    # coverage_state == "insufficient" → the supported-partial fallback gate
+    # fails and _should_attempt_supported_answer_repair finds no real support, so
+    # the engine abstains. The missing-members obligation must not fabricate a
+    # value or produce an empty-string answer.
+    assert result.report.status == "abstained"
+    assert result.output_text == (
+        "I do not have enough reliable retrieved evidence to answer that safely."
+    )
+    assert result.output_text != ""
+    assert result.report.abstention_reason == "answer_postcondition_failed"
+    # The honesty obligation still reaches the answer prompt for the model.
+    initial_answer_request = provider.requests[0]
+    assert (
+        "Known members not covered by retrieved evidence"
+        in initial_answer_request.messages[0].content
+        or "Member B"
+        in initial_answer_request.messages[0].content
+    )

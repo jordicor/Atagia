@@ -99,9 +99,12 @@ async def test_judge_includes_official_source_evidence_when_available() -> None:
         source_evidence=[
             {
                 "turn_id": "rosa-04-t07",
+                "session_id": "session_4",
                 "timestamp": "2025-12-02T11:07:00",
                 "speaker": "user",
                 "text": "She is expecting a baby. She is due in May.",
+                "blip_caption": "a calendar marked May",
+                "attachment_text": "Visual description of attached image: a calendar marked May",
             }
         ],
     )
@@ -112,7 +115,10 @@ async def test_judge_includes_official_source_evidence_when_available() -> None:
     assert "official source evidence" in system_prompt.lower()
     assert "Temporal specificity rule" in system_prompt
     assert "next applicable future occurrence" in system_prompt
+    assert "session_id=session_4" in provider.requests[0].messages[1].content
     assert "timestamp=2025-12-02T11:07:00" in provider.requests[0].messages[1].content
+    assert "[Image caption]" in provider.requests[0].messages[1].content
+    assert "[Attachment text]" in provider.requests[0].messages[1].content
     assert "May 2026" in provider.requests[0].messages[1].content
 
 

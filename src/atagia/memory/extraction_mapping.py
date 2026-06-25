@@ -121,7 +121,15 @@ def _common_fields(candidate: LeanExtractionCandidate) -> dict[str, object]:
         "informational_mention": None,
         "preserve_verbatim": candidate.preserve_verbatim,
         "subject_presence_ids": [],
-        "payload": {},
+        "payload": {
+            # Always emit the key so a processed row is distinguishable from a
+            # legacy (never-processed) one: key-presence is the processed marker.
+            # ``[]`` means "processed, no enumerable members". Stored as plain
+            # dicts so the payload round-trips through JSON unchanged.
+            "coverage_members": [
+                member.model_dump() for member in candidate.coverage_members
+            ],
+        },
         "temporal_type": temporal_type,
         "valid_from_iso": valid_from_iso,
         "valid_to_iso": valid_to_iso,

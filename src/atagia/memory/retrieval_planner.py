@@ -162,7 +162,29 @@ def build_retrieval_fts_query_specs(
                 kind="broad_or",
             )
 
-    return specs[:max_queries]
+    return _limit_fts_query_specs(
+        specs,
+        max_queries=max_queries,
+        preserve_broad_or=exact_recall,
+    )
+
+
+def _limit_fts_query_specs(
+    specs: list[RetrievalFtsQuerySpec],
+    *,
+    max_queries: int,
+    preserve_broad_or: bool,
+) -> list[RetrievalFtsQuerySpec]:
+    if len(specs) <= max_queries:
+        return specs
+    if not preserve_broad_or or max_queries <= 0:
+        return specs[:max_queries]
+
+    broad_or_spec = next((spec for spec in specs if spec.kind == "broad_or"), None)
+    if broad_or_spec is None or broad_or_spec in specs[:max_queries]:
+        return specs[:max_queries]
+
+    return [*specs[: max_queries - 1], broad_or_spec]
 
 
 def _should_add_must_keep_tail_query(

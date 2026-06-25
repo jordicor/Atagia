@@ -240,6 +240,7 @@ class Atagia:
         authenticated_user_privilege_level: str | None = None,
         authenticated_user_is_atagia_master: bool = False,
         response_mode: ResponseMode | str | None = None,
+        adaptive_retrieval: bool | None = None,
     ) -> ContextResult:
         """Run retrieval, persist the user message, and return a ready system prompt."""
         runtime = await self._require_runtime()
@@ -274,6 +275,7 @@ class Atagia:
             authenticated_user_privilege_level=authenticated_user_privilege_level,
             authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
             response_mode=response_mode,
+            adaptive_retrieval=adaptive_retrieval,
         )
 
     async def flush(
@@ -689,6 +691,7 @@ class Atagia:
         authenticated_user_privilege_level: str | None = None,
         authenticated_user_is_atagia_master: bool = False,
         response_mode: ResponseMode | str | None = None,
+        adaptive_retrieval: bool | None = None,
     ) -> ChatResult:
         """Run the full chat flow, including the LLM response generation."""
         runtime = await self._require_runtime()
@@ -746,6 +749,7 @@ class Atagia:
             authenticated_user_privilege_level=authenticated_user_privilege_level,
             authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
             response_mode=response_mode,
+            adaptive_retrieval=adaptive_retrieval,
         )
 
     async def get_memory_preferences(self, user_id: str) -> MemoryPreferencesResponse:
@@ -1361,10 +1365,14 @@ class Atagia:
             anthropic_api_key=anthropic_api_key,
             openai_api_key=openai_api_key,
             google_api_key=google_api_key,
+            kimi_api_key=env_settings.kimi_api_key,
+            minimax_api_key=env_settings.minimax_api_key,
             openrouter_api_key=openrouter_api_key,
             anthropic_base_url=env_settings.anthropic_base_url,
             openai_base_url=env_settings.openai_base_url,
             openai_embedding_base_url=env_settings.openai_embedding_base_url,
+            kimi_base_url=env_settings.kimi_base_url,
+            minimax_base_url=env_settings.minimax_base_url,
             openrouter_base_url=env_settings.openrouter_base_url,
             openrouter_site_url=env_settings.openrouter_site_url,
             openrouter_app_name=env_settings.openrouter_app_name,
@@ -1543,6 +1551,8 @@ class Atagia:
                 env_settings.fact_facet_retrieval_rrf_weight
             ),
             applicability_gate_mode=env_settings.applicability_gate_mode,
+            response_mode=env_settings.response_mode,
+            adaptive_retrieval=env_settings.adaptive_retrieval,
             promotion_conv_to_ws_min_conversations=env_settings.promotion_conv_to_ws_min_conversations,
             promotion_ws_to_global_min_sessions=env_settings.promotion_ws_to_global_min_sessions,
             promotion_require_mode_consistency=env_settings.promotion_require_mode_consistency,

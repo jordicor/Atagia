@@ -71,10 +71,19 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
+from tests.extraction_payload_support import (
+    is_memory_extraction_card_purpose,
+    memory_extraction_card_output_from_payload,
+)
 
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
+
+
+def _is_need_detection_card_purpose(purpose: object) -> bool:
+    value = str(purpose)
+    return value.startswith("need_detection_") and value.endswith("_card")
 
 
 class MCPProvider(LLMProvider):
@@ -86,52 +95,48 @@ class MCPProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
-        if purpose == "need_detection":
+        if _is_need_detection_card_purpose(purpose):
+            outputs = {
+                "need_detection_needs_card": "none",
+                "need_detection_language_card": "en\nen",
+                "need_detection_memory_card": "mixed",
+                "need_detection_exact_card": "no",
+                "need_detection_shape_card": "default",
+                "need_detection_facets_card": "none",
+                "need_detection_callback_card": "no",
+                "need_detection_search_words_card": "retry loop",
+                "need_detection_search_words_other_language_card": "none",
+            }
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "needs": [],
-                        "temporal_range": None,
-                        "sub_queries": ["retry loop"],
-                        "sparse_query_hints": [
-                            {
-                                "sub_query_text": "retry loop",
-                                "fts_phrase": "retry loop",
-                            }
-                        ],
-                        "query_type": "default",
-                        "retrieval_levels": [0],
-                    }
-                ),
+                output_text=outputs[purpose],
             )
-        if purpose == "applicability_scoring":
+        if purpose == "applicability_relevance_card":
             candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "scores": [
-                            {"score_key": score_key, "llm_applicability": 0.5}
-                            for _memory_id, score_key in candidate_keys
-                        ],
-                    }
+                output_text="\n".join(
+                    f"{score_key} useful" for _memory_id, score_key in candidate_keys
                 ),
             )
-        if purpose == "memory_extraction":
+        if purpose == "applicability_date_card":
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "evidences": [],
-                        "beliefs": [],
-                        "contract_signals": [],
-                        "state_updates": [],
-                        "nothing_durable": True,
-                    }
+                output_text="\n".join(
+                    f"{score_key} none" for _memory_id, score_key in candidate_keys
+                ),
+            )
+        if is_memory_extraction_card_purpose(purpose):
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=memory_extraction_card_output_from_payload(
+                    {"candidates": [], "nothing_durable": True},
+                    purpose,
                 ),
             )
         if purpose == "contract_projection":
@@ -145,20 +150,11 @@ class MCPProvider(LLMProvider):
                     }
                 ),
             )
-        if purpose == "consequence_detection":
+        if purpose == "consequence_gate_card":
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "is_consequence": False,
-                        "action_description": "",
-                        "outcome_description": "",
-                        "outcome_sentiment": "neutral",
-                        "confidence": 0.0,
-                        "likely_action_message_id": None,
-                    }
-                ),
+                output_text="no",
             )
         raise AssertionError(f"Unexpected LLM purpose: {purpose}")
 
@@ -337,7 +333,15 @@ async def test_mcp_get_context(
         assert first["system_prompt"]
         assert first["conversation_id"] == "cnv_1"
         assert second["conversation_id"] == "cnv_1"
-        assert sum(request.metadata.get("purpose") == "need_detection" for request in provider.requests) == 2
+        # The first turn is an empty-clean cold start (no stored memories,
+        # contracts, or prior messages), so the pipeline composes an empty
+        # context without invoking need detection. The second turn has a prior
+        # persisted message, so it runs the full pipeline and issues the
+        # parallel need-detection card set.
+        assert sum(
+            _is_need_detection_card_purpose(request.metadata.get("purpose"))
+            for request in provider.requests
+        ) == 8
         cache_key = ContextCacheService.build_cache_key(
             user_id="usr_1",
             assistant_mode_id="coding_debug",

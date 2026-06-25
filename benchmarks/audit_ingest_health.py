@@ -9,12 +9,13 @@ from typing import Any
 
 from benchmarks.ingest_health import audit_benchmark_db, classify_ingest_health
 from benchmarks.llm_run_guard import LLMRunGuardConfig
+from benchmarks.output_root import bench_output_root
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_ROOTS = (
-    _PROJECT_ROOT / "benchmarks" / "results",
-    _PROJECT_ROOT / "docs" / "tmp" / "benchmark_dbs",
+    bench_output_root() / "atagia_bench" / "benchmark_dbs",
+    bench_output_root() / "locomo" / "benchmark_dbs",
 )
 
 

@@ -158,9 +158,13 @@ class SidecarService:
         authenticated_user_privilege_level: str | None = None,
         authenticated_user_is_atagia_master: bool = False,
         response_mode: ResponseMode | str | None = None,
+        adaptive_retrieval: bool | None = None,
     ) -> ContextResult:
         """Run retrieval, persist the user message, and return a ready system prompt."""
         resolved_response_mode = self._resolve_response_mode(response_mode)
+        resolved_adaptive_retrieval = self._resolve_adaptive_retrieval(
+            adaptive_retrieval
+        )
         authority_context = normalize_request_authority_context(
             privacy_enforcement=(
                 ablation.privacy_enforcement
@@ -301,6 +305,7 @@ class SidecarService:
                         operational_signals=operational_signals,
                         ablation=ablation,
                         prompt_authority_context=authority_context,
+                        adaptive_retrieval=resolved_adaptive_retrieval,
                     )
                 else:
                     resolution = await cache_service.resolve_fast_with_connection(
@@ -405,6 +410,7 @@ class SidecarService:
                     ablation=ablation,
                     prompt_authority_context=authority_context,
                     last_retrieval_message_seq=int(user_message["seq"]),
+                    adaptive_retrieval=resolved_adaptive_retrieval,
                 )
             memory_processing = await self._message_processing_status(conversation)
             if self.runtime.settings.lifecycle_lazy_enabled:
@@ -656,6 +662,7 @@ class SidecarService:
             cache_source=resolution.cache_source,
             need_detection_skipped=resolution.need_detection_skipped,
             response_mode=resolved_response_mode.value,
+            adaptive_retrieval=resolved_adaptive_retrieval,
             memory_processing=memory_processing,
             request_message_id=str(user_message["id"]),
             initial_context_package=initial_context_package.diagnostics,
@@ -1435,6 +1442,15 @@ class SidecarService:
         if response_mode is None:
             return ResponseMode(self.runtime.settings.response_mode)
         return ResponseMode(response_mode)
+
+    def _resolve_adaptive_retrieval(
+        self,
+        adaptive_retrieval: bool | None,
+    ) -> bool:
+        """Resolve the per-request gate flag, falling back to the global default."""
+        if adaptive_retrieval is None:
+            return self.runtime.settings.adaptive_retrieval
+        return bool(adaptive_retrieval)
 
     @staticmethod
     def _resolve_ingest_control(

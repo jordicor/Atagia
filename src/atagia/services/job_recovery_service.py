@@ -17,6 +17,7 @@ from atagia.core.repositories import (
     UserRepository,
 )
 from atagia.core.storage_backend import StorageBackend
+from atagia.core.timestamps import parse_optional_datetime
 from atagia.memory.operational_profile import OperationalProfileLoader
 from atagia.models.schemas_jobs import (
     CONTRACT_STREAM_NAME,
@@ -26,6 +27,7 @@ from atagia.models.schemas_jobs import (
     InitialContextPackageRefreshReason,
     JobEnvelope,
     JobType,
+    WORKER_GROUP_NAME,
 )
 from atagia.models.schemas_memory import ConversationStatus, OperationalProfileSnapshot
 from atagia.services.chat_support import (
@@ -184,18 +186,28 @@ class JobRecoveryService:
         recovered_job = matching_job.model_copy(
             update={
                 "job_id": job_id,
-                "created_at": _parse_datetime(row.get("queued_at")),
+                "created_at": parse_optional_datetime(row.get("queued_at")),
             }
         )
-        await self._jobs.mark_requeued_for_recovery(
-            job_id,
-            metadata={"inprocess_recovered_at": self._clock.now().isoformat()},
-        )
+        delay_seconds = self._deferred_delay_seconds(row)
         try:
-            await self._storage_backend.stream_add(
-                stream_name,
-                recovered_job.model_dump(mode="json"),
-            )
+            if delay_seconds is not None:
+                await self._storage_backend.stream_defer(
+                    stream_name,
+                    WORKER_GROUP_NAME,
+                    "0-0",
+                    recovered_job.model_dump(mode="json"),
+                    delay_seconds=delay_seconds,
+                )
+            else:
+                await self._jobs.mark_requeued_for_recovery(
+                    job_id,
+                    metadata={"inprocess_recovered_at": self._clock.now().isoformat()},
+                )
+                await self._storage_backend.stream_add(
+                    stream_name,
+                    recovered_job.model_dump(mode="json"),
+                )
         except Exception as exc:
             await self._jobs.mark_failed(
                 job_id,
@@ -262,18 +274,28 @@ class JobRecoveryService:
             conversation_id=conversation_id,
             message_ids=source_message_ids,
             payload=payload.model_dump(mode="json"),
-            created_at=_parse_datetime(row.get("queued_at")),
+            created_at=parse_optional_datetime(row.get("queued_at")),
             operational_profile=self._operational_profile_snapshot(row),
         )
-        await self._jobs.mark_requeued_for_recovery(
-            job_id,
-            metadata={"inprocess_recovered_at": self._clock.now().isoformat()},
-        )
+        delay_seconds = self._deferred_delay_seconds(row)
         try:
-            await self._storage_backend.stream_add(
-                stream_name,
-                recovered_job.model_dump(mode="json"),
-            )
+            if delay_seconds is not None:
+                await self._storage_backend.stream_defer(
+                    stream_name,
+                    WORKER_GROUP_NAME,
+                    "0-0",
+                    recovered_job.model_dump(mode="json"),
+                    delay_seconds=delay_seconds,
+                )
+            else:
+                await self._jobs.mark_requeued_for_recovery(
+                    job_id,
+                    metadata={"inprocess_recovered_at": self._clock.now().isoformat()},
+                )
+                await self._storage_backend.stream_add(
+                    stream_name,
+                    recovered_job.model_dump(mode="json"),
+                )
         except Exception as exc:
             await self._jobs.mark_failed(
                 job_id,
@@ -321,11 +343,11 @@ class JobRecoveryService:
             error_message=reason,
         )
 
-
-def _parse_datetime(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    try:
-        return datetime.fromisoformat(str(value))
-    except ValueError:
-        return None
+    def _deferred_delay_seconds(self, row: dict[str, Any]) -> float | None:
+        deferred_until = parse_optional_datetime(row.get("deferred_until"))
+        if deferred_until is None:
+            return None
+        delay = (deferred_until - self._clock.now()).total_seconds()
+        if delay <= 0:
+            return None
+        return delay

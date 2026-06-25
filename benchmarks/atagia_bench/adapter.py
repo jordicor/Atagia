@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from benchmarks.source_evidence import validate_evidence_turn_ids
+
 
 _DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -138,6 +140,11 @@ class AtagiaBenchAdapter:
             persona_dir = self._data_dir / persona.persona_id
             conversations = self._load_conversations(persona_dir)
             questions = self._load_questions(persona_dir)
+            self._validate_source_evidence(
+                persona_id=persona.persona_id,
+                conversations=conversations,
+                questions=questions,
+            )
             persona_data.append(
                 AtagiaBenchPersonaData(
                     persona=persona,
@@ -179,3 +186,36 @@ class AtagiaBenchAdapter:
             AtagiaBenchQuestion.model_validate(entry)
             for entry in raw
         ]
+
+    @staticmethod
+    def _validate_source_evidence(
+        *,
+        persona_id: str,
+        conversations: list[AtagiaBenchConversation],
+        questions: list[AtagiaBenchQuestion],
+    ) -> None:
+        """Validate source-aware judge oracle evidence against authored turns."""
+        all_turns = [
+            turn
+            for conversation in conversations
+            for turn in conversation.turns
+        ]
+        conversation_id = (
+            ",".join(conversation.conversation_id for conversation in conversations)
+            or persona_id
+        )
+        for question in questions:
+            if question.grader == "llm_judge" and not question.evidence_turn_ids:
+                raise ValueError(
+                    "Atagia-bench source-aware LLM judge question "
+                    f"{question.question_id} for persona {persona_id} has no "
+                    "evidence_turn_ids"
+                )
+            if question.evidence_turn_ids:
+                validate_evidence_turn_ids(
+                    evidence_turn_ids=question.evidence_turn_ids,
+                    turns=all_turns,
+                    dataset_name="Atagia-bench",
+                    question_id=question.question_id,
+                    conversation_id=conversation_id,
+                )

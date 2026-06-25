@@ -43,8 +43,17 @@ _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
 
 _RETRIEVAL_PIPELINE_PURPOSES = frozenset(
     {
-        "need_detection",
-        "applicability_scoring",
+        "need_detection_needs_card",
+        "need_detection_language_card",
+        "need_detection_memory_card",
+        "need_detection_exact_card",
+        "need_detection_shape_card",
+        "need_detection_facets_card",
+        "need_detection_callback_card",
+        "need_detection_search_words_card",
+        "need_detection_search_words_other_language_card",
+        "applicability_relevance_card",
+        "applicability_date_card",
         "context_cache_signal_detection",
     }
 )
@@ -61,22 +70,22 @@ class RecordingProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         purpose = str(request.metadata.get("purpose"))
-        if purpose == "need_detection":
+        if purpose.startswith("need_detection_") and purpose.endswith("_card"):
+            outputs = {
+                "need_detection_needs_card": "none",
+                "need_detection_language_card": "en\nen",
+                "need_detection_memory_card": "mixed",
+                "need_detection_exact_card": "no",
+                "need_detection_shape_card": "default",
+                "need_detection_facets_card": "none",
+                "need_detection_callback_card": "no",
+                "need_detection_search_words_card": "budget",
+                "need_detection_search_words_other_language_card": "none",
+            }
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "needs": [],
-                        "temporal_range": None,
-                        "sub_queries": ["budget"],
-                        "sparse_query_hints": [
-                            {"sub_query_text": "budget", "fts_phrase": "budget"}
-                        ],
-                        "query_type": "default",
-                        "retrieval_levels": [0],
-                    }
-                ),
+                output_text=outputs[purpose],
             )
         if purpose == "context_cache_signal_detection":
             return LLMCompletionResponse(
@@ -93,20 +102,26 @@ class RecordingProvider(LLMProvider):
                     }
                 ),
             )
-        if purpose == "applicability_scoring":
+        if purpose == "applicability_relevance_card":
             candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
                 request.messages[1].content
             )
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps(
-                    {
-                        "scores": [
-                            {"score_key": score_key, "llm_applicability": 0.9}
-                            for _memory_id, score_key in candidate_keys
-                        ]
-                    }
+                output_text="\n".join(
+                    f"{score_key} exact" for _memory_id, score_key in candidate_keys
+                ),
+            )
+        if purpose == "applicability_date_card":
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
+                request.messages[1].content
+            )
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="\n".join(
+                    f"{score_key} none" for _memory_id, score_key in candidate_keys
                 ),
             )
         if purpose == "chat_reply":

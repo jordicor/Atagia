@@ -41,6 +41,7 @@ from benchmarks.locomo.retrieval_readout import (
     build_retrieval_readout,
     save_retrieval_readout,
 )
+from benchmarks.output_root import assert_outside_repo, bench_output_root
 from benchmarks.retained_db_paths import default_benchmark_db_dir
 from benchmarks.report_diff import (
     BenchmarkDiffReport,
@@ -52,9 +53,9 @@ from benchmarks.report_diff import (
 from atagia.models.schemas_replay import AblationConfig
 from atagia.services.model_resolution import COMPONENTS_BY_ID
 
-_DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
+_DEFAULT_OUTPUT_DIR = bench_output_root() / "locomo"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
-_DEFAULT_JUDGE_MODEL = "anthropic/claude-opus-4-7"
+_DEFAULT_JUDGE_MODEL = "kimi/kimi-k2.7-code"
 _DEFAULT_PRIVACY_ENFORCEMENT = "off"
 _BENCHMARK_DB_FILENAME = "benchmark.db"
 _BENCHMARK_DB_METADATA_FILENAME = "run_metadata.json"
@@ -175,8 +176,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--judge-model",
         default=None,
         help=(
-            "Optional LLM model for scoring; defaults to direct Anthropic "
-            "claude-opus-4-7 for benchmark stability"
+            "Optional LLM model for scoring; defaults to direct Kimi "
+            "kimi-k2.7-code for benchmark judging"
         ),
     )
     parser.add_argument(
@@ -219,7 +220,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Override one Atagia LLM component model. Repeatable. "
             "Examples: extractor=openai/gpt-4o-mini, "
-            "need_detector=openrouter/google/gemini-3.1-flash-lite,medium"
+            "need_detector_language=openrouter/google/gemini-3.1-flash-lite,medium"
         ),
     )
     parser.add_argument(
@@ -722,6 +723,8 @@ async def _run_async(
         if args.checkpoint_output is not None
         else _default_checkpoint_output_path(args.output)
     )
+    assert_outside_repo(args.output)
+    assert_outside_repo(checkpoint_path.parent)
     print(f"Checkpoint will be updated at: {checkpoint_path}", flush=True)
     report = await benchmark.run(
         ablation=_benchmark_ablation(
@@ -823,7 +826,7 @@ async def _run_async(
 def _benchmark_db_dir(args: argparse.Namespace) -> Path:
     if args.benchmark_db_dir is not None:
         return Path(args.benchmark_db_dir).expanduser()
-    return Path(__file__).resolve().parents[2] / "docs" / "tmp" / "benchmark_dbs"
+    return bench_output_root() / "locomo" / "benchmark_dbs"
 
 
 def _read_json_object(path: Path) -> dict[str, object] | None:

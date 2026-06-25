@@ -7,10 +7,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-_QUESTION_ID_PATTERN = re.compile(r"^locomo_(\d+)_qa(\d+)$")
+from benchmarks.source_evidence import normalize_evidence_turn_ids
 
-# Citation-only errors don't affect scoring
-_CITATION_ONLY_TYPES = {"WRONG_CITATION"}
+_QUESTION_ID_PATTERN = re.compile(r"^locomo_(\d+)_qa(\d+)$")
 
 
 def load_community_corrections(
@@ -20,17 +19,15 @@ def load_community_corrections(
     """Load dial481/locomo-audit errors.json and convert to Atagia format.
 
     Returns a corrections dict keyed by our question_id format
-    (e.g. "conv-26:q57"). Only score-corrupting errors are included;
-    citation-only errors are skipped.
+    (e.g. "conv-26:q57"). Answer corrections and citation/evidence
+    corrections are both preserved because source-aware judging treats the
+    evidence packet as the official oracle.
     """
     errors = json.loads(errors_path.read_text(encoding="utf-8"))
     sample_ids = _load_sample_ids(dataset_path)
 
     corrections: dict[str, Any] = {}
     for entry in errors:
-        if entry.get("error_type") in _CITATION_ONLY_TYPES:
-            continue
-
         match = _QUESTION_ID_PATTERN.match(entry.get("question_id", ""))
         if match is None:
             continue
@@ -42,19 +39,30 @@ def load_community_corrections(
             continue
 
         correct_answer = entry.get("correct_answer", "")
-        if not correct_answer:
+        corrected_evidence_turn_ids = normalize_evidence_turn_ids(
+            entry.get("correct_evidence")
+        )
+        if not correct_answer and not corrected_evidence_turn_ids:
             continue
 
         sample_id = sample_ids[conv_index]
         our_question_id = f"{sample_id}:q{question_index + 1}"
 
-        corrections[our_question_id] = {
-            "corrected_ground_truth": correct_answer,
+        correction: dict[str, Any] = {
             "original_ground_truth": entry.get("golden_answer", ""),
             "reason": entry.get("reasoning", ""),
             "error_type": entry.get("error_type", ""),
             "source": "community/dial481/locomo-audit",
         }
+        if correct_answer:
+            correction["corrected_ground_truth"] = correct_answer
+        if corrected_evidence_turn_ids:
+            correction["corrected_evidence_turn_ids"] = corrected_evidence_turn_ids
+            correction["original_evidence_turn_ids"] = normalize_evidence_turn_ids(
+                entry.get("cited_evidence")
+            )
+
+        corrections[our_question_id] = correction
 
     return corrections
 
