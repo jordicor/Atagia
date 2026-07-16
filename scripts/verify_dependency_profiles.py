@@ -206,7 +206,13 @@ def _lock_path(profile: str, minor: tuple[int, int]) -> Path:
     return LOCKS_DIR / f"{profile}-py{minor[0]}{minor[1]}.txt"
 
 
-def _compile_profile(python: Path, spec: ProfileSpec, output: Path) -> None:
+def _compile_profile(
+    python: Path,
+    spec: ProfileSpec,
+    output: Path,
+    *,
+    constraint: Path | None = None,
+) -> None:
     command = [
         str(python),
         "-m",
@@ -220,6 +226,8 @@ def _compile_profile(python: Path, spec: ProfileSpec, output: Path) -> None:
         "--no-emit-index-url",
         f"--output-file={output}",
     ]
+    if constraint is not None:
+        command.append(f"--constraint={constraint}")
     for extra in spec.extras:
         command.append(f"--extra={extra}")
     command.append(str(spec.source))
@@ -262,7 +270,12 @@ def _check_locks(python: Path, profiles: tuple[str, ...]) -> None:
             expected = _lock_path(profile, minor)
             _validate_lock(expected)
             generated = Path(temp_dir) / f"{profile}.txt"
-            _compile_profile(python, PROFILE_SPECS[profile], generated)
+            _compile_profile(
+                python,
+                PROFILE_SPECS[profile],
+                generated,
+                constraint=expected,
+            )
             if _lock_body(expected) != _lock_body(generated):
                 raise RuntimeError(
                     f"Dependency lock is stale: {expected.relative_to(ROOT)}; run the lock command"
@@ -354,8 +367,6 @@ def _build_wheel(python: Path, artifacts_dir: Path) -> Path:
                 "--wheel",
                 "--outdir",
                 str(wheel_dir),
-                "--report",
-                str(artifacts_dir / "wheel-build-report.json"),
                 str(build_source),
             ],
             cwd=build_source,
@@ -365,7 +376,27 @@ def _build_wheel(python: Path, artifacts_dir: Path) -> Path:
         raise RuntimeError(f"Expected exactly one Atagia wheel, found {len(wheels)}")
     wheel = wheels[0]
     _assert_wheel_payload_matches_source(wheel)
+    _write_build_report(wheel, artifacts_dir / "wheel-build-report.json")
     return wheel
+
+
+def _write_build_report(wheel: Path, report_path: Path) -> None:
+    report = {
+        "version": "1.0",
+        "artifacts": [
+            {
+                "name": wheel.name,
+                "path": str(wheel.resolve()),
+                "kind": "wheel",
+                "size": wheel.stat().st_size,
+                "hashes": {"sha256": _file_sha256(wheel)},
+            }
+        ],
+    }
+    report_path.write_text(
+        json.dumps(report, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _assert_wheel_payload_matches_source(

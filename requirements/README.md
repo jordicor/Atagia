@@ -17,10 +17,16 @@ Profiles:
 - Node: each supported integration owns its adjacent lockfile. The current
   OpenClaw plugin declares Node 22.14 or newer, which is also the CI baseline.
 
-Regenerate and compare one interpreter's Python locks with:
+Refresh one interpreter's Python locks explicitly with:
 
 ```bash
 python scripts/verify_dependency_profiles.py lock --python 3.12
+```
+
+Validate that the committed pins still resolve the declared profiles without
+opportunistically upgrading to newer compatible releases with:
+
+```bash
 python scripts/verify_dependency_profiles.py check-locks --python 3.12
 ```
 
@@ -65,9 +71,11 @@ Production Journal operators install the matching `blog-py312.txt` or
 is a developer convenience that delegates to `profiles/blog.in`; it is not a
 separate deployable resolution.
 
-The GitHub dependency workflow executes lock regeneration checks and the same
-build/install/smoke/audit command for both supported Python minors. It also
-installs and audits every supported Node package from its adjacent lockfile.
+The GitHub dependency workflow validates each committed lock against its
+declared profile and executes the same build/install/smoke/audit command for
+both supported Python minors. Lock upgrades remain an explicit maintenance
+operation. The workflow also installs and audits every supported Node package
+from its adjacent lockfile.
 The public sync intentionally excludes the private `_blog_engine/` tree. On
 that checkout the report records
 `dependency-only-private-artifact-unavailable` for the blog smoke instead of

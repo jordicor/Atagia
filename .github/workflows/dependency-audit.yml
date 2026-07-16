@@ -58,7 +58,7 @@ jobs:
           python -m pip install --constraint "$lock" build pip-audit pip-tools
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
-      - name: Reject stale locks
+      - name: Validate committed locks
         run: python scripts/verify_dependency_profiles.py check-locks --python "$(command -v python)"
       - name: Build, install, smoke, inventory, and audit
         run: python scripts/verify_dependency_profiles.py verify --python "$(command -v python)" --profile core --profile mcp --profile dev --profile blog

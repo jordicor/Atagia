@@ -8,7 +8,7 @@ anthropic==0.116.0
 anyio==4.14.2
 attrs==26.1.0
 boolean-py==5.0
-build==1.5.1
+build==1.5.0
 cachecontrol==0.14.4
 certifi==2026.6.17
 cffi==2.1.0
@@ -19,10 +19,10 @@ cyclonedx-python-lib==11.11.0
 defusedxml==0.7.1
 distro==1.9.0
 docstring-parser==0.18.0
-fastapi==0.139.0
-filelock==3.29.7
-google-auth==2.56.0
-google-genai==2.11.0
+fastapi==0.139.1
+filelock==3.30.0
+google-auth==2.55.2
+google-genai==2.12.0
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
