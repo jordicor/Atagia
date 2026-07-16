@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from atagia.models.schemas_memory import AdaptiveGateStatus, MemoryDependence
@@ -18,9 +21,23 @@ from benchmarks.atagia_bench_gate.scoring import (
 )
 
 
+BUNDLED_GATE_SUITE_FILE = (
+    Path(__file__).resolve().parents[2]
+    / "benchmarks"
+    / "atagia_bench_gate"
+    / "data"
+    / "gate_suite_v0.json"
+)
+requires_bundled_gate_suite = pytest.mark.skipif(
+    not BUNDLED_GATE_SUITE_FILE.is_file(),
+    reason="The private bundled gate suite is not included in the public checkout.",
+)
+
+
 # ---- Dataset loading and validation ----
 
 
+@requires_bundled_gate_suite
 def test_bundled_dataset_loads_and_validates() -> None:
     dataset = load_gate_suite()
     assert dataset.name == "atagia-bench-gate-v0"
@@ -28,6 +45,7 @@ def test_bundled_dataset_loads_and_validates() -> None:
     assert dataset.total_conversations == len(dataset.personas)
 
 
+@requires_bundled_gate_suite
 def test_bundled_dataset_has_world_and_personal_pairs() -> None:
     dataset = load_gate_suite()
     pair_members: dict[str, list[MemoryDependence]] = {}
@@ -41,6 +59,7 @@ def test_bundled_dataset_has_world_and_personal_pairs() -> None:
         assert sorted(m.value for m in members) == ["personal", "world"]
 
 
+@requires_bundled_gate_suite
 def test_bundled_dataset_has_conversation_window_probes() -> None:
     dataset = load_gate_suite()
     conversation_probes = [
@@ -52,6 +71,7 @@ def test_bundled_dataset_has_conversation_window_probes() -> None:
     assert all(q.probe_kind == "conversation" for q in conversation_probes)
 
 
+@requires_bundled_gate_suite
 def test_bundled_dataset_has_at_least_two_non_english_pairs() -> None:
     dataset = load_gate_suite()
     non_english_pairs: set[str] = set()
@@ -59,6 +79,63 @@ def test_bundled_dataset_has_at_least_two_non_english_pairs() -> None:
         if question.pair_id is not None and question.language != "en":
             non_english_pairs.add(question.pair_id)
     assert len(non_english_pairs) >= 2
+
+
+def test_loader_accepts_an_explicit_synthetic_fixture(tmp_path: Path) -> None:
+    dataset_file = tmp_path / "synthetic_gate_suite.json"
+    dataset_file.write_text(
+        json.dumps(
+            {
+                "name": "synthetic-gate-suite",
+                "personas": [
+                    {
+                        "persona_id": "fixture-persona",
+                        "display_name": "Fixture Persona",
+                        "profile": "Independent synthetic loader fixture.",
+                        "conversations": [
+                            {
+                                "conversation_id": "fixture-conversation",
+                                "assistant_mode_id": "personal_assistant",
+                                "timestamp_base": "2025-01-01T00:00:00Z",
+                                "turns": [],
+                            }
+                        ],
+                        "questions": [
+                            {
+                                "question_id": "fixture-world",
+                                "question_text": "What is the boiling point of water?",
+                                "probe_kind": "paired",
+                                "pair_id": "fixture-topic",
+                                "target_conversation_id": "fixture-conversation",
+                                "assistant_mode_id": "personal_assistant",
+                                "expected_memory_dependence": "world",
+                            },
+                            {
+                                "question_id": "fixture-personal",
+                                "question_text": "What temperature did I record?",
+                                "probe_kind": "paired",
+                                "pair_id": "fixture-topic",
+                                "target_conversation_id": "fixture-conversation",
+                                "assistant_mode_id": "personal_assistant",
+                                "expected_memory_dependence": "personal",
+                            },
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = load_gate_suite(dataset_file)
+
+    assert dataset.name == "synthetic-gate-suite"
+    assert dataset.total_conversations == 1
+    assert dataset.total_questions == 2
+    assert [question.question_id for question in dataset.questions] == [
+        "fixture-world",
+        "fixture-personal",
+    ]
 
 
 def test_expected_action_skips_world_and_conversation() -> None:

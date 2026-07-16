@@ -785,6 +785,11 @@ class HttpAtagiaClient:
         authenticated_user_privilege_level: str | None = None,
         authenticated_user_is_atagia_master: bool = False,
     ) -> ContextResult:
+        _require_standard_http_authority(
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+        )
         response = await self._post(
             f"/v1/conversations/{_path_segment(conversation_id)}/context",
             user_id=user_id,
@@ -815,9 +820,6 @@ class HttpAtagiaClient:
                     "ingest_origin": ingest_origin,
                     "confirmation_strategy": confirmation_strategy,
                     "memory_privacy_mode": memory_privacy_mode,
-                    "privacy_enforcement": privacy_enforcement,
-                    "authenticated_user_privilege_level": authenticated_user_privilege_level,
-                    "authenticated_user_is_atagia_master": authenticated_user_is_atagia_master,
                 }
             ),
         )
@@ -850,6 +852,11 @@ class HttpAtagiaClient:
         authenticated_user_privilege_level: str | None = None,
         authenticated_user_is_atagia_master: bool = False,
     ) -> None:
+        _require_standard_http_authority(
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+        )
         await self._post(
             f"/v1/conversations/{_path_segment(conversation_id)}/responses",
             user_id=user_id,
@@ -874,9 +881,6 @@ class HttpAtagiaClient:
                     "ingest_origin": ingest_origin,
                     "confirmation_strategy": confirmation_strategy,
                     "memory_privacy_mode": memory_privacy_mode,
-                    "privacy_enforcement": privacy_enforcement,
-                    "authenticated_user_privilege_level": authenticated_user_privilege_level,
-                    "authenticated_user_is_atagia_master": authenticated_user_is_atagia_master,
                 }
             ),
         )
@@ -912,6 +916,11 @@ class HttpAtagiaClient:
         authenticated_user_privilege_level: str | None = None,
         authenticated_user_is_atagia_master: bool = False,
     ) -> None:
+        _require_standard_http_authority(
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+        )
         await self._post(
             f"/v1/conversations/{_path_segment(conversation_id)}/messages",
             user_id=user_id,
@@ -943,9 +952,6 @@ class HttpAtagiaClient:
                     "ingest_origin": ingest_origin,
                     "confirmation_strategy": confirmation_strategy,
                     "memory_privacy_mode": memory_privacy_mode,
-                    "privacy_enforcement": privacy_enforcement,
-                    "authenticated_user_privilege_level": authenticated_user_privilege_level,
-                    "authenticated_user_is_atagia_master": authenticated_user_is_atagia_master,
                 }
             ),
         )
@@ -976,6 +982,11 @@ class HttpAtagiaClient:
         authenticated_user_privilege_level: str | None = None,
         authenticated_user_is_atagia_master: bool = False,
     ) -> ChatResult:
+        _require_standard_http_authority(
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+        )
         await self.create_conversation(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -1017,9 +1028,6 @@ class HttpAtagiaClient:
                 "space_id": space_id,
                 "mode": mode,
                 "incognito": incognito,
-                "privacy_enforcement": privacy_enforcement,
-                "authenticated_user_privilege_level": authenticated_user_privilege_level,
-                "authenticated_user_is_atagia_master": authenticated_user_is_atagia_master,
             },
         )
         payload = response.json()
@@ -1276,6 +1284,26 @@ class HttpAtagiaClient:
                     value = parts[index + 1]
                     return value or None
         return None
+
+
+def _require_standard_http_authority(
+    *,
+    privacy_enforcement: str,
+    authenticated_user_privilege_level: str | None,
+    authenticated_user_is_atagia_master: bool,
+) -> None:
+    normalized_level = " ".join(
+        str(authenticated_user_privilege_level or "").split()
+    ).lower()
+    if (
+        privacy_enforcement != "enforce"
+        or normalized_level not in {"", "standard"}
+        or authenticated_user_is_atagia_master
+    ):
+        raise ValueError(
+            "HTTP transport cannot set prompt authority; use trusted local "
+            "library or evaluation controls"
+        )
 
 
 def _omit_none(payload: dict[str, Any]) -> dict[str, Any]:

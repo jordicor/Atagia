@@ -4,12 +4,23 @@ from __future__ import annotations
 
 import importlib
 from importlib.util import find_spec
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from atagia.core.config import Settings
+from atagia.core.clock import FrozenClock
 from atagia.core.db_sqlite import initialize_database
+from atagia.core.job_run_repository import JobRunRepository
+from atagia.core.user_lifecycle_repository import UserLifecycleRepository
+from atagia.models.schemas_jobs import (
+    ClaimedJob,
+    DurableJobNotification,
+    JobEnvelope,
+    JobType,
+)
+from atagia.services.job_execution_context import bind_job_claim, reset_job_claim
 from atagia.services.llm_client import (
     ConfigurationError,
     LLMClient,
@@ -20,10 +31,17 @@ from atagia.services.llm_client import (
     LLMEmbeddingVector,
     LLMProvider,
 )
-from atagia.services.sqlite_vec_backend import SQLiteVecBackend
+from atagia.services.sqlite_vec_backend import (
+    SQLiteVecBackend,
+    StaleEmbeddingLifecycleError,
+)
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 HAS_SQLITE_VEC = find_spec("sqlite_vec") is not None
 
 
@@ -74,7 +92,9 @@ def _settings() -> Settings:
     )
 
 
-pytestmark = pytest.mark.skipif(not HAS_SQLITE_VEC, reason="sqlite-vec is not installed")
+pytestmark = pytest.mark.skipif(
+    not HAS_SQLITE_VEC, reason="sqlite-vec is not installed"
+)
 
 
 _TS = "2026-04-04T00:00:00+00:00"
@@ -85,6 +105,22 @@ async def _insert_stub_memory(connection, memory_id: str, user_id: str) -> None:
     await connection.execute(
         "INSERT OR IGNORE INTO users(id, created_at, updated_at) VALUES (?, ?, ?)",
         (user_id, _TS, _TS),
+    )
+    await connection.execute(
+        """
+        INSERT OR IGNORE INTO user_lifecycles(
+            user_id,
+            lifecycle_epoch,
+            lifecycle_cleanup_key,
+            cache_revision,
+            source_revision,
+            icp_refresh_generation,
+            state,
+            created_at,
+            updated_at
+        ) VALUES (?, 'ule_' || ?, 'ulk_' || ?, 0, 0, 0, 'active', ?, ?)
+        """,
+        (user_id, user_id, user_id, _TS, _TS),
     )
     await connection.execute(
         """INSERT OR IGNORE INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
@@ -108,7 +144,11 @@ async def _insert_stub_memory(connection, memory_id: str, user_id: str) -> None:
     await connection.commit()
 
 
-async def _build_backend(database_path: str = ":memory:"):
+async def _build_backend(
+    database_path: str = ":memory:",
+    *,
+    clock: FrozenClock | None = None,
+):
     connection = await initialize_database(database_path, MIGRATIONS_DIR)
     provider = EmbeddingProvider(
         {
@@ -124,9 +164,286 @@ async def _build_backend(database_path: str = ":memory:"):
         connection,
         LLMClient(provider_name=provider.name, providers=[provider]),
         _settings(),
+        clock,
     )
     await backend.initialize()
     return connection, backend, provider
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_cannot_upsert_after_lifecycle_revocation() -> None:
+    clock = FrozenClock(datetime(2026, 4, 4, 12, 0, tzinfo=timezone.utc))
+    connection, backend, _provider = await _build_backend(clock=clock)
+    try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
+        envelope = JobEnvelope(
+            job_id="job_vec_fence",
+            job_type=JobType.RUN_EVALUATION,
+            user_id="usr_1",
+            conversation_id="conv_stub",
+            payload={},
+        )
+        await JobRunRepository(connection, clock).create_durable_job(
+            stream_name="atagia:test",
+            target_backend="inprocess",
+            envelope=envelope,
+            source_token_estimate=1,
+            size_bucket="small",
+        )
+        lifecycle = await (
+            await connection.execute(
+                """
+                SELECT
+                    lifecycle_epoch,
+                    lifecycle_cleanup_key,
+                    derivation_revision
+                FROM user_lifecycles
+                WHERE user_id = 'usr_1'
+                """
+            )
+        ).fetchone()
+        assert lifecycle is not None
+        await connection.execute(
+            """
+            UPDATE worker_job_runs
+            SET status = 'running',
+                execution_owner = 'worker-old',
+                execution_fence = 1,
+                execution_lease_expires_at = ?
+            WHERE job_id = 'job_vec_fence'
+            """,
+            ((clock.now() + timedelta(minutes=5)).isoformat(),),
+        )
+        await connection.commit()
+        claim = ClaimedJob(
+            notification_message_id="stm_vec",
+            envelope=envelope,
+            owner_id="worker-old",
+            attempt_count=1,
+            execution_fence=1,
+            lifecycle_epoch=str(lifecycle["lifecycle_epoch"]),
+            lifecycle_cleanup_key=str(lifecycle["lifecycle_cleanup_key"]),
+            derivation_revision=int(lifecycle["derivation_revision"]),
+        )
+        await connection.execute(
+            """
+            UPDATE user_lifecycles
+            SET state = 'cleanup_pending', erasure_cleanup_id = 'erc_vec'
+            WHERE user_id = 'usr_1'
+            """
+        )
+        await connection.execute(
+            """
+            UPDATE worker_job_runs
+            SET status = 'cancelled',
+                execution_owner = NULL,
+                execution_fence = 2,
+                execution_lease_expires_at = NULL,
+                recovery_envelope_json = NULL,
+                envelope_schema_version = NULL
+            WHERE job_id = 'job_vec_fence'
+            """
+        )
+        await connection.commit()
+
+        token = bind_job_claim(claim)
+        try:
+            with pytest.raises(StaleEmbeddingLifecycleError):
+                await backend.upsert(
+                    "mem_1",
+                    "memory one",
+                    {
+                        "user_id": "usr_1",
+                        "object_type": "evidence",
+                        "scope": "conversation",
+                        "created_at": clock.now().isoformat(),
+                    },
+                )
+        finally:
+            reset_job_claim(token)
+        assert (
+            await (
+                await connection.execute(
+                    "SELECT 1 FROM vec_memory_embeddings WHERE memory_id = 'mem_1'"
+                )
+            ).fetchone()
+            is None
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_cannot_upsert_after_derivation_revision_bump() -> None:
+    clock = FrozenClock(datetime(2026, 4, 4, 12, 0, tzinfo=timezone.utc))
+    connection, backend, _provider = await _build_backend(clock=clock)
+    try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
+        envelope = JobEnvelope(
+            job_id="job_vec_derivation_fence",
+            job_type=JobType.RUN_EVALUATION,
+            user_id="usr_1",
+            conversation_id="conv_stub",
+            payload={},
+        )
+        jobs = JobRunRepository(connection, clock)
+        await jobs.create_durable_job(
+            stream_name="atagia:test",
+            target_backend="inprocess",
+            envelope=envelope,
+            source_token_estimate=1,
+            size_bucket="small",
+        )
+        dispatches = await jobs.claim_dispatchable_jobs(
+            target_backend="inprocess",
+            limit=1,
+            visibility_seconds=30,
+        )
+        assert len(dispatches) == 1
+        dispatch = dispatches[0]
+        claim = await jobs.claim_notification(
+            "delivery_vec_derivation",
+            DurableJobNotification(
+                job_id=envelope.job_id,
+                dispatch_token=str(dispatch["dispatch_token"]),
+                lifecycle_epoch=str(dispatch["lifecycle_epoch"]),
+                lifecycle_cleanup_key=str(dispatch["lifecycle_cleanup_key"]),
+            ),
+            owner_id="worker-old",
+            lease_seconds=300,
+        )
+        assert claim is not None
+        lifecycle_repository = UserLifecycleRepository(connection, clock)
+        identity = await lifecycle_repository.get_active_identity("usr_1")
+        assert identity is not None
+        bumped_revision = await lifecycle_repository.bump_derivation_revision(
+            "usr_1",
+            expected_lifecycle_epoch=identity.lifecycle_epoch,
+        )
+        assert bumped_revision == claim.derivation_revision + 1
+
+        token = bind_job_claim(claim)
+        try:
+            with pytest.raises(StaleEmbeddingLifecycleError):
+                await backend.upsert(
+                    "mem_1",
+                    "memory one",
+                    {
+                        "user_id": "usr_1",
+                        "object_type": "evidence",
+                        "scope": "conversation",
+                        "created_at": clock.now().isoformat(),
+                    },
+                )
+        finally:
+            reset_job_claim(token)
+        assert (
+            await (
+                await connection.execute(
+                    """
+                    SELECT 1
+                    FROM vec_memory_embeddings
+                    WHERE memory_id = 'mem_1'
+                    """
+                )
+            ).fetchone()
+            is None
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_cannot_delete_after_derivation_revision_bump() -> None:
+    clock = FrozenClock(datetime(2026, 4, 4, 12, 0, tzinfo=timezone.utc))
+    connection, backend, _provider = await _build_backend(clock=clock)
+    try:
+        await _insert_stub_memory(connection, "mem_1", "usr_1")
+        await backend.upsert(
+            "mem_1",
+            "memory one",
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": clock.now().isoformat(),
+            },
+        )
+        envelope = JobEnvelope(
+            job_id="job_vec_delete_derivation_fence",
+            job_type=JobType.RUN_EVALUATION,
+            user_id="usr_1",
+            conversation_id="conv_stub",
+            payload={},
+        )
+        jobs = JobRunRepository(connection, clock)
+        await jobs.create_durable_job(
+            stream_name="atagia:test",
+            target_backend="inprocess",
+            envelope=envelope,
+            source_token_estimate=1,
+            size_bucket="small",
+        )
+        dispatches = await jobs.claim_dispatchable_jobs(
+            target_backend="inprocess",
+            limit=1,
+            visibility_seconds=30,
+        )
+        assert len(dispatches) == 1
+        dispatch = dispatches[0]
+        claim = await jobs.claim_notification(
+            "delivery_vec_delete_derivation",
+            DurableJobNotification(
+                job_id=envelope.job_id,
+                dispatch_token=str(dispatch["dispatch_token"]),
+                lifecycle_epoch=str(dispatch["lifecycle_epoch"]),
+                lifecycle_cleanup_key=str(dispatch["lifecycle_cleanup_key"]),
+            ),
+            owner_id="worker-old",
+            lease_seconds=300,
+        )
+        assert claim is not None
+        lifecycle_repository = UserLifecycleRepository(connection, clock)
+        identity = await lifecycle_repository.get_active_identity("usr_1")
+        assert identity is not None
+        bumped_revision = await lifecycle_repository.bump_derivation_revision(
+            "usr_1",
+            expected_lifecycle_epoch=identity.lifecycle_epoch,
+        )
+        assert bumped_revision == claim.derivation_revision + 1
+
+        token = bind_job_claim(claim)
+        try:
+            with pytest.raises(StaleEmbeddingLifecycleError):
+                await backend.delete("mem_1")
+        finally:
+            reset_job_claim(token)
+        assert (
+            await (
+                await connection.execute(
+                    """
+                    SELECT 1
+                    FROM vec_memory_embeddings
+                    WHERE memory_id = 'mem_1'
+                    """
+                )
+            ).fetchone()
+            is not None
+        )
+        assert (
+            await (
+                await connection.execute(
+                    """
+                    SELECT 1
+                    FROM memory_embedding_metadata
+                    WHERE memory_id = 'mem_1'
+                    """
+                )
+            ).fetchone()
+            is not None
+        )
+    finally:
+        await connection.close()
 
 
 @pytest.mark.asyncio
@@ -137,11 +454,20 @@ async def test_upsert_stores_embedding_and_metadata() -> None:
         await backend.upsert(
             "mem_1",
             "memory one",
-            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:00:00+00:00",
+            },
         )
 
-        metadata_cursor = await connection.execute("SELECT user_id FROM memory_embedding_metadata WHERE memory_id = 'mem_1'")
-        vec_cursor = await connection.execute("SELECT memory_id FROM vec_memory_embeddings WHERE memory_id = 'mem_1'")
+        metadata_cursor = await connection.execute(
+            "SELECT user_id FROM memory_embedding_metadata WHERE memory_id = 'mem_1'"
+        )
+        vec_cursor = await connection.execute(
+            "SELECT memory_id FROM vec_memory_embeddings WHERE memory_id = 'mem_1'"
+        )
 
         assert (await metadata_cursor.fetchone())["user_id"] == "usr_1"
         assert (await vec_cursor.fetchone())["memory_id"] == "mem_1"
@@ -158,12 +484,22 @@ async def test_search_returns_nearest_neighbors_filtered_by_user_id() -> None:
         await backend.upsert(
             "mem_1",
             "memory one",
-            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:00:00+00:00",
+            },
         )
         await backend.upsert(
             "mem_2",
             "memory two",
-            {"user_id": "usr_2", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:01:00+00:00"},
+            {
+                "user_id": "usr_2",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:01:00+00:00",
+            },
         )
 
         matches = await backend.search("query one", "usr_1", top_k=5)
@@ -229,13 +565,22 @@ async def test_delete_removes_embedding_and_metadata() -> None:
         await backend.upsert(
             "mem_1",
             "memory one",
-            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:00:00+00:00",
+            },
         )
 
         await backend.delete("mem_1")
 
-        metadata_cursor = await connection.execute("SELECT COUNT(*) AS count FROM memory_embedding_metadata WHERE memory_id = 'mem_1'")
-        vec_cursor = await connection.execute("SELECT COUNT(*) AS count FROM vec_memory_embeddings WHERE memory_id = 'mem_1'")
+        metadata_cursor = await connection.execute(
+            "SELECT COUNT(*) AS count FROM memory_embedding_metadata WHERE memory_id = 'mem_1'"
+        )
+        vec_cursor = await connection.execute(
+            "SELECT COUNT(*) AS count FROM vec_memory_embeddings WHERE memory_id = 'mem_1'"
+        )
 
         assert (await metadata_cursor.fetchone())["count"] == 0
         assert (await vec_cursor.fetchone())["count"] == 0
@@ -251,15 +596,27 @@ async def test_upsert_twice_updates_existing_embedding_idempotently() -> None:
         await backend.upsert(
             "mem_1",
             "memory one",
-            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:00:00+00:00",
+            },
         )
         await backend.upsert(
             "mem_1",
             "updated memory one",
-            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:05:00+00:00"},
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:05:00+00:00",
+            },
         )
 
-        cursor = await connection.execute("SELECT COUNT(*) AS count FROM memory_embedding_metadata WHERE memory_id = 'mem_1'")
+        cursor = await connection.execute(
+            "SELECT COUNT(*) AS count FROM memory_embedding_metadata WHERE memory_id = 'mem_1'"
+        )
         matches = await backend.search("query one", "usr_1", top_k=5)
 
         assert (await cursor.fetchone())["count"] == 1
@@ -277,7 +634,12 @@ async def test_upsert_passes_dimensions_to_openai_compatible_provider() -> None:
         await backend.upsert(
             "mem_1",
             "memory one",
-            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:00:00+00:00",
+            },
         )
 
         assert provider.requests[0].dimensions == 2
@@ -305,7 +667,12 @@ async def test_upsert_rejects_dimension_mismatch() -> None:
             await backend.upsert(
                 "mem_1",
                 "memory one",
-                {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+                {
+                    "user_id": "usr_1",
+                    "object_type": "evidence",
+                    "scope": "conversation",
+                    "created_at": "2026-04-04T12:00:00+00:00",
+                },
             )
     finally:
         await connection.close()
@@ -320,7 +687,12 @@ async def test_initialize_cleans_up_archived_embeddings(tmp_path: Path) -> None:
         await backend.upsert(
             "mem_1",
             "memory one",
-            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:00:00+00:00",
+            },
         )
         await connection.execute(
             "UPDATE memory_objects SET status = 'archived' WHERE id = 'mem_1'"
@@ -332,7 +704,10 @@ async def test_initialize_cleans_up_archived_embeddings(tmp_path: Path) -> None:
     reopened = await initialize_database(database_path, MIGRATIONS_DIR)
     backend = SQLiteVecBackend(
         reopened,
-        LLMClient(provider_name=EmbeddingProvider.name, providers=[EmbeddingProvider({"memory one": [1.0, 0.0]})]),
+        LLMClient(
+            provider_name=EmbeddingProvider.name,
+            providers=[EmbeddingProvider({"memory one": [1.0, 0.0]})],
+        ),
         _settings(),
     )
     await backend.initialize()
@@ -359,7 +734,12 @@ async def test_upsert_commits_metadata_durably(tmp_path: Path) -> None:
         await backend.upsert(
             "mem_1",
             "memory one",
-            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:00:00+00:00",
+            },
         )
     finally:
         await connection.close()
@@ -383,7 +763,12 @@ async def test_delete_commits_metadata_removal_durably(tmp_path: Path) -> None:
         await backend.upsert(
             "mem_1",
             "memory one",
-            {"user_id": "usr_1", "object_type": "evidence", "scope": "conversation", "created_at": "2026-04-04T12:00:00+00:00"},
+            {
+                "user_id": "usr_1",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": "2026-04-04T12:00:00+00:00",
+            },
         )
         await backend.delete("mem_1")
     finally:
@@ -411,17 +796,32 @@ async def test_search_returns_available_user_rows_without_postfilter_warning(
         await backend.upsert(
             "mem_target",
             "memory one",
-            {"user_id": "usr_target", "object_type": "evidence", "scope": "conversation", "created_at": _TS},
+            {
+                "user_id": "usr_target",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": _TS,
+            },
         )
         await backend.upsert(
             "mem_other_1",
             "memory one",
-            {"user_id": "usr_other", "object_type": "evidence", "scope": "conversation", "created_at": _TS},
+            {
+                "user_id": "usr_other",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": _TS,
+            },
         )
         await backend.upsert(
             "mem_other_2",
             "memory two",
-            {"user_id": "usr_other", "object_type": "evidence", "scope": "conversation", "created_at": _TS},
+            {
+                "user_id": "usr_other",
+                "object_type": "evidence",
+                "scope": "conversation",
+                "created_at": _TS,
+            },
         )
 
         with caplog.at_level("WARNING", logger="atagia.services.sqlite_vec_backend"):

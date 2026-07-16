@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,13 +15,27 @@ from fastapi.testclient import TestClient
 from atagia.app import create_app
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+)
 from atagia.core.space_repository import SpaceRepository
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, SpaceBoundaryMode
+from atagia.models.schemas_memory import (
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    SpaceBoundaryMode,
+)
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -54,7 +71,9 @@ def _connection(client: TestClient):
         client.portal.call(connection.close)
 
 
-def test_memory_routes_support_feedback_lookup_and_contract_view(tmp_path: Path) -> None:
+def test_memory_routes_support_feedback_lookup_and_contract_view(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         runtime = client.app.state.runtime
@@ -78,8 +97,19 @@ def test_memory_routes_support_feedback_lookup_and_contract_view(tmp_path: Path)
                     platform_id="web",
                 )
             )
-            client.portal.call(messages.create_message, "msg_1", "cnv_1", "user", 1, "Need help", 2, {})
-            client.portal.call(messages.create_message, "msg_2", "cnv_1", "assistant", 2, "Try this", 2, {})
+            client.portal.call(
+                messages.create_message, "msg_1", "cnv_1", "user", 1, "Need help", 2, {}
+            )
+            client.portal.call(
+                messages.create_message,
+                "msg_2",
+                "cnv_1",
+                "assistant",
+                2,
+                "Try this",
+                2,
+                {},
+            )
             client.portal.call(
                 lambda: memories.create_memory_object(
                     user_id="usr_1",
@@ -152,7 +182,11 @@ def test_memory_routes_support_feedback_lookup_and_contract_view(tmp_path: Path)
                     "platform_id": "web",
                     "retrieval_plan_json": {"fts_queries": ["retry"]},
                     "selected_memory_ids_json": ["mem_1"],
-                    "context_view_json": {"selected_memory_ids": ["mem_1"], "items_included": 1, "items_dropped": 0},
+                    "context_view_json": {
+                        "selected_memory_ids": ["mem_1"],
+                        "items_included": 1,
+                        "items_dropped": 0,
+                    },
                     "outcome_json": {},
                 },
             )
@@ -227,7 +261,9 @@ def test_memory_routes_support_feedback_lookup_and_contract_view(tmp_path: Path)
                 },
             )
             assert memory_response.status_code == 200
-            assert memory_response.json()["canonical_text"] == "User is debugging retries."
+            assert (
+                memory_response.json()["canonical_text"] == "User is debugging retries."
+            )
 
             missing_memory = client.get(
                 "/v1/memory/objects/mem_1",
@@ -256,6 +292,130 @@ def test_memory_routes_support_feedback_lookup_and_contract_view(tmp_path: Path)
                 "urgency": "high",
             }
 
+            async def install_selected_transcript_blocker() -> None:
+                now = runtime.clock.now().isoformat()
+                await connection.execute(
+                    """
+                    INSERT INTO transcript_rebuild_workflows(
+                        id,
+                        operation_id,
+                        user_id,
+                        conversation_id,
+                        selection_epoch,
+                        transcript_hash,
+                        mutation_kind,
+                        selected_message_ids_json,
+                        abandoned_message_ids_json,
+                        supporting_message_ids_json,
+                        affected_memory_ids_json,
+                        affected_summary_ids_json,
+                        orchestrator_job_id,
+                        stage,
+                        start_derivation_revision,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "trw_feedback_selection_wins",
+                        "op_feedback_selection_wins",
+                        "usr_1",
+                        "cnv_1",
+                        1,
+                        "hash_feedback_selection_wins",
+                        "replace",
+                        "[]",
+                        "[]",
+                        "[]",
+                        "[]",
+                        "[]",
+                        "job_feedback_selection_wins",
+                        "aggregates",
+                        0,
+                        now,
+                        now,
+                    ),
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO conversation_transcript_selections(
+                        user_id,
+                        conversation_id,
+                        selection_epoch,
+                        transcript_hash,
+                        current_workflow_id,
+                        state,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'rebuilding', ?)
+                    """,
+                    (
+                        "usr_1",
+                        "cnv_1",
+                        1,
+                        "hash_feedback_selection_wins",
+                        "trw_feedback_selection_wins",
+                        now,
+                    ),
+                )
+                await connection.commit()
+
+            feedback_before = client.portal.call(
+                lambda: connection.execute_fetchall(
+                    "SELECT id FROM memory_feedback_events WHERE user_id = ?",
+                    ("usr_1",),
+                )
+            )
+            client.portal.call(connection.execute, "BEGIN IMMEDIATE")
+            request_started = threading.Event()
+            feedback_responses = []
+            feedback_errors = []
+
+            def submit_feedback() -> None:
+                request_started.set()
+                try:
+                    feedback_responses.append(
+                        client.post(
+                            "/v1/memory/feedback",
+                            json={
+                                "user_id": "usr_1",
+                                "conversation_id": "cnv_1",
+                                "platform_id": "web",
+                                "retrieval_event_id": event["id"],
+                                "memory_id": "mem_1",
+                                "feedback_type": "confirmed_by_user",
+                                "score": 1.0,
+                                "metadata": {"source": "selection_wins_test"},
+                            },
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - diagnostic path
+                    feedback_errors.append(exc)
+
+            feedback_thread = threading.Thread(target=submit_feedback, daemon=True)
+            feedback_thread.start()
+            assert request_started.wait(timeout=2.0)
+            feedback_thread.join(timeout=0.05)
+            assert feedback_thread.is_alive()
+
+            client.portal.call(install_selected_transcript_blocker)
+            feedback_thread.join(timeout=2.0)
+            assert not feedback_thread.is_alive()
+            assert feedback_errors == []
+            assert len(feedback_responses) == 1
+            blocked_feedback = feedback_responses[0]
+            assert blocked_feedback.status_code == 409
+            assert (
+                blocked_feedback.json()["code"]
+                == "selected_transcript_rebuild_in_progress"
+            )
+            feedback_after = client.portal.call(
+                lambda: connection.execute_fetchall(
+                    "SELECT id FROM memory_feedback_events WHERE user_id = ?",
+                    ("usr_1",),
+                )
+            )
+            assert feedback_after == feedback_before
+
 
 def test_memory_lifecycle_routes_edit_archive_and_hard_delete(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
@@ -265,6 +425,7 @@ def test_memory_lifecycle_routes_edit_archive_and_hard_delete(tmp_path: Path) ->
         with _connection(client) as connection:
             users = UserRepository(connection, runtime.clock)
             conversations = ConversationRepository(connection, runtime.clock)
+            messages = MessageRepository(connection, runtime.clock)
             memories = MemoryObjectRepository(connection, runtime.clock)
 
             client.portal.call(users.create_user, "usr_1")
@@ -277,6 +438,22 @@ def test_memory_lifecycle_routes_edit_archive_and_hard_delete(tmp_path: Path) ->
                     "Chat",
                     platform_id="web",
                 )
+            )
+            client.portal.call(
+                messages.create_message,
+                "msg_edit_source",
+                "cnv_1",
+                "user",
+                1,
+                "Original memory text.",
+            )
+            client.portal.call(
+                messages.create_message,
+                "msg_delete_source",
+                "cnv_1",
+                "user",
+                2,
+                "Delete me.",
             )
             client.portal.call(
                 lambda: memories.create_memory_object(
@@ -293,6 +470,7 @@ def test_memory_lifecycle_routes_edit_archive_and_hard_delete(tmp_path: Path) ->
                     privacy_level=0,
                     memory_id="mem_edit",
                     platform_id="web",
+                    payload={"source_message_ids": ["msg_edit_source"]},
                 )
             )
             client.portal.call(
@@ -308,6 +486,7 @@ def test_memory_lifecycle_routes_edit_archive_and_hard_delete(tmp_path: Path) ->
                     privacy_level=0,
                     memory_id="mem_delete",
                     platform_id="web",
+                    payload={"source_message_ids": ["msg_delete_source"]},
                 )
             )
 
@@ -335,11 +514,17 @@ def test_memory_lifecycle_routes_edit_archive_and_hard_delete(tmp_path: Path) ->
 
             archive_response = client.post(
                 "/v1/memories/mem_edit/delete",
-                json={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
+                json={
+                    "user_id": "usr_1",
+                    "conversation_id": "cnv_1",
+                    "platform_id": "web",
+                },
             )
             assert archive_response.status_code == 200
             assert archive_response.json()["deleted_memories"] == 1
-            archived = client.portal.call(memories.get_memory_object, "mem_edit", "usr_1")
+            archived = client.portal.call(
+                memories.get_memory_object, "mem_edit", "usr_1"
+            )
             assert archived["status"] == "archived"
 
             missing_confirmation = client.post(
@@ -365,7 +550,10 @@ def test_memory_lifecycle_routes_edit_archive_and_hard_delete(tmp_path: Path) ->
             )
             assert hard_delete_response.status_code == 200
             assert hard_delete_response.json()["deleted_memories"] == 1
-            assert client.portal.call(memories.get_memory_object, "mem_delete", "usr_1") is None
+            assert (
+                client.portal.call(memories.get_memory_object, "mem_delete", "usr_1")
+                is None
+            )
 
 
 @pytest.mark.parametrize(
@@ -430,21 +618,23 @@ def test_memory_routes_enforce_space_boundaries_for_broader_scope_memories(
             }
             for operation, memory_id in memory_ids.items():
                 client.portal.call(
-                    lambda operation=operation, memory_id=memory_id: memories.create_memory_object(
-                        user_id="usr_1",
-                        conversation_id=None,
-                        assistant_mode_id="coding_debug",
-                        object_type=MemoryObjectType.EVIDENCE,
-                        scope=MemoryScope.GLOBAL_USER,
-                        canonical_text=f"{operation} memory inside {space_id}.",
-                        source_kind=MemorySourceKind.EXTRACTED,
-                        confidence=0.9,
-                        privacy_level=0,
-                        memory_id=memory_id,
-                        platform_id="web",
-                        scope_canonical=MemoryScope.USER.value,
-                        space_id=space_id,
-                        space_boundary_mode=boundary_mode.value,
+                    lambda operation=operation, memory_id=memory_id: (
+                        memories.create_memory_object(
+                            user_id="usr_1",
+                            conversation_id=None,
+                            assistant_mode_id="coding_debug",
+                            object_type=MemoryObjectType.EVIDENCE,
+                            scope=MemoryScope.GLOBAL_USER,
+                            canonical_text=f"{operation} memory inside {space_id}.",
+                            source_kind=MemorySourceKind.VERBATIM,
+                            confidence=0.9,
+                            privacy_level=0,
+                            memory_id=memory_id,
+                            platform_id="web",
+                            scope_canonical=MemoryScope.USER.value,
+                            space_id=space_id,
+                            space_boundary_mode=boundary_mode.value,
+                        )
                     )
                 )
 
@@ -473,7 +663,9 @@ def test_memory_routes_enforce_space_boundaries_for_broader_scope_memories(
                 },
             )
             assert outside_edit.status_code == 404
-            stored_edit = client.portal.call(memories.get_memory_object, memory_ids["edit"], "usr_1")
+            stored_edit = client.portal.call(
+                memories.get_memory_object, memory_ids["edit"], "usr_1"
+            )
             assert stored_edit["canonical_text"] == f"edit memory inside {space_id}."
 
             outside_delete = client.post(
@@ -481,7 +673,9 @@ def test_memory_routes_enforce_space_boundaries_for_broader_scope_memories(
                 json=outside_params,
             )
             assert outside_delete.status_code == 404
-            stored_delete = client.portal.call(memories.get_memory_object, memory_ids["delete"], "usr_1")
+            stored_delete = client.portal.call(
+                memories.get_memory_object, memory_ids["delete"], "usr_1"
+            )
             assert stored_delete["status"] == "active"
 
             inside_get = client.get(
@@ -489,7 +683,9 @@ def test_memory_routes_enforce_space_boundaries_for_broader_scope_memories(
                 params=inside_params,
             )
             assert inside_get.status_code == 200
-            assert inside_get.json()["canonical_text"] == f"get memory inside {space_id}."
+            assert (
+                inside_get.json()["canonical_text"] == f"get memory inside {space_id}."
+            )
 
             inside_edit = client.patch(
                 f"/v1/memories/{memory_ids['edit']}",
@@ -506,5 +702,113 @@ def test_memory_routes_enforce_space_boundaries_for_broader_scope_memories(
                 json=inside_params,
             )
             assert inside_delete.status_code == 200
-            archived_delete = client.portal.call(memories.get_memory_object, memory_ids["delete"], "usr_1")
+            archived_delete = client.portal.call(
+                memories.get_memory_object, memory_ids["delete"], "usr_1"
+            )
             assert archived_delete["status"] == "archived"
+
+
+def test_memory_read_rejects_stale_row_after_completed_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime
+        with _connection(client) as connection:
+            client.portal.call(
+                UserRepository(connection, runtime.clock).create_user,
+                "usr_read_race",
+            )
+            client.portal.call(
+                lambda: ConversationRepository(
+                    connection,
+                    runtime.clock,
+                ).create_conversation(
+                    "cnv_read_race",
+                    "usr_read_race",
+                    None,
+                    "general_qa",
+                    "Read race",
+                    platform_id="web",
+                )
+            )
+            client.portal.call(
+                lambda: MemoryObjectRepository(
+                    connection,
+                    runtime.clock,
+                ).create_memory_object(
+                    memory_id="mem_read_race",
+                    user_id="usr_read_race",
+                    conversation_id="cnv_read_race",
+                    assistant_mode_id="general_qa",
+                    object_type=MemoryObjectType.EVIDENCE,
+                    scope=MemoryScope.CONVERSATION,
+                    canonical_text="Stale branch memory",
+                    source_kind=MemorySourceKind.EXTRACTED,
+                    confidence=0.9,
+                    privacy_level=0,
+                    platform_id="web",
+                )
+            )
+
+        original_get = MemoryObjectRepository.get_visible_memory_object
+        raced = False
+
+        async def get_while_replacement_completes(
+            repository: MemoryObjectRepository,
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any] | None:
+            nonlocal raced
+            row = await original_get(repository, *args, **kwargs)
+            if raced:
+                return row
+            raced = True
+            read_completed = asyncio.Event()
+            replacement_completed = asyncio.Event()
+
+            async def complete_replacement() -> None:
+                await read_completed.wait()
+                writer = await runtime.open_connection()
+                try:
+                    await writer.execute("BEGIN IMMEDIATE")
+                    await writer.execute(
+                        "DELETE FROM memory_objects WHERE id = ? AND user_id = ?",
+                        ("mem_read_race", "usr_read_race"),
+                    )
+                    await writer.execute(
+                        """
+                        UPDATE user_lifecycles
+                        SET derivation_revision = derivation_revision + 1
+                        WHERE user_id = ?
+                        """,
+                        ("usr_read_race",),
+                    )
+                    await writer.commit()
+                finally:
+                    await writer.close()
+                    replacement_completed.set()
+
+            replacement_task = asyncio.create_task(complete_replacement())
+            read_completed.set()
+            await asyncio.wait_for(replacement_completed.wait(), timeout=2.0)
+            await replacement_task
+            return row
+
+        monkeypatch.setattr(
+            MemoryObjectRepository,
+            "get_visible_memory_object",
+            get_while_replacement_completes,
+        )
+        response = client.get(
+            "/v1/memory/objects/mem_read_race",
+            params={
+                "user_id": "usr_read_race",
+                "conversation_id": "cnv_read_race",
+                "platform_id": "web",
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "selected_transcript_rebuild_in_progress"

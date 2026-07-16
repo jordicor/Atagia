@@ -32,8 +32,8 @@ from tests.extraction_payload_support import (
     rich_extraction_payload_to_lean,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 class ExtractionProvider(LLMProvider):

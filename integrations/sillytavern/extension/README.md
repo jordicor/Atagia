@@ -1,75 +1,77 @@
-# Atagia Memory SillyTavern Extension
+# Atagia Memory Browser Extension
 
-Status: implemented, mock-verified, live smoke pending.
+Compatibility target: SillyTavern `1.18.0` at commit
+`51ad27fb86d39a3daca3adaa970375c9670c12df`.
 
-This extension uses SillyTavern's prompt-interceptor hook to fetch Atagia context
-before generation, injects that context through `setExtensionPrompt`, and records
-generated assistant messages back to Atagia from `MESSAGE_RECEIVED`.
+This browser extension requires the companion Atagia server plugin in
+`../server-plugin/`. It has no service-key, Atagia-base-URL, platform-ID, or
+Atagia-user-ID setting. It calls only the fixed same-origin server route and
+uses the SillyTavern session and CSRF token.
 
-It deliberately does not insert synthetic Atagia messages into `chat`; that would
-risk persisting internal memory context as real SillyTavern history.
+This is a reference integration: it is not yet production-supported until a real
+user/assistant turn has been verified against the target SillyTavern install.
+Local automated verification is contract-level only, not a live-host smoke.
 
 ## Install
 
-Copy this `extension/` directory into a SillyTavern third-party extension folder
-and restart or reload SillyTavern.
-
-Current SillyTavern releases commonly use:
-
-```text
-data/<user-handle>/extensions/atagia-memory
-```
-
-or, for all users:
+First install and configure the server plugin as described in
+`../server-plugin/README.md`. Then copy this directory to a supported
+SillyTavern extension location, such as:
 
 ```text
-public/scripts/extensions/third-party/atagia-memory
+<SillyTavern>/data/<user-handle>/extensions/atagia-memory
 ```
 
-## Atagia Service
+Restart or reload SillyTavern. The extension requires SillyTavern `1.18.0` and
+does not support automatic client or server-plugin drift from the pinned host.
 
-Because this is a browser extension, Atagia must allow the SillyTavern origin:
+## Settings
 
-```bash
-ATAGIA_SERVICE_MODE=true \
-ATAGIA_SERVICE_API_KEY=change-me \
-ATAGIA_ADMIN_API_KEY=change-me-admin \
-ATAGIA_CORS_ALLOWED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000 \
-atagia-api --host 127.0.0.1 --port 8100
-```
+The panel exposes only non-secret behavior settings:
 
-Configure the extension panel:
+- enable/disable;
+- optional persona and character IDs;
+- conversation prefix;
+- mode;
+- memory privacy mode; and
+- memory-only diagnostic metadata opt-in.
 
-```text
-Atagia base URL: http://127.0.0.1:8100
-Service API key: change-me
-User ID: sillytavern-user
-Persona ID: optional stable persona ID
-Platform ID: sillytavern
-Character ID: optional stable character ID
-Conversation prefix: sillytavern
-Mode: companion
-Memory privacy mode: balanced
-```
+The Atagia user is selected server-side from the authenticated SillyTavern user
+handle. Browser payload fields cannot override that mapping.
 
-## Debug Panel
+When upgrading from the legacy extension, loading settings allowlists the
+current non-secret fields and deletes everything else immediately, including
+persisted `apiKey`, `lastRequest`, and `lastPreview` values. It also removes the
+old base URL, user/platform identity, request-message ID, status, and error
+fields. A service key that was ever persisted in the browser should not be
+reused; provision a fresh server-side key — see `../PRODUCTION_CREDENTIALS.md`.
 
-The panel shows:
+## Runtime Behavior
 
-- current status,
-- last injected context preview,
-- last Atagia request payload,
-- last request message ID,
-- fail-open error text.
+Before generation, the extension sends the current user message to the fixed
+same-origin `/context` route and injects returned context with
+`setExtensionPrompt`. It does not insert synthetic messages into persistent chat
+history. After the host's response event, it sends the assistant response to
+the fixed same-origin `/response` route. Atagia or boundary failures fail open
+for chat generation and expose only a generic status code. The server-confirmed
+mapping is saved in the host message: duplicate events and reloads do not resend
+that generation, while a failed request remains retryable.
 
-## Smoke Checklist
+Debug mode retains at most 20 metadata-only events in module memory. It does
+not retain or display message text, assistant text, request payloads, system
+prompts, memory previews, credentials, user mappings, or upstream response
+bodies. Disabling debug, reloading/page hiding, logging out, or replacing the
+module clears this memory and any injected extension prompt.
 
-- `Test connection` succeeds against `/v1/models`.
-- A generation calls `/context` with `message_id`, `source_seq`,
-  `platform_id`, `character_id`, `ingest_origin`, `confirmation_strategy`, and
-  `memory_privacy_mode`.
-- `setExtensionPrompt` receives the Atagia context block.
-- No Atagia message is added to persistent chat history.
-- `MESSAGE_RECEIVED` calls `/responses` with response message ID/source seq.
-- Regenerations/swipes produce deterministic response IDs.
-- API/CORS errors fail open and appear in the panel.
+## Validation Checklist
+
+- **Test server boundary** succeeds without an Atagia credential in browser
+  requests or storage.
+- Legacy settings are purged on upgrade and saved without secret/content
+  fields.
+- Another browser extension cannot read an Atagia key or mapped Atagia user ID
+  from extension settings, DOM, storage, module runtime, or network headers.
+- Reload and logout clear diagnostics and the injected prompt.
+- If a key was previously exposed to the browser: a server-side probe using
+  that old key returns `401`, while the same-origin route works with the fresh
+  server-held key before and after restarting both Atagia and SillyTavern.

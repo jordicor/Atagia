@@ -71,6 +71,7 @@ class PresenceRepository:
         owner_user_id: str,
         active_presence_id: str | None,
         character_id: str | None,
+        commit: bool = True,
     ) -> dict[str, Any]:
         if active_presence_id is not None:
             return await self.resolve_presence(
@@ -80,6 +81,7 @@ class PresenceRepository:
                 display_name=active_presence_id,
                 source_kind="explicit",
                 source_id=active_presence_id,
+                commit=commit,
             )
         if character_id is not None:
             return await self.resolve_presence(
@@ -89,6 +91,7 @@ class PresenceRepository:
                 display_name=character_id,
                 source_kind="character_id",
                 source_id=character_id,
+                commit=commit,
             )
         return await self.resolve_presence(
             owner_user_id=owner_user_id,
@@ -97,12 +100,14 @@ class PresenceRepository:
             display_name="Assistant",
             source_kind="default_ai",
             source_id="default_assistant",
+            commit=commit,
         )
 
     async def resolve_human_owner_presence(
         self,
         *,
         owner_user_id: str,
+        commit: bool = True,
     ) -> dict[str, Any]:
         return await self.resolve_presence(
             owner_user_id=owner_user_id,
@@ -111,6 +116,7 @@ class PresenceRepository:
             display_name="User",
             source_kind="human_owner",
             source_id="human_owner",
+            commit=commit,
         )
 
     async def resolve_presence(

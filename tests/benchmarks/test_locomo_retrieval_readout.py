@@ -31,13 +31,13 @@ def test_build_retrieval_readout_summarizes_selected_evidence(
                 results=[
                     QuestionResult(
                         question=BenchmarkQuestion(
-                            question_text="What did Gina design?",
-                            ground_truth="space, furniture, and decor",
+                            question_text="Which workshop zones did the layout cover?",
+                            ground_truth="assembly, storage, and inspection",
                             category=1,
-                            evidence_turn_ids=["D1:3"],
+                            evidence_turn_ids=["D91:1"],
                             question_id="conv-test:q1",
                         ),
-                        prediction="space, furniture, and decor",
+                        prediction="assembly, storage, and inspection",
                         score_result=ScoreResult(
                             score=1,
                             reasoning="ok",
@@ -55,7 +55,7 @@ def test_build_retrieval_readout_summarizes_selected_evidence(
                                     {
                                         "memory_id": "mem_literal",
                                         "supporting_quote": (
-                                            "I designed the space, furniture, and decor."
+                                            "I designed zones for assembly, storage, and inspection."
                                         ),
                                         "selected_for_answer_pack": True,
                                         "normalization": {

@@ -7,12 +7,21 @@ from typing import Any
 
 import aiosqlite
 
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+)
 from atagia.core.realm_repository import RealmRepository, realm_snapshot
 from atagia.core.space_repository import SpaceRepository, space_snapshot
 from atagia.core.topic_repository import TopicRepository
+from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
 from atagia.models.schemas_memory import ExtractionConversationContext, RetrievalTrace
-from atagia.models.schemas_memory import ResolvedOperationalProfile, TopicWorkingSetTrace
+from atagia.models.schemas_memory import (
+    ResolvedOperationalProfile,
+    TopicWorkingSetTrace,
+)
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
@@ -129,30 +138,42 @@ class RetrievalService:
         trace: RetrievalTrace | None = None,
         adaptive_retrieval: bool = False,
     ) -> PipelineResult:
+        rebuilds = TranscriptRebuildRepository(
+            connection,
+            self.runtime.clock,
+        )
+        availability = await rebuilds.capture_user_availability_snapshot(user_id)
         conversations = ConversationRepository(connection, self.runtime.clock)
         users = UserRepository(connection, self.runtime.clock)
         messages = MessageRepository(connection, self.runtime.clock)
         memories = MemoryObjectRepository(connection, self.runtime.clock)
 
-        active_conversation = conversation or await conversations.get_conversation(conversation_id, user_id)
+        active_conversation = conversation or await conversations.get_conversation(
+            conversation_id, user_id
+        )
         if active_conversation is None:
             raise ConversationNotFoundError("Conversation not found for user")
         memory_preferences = await users.get_memory_preferences(user_id)
-        authority_context = prompt_authority_context or normalize_request_authority_context(
-            privacy_enforcement=(
-                ablation.privacy_enforcement
-                if ablation is not None
-                else privacy_enforcement
-            ),
-            authenticated_user_privilege_level=authenticated_user_privilege_level,
-            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
-            user_id=user_id,
-            purpose="retrieval",
+        authority_context = (
+            prompt_authority_context
+            or normalize_request_authority_context(
+                privacy_enforcement=(
+                    ablation.privacy_enforcement
+                    if ablation is not None
+                    else privacy_enforcement
+                ),
+                authenticated_user_privilege_level=authenticated_user_privilege_level,
+                authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+                user_id=user_id,
+                purpose="retrieval",
+            )
         )
         retrieval_ablation = (
             ablation
             if ablation is not None
-            else AblationConfig(privacy_enforcement=authority_context.effective_privacy_enforcement)
+            else AblationConfig(
+                privacy_enforcement=authority_context.effective_privacy_enforcement
+            )
         )
 
         assistant_mode_id = resolve_retrieval_profile_id(
@@ -183,7 +204,9 @@ class RetrievalService:
             conversation_id=conversation_id,
         )
         active_space_id = active_conversation.get("active_space_id")
-        active_space_boundary_mode = active_conversation.get("active_space_boundary_mode")
+        active_space_boundary_mode = active_conversation.get(
+            "active_space_boundary_mode"
+        )
         active_space_display_name = active_conversation.get("active_space_display_name")
         active_mind_id = active_conversation.get("active_mind_id")
         mind_topology = active_conversation.get("mind_topology") or "unimind"
@@ -239,7 +262,8 @@ class RetrievalService:
             temporary_ttl_seconds=active_conversation.get("temporary_ttl_seconds"),
             purge_on_close=bool(active_conversation.get("purge_on_close")),
             isolated_mode=bool(active_conversation.get("isolated_mode")),
-            incognito=bool(active_conversation.get("incognito")) or bool(active_conversation.get("isolated_mode")),
+            incognito=bool(active_conversation.get("incognito"))
+            or bool(active_conversation.get("isolated_mode")),
             remember_across_chats=bool(memory_preferences["remember_across_chats"]),
             remember_across_devices=bool(memory_preferences["remember_across_devices"]),
             memory_privacy_mode=memory_preferences["memory_privacy_mode"],
@@ -275,7 +299,7 @@ class RetrievalService:
             conversation_id=conversation_id,
             trace=trace,
         )
-        return await RetrievalPipeline(
+        result = await RetrievalPipeline(
             connection=connection,
             llm_client=self.runtime.llm_client,
             embedding_index=self.runtime.embedding_index,
@@ -291,6 +315,8 @@ class RetrievalService:
             trace=trace,
             adaptive_retrieval=adaptive_retrieval,
         )
+        await rebuilds.require_user_availability_snapshot(user_id, availability)
+        return result
 
     async def _attach_topic_snapshot(
         self,
@@ -313,7 +339,9 @@ class RetrievalService:
             if settings is not None
             else {}
         )
-        snapshot = await TopicRepository(connection, self.runtime.clock).get_topic_snapshot(
+        snapshot = await TopicRepository(
+            connection, self.runtime.clock
+        ).get_topic_snapshot(
             user_id=user_id,
             conversation_id=conversation_id,
             **freshness_kwargs,

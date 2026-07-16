@@ -6,7 +6,14 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SkipValidation,
+    field_validator,
+    model_validator,
+)
 
 from atagia.core.timestamps import normalize_optional_timestamp
 from atagia.models.schemas_evaluation import MetricName
@@ -59,7 +66,7 @@ class CreateConversationRequest(BaseModel):
     workspace_id: str | None = None
     title: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    cross_chat_memory: bool = True
+    cross_chat_memory: SkipValidation[bool | None] = True
     temporary: bool = False
     temporary_ttl_seconds: int | None = Field(default=None, gt=0)
     purge_on_close: bool | None = None
@@ -78,7 +85,7 @@ class CreateConversationRequest(BaseModel):
     realm_id: str | None = None
     space_id: str | None = None
     mode: str | None = None
-    incognito: bool | None = None
+    incognito: SkipValidation[bool | None] = None
 
 
 class CloseConversationRequest(BaseModel):
@@ -296,7 +303,7 @@ class ChatReplyRequest(BaseModel):
     debug: bool = False
     operational_profile: str | None = Field(default=None, max_length=64)
     operational_signals: OperationalSignals | None = None
-    cross_chat_memory: bool = True
+    cross_chat_memory: SkipValidation[bool | None] = True
     # Namespace redesign per-turn identity / privacy hints. They override
     # the conversation defaults for this turn only (e.g. setting
     # ``incognito=True`` on a single reply). ``mode`` is a retrieval
@@ -311,10 +318,7 @@ class ChatReplyRequest(BaseModel):
     realm_id: str | None = None
     space_id: str | None = None
     mode: str | None = None
-    incognito: bool | None = None
-    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
-    authenticated_user_privilege_level: str | None = None
-    authenticated_user_is_atagia_master: bool = False
+    incognito: SkipValidation[bool | None] = None
     # Per-turn latency/quality override. ``None`` falls back to the global
     # ``response_mode`` setting (default ``normal``).
     response_mode: ResponseMode | None = None
@@ -442,7 +446,7 @@ class SidecarContextRequest(BaseModel):
     attachments: list[AttachmentInput] = Field(default_factory=list)
     operational_profile: str | None = Field(default=None, max_length=64)
     operational_signals: OperationalSignals | None = None
-    cross_chat_memory: bool = True
+    cross_chat_memory: SkipValidation[bool | None] = True
     # Namespace redesign identity fields. ``platform_id`` becomes
     # required for sidecar callers in Phase 4 wiring; until then it is
     # optional so existing integrations keep working.
@@ -456,13 +460,10 @@ class SidecarContextRequest(BaseModel):
     realm_id: str | None = None
     space_id: str | None = None
     mode: str | None = None
-    incognito: bool | None = None
+    incognito: SkipValidation[bool | None] = None
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
     confirmation_strategy: ConfirmationStrategy | None = None
     memory_privacy_mode: MemoryPrivacyMode | None = None
-    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
-    authenticated_user_privilege_level: str | None = None
-    authenticated_user_is_atagia_master: bool = False
     # Per-turn latency/quality override. ``None`` falls back to the global
     # ``response_mode`` setting (default ``normal``).
     response_mode: ResponseMode | None = None
@@ -510,7 +511,7 @@ class SidecarIngestMessageRequest(BaseModel):
     attachments: list[AttachmentInput] = Field(default_factory=list)
     operational_profile: str | None = Field(default=None, max_length=64)
     operational_signals: OperationalSignals | None = None
-    cross_chat_memory: bool = True
+    cross_chat_memory: SkipValidation[bool | None] = True
     user_persona_id: str | None = None
     platform_id: str | None = None
     character_id: str | None = None
@@ -521,13 +522,10 @@ class SidecarIngestMessageRequest(BaseModel):
     realm_id: str | None = None
     space_id: str | None = None
     mode: str | None = None
-    incognito: bool | None = None
+    incognito: SkipValidation[bool | None] = None
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
     confirmation_strategy: ConfirmationStrategy | None = None
     memory_privacy_mode: MemoryPrivacyMode | None = None
-    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
-    authenticated_user_privilege_level: str | None = None
-    authenticated_user_is_atagia_master: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -574,13 +572,10 @@ class SidecarAddResponseRequest(BaseModel):
     realm_id: str | None = None
     space_id: str | None = None
     mode: str | None = None
-    incognito: bool | None = None
+    incognito: SkipValidation[bool | None] = None
     ingest_origin: IngestOrigin = IngestOrigin.LIVE_TURN
     confirmation_strategy: ConfirmationStrategy | None = None
     memory_privacy_mode: MemoryPrivacyMode | None = None
-    privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
-    authenticated_user_privilege_level: str | None = None
-    authenticated_user_is_atagia_master: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -603,6 +598,137 @@ class SidecarAddResponseRequest(BaseModel):
             return None
         normalized = value.strip()
         return normalized or None
+
+
+class SelectedTranscriptMessage(BaseModel):
+    """One canonical host-selected user or assistant message."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1)
+    host_message_id: str = Field(min_length=1)
+    generation_id: str = Field(min_length=1)
+    source_namespace: str = Field(min_length=1)
+    source_seq: int = Field(ge=1)
+    role: Literal["user", "assistant"]
+    text: str
+    occurred_at: str | None = None
+
+    @field_validator(
+        "message_id",
+        "host_message_id",
+        "generation_id",
+        "source_namespace",
+    )
+    @classmethod
+    def validate_required_identity(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Selected transcript identities cannot be blank")
+        return normalized
+
+    @field_validator("occurred_at")
+    @classmethod
+    def validate_occurred_at(cls, value: str | None) -> str | None:
+        normalized = normalize_optional_timestamp(value)
+        if normalized is None:
+            return None
+        datetime.fromisoformat(normalized)
+        return normalized
+
+
+class ReplaceSelectedTranscriptRequest(BaseModel):
+    """Idempotent selected-branch replacement request from a supported host."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    contract_version: Literal["atagia.selected-transcript.v1"] = (
+        "atagia.selected-transcript.v1"
+    )
+    user_id: str
+    platform_id: str
+    operation_id: str = Field(min_length=1)
+    selection_epoch: int = Field(ge=0)
+    mutation_kind: Literal[
+        "initial",
+        "append",
+        "retry",
+        "undo",
+        "regeneration",
+        "backfill",
+    ]
+    retained_cutoff_message_id: str | None = None
+    messages: list[SelectedTranscriptMessage]
+
+    @field_validator("operation_id", "platform_id")
+    @classmethod
+    def validate_required_scope(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Selected transcript scope values cannot be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_ordered_identity(self) -> ReplaceSelectedTranscriptRequest:
+        message_ids = [message.message_id for message in self.messages]
+        source_seqs = [message.source_seq for message in self.messages]
+        if len(message_ids) != len(set(message_ids)):
+            raise ValueError("Selected transcript message_id values must be unique")
+        if len(source_seqs) != len(set(source_seqs)):
+            raise ValueError("Selected transcript source_seq values must be unique")
+        if source_seqs != sorted(source_seqs):
+            raise ValueError("Selected transcript messages must be source_seq ordered")
+        if self.retained_cutoff_message_id is not None:
+            normalized_cutoff = self.retained_cutoff_message_id.strip()
+            if not normalized_cutoff:
+                self.retained_cutoff_message_id = None
+            elif normalized_cutoff not in set(message_ids):
+                raise ValueError(
+                    "retained_cutoff_message_id must identify a selected message"
+                )
+            else:
+                self.retained_cutoff_message_id = normalized_cutoff
+        return self
+
+
+class SelectedTranscriptRebuildResponse(BaseModel):
+    """Durable selected-transcript replacement status."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation_id: str
+    workflow_id: str
+    user_id: str
+    conversation_id: str
+    selection_epoch: int
+    transcript_hash: str
+    status: Literal[
+        "rebuilding",
+        "complete",
+        "remediation_required",
+    ]
+    stage: Literal[
+        "preparing",
+        "sources",
+        "aggregates",
+        "finalizing",
+        "ready_to_finalize",
+        "complete",
+        "remediation_required",
+    ]
+    selected_message_count: int = Field(ge=0)
+    abandoned_message_count: int = Field(ge=0)
+    poll_path: str
+    idempotent_replay: bool = False
+    error_code: str | None = None
+
+
+class RetrySelectedTranscriptRequest(BaseModel):
+    """Authenticated request to restart a failed rebuild from canonical SQLite."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
 
 
 class PendingMemoryConfirmationRecord(BaseModel):

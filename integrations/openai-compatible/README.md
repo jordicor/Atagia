@@ -13,8 +13,9 @@ OpenAI-compatible base URL but cannot run custom code in the message pipeline.
 
 The proxy resolves Atagia identity, fetches context for the latest user message,
 injects it into the outbound system prompt, forwards the request to the
-configured upstream provider, streams or returns the response, and persists the
-assistant response fail-open.
+configured upstream provider, and persists the input, assistant response, and
+required root jobs as one durable turn. Transient context failures may continue
+without memory; terminal transcript persistence never fails open.
 
 ## Required Identity
 
@@ -60,6 +61,25 @@ The proxy accepts these fields from either headers or `metadata`:
 | `X-Atagia-Confirmation-Strategy` | `atagia_confirmation_strategy`, `confirmation_strategy` |
 | `X-Atagia-Memory-Privacy-Mode` | `atagia_memory_privacy_mode`, `memory_privacy_mode` |
 
+The request and response message IDs are an all-or-none pair. Supplying only
+one returns `400` before retrieval, storage, or provider execution. A source
+sequence is accepted only with its corresponding message ID; the two sequences
+remain independently optional.
+
+Supplying neither ID creates a fresh turn on every HTTP request. Supplying both
+defines a retryable turn: an identical completed request replays its stored
+content, tool calls, finish reason, and provider usage without another context
+or provider call, including when replaying between streaming and non-streaming
+framing. Reusing the pair with response-determining input changes returns
+`409`. A concurrent live owner returns retryable `409 request_in_progress`.
+Once a stream has started, an interrupted turn is permanently ambiguous and
+the client must retry with a new ID pair.
+
+Tool-only assistant responses and trailing tool-result batches are stored as
+ordered, versioned structured metadata. Call IDs, literal argument/result
+types, array order, and causal links are part of message identity. Tool data is
+treated as untrusted content when projected for retrieval.
+
 Use `live_turn` + `live_prompt_allowed` for normal proxy traffic. Use
 `backfill` + `admin_review_only` for offline importers instead of proxy calls.
 
@@ -68,7 +88,8 @@ Use `live_turn` + `live_prompt_allowed` for normal proxy traffic. Use
 - Non-streaming chat completions.
 - Streaming SSE chunks, including `stream_options.include_usage`.
 - Function/tool calls and `tool_choice="none"`.
-- Fail-open context retrieval and assistant-response persistence.
+- Fail-open handling for transient context infrastructure failures only.
+- Durable stable-ID replay and structured tool-call/result transcripts.
 - OpenAI-shaped validation, unknown-model, and upstream failure errors.
 
 ## Running
@@ -98,5 +119,5 @@ Use `change-me` as the OpenAI-compatible API key in the host.
   `data: [DONE]`.
 - Tool calls round-trip in both non-streaming and streaming mode.
 - Missing `platform_id` is rejected before the upstream model is called.
-- Turning Atagia storage off or breaking the sidecar path still returns the model
-  response fail-open.
+- A transient context-store outage can continue without memory, while a
+  terminal transcript commit failure never emits a successful terminal event.

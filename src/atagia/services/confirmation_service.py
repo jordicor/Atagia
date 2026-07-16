@@ -14,14 +14,23 @@ from atagia.core.consent_repository import (
     MemoryConsentProfileRepository,
     PendingMemoryConfirmationRepository,
 )
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    UserRepository,
+)
+from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
 from atagia.memory.consent_confirmation import (
     ConsentResponseIntent,
     category_plural_label,
     classify_confirmation_response,
     safe_confirmation_label,
 )
-from atagia.models.schemas_memory import ConversationStatus, MemoryCategory, MemoryStatus
+from atagia.models.schemas_memory import (
+    ConversationStatus,
+    MemoryCategory,
+    MemoryStatus,
+)
 from atagia.services.embedding_payloads import build_embedding_upsert_payload
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
 from atagia.services.llm_client import LLMClient
@@ -67,11 +76,18 @@ class PendingConfirmationService:
         llm_client: LLMClient[Any] | None = None,
         settings: Settings | None = None,
     ) -> None:
+        self._connection = connection
         self._memory_repository = MemoryObjectRepository(connection, clock)
         self._conversation_repository = ConversationRepository(connection, clock)
         self._user_repository = UserRepository(connection, clock)
         self._consent_repository = MemoryConsentProfileRepository(connection, clock)
-        self._pending_repository = PendingMemoryConfirmationRepository(connection, clock)
+        self._pending_repository = PendingMemoryConfirmationRepository(
+            connection, clock
+        )
+        self._transcript_rebuild_repository = TranscriptRebuildRepository(
+            connection,
+            clock,
+        )
         self._embedding_index = embedding_index or NoneBackend()
         self._clock = clock
         self._llm_client = llm_client
@@ -84,7 +100,10 @@ class PendingConfirmationService:
         conversation_id: str,
         message_text: str,
     ) -> PendingConfirmationTurnPlan:
-        asked_marker = await self._pending_repository.get_oldest_asked_marker(user_id, conversation_id)
+        await self._transcript_rebuild_repository.require_user_available(user_id)
+        asked_marker = await self._pending_repository.get_oldest_asked_marker(
+            user_id, conversation_id
+        )
         if asked_marker is not None:
             return await self._plan_response_batch(
                 user_id=user_id,
@@ -93,7 +112,9 @@ class PendingConfirmationService:
                 category=MemoryCategory(str(asked_marker["memory_category"])),
             )
 
-        unasked_marker = await self._pending_repository.get_oldest_unasked_marker(user_id, conversation_id)
+        unasked_marker = await self._pending_repository.get_oldest_unasked_marker(
+            user_id, conversation_id
+        )
         if unasked_marker is None:
             return PendingConfirmationTurnPlan()
         return await self._plan_prompt_batch(
@@ -109,6 +130,7 @@ class PendingConfirmationService:
         plan: PendingConfirmationTurnPlan,
         commit: bool = True,
     ) -> list[_EmbeddingUpsert]:
+        await self._transcript_rebuild_repository.require_user_available(user_id)
         embedding_upserts: list[_EmbeddingUpsert] = []
         if plan.response_category is not None and plan.response_memory_ids:
             if plan.response_intent is ConsentResponseIntent.CONFIRM:
@@ -150,7 +172,9 @@ class PendingConfirmationService:
             await self._upsert_embeddings(embedding_upserts)
         return embedding_upserts
 
-    async def apply_post_commit_embeddings(self, upserts: list[_EmbeddingUpsert]) -> None:
+    async def apply_post_commit_embeddings(
+        self, upserts: list[_EmbeddingUpsert]
+    ) -> None:
         """Run post-commit embedding side effects for confirmed memories."""
         await self._upsert_embeddings(upserts)
 
@@ -168,6 +192,7 @@ class PendingConfirmationService:
     ) -> list[dict[str, Any]]:
         """Return safe pending-confirmation records for a host user UX."""
 
+        await self._transcript_rebuild_repository.require_user_available(user_id)
         markers = await self._pending_repository.list_pending_markers(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -188,10 +213,16 @@ class PendingConfirmationService:
     ) -> dict[str, Any]:
         """Confirm one pending memory using the normal consent transition."""
 
-        marker = await self._pending_repository.get_marker_for_memory(user_id, memory_id)
-        if marker is None:
-            raise ValueError("Pending confirmation not found")
         try:
+            if not self._connection.in_transaction:
+                await self._connection.execute("BEGIN IMMEDIATE")
+            await self._transcript_rebuild_repository.require_user_available(user_id)
+            marker = await self._pending_repository.get_marker_for_memory(
+                user_id,
+                memory_id,
+            )
+            if marker is None:
+                raise ValueError("Pending confirmation not found")
             upserts = await self._confirm_memories(
                 user_id=user_id,
                 memory_ids=[memory_id],
@@ -215,10 +246,16 @@ class PendingConfirmationService:
     ) -> dict[str, Any]:
         """Decline one pending memory using the normal consent transition."""
 
-        marker = await self._pending_repository.get_marker_for_memory(user_id, memory_id)
-        if marker is None:
-            raise ValueError("Pending confirmation not found")
         try:
+            if not self._connection.in_transaction:
+                await self._connection.execute("BEGIN IMMEDIATE")
+            await self._transcript_rebuild_repository.require_user_available(user_id)
+            marker = await self._pending_repository.get_marker_for_memory(
+                user_id,
+                memory_id,
+            )
+            if marker is None:
+                raise ValueError("Pending confirmation not found")
             await self._deny_memories(
                 user_id=user_id,
                 memory_ids=[memory_id],
@@ -244,7 +281,9 @@ class PendingConfirmationService:
             "label": safe_confirmation_label(marker.get("index_text"), category),
             "created_at": str(marker["created_at"]),
             "asked_at": marker.get("asked_at"),
-            "confirmation_asked_once": bool(int(marker.get("confirmation_asked_once") or 0)),
+            "confirmation_asked_once": bool(
+                int(marker.get("confirmation_asked_once") or 0)
+            ),
             "user_persona_id": marker.get("user_persona_id"),
             "platform_id": marker.get("platform_id"),
             "character_id": marker.get("character_id"),
@@ -328,7 +367,9 @@ class PendingConfirmationService:
         user_id: str,
         memory_ids: list[str],
     ) -> list[str]:
-        memories = await self._memory_repository.list_memory_objects_by_ids(user_id, memory_ids)
+        memories = await self._memory_repository.list_memory_objects_by_ids(
+            user_id, memory_ids
+        )
         by_id = {str(memory["id"]): memory for memory in memories}
         labels: list[str] = []
         for memory_id in memory_ids:
@@ -365,7 +406,9 @@ class PendingConfirmationService:
         embedding_upserts: list[_EmbeddingUpsert] = []
         profile_user_persona_ids: set[str | None] = set()
         for memory_id in memory_ids:
-            marker = await self._pending_repository.get_marker_for_memory(user_id, memory_id)
+            marker = await self._pending_repository.get_marker_for_memory(
+                user_id, memory_id
+            )
             if marker is None:
                 continue
             profile_user_persona_ids.add(self._marker_persona(marker))
@@ -414,7 +457,9 @@ class PendingConfirmationService:
                     canonical_text=str(updated["canonical_text"]),
                     index_text=updated.get("index_text"),
                     privacy_level=int(updated["privacy_level"]),
-                    intimacy_boundary=str(updated.get("intimacy_boundary") or "ordinary"),
+                    intimacy_boundary=str(
+                        updated.get("intimacy_boundary") or "ordinary"
+                    ),
                     preserve_verbatim=bool(int(updated["preserve_verbatim"])),
                     user_id=str(updated["user_id"]),
                     object_type=str(updated["object_type"]),
@@ -450,9 +495,9 @@ class PendingConfirmationService:
             marker_value = marker.get(marker_key)
             if marker_value is not None and marker_value != memory_value:
                 return False
-        if marker.get("intended_scope") == "chat" and marker.get("conversation_id") != memory.get(
+        if marker.get("intended_scope") == "chat" and marker.get(
             "conversation_id"
-        ):
+        ) != memory.get("conversation_id"):
             return False
         if bool(int(marker.get("platform_locked") or 0)) and not bool(
             int(memory.get("platform_locked") or 0)
@@ -465,7 +510,9 @@ class PendingConfirmationService:
         marker: dict[str, Any],
         memory: dict[str, Any],
     ) -> bool:
-        active_user = await self._user_repository.get_active_user(str(memory["user_id"]))
+        active_user = await self._user_repository.get_active_user(
+            str(memory["user_id"])
+        )
         if active_user is None:
             return False
         conversation_id = str(marker.get("conversation_id") or "")
@@ -473,7 +520,10 @@ class PendingConfirmationService:
             conversation_id,
             str(memory["user_id"]),
         )
-        if conversation is None or str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
+        if (
+            conversation is None
+            or str(conversation.get("status")) != ConversationStatus.ACTIVE.value
+        ):
             return False
         source_chat_only = (
             bool(int(marker.get("incognito_snapshot") or 0))
@@ -493,13 +543,16 @@ class PendingConfirmationService:
             scope = "chat"
         if source_chat_only or current_chat_only:
             return scope == "chat" and memory.get("conversation_id") == conversation_id
-        source_platform_locked = (
-            bool(int(marker.get("platform_locked") or 0))
-            or not bool(int(marker.get("remember_across_devices_snapshot") or 1))
-        )
+        source_platform_locked = bool(
+            int(marker.get("platform_locked") or 0)
+        ) or not bool(int(marker.get("remember_across_devices_snapshot") or 1))
         current_platform_locked = not bool(active_user["remember_across_devices"])
         if source_platform_locked or current_platform_locked:
-            platform_id = str(conversation.get("platform_id") or marker.get("platform_id") or "default")
+            platform_id = str(
+                conversation.get("platform_id")
+                or marker.get("platform_id")
+                or "default"
+            )
             if not bool(memory.get("platform_locked")):
                 return False
             return memory.get("platform_id_lock") == platform_id
@@ -515,7 +568,9 @@ class PendingConfirmationService:
         declined_count = 0
         profile_user_persona_ids: set[str | None] = set()
         for memory_id in memory_ids:
-            marker = await self._pending_repository.get_marker_for_memory(user_id, memory_id)
+            marker = await self._pending_repository.get_marker_for_memory(
+                user_id, memory_id
+            )
             if marker is not None:
                 profile_user_persona_ids.add(self._marker_persona(marker))
             updated = await self._memory_repository.update_memory_object_status(
@@ -554,8 +609,12 @@ class PendingConfirmationService:
             category,
             user_persona_id=user_persona_id,
         )
-        confirmed_count = int(profile.get("confirmed_count", 0)) if profile is not None else 0
-        declined_count = int(profile.get("declined_count", 0)) if profile is not None else 0
+        confirmed_count = (
+            int(profile.get("confirmed_count", 0)) if profile is not None else 0
+        )
+        declined_count = (
+            int(profile.get("declined_count", 0)) if profile is not None else 0
+        )
         timestamp = self._clock.now().isoformat()
         await self._consent_repository.upsert_profile(
             user_id=user_id,
@@ -563,8 +622,16 @@ class PendingConfirmationService:
             confirmed_count=confirmed_count + confirmed_delta,
             declined_count=declined_count + declined_delta,
             user_persona_id=user_persona_id,
-            last_confirmed_at=timestamp if confirmed_delta > 0 else profile.get("last_confirmed_at") if profile else None,
-            last_declined_at=timestamp if declined_delta > 0 else profile.get("last_declined_at") if profile else None,
+            last_confirmed_at=timestamp
+            if confirmed_delta > 0
+            else profile.get("last_confirmed_at")
+            if profile
+            else None,
+            last_declined_at=timestamp
+            if declined_delta > 0
+            else profile.get("last_declined_at")
+            if profile
+            else None,
             commit=False,
         )
 

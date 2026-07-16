@@ -57,21 +57,8 @@ def _repo_root() -> Path | None:
     return None
 
 
-def _repo_resource_path(name: str) -> Path | None:
-    repo_root = _repo_root()
-    if repo_root is None:
-        return None
-    candidate = repo_root / name
-    if candidate.exists():
-        return candidate
-    return None
-
-
 def default_resource_path(name: str) -> str:
-    """Return a repo resource path, falling back to packaged resources."""
-    repo_path = _repo_resource_path(name)
-    if repo_path is not None:
-        return str(repo_path)
+    """Return the single canonical packaged resource directory."""
     return str(Path(__file__).resolve().parents[1] / "resources" / name)
 
 
@@ -92,9 +79,6 @@ def configured_resource_path(name: str, configured: str | None) -> str:
         repo_relative = repo_root / path
         if repo_relative.exists():
             return str(repo_relative)
-
-    if path == Path(name) or path.as_posix().lstrip("./") == name:
-        return default_resource_path(name)
 
     return str(path)
 
@@ -220,6 +204,15 @@ class Settings:
     worker_transient_defer_max_seconds: float = 300.0
     worker_transient_defer_max_count: int = 12
     worker_transient_defer_max_age_seconds: float = 3600.0
+    worker_retry_backoff_initial_seconds: float = 1.0
+    worker_retry_backoff_max_seconds: float = 30.0
+    worker_dispatch_visibility_seconds: float = 30.0
+    worker_dispatch_sweep_interval_seconds: float = 0.5
+    worker_dispatch_batch_size: int = 100
+    worker_execution_lease_seconds: float = 120.0
+    worker_execution_heartbeat_seconds: float = 30.0
+    worker_stream_reclaim_idle_seconds: float = 120.0
+    service_process_count: int = 1
     llm_run_guard_enabled: bool = True
     llm_run_guard_mode: str = "enforce"
     llm_run_guard_max_total_calls: int | None = None
@@ -272,11 +265,11 @@ class Settings:
         DEFAULT_STRUCTURED_OUTPUT_RESCUE_MODEL
     )
     llm_debug_io_enabled: bool = False
-    llm_debug_io_dir: str = "./docs/tmp/llm_debug"
+    llm_debug_io_dir: str = "./data/llm_debug"
     llm_debug_io_purposes: tuple[str, ...] = ()
     llm_debug_io_raw: bool = False
     llm_debug_io_max_chars: int = 50_000
-    operational_profiles_path: str = "./operational_profiles"
+    operational_profiles_path: str = default_resource_path("operational_profiles")
     artifact_blob_storage_kind: str = "sqlite_blob"
     artifact_blob_storage_path: str = "./data/artifact_blobs"
     allow_admin_export_anonymization: bool = False
@@ -367,7 +360,7 @@ class Settings:
     answer_postcondition_guard_enabled: bool = False
     answer_postcondition_retry_max_output_tokens: int = 8192
     recent_transcript_budget_tokens: int | None = None
-    context_envelope_budget_tokens: int = 4096
+    context_envelope_budget_tokens: int = 8192
     context_envelope_ratios: dict[str, float] = field(
         default_factory=lambda: dict(CONTEXT_ENVELOPE_DEFAULT_RATIOS)
     )
@@ -398,6 +391,13 @@ class Settings:
     openai_proxy_model_id: str = "atagia-memory-proxy"
     openai_proxy_upstream_model: str | None = None
     openai_proxy_default_mode: str | None = None
+    openai_proxy_max_output_tokens: int = 8192
+    request_max_body_bytes: int = 32 * 1024 * 1024
+    request_max_message_text_bytes: int = 256 * 1024
+    request_max_attachments: int = 16
+    request_max_attachment_decoded_bytes: int = 10 * 1024 * 1024
+    request_max_attachments_decoded_bytes: int = 20 * 1024 * 1024
+    request_max_metadata_bytes: int = 64 * 1024
     cors_allowed_origins: tuple[str, ...] = ()
     llm_technical_recovery_enabled: bool = True
     llm_output_limit_retry_attempts: int = 1
@@ -415,6 +415,25 @@ class Settings:
     def __post_init__(self) -> None:
         if not self.openai_proxy_model_id.strip():
             raise ValueError("openai_proxy_model_id cannot be blank")
+        for field_name in (
+            "openai_proxy_max_output_tokens",
+            "request_max_body_bytes",
+            "request_max_message_text_bytes",
+            "request_max_attachments",
+            "request_max_attachment_decoded_bytes",
+            "request_max_attachments_decoded_bytes",
+            "request_max_metadata_bytes",
+        ):
+            if int(getattr(self, field_name)) <= 0:
+                raise ValueError(f"{field_name} must be positive")
+        if (
+            self.request_max_attachments_decoded_bytes
+            < self.request_max_attachment_decoded_bytes
+        ):
+            raise ValueError(
+                "request_max_attachments_decoded_bytes must be >= "
+                "request_max_attachment_decoded_bytes"
+            )
         if self.context_cache_min_ttl_seconds <= 0:
             raise ValueError("context_cache_min_ttl_seconds must be positive")
         if self.worker_circuit_breaker_failure_threshold <= 0:
@@ -439,6 +458,36 @@ class Settings:
             raise ValueError("worker_transient_defer_max_count must be positive")
         if self.worker_transient_defer_max_age_seconds <= 0:
             raise ValueError("worker_transient_defer_max_age_seconds must be positive")
+        if self.worker_retry_backoff_initial_seconds <= 0:
+            raise ValueError("worker_retry_backoff_initial_seconds must be positive")
+        if self.worker_retry_backoff_max_seconds < self.worker_retry_backoff_initial_seconds:
+            raise ValueError(
+                "worker_retry_backoff_max_seconds must be >= worker_retry_backoff_initial_seconds"
+            )
+        if self.worker_dispatch_visibility_seconds <= 0:
+            raise ValueError("worker_dispatch_visibility_seconds must be positive")
+        if self.worker_dispatch_sweep_interval_seconds <= 0:
+            raise ValueError("worker_dispatch_sweep_interval_seconds must be positive")
+        if self.worker_dispatch_batch_size <= 0:
+            raise ValueError("worker_dispatch_batch_size must be positive")
+        if self.worker_execution_lease_seconds <= 0:
+            raise ValueError("worker_execution_lease_seconds must be positive")
+        if self.worker_execution_heartbeat_seconds <= 0:
+            raise ValueError("worker_execution_heartbeat_seconds must be positive")
+        if self.worker_execution_heartbeat_seconds >= self.worker_execution_lease_seconds:
+            raise ValueError(
+                "worker_execution_heartbeat_seconds must be shorter than worker_execution_lease_seconds"
+            )
+        if self.worker_stream_reclaim_idle_seconds < self.worker_dispatch_visibility_seconds:
+            raise ValueError(
+                "worker_stream_reclaim_idle_seconds must be >= worker_dispatch_visibility_seconds"
+            )
+        if self.service_process_count <= 0:
+            raise ValueError("service_process_count must be positive")
+        if self.storage_backend == "inprocess" and self.service_process_count != 1:
+            raise ValueError(
+                "storage_backend=inprocess supports exactly one service process; use Redis for multi-process deployments"
+            )
         if self.llm_run_guard_mode not in {"off", "audit", "enforce"}:
             raise ValueError("llm_run_guard_mode must be one of: off, audit, enforce")
         for field_name in (
@@ -663,14 +712,14 @@ class Settings:
             raise ValueError("llm_debug_io_max_chars must be non-negative")
         if self.artifact_blob_storage_kind not in {"sqlite_blob", "local_file"}:
             raise ValueError(
-                "artifact_blob_storage_kind must be 'sqlite_blob' or 'local_file'"
+                "artifact_blob_storage_kind must be 'sqlite_blob'"
             )
         if (
             self.artifact_blob_storage_kind == "local_file"
             and not self.artifact_blob_storage_path.strip()
         ):
             raise ValueError(
-                "artifact_blob_storage_path is required for local_file artifact storage"
+                "artifact_blob_storage_path is required to migrate legacy local_file artifacts"
             )
         if not 0.0 <= self.small_corpus_token_threshold_ratio <= 1.0:
             raise ValueError(
@@ -864,7 +913,7 @@ class Settings:
             llm_debug_io_enabled=_env_bool("ATAGIA_DEBUG_LLM_IO", False),
             llm_debug_io_dir=os.getenv(
                 "ATAGIA_DEBUG_LLM_IO_DIR",
-                "./docs/tmp/llm_debug",
+                "./data/llm_debug",
             ),
             llm_debug_io_purposes=_env_csv_tuple("ATAGIA_DEBUG_LLM_IO_PURPOSES", ()),
             llm_debug_io_raw=_env_bool("ATAGIA_DEBUG_LLM_IO_RAW", False),
@@ -904,6 +953,36 @@ class Settings:
             ),
             worker_transient_defer_max_age_seconds=float(
                 os.getenv("ATAGIA_WORKER_TRANSIENT_DEFER_MAX_AGE_SECONDS", "3600.0")
+            ),
+            worker_retry_backoff_initial_seconds=float(
+                os.getenv("ATAGIA_WORKER_RETRY_BACKOFF_INITIAL_SECONDS", "1.0")
+            ),
+            worker_retry_backoff_max_seconds=float(
+                os.getenv("ATAGIA_WORKER_RETRY_BACKOFF_MAX_SECONDS", "30.0")
+            ),
+            worker_dispatch_visibility_seconds=float(
+                os.getenv("ATAGIA_WORKER_DISPATCH_VISIBILITY_SECONDS", "30.0")
+            ),
+            worker_dispatch_sweep_interval_seconds=float(
+                os.getenv("ATAGIA_WORKER_DISPATCH_SWEEP_INTERVAL_SECONDS", "0.5")
+            ),
+            worker_dispatch_batch_size=int(
+                os.getenv("ATAGIA_WORKER_DISPATCH_BATCH_SIZE", "100")
+            ),
+            worker_execution_lease_seconds=float(
+                os.getenv("ATAGIA_WORKER_EXECUTION_LEASE_SECONDS", "120.0")
+            ),
+            worker_execution_heartbeat_seconds=float(
+                os.getenv("ATAGIA_WORKER_EXECUTION_HEARTBEAT_SECONDS", "30.0")
+            ),
+            worker_stream_reclaim_idle_seconds=float(
+                os.getenv("ATAGIA_WORKER_STREAM_RECLAIM_IDLE_SECONDS", "120.0")
+            ),
+            service_process_count=int(
+                os.getenv(
+                    "ATAGIA_SERVICE_PROCESS_COUNT",
+                    os.getenv("WEB_CONCURRENCY", "1"),
+                )
             ),
             llm_run_guard_enabled=_env_bool("ATAGIA_LLM_RUN_GUARD_ENABLED", True),
             llm_run_guard_mode=os.getenv("ATAGIA_LLM_RUN_GUARD_MODE", "enforce")
@@ -1269,7 +1348,7 @@ class Settings:
                 "ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS"
             ),
             context_envelope_budget_tokens=int(
-                os.getenv("ATAGIA_CONTEXT_ENVELOPE_BUDGET_TOKENS", "4096")
+                os.getenv("ATAGIA_CONTEXT_ENVELOPE_BUDGET_TOKENS", "8192")
             ),
             context_envelope_ratios=_env_ratio_mapping(
                 "ATAGIA_CONTEXT_ENVELOPE_RATIOS",
@@ -1327,6 +1406,33 @@ class Settings:
                 "ATAGIA_PROXY_UPSTREAM_MODEL"
             ),
             openai_proxy_default_mode=_env_optional_str("ATAGIA_PROXY_DEFAULT_MODE"),
+            openai_proxy_max_output_tokens=int(
+                os.getenv("ATAGIA_PROXY_MAX_OUTPUT_TOKENS", "8192")
+            ),
+            request_max_body_bytes=int(
+                os.getenv("ATAGIA_REQUEST_MAX_BODY_BYTES", str(32 * 1024 * 1024))
+            ),
+            request_max_message_text_bytes=int(
+                os.getenv("ATAGIA_REQUEST_MAX_MESSAGE_TEXT_BYTES", str(256 * 1024))
+            ),
+            request_max_attachments=int(
+                os.getenv("ATAGIA_REQUEST_MAX_ATTACHMENTS", "16")
+            ),
+            request_max_attachment_decoded_bytes=int(
+                os.getenv(
+                    "ATAGIA_REQUEST_MAX_ATTACHMENT_DECODED_BYTES",
+                    str(10 * 1024 * 1024),
+                )
+            ),
+            request_max_attachments_decoded_bytes=int(
+                os.getenv(
+                    "ATAGIA_REQUEST_MAX_ATTACHMENTS_DECODED_BYTES",
+                    str(20 * 1024 * 1024),
+                )
+            ),
+            request_max_metadata_bytes=int(
+                os.getenv("ATAGIA_REQUEST_MAX_METADATA_BYTES", str(64 * 1024))
+            ),
             cors_allowed_origins=_env_csv_tuple(
                 "ATAGIA_CORS_ALLOWED_ORIGINS",
                 (),

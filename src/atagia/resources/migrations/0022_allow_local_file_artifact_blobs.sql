@@ -1,5 +1,4 @@
 -- atagia:foreign_keys_off
-BEGIN;
 
 DROP INDEX IF EXISTS artifact_blobs_storage_idx;
 
@@ -42,5 +41,3 @@ ALTER TABLE artifact_blobs_new RENAME TO artifact_blobs;
 
 CREATE INDEX IF NOT EXISTS artifact_blobs_storage_idx
     ON artifact_blobs(storage_kind, storage_uri);
-
-COMMIT;

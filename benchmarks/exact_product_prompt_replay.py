@@ -21,7 +21,7 @@ from benchmarks.broad_list_coverage import (
 from benchmarks.fixed_context_answer_quality import AnswerProfile, parse_answer_profile
 from benchmarks.llm_metrics import summarize_llm_calls
 from benchmarks.trusted_eval import trusted_evaluation_prompt_note
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.services.chat_support import build_system_prompt
 from atagia.services.llm_client import LLMCompletionRequest, LLMMessage
@@ -266,7 +266,9 @@ def load_locomo_summary_cases(
 
 
 def _reconstruct_product_prompt(memory_block: str, *, trusted_evaluation: bool) -> str:
-    manifest = ManifestLoader(Path("manifests")).load_all()[_ASSISTANT_MODE_ID]
+    manifest = ManifestLoader(Path(default_resource_path("manifests"))).load_all()[
+        _ASSISTANT_MODE_ID
+    ]
     policy = PolicyResolver().resolve(manifest, None, None)
     prompt = build_system_prompt(
         _ASSISTANT_MODE_ID,

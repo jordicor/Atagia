@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 import aiosqlite
@@ -12,7 +14,13 @@ import pytest
 from atagia.core import json_utils
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
-from atagia.core.db_sqlite import initialize_database
+from atagia.core.db_sqlite import close_connection, initialize_database, open_connection
+from atagia.core.initial_context_package_revision_repository import (
+    InitialContextPackageRevisionRepository,
+)
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageSourceChangedError,
+)
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
@@ -24,7 +32,11 @@ from atagia.core.space_repository import SpaceRepository
 from atagia.core.summary_repository import SummaryRepository
 from atagia.core.topic_repository import TopicRepository
 from atagia.memory.context_composer import ContextComposer
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
+from atagia.memory.policy_manifest import (
+    ManifestLoader,
+    PolicyResolver,
+    sync_assistant_modes,
+)
 from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
@@ -49,12 +61,18 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
-async def _seed_runtime() -> tuple[aiosqlite.Connection, FrozenClock, Any]:
-    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+async def _seed_runtime(
+    database_path: str = ":memory:",
+) -> tuple[aiosqlite.Connection, FrozenClock, Any]:
+    connection = await initialize_database(database_path, MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 6, 8, 9, 0, tzinfo=timezone.utc))
     manifests = ManifestLoader(MANIFESTS_DIR).load_all()
     await sync_assistant_modes(connection, manifests, clock)
@@ -230,7 +248,416 @@ def _curator_with_provider(
 
 
 @pytest.mark.asyncio
-async def test_baseline_package_includes_visible_profile_with_sources_only_for_user() -> None:
+async def test_baseline_captures_source_before_reading_user_preferences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "icp-preference-capture.db")
+    connection, clock, resolved_policy = await _seed_runtime(database_path)
+    writer = await open_connection(database_path)
+    try:
+        builder = InitialContextPackageBuilder(connection, clock)
+        original_fetch = builder._fetch_user_preferences  # noqa: SLF001
+        preferences_read = asyncio.Event()
+        resume_build = asyncio.Event()
+
+        async def hold_old_preferences(user_id: str) -> dict[str, Any]:
+            preferences = await original_fetch(user_id)
+            assert preferences["remember_across_chats"] == 1
+            preferences_read.set()
+            await resume_build.wait()
+            return preferences
+
+        monkeypatch.setattr(builder, "_fetch_user_preferences", hold_old_preferences)
+        build_task = asyncio.create_task(
+            builder.build_baseline_package(
+                user_id="usr_1",
+                resolved_policy=resolved_policy,
+                assistant_mode_id="coding_debug",
+            )
+        )
+        await asyncio.wait_for(preferences_read.wait(), timeout=2)
+        await writer.execute(
+            "UPDATE users SET remember_across_chats = 0 WHERE id = ?",
+            ("usr_1",),
+        )
+        await writer.commit()
+        resume_build.set()
+
+        with pytest.raises(InitialContextPackageSourceChangedError):
+            await build_task
+        active = await (
+            await connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM initial_context_packages
+                WHERE user_id = ?
+                  AND package_kind = 'baseline'
+                  AND build_status = 'active'
+                """,
+                ("usr_1",),
+            )
+        ).fetchone()
+        assert active is not None
+        assert int(active["count"]) == 0
+    finally:
+        await close_connection(writer)
+        await close_connection(connection)
+
+
+@pytest.mark.asyncio
+async def test_conversation_build_refetches_stale_supplied_row_after_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "icp-stale-conversation-input.db")
+    connection, clock, resolved_policy = await _seed_runtime(database_path)
+    writer = await open_connection(database_path)
+    try:
+        stale_conversation = await ConversationRepository(
+            connection,
+            clock,
+        ).get_conversation("cnv_1", "usr_1")
+        assert stale_conversation is not None
+        assert not bool(stale_conversation["incognito"])
+        await ConversationRepository(writer, clock).set_conversation_incognito(
+            "cnv_1",
+            "usr_1",
+            True,
+        )
+
+        original_capture = (
+            InitialContextPackageRevisionRepository.capture_active_coordinates
+        )
+        coordinates_captured = asyncio.Event()
+        resume_build = asyncio.Event()
+
+        async def hold_after_capture(
+            repository: InitialContextPackageRevisionRepository,
+            **kwargs: Any,
+        ):
+            coordinates = await original_capture(repository, **kwargs)
+            if kwargs.get("conversation_id") == "cnv_1":
+                coordinates_captured.set()
+                await resume_build.wait()
+            return coordinates
+
+        monkeypatch.setattr(
+            InitialContextPackageRevisionRepository,
+            "capture_active_coordinates",
+            hold_after_capture,
+        )
+        build_task = asyncio.create_task(
+            InitialContextPackageBuilder(connection, clock).build_conversation_package(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                conversation=stale_conversation,
+                resolved_policy=resolved_policy,
+            )
+        )
+        await asyncio.wait_for(coordinates_captured.wait(), timeout=2)
+        resume_build.set()
+        package = await build_task
+
+        assert (
+            package.coordinate_signature_json.markers_json["lifecycle"]["incognito"]
+            is True
+        )
+        assert (
+            package.coordinate_signature_json.markers_json["conversation"]["incognito"]
+            == 1
+        )
+    finally:
+        await close_connection(writer)
+        await close_connection(connection)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("package_kind", ["baseline", "conversation"])
+async def test_unexpected_build_failure_terminalizes_attempt(
+    package_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, clock, resolved_policy = await _seed_runtime()
+    try:
+        builder = InitialContextPackageBuilder(connection, clock)
+
+        async def fail_after_attempt(**_: object) -> tuple[str, list[dict[str, Any]]]:
+            raise RuntimeError("forced post-attempt failure")
+
+        monkeypatch.setattr(builder, "_build_contract_block", fail_after_attempt)
+        with pytest.raises(RuntimeError, match="forced post-attempt failure"):
+            if package_kind == "baseline":
+                await builder.build_baseline_package(
+                    user_id="usr_1",
+                    resolved_policy=resolved_policy,
+                    assistant_mode_id="coding_debug",
+                    refresh_request_job_id="job_failed_baseline",
+                )
+            else:
+                await builder.build_conversation_package(
+                    user_id="usr_1",
+                    conversation_id="cnv_1",
+                    resolved_policy=resolved_policy,
+                    refresh_request_job_id="job_failed_conversation",
+                )
+
+        rows = await (
+            await connection.execute(
+                """
+                SELECT status, finished_at, diagnostics_json
+                FROM initial_context_package_build_attempts
+                WHERE user_id = ?
+                  AND conversation_id IS ?
+                """,
+                (
+                    "usr_1",
+                    None if package_kind == "baseline" else "cnv_1",
+                ),
+            )
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["finished_at"] is not None
+        assert json_utils.loads(rows[0]["diagnostics_json"]) == {
+            "error_class": "RuntimeError"
+        }
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_build_terminalizes_attempt_without_masking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, clock, resolved_policy = await _seed_runtime()
+    try:
+        builder = InitialContextPackageBuilder(connection, clock)
+
+        async def cancel_after_attempt(**_: object) -> tuple[str, list[dict[str, Any]]]:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(builder, "_build_contract_block", cancel_after_attempt)
+        with pytest.raises(asyncio.CancelledError):
+            await builder.build_baseline_package(
+                user_id="usr_1",
+                resolved_policy=resolved_policy,
+                assistant_mode_id="coding_debug",
+                refresh_request_job_id="job_cancelled_baseline",
+            )
+
+        row = await (
+            await connection.execute(
+                """
+                SELECT status, finished_at, diagnostics_json
+                FROM initial_context_package_build_attempts
+                WHERE user_id = ?
+                  AND conversation_id IS NULL
+                """,
+                ("usr_1",),
+            )
+        ).fetchone()
+        assert row is not None
+        assert row["status"] == "failed"
+        assert row["finished_at"] is not None
+        assert json_utils.loads(row["diagnostics_json"]) == {
+            "error_class": "CancelledError"
+        }
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_terminalization_failure_does_not_mask_primary_build_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, clock, resolved_policy = await _seed_runtime()
+    try:
+        builder = InitialContextPackageBuilder(connection, clock)
+
+        async def fail_after_attempt(**_: object) -> tuple[str, list[dict[str, Any]]]:
+            raise RuntimeError("primary build failure")
+
+        original_terminalize = InitialContextPackageRevisionRepository.fail_building_attempts_for_generation
+        terminalize_calls = 0
+
+        async def fail_second_terminalization(
+            repository: InitialContextPackageRevisionRepository,
+            **kwargs: Any,
+        ) -> int:
+            nonlocal terminalize_calls
+            terminalize_calls += 1
+            if terminalize_calls == 2:
+                raise sqlite3.OperationalError("terminalization is locked")
+            return await original_terminalize(repository, **kwargs)
+
+        monkeypatch.setattr(builder, "_build_contract_block", fail_after_attempt)
+        monkeypatch.setattr(
+            InitialContextPackageRevisionRepository,
+            "fail_building_attempts_for_generation",
+            fail_second_terminalization,
+        )
+        with pytest.raises(RuntimeError, match="primary build failure"):
+            await builder.build_baseline_package(
+                user_id="usr_1",
+                resolved_policy=resolved_policy,
+                assistant_mode_id="coding_debug",
+                refresh_request_job_id="job_primary_error",
+            )
+
+        attempt = await (
+            await connection.execute(
+                """
+                SELECT status, refresh_generation
+                FROM initial_context_package_build_attempts
+                WHERE user_id = ?
+                  AND conversation_id IS NULL
+                """,
+                ("usr_1",),
+            )
+        ).fetchone()
+        assert attempt is not None
+        assert attempt["status"] == "building"
+
+        recovered = await original_terminalize(
+            InitialContextPackageRevisionRepository(connection, clock),
+            user_id="usr_1",
+            conversation_id=None,
+            refresh_generation=int(attempt["refresh_generation"]),
+            error_class="DeferredTerminalization",
+        )
+        assert recovered == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_locked_activation_preserves_error_and_restart_closes_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "icp-activation-lock.db")
+    connection, clock, resolved_policy = await _seed_runtime(database_path)
+    locker = await open_connection(database_path)
+    reopened: aiosqlite.Connection | None = None
+    primary_closed = False
+    lock_held = False
+    try:
+        await connection.execute("PRAGMA busy_timeout = 0")
+        await locker.execute("PRAGMA busy_timeout = 0")
+        builder = InitialContextPackageBuilder(connection, clock)
+
+        async def lock_after_attempt(**_: object) -> tuple[str, list[dict[str, Any]]]:
+            nonlocal lock_held
+            await locker.execute("BEGIN IMMEDIATE")
+            lock_held = True
+            return "", []
+
+        monkeypatch.setattr(builder, "_build_contract_block", lock_after_attempt)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            await builder.build_baseline_package(
+                user_id="usr_1",
+                resolved_policy=resolved_policy,
+                assistant_mode_id="coding_debug",
+                refresh_request_job_id="job_locked_activation",
+            )
+
+        attempt = await (
+            await connection.execute(
+                """
+                SELECT status, refresh_generation
+                FROM initial_context_package_build_attempts
+                WHERE user_id = ?
+                  AND conversation_id IS NULL
+                """,
+                ("usr_1",),
+            )
+        ).fetchone()
+        assert attempt is not None
+        assert attempt["status"] == "building"
+        refresh_generation = int(attempt["refresh_generation"])
+
+        await locker.rollback()
+        lock_held = False
+        await close_connection(connection)
+        primary_closed = True
+        reopened = await open_connection(database_path)
+
+        recovered = await InitialContextPackageRevisionRepository(
+            reopened,
+            clock,
+        ).fail_abandoned_build_attempts()
+        assert recovered == 1
+
+        retry_package = await InitialContextPackageBuilder(
+            reopened,
+            clock,
+        ).build_baseline_package(
+            user_id="usr_1",
+            resolved_policy=resolved_policy,
+            assistant_mode_id="coding_debug",
+            refresh_generation=refresh_generation,
+            refresh_request_job_id="job_locked_activation_retry",
+        )
+        assert retry_package.refresh_generation == refresh_generation
+
+        rows = await (
+            await reopened.execute(
+                """
+                SELECT status, diagnostics_json
+                FROM initial_context_package_build_attempts
+                WHERE user_id = ?
+                  AND conversation_id IS NULL
+                ORDER BY created_at, attempt_id
+                """,
+                ("usr_1",),
+            )
+        ).fetchall()
+        assert sorted(row["status"] for row in rows) == ["activated", "failed"]
+        failed_row = next(row for row in rows if row["status"] == "failed")
+        assert json_utils.loads(failed_row["diagnostics_json"]) == {
+            "reason": "abandoned_attempt_recovery"
+        }
+        assert all(row["status"] != "building" for row in rows)
+    finally:
+        if lock_held:
+            await locker.rollback()
+        await close_connection(locker)
+        if reopened is not None:
+            await close_connection(reopened)
+        elif not primary_closed:
+            await close_connection(connection)
+
+
+@pytest.mark.asyncio
+async def test_contract_defaults_use_resolved_policy_without_hidden_sqlite_input() -> (
+    None
+):
+    connection, clock, resolved_policy = await _seed_runtime()
+    try:
+        overridden_policy = resolved_policy.model_copy(
+            update={"contract_dimensions_priority": ["runtime_override_dimension"]}
+        )
+        package = await InitialContextPackageBuilder(
+            connection,
+            clock,
+        ).build_baseline_package(
+            user_id="usr_1",
+            resolved_policy=overridden_policy,
+            assistant_mode_id="coding_debug",
+        )
+
+        assert package.blocks_json.contract_block == (
+            "[Interaction Contract]\n- runtime_override_dimension: default"
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_baseline_package_includes_visible_profile_with_sources_only_for_user() -> (
+    None
+):
     connection, clock, resolved_policy = await _seed_runtime()
     try:
         memory = await _create_belief(
@@ -270,7 +697,9 @@ async def test_baseline_package_includes_visible_profile_with_sources_only_for_u
         )
         await connection.commit()
 
-        package = await InitialContextPackageBuilder(connection, clock).build_baseline_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_baseline_package(
             user_id="usr_1",
             resolved_policy=resolved_policy,
             user_persona_id="persona_jordi",
@@ -368,21 +797,30 @@ async def test_conversation_package_includes_summary_topic_and_recent_seed() -> 
             source_id="msg_2",
         )
 
-        package = await InitialContextPackageBuilder(connection, clock).build_conversation_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_conversation_package(
             user_id="usr_1",
             conversation_id="cnv_1",
             resolved_policy=resolved_policy,
         )
 
-        assert "historical context only" in package.blocks_json.conversation_summary_block
-        assert "paquete inicial preparado" in package.blocks_json.conversation_summary_block
+        assert (
+            "historical context only" in package.blocks_json.conversation_summary_block
+        )
+        assert (
+            "paquete inicial preparado"
+            in package.blocks_json.conversation_summary_block
+        )
         assert "Initial package planning" in package.blocks_json.working_topic_block
         assert len(package.blocks_json.recent_verbatim_seed) == 2
         assert package.blocks_json.recent_verbatim_seed[0]["message_id"] == "msg_1"
         assert package.blocks_json.empty_markers["conversation_summary_empty"] is False
         assert package.blocks_json.empty_markers["working_topic_empty"] is False
         assert package.blocks_json.empty_markers["recent_verbatim_seed_empty"] is False
-        assert package.source_refs_json["conversation_summary"][0]["summary_id"] == "sum_1"
+        assert (
+            package.source_refs_json["conversation_summary"][0]["summary_id"] == "sum_1"
+        )
         assert package.source_refs_json["working_topic"][0]["topic_id"] == "tpc_1"
         assert "Private hidden topic" not in package.blocks_json.working_topic_block
         assert {
@@ -430,14 +868,22 @@ async def test_conversation_package_uses_space_boundary_mode_from_signature() ->
             space_boundary_mode=SpaceBoundaryMode.SEVERANCE.value,
         )
 
-        package = await InitialContextPackageBuilder(connection, clock).build_conversation_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_conversation_package(
             user_id="usr_1",
             conversation_id="cnv_severed",
             resolved_policy=resolved_policy,
         )
 
-        assert "Severed-space fact is visible" in package.blocks_json.prepared_memory_profile_block
-        assert "Unscoped fact must not cross" not in package.blocks_json.prepared_memory_profile_block
+        assert (
+            "Severed-space fact is visible"
+            in package.blocks_json.prepared_memory_profile_block
+        )
+        assert (
+            "Unscoped fact must not cross"
+            not in package.blocks_json.prepared_memory_profile_block
+        )
     finally:
         await connection.close()
 
@@ -473,7 +919,9 @@ async def test_baseline_without_platform_does_not_mix_persona_rows() -> None:
             workspace_id="wrk_1",
         )
 
-        package = await InitialContextPackageBuilder(connection, clock).build_baseline_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_baseline_package(
             user_id="usr_1",
             resolved_policy=resolved_policy,
             user_persona_id="persona_jordi",
@@ -482,8 +930,14 @@ async def test_baseline_without_platform_does_not_mix_persona_rows() -> None:
             workspace_id="wrk_1",
         )
 
-        assert "Persona Jordi fact is visible" in package.blocks_json.prepared_memory_profile_block
-        assert "Other persona fact" not in package.blocks_json.prepared_memory_profile_block
+        assert (
+            "Persona Jordi fact is visible"
+            in package.blocks_json.prepared_memory_profile_block
+        )
+        assert (
+            "Other persona fact"
+            not in package.blocks_json.prepared_memory_profile_block
+        )
         assert "Other character in same workspace" not in (
             package.blocks_json.prepared_memory_profile_block
         )
@@ -495,13 +949,17 @@ async def test_baseline_without_platform_does_not_mix_persona_rows() -> None:
 async def test_empty_conversation_package_marks_same_chat_sections_empty() -> None:
     connection, clock, resolved_policy = await _seed_runtime()
     try:
-        package = await InitialContextPackageBuilder(connection, clock).build_conversation_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_conversation_package(
             user_id="usr_1",
             conversation_id="cnv_empty",
             resolved_policy=resolved_policy,
         )
 
-        assert package.blocks_json.empty_markers["same_chat_history_known_empty"] is True
+        assert (
+            package.blocks_json.empty_markers["same_chat_history_known_empty"] is True
+        )
         assert package.blocks_json.empty_markers["conversation_summary_empty"] is True
         assert package.blocks_json.empty_markers["working_topic_empty"] is True
         assert package.blocks_json.empty_markers["recent_verbatim_seed_empty"] is True
@@ -650,7 +1108,10 @@ async def test_package_curation_is_stored_inside_signed_blocks_with_sources() ->
         assert package.blocks_json.curated_items
         assert "trust repair" in package.blocks_json.curated_orientation_block
         assert package.blocks_json.source_counts["curated_items"] == 1
-        assert package.source_refs_json["curated_orientation"][0]["memory_id"] == "mem_pivotal"
+        assert (
+            package.source_refs_json["curated_orientation"][0]["memory_id"]
+            == "mem_pivotal"
+        )
         assert package.diagnostics_json.selected_curated_items == 1
         assert package.diagnostics_json.warnings == []
         assert package.build_status.value == "active"
@@ -749,7 +1210,9 @@ async def test_package_curation_skips_recent_seed_marked_skip_by_default() -> No
 
 
 @pytest.mark.asyncio
-async def test_package_curation_prompt_preserves_ambiguity_and_old_emotional_state() -> None:
+async def test_package_curation_prompt_preserves_ambiguity_and_old_emotional_state() -> (
+    None
+):
     curator, provider = _curator_with_provider(
         {
             "items": [],
@@ -767,7 +1230,9 @@ async def test_package_curation_prompt_preserves_ambiguity_and_old_emotional_sta
                 item_id="memory:mem_current",
                 text="The user is unsure whether they like the tool.",
                 reason_category="preference_state",
-                source_refs=[{"source_kind": "memory_object", "memory_id": "mem_current"}],
+                source_refs=[
+                    {"source_kind": "memory_object", "memory_id": "mem_current"}
+                ],
                 status="ambiguous",
                 salience=0.8,
             )
@@ -790,7 +1255,9 @@ async def test_package_curation_prompt_preserves_ambiguity_and_old_emotional_sta
 
 
 @pytest.mark.asyncio
-async def test_package_curation_does_not_promote_noncurrent_sources_to_current() -> None:
+async def test_package_curation_does_not_promote_noncurrent_sources_to_current() -> (
+    None
+):
     curator = _curator(
         {
             "items": [
@@ -928,7 +1395,9 @@ async def test_package_curation_can_exclude_recent_seed_from_curation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_profile_includes_recent_superseded_and_historical_items_with_status() -> None:
+async def test_profile_includes_recent_superseded_and_historical_items_with_status() -> (
+    None
+):
     connection, clock, resolved_policy = await _seed_runtime()
     try:
         await _create_belief(
@@ -956,7 +1425,9 @@ async def test_profile_includes_recent_superseded_and_historical_items_with_stat
             vitality=0.7,
         )
 
-        package = await InitialContextPackageBuilder(connection, clock).build_baseline_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_baseline_package(
             user_id="usr_1",
             resolved_policy=resolved_policy,
             user_persona_id="persona_jordi",
@@ -965,7 +1436,9 @@ async def test_profile_includes_recent_superseded_and_historical_items_with_stat
             workspace_id="wrk_1",
         )
 
-        statuses = {item.item_id: item.status for item in package.blocks_json.profile_items}
+        statuses = {
+            item.item_id: item.status for item in package.blocks_json.profile_items
+        }
         assert statuses["memory:mem_current"] == "current"
         assert statuses["memory:mem_superseded"] == "superseded"
         assert statuses["memory:mem_historical"] == "historical"
@@ -1002,7 +1475,9 @@ async def test_profile_db_lifecycle_status_overrides_payload_current_hint() -> N
             vitality=0.8,
         )
 
-        package = await InitialContextPackageBuilder(connection, clock).build_baseline_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_baseline_package(
             user_id="usr_1",
             resolved_policy=resolved_policy,
             user_persona_id="persona_jordi",
@@ -1011,7 +1486,9 @@ async def test_profile_db_lifecycle_status_overrides_payload_current_hint() -> N
             workspace_id="wrk_1",
         )
 
-        statuses = {item.item_id: item.status for item in package.blocks_json.profile_items}
+        statuses = {
+            item.item_id: item.status for item in package.blocks_json.profile_items
+        }
         assert statuses["memory:mem_superseded_payload_current"] == "superseded"
         assert statuses["memory:mem_historical_payload_current"] == "historical"
         assert "[superseded] The user was angry" in (
@@ -1025,7 +1502,9 @@ async def test_profile_db_lifecycle_status_overrides_payload_current_hint() -> N
 
 
 @pytest.mark.asyncio
-async def test_profile_reserves_review_required_items_as_ambiguous_when_active_rows_saturate() -> None:
+async def test_profile_reserves_review_required_items_as_ambiguous_when_active_rows_saturate() -> (
+    None
+):
     connection, clock, resolved_policy = await _seed_runtime()
     try:
         for index in range(13):
@@ -1049,7 +1528,9 @@ async def test_profile_reserves_review_required_items_as_ambiguous_when_active_r
             confidence=0.9,
         )
 
-        package = await InitialContextPackageBuilder(connection, clock).build_baseline_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_baseline_package(
             user_id="usr_1",
             resolved_policy=resolved_policy,
             user_persona_id="persona_jordi",
@@ -1058,7 +1539,9 @@ async def test_profile_reserves_review_required_items_as_ambiguous_when_active_r
             workspace_id="wrk_1",
         )
 
-        statuses = {item.item_id: item.status for item in package.blocks_json.profile_items}
+        statuses = {
+            item.item_id: item.status for item in package.blocks_json.profile_items
+        }
         assert statuses["memory:mem_review_required"] == "ambiguous"
         assert "[ambiguous] The user's preference for the tool is under review" in (
             package.blocks_json.prepared_memory_profile_block
@@ -1079,7 +1562,9 @@ async def test_profile_marks_high_tension_active_items_as_ambiguous() -> None:
             tension_score=0.9,
         )
 
-        package = await InitialContextPackageBuilder(connection, clock).build_baseline_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_baseline_package(
             user_id="usr_1",
             resolved_policy=resolved_policy,
             user_persona_id="persona_jordi",
@@ -1088,7 +1573,9 @@ async def test_profile_marks_high_tension_active_items_as_ambiguous() -> None:
             workspace_id="wrk_1",
         )
 
-        statuses = {item.item_id: item.status for item in package.blocks_json.profile_items}
+        statuses = {
+            item.item_id: item.status for item in package.blocks_json.profile_items
+        }
         assert statuses["memory:mem_tense_active"] == "ambiguous"
         assert "[ambiguous] The user may or may not want verbose explanations" in (
             package.blocks_json.prepared_memory_profile_block
@@ -1098,7 +1585,9 @@ async def test_profile_marks_high_tension_active_items_as_ambiguous() -> None:
 
 
 @pytest.mark.asyncio
-async def test_profile_reserves_slots_for_historical_items_when_active_rows_saturate() -> None:
+async def test_profile_reserves_slots_for_historical_items_when_active_rows_saturate() -> (
+    None
+):
     connection, clock, resolved_policy = await _seed_runtime()
     try:
         for index in range(13):
@@ -1122,7 +1611,9 @@ async def test_profile_reserves_slots_for_historical_items_when_active_rows_satu
             confidence=0.9,
         )
 
-        package = await InitialContextPackageBuilder(connection, clock).build_baseline_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_baseline_package(
             user_id="usr_1",
             resolved_policy=resolved_policy,
             user_persona_id="persona_jordi",
@@ -1168,7 +1659,9 @@ async def test_profile_does_not_reserve_old_low_signal_superseded_items() -> Non
             confidence=0.9,
         )
 
-        package = await InitialContextPackageBuilder(connection, clock).build_baseline_package(
+        package = await InitialContextPackageBuilder(
+            connection, clock
+        ).build_baseline_package(
             user_id="usr_1",
             resolved_policy=resolved_policy,
             user_persona_id="persona_jordi",

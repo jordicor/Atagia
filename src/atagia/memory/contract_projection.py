@@ -106,6 +106,8 @@ Rules:
 - The dimension_name field is open-ended text, not a fixed enum.
 - Prefer the priority dimensions when relevant, but capture another dimension if it is explicitly expressed.
 - Keep canonical_text concise and grounded in the source message.
+- Give every canonical_text an explicit subject. If it keeps a quote, keep who
+  said it inside canonical_text; never store a bare quote with no speaker.
 - For every signal, set `language_codes` to the ISO 639-1 code(s) of the
   language actually used in its `canonical_text`. Do not translate it.
 - Set nothing_durable=true when the message contains no usable contract signal.

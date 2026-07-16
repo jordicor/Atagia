@@ -26,12 +26,15 @@ class JobType(str, Enum):
     SYNC_GRAPH = "sync_graph"
     RUN_EVALUATION = "run_evaluation"
     REFRESH_INITIAL_CONTEXT_PACKAGE = "refresh_initial_context_package"
+    REBUILD_SELECTED_TRANSCRIPT = "rebuild_selected_transcript"
 
 
 class JobRunStatus(str, Enum):
     QUEUED = "queued"
+    AWAITING_CLAIM = "awaiting_claim"
     RUNNING = "running"
     RETRYING = "retrying"
+    DEFERRED = "deferred"
     SUCCEEDED = "succeeded"
     SKIPPED = "skipped"
     FAILED = "failed"
@@ -62,6 +65,7 @@ class InitialContextPackageRefreshReason(str, Enum):
     BACKFILL = "backfill"
     ADMIN_REBUILD = "admin_rebuild"
     COORDINATE_CHANGE = "coordinate_change"
+    SOURCE_CHANGED = "source_changed"
 
 
 class JobEnvelope(BaseModel):
@@ -69,11 +73,15 @@ class JobEnvelope(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: Literal[1] = 1
     job_id: str
     job_type: JobType
     user_id: str
+    parent_job_id: str | None = None
     conversation_id: str | None = None
     message_ids: list[str] = Field(default_factory=list)
+    transcript_rebuild_id: str | None = None
+    maintenance_operation_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime | None = None
     operational_profile: OperationalProfileSnapshot | None = None
@@ -87,6 +95,31 @@ class StreamMessage(BaseModel):
     message_id: str
     payload: dict[str, Any]
     delivery_count: int = 1
+
+
+class DurableJobNotification(BaseModel):
+    """Content-free transient wake-up for a durable worker job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    dispatch_token: str = Field(min_length=1)
+    lifecycle_epoch: str = Field(min_length=1)
+    lifecycle_cleanup_key: str = Field(min_length=1)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedJob:
+    """Durable envelope and ownership fence granted to one worker."""
+
+    notification_message_id: str
+    envelope: JobEnvelope
+    owner_id: str
+    attempt_count: int
+    execution_fence: int
+    lifecycle_epoch: str
+    lifecycle_cleanup_key: str
+    derivation_revision: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,7 +225,9 @@ COMPACT_STREAM_NAME = "atagia:compact"
 GRAPH_STREAM_NAME = "atagia:graph"
 EVALUATION_STREAM_NAME = "atagia:evaluate"
 INITIAL_CONTEXT_PACKAGE_STREAM_NAME = "atagia:initial_context_package"
+TRANSCRIPT_REBUILD_STREAM_NAME = "atagia:transcript_rebuild"
 WORKER_GROUP_NAME = "atagia-workers"
+INTERNAL_SYSTEM_USER_ID = "atagia_system"
 
 
 class RevisionJobPayload(BaseModel):
@@ -257,6 +292,7 @@ class CompactionJobPayload(BaseModel):
     valid_to: str | None = None
     privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
     job_kind: CompactionJobKind
+    force_rebuild: bool = False
 
 
 class InitialContextPackageRefreshJobPayload(BaseModel):
@@ -269,6 +305,8 @@ class InitialContextPackageRefreshJobPayload(BaseModel):
     package_kind: Literal["all", "baseline", "conversation"] = "all"
     retrieval_profile_id: str | None = None
     reason: InitialContextPackageRefreshReason
+    refresh_generation: int = Field(ge=1)
+    refresh_dedupe_key: str = Field(min_length=1)
     source_message_ids: list[str] = Field(default_factory=list)
     privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
 

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from atagia.core.clock import FrozenClock
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 from atagia.memory.consequence_detector import (
     ConsequenceDetector,
     _CARD_PURPOSES,
@@ -69,8 +69,8 @@ class QueueProvider(LLMProvider):
 def _settings(**overrides: Any) -> Settings:
     values: dict[str, Any] = {
         "sqlite_path": ":memory:",
-        "migrations_path": "migrations",
-        "manifests_path": "manifests",
+        "migrations_path": default_resource_path("migrations"),
+        "manifests_path": default_resource_path("manifests"),
         "storage_backend": "inprocess",
         "redis_url": "redis://localhost:6379/0",
         "openai_api_key": "test-openai-key",
@@ -476,8 +476,8 @@ def test_consequence_signal_accepts_nullable_non_consequence_fields() -> None:
 def test_consequence_card_prompts_do_not_leak_shadow_benchmark_content() -> None:
     # The consequence cards have their own shadow benchmark; their examples must
     # not reuse a benchmark case message or distinctive answer token, so the
-    # benchmark keeps measuring generalization (the 2026-06-19 review found the
-    # original 'Perfecto, that worked' example was a trimmed benchmark case).
+    # benchmark keeps measuring generalization instead of recalling its own
+    # cases.
     prompt = "\n".join(
         _card_task(card_name, include_examples=True) for card_name in _CARD_PURPOSES
     )

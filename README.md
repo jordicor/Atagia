@@ -319,10 +319,17 @@ atagia-api --host 127.0.0.1 --port 8100 --reload
 ```
 
 Service mode requires `ATAGIA_SERVICE_MODE=true` and `ATAGIA_SERVICE_API_KEY`.
-Core routes cover users, conversations, chat replies, sidecar context, message
-ingestion, memory feedback and edits, conversation lifecycle, and erasure. The
-full route list including admin endpoints is in
+The service key is a shared server-side credential and must not be exposed to
+browser code or another untrusted client; trusted callers carry user identity
+separately. Core routes cover users, conversations, chat replies, sidecar
+context, message ingestion, memory feedback and edits, conversation lifecycle,
+and erasure. The full route list including admin endpoints is in
 [docs/API.md](docs/API.md).
+
+Deployments can constrain the wheel to the exact Python 3.12 or 3.13 resolutions
+used by the dependency-profile gates. The profile names, install commands,
+audit evidence, and lock regeneration procedure are documented in
+[requirements/README.md](requirements/README.md).
 
 ### Configuration
 

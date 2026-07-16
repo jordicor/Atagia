@@ -6,6 +6,7 @@ from typing import Any
 
 import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from starlette.concurrency import run_in_threadpool
 
 from atagia.api.dependencies import (
     AuthContext,
@@ -14,8 +15,10 @@ from atagia.api.dependencies import (
     get_clock,
     get_connection,
     get_runtime,
+    ordinary_http_authority_context,
 )
 from atagia.api.namespace_context import require_route_namespace_context
+from atagia.api.path_ids import TransportIdRoute
 from atagia.core.clock import Clock
 from atagia.core.mind_repository import MindNotFoundError
 from atagia.core.repositories import (
@@ -42,12 +45,15 @@ from atagia.models.schemas_api import (
     MemoryProcessingStatus,
     PendingMemoryConfirmationActionResponse,
     PendingMemoryConfirmationListResponse,
+    ReplaceSelectedTranscriptRequest,
+    RetrySelectedTranscriptRequest,
     SaveFromIncognitoRequest,
     SaveFromIncognitoResponse,
     SidecarAddResponseRequest,
     SidecarContextRequest,
     SidecarIngestMessageRequest,
     SidecarMutationResponse,
+    SelectedTranscriptRebuildResponse,
     UpdateMemoryPreferencesRequest,
 )
 from atagia.models.schemas_memory import MemoryCategory
@@ -56,7 +62,6 @@ from atagia.memory.operational_profile import (
     UnknownOperationalProfileError,
 )
 from atagia.services.chat_service import ChatService
-from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.errors import (
     AssistantModeMismatchError,
     ConversationAlreadyClosedError,
@@ -66,9 +71,14 @@ from atagia.services.errors import (
     InvalidConversationTransitionError,
     LLMUnavailableError,
     MessageIdConflictError,
+    MemoryProvenanceRepairRequiredError,
     SourceSequenceConflictError,
+    TranscriptRebuildUnavailableError,
+    TranscriptSelectionConflictError,
     UnknownAssistantModeError,
     UserDeletedError,
+    UserErasureCleanupPendingError,
+    UserErasureReconciliationRequiredError,
     WorkspaceMismatchError,
     WorkspaceNotFoundError,
 )
@@ -76,19 +86,20 @@ from atagia.services.lifecycle_service import ConversationLifecycleService
 from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.confirmation_service import PendingConfirmationService
 from atagia.services.sidecar_service import SidecarService
-from atagia.transport_ids import decode_path_id
+from atagia.services.selected_transcript_service import SelectedTranscriptService
+from atagia.services.request_controls import (
+    ResolvedMemoryScopeControls,
+    reject_remote_authority_claims,
+    resolve_memory_scope_controls,
+)
+from atagia.services.request_budgets import (
+    RequestBudgetExceededError,
+    RequestBudgetLimits,
+    RequestPayloadStructureError,
+    validate_direct_message_request_budget,
+)
 
-router = APIRouter(prefix="/v1", tags=["chat"])
-
-
-def _route_id(value: str) -> str:
-    try:
-        return decode_path_id(value)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
+router = APIRouter(prefix="/v1", tags=["chat"], route_class=TransportIdRoute)
 
 
 def _canonical_mode(legacy_mode: str | None, mode: str | None) -> str | None:
@@ -103,6 +114,63 @@ def _require_platform_id_for_service(request: Request, platform_id: str | None) 
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="platform_id is required in service mode",
         )
+
+
+async def _enforce_message_request_budget(
+    request: Request,
+    *,
+    message_text: str,
+    attachments: list[Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        await run_in_threadpool(
+            validate_direct_message_request_budget,
+            message_text=message_text,
+            attachments=attachments or [],
+            metadata=metadata,
+            limits=RequestBudgetLimits.from_settings(get_runtime(request).settings),
+        )
+    except RequestBudgetExceededError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=str(exc),
+        ) from exc
+    except RequestPayloadStructureError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+
+def _ordinary_memory_scope_controls(
+    payload: Any,
+    request: Request,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> ResolvedMemoryScopeControls:
+    """Validate ordinary request claims and resolve effective memory scope."""
+
+    try:
+        reject_remote_authority_claims(
+            metadata=metadata,
+            headers=request.headers,
+        )
+        typed_fields = {
+            field_name: getattr(payload, field_name)
+            for field_name in ("incognito", "cross_chat_memory")
+            if field_name in payload.model_fields_set
+        }
+        return resolve_memory_scope_controls(
+            typed_fields=typed_fields,
+            metadata=metadata,
+            headers=request.headers,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
 
 async def _ensure_user_exists(users: UserRepository, user_id: str) -> None:
@@ -145,6 +213,11 @@ async def create_conversation(
 ) -> dict[str, Any]:
     ensure_user_access(payload.user_id, auth_context)
     _require_platform_id_for_service(request, payload.platform_id)
+    memory_scope = _ordinary_memory_scope_controls(
+        payload,
+        request,
+        metadata=payload.metadata,
+    )
     sidecar = SidecarService(get_runtime(request))
     try:
         await sidecar.ensure_user_exists(connection, payload.user_id)
@@ -156,7 +229,7 @@ async def create_conversation(
             assistant_mode_id=_canonical_mode(payload.assistant_mode_id, payload.mode),
             title=payload.title,
             metadata=payload.metadata,
-            cross_chat_memory=payload.cross_chat_memory,
+            cross_chat_memory=memory_scope.cross_chat_memory,
             temporary=payload.temporary,
             temporary_ttl_seconds=payload.temporary_ttl_seconds,
             purge_on_close=payload.purge_on_close,
@@ -170,7 +243,7 @@ async def create_conversation(
             realm_id=payload.realm_id,
             space_id=payload.space_id,
             mode=payload.mode,
-            incognito=payload.incognito,
+            incognito=memory_scope.incognito,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -202,9 +275,13 @@ async def create_conversation(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
-    except ConversationNotActiveError as exc:
+    except (ConversationNotActiveError, UserDeletedError) as exc:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=(
+                status.HTTP_410_GONE
+                if isinstance(exc, UserDeletedError)
+                else status.HTTP_409_CONFLICT
+            ),
             detail=str(exc),
         ) from exc
     except UserDeletedError as exc:
@@ -223,7 +300,6 @@ async def get_memory_preferences(
     request: Request,
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> MemoryPreferencesResponse:
-    user_id = _route_id(user_id)
     ensure_user_access(user_id, auth_context)
     try:
         preferences = await SidecarService(get_runtime(request)).get_memory_preferences(
@@ -247,7 +323,6 @@ async def update_memory_preferences(
     request: Request,
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> MemoryPreferencesResponse:
-    user_id = _route_id(user_id)
     ensure_user_access(user_id, auth_context)
     try:
         preferences = await SidecarService(get_runtime(request)).set_memory_preferences(
@@ -281,7 +356,6 @@ async def list_pending_memory_confirmations(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> PendingMemoryConfirmationListResponse:
-    user_id = _route_id(user_id)
     ensure_user_access(user_id, auth_context)
     items = await PendingConfirmationService(
         connection, clock
@@ -309,8 +383,6 @@ async def confirm_pending_memory(
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> PendingMemoryConfirmationActionResponse:
-    user_id = _route_id(user_id)
-    memory_id = _route_id(memory_id)
     ensure_user_access(user_id, auth_context)
     try:
         memory = await PendingConfirmationService(
@@ -338,8 +410,6 @@ async def decline_pending_memory(
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> PendingMemoryConfirmationActionResponse:
-    user_id = _route_id(user_id)
-    memory_id = _route_id(memory_id)
     ensure_user_access(user_id, auth_context)
     try:
         memory = await PendingConfirmationService(
@@ -363,7 +433,6 @@ async def set_conversation_incognito(
     request: Request,
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> dict[str, Any]:
-    conversation_id = _route_id(conversation_id)
     ensure_user_access(payload.user_id, auth_context)
     _require_platform_id_for_service(request, payload.platform_id)
     try:
@@ -397,7 +466,6 @@ async def save_from_incognito(
     request: Request,
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> SaveFromIncognitoResponse:
-    conversation_id = _route_id(conversation_id)
     ensure_user_access(payload.user_id, auth_context)
     _require_platform_id_for_service(request, payload.platform_id)
     try:
@@ -441,9 +509,8 @@ async def close_conversation(
     auth_context: AuthContext = Depends(get_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
 ) -> dict[str, Any] | DeletionReport:
-    conversation_id = _route_id(conversation_id)
     ensure_user_access(payload.user_id, auth_context)
-    await require_route_namespace_context(
+    namespace = await require_route_namespace_context(
         connection,
         get_runtime(request).clock,
         user_id=payload.user_id,
@@ -462,6 +529,7 @@ async def close_conversation(
             conversation_id=conversation_id,
             purge=payload.purge,
             confirmation=payload.confirmation,
+            namespace_guard=namespace.authorization_snapshot,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -490,9 +558,8 @@ async def archive_conversation(
     auth_context: AuthContext = Depends(get_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
 ) -> dict[str, Any]:
-    conversation_id = _route_id(conversation_id)
     ensure_user_access(payload.user_id, auth_context)
-    await require_route_namespace_context(
+    namespace = await require_route_namespace_context(
         connection,
         get_runtime(request).clock,
         user_id=payload.user_id,
@@ -510,6 +577,7 @@ async def archive_conversation(
             connection,
             user_id=payload.user_id,
             conversation_id=conversation_id,
+            namespace_guard=namespace.authorization_snapshot,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -517,6 +585,10 @@ async def archive_conversation(
             detail="Conversation not found for user",
         ) from None
     except InvalidConversationTransitionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    except MemoryProvenanceRepairRequiredError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc)
         ) from exc
@@ -530,11 +602,9 @@ async def delete_conversation(
     auth_context: AuthContext = Depends(get_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
 ) -> DeletionReport:
-    conversation_id = _route_id(conversation_id)
     ensure_user_access(payload.user_id, auth_context)
     runtime = get_runtime(request)
-    cache_service = ContextCacheService(runtime)
-    await require_route_namespace_context(
+    namespace = await require_route_namespace_context(
         connection,
         runtime.clock,
         user_id=payload.user_id,
@@ -546,13 +616,13 @@ async def delete_conversation(
         require_active=False,
     )
     try:
-        async with cache_service.user_cache_guard(payload.user_id):
-            return await ConversationLifecycleService(runtime).delete_conversation(
-                connection,
-                user_id=payload.user_id,
-                conversation_id=conversation_id,
-                confirmation=payload.confirmation,
-            )
+        return await ConversationLifecycleService(runtime).delete_conversation(
+            connection,
+            user_id=payload.user_id,
+            conversation_id=conversation_id,
+            confirmation=payload.confirmation,
+            namespace_guard=namespace.authorization_snapshot,
+        )
     except DeletionConfirmationError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -576,7 +646,6 @@ async def erase_user_data(
     auth_context: AuthContext = Depends(get_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
 ) -> ErasureReport:
-    user_id = _route_id(user_id)
     ensure_user_access(user_id, auth_context)
     if payload.user_id != user_id:
         raise HTTPException(
@@ -592,6 +661,17 @@ async def erase_user_data(
     except DeletionConfirmationError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except UserErasureCleanupPendingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "1"},
+        ) from exc
+    except UserErasureReconciliationRequiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
         ) from exc
 
 
@@ -631,9 +711,24 @@ async def chat_reply(
     request: Request,
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> ChatReplyResponse:
-    conversation_id = _route_id(conversation_id)
     ensure_user_access(payload.user_id, auth_context)
+    await _enforce_message_request_budget(
+        request,
+        message_text=payload.message_text,
+        attachments=payload.attachments,
+        metadata=payload.metadata,
+    )
     _require_platform_id_for_service(request, payload.platform_id)
+    memory_scope = _ordinary_memory_scope_controls(
+        payload,
+        request,
+        metadata=payload.metadata,
+    )
+    authority_context = ordinary_http_authority_context(
+        auth_context,
+        user_id=payload.user_id,
+        purpose="chat_reply",
+    )
     try:
         result = await ChatService(runtime=get_runtime(request)).chat_reply(
             user_id=payload.user_id,
@@ -647,7 +742,7 @@ async def chat_reply(
             attachments=payload.attachments,
             operational_profile=payload.operational_profile,
             operational_signals=payload.operational_signals,
-            cross_chat_memory=payload.cross_chat_memory,
+            cross_chat_memory=memory_scope.cross_chat_memory,
             user_persona_id=payload.user_persona_id,
             platform_id=payload.platform_id,
             character_id=payload.character_id,
@@ -658,12 +753,10 @@ async def chat_reply(
             realm_id=payload.realm_id,
             space_id=payload.space_id,
             mode=payload.mode,
-            incognito=payload.incognito,
-            privacy_enforcement=payload.privacy_enforcement,
-            authenticated_user_privilege_level=payload.authenticated_user_privilege_level,
-            authenticated_user_is_atagia_master=payload.authenticated_user_is_atagia_master,
+            incognito=memory_scope.incognito,
             response_mode=payload.response_mode,
             adaptive_retrieval=payload.adaptive_retrieval,
+            prompt_authority_context=authority_context,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -734,7 +827,6 @@ async def get_conversation_processing_status(
     user_id: str = Query(...),
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> MemoryProcessingStatus:
-    conversation_id = _route_id(conversation_id)
     ensure_user_access(user_id, auth_context)
     runtime = get_runtime(request)
     connection = await runtime.open_connection()
@@ -746,6 +838,128 @@ async def get_conversation_processing_status(
         ).get_status(user_id=user_id, conversation_id=conversation_id)
     finally:
         await connection.close()
+
+
+@router.post(
+    "/conversations/{conversation_id}/selected-transcript",
+    response_model=SelectedTranscriptRebuildResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def replace_selected_transcript(
+    conversation_id: str,
+    payload: ReplaceSelectedTranscriptRequest,
+    request: Request,
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> SelectedTranscriptRebuildResponse:
+    """Atomically install a host-selected branch and start its durable rebuild."""
+
+    ensure_user_access(payload.user_id, auth_context)
+    _require_platform_id_for_service(request, payload.platform_id)
+    for message in payload.messages:
+        await _enforce_message_request_budget(request, message_text=message.text)
+    try:
+        return await SelectedTranscriptService(get_runtime(request)).replace(
+            conversation_id=conversation_id,
+            request=payload,
+        )
+    except ConversationNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except (ConversationNotActiveError, UserDeletedError) as exc:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_410_GONE
+                if isinstance(exc, UserDeletedError)
+                else status.HTTP_409_CONFLICT
+            ),
+            detail=str(exc),
+        ) from exc
+    except TranscriptSelectionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except TranscriptRebuildUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get(
+    "/conversations/{conversation_id}/selected-transcript/{operation_id}",
+    response_model=SelectedTranscriptRebuildResponse,
+)
+async def get_selected_transcript_status(
+    conversation_id: str,
+    operation_id: str,
+    request: Request,
+    user_id: str = Query(...),
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> SelectedTranscriptRebuildResponse:
+    """Poll a selected-transcript rebuild without exposing partial memory state."""
+
+    ensure_user_access(user_id, auth_context)
+    try:
+        return await SelectedTranscriptService(get_runtime(request)).get_status(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            operation_id=operation_id,
+        )
+    except ConversationNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+
+@router.post(
+    "/conversations/{conversation_id}/selected-transcript/{operation_id}/retry",
+    response_model=SelectedTranscriptRebuildResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_selected_transcript_rebuild(
+    conversation_id: str,
+    operation_id: str,
+    payload: RetrySelectedTranscriptRequest,
+    request: Request,
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> SelectedTranscriptRebuildResponse:
+    """Restart a remediation-required rebuild using canonical selected messages."""
+
+    ensure_user_access(payload.user_id, auth_context)
+    try:
+        return await SelectedTranscriptService(get_runtime(request)).retry(
+            user_id=payload.user_id,
+            conversation_id=conversation_id,
+            operation_id=operation_id,
+        )
+    except ConversationNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except (ConversationNotActiveError, UserDeletedError) as exc:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_410_GONE
+                if isinstance(exc, UserDeletedError)
+                else status.HTTP_409_CONFLICT
+            ),
+            detail=str(exc),
+        ) from exc
+    except TranscriptSelectionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except TranscriptRebuildUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
 
 @router.get(
@@ -763,7 +977,6 @@ async def get_user_processing_status(
     remember_across_devices: bool = Query(default=True),
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> MemoryProcessingStatus:
-    user_id = _route_id(user_id)
     ensure_user_access(user_id, auth_context)
     runtime = get_runtime(request)
     connection = await runtime.open_connection()
@@ -796,9 +1009,19 @@ async def get_sidecar_context(
     request: Request,
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> ContextResult:
-    conversation_id = _route_id(conversation_id)
     ensure_user_access(payload.user_id, auth_context)
+    await _enforce_message_request_budget(
+        request,
+        message_text=payload.message_text,
+        attachments=payload.attachments,
+    )
     _require_platform_id_for_service(request, payload.platform_id)
+    memory_scope = _ordinary_memory_scope_controls(payload, request)
+    authority_context = ordinary_http_authority_context(
+        auth_context,
+        user_id=payload.user_id,
+        purpose="sidecar_context",
+    )
     try:
         return await SidecarService(get_runtime(request)).get_context(
             user_id=payload.user_id,
@@ -814,7 +1037,7 @@ async def get_sidecar_context(
             source_seq=payload.source_seq,
             operational_profile=payload.operational_profile,
             operational_signals=payload.operational_signals,
-            cross_chat_memory=payload.cross_chat_memory,
+            cross_chat_memory=memory_scope.cross_chat_memory,
             user_persona_id=payload.user_persona_id,
             platform_id=payload.platform_id,
             character_id=payload.character_id,
@@ -824,15 +1047,13 @@ async def get_sidecar_context(
             embodiment_id=payload.embodiment_id,
             realm_id=payload.realm_id,
             space_id=payload.space_id,
-            incognito=payload.incognito,
+            incognito=memory_scope.incognito,
             ingest_origin=payload.ingest_origin,
             confirmation_strategy=payload.confirmation_strategy,
             memory_privacy_mode=payload.memory_privacy_mode,
-            privacy_enforcement=payload.privacy_enforcement,
-            authenticated_user_privilege_level=payload.authenticated_user_privilege_level,
-            authenticated_user_is_atagia_master=payload.authenticated_user_is_atagia_master,
             response_mode=payload.response_mode,
             adaptive_retrieval=payload.adaptive_retrieval,
+            prompt_authority_context=authority_context,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -902,9 +1123,19 @@ async def ingest_sidecar_message(
     request: Request,
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> SidecarMutationResponse:
-    conversation_id = _route_id(conversation_id)
     ensure_user_access(payload.user_id, auth_context)
+    await _enforce_message_request_budget(
+        request,
+        message_text=payload.text,
+        attachments=payload.attachments,
+    )
     _require_platform_id_for_service(request, payload.platform_id)
+    memory_scope = _ordinary_memory_scope_controls(payload, request)
+    authority_context = ordinary_http_authority_context(
+        auth_context,
+        user_id=payload.user_id,
+        purpose="sidecar_ingest_message",
+    )
     try:
         result = await SidecarService(get_runtime(request)).ingest_message(
             user_id=payload.user_id,
@@ -921,7 +1152,7 @@ async def ingest_sidecar_message(
             source_seq=payload.source_seq,
             operational_profile=payload.operational_profile,
             operational_signals=payload.operational_signals,
-            cross_chat_memory=payload.cross_chat_memory,
+            cross_chat_memory=memory_scope.cross_chat_memory,
             user_persona_id=payload.user_persona_id,
             platform_id=payload.platform_id,
             character_id=payload.character_id,
@@ -931,13 +1162,11 @@ async def ingest_sidecar_message(
             embodiment_id=payload.embodiment_id,
             realm_id=payload.realm_id,
             space_id=payload.space_id,
-            incognito=payload.incognito,
+            incognito=memory_scope.incognito,
             ingest_origin=payload.ingest_origin,
             confirmation_strategy=payload.confirmation_strategy,
             memory_privacy_mode=payload.memory_privacy_mode,
-            privacy_enforcement=payload.privacy_enforcement,
-            authenticated_user_privilege_level=payload.authenticated_user_privilege_level,
-            authenticated_user_is_atagia_master=payload.authenticated_user_is_atagia_master,
+            prompt_authority_context=authority_context,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -1013,9 +1242,15 @@ async def add_sidecar_response(
     request: Request,
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> SidecarMutationResponse:
-    conversation_id = _route_id(conversation_id)
     ensure_user_access(payload.user_id, auth_context)
+    await _enforce_message_request_budget(request, message_text=payload.text)
     _require_platform_id_for_service(request, payload.platform_id)
+    memory_scope = _ordinary_memory_scope_controls(payload, request)
+    authority_context = ordinary_http_authority_context(
+        auth_context,
+        user_id=payload.user_id,
+        purpose="sidecar_add_response",
+    )
     try:
         result = await SidecarService(get_runtime(request)).add_response(
             user_id=payload.user_id,
@@ -1036,13 +1271,11 @@ async def add_sidecar_response(
             realm_id=payload.realm_id,
             space_id=payload.space_id,
             mode=payload.mode,
-            incognito=payload.incognito,
+            incognito=memory_scope.incognito,
             ingest_origin=payload.ingest_origin,
             confirmation_strategy=payload.confirmation_strategy,
             memory_privacy_mode=payload.memory_privacy_mode,
-            privacy_enforcement=payload.privacy_enforcement,
-            authenticated_user_privilege_level=payload.authenticated_user_privilege_level,
-            authenticated_user_is_atagia_master=payload.authenticated_user_is_atagia_master,
+            prompt_authority_context=authority_context,
         )
     except ConversationNotFoundError:
         raise HTTPException(
@@ -1091,11 +1324,7 @@ async def flush_sidecar_work(
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> FlushResponse:
     ensure_user_access(payload.user_id, auth_context)
-    conversation_id = (
-        _route_id(payload.conversation_id)
-        if payload.conversation_id is not None
-        else None
-    )
+    conversation_id = payload.conversation_id
     runtime = get_runtime(request)
     if not runtime.settings.workers_enabled:
         connection = await runtime.open_connection()

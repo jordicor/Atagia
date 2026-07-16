@@ -24,18 +24,18 @@ class _Turn:
 
 
 def test_normalize_evidence_turn_ids_splits_structured_citation_strings() -> None:
-    evidence_turn_ids = normalize_evidence_turn_ids(
-        ["D8:6; D9:17", "D9:1 D4:4 D4:6", "D:11:26", "D30:05"]
+    normalized = normalize_evidence_turn_ids(
+        ["D71:3; D72:8", "D73:5 D74:9 D75:4", "D:76:26", "D77:05"]
     )
 
-    assert evidence_turn_ids == [
-        "D8:6",
-        "D9:17",
-        "D9:1",
-        "D4:4",
-        "D4:6",
-        "D11:26",
-        "D30:5",
+    assert normalized == [
+        "D71:3",
+        "D72:8",
+        "D73:5",
+        "D74:9",
+        "D75:4",
+        "D76:26",
+        "D77:5",
     ]
 
 
@@ -71,7 +71,7 @@ def test_source_evidence_from_turns_uses_official_evidence_order() -> None:
 def test_source_evidence_from_turns_includes_caption_attachment_text() -> None:
     turns = [
         _Turn(
-            turn_id="D1:1",
+            turn_id="D81:1",
             role="user",
             speaker="Rosa",
             timestamp="2025-12-02T11:07:00",
@@ -89,14 +89,14 @@ def test_source_evidence_from_turns_includes_caption_attachment_text() -> None:
     ]
 
     evidence = source_evidence_from_turns(
-        evidence_turn_ids=["D1:1"],
+        evidence_turn_ids=["D81:1"],
         turns=turns,
         conversation_id="conv",
     )
 
     assert evidence == [
         {
-            "turn_id": "D1:1",
+            "turn_id": "D81:1",
             "conversation_id": "conv",
             "timestamp": "2025-12-02T11:07:00",
             "speaker": "Rosa",
@@ -114,7 +114,7 @@ def test_source_evidence_from_turns_includes_caption_attachment_text() -> None:
 def test_validate_evidence_turn_ids_reports_bad_question() -> None:
     turns = [
         _Turn(
-            turn_id="D1:1",
+            turn_id="D81:1",
             role="user",
             speaker="Rosa",
             timestamp="2025-12-02T11:07:00",
@@ -124,7 +124,7 @@ def test_validate_evidence_turn_ids_reports_bad_question() -> None:
 
     try:
         validate_evidence_turn_ids(
-            evidence_turn_ids=["D1:1", "D1:2"],
+            evidence_turn_ids=["D81:1", "D82:1"],
             turns=turns,
             dataset_name="TestBench",
             question_id="test-q1",
@@ -132,18 +132,18 @@ def test_validate_evidence_turn_ids_reports_bad_question() -> None:
         )
     except ValueError as exc:
         assert "TestBench question test-q1" in str(exc)
-        assert "D1:2" in str(exc)
+        assert "D82:1" in str(exc)
     else:  # pragma: no cover - defensive assertion
         raise AssertionError("Expected unresolved evidence validation error")
 
 
 def test_atagia_bench_grade_context_records_source_evidence_without_memory() -> None:
     question = AtagiaBenchQuestion(
-        question_id="rosa-q17",
-        question_text="Is Elena expecting a baby, and if so, when?",
-        ground_truth="Yes, Elena is expecting a baby in May",
+        question_id="fixture-q17",
+        question_text="When and where is Priya's astronomy workshop?",
+        ground_truth="April 18 at 7 PM in the North Hall",
         answer_type="llm_judge",
-        evidence_turn_ids=["rosa-04-t07"],
+        evidence_turn_ids=["fixture-04-t07"],
         grader="llm_judge",
     )
 
@@ -152,9 +152,9 @@ def test_atagia_bench_grade_context_records_source_evidence_without_memory() -> 
         {
             "source_evidence": [
                 {
-                    "turn_id": "rosa-04-t07",
-                    "timestamp": "2025-12-02T11:07:00",
-                    "text": "She is due in May.",
+                    "turn_id": "fixture-04-t07",
+                    "timestamp": "2027-04-02T11:07:00",
+                    "text": "Priya's astronomy workshop is April 18 at 7 PM in the North Hall.",
                 }
             ],
             "abstention_kind": None,
@@ -163,5 +163,5 @@ def test_atagia_bench_grade_context_records_source_evidence_without_memory() -> 
 
     assert context["judge_mode"] == "source_aware_llm_judge"
     assert context["source_evidence_source"] == "official_benchmark_dataset"
-    assert context["source_turn_ids"] == ["rosa-04-t07"]
-    assert context["source_timestamps"] == ["2025-12-02T11:07:00"]
+    assert context["source_turn_ids"] == ["fixture-04-t07"]
+    assert context["source_timestamps"] == ["2027-04-02T11:07:00"]

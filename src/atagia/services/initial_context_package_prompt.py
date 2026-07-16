@@ -9,7 +9,13 @@ from typing import Any, Mapping
 import aiosqlite
 
 from atagia.core.clock import Clock
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
+from atagia.core.initial_context_package_revision_repository import (
+    InitialContextPackageRevisionRepository,
+)
+from atagia.core.repositories import ConversationRepository
 from atagia.memory.context_envelope import ContextEnvelopeBudget
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.models.schemas_initial_context_package import (
@@ -19,6 +25,7 @@ from atagia.models.schemas_initial_context_package import (
     InitialContextPackageRecord,
     initial_context_package_key_hash,
 )
+from atagia.models.schemas_jobs import InitialContextPackageRefreshReason
 from atagia.models.schemas_memory import OperationalProfileSnapshot
 from atagia.services.chat_support import estimate_tokens
 from atagia.services.initial_context_package_builder import (
@@ -27,6 +34,9 @@ from atagia.services.initial_context_package_builder import (
 from atagia.services.initial_context_package_keys import (
     build_initial_context_package_key,
     initial_context_package_subject,
+)
+from atagia.services.initial_context_package_refresh_service import (
+    InitialContextPackageRefreshEnqueuer,
 )
 from atagia.services.initial_context_package_signatures import (
     build_initial_context_package_coordinate_signature,
@@ -84,6 +94,7 @@ async def assemble_initial_context_package_prompt(
     recent_transcript_message_ids: set[str],
     include_recent_verbatim_seed: bool = True,
     prompt_budget_tokens: int = INITIAL_CONTEXT_PACKAGE_PROMPT_MAX_TOKENS,
+    refresh_enqueuer: InitialContextPackageRefreshEnqueuer | None = None,
 ) -> InitialContextPackagePromptAssembly:
     """Read and render prepared packages without calling an LLM."""
 
@@ -102,6 +113,8 @@ async def assemble_initial_context_package_prompt(
         "deduped_source_refs": 0,
         "dropped_sections": [],
         "known_empty": {},
+        "refresh_requested": False,
+        "refresh_jobs": {},
     }
     if not enabled:
         base_diagnostics["read_ms"] = _elapsed_ms(started)
@@ -126,6 +139,7 @@ async def assemble_initial_context_package_prompt(
     repository = InitialContextPackageRepository(connection, clock)
     expected = await _expected_packages(
         connection,
+        clock=clock,
         user_id=user_id,
         conversation_id=conversation_id,
         conversation=conversation,
@@ -137,10 +151,36 @@ async def assemble_initial_context_package_prompt(
     for request in expected:
         read_results.append(await _read_expected_package(repository, request))
 
-    active_packages = [result.package for result in read_results if result.package is not None]
+    refresh_jobs: dict[str, str | None] = {}
+    if refresh_enqueuer is not None:
+        for request, read_result in zip(expected, read_results, strict=True):
+            if not read_result.refresh_required:
+                continue
+            refresh_jobs[request.kind.value] = await refresh_enqueuer.enqueue_refresh(
+                user_id=user_id,
+                conversation_id=(
+                    conversation_id
+                    if request.kind == InitialContextPackageKind.CONVERSATION
+                    else None
+                ),
+                package_kind=request.kind,
+                retrieval_profile_id=request.retrieval_profile_id,
+                reason=InitialContextPackageRefreshReason.SOURCE_CHANGED,
+                privacy_enforcement=authority_context.effective_privacy_enforcement,
+                operational_profile=operational_profile,
+                fail_open=True,
+                mark_existing_packages_stale=False,
+                return_existing=True,
+            )
+
+    active_packages = [
+        result.package for result in read_results if result.package is not None
+    ]
     diagnostics = {
         **base_diagnostics,
         "packages": [result.diagnostics for result in read_results],
+        "refresh_requested": any(result.refresh_required for result in read_results),
+        "refresh_jobs": refresh_jobs,
     }
     if not active_packages:
         diagnostics["read_ms"] = _elapsed_ms(started)
@@ -175,12 +215,16 @@ class _ExpectedPackage:
     subject_json: dict[str, Any]
     retrieval_profile_id: str
     conversation_id: str | None
+    policy_json: dict[str, Any]
+    operational_json: dict[str, Any]
+    source_coordinates_current: bool
 
 
 @dataclass(frozen=True, slots=True)
 class _PackageRead:
     package: InitialContextPackageRecord | None
     diagnostics: dict[str, Any]
+    refresh_required: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +236,7 @@ class _RenderResult:
 async def _expected_packages(
     connection: aiosqlite.Connection,
     *,
+    clock: Clock,
     user_id: str,
     conversation_id: str,
     conversation: Mapping[str, Any],
@@ -199,6 +244,26 @@ async def _expected_packages(
     privacy_enforcement: str,
     operational_profile: OperationalProfileSnapshot | None,
 ) -> list[_ExpectedPackage]:
+    revision_repository = InitialContextPackageRevisionRepository(connection, clock)
+    source_coordinates = await revision_repository.capture_active_coordinates(
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    if source_coordinates is None:
+        return []
+    if str(conversation.get("user_id")) != user_id:
+        raise ValueError("conversation must belong to user_id")
+    if str(conversation.get("id")) != conversation_id:
+        raise ValueError("conversation_id must match conversation")
+    canonical_conversation = await ConversationRepository(
+        connection,
+        clock,
+    ).get_conversation(
+        conversation_id,
+        user_id,
+    )
+    if canonical_conversation is None:
+        return []
     retrieval_profile_id = resolved_policy.profile_id.value
     policy_signature = build_initial_context_package_policy_signature(
         resolved_policy,
@@ -206,28 +271,38 @@ async def _expected_packages(
         authority_context=None,
         operational_profile=operational_profile,
     )
-    baseline_subject = _baseline_subject(conversation, retrieval_profile_id)
-    baseline_coordinate_signature = await build_initial_context_package_coordinate_signature(
-        connection,
-        user_id=user_id,
-        retrieval_profile_id=retrieval_profile_id,
-        conversation_id=None,
-        conversation=None,
-        user_persona_id=baseline_subject.get("user_persona_id"),
-        platform_id=baseline_subject.get("platform_id"),
-        character_id=baseline_subject.get("character_id"),
-        workspace_id=baseline_subject.get("workspace_id"),
-        assistant_mode_id=retrieval_profile_id,
-        active_presence_id=_optional_text(conversation.get("active_presence_id")),
-        active_space_id=_optional_text(conversation.get("active_space_id")),
-        active_mind_id=_optional_text(conversation.get("active_mind_id")),
-        mind_topology=_optional_text(conversation.get("mind_topology")),
-        active_embodiment_id=_optional_text(conversation.get("active_embodiment_id")),
-        active_realm_id=_optional_text(conversation.get("active_realm_id")),
-        incognito=(
-            _coerce_bool(conversation.get("incognito"))
-            or _coerce_bool(conversation.get("isolated_mode"))
-        ),
+    baseline_subject = _baseline_subject(canonical_conversation, retrieval_profile_id)
+    baseline_coordinate_signature = (
+        await build_initial_context_package_coordinate_signature(
+            connection,
+            user_id=user_id,
+            retrieval_profile_id=retrieval_profile_id,
+            conversation_id=None,
+            conversation=None,
+            user_persona_id=baseline_subject.get("user_persona_id"),
+            platform_id=baseline_subject.get("platform_id"),
+            character_id=baseline_subject.get("character_id"),
+            workspace_id=baseline_subject.get("workspace_id"),
+            assistant_mode_id=retrieval_profile_id,
+            active_presence_id=_optional_text(
+                canonical_conversation.get("active_presence_id")
+            ),
+            active_space_id=_optional_text(
+                canonical_conversation.get("active_space_id")
+            ),
+            active_mind_id=_optional_text(canonical_conversation.get("active_mind_id")),
+            mind_topology=_optional_text(canonical_conversation.get("mind_topology")),
+            active_embodiment_id=_optional_text(
+                canonical_conversation.get("active_embodiment_id")
+            ),
+            active_realm_id=_optional_text(
+                canonical_conversation.get("active_realm_id")
+            ),
+            incognito=(
+                _coerce_bool(canonical_conversation.get("incognito"))
+                or _coerce_bool(canonical_conversation.get("isolated_mode"))
+            ),
+        )
     )
     baseline_key = build_initial_context_package_key(
         version=INITIAL_CONTEXT_PACKAGE_SCHEMA_VERSION,
@@ -242,15 +317,15 @@ async def _expected_packages(
     )
 
     conversation_subject = initial_context_package_subject(
-        user_persona_id=_optional_text(conversation.get("user_persona_id")),
-        platform_id=_optional_text(conversation.get("platform_id")),
-        character_id=_optional_text(conversation.get("character_id")),
-        workspace_id=_optional_text(conversation.get("workspace_id")),
+        user_persona_id=_optional_text(canonical_conversation.get("user_persona_id")),
+        platform_id=_optional_text(canonical_conversation.get("platform_id")),
+        character_id=_optional_text(canonical_conversation.get("character_id")),
+        workspace_id=_optional_text(canonical_conversation.get("workspace_id")),
         assistant_mode_id=(
-            _optional_text(conversation.get("assistant_mode_id"))
+            _optional_text(canonical_conversation.get("assistant_mode_id"))
             or retrieval_profile_id
         ),
-        mode=_optional_text(conversation.get("mode")),
+        mode=_optional_text(canonical_conversation.get("mode")),
     )
     conversation_coordinate_signature = (
         await build_initial_context_package_coordinate_signature(
@@ -258,7 +333,7 @@ async def _expected_packages(
             user_id=user_id,
             retrieval_profile_id=retrieval_profile_id,
             conversation_id=conversation_id,
-            conversation=conversation,
+            conversation=canonical_conversation,
         )
     )
     conversation_key = build_initial_context_package_key(
@@ -272,6 +347,11 @@ async def _expected_packages(
         coordinate_signature=conversation_coordinate_signature,
         operational_profile=operational_profile,
     )
+    source_coordinates_current = await revision_repository.coordinates_are_current(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        coordinates=source_coordinates,
+    )
     return [
         _ExpectedPackage(
             kind=InitialContextPackageKind.BASELINE,
@@ -280,6 +360,9 @@ async def _expected_packages(
             subject_json=baseline_subject,
             retrieval_profile_id=retrieval_profile_id,
             conversation_id=None,
+            policy_json=baseline_key.policy_json,
+            operational_json=baseline_key.operational_json,
+            source_coordinates_current=source_coordinates_current,
         ),
         _ExpectedPackage(
             kind=InitialContextPackageKind.CONVERSATION,
@@ -288,6 +371,9 @@ async def _expected_packages(
             subject_json=conversation_subject,
             retrieval_profile_id=retrieval_profile_id,
             conversation_id=conversation_id,
+            policy_json=conversation_key.policy_json,
+            operational_json=conversation_key.operational_json,
+            source_coordinates_current=source_coordinates_current,
         ),
     ]
 
@@ -296,6 +382,17 @@ async def _read_expected_package(
     repository: InitialContextPackageRepository,
     request: _ExpectedPackage,
 ) -> _PackageRead:
+    if not request.source_coordinates_current:
+        return _PackageRead(
+            None,
+            _package_read_diagnostics(
+                request,
+                status="source_changed",
+                package=None,
+                fallback_reason="source_coordinates_changed_during_read",
+            ),
+            True,
+        )
     read_result = await repository.read_by_key_hash(
         user_id=request.user_id,
         package_key_hash=request.key_hash,
@@ -305,6 +402,16 @@ async def _read_expected_package(
         status = _usable_status(read_result.status, read_result.package)
         if status != "hit":
             package = None
+            if (
+                read_result.package is not None
+                and read_result.package.build_status
+                == InitialContextPackageBuildStatus.ACTIVE
+            ):
+                await repository.mark_stale_if_row_version(
+                    user_id=request.user_id,
+                    package_key_hash=read_result.package.package_key_hash,
+                    expected_row_version=read_result.package.package_row_version,
+                )
         return _PackageRead(
             package,
             _package_read_diagnostics(
@@ -313,6 +420,7 @@ async def _read_expected_package(
                 package=read_result.package,
                 fallback_reason=read_result.fallback_reason,
             ),
+            status != "hit",
         )
 
     latest = await _latest_related_package(repository, request)
@@ -320,6 +428,22 @@ async def _read_expected_package(
         return _PackageRead(
             None,
             _package_read_diagnostics(request, status="miss", package=None),
+            True,
+        )
+    latest_read = await repository.read_by_key_hash(
+        user_id=request.user_id,
+        package_key_hash=latest.package_key_hash,
+    )
+    if latest_read.status != "hit":
+        return _PackageRead(
+            None,
+            _package_read_diagnostics(
+                request,
+                status=latest_read.status,
+                package=latest_read.package,
+                fallback_reason=latest_read.fallback_reason,
+            ),
+            True,
         )
     if latest.build_status != InitialContextPackageBuildStatus.ACTIVE:
         return _PackageRead(
@@ -330,6 +454,7 @@ async def _read_expected_package(
                 package=latest,
                 fallback_reason=f"package_{latest.build_status.value}",
             ),
+            True,
         )
     return _PackageRead(
         None,
@@ -339,6 +464,7 @@ async def _read_expected_package(
             package=latest,
             fallback_reason="package_key_hash_mismatch",
         ),
+        True,
     )
 
 
@@ -351,6 +477,8 @@ async def _latest_related_package(
             user_id=request.user_id,
             retrieval_profile_id=request.retrieval_profile_id,
             subject_json=request.subject_json,
+            policy_json=request.policy_json,
+            operational_json=request.operational_json,
             include_inactive=True,
         )
     if request.conversation_id is None:
@@ -359,6 +487,8 @@ async def _latest_related_package(
         user_id=request.user_id,
         conversation_id=request.conversation_id,
         retrieval_profile_id=request.retrieval_profile_id,
+        policy_json=request.policy_json,
+        operational_json=request.operational_json,
         include_inactive=True,
     )
 
@@ -430,9 +560,9 @@ def _render_packages(
 
     for package in packages:
         for key, value in package.blocks_json.empty_markers.items():
-            diagnostics["known_empty"][key] = (
-                bool(diagnostics["known_empty"].get(key)) or bool(value)
-            )
+            diagnostics["known_empty"][key] = bool(
+                diagnostics["known_empty"].get(key)
+            ) or bool(value)
         section = _render_package(
             package,
             selected_source_keys=selected_source_keys,
@@ -488,7 +618,9 @@ def _render_package(
     selected_curated_items = 0
     dropped_curated_items = 0
 
-    def add_section(name: str, text: str, *, source_refs: list[dict[str, Any]] | None = None) -> None:
+    def add_section(
+        name: str, text: str, *, source_refs: list[dict[str, Any]] | None = None
+    ) -> None:
         nonlocal deduped_source_refs
         normalized = text.strip()
         if not normalized:
@@ -520,10 +652,7 @@ def _render_package(
         body_lines.append(str(curated["body"]))
     elif blocks.curated_orientation_block and not blocks.curated_items:
         curated_refs = list(source_refs.get("curated_orientation") or [])
-        if (
-            not include_recent_verbatim_seed
-            and _has_message_ref(curated_refs)
-        ):
+        if not include_recent_verbatim_seed and _has_message_ref(curated_refs):
             dropped_sections.append(
                 f"{package.package_kind.value}:curated_orientation:recent_seed_disabled"
             )
@@ -662,10 +791,7 @@ def _render_curated_items(
     dropped = 0
     deduped = 0
     for item in items:
-        if (
-            not include_recent_verbatim_seed
-            and _has_message_ref(item.source_refs)
-        ):
+        if not include_recent_verbatim_seed and _has_message_ref(item.source_refs):
             dropped += 1
             continue
         ref_keys = _source_ref_keys(item.source_refs)

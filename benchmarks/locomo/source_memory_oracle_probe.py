@@ -40,11 +40,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DATA_PATH = _PROJECT_ROOT / "benchmarks" / "data" / "locomo10.json"
 _DEFAULT_OUTPUT_DIR = bench_output_root() / "locomo"
 _CATEGORY_NAMES = {
-    1: "single-hop",
-    2: "multi-hop",
-    3: "temporal",
-    4: "open-domain",
-    5: "unscored",
+    1: "multi-hop",
+    2: "temporal",
+    3: "open-domain",
+    4: "single-hop",
+    5: "adversarial-unscored",
 }
 _CRITICAL_COUNT_KEYS = (
     "critical_evidence_count",
@@ -591,7 +591,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default=str(_default_output_path()),
-        help="Output JSON path. Defaults to docs/tmp with a timestamp.",
+        help="Output JSON path. Defaults to the benchmark output root with a timestamped filename.",
     )
     parser.add_argument(
         "--include-passing",

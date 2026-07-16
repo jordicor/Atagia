@@ -30,10 +30,10 @@ def test_locomo_dataset_parses() -> None:
         for question in conversation.questions:
             category_counts[question.category] += 1
 
-    print(f"Cat 1 (single-hop): {category_counts[1]} questions")
-    print(f"Cat 2 (multi-hop): {category_counts[2]} questions")
-    print(f"Cat 3 (temporal): {category_counts[3]} questions")
-    print(f"Cat 4 (open-domain): {category_counts[4]} questions")
+    print(f"Cat 1 (multi-hop): {category_counts[1]} questions")
+    print(f"Cat 2 (temporal): {category_counts[2]} questions")
+    print(f"Cat 3 (open-domain): {category_counts[3]} questions")
+    print(f"Cat 4 (single-hop): {category_counts[4]} questions")
     print(f"Cat 5 (adversarial, excluded): {category_counts[5]} questions")
     for conversation_id, num_turns, num_scored_questions in conversation_rows:
         print(

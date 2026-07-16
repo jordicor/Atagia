@@ -33,15 +33,16 @@ calling the engine, so it has no champion-prompt copy to drift.)
 
 ## Cases and frozen ranges
 
-- **realistic** — the 5 conversational cases from
-  `benchmarks/model_casting/inputs/compactor.json`, each with a hand-authored,
-  contiguous, non-overlapping partition (the card-1 stand-in).
+- **realistic** — 5 independently authored public synthetic conversations in
+  `benchmarks/card2_summary/fixtures/compactor_cases.json`, each with a
+  hand-authored, contiguous, non-overlapping partition (the card-1 stand-in).
 - **stress** — two synthetic cases with realistic fictional dialogue (no
   benchmark entities): `stress_many_single_ranges` (~20 single-message ranges to
   saturate concurrency) and `stress_long_single_range` (one ~30-message range).
 
-The frozen partition is versioned by `FROZEN_RANGE_FIXTURE_ID` in `cases.py`, and
-that id is recorded in every report so metrics can be matched to the exact fixture.
+The current partition and independently authored fixture are identified as
+`card2_frozen_ranges_v2` by `FROZEN_RANGE_FIXTURE_ID` in `cases.py`. That id is
+recorded in every report so metrics can be matched to the exact fixture.
 
 ## Offline self-test (no network, no keys)
 
@@ -62,6 +63,8 @@ Live runs need the relevant provider key:
 `OPENROUTER_API_KEY` (or `ATAGIA_OPENROUTER_API_KEY`) for OpenRouter models,
 `GEMINI_KEY` / `ATAGIA_GOOGLE_API_KEY` for direct Gemini,
 `MINIMAX_API_KEY` / `ATAGIA_MINIMAX_API_KEY` for direct MiniMax.
+The CLI loads the project `.env` only after a live run is selected; the offline
+self-test does not read provider credentials.
 
 The compactor model is selected with `--model`; provider routing is by model-id
 prefix, exactly as production (`google/<id>`, `minimax/MiniMax-M3` direct;

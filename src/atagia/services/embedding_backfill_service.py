@@ -10,6 +10,11 @@ from typing import Any, Awaitable, Callable
 import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field
 
+from atagia.core.admin_maintenance_repository import (
+    AdminMaintenanceOperation,
+    AdminMaintenanceRepository,
+)
+from atagia.core.clock import Clock
 from atagia.models.schemas_memory import MemoryStatus
 from atagia.services.embedding_payloads import build_embedding_upsert_payload
 from atagia.services.embeddings import EmbeddingIndex
@@ -42,11 +47,15 @@ class EmbeddingBackfillService:
         *,
         connection: aiosqlite.Connection,
         embedding_index: EmbeddingIndex,
+        clock: Clock | None = None,
+        maintenance_operation: AdminMaintenanceOperation | None = None,
         progress_callback: ProgressCallback | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._connection = connection
         self._embedding_index = embedding_index
+        self._clock = clock
+        self._maintenance_operation = maintenance_operation
         self._progress_callback = progress_callback
         self._sleep = sleep or asyncio.sleep
 
@@ -63,6 +72,8 @@ class EmbeddingBackfillService:
             raise ValueError("delay_ms must be non-negative")
         if self._embedding_index.vector_limit == 0:
             raise ValueError("Embedding backfill requires an active embedding backend")
+
+        await self._mark_maintenance_dirty()
 
         result = EmbeddingBackfillResult(
             batch_size=batch_size,
@@ -83,6 +94,25 @@ class EmbeddingBackfillService:
         finally:
             await cursor.close()
         return result
+
+    async def _mark_maintenance_dirty(self) -> None:
+        operation = self._maintenance_operation
+        if operation is None:
+            return
+        if self._clock is None:
+            raise RuntimeError("Maintenance validation requires a clock")
+        await self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            repository = AdminMaintenanceRepository(
+                self._connection,
+                self._clock,
+            )
+            await repository.require_current(operation)
+            await repository.mark_dirty(operation)
+            await self._connection.commit()
+        except Exception:
+            await self._connection.rollback()
+            raise
 
     def _scan_query(self, user_id: str | None) -> tuple[str, tuple[Any, ...]]:
         clauses = ["mem.memory_id IS NULL"]
@@ -123,9 +153,18 @@ class EmbeddingBackfillService:
             return
 
         try:
+            if self._maintenance_operation is not None:
+                if self._clock is None:
+                    raise RuntimeError("Maintenance validation requires a clock")
+                await AdminMaintenanceRepository(
+                    self._connection,
+                    self._clock,
+                ).require_current(self._maintenance_operation)
             payload = build_embedding_upsert_payload(
                 canonical_text=str(row["canonical_text"]),
-                index_text=str(row["index_text"]) if row["index_text"] is not None else None,
+                index_text=str(row["index_text"])
+                if row["index_text"] is not None
+                else None,
                 privacy_level=int(row["privacy_level"]),
                 intimacy_boundary=str(row["intimacy_boundary"]),
                 preserve_verbatim=bool(int(row["preserve_verbatim"])),
@@ -141,6 +180,19 @@ class EmbeddingBackfillService:
                     "index_text": payload.index_text,
                 },
             )
+            if self._maintenance_operation is not None:
+                assert self._clock is not None
+                try:
+                    await AdminMaintenanceRepository(
+                        self._connection,
+                        self._clock,
+                    ).require_current(self._maintenance_operation)
+                except Exception:
+                    # sqlite-vec/remote embeddings are acceleration only. If
+                    # ownership expired during the external write, compensate
+                    # immediately so stale acceleration cannot outlive SQLite.
+                    await self._embedding_index.delete(str(row["id"]))
+                    raise
             result.embedded += 1
         except Exception:
             result.failed += 1

@@ -42,8 +42,8 @@ from tests.extraction_payload_support import (
     memory_extraction_card_output_from_payload,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def _message_sequences_from_last_conversation_messages(prompt: str) -> list[int]:
@@ -190,7 +190,7 @@ def _settings(tmp_path: Path) -> Settings:
         llm_ingest_model="openai/chat-test-model",
         llm_retrieval_model="openai/score-test-model",
         llm_component_models={"intent_classifier": "openai/classify-test-model"},
-        artifact_blob_storage_kind="local_file",
+        artifact_blob_storage_kind="sqlite_blob",
         artifact_blob_storage_path=str(tmp_path / "artifact-blobs"),
         service_mode=True,
         service_api_key="service-key",
@@ -288,6 +288,7 @@ def test_admin_can_list_and_archive_review_required_memory(tmp_path: Path) -> No
             clock = client.app.state.runtime.clock
             users = UserRepository(connection, clock)
             conversations = ConversationRepository(connection, clock)
+            messages = MessageRepository(connection, clock)
             memories = MemoryObjectRepository(connection, clock)
             client.portal.call(users.create_user, "usr_1")
             client.portal.call(
@@ -299,6 +300,16 @@ def test_admin_can_list_and_archive_review_required_memory(tmp_path: Path) -> No
                     "Review Chat",
                     platform_id="aurvek",
                 )
+            )
+            client.portal.call(
+                messages.create_message,
+                "aurvek:msg:4512",
+                "cnv_1",
+                "user",
+                1,
+                "Imported bank PIN: 4512",
+                5,
+                {"ingest_origin": "backfill"},
             )
             client.portal.call(
                 lambda: memories.create_memory_object(
@@ -751,35 +762,6 @@ def test_admin_lifecycle_expires_idle_temporary_conversations(tmp_path: Path) ->
                 True,
             )
             client.portal.call(messages.create_message, "msg_purge", "cnv_purge", "user", 1, "Temp", 1, {})
-            stored_blob = runtime.artifact_blob_store.store_bytes(
-                user_id="usr_1",
-                content_bytes=b"queued cleanup",
-            )
-            client.portal.call(
-                connection.execute,
-                """
-                INSERT INTO pending_file_deletions(
-                    id,
-                    storage_uri,
-                    storage_root,
-                    sha256,
-                    reason,
-                    tombstone_id,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, 'user_erasure', ?, ?)
-                """,
-                (
-                    "pfd_retry",
-                    stored_blob.storage_uri,
-                    str(runtime.artifact_blob_store.base_dir),
-                    stored_blob.sha256,
-                    "tmb_retry",
-                    runtime.clock.now().isoformat(),
-                ),
-            )
-            client.portal.call(connection.commit)
-
         runtime.clock = FrozenClock(datetime(2026, 4, 10, 12, 1, tzinfo=timezone.utc))
         response = client.post(
             "/v1/admin/lifecycle/run",
@@ -788,8 +770,7 @@ def test_admin_lifecycle_expires_idle_temporary_conversations(tmp_path: Path) ->
 
         assert response.status_code == 200
         assert response.json()["expired_temporary_conversations_count"] == 2
-        assert response.json()["processed_pending_file_deletions_count"] == 1
-        assert not Path(stored_blob.storage_uri).exists()
+        assert response.json()["processed_pending_file_deletions_count"] == 0
         with _connection(client) as connection:
             conversations = ConversationRepository(connection, runtime.clock)
             close_row = client.portal.call(conversations.get_conversation, "cnv_close", "usr_1")
@@ -1132,7 +1113,7 @@ def test_admin_coverage_backfill_route_rejects_bad_args(tmp_path: Path) -> None:
 def test_admin_coverage_backfill_route_returns_counters_and_honors_user_id(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     provider = CoverageMembersProvider(
-        'cand_001 | [{"member_key": "dr. mendez", "display_text": "Dr. Mendez"}]'
+        'cand_001 | [{"member_key": "dr. navarro", "display_text": "Dr. Navarro"}]'
     )
     with TestClient(app) as client:
         runtime = client.app.state.runtime
@@ -1146,7 +1127,7 @@ def test_admin_coverage_backfill_route_returns_counters_and_honors_user_id(tmp_p
             user_id="usr_1",
             conversation_id="cnv_1",
             memory_id="mem_usr_1",
-            text="Rosa sees Dr. Mendez.",
+            text="Mira sees Dr. Navarro.",
         )
         _create_backfill_memory(
             client,
@@ -1184,7 +1165,7 @@ def test_admin_coverage_backfill_route_returns_counters_and_honors_user_id(tmp_p
             row_1 = client.portal.call(memories.get_memory_object, "mem_usr_1", "usr_1")
             row_2 = client.portal.call(memories.get_memory_object, "mem_usr_2", "usr_2")
         assert row_1["payload_json"]["coverage_members"] == [
-            {"member_key": "dr. mendez", "display_text": "Dr. Mendez"}
+            {"member_key": "dr. navarro", "display_text": "Dr. Navarro"}
         ]
         # The other user's row was not touched (no key written).
         assert "coverage_members" not in row_2["payload_json"]

@@ -13,7 +13,7 @@ from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import UserRepository
 from atagia.models.schemas_memory import MemoryCategory
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
 
 @pytest.mark.asyncio

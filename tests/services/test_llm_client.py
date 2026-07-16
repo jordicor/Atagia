@@ -188,7 +188,9 @@ class PromptStructuredProvider(LLMProvider):
 class VendorAwareStructuredProvider(PromptStructuredProvider):
     name = "openrouter"
 
-    def supports_native_structured_output_for(self, request: LLMCompletionRequest) -> bool:
+    def supports_native_structured_output_for(
+        self, request: LLMCompletionRequest
+    ) -> bool:
         return request.model.startswith(("anthropic/", "google/", "openai/", "x-ai/"))
 
 
@@ -298,7 +300,9 @@ class PostDoneLimitThenSuccessProvider(PostDoneLimitProvider):
         self.stream_calls += 1
         if self.stream_calls == 1:
             yield LLMStreamEvent(type="text", content="partial")
-            yield LLMStreamEvent(type="done", payload={"usage": {"completion_tokens": 2}})
+            yield LLMStreamEvent(
+                type="done", payload={"usage": {"completion_tokens": 2}}
+            )
             raise OutputLimitExceededError(
                 "hit max output tokens",
                 provider=self.name,
@@ -464,7 +468,9 @@ class RecordingProvider(LLMProvider):
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
-        return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+        return LLMCompletionResponse(
+            provider=self.name, model=request.model, output_text="ok"
+        )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         return LLMEmbeddingResponse(
@@ -477,7 +483,9 @@ class RecordingProvider(LLMProvider):
 class PolicyBlockingProvider(RecordingProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
-        raise LLMPolicyBlockedError("provider blocked the response (finish_reason=content_filter)")
+        raise LLMPolicyBlockedError(
+            "provider blocked the response (finish_reason=content_filter)"
+        )
 
 
 def _request() -> LLMCompletionRequest:
@@ -485,6 +493,56 @@ def _request() -> LLMCompletionRequest:
         model="model-test",
         messages=[LLMMessage(role="user", content="hello")],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["complete", "stream", "complete_streamed"])
+async def test_external_answer_token_limit_is_never_floored(
+    operation: str,
+) -> None:
+    provider = RecordingProvider("external-limit")
+    client = LLMClient(provider_name=provider.name, providers=[provider])
+    request = _request().model_copy(
+        update={"max_output_tokens": 1, "external_answer": True}
+    )
+
+    if operation == "complete":
+        await client.complete(request)
+    elif operation == "stream":
+        [event async for event in client.stream(request)]
+    else:
+        await client.complete_streamed(request)
+
+    assert provider.requests
+    assert all(seen.max_output_tokens == 1 for seen in provider.requests)
+    assert all(seen.external_answer is True for seen in provider.requests)
+
+
+@pytest.mark.asyncio
+async def test_internal_completion_keeps_structured_output_headroom() -> None:
+    provider = RecordingProvider("internal-limit")
+    client = LLMClient(provider_name=provider.name, providers=[provider])
+
+    await client.complete(_request().model_copy(update={"max_output_tokens": 1}))
+
+    assert provider.requests[0].max_output_tokens > 1
+    assert provider.requests[0].external_answer is False
+
+
+@pytest.mark.asyncio
+async def test_external_answer_does_not_retry_a_real_limit_stop() -> None:
+    provider = OutputLimitThenSuccessProvider()
+    client = LLMClient(provider_name=provider.name, providers=[provider])
+
+    with pytest.raises(OutputLimitExceededError, match="max output tokens"):
+        await client.complete(
+            _request().model_copy(
+                update={"max_output_tokens": 1, "external_answer": True}
+            )
+        )
+
+    assert len(provider.requests) == 1
+    assert provider.requests[0].max_output_tokens == 1
 
 
 @pytest.mark.asyncio
@@ -523,7 +581,10 @@ async def test_complete_uses_intimacy_fallback_for_policy_block() -> None:
     assert primary.requests[0].model == "gpt-5-mini"
     assert fallback.requests[0].model == "z-ai/glm-4.6"
     assert fallback.requests[0].metadata["atagia_intimacy_fallback_used"] is True
-    assert fallback.requests[0].metadata["atagia_intimacy_primary_model"] == "openai/gpt-5-mini"
+    assert (
+        fallback.requests[0].metadata["atagia_intimacy_primary_model"]
+        == "openai/gpt-5-mini"
+    )
     assert fallback.requests[0].metadata["atagia_component_id"] == "extractor"
 
 
@@ -552,7 +613,10 @@ async def test_complete_proactively_uses_intimacy_model_for_known_context() -> N
     assert primary.requests == []
     assert fallback.requests[0].model == "z-ai/glm-4.6"
     assert fallback.requests[0].metadata["atagia_intimacy_proactive_route"] is True
-    assert fallback.requests[0].metadata["atagia_intimacy_primary_model"] == "openai/gpt-5-mini"
+    assert (
+        fallback.requests[0].metadata["atagia_intimacy_primary_model"]
+        == "openai/gpt-5-mini"
+    )
 
 
 @pytest.mark.asyncio
@@ -582,7 +646,9 @@ async def test_complete_does_not_proactively_route_without_setting() -> None:
 @pytest.mark.asyncio
 async def test_complete_does_not_use_intimacy_fallback_for_non_policy_error() -> None:
     class FailingProvider(RecordingProvider):
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
             self.requests.append(request)
             raise LLMError("ordinary provider failure")
 
@@ -607,9 +673,13 @@ async def test_complete_does_not_use_intimacy_fallback_for_non_policy_error() ->
 
 
 @pytest.mark.asyncio
-async def test_complete_does_not_use_intimacy_fallback_for_generic_refusal_word() -> None:
+async def test_complete_does_not_use_intimacy_fallback_for_generic_refusal_word() -> (
+    None
+):
     class FailingProvider(RecordingProvider):
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
             self.requests.append(request)
             raise LLMError("ordinary refusal counter update failed")
 
@@ -661,7 +731,9 @@ async def test_stream_uses_intimacy_fallback_for_pre_output_policy_block() -> No
 
 
 @pytest.mark.asyncio
-async def test_complete_streamed_proactively_routes_known_intimacy_enum_boundary() -> None:
+async def test_complete_streamed_proactively_routes_known_intimacy_enum_boundary() -> (
+    None
+):
     primary = RecordingProvider("openai")
     fallback = RecordingProvider("openrouter")
     client = LLMClient(
@@ -689,7 +761,9 @@ async def test_complete_streamed_proactively_routes_known_intimacy_enum_boundary
 
 @pytest.mark.asyncio
 async def test_complete_structured_parses_json_payload() -> None:
-    client = LLMClient(provider_name="json", providers=[JsonProvider('{"label":"ok","score":7}')])
+    client = LLMClient(
+        provider_name="json", providers=[JsonProvider('{"label":"ok","score":7}')]
+    )
 
     payload = await client.complete_structured(_request(), StructuredPayload)
 
@@ -698,9 +772,13 @@ async def test_complete_structured_parses_json_payload() -> None:
 
 @pytest.mark.asyncio
 async def test_complete_structured_with_response_returns_raw_response() -> None:
-    client = LLMClient(provider_name="json", providers=[JsonProvider('{"label":"ok","score":7}')])
+    client = LLMClient(
+        provider_name="json", providers=[JsonProvider('{"label":"ok","score":7}')]
+    )
 
-    result = await client.complete_structured_with_response(_request(), StructuredPayload)
+    result = await client.complete_structured_with_response(
+        _request(), StructuredPayload
+    )
 
     assert result.value == StructuredPayload(label="ok", score=7)
     assert result.response.output_text == '{"label":"ok","score":7}'
@@ -720,7 +798,9 @@ async def test_complete_structured_rejects_invalid_json() -> None:
 async def test_complete_structured_extracts_json_from_fenced_or_prefixed_text() -> None:
     client = LLMClient(
         provider_name="json",
-        providers=[JsonProvider('Here is the payload:\n```json\n{"label":"ok","score":7}\n```')],
+        providers=[
+            JsonProvider('Here is the payload:\n```json\n{"label":"ok","score":7}\n```')
+        ],
     )
 
     payload = await client.complete_structured(_request(), StructuredPayload)
@@ -732,7 +812,11 @@ async def test_complete_structured_extracts_json_from_fenced_or_prefixed_text() 
 async def test_complete_structured_extracts_generic_fence_and_repairs_json() -> None:
     client = LLMClient(
         provider_name="json",
-        providers=[JsonProvider('Here is the payload:\n```\n{"label":"Use {braces}","score":7,}\n```\nDone.')],
+        providers=[
+            JsonProvider(
+                'Here is the payload:\n```\n{"label":"Use {braces}","score":7,}\n```\nDone.'
+            )
+        ],
     )
 
     payload = await client.complete_structured(_request(), StructuredPayload)
@@ -836,12 +920,16 @@ class StreamingSchemaDrop4xxThenJsonProvider(LLMProvider):
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_falls_back_when_provider_rejects_large_grammar() -> None:
+async def test_complete_structured_falls_back_when_provider_rejects_large_grammar() -> (
+    None
+):
     provider = GrammarFallbackProvider()
     client = LLMClient(provider_name="grammar-fallback", providers=[provider])
 
     payload = await client.complete_structured(
-        _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()}),
+        _request().model_copy(
+            update={"response_schema": StructuredPayload.model_json_schema()}
+        ),
         StructuredPayload,
     )
 
@@ -851,12 +939,16 @@ async def test_complete_structured_falls_back_when_provider_rejects_large_gramma
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_falls_back_when_provider_rejects_schema_contract() -> None:
+async def test_complete_structured_falls_back_when_provider_rejects_schema_contract() -> (
+    None
+):
     provider = SchemaFallbackProvider()
     client = LLMClient(provider_name="schema-fallback", providers=[provider])
 
     payload = await client.complete_structured(
-        _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()}),
+        _request().model_copy(
+            update={"response_schema": StructuredPayload.model_json_schema()}
+        ),
         StructuredPayload,
     )
 
@@ -870,7 +962,9 @@ async def test_complete_structured_falls_back_via_prompt_json_on_typed_4xx() -> 
     client = LLMClient(provider_name=provider.name, providers=[provider])
 
     result = await client.complete_structured_with_response(
-        _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()}),
+        _request().model_copy(
+            update={"response_schema": StructuredPayload.model_json_schema()}
+        ),
         StructuredPayload,
     )
 
@@ -888,12 +982,16 @@ async def test_complete_structured_falls_back_via_prompt_json_on_typed_4xx() -> 
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_streamed_falls_back_via_prompt_json_on_typed_4xx() -> None:
+async def test_complete_structured_streamed_falls_back_via_prompt_json_on_typed_4xx() -> (
+    None
+):
     provider = StreamingSchemaDrop4xxThenJsonProvider()
     client = LLMClient(provider_name=provider.name, providers=[provider])
 
     payload = await client.complete_structured_streamed(
-        _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()}),
+        _request().model_copy(
+            update={"response_schema": StructuredPayload.model_json_schema()}
+        ),
         StructuredPayload,
     )
 
@@ -910,8 +1008,14 @@ async def test_complete_structured_streamed_falls_back_via_prompt_json_on_typed_
     assert "label (string)" in instruction
     assert "score (integer)" in instruction
     # The fallback reason is recorded in the trace metadata.
-    assert fallback_request.metadata["atagia_structured_output_schema_drop_fallback"] is True
-    assert fallback_request.metadata["atagia_structured_output_schema_drop_status_code"] == 400
+    assert (
+        fallback_request.metadata["atagia_structured_output_schema_drop_fallback"]
+        is True
+    )
+    assert (
+        fallback_request.metadata["atagia_structured_output_schema_drop_status_code"]
+        == 400
+    )
     assert (
         fallback_request.metadata["atagia_structured_output_schema_drop_reason"]
         == "client_request_error_4xx"
@@ -929,7 +1033,9 @@ async def test_complete_structured_does_not_drop_schema_for_non_request_error() 
 
     with pytest.raises(LLMError, match="schema is too complex"):
         await client.complete_structured(
-            _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()}),
+            _request().model_copy(
+                update={"response_schema": StructuredPayload.model_json_schema()}
+            ),
             StructuredPayload,
         )
 
@@ -938,12 +1044,16 @@ async def test_complete_structured_does_not_drop_schema_for_non_request_error() 
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_prompts_json_for_provider_without_native_schema() -> None:
+async def test_complete_structured_prompts_json_for_provider_without_native_schema() -> (
+    None
+):
     provider = PromptStructuredProvider()
     client = LLMClient(provider_name="prompt-structured", providers=[provider])
 
     result = await client.complete_structured_with_response(
-        _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()}),
+        _request().model_copy(
+            update={"response_schema": StructuredPayload.model_json_schema()}
+        ),
         StructuredPayload,
     )
 
@@ -976,7 +1086,9 @@ async def test_complete_structured_uses_model_aware_native_schema_support() -> N
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_falls_back_for_model_without_native_schema_support() -> None:
+async def test_complete_structured_falls_back_for_model_without_native_schema_support() -> (
+    None
+):
     provider = VendorAwareStructuredProvider()
     client = LLMClient(providers=[provider])
 
@@ -1099,7 +1211,9 @@ async def test_complete_structured_can_disable_same_model_retry() -> None:
 
     with pytest.raises(StructuredOutputError):
         await client.complete_structured(
-            _request().model_copy(update={"model": "openrouter/deepseek/deepseek-v4-flash"}),
+            _request().model_copy(
+                update={"model": "openrouter/deepseek/deepseek-v4-flash"}
+            ),
             StructuredPayload,
         )
 
@@ -1108,7 +1222,9 @@ async def test_complete_structured_can_disable_same_model_retry() -> None:
 
 @pytest.mark.parametrize("status_code", [400, 404, 422, 499])
 def test_should_retry_without_schema_for_client_request_4xx(status_code: int) -> None:
-    request = _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()})
+    request = _request().model_copy(
+        update={"response_schema": StructuredPayload.model_json_schema()}
+    )
 
     assert LLMClient._should_retry_without_schema(
         LLMRequestError("client error", status_code=status_code),
@@ -1117,7 +1233,9 @@ def test_should_retry_without_schema_for_client_request_4xx(status_code: int) ->
 
 
 def test_should_not_retry_without_schema_for_non_request_error() -> None:
-    request = _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()})
+    request = _request().model_copy(
+        update={"response_schema": StructuredPayload.model_json_schema()}
+    )
 
     assert not LLMClient._should_retry_without_schema(
         LLMError("400 invalid_request_error: schema is too complex"),
@@ -1126,7 +1244,9 @@ def test_should_not_retry_without_schema_for_non_request_error() -> None:
 
 
 def test_should_not_retry_without_schema_for_5xx_request_error() -> None:
-    request = _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()})
+    request = _request().model_copy(
+        update={"response_schema": StructuredPayload.model_json_schema()}
+    )
 
     assert not LLMClient._should_retry_without_schema(
         LLMRequestError("server error", status_code=500),
@@ -1144,7 +1264,9 @@ def test_should_not_retry_without_schema_when_schema_already_dropped() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_normalizes_legacy_extraction_payload_shapes() -> None:
+async def test_complete_structured_normalizes_legacy_extraction_payload_shapes() -> (
+    None
+):
     client = LLMClient(
         provider_name="json",
         providers=[
@@ -1165,7 +1287,9 @@ async def test_complete_structured_normalizes_legacy_extraction_payload_shapes()
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_normalizes_legacy_belief_claims_and_downgrades_invalid_ones() -> None:
+async def test_complete_structured_normalizes_legacy_belief_claims_and_downgrades_invalid_ones() -> (
+    None
+):
     client = LLMClient(
         provider_name="json",
         providers=[
@@ -1191,7 +1315,9 @@ async def test_complete_structured_normalizes_legacy_belief_claims_and_downgrade
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_defaults_legacy_item_confidence_when_missing() -> None:
+async def test_complete_structured_defaults_legacy_item_confidence_when_missing() -> (
+    None
+):
     client = LLMClient(
         provider_name="json",
         providers=[
@@ -1210,7 +1336,9 @@ async def test_complete_structured_defaults_legacy_item_confidence_when_missing(
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_retries_non_extraction_validation_errors_once() -> None:
+async def test_complete_structured_retries_non_extraction_validation_errors_once() -> (
+    None
+):
     provider = JsonProvider('{"label":"ok"}')
     client = LLMClient(provider_name="json", providers=[provider])
 
@@ -1239,15 +1367,21 @@ async def test_missing_provider_raises_configuration_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_routes_provider_qualified_model_and_applies_openai_profile() -> None:
+async def test_complete_routes_provider_qualified_model_and_applies_openai_profile() -> (
+    None
+):
     provider = RecordingProvider("openai")
     client = LLMClient(providers=[provider])
 
-    await client.complete(_request().model_copy(update={"model": "openai/gpt-5-mini,high"}))
+    await client.complete(
+        _request().model_copy(update={"model": "openai/gpt-5-mini,high"})
+    )
 
     assert provider.requests[0].model == "gpt-5-mini"
     assert provider.requests[0].metadata["reasoning_effort"] == "high"
-    assert provider.requests[0].metadata["atagia_canonical_model"] == "openai/gpt-5-mini"
+    assert (
+        provider.requests[0].metadata["atagia_canonical_model"] == "openai/gpt-5-mini"
+    )
 
 
 @pytest.mark.asyncio
@@ -1272,7 +1406,9 @@ async def test_complete_applies_gemini_profile_without_exposing_thinking() -> No
 
 
 @pytest.mark.asyncio
-async def test_complete_applies_purpose_temperature_when_request_omits_temperature() -> None:
+async def test_complete_applies_purpose_temperature_when_request_omits_temperature() -> (
+    None
+):
     provider = RecordingProvider("openrouter")
     client = LLMClient(providers=[provider])
 
@@ -1286,12 +1422,19 @@ async def test_complete_applies_purpose_temperature_when_request_omits_temperatu
     )
 
     assert provider.requests[0].temperature == 1.0
-    assert provider.requests[0].metadata["atagia_temperature_source"] == "purpose_default"
-    assert provider.requests[0].metadata["atagia_temperature_reason"] == "chat answer generation"
+    assert (
+        provider.requests[0].metadata["atagia_temperature_source"] == "purpose_default"
+    )
+    assert (
+        provider.requests[0].metadata["atagia_temperature_reason"]
+        == "chat answer generation"
+    )
 
 
 @pytest.mark.asyncio
-async def test_complete_applies_low_mechanical_temperature_for_verifier_purpose() -> None:
+async def test_complete_applies_low_mechanical_temperature_for_verifier_purpose() -> (
+    None
+):
     provider = RecordingProvider("openrouter")
     client = LLMClient(providers=[provider])
 
@@ -1305,7 +1448,10 @@ async def test_complete_applies_low_mechanical_temperature_for_verifier_purpose(
     )
 
     assert provider.requests[0].temperature == 0.2
-    assert provider.requests[0].metadata["atagia_temperature_reason"] == "mechanical verifier/classifier"
+    assert (
+        provider.requests[0].metadata["atagia_temperature_reason"]
+        == "mechanical verifier/classifier"
+    )
 
 
 @pytest.mark.asyncio
@@ -1396,11 +1542,15 @@ async def test_complete_applies_openrouter_flashlite_profile_after_resolution() 
         provider.requests[0].metadata["atagia_temperature_source"]
         == "request+minimum_floor+model_floor"
     )
-    assert provider.requests[0].metadata["provider_extra_body"] == {"reasoning": {"effort": "minimal"}}
+    assert provider.requests[0].metadata["provider_extra_body"] == {
+        "reasoning": {"effort": "minimal"}
+    }
 
 
 @pytest.mark.asyncio
-async def test_complete_applies_openrouter_minimax_m3_profile_after_resolution() -> None:
+async def test_complete_applies_openrouter_minimax_m3_profile_after_resolution() -> (
+    None
+):
     provider = RecordingProvider("openrouter")
     client = LLMClient(providers=[provider])
 
@@ -1438,7 +1588,9 @@ async def test_complete_routes_direct_minimax_m3_after_resolution() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_routes_direct_minimax_m27_highspeed_with_thinking_disabled() -> None:
+async def test_complete_routes_direct_minimax_m27_highspeed_with_thinking_disabled() -> (
+    None
+):
     provider = RecordingProvider("minimax")
     client = LLMClient(providers=[provider])
 
@@ -1472,8 +1624,14 @@ async def test_complete_omits_temperature_for_direct_kimi_k27_code() -> None:
 
     assert provider.requests[0].model == "kimi-k2.7-code"
     assert provider.requests[0].temperature is None
-    assert provider.requests[0].metadata["atagia_temperature_source"] == "model_profile_omitted"
-    assert provider.requests[0].metadata["atagia_temperature_reason"] == "kimi/kimi-k2.7-code"
+    assert (
+        provider.requests[0].metadata["atagia_temperature_source"]
+        == "model_profile_omitted"
+    )
+    assert (
+        provider.requests[0].metadata["atagia_temperature_reason"]
+        == "kimi/kimi-k2.7-code"
+    )
 
 
 @pytest.mark.asyncio
@@ -1492,7 +1650,10 @@ async def test_complete_omits_temperature_for_direct_kimi_k27_code_highspeed() -
 
     assert provider.requests[0].model == "kimi-k2.7-code-highspeed"
     assert provider.requests[0].temperature is None
-    assert provider.requests[0].metadata["atagia_temperature_source"] == "model_profile_omitted"
+    assert (
+        provider.requests[0].metadata["atagia_temperature_source"]
+        == "model_profile_omitted"
+    )
     assert (
         provider.requests[0].metadata["atagia_temperature_reason"]
         == "kimi/kimi-k2.7-code-highspeed"
@@ -1504,7 +1665,9 @@ async def test_complete_applies_local_qwen_sampling_profile() -> None:
     provider = RecordingProvider("openai")
     client = LLMClient(providers=[provider])
 
-    await client.complete(_request().model_copy(update={"model": "openai/qwen3-coder:30b"}))
+    await client.complete(
+        _request().model_copy(update={"model": "openai/qwen3-coder:30b"})
+    )
 
     assert provider.requests[0].model == "qwen3-coder:30b"
     assert provider.requests[0].temperature == 0.7
@@ -1523,7 +1686,9 @@ async def test_complete_applies_anthropic_opus_47_effort_profile() -> None:
     provider = RecordingProvider("anthropic")
     client = LLMClient(providers=[provider])
 
-    await client.complete(_request().model_copy(update={"model": "anthropic/claude-opus-4-7,high"}))
+    await client.complete(
+        _request().model_copy(update={"model": "anthropic/claude-opus-4-7,high"})
+    )
 
     assert provider.requests[0].model == "claude-opus-4-7"
     assert provider.requests[0].metadata["anthropic_thinking_adaptive"] is True
@@ -1535,10 +1700,14 @@ async def test_complete_applies_openrouter_gpt55_reasoning_profile() -> None:
     provider = RecordingProvider("openrouter")
     client = LLMClient(providers=[provider])
 
-    await client.complete(_request().model_copy(update={"model": "openrouter/openai/gpt-5.5,high"}))
+    await client.complete(
+        _request().model_copy(update={"model": "openrouter/openai/gpt-5.5,high"})
+    )
 
     assert provider.requests[0].model == "openai/gpt-5.5"
-    assert provider.requests[0].metadata["provider_extra_body"] == {"reasoning": {"effort": "high"}}
+    assert provider.requests[0].metadata["provider_extra_body"] == {
+        "reasoning": {"effort": "high"}
+    }
 
 
 @pytest.mark.asyncio
@@ -1567,7 +1736,9 @@ async def test_complete_applies_openrouter_native_structured_profile(
 
 
 @pytest.mark.asyncio
-async def test_complete_rejects_unqualified_model_without_explicit_test_escape() -> None:
+async def test_complete_rejects_unqualified_model_without_explicit_test_escape() -> (
+    None
+):
     provider = RecordingProvider("openai")
     client = LLMClient(providers=[provider])
 
@@ -1611,7 +1782,9 @@ async def test_stream_does_not_retry_after_partial_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_structured_streamed_retries_partial_stream_when_extraction_opts_in() -> None:
+async def test_complete_structured_streamed_retries_partial_stream_when_extraction_opts_in() -> (
+    None
+):
     provider = PartialTransientThenJsonProvider()
     observer = ResetRecordingObserver()
     client = LLMClient(
@@ -1670,12 +1843,18 @@ async def test_complete_recovers_once_from_output_limit_by_default() -> None:
     assert retry_request.metadata["atagia_technical_recovery_retry"] is True
     assert retry_request.metadata["atagia_technical_recovery_retry_attempt"] == 1
     assert "output limit" in retry_request.messages[-1].content
-    assert response.raw_response["atagia_technical_recovery"]["operation"] == "completion"
-    assert response.raw_response["atagia_technical_recovery"]["finish_reason"] == "length"
+    assert (
+        response.raw_response["atagia_technical_recovery"]["operation"] == "completion"
+    )
+    assert (
+        response.raw_response["atagia_technical_recovery"]["finish_reason"] == "length"
+    )
 
 
 @pytest.mark.asyncio
-async def test_complete_can_disable_technical_recovery_for_raw_provider_checks() -> None:
+async def test_complete_can_disable_technical_recovery_for_raw_provider_checks() -> (
+    None
+):
     provider = OutputLimitThenSuccessProvider()
     client = LLMClient(
         provider_name=provider.name,
@@ -1689,7 +1868,9 @@ async def test_complete_can_disable_technical_recovery_for_raw_provider_checks()
 
 
 @pytest.mark.asyncio
-async def test_complete_streamed_recovers_from_mechanical_runaway_when_enabled() -> None:
+async def test_complete_streamed_recovers_from_mechanical_runaway_when_enabled() -> (
+    None
+):
     provider = RunawayThenSuccessProvider()
     run_counters = RunCounterAccumulator()
     client = LLMClient(
@@ -1782,7 +1963,9 @@ async def test_complete_structured_streamed_preserves_schema_fallback() -> None:
     client = LLMClient(provider_name=provider.name, providers=[provider])
 
     payload = await client.complete_structured_streamed(
-        _request().model_copy(update={"response_schema": StructuredPayload.model_json_schema()}),
+        _request().model_copy(
+            update={"response_schema": StructuredPayload.model_json_schema()}
+        ),
         StructuredPayload,
     )
 
@@ -1875,7 +2058,9 @@ async def test_unset_purpose_keeps_injected_retry_policy() -> None:
 
 
 @pytest.mark.asyncio
-async def test_retry_after_delay_is_honored_and_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_retry_after_delay_is_honored_and_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provider = AlwaysTransientProvider()
     sleeps: list[float] = []
 
@@ -1885,7 +2070,9 @@ async def test_retry_after_delay_is_honored_and_capped(monkeypatch: pytest.Monke
     monkeypatch.setattr("atagia.services.llm_client.asyncio.sleep", fake_sleep)
 
     class RetryAfterProvider(AlwaysTransientProvider):
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
             self.calls += 1
             raise TransientLLMError("rate limited", retry_after_seconds=9.0)
 
@@ -1946,7 +2133,9 @@ async def _assert_long_retry_after_propagates_without_sleep(
     monkeypatch.setattr("atagia.services.llm_client.asyncio.sleep", fake_sleep)
 
     class RetryAfterProvider(AlwaysTransientProvider):
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
             self.calls += 1
             raise TransientLLMError("rate limited", retry_after_seconds=60.0)
 
@@ -1998,8 +2187,16 @@ def test_retry_policy_for_resolves_interactive_and_default() -> None:
         interactive_retry_policy=interactive,
     )
 
-    assert client._retry_policy_for(_purpose_request("applicability_scoring")) is interactive
-    assert client._retry_policy_for(_purpose_request("context_cache_signal_detection")) is interactive
-    assert client._retry_policy_for(_purpose_request("coverage_expansion")) is interactive
+    assert (
+        client._retry_policy_for(_purpose_request("applicability_scoring"))
+        is interactive
+    )
+    assert (
+        client._retry_policy_for(_purpose_request("context_cache_signal_detection"))
+        is interactive
+    )
+    assert (
+        client._retry_policy_for(_purpose_request("coverage_expansion")) is interactive
+    )
     assert client._retry_policy_for(_purpose_request("memory_extraction")) is base
     assert client._retry_policy_for(_request()) is base

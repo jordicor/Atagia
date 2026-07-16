@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 from atagia.services.providers import build_llm_client
 from atagia.services.providers.kimi import KimiProvider
 
@@ -23,8 +23,8 @@ def test_kimi_default_base_url_and_factory_wiring(monkeypatch) -> None:
 
     settings = Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         openai_api_key=None,

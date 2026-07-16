@@ -113,6 +113,8 @@ class ArtifactPayloadRepository(BaseRepository):
         status: str = "ready",
         commit: bool = True,
     ) -> dict[str, Any]:
+        if storage_kind == "local_file":
+            raise ValueError("local_file artifact storage is retired; use sqlite_blob")
         resolved_id = payload_blob_id or generate_prefixed_id("apb")
         timestamp = self._timestamp()
         await self._connection.execute(

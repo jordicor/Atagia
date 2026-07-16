@@ -31,8 +31,8 @@ from atagia.services.llm_client import (
 )
 from tests.memory.card_leak_guard import assert_prompt_has_no_benchmark_leak
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 _LANGUAGE_PROFILE_CARD_PURPOSES = {
     "user_language_profile_observed_card",

@@ -8,7 +8,14 @@ from fastapi import APIRouter, Header, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from atagia.api.dependencies import get_runtime, get_settings
+from atagia.core.mind_repository import MindNotFoundError
+from atagia.api.dependencies import (
+    AuthContext,
+    get_runtime,
+    get_settings,
+    ordinary_http_authority_context,
+    reject_duplicate_singleton_headers,
+)
 from atagia.models.schemas_openai_proxy import (
     OpenAIChatCompletionRequest,
     OpenAIModelList,
@@ -20,6 +27,8 @@ from atagia.memory.operational_profile import (
 from atagia.services.errors import (
     AssistantModeMismatchError,
     ConversationNotFoundError,
+    MessageIdConflictError,
+    SourceSequenceConflictError,
     ConversationNotActiveError,
     UnknownAssistantModeError,
     UserDeletedError,
@@ -28,16 +37,44 @@ from atagia.services.errors import (
 )
 from atagia.services.llm_client import LLMError
 from atagia.services.openai_proxy_service import OpenAIProxyService
+from atagia.services.openai_proxy_contract import OpenAIProxyProtocolError
+from atagia.services.request_controls import reject_remote_authority_claims
+from atagia.services.request_budgets import (
+    RequestBudgetExceededError,
+    RequestPayloadStructureError,
+)
 
 
 router = APIRouter(prefix="/v1", tags=["openai-compatible"])
 
-
-@dataclass(frozen=True, slots=True)
-class OpenAIProxyAuth:
-    """Authentication result for OpenAI-compatible proxy requests."""
-
-    claimed_user_id: str | None
+_PROXY_SINGLETON_HEADERS = (
+    "Authorization",
+    "X-Atagia-User-Id",
+    "X-Atagia-Conversation-Id",
+    "X-Atagia-Assistant-Mode",
+    "X-Atagia-Mode",
+    "X-Atagia-Workspace-Id",
+    "X-Atagia-User-Persona-Id",
+    "X-Atagia-Platform-Id",
+    "X-Atagia-Character-Id",
+    "X-Atagia-Active-Presence-Id",
+    "X-Atagia-Mind-Id",
+    "X-Atagia-Mind-Topology",
+    "X-Atagia-Embodiment-Id",
+    "X-Atagia-Realm-Id",
+    "X-Atagia-Space-Id",
+    "X-Atagia-Incognito",
+    "X-Atagia-Cross-Chat-Memory",
+    "X-Atagia-Message-Id",
+    "X-Atagia-Source-Seq",
+    "X-Atagia-Response-Message-Id",
+    "X-Atagia-Response-Source-Seq",
+    "X-Atagia-Ingest-Origin",
+    "X-Atagia-Confirmation-Strategy",
+    "X-Atagia-Memory-Privacy-Mode",
+    "X-Atagia-Response-Mode",
+    "X-Atagia-Adaptive-Retrieval",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,9 +95,11 @@ def _openai_error_response(
     error_type: str = "invalid_request_error",
     param: str | None = None,
     code: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
+        headers=headers,
         content={
             "error": {
                 "message": message,
@@ -82,10 +121,26 @@ def _route_error_response(exc: OpenAIProxyRouteError) -> JSONResponse:
     )
 
 
+def _protocol_error_response(exc: OpenAIProxyProtocolError) -> JSONResponse:
+    headers = None
+    if exc.retry_after_seconds is not None:
+        headers = {"Retry-After": str(max(0, int(exc.retry_after_seconds)))}
+    return _openai_error_response(
+        exc.status_code,
+        exc.message,
+        error_type=exc.error_type,
+        param=exc.param,
+        code=exc.code,
+        headers=headers,
+    )
+
+
 def openai_proxy_validation_error_response(exc: RequestValidationError) -> JSONResponse:
     first_error = exc.errors()[0] if exc.errors() else {}
     location = first_error.get("loc") or ()
-    param = ".".join(str(part) for part in location if part not in {"body", "query", "header"})
+    param = ".".join(
+        str(part) for part in location if part not in {"body", "query", "header"}
+    )
     message = str(first_error.get("msg") or "Invalid request")
     return _openai_error_response(
         422,
@@ -118,13 +173,16 @@ def _authenticate_proxy(
     request: Request,
     authorization: str | None,
     x_atagia_user_id: str | None,
-) -> OpenAIProxyAuth:
+) -> AuthContext:
     settings = get_settings(request)
     if not settings.service_mode:
-        return OpenAIProxyAuth(
+        return AuthContext(
+            service_mode=False,
+            is_admin=False,
+            actor_id="library_mode",
             claimed_user_id=x_atagia_user_id.strip()
             if x_atagia_user_id and x_atagia_user_id.strip()
-            else None
+            else None,
         )
     if settings.service_api_key is None:
         raise OpenAIProxyRouteError(
@@ -141,10 +199,14 @@ def _authenticate_proxy(
             error_type="authentication_error",
             code="invalid_api_key",
         )
-    return OpenAIProxyAuth(
+    return AuthContext(
+        service_mode=True,
+        is_admin=False,
+        actor_id="service_api_key",
+        api_key=token,
         claimed_user_id=x_atagia_user_id.strip()
         if x_atagia_user_id and x_atagia_user_id.strip()
-        else None
+        else None,
     )
 
 
@@ -155,7 +217,13 @@ async def list_openai_proxy_models(
     x_atagia_user_id: str | None = Header(default=None, alias="X-Atagia-User-Id"),
 ) -> OpenAIModelList:
     try:
+        reject_duplicate_singleton_headers(
+            request,
+            ("Authorization", "X-Atagia-User-Id"),
+        )
         _authenticate_proxy(request, authorization, x_atagia_user_id)
+    except ValueError as exc:
+        return _openai_error_response(status.HTTP_400_BAD_REQUEST, str(exc))
     except OpenAIProxyRouteError as exc:
         return _route_error_response(exc)
     return OpenAIProxyService(get_runtime(request)).list_models()
@@ -262,9 +330,30 @@ async def create_openai_proxy_chat_completion(
     ),
 ):
     try:
+        reject_duplicate_singleton_headers(request, _PROXY_SINGLETON_HEADERS)
         auth = _authenticate_proxy(request, authorization, x_atagia_user_id)
+    except ValueError as exc:
+        return _openai_error_response(status.HTTP_400_BAD_REQUEST, str(exc))
     except OpenAIProxyRouteError as exc:
         return _route_error_response(exc)
+    try:
+        reject_remote_authority_claims(
+            metadata=payload.metadata,
+            extra_fields=payload.model_extra,
+            headers=request.headers,
+        )
+    except OpenAIProxyProtocolError as exc:
+        return _protocol_error_response(exc)
+    except ValueError as exc:
+        return _openai_error_response(
+            status.HTTP_400_BAD_REQUEST,
+            str(exc),
+        )
+    authority_context = ordinary_http_authority_context(
+        auth,
+        user_id=auth.claimed_user_id,
+        purpose="openai_proxy",
+    )
     service = OpenAIProxyService(get_runtime(request))
     try:
         if payload.stream:
@@ -284,8 +373,10 @@ async def create_openai_proxy_chat_completion(
                 embodiment_id_header=x_atagia_embodiment_id,
                 realm_id_header=x_atagia_realm_id,
                 space_id_header=x_atagia_space_id,
-                incognito_header=x_atagia_incognito,
-                cross_chat_memory_header=x_atagia_cross_chat_memory,
+                incognito_header=request.headers.getlist("X-Atagia-Incognito"),
+                cross_chat_memory_header=request.headers.getlist(
+                    "X-Atagia-Cross-Chat-Memory"
+                ),
                 message_id_header=x_atagia_message_id,
                 source_seq_header=x_atagia_source_seq,
                 response_message_id_header=x_atagia_response_message_id,
@@ -295,6 +386,7 @@ async def create_openai_proxy_chat_completion(
                 memory_privacy_mode_header=x_atagia_memory_privacy_mode,
                 response_mode_header=x_atagia_response_mode,
                 adaptive_retrieval_header=x_atagia_adaptive_retrieval,
+                prompt_authority_context=authority_context,
             )
             return StreamingResponse(
                 stream,
@@ -320,8 +412,10 @@ async def create_openai_proxy_chat_completion(
             embodiment_id_header=x_atagia_embodiment_id,
             realm_id_header=x_atagia_realm_id,
             space_id_header=x_atagia_space_id,
-            incognito_header=x_atagia_incognito,
-            cross_chat_memory_header=x_atagia_cross_chat_memory,
+            incognito_header=request.headers.getlist("X-Atagia-Incognito"),
+            cross_chat_memory_header=request.headers.getlist(
+                "X-Atagia-Cross-Chat-Memory"
+            ),
             message_id_header=x_atagia_message_id,
             source_seq_header=x_atagia_source_seq,
             response_message_id_header=x_atagia_response_message_id,
@@ -331,6 +425,29 @@ async def create_openai_proxy_chat_completion(
             memory_privacy_mode_header=x_atagia_memory_privacy_mode,
             response_mode_header=x_atagia_response_mode,
             adaptive_retrieval_header=x_atagia_adaptive_retrieval,
+            prompt_authority_context=authority_context,
+        )
+    except RequestBudgetExceededError as exc:
+        return _openai_error_response(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            str(exc),
+            param=exc.field,
+            code="request_too_large",
+        )
+    except RequestPayloadStructureError as exc:
+        return _openai_error_response(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            str(exc),
+            param=exc.field,
+            code="invalid_request_structure",
+        )
+    except OpenAIProxyProtocolError as exc:
+        return _protocol_error_response(exc)
+    except MindNotFoundError as exc:
+        return _openai_error_response(
+            status.HTTP_404_NOT_FOUND,
+            str(exc),
+            code="mind_not_found",
         )
     except ValueError as exc:
         return _openai_error_response(
@@ -347,19 +464,59 @@ async def create_openai_proxy_chat_completion(
             code="llm_unavailable",
         )
     except ConversationNotFoundError as exc:
-        return _openai_error_response(status.HTTP_404_NOT_FOUND, str(exc))
+        return _openai_error_response(
+            status.HTTP_404_NOT_FOUND,
+            str(exc),
+            code="conversation_not_found",
+        )
     except WorkspaceNotFoundError as exc:
-        return _openai_error_response(status.HTTP_404_NOT_FOUND, str(exc))
+        return _openai_error_response(
+            status.HTTP_404_NOT_FOUND,
+            str(exc),
+            code="workspace_not_found",
+        )
     except UnknownAssistantModeError as exc:
-        return _openai_error_response(status.HTTP_404_NOT_FOUND, str(exc))
+        return _openai_error_response(
+            status.HTTP_404_NOT_FOUND,
+            str(exc),
+            code="assistant_mode_not_found",
+        )
     except UnknownOperationalProfileError as exc:
-        return _openai_error_response(status.HTTP_404_NOT_FOUND, str(exc))
+        return _openai_error_response(
+            status.HTTP_404_NOT_FOUND,
+            str(exc),
+            code="operational_profile_not_found",
+        )
     except OperationalProfileNotAuthorizedError as exc:
-        return _openai_error_response(status.HTTP_403_FORBIDDEN, str(exc))
+        return _openai_error_response(
+            status.HTTP_403_FORBIDDEN,
+            str(exc),
+            code="operational_profile_not_authorized",
+        )
     except AssistantModeMismatchError as exc:
-        return _openai_error_response(status.HTTP_409_CONFLICT, str(exc))
+        return _openai_error_response(
+            status.HTTP_409_CONFLICT,
+            str(exc),
+            code="assistant_mode_conflict",
+        )
     except WorkspaceMismatchError as exc:
-        return _openai_error_response(status.HTTP_409_CONFLICT, str(exc))
+        return _openai_error_response(
+            status.HTTP_409_CONFLICT,
+            str(exc),
+            code="workspace_conflict",
+        )
+    except MessageIdConflictError as exc:
+        return _openai_error_response(
+            status.HTTP_409_CONFLICT,
+            str(exc),
+            code="message_id_conflict",
+        )
+    except SourceSequenceConflictError as exc:
+        return _openai_error_response(
+            status.HTTP_409_CONFLICT,
+            str(exc),
+            code="source_sequence_conflict",
+        )
     except (ConversationNotActiveError, UserDeletedError) as exc:
         return _openai_error_response(
             (

@@ -87,6 +87,7 @@ class ScoreResult(BaseModel):
     score: int = Field(ge=0, le=1)
     reasoning: str
     judge_model: str
+    protocol: str | None = None
 
 
 class QuestionResult(BaseModel):

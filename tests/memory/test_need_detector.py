@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from atagia.core.clock import FrozenClock
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 from atagia.memory.card_prompt import compose_card_prompt
 from atagia.memory.need_detector import _CARD_NAMES, _card_task, NeedDetector
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
@@ -27,16 +27,9 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
-from benchmarks.need_detection_cards.__main__ import (
-    _NAKED_CARD_NAMES,
-    _case_set,
-    _naked_card_request,
-    CardModelSpec,
-    NeedCardCase,
-)
 from tests.memory.card_leak_guard import assert_prompt_has_no_benchmark_leak_in_cases
 
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 class CannedCardProvider(LLMProvider):
@@ -92,8 +85,8 @@ def _settings(
 ) -> Settings:
     return Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         openai_api_key=None,
@@ -375,6 +368,13 @@ def _harness_card_prompt() -> str:
     # engine injects from the case (reference time, recent context, language
     # profile) is benchmark-agnostic metadata, not an answer key, so the dummy
     # case keeps it empty/neutral.
+    from benchmarks.need_detection_cards.__main__ import (
+        _NAKED_CARD_NAMES,
+        _naked_card_request,
+        CardModelSpec,
+        NeedCardCase,
+    )
+
     dummy_case = NeedCardCase(
         case_id="leak_guard_dummy",
         category="leak_guard",
@@ -408,13 +408,18 @@ def test_need_card_prompts_do_not_leak_shadow_benchmark_content() -> None:
     # The engine builder (_card_task) is the canonical leak surface; the harness
     # now composes through the same engine path (_naked_card_request ->
     # NeedDetector._card_request), so the second check guards the prompt the
-    # benchmark actually grades.
+    # benchmark actually grades. The card harness ships only with the private
+    # checkout, so this guard skips visibly when it is absent.
+    harness = pytest.importorskip(
+        "benchmarks.need_detection_cards.__main__",
+        reason="need-detection card harness is not present in this checkout",
+    )
     engine_prompt = "\n".join(
         compose_card_prompt(instruction, examples, include_examples=True)
         for instruction, examples, _max_output_tokens in (
             _card_task(card_name) for card_name in _CARD_NAMES
         )
     )
-    cases = [asdict(case) for case in _case_set()]
+    cases = [asdict(case) for case in harness._case_set()]
     assert_prompt_has_no_benchmark_leak_in_cases(engine_prompt, cases)
     assert_prompt_has_no_benchmark_leak_in_cases(_harness_card_prompt(), cases)

@@ -22,6 +22,7 @@ from atagia.core.repositories import (
     UserRepository,
 )
 from atagia.core.summary_repository import SummaryRepository
+from atagia.core.storage_backend import InProcessBackend
 from atagia.models.schemas_memory import (
     ConversationStatus,
     MemoryCategory,
@@ -33,6 +34,7 @@ from atagia.models.schemas_memory import (
     SummaryViewKind,
 )
 from atagia.services.lifecycle_service import ConversationLifecycleService
+from atagia.services.errors import ConversationNotActiveError, UserDeletedError
 from atagia.services.llm_client import (
     ConfigurationError,
     LLMClient,
@@ -42,9 +44,37 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
+from atagia.services.selected_transcript_service import SelectedTranscriptService
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
+
+
+class _ApiFlakyErasureBackend(InProcessBackend):
+    __slots__ = ("fail_revoke",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_revoke = True
+
+    async def revoke_lifecycle_and_purge_notifications(
+        self,
+        lifecycle_cleanup_key: str,
+        lifecycle_epoch: str,
+        *,
+        group_name: str,
+    ) -> int:
+        if self.fail_revoke:
+            raise ConnectionError("injected erasure backend outage")
+        return await super().revoke_lifecycle_and_purge_notifications(
+            lifecycle_cleanup_key,
+            lifecycle_epoch,
+            group_name=group_name,
+        )
 
 
 def _is_need_detection_card_purpose(purpose: object) -> bool:
@@ -192,16 +222,96 @@ def test_create_conversation_accepts_redesign_identity_fields(tmp_path: Path) ->
         assert payload["incognito"] == 1
         assert payload["isolated_mode"] == 1
 
-        mismatch = client.post(
+        omitted_hints = client.post(
             "/v1/conversations",
             json={
                 "user_id": "usr_1",
                 "conversation_id": "cnv_identity",
-                "platform_id": "web_desktop",
                 "mode": "coding_debug",
             },
         )
-        assert mismatch.status_code == 404
+        assert omitted_hints.status_code == 200
+
+        for field_name, value in (
+            ("user_persona_id", "persona_a"),
+            ("platform_id", "web_desktop"),
+            ("character_id", "char_debugger"),
+        ):
+            matching = client.post(
+                "/v1/conversations",
+                json={
+                    "user_id": "usr_1",
+                    "conversation_id": "cnv_identity",
+                    "mode": "coding_debug",
+                    field_name: value,
+                },
+            )
+            assert matching.status_code == 200
+
+            mismatch = client.post(
+                "/v1/conversations",
+                json={
+                    "user_id": "usr_1",
+                    "conversation_id": "cnv_identity",
+                    "mode": "coding_debug",
+                    field_name: f"conflicting-{field_name}",
+                },
+            )
+            assert mismatch.status_code == 404
+            assert mismatch.json()["detail"] == "Conversation not found for user"
+
+
+def test_create_conversation_applies_header_memory_scope(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/conversations",
+            headers={
+                "X-Atagia-Incognito": "true",
+                "X-Atagia-Cross-Chat-Memory": "true",
+            },
+            json={
+                "user_id": "usr_header_scope",
+                "conversation_id": "cnv_header_scope",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["incognito"] == 1
+        assert response.json()["isolated_mode"] == 1
+
+
+def test_create_conversation_rejects_invalid_or_conflicting_scope_claims(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        invalid = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_scope_invalid",
+                "conversation_id": "cnv_scope_invalid",
+                "cross_chat_memory": "sometimes",
+            },
+        )
+        conflicting = client.post(
+            "/v1/conversations",
+            json={
+                "user_id": "usr_scope_conflict",
+                "conversation_id": "cnv_scope_conflict",
+                "cross_chat_memory": False,
+                "metadata": {"atagia_cross_chat_memory": True},
+            },
+        )
+
+        assert invalid.status_code == 400
+        assert invalid.json()["detail"] == (
+            "Invalid boolean for cross_chat_memory from typed.cross_chat_memory"
+        )
+        assert conflicting.status_code == 400
+        assert conflicting.json()["detail"] == (
+            "Conflicting cross_chat_memory values across request sources"
+        )
 
 
 def test_memory_preferences_routes_round_trip(tmp_path: Path) -> None:
@@ -449,7 +559,9 @@ def test_create_conversation_reuses_existing_when_scope_matches(tmp_path: Path) 
         assert second.json()["metadata_json"] == {"source": "api"}
 
 
-def test_create_conversation_reuses_existing_conversation_with_new_mode(tmp_path: Path) -> None:
+def test_create_conversation_reuses_existing_conversation_with_new_mode(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         created = client.post(
@@ -481,7 +593,9 @@ def test_create_conversation_reuses_existing_conversation_with_new_mode(tmp_path
         assert response.json()["assistant_mode_id"] == "coding_debug"
 
 
-def test_create_conversation_rejects_existing_workspace_mismatch(tmp_path: Path) -> None:
+def test_create_conversation_rejects_existing_workspace_mismatch(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         workspace_a = client.post(
@@ -573,7 +687,9 @@ def test_create_app_rejects_insecure_http_by_default(tmp_path: Path) -> None:
         create_app(_settings(tmp_path, service_mode=False, allow_insecure_http=False))
 
 
-def test_sidecar_context_unknown_operational_profile_returns_404(tmp_path: Path) -> None:
+def test_sidecar_context_unknown_operational_profile_returns_404(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         conversation = client.post(
@@ -600,7 +716,9 @@ def test_sidecar_context_unknown_operational_profile_returns_404(tmp_path: Path)
         assert "Unknown operational profile" in response.json()["detail"]
 
 
-def test_sidecar_context_high_risk_operational_profile_requires_opt_in(tmp_path: Path) -> None:
+def test_sidecar_context_high_risk_operational_profile_requires_opt_in(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         conversation = client.post(
@@ -720,7 +838,9 @@ def test_pending_memory_confirmation_routes_list_and_confirm(tmp_path: Path) -> 
         ).json()
 
         with _connection(client) as connection:
-            memories = MemoryObjectRepository(connection, client.app.state.runtime.clock)
+            memories = MemoryObjectRepository(
+                connection, client.app.state.runtime.clock
+            )
             confirmations = PendingMemoryConfirmationRepository(
                 connection,
                 client.app.state.runtime.clock,
@@ -1005,7 +1125,9 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
             chunk_rows = client.portal.call(chunk_cursor.fetchall)
             assert chunk_rows
             assert all("SGVsbG8sIHdvcmxkIQ==" not in row["text"] for row in chunk_rows)
-            assert {row["intimacy_boundary"] for row in chunk_rows} == {"romantic_private"}
+            assert {row["intimacy_boundary"] for row in chunk_rows} == {
+                "romantic_private"
+            }
 
             message_cursor = client.portal.call(
                 lambda: connection.execute(
@@ -1018,13 +1140,24 @@ def test_chat_reply_accepts_attachments_and_persists_artifacts_without_raw_base6
             metadata_json = json.loads(message_row["metadata_json"])
             assert metadata_json["attachment_count"] == 1
             assert metadata_json["attachment_artifact_ids"] == [artifact_row["id"]]
-            assert metadata_json["attachments"][0]["relevance_state"] == "active_work_material"
-            assert metadata_json["attachments"][0]["relevance_source"] == "attachment_ingest"
-            assert metadata_json["attachments"][0]["intimacy_boundary"] == "romantic_private"
+            assert (
+                metadata_json["attachments"][0]["relevance_state"]
+                == "active_work_material"
+            )
+            assert (
+                metadata_json["attachments"][0]["relevance_source"]
+                == "attachment_ingest"
+            )
+            assert (
+                metadata_json["attachments"][0]["intimacy_boundary"]
+                == "romantic_private"
+            )
     return None
 
 
-def test_chat_reply_includes_current_user_state_in_system_prompt(tmp_path: Path) -> None:
+def test_chat_reply_includes_current_user_state_in_system_prompt(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path))
     provider = QueueProvider(
         [
@@ -1079,16 +1212,22 @@ def test_chat_reply_includes_current_user_state_in_system_prompt(tmp_path: Path)
         )
 
         assert response.status_code == 200
-        system_prompt = _llm_request_by_purpose(
-            provider,
-            "chat_reply",
-        ).messages[0].content
+        system_prompt = (
+            _llm_request_by_purpose(
+                provider,
+                "chat_reply",
+            )
+            .messages[0]
+            .content
+        )
         assert "[Current User State]" in system_prompt
         assert "focus_topic: websocket retries" in system_prompt
         assert "urgency: high" in system_prompt
 
 
-def test_chat_reply_prevents_cross_user_conversation_access_in_service_mode(tmp_path: Path) -> None:
+def test_chat_reply_prevents_cross_user_conversation_access_in_service_mode(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path, service_mode=True))
     provider = QueueProvider([json.dumps([]), "irrelevant"])
     create_headers = {
@@ -1132,7 +1271,9 @@ def test_chat_reply_prevents_cross_user_conversation_access_in_service_mode(tmp_
         assert response.status_code == 404
 
 
-def test_chat_reply_uses_character_rollup_and_hides_legacy_workspace_rollup(tmp_path: Path) -> None:
+def test_chat_reply_uses_character_rollup_and_hides_legacy_workspace_rollup(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path))
     provider = QueueProvider(
         [
@@ -1219,10 +1360,14 @@ def test_chat_reply_uses_character_rollup_and_hides_legacy_workspace_rollup(tmp_
         )
 
         assert response.status_code == 200
-        system_prompt = _llm_request_by_purpose(
-            provider,
-            "chat_reply",
-        ).messages[0].content
+        system_prompt = (
+            _llm_request_by_purpose(
+                provider,
+                "chat_reply",
+            )
+            .messages[0]
+            .content
+        )
         assert "[Workspace Context]" in system_prompt
         assert "The character prefers patch-first debugging." in system_prompt
         assert "The workspace prefers patch-first debugging." not in system_prompt
@@ -1256,10 +1401,12 @@ def test_conversation_lifecycle_routes_close_delete_and_erasure(tmp_path: Path) 
                 "assistant_mode_id": "coding_debug",
                 "platform_id": "web",
                 "cross_chat_memory": False,
+                "incognito": False,
             },
         )
         assert create_isolated.status_code == 200
         assert create_isolated.json()["isolated_mode"] == 1
+        assert create_isolated.json()["incognito"] == 1
 
         missing_purge_confirmation = client.post(
             "/v1/conversations/cnv_temp/close",
@@ -1280,15 +1427,24 @@ def test_conversation_lifecycle_routes_close_delete_and_erasure(tmp_path: Path) 
 
         with _connection(client) as connection:
             conversations = ConversationRepository(connection, runtime.clock)
-            pending_temp = client.portal.call(conversations.get_conversation, "cnv_temp", "usr_life")
+            pending_temp = client.portal.call(
+                conversations.get_conversation, "cnv_temp", "usr_life"
+            )
             assert pending_temp is not None
             assert pending_temp["status"] == ConversationStatus.PENDING_DELETION.value
             purged = client.portal.call(
-                ConversationLifecycleService(runtime).purge_pending_deleted_conversations,
+                ConversationLifecycleService(
+                    runtime
+                ).purge_pending_deleted_conversations,
                 connection,
             )
             assert purged == 1
-            assert client.portal.call(conversations.get_conversation, "cnv_temp", "usr_life") is None
+            assert (
+                client.portal.call(
+                    conversations.get_conversation, "cnv_temp", "usr_life"
+                )
+                is None
+            )
 
             users = UserRepository(connection, runtime.clock)
             messages = MessageRepository(connection, runtime.clock)
@@ -1305,7 +1461,16 @@ def test_conversation_lifecycle_routes_close_delete_and_erasure(tmp_path: Path) 
                     platform_id="web",
                 )
             )
-            client.portal.call(messages.create_message, "msg_delete", "cnv_delete", "user", 1, "Delete me", 1, {})
+            client.portal.call(
+                messages.create_message,
+                "msg_delete",
+                "cnv_delete",
+                "user",
+                1,
+                "Delete me",
+                1,
+                {},
+            )
             client.portal.call(
                 lambda: memories.create_memory_object(
                     user_id="usr_delete",
@@ -1414,7 +1579,11 @@ def test_conversation_lifecycle_routes_close_delete_and_erasure(tmp_path: Path) 
 
         missing_confirmation = client.post(
             "/v1/conversations/cnv_delete/delete",
-            json={"user_id": "usr_delete", "platform_id": "web", "confirmation": "WRONG"},
+            json={
+                "user_id": "usr_delete",
+                "platform_id": "web",
+                "confirmation": "WRONG",
+            },
         )
         assert missing_confirmation.status_code == 400
 
@@ -1432,14 +1601,22 @@ def test_conversation_lifecycle_routes_close_delete_and_erasure(tmp_path: Path) 
         with _connection(client) as connection:
             conversations = ConversationRepository(connection, runtime.clock)
             memories = MemoryObjectRepository(connection, runtime.clock)
-            pending_delete = client.portal.call(conversations.get_conversation, "cnv_delete", "usr_delete")
+            pending_delete = client.portal.call(
+                conversations.get_conversation, "cnv_delete", "usr_delete"
+            )
             assert pending_delete is not None
             assert pending_delete["status"] == ConversationStatus.PENDING_DELETION.value
-            deleted_memory = client.portal.call(memories.get_memory_object, "mem_delete", "usr_delete")
+            deleted_memory = client.portal.call(
+                memories.get_memory_object, "mem_delete", "usr_delete"
+            )
             assert deleted_memory is not None
             assert deleted_memory["status"] == MemoryStatus.DELETED.value
-            child_mirror = client.portal.call(memories.get_memory_object, "sum_mem_sum_child", "usr_delete")
-            parent_mirror = client.portal.call(memories.get_memory_object, "sum_mem_sum_parent", "usr_delete")
+            child_mirror = client.portal.call(
+                memories.get_memory_object, "sum_mem_sum_child", "usr_delete"
+            )
+            parent_mirror = client.portal.call(
+                memories.get_memory_object, "sum_mem_sum_parent", "usr_delete"
+            )
             assert child_mirror is None
             assert parent_mirror is None
             summary_rows = client.portal.call(
@@ -1464,12 +1641,24 @@ def test_conversation_lifecycle_routes_close_delete_and_erasure(tmp_path: Path) 
             assert "conversation_id" not in tombstone_scope
             assert "user_id" not in tombstone_scope
             purged = client.portal.call(
-                ConversationLifecycleService(runtime).purge_pending_deleted_conversations,
+                ConversationLifecycleService(
+                    runtime
+                ).purge_pending_deleted_conversations,
                 connection,
             )
             assert purged == 1
-            assert client.portal.call(conversations.get_conversation, "cnv_delete", "usr_delete") is None
-            assert client.portal.call(memories.get_memory_object, "mem_delete", "usr_delete") is None
+            assert (
+                client.portal.call(
+                    conversations.get_conversation, "cnv_delete", "usr_delete"
+                )
+                is None
+            )
+            assert (
+                client.portal.call(
+                    memories.get_memory_object, "mem_delete", "usr_delete"
+                )
+                is None
+            )
 
         with _connection(client) as connection:
             conversations = ConversationRepository(connection, runtime.clock)
@@ -1511,8 +1700,20 @@ def test_conversation_lifecycle_routes_close_delete_and_erasure(tmp_path: Path) 
                 VALUES (?, 'admin_1', 'inspect', ?, ?, ?, ?)
                 """,
                 [
-                    ("aud_conversation", "conversation", "cnv_audit", "{}", runtime.clock.now().isoformat()),
-                    ("aud_memory", "memory_object", "mem_audit", "{}", runtime.clock.now().isoformat()),
+                    (
+                        "aud_conversation",
+                        "conversation",
+                        "cnv_audit",
+                        "{}",
+                        runtime.clock.now().isoformat(),
+                    ),
+                    (
+                        "aud_memory",
+                        "memory_object",
+                        "mem_audit",
+                        "{}",
+                        runtime.clock.now().isoformat(),
+                    ),
                     (
                         "aud_metadata",
                         "other",
@@ -1545,6 +1746,189 @@ def test_conversation_lifecycle_routes_close_delete_and_erasure(tmp_path: Path) 
         assert recreate_response.status_code == 410
 
 
+def test_user_erasure_returns_retryable_error_then_resumes_same_cleanup(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime
+        original_backend = runtime.storage_backend
+        backend = _ApiFlakyErasureBackend()
+        runtime.storage_backend = backend
+        client.portal.call(original_backend.close)
+
+        assert (
+            client.post("/v1/users", json={"user_id": "usr_retry_erase"}).status_code
+            == 200
+        )
+        first = client.post(
+            "/v1/users/usr_retry_erase/erase",
+            json={
+                "user_id": "usr_retry_erase",
+                "confirmation": "ERASE_ALL_DATA",
+            },
+        )
+        assert first.status_code == 503
+        assert first.headers["retry-after"] == "1"
+
+        with _connection(client) as connection:
+            user = client.portal.call(
+                lambda: connection.execute_fetchall(
+                    "SELECT id FROM users WHERE id = 'usr_retry_erase'"
+                )
+            )
+            cleanup = client.portal.call(
+                lambda: connection.execute_fetchall(
+                    "SELECT cleanup_id FROM user_erasure_cleanups"
+                )
+            )
+            assert user == []
+            assert len(cleanup) == 1
+
+        backend.fail_revoke = False
+        retry = client.post(
+            "/v1/users/usr_retry_erase/erase",
+            json={
+                "user_id": "usr_retry_erase",
+                "confirmation": "ERASE_ALL_DATA",
+            },
+        )
+        assert retry.status_code == 200
+        assert retry.json()["already_erased"] is False
+        with _connection(client) as connection:
+            cleanup = client.portal.call(
+                lambda: connection.execute_fetchall(
+                    "SELECT cleanup_id FROM user_erasure_cleanups"
+                )
+            )
+            marker = client.portal.call(
+                lambda: connection.execute_fetchall(
+                    """
+                    SELECT erasure_cleanup_state
+                    FROM deletion_tombstones
+                    WHERE deletion_reason = 'right_to_erasure'
+                    """
+                )
+            )
+            assert cleanup == []
+            assert [row["erasure_cleanup_state"] for row in marker] == ["verified"]
+
+
+def test_user_erasure_pending_cleanup_recovers_during_real_app_restart(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    first_app = create_app(settings)
+    with TestClient(first_app) as client:
+        runtime = client.app.state.runtime
+        original_backend = runtime.storage_backend
+        runtime.storage_backend = _ApiFlakyErasureBackend()
+        client.portal.call(original_backend.close)
+        assert (
+            client.post("/v1/users", json={"user_id": "usr_restart_erase"}).status_code
+            == 200
+        )
+        failed = client.post(
+            "/v1/users/usr_restart_erase/erase",
+            json={
+                "user_id": "usr_restart_erase",
+                "confirmation": "ERASE_ALL_DATA",
+            },
+        )
+        assert failed.status_code == 503
+
+    restarted_app = create_app(settings)
+    with TestClient(restarted_app) as client:
+        with _connection(client) as connection:
+            cleanup = client.portal.call(
+                lambda: connection.execute_fetchall(
+                    "SELECT cleanup_id FROM user_erasure_cleanups"
+                )
+            )
+            marker = client.portal.call(
+                lambda: connection.execute_fetchall(
+                    """
+                    SELECT erasure_cleanup_state
+                    FROM deletion_tombstones
+                    WHERE deletion_reason = 'right_to_erasure'
+                    """
+                )
+            )
+            assert cleanup == []
+            assert [row["erasure_cleanup_state"] for row in marker] == ["verified"]
+        already_erased = client.post(
+            "/v1/users/usr_restart_erase/erase",
+            json={
+                "user_id": "usr_restart_erase",
+                "confirmation": "ERASE_ALL_DATA",
+            },
+        )
+        assert already_erased.status_code == 200
+        assert already_erased.json()["already_erased"] is True
+
+
+def test_selected_transcript_replace_maps_erased_user_race_to_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def raise_erased_user(
+        self: SelectedTranscriptService,
+        **kwargs: object,
+    ) -> None:
+        del self, kwargs
+        raise UserDeletedError("User has been erased")
+
+    monkeypatch.setattr(SelectedTranscriptService, "replace", raise_erased_user)
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/conversations/cnv_selected/selected-transcript",
+            json={
+                "user_id": "usr_selected",
+                "platform_id": "openclaw",
+                "operation_id": "op_selected",
+                "selection_epoch": 1,
+                "mutation_kind": "initial",
+                "messages": [],
+            },
+        )
+
+    assert response.status_code == 410
+    assert response.json()["detail"] == "User has been erased"
+
+
+@pytest.mark.parametrize(
+    ("service_error", "expected_status"),
+    [
+        (ConversationNotActiveError("Conversation lifecycle changed"), 409),
+        (UserDeletedError("User has been erased"), 410),
+    ],
+)
+def test_selected_transcript_retry_maps_lifecycle_fence_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    service_error: Exception,
+    expected_status: int,
+) -> None:
+    async def raise_lifecycle_error(
+        self: SelectedTranscriptService,
+        **kwargs: object,
+    ) -> None:
+        del self, kwargs
+        raise service_error
+
+    monkeypatch.setattr(SelectedTranscriptService, "retry", raise_lifecycle_error)
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/conversations/cnv_selected/selected-transcript/op_selected/retry",
+            json={"user_id": "usr_selected"},
+        )
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"] == str(service_error)
+
+
 def test_service_mode_requires_x_atagia_user_id_header(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path, service_mode=True))
     with TestClient(app) as client:
@@ -1561,10 +1945,15 @@ def test_service_mode_requires_x_atagia_user_id_header(tmp_path: Path) -> None:
         )
 
         assert response.status_code == 401
-        assert response.json()["detail"] == "X-Atagia-User-Id header is required in service mode"
+        assert (
+            response.json()["detail"]
+            == "X-Atagia-User-Id header is required in service mode"
+        )
 
 
-def test_service_mode_requires_platform_id_on_conversation_boundary(tmp_path: Path) -> None:
+def test_service_mode_requires_platform_id_on_conversation_boundary(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path, service_mode=True))
     with TestClient(app) as client:
         response = client.post(

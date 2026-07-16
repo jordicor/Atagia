@@ -29,7 +29,7 @@ from atagia.models.schemas_memory import (
 from atagia.services.llm_client import LLMClient, RetryPolicy
 from atagia.services.providers.openrouter import OpenRouterProvider
 
-MANIFESTS_DIR = Path(__file__).resolve().parents[1] / "manifests"
+MANIFESTS_DIR = Path(__file__).resolve().parents[1] / "src" / "atagia" / "resources" / "manifests"
 SKIP_CLASSES = {MemoryDependence.WORLD.value, MemoryDependence.CONVERSATION.value}
 
 # Each case: (label, mode, question, recent_messages, expect_skip)

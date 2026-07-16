@@ -38,7 +38,7 @@ PACE_LABEL_MULTIPLIER = {
 # record a token-overlap distribution to fit these against, so these are
 # conservative defaults chosen to keep both bands rare and safe, coherent with
 # the existing per-mode ceilings (max_messages_without_refresh 4-15,
-# max_minutes_without_refresh 10-30; see manifests/*.json).
+# max_minutes_without_refresh 10-30; see resources/manifests/*.json).
 #
 # - REFRESH band is the safe side (it never serves stale), so its overlap gate
 #   can be permissive-but-low: at/below this ratio of shared tokens the new

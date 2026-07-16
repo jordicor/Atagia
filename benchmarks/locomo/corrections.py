@@ -19,7 +19,7 @@ def load_community_corrections(
     """Load dial481/locomo-audit errors.json and convert to Atagia format.
 
     Returns a corrections dict keyed by our question_id format
-    (e.g. "conv-26:q57"). Answer corrections and citation/evidence
+    (e.g. "<sample-id>:q57"). Answer corrections and citation/evidence
     corrections are both preserved because source-aware judging treats the
     evidence packet as the official oracle.
     """

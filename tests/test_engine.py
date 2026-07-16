@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import json
 import re
 from pathlib import Path
+from time import monotonic
 
 import pytest
 
@@ -13,6 +15,7 @@ from atagia import Atagia
 from atagia.core.clock import FrozenClock
 from atagia.core.mind_repository import DEFAULT_MIND_ID
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
+from atagia.core.user_lifecycle_repository import UserLifecycleRepository
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
@@ -30,10 +33,17 @@ from atagia.models.schemas_memory import (
     PlannedSubQuery,
     RetrievalPlan,
 )
+from atagia.models.schemas_jobs import JobEnvelope, JobType, WORKER_GROUP_NAME
 from atagia.models.schemas_replay import AblationConfig
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.chat_support import default_operational_profile_snapshot
-from atagia.services.errors import MessageIdConflictError, SourceSequenceConflictError
+from atagia.services.errors import (
+    ConversationNotFoundError,
+    MessageIdConflictError,
+    SourceSequenceConflictError,
+    TranscriptRebuildInProgressError,
+    TranscriptRebuildRemediationRequiredError,
+)
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -43,10 +53,96 @@ from atagia.services.llm_client import (
     LLMError,
     LLMProvider,
 )
+from atagia.services.job_tracking_service import JobTrackingService
 from tests.extraction_payload_support import (
     is_memory_extraction_card_purpose,
     memory_extraction_card_output_from_payload,
 )
+
+
+async def _block_library_memory_access_for_selected_transcript(
+    engine: Atagia,
+    *,
+    user_id: str,
+    conversation_id: str,
+    state: str,
+) -> None:
+    runtime = engine.runtime
+    assert runtime is not None
+    now = runtime.clock.now().isoformat()
+    workflow_id = f"trw_library_{state}"
+    connection = await runtime.open_connection()
+    try:
+        await connection.execute(
+            """
+            INSERT INTO transcript_rebuild_workflows(
+                id,
+                operation_id,
+                user_id,
+                conversation_id,
+                selection_epoch,
+                transcript_hash,
+                mutation_kind,
+                selected_message_ids_json,
+                abandoned_message_ids_json,
+                supporting_message_ids_json,
+                affected_memory_ids_json,
+                affected_summary_ids_json,
+                orchestrator_job_id,
+                stage,
+                start_derivation_revision,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                workflow_id,
+                f"op_library_{state}",
+                user_id,
+                conversation_id,
+                1,
+                f"hash_library_{state}",
+                "replace",
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                f"job_library_{state}",
+                "remediation_required"
+                if state == "remediation_required"
+                else "aggregates",
+                0,
+                now,
+                now,
+            ),
+        )
+        await connection.execute(
+            """
+            INSERT INTO conversation_transcript_selections(
+                user_id,
+                conversation_id,
+                selection_epoch,
+                transcript_hash,
+                current_workflow_id,
+                state,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                conversation_id,
+                1,
+                f"hash_library_{state}",
+                workflow_id,
+                state,
+                now,
+            ),
+        )
+        await connection.commit()
+    finally:
+        await connection.close()
+
 
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
@@ -188,6 +284,24 @@ class EngineProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text="no",
+            )
+        if purpose.startswith("user_language_profile_") and purpose.endswith("_card"):
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="none",
+            )
+        if purpose == "topic_working_set_route_card":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="none",
+            )
+        if purpose == "initial_context_package_curation":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps({"items": [], "nothing_to_add": True}),
             )
         raise AssertionError(f"Unexpected LLM purpose: {purpose}")
 
@@ -417,6 +531,8 @@ def test_engine_build_settings_resolves_resource_env_from_external_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    for name in ("migrations", "manifests", "operational_profiles"):
+        (tmp_path / name).mkdir()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ATAGIA_MIGRATIONS_PATH", "./migrations")
     monkeypatch.setenv("ATAGIA_MANIFESTS_PATH", "./manifests")
@@ -425,9 +541,12 @@ def test_engine_build_settings_resolves_resource_env_from_external_cwd(
     engine = Atagia(db_path=tmp_path / "external-cwd.db")
     settings = engine._build_settings()
 
-    assert settings.migrations_dir().exists()
-    assert settings.manifests_dir().exists()
-    assert settings.operational_profiles_dir().exists()
+    assert settings.migrations_dir().resolve() == tmp_path / "migrations"
+    assert settings.manifests_dir().resolve() == tmp_path / "manifests"
+    assert (
+        settings.operational_profiles_dir().resolve()
+        == tmp_path / "operational_profiles"
+    )
 
 
 def _install_stub_client(
@@ -450,6 +569,29 @@ def _normal_operational_profile_token(engine: Atagia) -> str:
         loader=engine.runtime.operational_profile_loader,
         settings=engine.runtime.settings,
     ).token
+
+
+async def _active_cache_identity(
+    engine: Atagia,
+    user_id: str,
+) -> tuple[str, int, int]:
+    if engine.runtime is None:
+        raise AssertionError("Engine runtime should be initialized")
+    connection = await engine.runtime.open_connection()
+    try:
+        identity = await UserLifecycleRepository(
+            connection,
+            engine.runtime.clock,
+        ).get_active_identity(user_id)
+    finally:
+        await connection.close()
+    if identity is None:
+        raise AssertionError("Active user lifecycle identity should exist")
+    return (
+        identity.lifecycle_epoch,
+        identity.cache_revision,
+        identity.derivation_revision,
+    )
 
 
 @pytest.mark.asyncio
@@ -609,10 +751,11 @@ async def test_engine_lifecycle_methods(monkeypatch: pytest.MonkeyPatch) -> None
                 object_type=MemoryObjectType.EVIDENCE,
                 scope=MemoryScope.CONVERSATION,
                 canonical_text="Original lifecycle memory.",
-                source_kind=MemorySourceKind.EXTRACTED,
+                source_kind=MemorySourceKind.VERBATIM,
                 confidence=0.9,
                 privacy_level=0,
                 memory_id="mem_lifecycle",
+                payload={"writer_kind": "manual"},
             )
             surfaces = MemoryRetrievalSurfaceRepository(
                 connection, engine.runtime.clock
@@ -1005,6 +1148,11 @@ async def test_lifecycle_deletes_only_targeted_retrieval_events(
                     confidence=0.9,
                     privacy_level=0,
                     memory_id=memory_id,
+                    payload={
+                        "source_message_ids": [
+                            "msg_mem_1" if memory_id == "mem_target" else "msg_mem_2"
+                        ]
+                    },
                 )
             await memories.create_memory_object(
                 user_id="usr_1",
@@ -1048,6 +1196,9 @@ async def test_lifecycle_deletes_only_targeted_retrieval_events(
             hard=True,
             confirmation="HARD_DELETE_MEMORY",
         )
+        lifecycle_epoch, cache_revision, derivation_revision = (
+            await _active_cache_identity(engine, "usr_1")
+        )
         cache_key = ContextCacheService.build_cache_key(
             user_id="usr_1",
             assistant_mode_id="coding_debug",
@@ -1057,6 +1208,9 @@ async def test_lifecycle_deletes_only_targeted_retrieval_events(
             active_mind_id=DEFAULT_MIND_ID,
             mind_topology="unimind",
             operational_profile_token=_normal_operational_profile_token(engine),
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
         )
         await engine.runtime.storage_backend.set_context_view(
             cache_key,
@@ -1231,9 +1385,9 @@ async def test_engine_get_context_keeps_recent_transcript_inside_context_envelop
         )
 
         assert context.recent_transcript_trace is not None
-        assert context.recent_transcript_trace.budget_tokens == 819
+        assert context.recent_transcript_trace.budget_tokens == 1_638
         assert context.context_envelope_trace is not None
-        assert context.context_envelope_trace["total_budget_tokens"] == 4_096
+        assert context.context_envelope_trace["total_budget_tokens"] == 8_192
     finally:
         await engine.close()
 
@@ -1613,6 +1767,9 @@ async def test_engine_add_response_invalidates_stable_context_cache(
             message="Please help me debug this retry loop.",
         )
 
+        lifecycle_epoch, cache_revision, derivation_revision = (
+            await _active_cache_identity(engine, "usr_1")
+        )
         cache_key = ContextCacheService.build_cache_key(
             user_id="usr_1",
             assistant_mode_id="coding_debug",
@@ -1622,6 +1779,9 @@ async def test_engine_add_response_invalidates_stable_context_cache(
             active_mind_id=DEFAULT_MIND_ID,
             mind_topology="unimind",
             operational_profile_token=_normal_operational_profile_token(engine),
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
         )
         assert (
             await engine.runtime.storage_backend.get_context_view(cache_key) is not None
@@ -1664,6 +1824,9 @@ async def test_engine_ingest_message_invalidates_stable_context_cache(
             message="Please help me debug this retry loop.",
         )
 
+        lifecycle_epoch, cache_revision, derivation_revision = (
+            await _active_cache_identity(engine, "usr_1")
+        )
         cache_key = ContextCacheService.build_cache_key(
             user_id="usr_1",
             assistant_mode_id="coding_debug",
@@ -1673,6 +1836,9 @@ async def test_engine_ingest_message_invalidates_stable_context_cache(
             active_mind_id=DEFAULT_MIND_ID,
             mind_topology="unimind",
             operational_profile_token=_normal_operational_profile_token(engine),
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
         )
         assert (
             await engine.runtime.storage_backend.get_context_view(cache_key) is not None
@@ -1719,6 +1885,295 @@ async def test_engine_flush(
 
         assert await engine.flush(timeout_seconds=5.0) is True
     finally:
+        await engine.close()
+
+
+async def _cancel_runtime_dispatcher(engine: Atagia) -> None:
+    assert engine.runtime is not None
+    dispatcher_tasks = [
+        task
+        for task in engine.runtime.worker_tasks
+        if task.get_name() == "atagia-durable-job-dispatcher"
+    ]
+    assert len(dispatcher_tasks) == 1
+    dispatcher_tasks[0].cancel()
+    await asyncio.gather(*dispatcher_tasks, return_exceptions=True)
+
+
+async def _finish_flush_test_job(engine: Atagia, stream_name: str) -> None:
+    assert engine.runtime is not None
+    connection = await engine.runtime.open_connection()
+    try:
+        tracking = JobTrackingService(
+            connection,
+            engine.runtime.clock,
+            workers_enabled=True,
+            settings=engine.runtime.settings,
+        )
+        await tracking.dispatch_pending_jobs(engine.runtime.storage_backend)
+        messages = await engine.runtime.storage_backend.stream_read(
+            stream_name,
+            WORKER_GROUP_NAME,
+            "flush-test-consumer",
+            count=1,
+            block_ms=0,
+        )
+        assert len(messages) == 1
+        claim = await tracking.claim_notification(
+            messages[0],
+            owner_id="flush-test-owner",
+        )
+        assert claim is not None
+        assert await tracking.finish_claim_succeeded(claim)
+        await engine.runtime.storage_backend.stream_ack(
+            stream_name,
+            WORKER_GROUP_NAME,
+            messages[0].message_id,
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_flush_waits_for_durable_job_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=tmp_path / "atagia-engine-delayed-dispatch-flush.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+    stream_name = "atagia:test_flush_delayed_dispatch"
+
+    await engine.setup()
+    try:
+        assert engine.runtime is not None
+        await _cancel_runtime_dispatcher(engine)
+        await engine.create_user("usr_flush")
+        await engine.runtime.storage_backend.stream_ensure_group(
+            stream_name,
+            WORKER_GROUP_NAME,
+        )
+        connection = await engine.runtime.open_connection()
+        try:
+            await JobTrackingService(
+                connection,
+                engine.runtime.clock,
+                workers_enabled=True,
+                settings=engine.runtime.settings,
+            ).enqueue_job(
+                engine.runtime.storage_backend,
+                stream_name,
+                JobEnvelope(
+                    job_id="job_flush_delayed_dispatch",
+                    job_type=JobType.RUN_EVALUATION,
+                    user_id="usr_flush",
+                ),
+                dispatch=False,
+            )
+        finally:
+            await connection.close()
+
+        flush_task = asyncio.create_task(engine.flush(timeout_seconds=2.0))
+        await asyncio.sleep(0.1)
+        assert not flush_task.done()
+
+        await _finish_flush_test_job(engine, stream_name)
+        assert await flush_task is True
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_flush_waits_for_durable_job_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    database_path = tmp_path / "atagia-engine-restart-flush.db"
+    stream_name = "atagia:test_flush_restart"
+    first_engine = Atagia(
+        db_path=database_path,
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await first_engine.setup()
+    try:
+        assert first_engine.runtime is not None
+        await _cancel_runtime_dispatcher(first_engine)
+        await first_engine.create_user("usr_flush")
+        connection = await first_engine.runtime.open_connection()
+        try:
+            await JobTrackingService(
+                connection,
+                first_engine.runtime.clock,
+                workers_enabled=True,
+                settings=first_engine.runtime.settings,
+            ).enqueue_job(
+                first_engine.runtime.storage_backend,
+                stream_name,
+                JobEnvelope(
+                    job_id="job_flush_restart",
+                    job_type=JobType.RUN_EVALUATION,
+                    user_id="usr_flush",
+                ),
+                dispatch=False,
+            )
+        finally:
+            await connection.close()
+    finally:
+        await first_engine.close()
+
+    second_engine = Atagia(
+        db_path=database_path,
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+    await second_engine.setup()
+    try:
+        assert second_engine.runtime is not None
+        await _cancel_runtime_dispatcher(second_engine)
+        await second_engine.runtime.storage_backend.stream_ensure_group(
+            stream_name,
+            WORKER_GROUP_NAME,
+        )
+        flush_task = asyncio.create_task(second_engine.flush(timeout_seconds=2.0))
+        await asyncio.sleep(0.1)
+        assert not flush_task.done()
+
+        await _finish_flush_test_job(second_engine, stream_name)
+        assert await flush_task is True
+    finally:
+        await second_engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_flush_retries_locked_job_table_until_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+    stream_name = "atagia:test_flush_locked"
+
+    await engine.setup()
+    blocker = None
+    try:
+        assert engine.runtime is not None
+        await _cancel_runtime_dispatcher(engine)
+        await engine.create_user("usr_flush")
+        await engine.runtime.storage_backend.stream_ensure_group(
+            stream_name,
+            WORKER_GROUP_NAME,
+        )
+        connection = await engine.runtime.open_connection()
+        try:
+            await JobTrackingService(
+                connection,
+                engine.runtime.clock,
+                workers_enabled=True,
+                settings=engine.runtime.settings,
+            ).enqueue_job(
+                engine.runtime.storage_backend,
+                stream_name,
+                JobEnvelope(
+                    job_id="job_flush_locked",
+                    job_type=JobType.RUN_EVALUATION,
+                    user_id="usr_flush",
+                ),
+                dispatch=False,
+            )
+        finally:
+            await connection.close()
+
+        blocker = await engine.runtime.open_connection()
+        await blocker.execute("BEGIN IMMEDIATE")
+        await blocker.execute(
+            """
+            UPDATE worker_job_runs
+            SET status = status
+            WHERE job_id = 'job_flush_locked'
+            """
+        )
+        flush_task = asyncio.create_task(engine.flush(timeout_seconds=2.0))
+        await asyncio.sleep(0.1)
+        assert not flush_task.done()
+
+        await blocker.rollback()
+        await _finish_flush_test_job(engine, stream_name)
+        assert await flush_task is True
+    finally:
+        if blocker is not None:
+            if blocker.in_transaction:
+                await blocker.rollback()
+            await blocker.close()
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_flush_locked_job_table_honors_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+    engine = Atagia(
+        db_path=":memory:",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    blocker = None
+    try:
+        assert engine.runtime is not None
+        await _cancel_runtime_dispatcher(engine)
+        await engine.create_user("usr_flush")
+        connection = await engine.runtime.open_connection()
+        try:
+            await JobTrackingService(
+                connection,
+                engine.runtime.clock,
+                workers_enabled=True,
+                settings=engine.runtime.settings,
+            ).enqueue_job(
+                engine.runtime.storage_backend,
+                "atagia:test_flush_locked_timeout",
+                JobEnvelope(
+                    job_id="job_flush_locked_timeout",
+                    job_type=JobType.RUN_EVALUATION,
+                    user_id="usr_flush",
+                ),
+                dispatch=False,
+            )
+        finally:
+            await connection.close()
+
+        blocker = await engine.runtime.open_connection()
+        await blocker.execute("BEGIN IMMEDIATE")
+        await blocker.execute(
+            """
+            UPDATE worker_job_runs
+            SET status = status
+            WHERE job_id = 'job_flush_locked_timeout'
+            """
+        )
+        started_at = monotonic()
+        assert await engine.flush(timeout_seconds=0.15) is False
+        assert monotonic() - started_at < 0.5
+    finally:
+        if blocker is not None:
+            if blocker.in_transaction:
+                await blocker.rollback()
+            await blocker.close()
         await engine.close()
 
 
@@ -2186,3 +2641,179 @@ async def test_engine_get_context_degrades_when_need_detector_fails(
             await connection.close()
     finally:
         await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_library_optional_identity_hint_matrix(tmp_path: Path) -> None:
+    engine = Atagia(
+        db_path=tmp_path / "library-optional-identity.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    )
+
+    await engine.setup()
+    try:
+        await engine.create_user("user_identity")
+        await engine.create_conversation(
+            "user_identity",
+            "conversation_identity",
+            platform_id="platform-a",
+            user_persona_id="persona-a",
+            character_id="character-a",
+            mode="coding_debug",
+        )
+
+        assert (
+            await engine.create_conversation(
+                "user_identity",
+                "conversation_identity",
+                mode="coding_debug",
+            )
+            == "conversation_identity"
+        )
+
+        for field_name, persisted_value in (
+            ("user_persona_id", "persona-a"),
+            ("platform_id", "platform-a"),
+            ("character_id", "character-a"),
+        ):
+            assert (
+                await engine.create_conversation(
+                    "user_identity",
+                    "conversation_identity",
+                    mode="coding_debug",
+                    **{field_name: persisted_value},
+                )
+                == "conversation_identity"
+            )
+            with pytest.raises(
+                ConversationNotFoundError,
+                match="Conversation not found for user",
+            ):
+                await engine.create_conversation(
+                    "user_identity",
+                    "conversation_identity",
+                    mode="coding_debug",
+                    **{field_name: "conflicting-value"},
+                )
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_readme_library_quickstart_sequence_runs_with_omitted_identity_hints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = EngineProvider()
+    _install_stub_client(monkeypatch, provider)
+
+    async with Atagia(
+        db_path=tmp_path / "memory.db",
+        anthropic_api_key="test-anthropic-key",
+        llm_forced_global_model="anthropic/claude-sonnet-4-6",
+    ) as engine:
+        await engine.create_user("user_1")
+        await engine.create_conversation(
+            "user_1",
+            "conv_1",
+            platform_id="web",
+            character_id="project_backend",
+            mode="coding_debug",
+        )
+
+        context = await engine.get_context(
+            user_id="user_1",
+            conversation_id="conv_1",
+            message="What did we decide about the migration?",
+            mode="coding_debug",
+        )
+
+        result = await engine.chat(
+            user_id="user_1",
+            conversation_id="conv_1",
+            message="Why is the test failing?",
+            mode="coding_debug",
+        )
+
+    assert context.system_prompt
+    assert result.response_text == "Check the retry guard first."
+
+
+@pytest.mark.parametrize(
+    ("state", "error_type", "error_message"),
+    [
+        (
+            "rebuilding",
+            TranscriptRebuildInProgressError,
+            "Selected transcript rebuild is still in progress",
+        ),
+        (
+            "remediation_required",
+            TranscriptRebuildRemediationRequiredError,
+            "Selected transcript rebuild requires remediation before memory access",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_library_memory_surfaces_fail_closed_during_selected_transcript_rebuild(
+    tmp_path: Path,
+    state: str,
+    error_type: type[Exception],
+    error_message: str,
+) -> None:
+    async with Atagia(
+        db_path=tmp_path / f"library-selected-{state}.db",
+        openai_api_key="test-openai-key",
+        llm_forced_global_model="openai/test-model",
+    ) as engine:
+        await engine.create_user("usr_selected")
+        await engine.create_conversation(
+            "usr_selected",
+            "cnv_selected",
+            platform_id="library",
+        )
+        await _block_library_memory_access_for_selected_transcript(
+            engine,
+            user_id="usr_selected",
+            conversation_id="cnv_selected",
+            state=state,
+        )
+
+        for operation in (
+            engine.get_memory_preferences("usr_selected"),
+            engine.set_memory_preferences(
+                "usr_selected",
+                remember_across_chats=False,
+            ),
+            engine.ingest_message(
+                "usr_selected",
+                "cnv_selected",
+                "user",
+                "This write must not become visible.",
+            ),
+        ):
+            with pytest.raises(
+                error_type,
+                match=f"^{re.escape(error_message)}$",
+            ):
+                await operation
+
+        runtime = engine.runtime
+        assert runtime is not None
+        connection = await runtime.open_connection()
+        try:
+            preferences = await UserRepository(
+                connection,
+                runtime.clock,
+            ).get_memory_preferences("usr_selected")
+            messages = await MessageRepository(
+                connection,
+                runtime.clock,
+            ).list_messages_for_conversation("cnv_selected", "usr_selected")
+        finally:
+            await connection.close()
+
+        assert preferences is not None
+        assert bool(preferences["remember_across_chats"]) is True
+        assert messages == []

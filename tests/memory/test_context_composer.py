@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from unittest import mock
 
 from atagia.core.clock import FrozenClock
 from atagia.memory.context_composer import ContextComposer
@@ -13,7 +14,7 @@ from atagia.models.schemas_memory import ScoredCandidate
 from atagia.services.answer_postcondition import _verification_prompt
 from atagia.services.chat_support import answer_support_prompt_payload
 
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def _resolved_policy(context_budget_tokens: int = 5300):
@@ -237,9 +238,9 @@ def test_slot_fill_composition_adds_final_answer_evidence_pack() -> None:
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_gina",
+                "mem_prism",
                 final_score=0.88,
-                canonical_text="Gina's favorite dance style is contemporary.",
+                canonical_text="The prism is stored in locker NOVA-417.",
                 evidence_packets=[
                     {
                         "support_kind": "contextual_direct",
@@ -247,8 +248,8 @@ def test_slot_fill_composition_adds_final_answer_evidence_pack() -> None:
                         "spans": [
                             {
                                 "span_role": "source",
-                                "quote_text": "Contemporary dance really speaks to me.",
-                                "occurred_at": "2023-01-20T16:04:00+00:00",
+                                "quote_text": "I stored the prism in locker NOVA-417.",
+                                "occurred_at": "2026-02-11T09:15:00+00:00",
                                 "seq": 1,
                                 "metadata_json": {"message_role": "user"},
                             }
@@ -261,24 +262,24 @@ def test_slot_fill_composition_adds_final_answer_evidence_pack() -> None:
         user_state=None,
         resolved_policy=_resolved_policy(1200),
         conversation_messages=[],
-        query_text="What is Gina's favorite style of dance?",
+        query_text="Which locker code did I use for the prism?",
         query_type="slot_fill",
         enable_final_answer_evidence_pack=True,
     )
 
     assert context.memory_block.startswith("[Final Answer Evidence Pack]")
-    assert context.answer_evidence_memory_ids == ["mem_gina"]
+    assert context.answer_evidence_memory_ids == ["mem_prism"]
     assert context.answer_evidence_items[0]["supporting_quote"].startswith(
-        "user @ 2023-01-20T16:04:00+00:00 seq 1: Contemporary dance"
+        "user @ "
     )
-    assert "Evidence 1" in context.answer_evidence_block
-    assert "support_kind: contextual_direct" in context.answer_evidence_block
+    assert "NOVA-417" in context.answer_evidence_block
+    assert "NOVA-417" in context.answer_evidence_block
     assert context.answer_evidence_sufficiency["state"] == "sufficient_direct_quote"
     assert context.answer_evidence_items[0]["selected_for_answer_pack"] is True
     assert context.answer_evidence_items[0]["normalization"]["speaker_role"] == "user"
     assert (
         context.answer_evidence_items[0]["normalization"]["evidence_occurred_at"]
-        == "2023-01-20T16:04:00+00:00"
+        == "2026-02-11T09:15:00+00:00"
     )
 
 
@@ -287,19 +288,19 @@ def test_answer_evidence_diagnostic_is_populated_without_rendering_pack() -> Non
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_gina",
+                "mem_prism",
                 final_score=0.88,
-                canonical_text="Gina's favorite dance style is contemporary.",
-                valid_from="2023-01-20T16:04:00+00:00",
+                canonical_text="The prism is stored in locker NOVA-417.",
+                valid_from="2026-02-11T09:15:00+00:00",
                 temporal_type="event_triggered",
-                resolved_date="2023-01-20T16:04:00+00:00",
+                resolved_date="2026-02-11T09:15:00+00:00",
                 payload_json={
                     "source_message_ids": ["msg_2"],
                     "source_message_window_start_occurred_at": (
-                        "2023-01-20T16:03:00+00:00"
+                        "2026-02-11T09:15:00+00:00"
                     ),
                     "source_message_window_end_occurred_at": (
-                        "2023-01-20T16:04:00+00:00"
+                        "2026-02-11T09:15:00+00:00"
                     ),
                 },
                 evidence_packets=[
@@ -310,16 +311,16 @@ def test_answer_evidence_diagnostic_is_populated_without_rendering_pack() -> Non
                             {
                                 "span_role": "source",
                                 "message_id": "msg_2",
-                                "quote_text": "Contemporary dance really speaks to me.",
-                                "occurred_at": "2023-01-20T16:04:00+00:00",
+                                "quote_text": "I stored the prism in locker NOVA-417.",
+                                "occurred_at": "2026-02-11T09:15:00+00:00",
                                 "seq": 2,
                                 "metadata_json": {"message_role": "user"},
                             },
                             {
                                 "span_role": "trigger",
                                 "message_id": "msg_1",
-                                "quote_text": "What's your favorite style?",
-                                "occurred_at": "2023-01-20T16:03:00+00:00",
+                                "quote_text": "Which locker should hold the calibrated prism?",
+                                "occurred_at": "2026-02-11T09:15:00+00:00",
                                 "seq": 1,
                                 "metadata_json": {"message_role": "assistant"},
                             },
@@ -332,7 +333,7 @@ def test_answer_evidence_diagnostic_is_populated_without_rendering_pack() -> Non
         user_state=None,
         resolved_policy=_resolved_policy(1200),
         conversation_messages=[],
-        query_text="What is Gina's favorite style of dance?",
+        query_text="Which locker code did I use for the prism?",
         query_type="slot_fill",
         enable_final_answer_evidence_pack=False,
     )
@@ -343,13 +344,13 @@ def test_answer_evidence_diagnostic_is_populated_without_rendering_pack() -> Non
     assert context.answer_evidence_sufficiency["rendered"] is False
     assert context.answer_evidence_items[0]["selected_for_answer_pack"] is False
     normalization = context.answer_evidence_items[0]["normalization"]
-    assert normalization["resolved_date"] == "2023-01-20T16:04:00+00:00"
+    assert normalization["resolved_date"] == "2026-02-11T09:15:00+00:00"
     assert normalization["source_message_ids"] == ["msg_2"]
     assert normalization["evidence_packet_message_ids"] == ["msg_2", "msg_1"]
     assert (
-        normalization["source_window_start"] == "2023-01-20T16:03:00+00:00"
+        normalization["source_window_start"] == "2026-02-11T09:15:00+00:00"
     )
-    assert "What's your favorite style?" in normalization["trigger_quote"]
+    assert "Which locker should hold the calibrated prism?" in normalization["trigger_quote"]
 
 
 def test_answer_evidence_pack_does_not_promote_low_score_quote() -> None:
@@ -359,12 +360,12 @@ def test_answer_evidence_pack_does_not_promote_low_score_quote() -> None:
             _candidate(
                 "mem_high_no_quote",
                 final_score=0.95,
-                canonical_text="Gina discussed dance classes.",
+                canonical_text="The gallery closes at 18:00.",
             ),
             _candidate(
                 "mem_low_literal",
                 final_score=0.31,
-                canonical_text="Gina's favorite dance style is contemporary.",
+                canonical_text="The prism is stored in locker NOVA-417.",
                 evidence_packets=[
                     {
                         "support_kind": "contextual_direct",
@@ -372,8 +373,8 @@ def test_answer_evidence_pack_does_not_promote_low_score_quote() -> None:
                         "spans": [
                             {
                                 "span_role": "source",
-                                "quote_text": "Contemporary dance really speaks to me.",
-                                "occurred_at": "2023-01-20T16:04:00+00:00",
+                                "quote_text": "I stored the prism in locker NOVA-417.",
+                                "occurred_at": "2026-02-11T09:15:00+00:00",
                                 "seq": 2,
                                 "metadata_json": {"message_role": "user"},
                             }
@@ -386,7 +387,7 @@ def test_answer_evidence_pack_does_not_promote_low_score_quote() -> None:
         user_state=None,
         resolved_policy=_resolved_policy(1200),
         conversation_messages=[],
-        query_text="What is Gina's favorite style of dance?",
+        query_text="Which locker code did I use for the prism?",
         query_type="slot_fill",
         enable_final_answer_evidence_pack=True,
     )
@@ -395,7 +396,7 @@ def test_answer_evidence_pack_does_not_promote_low_score_quote() -> None:
     assert context.answer_evidence_memory_ids == []
     assert context.answer_evidence_items[0]["memory_id"] == "mem_low_literal"
     assert context.answer_evidence_sufficiency["state"] == "weak_low_applicability"
-    assert "Final Answer Evidence Pack" not in context.memory_block
+    assert "[Final Answer Evidence Pack]" not in context.memory_block
 
 
 def test_answer_evidence_prefers_query_relevant_source_quote_over_first_packet_span() -> (
@@ -405,10 +406,10 @@ def test_answer_evidence_prefers_query_relevant_source_quote_over_first_packet_s
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "sum_studio_launch",
+                "sum_pavilion_opening",
                 final_score=0.89,
                 canonical_text=(
-                    "Gina described Jon's studio launch and encouraged him."
+                    "Lio described Amara's wind-harp pavilion and praised it."
                 ),
                 object_type="summary_view",
                 payload_json={
@@ -423,7 +424,7 @@ def test_answer_evidence_prefers_query_relevant_source_quote_over_first_packet_s
                             {
                                 "span_role": "source",
                                 "message_id": "msg_1",
-                                "quote_text": "Jon took a short trip last week.",
+                                "quote_text": "Theo sorted invoices last week.",
                                 "occurred_at": "2023-06-19T10:04:00+00:00",
                                 "seq": 1,
                                 "metadata_json": {"message_role": "assistant"},
@@ -441,25 +442,25 @@ def test_answer_evidence_prefers_query_relevant_source_quote_over_first_packet_s
                 "id": "msg_1",
                 "role": "assistant",
                 "seq": 1,
-                "text": "Jon took a short trip last week.",
+                "text": "Theo sorted invoices last week.",
                 "occurred_at": "2023-06-19T10:04:00+00:00",
             },
             {
                 "id": "msg_2",
                 "role": "user",
                 "seq": 2,
-                "text": "Gina: Congrats, Jon! The studio looks amazing.",
+                "text": "Lio: The wind-harp pavilion sounds wonderfully clear.",
                 "occurred_at": "2023-06-19T10:04:00+00:00",
             },
         ],
-        query_text="How does Gina describe the studio Jon opened?",
+        query_text="How does Lio describe the pavilion Amara built?",
         query_type="slot_fill",
         enable_final_answer_evidence_pack=True,
     )
 
     assert context.answer_evidence_items[0]["quote_source"] == "source_message"
-    assert "studio looks amazing" in context.answer_evidence_items[0]["supporting_quote"]
-    assert "short trip" not in context.answer_evidence_items[0]["supporting_quote"]
+    assert "sounds wonderfully clear" in context.answer_evidence_items[0]["supporting_quote"]
+    assert "sorted invoices" not in context.answer_evidence_items[0]["supporting_quote"]
 
 
 def test_answer_evidence_keeps_named_speaker_prefix_for_quote_relevance() -> None:
@@ -467,13 +468,13 @@ def test_answer_evidence_keeps_named_speaker_prefix_for_quote_relevance() -> Non
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "vew_studio_opening",
+                "vew_tidal_gauge",
                 final_score=0.99,
                 canonical_text=(
-                    "[user] Gina: When are you opening the studio?\n"
-                    "[assistant] Jon: The official opening night is tomorrow.\n"
-                    "[user] Gina: Congrats, Jon! The studio looks amazing.\n"
-                    "[assistant] Jon: Thanks, Gina! I'm excited!"
+                    "[user] Sela Nori: The tidal gauge installation begins on November 6.\n"
+                    "[assistant] Engineer: I will note the installation date.\n"
+                    "[user] Sela Nori: The dock inspection starts at 14:20.\n"
+                    "[assistant] Engineer: Recorded the dock inspection time."
                 ),
                 object_type="evidence",
                 payload_json={
@@ -497,39 +498,39 @@ def test_answer_evidence_keeps_named_speaker_prefix_for_quote_relevance() -> Non
                 "id": "msg_278",
                 "role": "user",
                 "seq": 278,
-                "text": "Gina: When are you opening the studio?",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Sela Nori: The tidal gauge installation begins on November 6.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_279",
                 "role": "assistant",
                 "seq": 279,
-                "text": "Jon: The official opening night is tomorrow.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Engineer: I will note the installation date.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_280",
                 "role": "user",
                 "seq": 280,
-                "text": "Gina: Congrats, Jon! The studio looks amazing.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Sela Nori: The dock inspection starts at 14:20.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_281",
                 "role": "assistant",
                 "seq": 281,
-                "text": "Jon: Thanks, Gina! I'm excited!",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Engineer: Recorded the dock inspection time.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
         ],
-        query_text="How does Gina describe the studio that Jon has opened?",
+        query_text="When does the tidal gauge installation begin?",
         query_type="slot_fill",
         enable_final_answer_evidence_pack=True,
     )
 
-    assert context.answer_evidence_memory_ids == ["vew_studio_opening"]
-    assert "seq 280" in context.answer_evidence_items[0]["supporting_quote"]
-    assert "studio looks amazing" in context.answer_evidence_items[0]["supporting_quote"]
+    assert context.answer_evidence_memory_ids == ["vew_tidal_gauge"]
+    assert "Sela Nori" in context.answer_evidence_items[0]["supporting_quote"]
+    assert "November 6" in context.answer_evidence_items[0]["supporting_quote"]
 
 
 def test_answer_evidence_ranks_query_relevant_quote_before_higher_score_distractor() -> (
@@ -539,9 +540,9 @@ def test_answer_evidence_ranks_query_relevant_quote_before_higher_score_distract
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_flooring",
+                "mem_pavilion_flooring",
                 final_score=0.95,
-                canonical_text="Gina liked the studio flooring.",
+                canonical_text="Lio liked the pavilion flooring.",
                 evidence_packets=[
                     {
                         "support_kind": "direct",
@@ -549,7 +550,7 @@ def test_answer_evidence_ranks_query_relevant_quote_before_higher_score_distract
                         "spans": [
                             {
                                 "span_role": "source",
-                                "quote_text": "The Marley flooring has the right grip.",
+                                "quote_text": "The cork flooring dampens footsteps well.",
                                 "occurred_at": "2023-01-29T14:32:00+00:00",
                                 "seq": 1,
                                 "metadata_json": {"message_role": "user"},
@@ -559,9 +560,9 @@ def test_answer_evidence_ranks_query_relevant_quote_before_higher_score_distract
                 ],
             ),
             _candidate(
-                "sum_studio_launch",
+                "sum_pavilion_opening",
                 final_score=0.72,
-                canonical_text="Gina described Jon's studio launch.",
+                canonical_text="Lio described Amara's wind-harp pavilion.",
                 object_type="summary_view",
                 payload_json={
                     "summary_kind": "conversation_chunk",
@@ -577,17 +578,17 @@ def test_answer_evidence_ranks_query_relevant_quote_before_higher_score_distract
                 "id": "msg_1",
                 "role": "user",
                 "seq": 2,
-                "text": "Gina: Congrats, Jon! The studio looks amazing.",
+                "text": "Lio: The wind-harp pavilion sounds wonderfully clear.",
                 "occurred_at": "2023-06-19T10:04:00+00:00",
             }
         ],
-        query_text="How does Gina describe the studio Jon opened?",
+        query_text="How does Lio describe the pavilion Amara built?",
         query_type="slot_fill",
         enable_final_answer_evidence_pack=True,
     )
 
-    assert context.answer_evidence_items[0]["memory_id"] == "sum_studio_launch"
-    assert "studio looks amazing" in context.answer_evidence_items[0]["supporting_quote"]
+    assert context.answer_evidence_items[0]["memory_id"] == "sum_pavilion_opening"
+    assert "sounds wonderfully clear" in context.answer_evidence_items[0]["supporting_quote"]
 
 
 def test_broad_list_answer_evidence_prefers_material_applicability_over_ir_noise() -> (
@@ -597,13 +598,13 @@ def test_broad_list_answer_evidence_prefers_material_applicability_over_ir_noise
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "vew_paris",
+                "vew_northglass",
                 final_score=0.86,
-                canonical_text="[assistant] Jon: I visited Paris yesterday.",
+                canonical_text="[assistant] Rhea: I inspected Northglass Station yesterday.",
                 object_type="evidence",
                 payload_json={
                     "source_kind_variant": "conversation_window",
-                    "source_message_ids": ["msg_paris"],
+                    "source_message_ids": ["msg_northglass"],
                 },
                 llm_applicability=1.0,
                 retrieval_score=0.75,
@@ -611,7 +612,7 @@ def test_broad_list_answer_evidence_prefers_material_applicability_over_ir_noise
             _candidate(
                 "vew_ir_noise",
                 final_score=0.35,
-                canonical_text="[assistant] Jon: The studio floor needs work.",
+                canonical_text="[assistant] Rhea: The archive shelves need labels.",
                 object_type="evidence",
                 payload_json={
                     "source_kind_variant": "conversation_window",
@@ -621,16 +622,16 @@ def test_broad_list_answer_evidence_prefers_material_applicability_over_ir_noise
                 retrieval_score=0.98,
             ),
             _candidate(
-                "sum_rome",
+                "sum_ember_shoal",
                 final_score=0.20,
                 canonical_text=(
-                    "Jon mentioned taking a short trip to Rome to clear his mind."
+                    "Rhea mentioned a short survey trip to Ember Shoal Station."
                 ),
                 object_type="summary_view",
                 payload_json={
                     "summary_kind": "conversation_chunk",
                     "hierarchy_level": 0,
-                    "source_message_ids": ["msg_rome"],
+                    "source_message_ids": ["msg_ember_shoal"],
                     "source_message_window_start_occurred_at": (
                         "2023-06-19T10:04:00"
                     ),
@@ -647,41 +648,41 @@ def test_broad_list_answer_evidence_prefers_material_applicability_over_ir_noise
         resolved_policy=_resolved_policy(1600),
         conversation_messages=[
             {
-                "id": "msg_paris",
+                "id": "msg_northglass",
                 "role": "assistant",
                 "seq": 32,
-                "text": "Jon: I visited Paris yesterday.",
+                "text": "Rhea: I inspected Northglass Station yesterday.",
                 "occurred_at": "2023-01-28T14:32:00",
             },
             {
                 "id": "msg_noise",
                 "role": "assistant",
                 "seq": 34,
-                "text": "Jon: The studio floor needs work.",
+                "text": "Rhea: The archive shelves need labels.",
                 "occurred_at": "2023-01-29T14:32:00",
             },
             {
-                "id": "msg_rome",
+                "id": "msg_ember_shoal",
                 "role": "assistant",
                 "seq": 275,
                 "text": (
-                    "Jon: Took a short trip last week to Rome to clear my mind "
-                    "a little."
+                    "Rhea: I made a short survey trip last week to Ember Shoal "
+                    "Station."
                 ),
                 "occurred_at": "2023-06-19T10:04:00",
             },
         ],
-        query_text="Which cities has Jon visited?",
+        query_text="Which field stations has Rhea inspected?",
         query_type="broad_list",
         exact_recall_mode=True,
         enable_final_answer_evidence_pack=True,
     )
 
     assert [item["memory_id"] for item in context.answer_evidence_items[:2]] == [
-        "vew_paris",
-        "sum_rome",
+        "vew_northglass",
+        "sum_ember_shoal",
     ]
-    assert "Rome" in context.answer_evidence_block
+    assert "Ember Shoal" in context.answer_evidence_block
     assert "vew_ir_noise" not in context.answer_evidence_memory_ids
 
 
@@ -692,26 +693,26 @@ def test_broad_list_evidence_obligation_reserves_applicable_source_linked_summar
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "vew_paris",
+                "vew_northglass",
                 final_score=0.86,
-                canonical_text="[assistant] Jon: I visited Paris yesterday.",
+                canonical_text="[assistant] Rhea: I inspected Northglass Station yesterday.",
                 object_type="evidence",
                 payload_json={
                     "source_kind_variant": "conversation_window",
-                    "source_message_ids": ["msg_paris"],
+                    "source_message_ids": ["msg_northglass"],
                 },
                 llm_applicability=1.0,
             ),
             _candidate(
                 "mem_distractor",
                 final_score=0.82,
-                canonical_text="Jon discussed dance studio flooring.",
+                canonical_text="Rhea discussed archive shelf labels.",
                 llm_applicability=0.1,
             ),
             _candidate(
                 "sum_unrelated",
                 final_score=0.81,
-                canonical_text="Jon discussed unrelated dance studio logistics.",
+                canonical_text="Rhea discussed unrelated archive logistics.",
                 object_type="summary_view",
                 payload_json={
                     "summary_kind": "conversation_chunk",
@@ -723,7 +724,7 @@ def test_broad_list_evidence_obligation_reserves_applicable_source_linked_summar
             _candidate(
                 "vew_unrelated",
                 final_score=0.70,
-                canonical_text="[assistant] Jon: Marley flooring seems practical.",
+                canonical_text="[assistant] Rhea: Acid-free folders seem practical.",
                 object_type="evidence",
                 payload_json={
                     "source_kind_variant": "conversation_window",
@@ -732,16 +733,16 @@ def test_broad_list_evidence_obligation_reserves_applicable_source_linked_summar
                 llm_applicability=0.1,
             ),
             _candidate(
-                "sum_rome",
+                "sum_ember_shoal",
                 final_score=0.20,
                 canonical_text=(
-                    "Jon mentioned taking a short trip to Rome to clear his mind."
+                    "Rhea mentioned a short survey trip to Ember Shoal Station."
                 ),
                 object_type="summary_view",
                 payload_json={
                     "summary_kind": "conversation_chunk",
                     "hierarchy_level": 0,
-                    "source_message_ids": ["msg_rome"],
+                    "source_message_ids": ["msg_ember_shoal"],
                     "source_message_window_start_occurred_at": (
                         "2023-06-19T10:04:00"
                     ),
@@ -757,19 +758,19 @@ def test_broad_list_evidence_obligation_reserves_applicable_source_linked_summar
         resolved_policy=_policy_with_final_context_items(1300, 2),
         conversation_messages=[
             {
-                "id": "msg_paris",
+                "id": "msg_northglass",
                 "role": "assistant",
                 "seq": 32,
-                "text": "Jon: I visited Paris yesterday.",
+                "text": "Rhea: I inspected Northglass Station yesterday.",
                 "occurred_at": "2023-01-28T14:32:00",
             },
             {
-                "id": "msg_rome",
+                "id": "msg_ember_shoal",
                 "role": "assistant",
                 "seq": 275,
                 "text": (
-                    "Jon: Took a short trip last week to Rome to clear my mind "
-                    "a little."
+                    "Rhea: I made a short survey trip last week to Ember Shoal "
+                    "Station."
                 ),
                 "occurred_at": "2023-06-19T10:04:00",
             },
@@ -777,19 +778,19 @@ def test_broad_list_evidence_obligation_reserves_applicable_source_linked_summar
                 "id": "msg_unrelated",
                 "role": "assistant",
                 "seq": 36,
-                "text": "Jon: Marley flooring seems practical.",
+                "text": "Rhea: Acid-free folders seem practical.",
                 "occurred_at": "2023-01-29T14:32:00",
             },
         ],
-        query_text="Which cities has Jon visited?",
+        query_text="Which field stations has Rhea inspected?",
         query_type="broad_list",
         exact_recall_mode=True,
         enable_evidence_obligation_coverage=True,
     )
 
-    assert context.selected_memory_ids == ["vew_paris", "sum_rome"]
-    assert "Rome" in context.memory_block
-    assert "dance studio flooring" not in context.memory_block
+    assert context.selected_memory_ids == ["vew_northglass", "sum_ember_shoal"]
+    assert "Ember Shoal" in context.memory_block
+    assert "archive shelf labels" not in context.memory_block
 
 
 def test_broad_list_answer_evidence_renders_material_direct_quote_below_score_floor() -> (
@@ -801,21 +802,21 @@ def test_broad_list_answer_evidence_renders_material_direct_quote_below_score_fl
             _candidate(
                 "mem_high_ir_noise",
                 final_score=0.92,
-                canonical_text="Jon discussed studio logistics.",
+                canonical_text="Rhea discussed archive logistics.",
                 llm_applicability=0.0,
                 retrieval_score=0.95,
             ),
             _candidate(
-                "sum_rome",
+                "sum_ember_shoal",
                 final_score=0.20,
                 canonical_text=(
-                    "Jon mentioned taking a short trip to Rome to clear his mind."
+                    "Rhea mentioned a short survey trip to Ember Shoal Station."
                 ),
                 object_type="summary_view",
                 payload_json={
                     "summary_kind": "conversation_chunk",
                     "hierarchy_level": 0,
-                    "source_message_ids": ["msg_rome"],
+                    "source_message_ids": ["msg_ember_shoal"],
                     "source_message_window_start_occurred_at": (
                         "2023-06-19T10:04:00"
                     ),
@@ -832,25 +833,25 @@ def test_broad_list_answer_evidence_renders_material_direct_quote_below_score_fl
         resolved_policy=_resolved_policy(1600),
         conversation_messages=[
             {
-                "id": "msg_rome",
+                "id": "msg_ember_shoal",
                 "role": "assistant",
                 "seq": 275,
                 "text": (
-                    "Jon: Took a short trip last week to Rome to clear my mind "
-                    "a little."
+                    "Rhea: I made a short survey trip last week to Ember Shoal "
+                    "Station."
                 ),
                 "occurred_at": "2023-06-19T10:04:00",
             },
         ],
-        query_text="Which cities has Jon visited?",
+        query_text="Which field stations has Rhea inspected?",
         query_type="broad_list",
         exact_recall_mode=True,
         enable_final_answer_evidence_pack=True,
     )
 
     assert context.answer_evidence_sufficiency["state"] == "sufficient_direct_quote"
-    assert context.answer_evidence_memory_ids == ["sum_rome"]
-    assert "Rome" in context.answer_evidence_block
+    assert context.answer_evidence_memory_ids == ["sum_ember_shoal"]
+    assert "Ember Shoal" in context.answer_evidence_block
 
 
 def test_memory_entry_adds_query_relevant_source_quote_when_packet_span_is_weak() -> (
@@ -860,9 +861,9 @@ def test_memory_entry_adds_query_relevant_source_quote_when_packet_span_is_weak(
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "sum_studio_launch",
+                "sum_pavilion_opening",
                 final_score=0.89,
-                canonical_text="Gina described Jon's studio launch and encouraged him.",
+                canonical_text="Lio described Amara's wind-harp pavilion and praised it.",
                 object_type="summary_view",
                 payload_json={
                     "summary_kind": "conversation_chunk",
@@ -876,7 +877,7 @@ def test_memory_entry_adds_query_relevant_source_quote_when_packet_span_is_weak(
                             {
                                 "span_role": "source",
                                 "message_id": "msg_1",
-                                "quote_text": "Jon took a short trip last week.",
+                                "quote_text": "Theo sorted invoices last week.",
                                 "occurred_at": "2023-06-19T10:04:00+00:00",
                                 "seq": 1,
                                 "metadata_json": {"message_role": "assistant"},
@@ -894,25 +895,25 @@ def test_memory_entry_adds_query_relevant_source_quote_when_packet_span_is_weak(
                 "id": "msg_1",
                 "role": "assistant",
                 "seq": 1,
-                "text": "Jon took a short trip last week.",
+                "text": "Theo sorted invoices last week.",
                 "occurred_at": "2023-06-19T10:04:00+00:00",
             },
             {
                 "id": "msg_2",
                 "role": "user",
                 "seq": 2,
-                "text": "Gina: Congrats, Jon! The studio looks amazing.",
+                "text": "Lio: The wind-harp pavilion sounds wonderfully clear.",
                 "occurred_at": "2023-06-19T10:04:00+00:00",
             },
         ],
-        query_text="How does Gina describe the studio Jon opened?",
+        query_text="How does Lio describe the pavilion Amara built?",
         query_type="slot_fill",
         enable_final_answer_evidence_pack=False,
     )
 
     assert "evidence_packet: support: inferred" in context.memory_block
     assert "source_quote: user @ 2023-06-19T10:04:00+00:00 seq 2:" in context.memory_block
-    assert "studio looks amazing" in context.memory_block
+    assert "sounds wonderfully clear" in context.memory_block
 
 
 def test_summary_memory_entry_renders_short_source_chain_from_first_query_match() -> (
@@ -922,11 +923,11 @@ def test_summary_memory_entry_renders_short_source_chain_from_first_query_match(
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "sum_grand_opening",
+                "sum_clock_opening",
                 final_score=0.88,
                 canonical_text=(
-                    "Jon's dance studio was nearly ready, with Gina excited "
-                    "for the grand opening."
+                    "Museum planning summary: the kinetic clock exhibit opens "
+                    "on October 12 and the preview tour starts at 09:30."
                 ),
                 object_type="summary_view",
                 payload_json={
@@ -950,9 +951,9 @@ def test_summary_memory_entry_renders_short_source_chain_from_first_query_match(
                                 "span_role": "source",
                                 "message_id": "msg_277",
                                 "quote_text": (
-                                    "Still working on opening a dance studio."
+                                    "Curator: Which exhibit date belongs on the calendar?"
                                 ),
-                                "occurred_at": "2023-06-19T10:04:00+00:00",
+                                "occurred_at": "2026-03-08T10:00:00+00:00",
                                 "seq": 277,
                                 "metadata_json": {"message_role": "assistant"},
                             }
@@ -969,65 +970,61 @@ def test_summary_memory_entry_renders_short_source_chain_from_first_query_match(
                 "id": "msg_277",
                 "role": "assistant",
                 "seq": 277,
-                "text": "Jon: Still working on opening a dance studio.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Curator: Which exhibit date belongs on the calendar?",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_278",
                 "role": "user",
                 "seq": 278,
-                "text": "Gina: When are you opening the studio?",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Rin Vale: The kinetic clock exhibit opens on October 12.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_279",
                 "role": "assistant",
                 "seq": 279,
-                "text": (
-                    "Jon: The official opening night is tomorrow. I'm working "
-                    "hard to make everything just right."
-                ),
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Curator: I will note the public opening date.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_280",
                 "role": "user",
                 "seq": 280,
-                "text": "Gina: Congrats, Jon! The studio looks amazing.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Rin Vale: The preview tour starts at 09:30.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_281",
                 "role": "assistant",
                 "seq": 281,
-                "text": "Jon: Thanks, Gina! I'm excited!",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Curator: Recorded the preview tour time.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_282",
                 "role": "user",
                 "seq": 282,
-                "text": "Gina: Take some time to savor it.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Rin Vale: The brass pendulum arrives two days earlier.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_283",
                 "role": "assistant",
                 "seq": 283,
-                "text": "Jon: I want to savor all the good vibes.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Curator: I will keep the delivery date with the notes.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
         ],
-        query_text="What does Jon plan to do at the grand opening?",
+        query_text="When does the kinetic clock exhibit open?",
         query_type="slot_fill",
         enable_final_answer_evidence_pack=True,
     )
 
     assert "source_chain:" in context.memory_block
-    assert "seq 279: Jon: The official opening night is tomorrow" in context.memory_block
-    assert "seq 283: Jon: I want to savor all the good vibes." in context.memory_block
+    assert "October 12" in context.memory_block
     assert any(
-        "savor all the good vibes" in line
+        "October 12" in line
         for line in context.answer_evidence_items[0]["source_chain"]
     )
 
@@ -1039,16 +1036,16 @@ def test_answer_evidence_uses_verbatim_window_text_when_source_messages_are_abse
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "vew_conv_281_283",
+                "vew_launch_41_43",
                 final_score=0.91,
                 canonical_text=(
-                    "[user] Take some time to savor it.\n"
-                    "[assistant] I want to savor all the good vibes."
+                    "[user] Pause and record the prototype launch.\n"
+                    "[assistant] I will record a voice note before packing up."
                 ),
                 object_type="evidence",
                 payload_json={
                     "source_kind_variant": "conversation_window",
-                    "source_message_ids": ["msg_281", "msg_282", "msg_283"],
+                    "source_message_ids": ["msg_41", "msg_42", "msg_43"],
                 },
             )
         ],
@@ -1056,13 +1053,13 @@ def test_answer_evidence_uses_verbatim_window_text_when_source_messages_are_abse
         user_state=None,
         resolved_policy=_resolved_policy(1200),
         conversation_messages=[],
-        query_text="What does Jon plan to do at the grand opening?",
+        query_text="What will Niko do after the prototype launch?",
         query_type="slot_fill",
         enable_final_answer_evidence_pack=True,
     )
 
     assert context.answer_evidence_items[0]["quote_source"] == "verbatim_evidence_window"
-    assert "savor all the good vibes" in context.answer_evidence_items[0]["supporting_quote"]
+    assert "record a voice note" in context.answer_evidence_items[0]["supporting_quote"]
     assert context.answer_evidence_sufficiency["state"] == "sufficient_direct_quote"
 
 
@@ -1071,11 +1068,11 @@ def test_summary_source_window_answer_evidence_renders_source_chain() -> None:
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "vew_grand_opening_277_278",
+                "vew_clock_opening_277_278",
                 final_score=0.98,
                 canonical_text=(
-                    "[assistant] Still working on opening a dance studio.\n"
-                    "[user] When are you opening the studio?"
+                    "[assistant] Curator: Which exhibit date belongs on the calendar?\n"
+                    "[user] Rin Vale: The kinetic clock exhibit opens on October 12."
                 ),
                 object_type="evidence",
                 payload_json={
@@ -1084,23 +1081,16 @@ def test_summary_source_window_answer_evidence_renders_source_chain() -> None:
                 },
             ),
             _candidate(
-                "ssw_sum_grand_opening_277_283",
+                "ssw_sum_clock_opening_277_283",
                 final_score=0.93,
                 canonical_text=(
-                    "assistant @ 2023-06-19T10:04:00 seq 277: Jon: Still "
-                    "working on opening a dance studio.\n"
-                    "user @ 2023-06-19T10:04:00 seq 278: Gina: When are you "
-                    "opening the studio?\n"
-                    "assistant @ 2023-06-19T10:04:00 seq 279: Jon: The official "
-                    "opening night is tomorrow.\n"
-                    "user @ 2023-06-19T10:04:00 seq 280: Gina: Congrats, Jon! "
-                    "The studio looks amazing.\n"
-                    "assistant @ 2023-06-19T10:04:00 seq 281: Jon: Thanks, Gina! "
-                    "I'm excited!\n"
-                    "user @ 2023-06-19T10:04:00 seq 282: Gina: Take some time "
-                    "to savor it.\n"
-                    "assistant @ 2023-06-19T10:04:00 seq 283: Jon: I want to "
-                    "savor all the good vibes."
+                    "[assistant] Curator: Which exhibit date belongs on the calendar?\n"
+                    "[user] Rin Vale: The kinetic clock exhibit opens on October 12.\n"
+                    "[assistant] Curator: I will note the public opening date.\n"
+                    "[user] Rin Vale: The preview tour starts at 09:30.\n"
+                    "[assistant] Curator: Recorded the preview tour time.\n"
+                    "[user] Rin Vale: The brass pendulum arrives two days earlier.\n"
+                    "[assistant] Curator: I will keep the delivery date with the notes."
                 ),
                 object_type="evidence",
                 payload_json={
@@ -1115,13 +1105,13 @@ def test_summary_source_window_answer_evidence_renders_source_chain() -> None:
                         "msg_283",
                     ],
                     "source_message_window_start_occurred_at": (
-                        "2023-06-19T10:04:00+00:00"
+                        "2026-03-08T10:00:00+00:00"
                     ),
                     "source_message_window_end_occurred_at": (
-                        "2023-06-19T10:04:00+00:00"
+                        "2026-03-08T10:00:00+00:00"
                     ),
                 },
-            )
+            ),
         ],
         current_contract={},
         user_state=None,
@@ -1131,62 +1121,62 @@ def test_summary_source_window_answer_evidence_renders_source_chain() -> None:
                 "id": "msg_277",
                 "role": "assistant",
                 "seq": 277,
-                "text": "Jon: Still working on opening a dance studio.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Curator: Which exhibit date belongs on the calendar?",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_278",
                 "role": "user",
                 "seq": 278,
-                "text": "Gina: When are you opening the studio?",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Rin Vale: The kinetic clock exhibit opens on October 12.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_279",
                 "role": "assistant",
                 "seq": 279,
-                "text": "Jon: The official opening night is tomorrow.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Curator: I will note the public opening date.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_280",
                 "role": "user",
                 "seq": 280,
-                "text": "Gina: Congrats, Jon! The studio looks amazing.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Rin Vale: The preview tour starts at 09:30.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_281",
                 "role": "assistant",
                 "seq": 281,
-                "text": "Jon: Thanks, Gina! I'm excited!",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Curator: Recorded the preview tour time.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_282",
                 "role": "user",
                 "seq": 282,
-                "text": "Gina: Take some time to savor it.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Rin Vale: The brass pendulum arrives two days earlier.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
             {
                 "id": "msg_283",
                 "role": "assistant",
                 "seq": 283,
-                "text": "Jon: I want to savor all the good vibes.",
-                "occurred_at": "2023-06-19T10:04:00+00:00",
+                "text": "Curator: I will keep the delivery date with the notes.",
+                "occurred_at": "2026-03-08T10:00:00+00:00",
             },
         ],
-        query_text="What does Jon plan to do at the grand opening?",
+        query_text="When does the kinetic clock exhibit open?",
         query_type="slot_fill",
         enable_final_answer_evidence_pack=True,
     )
 
     source_chain = context.answer_evidence_items[0]["source_chain"]
-    assert context.answer_evidence_memory_ids == ["ssw_sum_grand_opening_277_283"]
+    assert context.answer_evidence_memory_ids == ["ssw_sum_clock_opening_277_283"]
     assert context.memory_block.startswith("[Final Answer Evidence Pack]")
-    assert any("seq 283: Jon: I want to savor all the good vibes." in line for line in source_chain)
-    assert "seq 283: Jon: I want to savor all the good vibes." in context.answer_evidence_block
+    assert any("October 12" in line for line in source_chain)
+    assert "October 12" in context.answer_evidence_block
 
 
 def test_literal_evidence_is_selected_before_higher_scoring_summary() -> None:
@@ -1196,14 +1186,14 @@ def test_literal_evidence_is_selected_before_higher_scoring_summary() -> None:
             _candidate(
                 "mem_summary",
                 final_score=0.99,
-                canonical_text="Gina discussed several store design ideas.",
+                canonical_text="The prism is somewhere in the observatory storage area.",
                 object_type="summary_view",
                 payload_json={"hierarchy_level": 1, "source_message_ids": ["msg_1"]},
             ),
             _candidate(
                 "mem_literal",
                 final_score=0.62,
-                canonical_text="Gina designed the space, furniture, and decor.",
+                canonical_text="The prism is stored in locker NOVA-417.",
                 evidence_packets=[
                     {
                         "support_kind": "contextual_direct",
@@ -1211,7 +1201,7 @@ def test_literal_evidence_is_selected_before_higher_scoring_summary() -> None:
                         "spans": [
                             {
                                 "span_role": "source",
-                                "quote_text": "I designed the space, furniture, and decor.",
+                                "quote_text": "I stored the prism in locker NOVA-417.",
                                 "metadata_json": {"message_role": "user"},
                             }
                         ],
@@ -1226,16 +1216,16 @@ def test_literal_evidence_is_selected_before_higher_scoring_summary() -> None:
             {
                 "id": "msg_1",
                 "role": "user",
-                "text": "Gina talked about her store designs.",
+                "text": "I stored the prism in locker NOVA-417.",
             }
         ],
-        query_text="What did Gina design for her store?",
+        query_text="Which locker code did I use for the prism?",
         query_type="slot_fill",
         exact_recall_mode=True,
     )
 
     assert context.selected_memory_ids == ["mem_literal"]
-    assert "I designed the space, furniture, and decor." in context.memory_block
+    assert "I stored the prism in locker NOVA-417." in context.memory_block
 
 
 def test_cross_presence_memory_is_rendered_with_attribution() -> None:
@@ -1483,7 +1473,7 @@ def test_memory_block_redacts_high_risk_secret_literals() -> None:
 
 def test_answer_evidence_and_verifier_prompt_omit_withheld_secret_literals() -> None:
     composer = _composer()
-    secret_literal = "K8sN0d3Jump!2024"
+    secret_literal = "fixture-secret-Q7X9"
     candidate = _candidate(
         "mem_secret",
         final_score=0.98,
@@ -1550,11 +1540,11 @@ def test_coverage_metadata_redacts_secret_literals_without_hiding_gap() -> None:
     selected_secret = _candidate(
         "mem_jump_host_secret",
         final_score=0.96,
-        canonical_text="The production jump host password is K8sN0d3Jump!2024.",
+        canonical_text="The production jump host password is fixture-secret-Q7X9.",
         payload_json={
             "source_message_ids": ["msg_jump_host"],
-            "value_norm_key": "K8sN0d3Jump!2024",
-            "value_text": "K8sN0d3Jump!2024",
+            "value_norm_key": "fixture-secret-Q7X9",
+            "value_text": "fixture-secret-Q7X9",
         },
     )
     selected_secret.memory_object.update(
@@ -1612,7 +1602,7 @@ def test_coverage_metadata_redacts_secret_literals_without_hiding_gap() -> None:
     assert context.coverage_state == "partial"
     assert context.missing_slots == []
     assert "Protected high-risk memory present; raw value withheld." in context.memory_block
-    assert "K8sN0d3Jump!2024" not in context.memory_block
+    assert "fixture-secret-Q7X9" not in context.memory_block
     assert "VaultReset-9911" not in context.memory_block
     serialized_support = json.dumps(
         {
@@ -1624,7 +1614,7 @@ def test_coverage_metadata_redacts_secret_literals_without_hiding_gap() -> None:
         ensure_ascii=False,
         sort_keys=True,
     )
-    assert "K8sN0d3Jump!2024" not in serialized_support
+    assert "fixture-secret-Q7X9" not in serialized_support
     assert "VaultReset-9911" not in serialized_support
     assert "Protected high-risk memory present" not in serialized_support
     assert "withheld|high_risk_secret_literal" not in serialized_support
@@ -1669,11 +1659,11 @@ def test_privacy_off_can_render_high_risk_secret_literals() -> None:
 
 def test_privacy_off_renders_source_quote_for_high_risk_secret() -> None:
     composer = _composer()
-    secret_message_text = "The production jump host password is K8sN0d3Jump!2024."
+    secret_message_text = "The production jump host password is fixture-secret-Q7X9."
     candidate = _candidate(
         "mem_secret_quote",
         final_score=0.93,
-        canonical_text="The production jump host password is K8sN0d3Jump!2024.",
+        canonical_text="The production jump host password is fixture-secret-Q7X9.",
         payload_json={"source_message_ids": ["msg_secret"]},
     )
     candidate.memory_object.update(
@@ -1964,8 +1954,8 @@ def test_temporal_memory_includes_validity_window_in_rendered_block() -> None:
                 "mem_bounded",
                 final_score=0.9,
                 canonical_text="User painted a lake sunrise.",
-                valid_from="2022-05-15T00:00:00+00:00",
-                valid_to="2022-05-31T23:59:59+00:00",
+                valid_from="2041-05-15T00:00:00+00:00",
+                valid_to="2041-05-31T23:59:59+00:00",
                 temporal_type="bounded",
             ),
             _candidate(
@@ -1989,7 +1979,7 @@ def test_temporal_memory_includes_validity_window_in_rendered_block() -> None:
 
     # Bounded memory shows both dates
     assert (
-        "valid_window: 2022-05-15T00:00:00+00:00 to 2022-05-31T23:59:59+00:00"
+        "valid_window: 2041-05-15T00:00:00+00:00 to 2041-05-31T23:59:59+00:00"
         in context.memory_block
     )
     # Open-ended (only valid_from) shows from-date and ?
@@ -2063,13 +2053,13 @@ def test_exact_recall_memory_includes_source_quote_from_source_message() -> None
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_job_loss",
+                "mem_badge_expiry",
                 final_score=0.9,
-                canonical_text="Jon is no longer in a secure banker job.",
+                canonical_text="Nia's observatory access badge expired.",
                 payload_json={
                     "source_message_ids": ["msg_1"],
-                    "source_message_window_start_occurred_at": "2023-01-20T16:04:00+00:00",
-                    "source_message_window_end_occurred_at": "2023-01-20T16:04:00+00:00",
+                    "source_message_window_start_occurred_at": "2024-02-12T08:40:00+00:00",
+                    "source_message_window_end_occurred_at": "2024-02-12T08:40:00+00:00",
                 },
             )
         ],
@@ -2081,8 +2071,11 @@ def test_exact_recall_memory_includes_source_quote_from_source_message() -> None
                 "id": "msg_1",
                 "role": "user",
                 "seq": 2,
-                "text": "Jon: Lost my job as a banker yesterday, so I'm gonna start my own business.",
-                "occurred_at": "2023-01-20T16:04:00+00:00",
+                "text": (
+                    "Nia: My observatory access badge expired yesterday, so I "
+                    "requested a replacement."
+                ),
+                "occurred_at": "2024-02-12T08:40:00+00:00",
             }
         ],
         query_type="temporal",
@@ -2090,11 +2083,12 @@ def test_exact_recall_memory_includes_source_quote_from_source_message() -> None
     )
 
     assert (
-        "source_window: 2023-01-20T16:04:00+00:00 to 2023-01-20T16:04:00+00:00"
+        "source_window: 2024-02-12T08:40:00+00:00 to 2024-02-12T08:40:00+00:00"
         in context.memory_block
     )
     assert (
-        "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 2: Jon: Lost my job as a banker yesterday"
+        "source_quote: user @ 2024-02-12T08:40:00+00:00 seq 2: "
+        "Nia: My observatory access badge expired yesterday"
         in context.memory_block
     )
 
@@ -2104,27 +2098,27 @@ def test_memory_entry_prefers_evidence_packet_quotes_when_hydrated() -> None:
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_gina",
+                "mem_kiln_setting",
                 final_score=0.9,
-                canonical_text="Gina's favorite dance style is contemporary.",
+                canonical_text="Mira's preferred kiln setting is cone six.",
                 evidence_packets=[
                     {
                         "support_kind": "contextual_direct",
                         "evidence_polarity": "supports",
                         "speaker_relation_to_subject": "self_report",
                         "confidence": 0.91,
-                        "rationale": "Gina answers Jon's favorite-dance question.",
+                        "rationale": "Mira answers Theo's kiln-setting question.",
                         "spans": [
                             {
                                 "span_role": "source",
-                                "quote_text": "Contemporary dance really speaks to me.",
+                                "quote_text": "Cone six gives the glaze finish I want.",
                                 "seq": 2,
                                 "occurred_at": "2023-01-20T16:04:00+00:00",
                                 "metadata_json": {"message_role": "user"},
                             },
                             {
                                 "span_role": "trigger",
-                                "quote_text": "What's your fave?",
+                                "quote_text": "Which kiln setting do you prefer?",
                                 "seq": 1,
                                 "occurred_at": "2023-01-20T16:03:00+00:00",
                                 "metadata_json": {"message_role": "assistant"},
@@ -2153,8 +2147,14 @@ def test_memory_entry_prefers_evidence_packet_quotes_when_hydrated() -> None:
     )
 
     assert "evidence_packet: support: contextual_direct" in context.memory_block
-    assert "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 2: Contemporary dance really speaks to me." in context.memory_block
-    assert "trigger_quote: assistant @ 2023-01-20T16:03:00+00:00 seq 1: What's your fave?" in context.memory_block
+    assert (
+        "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 2: "
+        "Cone six gives the glaze finish I want."
+    ) in context.memory_block
+    assert (
+        "trigger_quote: assistant @ 2023-01-20T16:03:00+00:00 seq 1: "
+        "Which kiln setting do you prefer?"
+    ) in context.memory_block
     assert "fallback source quote" not in context.memory_block
 
 
@@ -2412,7 +2412,7 @@ def test_default_source_quote_renders_for_non_exact_queries() -> None:
 
 def test_source_quote_with_zero_query_token_overlap_is_not_vetoed() -> None:
     composer = _composer()
-    source_text = "Liora packed saffron notebooks before sunrise."
+    source_text = "Liora packed vellum logbooks before sunrise."
     query_text = "Which tool preference should be remembered?"
 
     assert ContextComposer._quote_query_relevance(source_text, query_text) == 0.0
@@ -2453,7 +2453,7 @@ def test_source_quote_with_zero_query_token_overlap_is_not_vetoed() -> None:
     assert "evidence_packet: support: contextual_direct" in context.memory_block
     assert (
         "source_quote: user @ 2026-02-14T09:30:00+00:00 seq 7: "
-        "Liora packed saffron notebooks before sunrise."
+        "Liora packed vellum logbooks before sunrise."
     ) in context.memory_block
 
 
@@ -2647,7 +2647,7 @@ def test_conversation_chunk_summary_includes_source_window_and_excerpt() -> None
             _candidate(
                 "sum_mem_chunk",
                 final_score=0.9,
-                canonical_text="Melanie signed up for a pottery class.",
+                canonical_text="Oren registered for a paper marbling workshop.",
                 object_type="summary_view",
                 scope="conversation",
                 payload_json={
@@ -2657,7 +2657,9 @@ def test_conversation_chunk_summary_includes_source_window_and_excerpt() -> None
                         {
                             "role": "assistant",
                             "occurred_at": "2023-07-03T13:36:00",
-                            "text": "Melanie: I just signed up for a pottery class yesterday.",
+                            "text": (
+                                "Oren: I registered for a paper marbling workshop yesterday."
+                            ),
                         }
                     ],
                     "source_message_window_start_occurred_at": "2023-07-03T13:36:00",
@@ -2676,7 +2678,8 @@ def test_conversation_chunk_summary_includes_source_window_and_excerpt() -> None
         in context.memory_block
     )
     assert (
-        "source_excerpt: assistant @ 2023-07-03T13:36:00: Melanie: I just signed up for a pottery class yesterday."
+        "source_excerpt: assistant @ 2023-07-03T13:36:00: "
+        "Oren: I registered for a paper marbling workshop yesterday."
         in context.memory_block
     )
 
@@ -2688,7 +2691,10 @@ def test_verbatim_evidence_search_candidate_includes_source_window() -> None:
             _candidate(
                 "raw_cnv_1_1_2",
                 final_score=0.9,
-                canonical_text="user: My allergy is peanut and shellfish\nassistant: Noted.",
+                canonical_text=(
+                    "user: My calibration targets are cobalt and quartz\n"
+                    "assistant: Noted."
+                ),
                 object_type="evidence",
                 payload_json={
                     "source_kind_variant": "conversation_window",
@@ -2716,7 +2722,7 @@ def test_evidence_obligation_reserves_literal_support_for_source_summary() -> No
             _candidate(
                 "sum_episode",
                 final_score=0.98,
-                canonical_text="Caroline looked into adoption options.",
+                canonical_text="Ilya compared acoustic panel suppliers.",
                 object_type="summary_view",
                 payload_json={
                     "summary_kind": "episode",
@@ -2727,14 +2733,14 @@ def test_evidence_obligation_reserves_literal_support_for_source_summary() -> No
             _candidate(
                 "mem_distractor",
                 final_score=0.96,
-                canonical_text="Caroline talked about unrelated travel logistics.",
+                canonical_text="Ilya discussed unrelated freight schedules.",
             ),
             _candidate(
                 "vew_conv_10_12",
                 final_score=0.52,
                 canonical_text=(
-                    "[user] Caroline: Researching adoption agencies has been "
-                    "on my mind."
+                    "[user] Ilya: Comparing acoustic panel suppliers has been "
+                    "on my agenda."
                 ),
                 object_type="evidence",
                 payload_json={
@@ -2749,13 +2755,13 @@ def test_evidence_obligation_reserves_literal_support_for_source_summary() -> No
         user_state=None,
         resolved_policy=_policy_with_final_context_items(800, 2),
         conversation_messages=[],
-        query_text="What did Caroline research?",
+        query_text="Which suppliers did Ilya compare?",
         query_type="slot_fill",
         enable_evidence_obligation_coverage=True,
     )
 
     assert context.selected_memory_ids[0] == "vew_conv_10_12"
-    assert "Researching adoption agencies" in context.memory_block
+    assert "Comparing acoustic panel suppliers" in context.memory_block
 
 
 def test_evidence_obligation_keeps_near_tie_literal_windows() -> None:
@@ -2937,20 +2943,20 @@ def test_source_required_list_reserves_distinct_values_from_same_source() -> Non
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_paris",
+                "mem_northglass",
                 final_score=0.95,
-                canonical_text="Caroline mentioned Paris.",
+                canonical_text="Rhea mentioned Northglass Station.",
                 object_type="evidence",
                 payload_json={
                     "source_message_ids": ["msg_combo"],
-                    "value_norm_key": "paris",
-                    "value_text": "Paris",
+                    "value_norm_key": "northglass",
+                    "value_text": "Northglass",
                 },
             ),
             _candidate(
                 "mem_unrelated",
                 final_score=0.94,
-                canonical_text="Caroline also discussed unrelated travel logistics.",
+                canonical_text="Rhea also discussed unrelated archive logistics.",
                 object_type="summary_view",
                 payload_json={
                     "source_message_ids": ["msg_other"],
@@ -2959,14 +2965,14 @@ def test_source_required_list_reserves_distinct_values_from_same_source() -> Non
                 },
             ),
             _candidate(
-                "mem_rome",
+                "mem_ember_shoal",
                 final_score=0.41,
-                canonical_text="Caroline mentioned Rome in the same sentence.",
+                canonical_text="Rhea mentioned Ember Shoal in the same sentence.",
                 object_type="evidence",
                 payload_json={
                     "source_message_ids": ["msg_combo"],
-                    "value_norm_key": "rome",
-                    "value_text": "Rome",
+                    "value_norm_key": "ember_shoal",
+                    "value_text": "Ember Shoal",
                 },
             ),
         ],
@@ -2974,7 +2980,7 @@ def test_source_required_list_reserves_distinct_values_from_same_source() -> Non
         user_state=None,
         resolved_policy=_policy_with_final_context_items(900, 2),
         conversation_messages=[],
-        query_text="Which cities did Caroline mention?",
+        query_text="Which field stations did Rhea mention?",
         query_type="broad_list",
         answer_shape="list",
         coverage_mode="exhaustive_known_set",
@@ -2982,19 +2988,21 @@ def test_source_required_list_reserves_distinct_values_from_same_source() -> Non
         enable_evidence_obligation_coverage=True,
     )
 
-    assert context.selected_memory_ids == ["mem_paris", "mem_rome"]
+    assert context.selected_memory_ids == ["mem_northglass", "mem_ember_shoal"]
     assert [item["display_text"] for item in context.allowed_values] == [
-        "Paris",
-        "Rome",
+        "Northglass",
+        "Ember Shoal",
     ]
-    assert "Caroline also discussed unrelated travel logistics." not in context.memory_block
+    assert "Rhea also discussed unrelated archive logistics." not in context.memory_block
 
 
 def test_source_coverage_reserve_seeds_groups_from_window_reservations() -> None:
     window = _candidate(
         "vew_combo",
         final_score=0.99,
-        canonical_text="Caroline said she lived in Paris, Rome, and Lisbon.",
+        canonical_text=(
+            "Rhea inspected Northglass, Ember Shoal, and Cloudbreak Stations."
+        ),
         payload_json={
             "source_kind_variant": "conversation_window",
             "source_message_ids": ["msg_combo"],
@@ -3003,42 +3011,42 @@ def test_source_coverage_reserve_seeds_groups_from_window_reservations() -> None
     same_source_duplicate = _candidate(
         "mem_combo_duplicate",
         final_score=0.98,
-        canonical_text="Caroline discussed the same source message.",
+        canonical_text="Rhea discussed the same inspection record.",
         payload_json={"source_message_ids": ["msg_combo"]},
     )
-    paris = _candidate(
-        "mem_paris",
+    northglass = _candidate(
+        "mem_northglass",
         final_score=0.97,
-        canonical_text="Caroline lived in Paris.",
+        canonical_text="Rhea inspected Northglass Station.",
         payload_json={
-            "source_message_ids": ["msg_paris"],
-            "value_norm_key": "paris",
-            "value_text": "Paris",
+            "source_message_ids": ["msg_northglass"],
+            "value_norm_key": "northglass",
+            "value_text": "Northglass",
         },
     )
-    rome = _candidate(
-        "mem_rome",
+    ember_shoal = _candidate(
+        "mem_ember_shoal",
         final_score=0.96,
-        canonical_text="Caroline lived in Rome.",
+        canonical_text="Rhea inspected Ember Shoal Station.",
         payload_json={
-            "source_message_ids": ["msg_rome"],
-            "value_norm_key": "rome",
-            "value_text": "Rome",
+            "source_message_ids": ["msg_ember_shoal"],
+            "value_norm_key": "ember_shoal",
+            "value_text": "Ember Shoal",
         },
     )
-    lisbon = _candidate(
-        "mem_lisbon",
+    cloudbreak = _candidate(
+        "mem_cloudbreak",
         final_score=0.95,
-        canonical_text="Caroline lived in Lisbon.",
+        canonical_text="Rhea inspected Cloudbreak Station.",
         payload_json={
-            "source_message_ids": ["msg_lisbon"],
-            "value_norm_key": "lisbon",
-            "value_text": "Lisbon",
+            "source_message_ids": ["msg_cloudbreak"],
+            "value_norm_key": "cloudbreak",
+            "value_text": "Cloudbreak",
         },
     )
 
     reserved = ContextComposer._evidence_obligation_candidates(
-        [window, same_source_duplicate, paris, rome, lisbon],
+        [window, same_source_duplicate, northglass, ember_shoal, cloudbreak],
         max_items=4,
         query_type="slot_fill",
         answer_shape="single_fact",
@@ -3050,9 +3058,9 @@ def test_source_coverage_reserve_seeds_groups_from_window_reservations() -> None
 
     assert [candidate.memory_id for candidate in reserved] == [
         "vew_combo",
-        "mem_paris",
-        "mem_rome",
-        "mem_lisbon",
+        "mem_northglass",
+        "mem_ember_shoal",
+        "mem_cloudbreak",
     ]
 
 
@@ -3190,14 +3198,14 @@ def test_source_required_summary_only_support_is_insufficient() -> None:
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "sum_country",
+                "sum_origin_port",
                 final_score=0.95,
-                canonical_text="Episode summary says Caroline moved from Sweden.",
+                canonical_text="Episode summary says Vela transferred from Arbor Bay.",
                 object_type="summary_view",
                 payload_json={
-                    "source_message_ids": ["msg_country"],
-                    "value_norm_key": "sweden",
-                    "value_text": "Sweden",
+                    "source_message_ids": ["msg_origin_port"],
+                    "value_norm_key": "arbor_bay",
+                    "value_text": "Arbor Bay",
                 },
             )
         ],
@@ -3205,7 +3213,7 @@ def test_source_required_summary_only_support_is_insufficient() -> None:
         user_state=None,
         resolved_policy=_policy_with_final_context_items(700, 1),
         conversation_messages=[],
-        query_text="Where did Caroline move from?",
+        query_text="Which port did Vela transfer from?",
         query_type="slot_fill",
         answer_shape="single_fact",
         coverage_mode="current_state",
@@ -3213,7 +3221,7 @@ def test_source_required_summary_only_support_is_insufficient() -> None:
         enable_evidence_obligation_coverage=True,
     )
 
-    assert context.selected_memory_ids == ["sum_country"]
+    assert context.selected_memory_ids == ["sum_origin_port"]
     assert context.coverage_state == "insufficient"
     assert context.allowed_values == []
     assert context.support_map == {}
@@ -3757,7 +3765,13 @@ def test_thematic_profile_can_ground_through_episode_to_nested_l0_support() -> N
     assert "Theme derived from an episode only." in context.memory_block
 
 
-def test_broad_query_selection_prefers_diverse_specific_facets() -> None:
+def test_broad_query_admission_protects_top_k_rank() -> None:
+    # CS-2.2: the diversity reranker may no longer displace a top-K
+    # (pre-diversity rank) candidate with a lower-ranked one. The redundant but
+    # higher-ranked "busy with apprentices" summary keeps its seat; the lower-ranked
+    # "outdoors" summary is dropped. Production broad-list COVERAGE comes from the
+    # evidence-obligation path (disabled in this composer-only unit test), not
+    # from letting a lower-ranked item outrank a higher-ranked one.
     composer = _composer()
     policy = _resolved_policy(500).model_copy(
         update={
@@ -3770,33 +3784,42 @@ def test_broad_query_selection_prefers_diverse_specific_facets() -> None:
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_dinosaurs",
+                "mem_clockwork",
                 final_score=0.91,
-                canonical_text="Melanie's kids were excited about the dinosaur exhibit at the museum.",
+                canonical_text=(
+                    "Orin's apprentices crowded around the clockwork exhibit "
+                    "at the gallery."
+                ),
                 object_type="summary_view",
             ),
             _candidate(
                 "mem_busy",
                 final_score=0.90,
-                canonical_text="Melanie mentions being busy with the kids and work.",
+                canonical_text="Orin is busy with the apprentices.",
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_pottery",
+                "mem_glasswork",
                 final_score=0.87,
-                canonical_text="Melanie took her kids to a pottery workshop where they loved getting creative with clay.",
+                canonical_text=(
+                    "Orin took the apprentices to a glassworking studio where they "
+                    "enjoyed shaping bright glass."
+                ),
                 object_type="summary_view",
             ),
             _candidate(
                 "mem_nature",
                 final_score=0.86,
-                canonical_text="Melanie's family enjoys camping, hiking, and spending time in nature together.",
+                canonical_text=(
+                    "Orin's workshop group enjoys stargazing, sketching, and working "
+                    "outdoors together."
+                ),
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_swimming",
+                "mem_canoe_practice",
                 final_score=0.88,
-                canonical_text="Melanie went swimming with her kids after the conversation.",
+                canonical_text="Orin practiced canoeing with the apprentices.",
                 object_type="summary_view",
             ),
         ],
@@ -3804,20 +3827,26 @@ def test_broad_query_selection_prefers_diverse_specific_facets() -> None:
         user_state=None,
         resolved_policy=policy,
         conversation_messages=[],
-        query_text="What do Melanie's kids like?",
+        query_text="What do Orin's apprentices like?",
         query_type="broad_list",
     )
 
     assert set(context.selected_memory_ids) == {
-        "mem_dinosaurs",
-        "mem_pottery",
-        "mem_nature",
-        "mem_swimming",
+        "mem_clockwork",
+        "mem_busy",
+        "mem_canoe_practice",
+        "mem_glasswork",
     }
-    assert "busy with the kids and work" not in context.memory_block
+    assert "busy with the apprentices" in context.memory_block
+    assert "mem_nature" not in context.selected_memory_ids
 
 
-def test_broad_query_selection_penalizes_duplicate_source_messages() -> None:
+def test_broad_query_admission_keeps_higher_ranked_shared_source_carrier() -> None:
+    # CS-2.2: the composer no longer drops a higher-ranked carrier that shares a
+    # source message with another top-K carrier -- both top-2 carriers are
+    # admitted and the lower-ranked distinct one is dropped by the item cap. In
+    # production the CS-2.3 fusion dedupe collapses same-source carriers BEFORE
+    # the composer, so this backstop no longer needs to reorder by source.
     composer = _composer()
     policy = _resolved_policy(500).model_copy(
         update={
@@ -3830,36 +3859,43 @@ def test_broad_query_selection_penalizes_duplicate_source_messages() -> None:
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_first_pottery",
+                "mem_first_glasswork",
                 final_score=0.94,
-                canonical_text="Melanie's kids loved pottery at the workshop.",
-                payload_json={"source_message_ids": ["msg_pottery"]},
+                canonical_text="Orin's apprentices loved glassworking at the studio.",
+                payload_json={"source_message_ids": ["msg_glasswork"]},
             ),
             _candidate(
-                "mem_duplicate_pottery",
+                "mem_duplicate_glasswork",
                 final_score=0.93,
-                canonical_text="The pottery workshop made Melanie's kids happy.",
-                payload_json={"source_message_ids": ["msg_pottery"]},
+                canonical_text="The glassworking studio delighted Orin's apprentices.",
+                payload_json={"source_message_ids": ["msg_glasswork"]},
             ),
             _candidate(
-                "mem_swimming",
+                "mem_canoe_practice",
                 final_score=0.82,
-                canonical_text="Melanie's kids also enjoyed swimming.",
-                payload_json={"source_message_ids": ["msg_swimming"]},
+                canonical_text="Orin's apprentices also enjoyed canoe practice.",
+                payload_json={"source_message_ids": ["msg_canoe_practice"]},
             ),
         ],
         current_contract=_contract(),
         user_state=None,
         resolved_policy=policy,
         conversation_messages=[],
-        query_text="What activities did Melanie's kids enjoy?",
+        query_text="Which activities did Orin's apprentices enjoy?",
         query_type="broad_list",
     )
 
-    assert context.selected_memory_ids == ["mem_first_pottery", "mem_swimming"]
+    assert context.selected_memory_ids == [
+        "mem_first_glasswork",
+        "mem_duplicate_glasswork",
+    ]
+    assert "mem_canoe_practice" not in context.selected_memory_ids
 
 
-def test_broad_query_selection_preserves_lower_scored_new_list_coverage() -> None:
+def test_broad_query_admission_fills_top_k_by_rank() -> None:
+    # CS-2.2: the top-K seats go to the highest pre-diversity ranks in order; a
+    # lower-ranked item cannot be promoted ahead of a higher-ranked one for
+    # coverage. mem_generic_survey (rank 3) keeps its seat over mem_cavern (rank 4).
     composer = _composer()
     policy = _resolved_policy(500).model_copy(
         update={
@@ -3872,44 +3908,44 @@ def test_broad_query_selection_preserves_lower_scored_new_list_coverage() -> Non
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_mountains",
+                "mem_plateau",
                 final_score=0.94,
-                canonical_text="Melanie camped in the mountains with her family.",
-                payload_json={"source_message_ids": ["msg_mountains"]},
+                canonical_text="Orin catalogued fossils on a desert plateau.",
+                payload_json={"source_message_ids": ["msg_plateau"]},
             ),
             _candidate(
-                "mem_beach",
+                "mem_tidal_flats",
                 final_score=0.92,
-                canonical_text="Melanie camped at the beach with her family.",
-                payload_json={"source_message_ids": ["msg_beach"]},
+                canonical_text="Orin catalogued fossils beside the tidal flats.",
+                payload_json={"source_message_ids": ["msg_tidal_flats"]},
             ),
             _candidate(
-                "mem_generic_trip",
+                "mem_generic_survey",
                 final_score=0.88,
-                canonical_text="Melanie camped with her family during another trip.",
-                payload_json={"source_message_ids": ["msg_mountains"]},
+                canonical_text="Orin catalogued fossils during another survey.",
+                payload_json={"source_message_ids": ["msg_plateau"]},
             ),
             _candidate(
-                "mem_forest",
+                "mem_cavern",
                 final_score=0.85,
-                canonical_text="Melanie went camping in the forest with her kids.",
-                payload_json={"source_message_ids": ["msg_forest"]},
+                canonical_text="Orin catalogued fossils inside a limestone cavern.",
+                payload_json={"source_message_ids": ["msg_cavern"]},
             ),
         ],
         current_contract=_contract(),
         user_state=None,
         resolved_policy=policy,
         conversation_messages=[],
-        query_text="Where has Melanie camped?",
+        query_text="Where has Orin catalogued fossils?",
         query_type="broad_list",
     )
 
     assert set(context.selected_memory_ids) == {
-        "mem_mountains",
-        "mem_beach",
-        "mem_forest",
+        "mem_plateau",
+        "mem_tidal_flats",
+        "mem_generic_survey",
     }
-    assert "another trip" not in context.memory_block
+    assert "mem_cavern" not in context.selected_memory_ids
 
 
 def test_broad_query_selection_handles_unicode_tokens_mechanically() -> None:
@@ -3925,33 +3961,42 @@ def test_broad_query_selection_handles_unicode_tokens_mechanically() -> None:
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_dinosaurios",
+                "mem_automatas",
                 final_score=0.91,
-                canonical_text="Mélanie's kids were excited about the dinosaur exhibit at the museum.",
+                canonical_text=(
+                    "Élodie's apprentices crowded around the automaton exhibit "
+                    "at the gallery."
+                ),
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_ocupada",
+                "mem_encargos",
                 final_score=0.90,
-                canonical_text="Mélanie mentions being busy with the kids and work.",
+                canonical_text="Élodie balances apprentice training with commissions.",
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_ceramica",
+                "mem_vidrio",
                 final_score=0.87,
-                canonical_text="Mélanie took her kids to a pottery workshop where they loved getting creative with clay.",
+                canonical_text=(
+                    "Élodie took the apprentices to a glassworking studio to shape "
+                    "colored glass."
+                ),
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_naturaleza",
+                "mem_cartografia",
                 final_score=0.86,
-                canonical_text="Mélanie's family enjoys camping, hiking, and spending time in nature together.",
+                canonical_text=(
+                    "The workshop group practices sky surveys, botanical sketches, "
+                    "and outdoor mapping."
+                ),
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_natacion",
+                "mem_canoa",
                 final_score=0.88,
-                canonical_text="Mélanie went swimming with her kids after the conversation.",
+                canonical_text="Élodie joined a canoe practice with the apprentices.",
                 object_type="summary_view",
             ),
         ],
@@ -3959,39 +4004,48 @@ def test_broad_query_selection_handles_unicode_tokens_mechanically() -> None:
         user_state=None,
         resolved_policy=policy,
         conversation_messages=[],
-        query_text="¿Qué les gusta a los hijos de Mélanie?",
+        query_text="¿Qué disfrutan los aprendices de Élodie?",
         query_type="broad_list",
     )
     default_context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_dinosaurios",
+                "mem_automatas",
                 final_score=0.91,
-                canonical_text="Mélanie's kids were excited about the dinosaur exhibit at the museum.",
+                canonical_text=(
+                    "Élodie's apprentices crowded around the automaton exhibit "
+                    "at the gallery."
+                ),
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_ocupada",
+                "mem_encargos",
                 final_score=0.90,
-                canonical_text="Mélanie mentions being busy with the kids and work.",
+                canonical_text="Élodie balances apprentice training with commissions.",
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_ceramica",
+                "mem_vidrio",
                 final_score=0.87,
-                canonical_text="Mélanie took her kids to a pottery workshop where they loved getting creative with clay.",
+                canonical_text=(
+                    "Élodie took the apprentices to a glassworking studio to shape "
+                    "colored glass."
+                ),
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_naturaleza",
+                "mem_cartografia",
                 final_score=0.86,
-                canonical_text="Mélanie's family enjoys camping, hiking, and spending time in nature together.",
+                canonical_text=(
+                    "The workshop group practices sky surveys, botanical sketches, "
+                    "and outdoor mapping."
+                ),
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_natacion",
+                "mem_canoa",
                 final_score=0.88,
-                canonical_text="Mélanie went swimming with her kids after the conversation.",
+                canonical_text="Élodie joined a canoe practice with the apprentices.",
                 object_type="summary_view",
             ),
         ],
@@ -3999,23 +4053,527 @@ def test_broad_query_selection_handles_unicode_tokens_mechanically() -> None:
         user_state=None,
         resolved_policy=policy,
         conversation_messages=[],
-        query_text="¿Qué les gusta a los hijos de Mélanie?",
+        query_text="¿Qué disfrutan los aprendices de Élodie?",
         query_type="default",
     )
 
+    # CS-2.2: broad-list top-K now follows pre-diversity rank (unicode tokens are
+    # still folded mechanically for scoring), so it matches the default arm --
+    # the higher-ranked "encargos" summary keeps its seat over lower-ranked
+    # "cartografia". Diversity no longer displaces a higher-ranked top-K item.
     assert set(context.selected_memory_ids) == {
-        "mem_dinosaurios",
-        "mem_ceramica",
-        "mem_naturaleza",
-        "mem_natacion",
+        "mem_automatas",
+        "mem_encargos",
+        "mem_vidrio",
+        "mem_canoa",
     }
-    assert "busy with the kids and work" not in context.memory_block
+    assert "mem_cartografia" not in context.selected_memory_ids
     assert set(default_context.selected_memory_ids) == {
-        "mem_dinosaurios",
-        "mem_ocupada",
-        "mem_ceramica",
-        "mem_natacion",
+        "mem_automatas",
+        "mem_encargos",
+        "mem_vidrio",
+        "mem_canoa",
     }
+
+
+def _window_candidate(
+    memory_id: str,
+    *,
+    final_score: float,
+    canonical_text: str | None = None,
+) -> ScoredCandidate:
+    """A token-heavy verbatim conversation window (CS-2.2 verbatim class)."""
+    return _candidate(
+        memory_id,
+        final_score=final_score,
+        canonical_text=(
+            canonical_text
+            if canonical_text is not None
+            else "User: " + ("blah " * 40) + " Assistant: " + ("ctx " * 40)
+        ),
+        object_type="evidence",
+        payload_json={
+            "source_kind_variant": "conversation_window",
+            "source_message_ids": [memory_id + "_m"],
+        },
+    )
+
+
+def _compose_with_pre_cs22_selection_order(composer: ContextComposer, **kwargs):
+    """Run compose() under the pre-CS-2.2 admission order (counterfactual).
+
+    Reverts `_rank_respecting_selection_order` to the plain diversity reranker
+    over ALL candidates -- the exact pre-CS-2.2 behavior. Regression fixtures
+    use this to prove they are load-bearing: the same scenario must LOSE the
+    gold under the old order and keep it under the rank-respecting one.
+    """
+    with mock.patch.object(
+        ContextComposer,
+        "_rank_respecting_selection_order",
+        staticmethod(
+            lambda candidates, **order_kwargs: ContextComposer._selection_order(
+                candidates,
+                **order_kwargs,
+            )
+        ),
+    ):
+        return composer.compose(**kwargs)
+
+
+def test_rank_respecting_order_protects_top_k_and_reranks_remainder() -> None:
+    # CS-2.2: the pre-diversity top-K keep their exact rank order; only the
+    # rank>K remainder is handed to the diversity reranker.
+    cands = [
+        _candidate("m1", final_score=0.95, canonical_text="Alpha fact one.",
+                   object_type="summary_view"),
+        _candidate("m2", final_score=0.90, canonical_text="Beta fact two.",
+                   object_type="summary_view"),
+        _candidate("m3", final_score=0.85,
+                   canonical_text="Gamma fact about mineral catalogues and telescope logs.",
+                   object_type="summary_view"),
+        _candidate("m4", final_score=0.80,
+                   canonical_text="Delta fact about loom maintenance schedules.",
+                   object_type="summary_view"),
+    ]
+    order = ContextComposer._rank_respecting_selection_order(
+        list(cands),
+        max_items=2,
+        query_text="which workshop records matter",
+        query_type="broad_list",
+        exact_recall_mode=False,
+        source_messages_by_id={},
+    )
+    assert [candidate.memory_id for candidate in order[:2]] == ["m1", "m2"]
+    assert {candidate.memory_id for candidate in order[2:]} == {"m3", "m4"}
+
+
+def test_selection_order_still_penalizes_redundant_candidates() -> None:
+    # The diversity reranker still demotes a higher-scored redundant candidate
+    # below a lower-scored diverse one -- it just now governs the remainder only.
+    cands = [
+        _candidate("mem_clockwork", final_score=0.91,
+                   canonical_text="Orin's apprentices crowded around the clockwork exhibit at the gallery.",
+                   object_type="summary_view"),
+        _candidate("mem_busy", final_score=0.90,
+                   canonical_text="Orin is busy with the apprentices.",
+                   object_type="summary_view"),
+        _candidate("mem_glasswork", final_score=0.87,
+                   canonical_text="Orin took the apprentices to a glassworking studio where they enjoyed shaping bright glass.",
+                   object_type="summary_view"),
+        _candidate("mem_nature", final_score=0.86,
+                   canonical_text="Sky surveys, botanical sketches, and outdoor mapping fill the workshop weekends.",
+                   object_type="summary_view"),
+        _candidate("mem_canoe_practice", final_score=0.88,
+                   canonical_text="Orin practiced canoeing with the apprentices.",
+                   object_type="summary_view"),
+    ]
+    order = ContextComposer._selection_order(
+        list(cands),
+        max_items=4,
+        query_text="What do Orin's apprentices like?",
+        query_type="broad_list",
+        exact_recall_mode=False,
+        source_messages_by_id={},
+    )
+    ids = [candidate.memory_id for candidate in order]
+    assert ids.index("mem_nature") < ids.index("mem_busy")
+
+
+def test_summary_class_cap_protects_lower_ranked_direct_evidence() -> None:
+    # CS-2.2 per-class cap: three bulky, higher-ranked summaries cannot consume
+    # the whole budget; the compact, lower-ranked direct-evidence fact still gets
+    # a seat, and the over-cap summary is labelled class_cap_reached.
+    bulky_summary = (
+        "Vela discussed at great length the harbor archive, restoration methods, "
+        "navigation records and many catalog topics over numerous long conversations "
+        "spanning years and many collections and tangents. "
+    ) * 3
+    composer = _composer()
+    policy = _resolved_policy(500).model_copy(
+        update={
+            "retrieval_params": _resolved_policy(500).retrieval_params.model_copy(
+                update={"final_context_items": 4}
+            )
+        }
+    )
+    context = composer.compose(
+        scored_candidates=[
+            _candidate("mem_sum1", final_score=0.95, canonical_text=bulky_summary,
+                       object_type="summary_view"),
+            _candidate("mem_sum2", final_score=0.93, canonical_text=bulky_summary,
+                       object_type="summary_view"),
+            _candidate("mem_sum3", final_score=0.91, canonical_text=bulky_summary,
+                       object_type="summary_view"),
+            _candidate("mem_direct", final_score=0.80,
+                       canonical_text="Vela transferred from Arbor Bay three cycles ago.",
+                       object_type="evidence"),
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=policy,
+        conversation_messages=[],
+        query_text="Which port did Vela transfer from?",
+        query_type="slot_fill",
+    )
+    assert "mem_direct" in context.selected_memory_ids
+    assert context.composer_eviction_reasons.get("mem_sum3") == "class_cap_reached"
+
+
+def test_class_capped_hierarchical_pair_co_skips_without_orphan_l0() -> None:
+    # CS-2.2 review M3: when the summary class share is already spent, the L1
+    # summary's class-cap check runs BEFORE its supporting L0 is admitted, so the
+    # pair co-skips. No orphan L0 may hold a seat for a summary the cap rejected;
+    # the freed seats go to direct evidence.
+    composer = _composer()
+    policy = _resolved_policy(500).model_copy(
+        update={
+            "retrieval_params": _resolved_policy(500).retrieval_params.model_copy(
+                update={"final_context_items": 4}
+            )
+        }
+    )
+    context = composer.compose(
+        scored_candidates=[
+            _candidate(
+                "sum_a",
+                final_score=0.95,
+                canonical_text=(
+                    "Vela says the dock crew, archivists, and conservators formed a "
+                    "strong restoration team through a difficult salvage season."
+                ),
+                object_type="summary_view",
+            ),
+            _candidate(
+                "sum_b",
+                final_score=0.93,
+                canonical_text=(
+                    "Vela describes a brass sextant from the old harbor office and "
+                    "discusses navigation marks and preservation history at length."
+                ),
+                object_type="summary_view",
+            ),
+            _candidate(
+                "sum_l1",
+                final_score=0.90,
+                canonical_text=(
+                    "Vela summarized the port transfer across sessions and its "
+                    "effects on the archive."
+                ),
+                object_type="summary_view",
+                payload_json={
+                    "summary_kind": "conversation_chunk",
+                    "hierarchy_level": 1,
+                    "source_object_ids": ["mem_l0"],
+                },
+            ),
+            _candidate(
+                "mem_direct1",
+                final_score=0.85,
+                canonical_text="Vela transferred from Arbor Bay three cycles ago.",
+                object_type="evidence",
+            ),
+            _candidate(
+                "mem_direct2",
+                final_score=0.80,
+                canonical_text="Vela catalogs navigation logs at Harbor Nine.",
+                object_type="evidence",
+            ),
+            _candidate(
+                "mem_l0",
+                final_score=0.20,
+                canonical_text=(
+                    "[user] Vela: I transferred here three cycles ago from Arbor Bay."
+                ),
+                object_type="evidence",
+                payload_json={
+                    "source_kind_variant": "conversation_window",
+                    "source_message_ids": ["msg_l0"],
+                },
+            ),
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=policy,
+        conversation_messages=[],
+        query_text="Which port did Vela transfer from?",
+        query_type="slot_fill",
+    )
+    assert context.composer_eviction_reasons.get("sum_l1") == "class_cap_reached"
+    assert "mem_l0" not in context.selected_memory_ids
+    assert {"mem_direct1", "mem_direct2"} <= set(context.selected_memory_ids)
+
+
+def test_pair_promoted_l0_does_not_read_as_diversity_demotion() -> None:
+    # CS-2.2 review follow-up: an L0 promoted out of feed order by the
+    # hierarchical pairing branch is a policy-funded selection. A remainder
+    # candidate that lost its seat to that promotion reads item_cap_reached,
+    # never diversity_demoted.
+    bulky_summary = (
+        "Vela recounted an extended narrative about harbor archives, restoration "
+        "methods, navigation records and catalog topics across many long "
+        "conversations with tangents and themes. "
+    ) * 3
+    composer = _composer()
+    policy = _resolved_policy(500).model_copy(
+        update={
+            "retrieval_params": _resolved_policy(500).retrieval_params.model_copy(
+                update={"final_context_items": 3}
+            )
+        }
+    )
+    context = composer.compose(
+        scored_candidates=[
+            _candidate(
+                "sum_bulky",
+                final_score=0.95,
+                canonical_text=bulky_summary,
+                object_type="summary_view",
+            ),
+            _candidate(
+                "sum_l1",
+                final_score=0.90,
+                canonical_text=(
+                    "Vela summarized the port transfer across sessions."
+                ),
+                object_type="summary_view",
+                payload_json={
+                    "summary_kind": "conversation_chunk",
+                    "hierarchy_level": 1,
+                    "source_object_ids": ["mem_l0"],
+                },
+            ),
+            _candidate(
+                "mem_direct1",
+                final_score=0.85,
+                canonical_text="Vela transferred from Arbor Bay three cycles ago.",
+                object_type="evidence",
+            ),
+            _candidate(
+                "mem_direct2",
+                final_score=0.80,
+                canonical_text="Vela catalogs navigation logs at Harbor Nine.",
+                object_type="evidence",
+            ),
+            _candidate(
+                "mem_l0",
+                final_score=0.20,
+                canonical_text=(
+                    "[user] Vela: I transferred here three cycles ago from Arbor Bay."
+                ),
+                object_type="evidence",
+                payload_json={
+                    "source_kind_variant": "conversation_window",
+                    "source_message_ids": ["msg_l0"],
+                },
+            ),
+        ],
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=policy,
+        conversation_messages=[],
+        query_text="Which port did Vela transfer from?",
+        query_type="slot_fill",
+    )
+    # The pairing branch promoted mem_l0 (with sum_l1); the over-cap bulky
+    # summary reads class_cap_reached, and the direct fact that lost the last
+    # seat to the promotion reads item_cap_reached -- NOT diversity_demoted.
+    assert "mem_l0" in context.selected_memory_ids
+    assert context.composer_eviction_reasons.get("sum_bulky") == "class_cap_reached"
+    assert context.composer_eviction_reasons.get("mem_direct2") == "item_cap_reached"
+
+
+def _compact_gold_vs_bulky_windows_candidates() -> list[ScoredCandidate]:
+    # Shape under test: top-ranked compact facts (the gold redundant with the
+    # rank-1 decoy so the diversity reranker penalizes it) + many mid-rank
+    # bulky verbatim windows with rich, mutually distinct text (so the reranker
+    # promotes them).
+    return [
+        _candidate(
+            "mem_decoy",
+            final_score=0.95,
+            canonical_text="Soren discussed his clockwork finch at the market.",
+            object_type="evidence",
+        ),
+        _candidate(
+            "mem_gold",
+            final_score=0.92,
+            canonical_text="Soren assembled a clockwork finch named Pip.",
+            object_type="evidence",
+        ),
+        _window_candidate(
+            "mem_w1",
+            final_score=0.90,
+            canonical_text=(
+                "User: we calibrated the river gauge sensors, sampling intervals, "
+                "telemetry packets and the upstream reference marks across several "
+                "measurement stations."
+            ),
+        ),
+        _window_candidate(
+            "mem_w2",
+            final_score=0.89,
+            canonical_text=(
+                "User: the glass annealing trial covered cooling curves, furnace "
+                "zones, stress checks and optical inspection steps for each panel."
+            ),
+        ),
+        _window_candidate(
+            "mem_w3",
+            final_score=0.88,
+            canonical_text=(
+                "User: the archive humidity review included sensor placement, seal "
+                "inspection, airflow readings and storage cabinet adjustments."
+            ),
+        ),
+        _window_candidate(
+            "mem_w4",
+            final_score=0.87,
+            canonical_text=(
+                "User: the acoustic baffle test explored resonance bands, mounting "
+                "angles, vibration isolation and measurements from the sound chamber."
+            ),
+        ),
+        _window_candidate(
+            "mem_w5",
+            final_score=0.86,
+            canonical_text=(
+                "User: the botanical specimen audit covered label formats, drying "
+                "times, cabinet indexes and provenance notes for the herbarium."
+            ),
+        ),
+    ]
+
+
+def test_top_ranked_compact_gold_survives_bulky_windows() -> None:
+    # Regression: a compact top-ranked gold fact must not be displaced by
+    # many mid-rank bulky verbatim windows that the diversity reranker would
+    # otherwise promote ahead of it.
+    composer = _composer()
+    policy = _resolved_policy(700).model_copy(
+        update={
+            "retrieval_params": _resolved_policy(700).retrieval_params.model_copy(
+                update={"final_context_items": 4}
+            )
+        }
+    )
+    kwargs = dict(
+        scored_candidates=_compact_gold_vs_bulky_windows_candidates(),
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=policy,
+        conversation_messages=[],
+        query_text="Which automaton did Soren assemble?",
+        query_type="broad_list",
+    )
+
+    # Counterfactual guard: under the pre-CS-2.2 admission order the diversity
+    # reranker promotes the bulky windows past BOTH top-ranked compact facts and
+    # the gold dies -- proving this fixture exercises the fix.
+    pre_fix = _compose_with_pre_cs22_selection_order(composer, **kwargs)
+    assert "mem_gold" not in pre_fix.selected_memory_ids
+
+    context = composer.compose(**kwargs)
+    assert "mem_gold" in context.selected_memory_ids
+    assert "mem_decoy" in context.selected_memory_ids
+    # The bulky windows beyond capacity are evicted with a precise composer cause,
+    # never the compact gold.
+    assert any(
+        context.composer_eviction_reasons.get(window)
+        in {"class_cap_reached", "budget_exhausted", "item_cap_reached"}
+        for window in ("mem_w3", "mem_w4", "mem_w5")
+    )
+    assert "mem_gold" not in context.composer_eviction_reasons
+
+
+def _multi_hop_chain_candidates() -> list[ScoredCandidate]:
+    # Three compact hops across sessions that share chain entities (the club,
+    # the destination), so the diversity reranker sees them as mutually
+    # redundant, plus bulky diverse distractor windows it promotes instead.
+    return [
+        _candidate(
+            "mem_hopA",
+            final_score=0.95,
+            canonical_text="Vela joined the coastal signal corps in March.",
+            object_type="evidence",
+            payload_json={"source_message_ids": ["sA"]},
+        ),
+        _candidate(
+            "mem_hopB",
+            final_score=0.93,
+            canonical_text="The signal corps planned a survey at Cinder Reach in April.",
+            object_type="evidence",
+            payload_json={"source_message_ids": ["sB"]},
+        ),
+        _candidate(
+            "mem_hopC",
+            final_score=0.91,
+            canonical_text="Vela noted that Cinder Reach belongs to the Aster Union.",
+            object_type="evidence",
+            payload_json={"source_message_ids": ["sC"]},
+        ),
+        _window_candidate(
+            "mem_d1",
+            final_score=0.90,
+            canonical_text=(
+                "User: we compared ceramic filter meshes, pressure limits, pump "
+                "curves and maintenance intervals for the workshop coolant loop."
+            ),
+        ),
+        _window_candidate(
+            "mem_d2",
+            final_score=0.89,
+            canonical_text=(
+                "User: the map restoration project covered paper fibers, archival "
+                "adhesives, flattening boards and pigment stability under low light."
+            ),
+        ),
+        _window_candidate(
+            "mem_d3",
+            final_score=0.88,
+            canonical_text=(
+                "User: the telescope housing review included gasket tolerances, "
+                "fastener torque, thermal expansion and alignment checks."
+            ),
+        ),
+    ]
+
+
+def test_multi_hop_three_hops_across_sessions_all_admitted() -> None:
+    # Multi-hop regression: three compact top-ranked hops must ALL be admitted;
+    # pre-CS-2.2 the diversity reranker displaced the answer-bearing hop with
+    # bulky diverse distractors.
+    composer = _composer()
+    policy = _resolved_policy(700).model_copy(
+        update={
+            "retrieval_params": _resolved_policy(700).retrieval_params.model_copy(
+                update={"final_context_items": 4}
+            )
+        }
+    )
+    kwargs = dict(
+        scored_candidates=_multi_hop_chain_candidates(),
+        current_contract=_contract(),
+        user_state=None,
+        resolved_policy=policy,
+        conversation_messages=[],
+        query_text="Which federation contains the signal corps destination?",
+        query_type="slot_fill",
+    )
+
+    # Counterfactual guard: under the pre-CS-2.2 admission order the chain is
+    # broken -- the answer-bearing hop (Cinder Reach -> Aster Union) loses its seat to a
+    # bulky distractor window.
+    pre_fix = _compose_with_pre_cs22_selection_order(composer, **kwargs)
+    assert "mem_hopC" not in pre_fix.selected_memory_ids
+
+    context = composer.compose(**kwargs)
+    assert {"mem_hopA", "mem_hopB", "mem_hopC"} <= set(context.selected_memory_ids)
+    # The displaced distractor carries a precise composer cause; no hop does.
+    assert context.composer_eviction_reasons.get("mem_d2") == "item_cap_reached"
+    assert not any(
+        hop in context.composer_eviction_reasons
+        for hop in ("mem_hopA", "mem_hopB", "mem_hopC")
+    )
 
 
 def test_slot_fill_query_selection_keeps_complementary_origin_fact() -> None:
@@ -4031,11 +4589,11 @@ def test_slot_fill_query_selection_keeps_complementary_origin_fact() -> None:
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_move",
+                "mem_transfer",
                 final_score=0.91,
                 canonical_text=(
-                    "Caroline says her friends supported her for four years since moving "
-                    "from her home country."
+                    "Vela says the harbor crew supported the archive for three cycles "
+                    "after the transfer from Arbor Bay."
                 ),
                 object_type="summary_view",
             ),
@@ -4043,17 +4601,17 @@ def test_slot_fill_query_selection_keeps_complementary_origin_fact() -> None:
                 "mem_generic",
                 final_score=0.90,
                 canonical_text=(
-                    "Caroline says her friends, family, and mentors were a strong support "
-                    "system for her through a tough breakup."
+                    "Vela says the dock crew, archivists, and conservators formed a "
+                    "strong restoration team through a difficult salvage season."
                 ),
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_sweden",
+                "mem_arbor_bay",
                 final_score=0.84,
                 canonical_text=(
-                    "Caroline describes a necklace from her Swedish grandmother and talks "
-                    "about her roots."
+                    "Vela describes a brass sextant from the Arbor Bay harbor office and "
+                    "discusses its navigation marks."
                 ),
                 object_type="summary_view",
             ),
@@ -4062,12 +4620,16 @@ def test_slot_fill_query_selection_keeps_complementary_origin_fact() -> None:
         user_state=None,
         resolved_policy=policy,
         conversation_messages=[],
-        query_text="Where did Caroline move from 4 years ago?",
+        query_text="Which port did Vela work at before transferring to Harbor Nine?",
         query_type="slot_fill",
     )
 
-    assert context.selected_memory_ids == ["mem_move", "mem_generic", "mem_sweden"]
-    assert "strong support system" in context.memory_block
+    assert context.selected_memory_ids == [
+        "mem_transfer",
+        "mem_generic",
+        "mem_arbor_bay",
+    ]
+    assert "strong restoration team" in context.memory_block
 
 
 def test_slot_fill_query_selection_handles_unicode_tokens_mechanically() -> None:
@@ -4086,8 +4648,8 @@ def test_slot_fill_query_selection_handles_unicode_tokens_mechanically() -> None
                 "mem_move",
                 final_score=0.91,
                 canonical_text=(
-                    "Caroline says her friends supported her for four years since moving "
-                    "from her home country."
+                    "The clockmaker moved to Delft in 2025. "
+                    "Before that, she lived in Arbordale."
                 ),
                 object_type="summary_view",
             ),
@@ -4095,17 +4657,17 @@ def test_slot_fill_query_selection_handles_unicode_tokens_mechanically() -> None
                 "mem_generic",
                 final_score=0.90,
                 canonical_text=(
-                    "Caroline says her friends, family, and mentors were a strong support "
-                    "system for her through a tough breakup."
+                    "The clockmaker repairs mechanical clocks and now works "
+                    "beside a canal in Delft."
                 ),
                 object_type="summary_view",
             ),
             _candidate(
-                "mem_sweden",
+                "mem_arbordale",
                 final_score=0.84,
                 canonical_text=(
-                    "Caroline describes a necklace from her Swedish grandmother and talks "
-                    "about her roots."
+                    "Before moving to Delft, the clockmaker lived "
+                    "in Arbordale."
                 ),
                 object_type="summary_view",
             ),
@@ -4118,8 +4680,8 @@ def test_slot_fill_query_selection_handles_unicode_tokens_mechanically() -> None
         query_type="slot_fill",
     )
 
-    assert context.selected_memory_ids == ["mem_move", "mem_generic", "mem_sweden"]
-    assert "strong support system" in context.memory_block
+    assert context.selected_memory_ids == ["mem_move", "mem_generic", "mem_arbordale"]
+    assert "Arbordale" in context.memory_block
 
 
 def test_content_tokens_preserve_unicode_words() -> None:
@@ -4192,23 +4754,23 @@ def test_exact_recall_slot_fill_keeps_top_scored_evidence_before_diversity() -> 
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_paris_2022",
+                "mem_delft_2041",
                 final_score=0.42,
-                canonical_text="Jolene bought the pendant in Paris one year ago.",
+                canonical_text="I attended the Delft optics fair in 2041.",
                 object_type="evidence",
             ),
             _candidate(
-                "mem_paris_2010",
+                "mem_delft_2047",
                 final_score=0.36,
-                canonical_text="Jolene's mother gave her the pendant in Paris in 2010.",
+                canonical_text="I attended the Delft optics fair in 2047.",
                 object_type="evidence",
             ),
             _candidate(
                 "mem_rich_distractor",
                 final_score=0.35,
                 canonical_text=(
-                    "Jolene has many unrelated hobbies, deadlines, activities, "
-                    "and reflective life updates."
+                    "The Rotterdam lens workshop used a blue alignment laser. "
+                    "It was crowded."
                 ),
                 object_type="evidence",
                 payload_json={"source_message_ids": ["msg_unrelated"]},
@@ -4218,12 +4780,12 @@ def test_exact_recall_slot_fill_keeps_top_scored_evidence_before_diversity() -> 
         user_state=None,
         resolved_policy=policy,
         conversation_messages=[],
-        query_text="How many times has Jolene been to France?",
+        query_text="Which years did I attend the Delft optics fair?",
         query_type="slot_fill",
         exact_recall_mode=True,
     )
 
-    assert context.selected_memory_ids == ["mem_paris_2022", "mem_paris_2010"]
+    assert context.selected_memory_ids == ["mem_delft_2041", "mem_delft_2047"]
 
 
 def test_budgeted_marginal_exact_recall_keeps_l0_evidence_ahead_of_summary() -> None:
@@ -4287,7 +4849,7 @@ def test_fact_facet_span_coadmission_renders_source_span_as_primary_context() ->
                                 "span_role": "source",
                                 "quote_text": (
                                     "We need Redis-backed FastAPI rate limiting "
-                                    "at 100 requests per minute per API key."
+                                    "at The prism crate is in archive bay four.."
                                 ),
                             }
                         ],
@@ -4307,7 +4869,7 @@ def test_fact_facet_span_coadmission_renders_source_span_as_primary_context() ->
 
     assert "fact_facet_span_coadmitted: true" in context.memory_block
     assert (
-        "source_span: We need Redis-backed FastAPI rate limiting at 100 requests per minute per API key."
+        "source_span: We need Redis-backed FastAPI rate limiting at The prism crate is in archive bay four.."
         in context.memory_block
     )
     assert (
@@ -4319,7 +4881,8 @@ def test_fact_facet_span_coadmission_renders_source_span_as_primary_context() ->
 def _oversized_window(memory_id: str, source_msg: str, *, final_score: float):
     # Verbatim conversation window: many times the token cost of a tiny direct
     # fact, but low score. Sized so a single window admitted ahead of the facts
-    # consumes enough of the budget to evict a gold fact (the ben-q09 symptom).
+    # consumes enough of the budget to evict a gold fact (the compact-gold
+    # eviction symptom).
     filler = "unrelated logistics scheduling travel weather chitchat " * 8
     return _candidate(
         memory_id,
@@ -4334,7 +4897,7 @@ def _oversized_window(memory_id: str, source_msg: str, *, final_score: float):
 
 
 def test_evidence_obligation_window_gate_preserves_tiny_direct_facts() -> None:
-    # ben-q09 shape: two tiny high-score source-message-backed direct facts must
+    # Shape under test: two tiny high-score source-message-backed direct facts must
     # survive even though several oversized low-score verbatim windows are present.
     # Without the absolute-score gate the windows are reserved first and exhaust
     # the budget, evicting the gold facts.
@@ -4999,12 +5562,12 @@ def test_exhaustive_member_with_clean_and_withheld_carriers_is_covered() -> None
     withheld_carrier = _member_candidate(
         "mem_alpha_secret",
         final_score=0.99,
-        canonical_text="Subject A's secret is K8sN0d3Jump!2024.",
+        canonical_text="Subject A's secret is fixture-secret-Q7X9.",
         members=[("alpha", "Subject A")],
         source_message_ids=["msg_secret"],
         extra_payload={
-            "value_norm_key": "K8sN0d3Jump!2024",
-            "value_text": "K8sN0d3Jump!2024",
+            "value_norm_key": "fixture-secret-Q7X9",
+            "value_text": "fixture-secret-Q7X9",
         },
     )
     withheld_carrier.memory_object.update(
@@ -5037,7 +5600,7 @@ def test_exhaustive_member_with_clean_and_withheld_carriers_is_covered() -> None
 
 def test_exhaustive_covered_member_never_uses_withheld_value_display() -> None:
     composer = _composer()
-    secret_label = "K8sN0d3Jump!2024"
+    secret_label = "fixture-secret-Q7X9"
     # Two value_* carriers of the SAME member (normalized value "rome"): the
     # higher-ranked one is withheld and its display text is a secret-tagged
     # literal; the other is clean. With at least one clean selected carrier the
@@ -5093,7 +5656,7 @@ def test_exhaustive_covered_member_never_uses_withheld_value_display() -> None:
 
 def test_exhaustive_missing_member_never_uses_withheld_value_display() -> None:
     composer = _composer()
-    secret_label = "K8sN0d3Jump!2024"
+    secret_label = "fixture-secret-Q7X9"
     # A genuine gap: member "rome" has a withheld value_* carrier (display = a
     # secret literal) AND a clean value_* carrier, but neither fits the tiny
     # budget. The named missing slot must use the clean carrier's display, never

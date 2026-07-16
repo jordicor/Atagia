@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
+from benchmarks.atagia_bench import __main__ as atagia_bench_cli
 from benchmarks.atagia_bench.adapter import AtagiaBenchAdapter
 from benchmarks.atagia_bench.adapter import AtagiaBenchQuestion
 from benchmarks.atagia_bench.graders import GradeResult
@@ -14,6 +16,7 @@ from benchmarks.atagia_bench.runner import (
     AtagiaBenchRunner,
     AtagiaQuestionResult,
     CategoryStats,
+    load_holdout_conversation_ids,
     load_holdout_question_ids,
 )
 from atagia.services.run_counters import RunCounterAccumulator
@@ -111,6 +114,30 @@ def test_atagia_bench_adapter_rejects_unresolved_evidence_turn_id(
         AtagiaBenchAdapter(data_dir).load()
 
 
+def test_atagia_bench_adapter_rejects_declared_conversation_count_mismatch(
+    tmp_path: Path,
+) -> None:
+    data_dir = _write_minimal_atagia_bench_data(
+        tmp_path,
+        question={
+            "question_id": "mini-q3",
+            "question_text": "What color is the notebook?",
+            "ground_truth": "red",
+            "answer_type": "exact_match",
+            "category_tags": ["smoke"],
+            "evidence_turn_ids": ["mini-t1"],
+            "grader": "exact_match",
+        },
+    )
+    personas_path = data_dir / "personas.json"
+    personas = json.loads(personas_path.read_text(encoding="utf-8"))
+    personas[0]["conversation_count"] = 2
+    personas_path.write_text(json.dumps(personas), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="conversation_count=2.*1 conversations"):
+        AtagiaBenchAdapter(data_dir).load()
+
+
 def test_load_holdout_question_ids_returns_sorted_unique_values(tmp_path: Path) -> None:
     holdout_path = tmp_path / "holdout.json"
     holdout_path.write_text(
@@ -119,6 +146,523 @@ def test_load_holdout_question_ids_returns_sorted_unique_values(tmp_path: Path) 
     )
 
     assert load_holdout_question_ids(holdout_path) == ["q1", "q2"]
+    assert load_holdout_conversation_ids(holdout_path) == []
+
+
+def test_load_holdout_conversation_ids_returns_sorted_unique_values(
+    tmp_path: Path,
+) -> None:
+    holdout_path = tmp_path / "holdout.json"
+    holdout_path.write_text(
+        json.dumps(
+            {
+                "status": "active_frozen",
+                "question_ids": ["q1"],
+                "conversation_ids": ["held-b", "held-a", "held-b"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_holdout_conversation_ids(holdout_path) == ["held-a", "held-b"]
+
+
+def test_legacy_question_only_holdout_requires_explicit_cli_opt_in() -> None:
+    parser = atagia_bench_cli._build_parser()
+
+    default_args = parser.parse_args(["--provider", "openai"])
+    opted_in_args = parser.parse_args(
+        ["--provider", "openai", "--allow-legacy-question-only-holdout"]
+    )
+
+    assert default_args.allow_legacy_question_only_holdout is False
+    assert opted_in_args.allow_legacy_question_only_holdout is True
+
+
+def test_load_holdout_conversation_ids_rejects_invalid_values(
+    tmp_path: Path,
+) -> None:
+    holdout_path = tmp_path / "holdout.json"
+    holdout_path.write_text(
+        json.dumps(
+            {
+                "status": "active_frozen",
+                "question_ids": ["q1"],
+                "conversation_ids": ["held-a", 7],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="conversation_ids must be a string list"):
+        load_holdout_conversation_ids(holdout_path)
+
+
+def test_load_holdout_question_ids_rejects_retired_manifest(tmp_path: Path) -> None:
+    holdout_path = tmp_path / "holdout.json"
+    holdout_path.write_text(
+        json.dumps(
+            {
+                "status": "retired_contaminated",
+                "question_ids": ["q1"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="retired and cannot be used"):
+        load_holdout_question_ids(holdout_path)
+    with pytest.raises(ValueError, match="retired and cannot be used"):
+        load_holdout_conversation_ids(holdout_path)
+
+
+@pytest.mark.asyncio
+async def test_development_split_excludes_holdout_conversations_and_records_them(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_dir = _write_minimal_atagia_bench_data(
+        tmp_path,
+        question={
+            "question_id": "mini-q4",
+            "question_text": "What color is the notebook?",
+            "ground_truth": "red",
+            "answer_type": "exact_match",
+            "category_tags": ["smoke"],
+            "evidence_turn_ids": ["mini-t1"],
+            "grader": "exact_match",
+        },
+    )
+    conversations_path = data_dir / "mini_persona" / "conversations.json"
+    conversations = json.loads(conversations_path.read_text(encoding="utf-8"))
+    for index in range(1, 4):
+        conversations.append(
+            {
+                "conversation_id": f"held-conv-{index}",
+                "assistant_mode_id": "general_qa",
+                "timestamp_base": f"2026-01-0{index}T10:00:00",
+                "turns": [
+                    {
+                        "turn_id": f"held-t{index}",
+                        "role": "user",
+                        "text": f"Isolated fact {index}.",
+                        "timestamp": f"2026-01-0{index}T10:00:00",
+                    }
+                ],
+            }
+        )
+    conversations_path.write_text(json.dumps(conversations), encoding="utf-8")
+    personas_path = data_dir / "personas.json"
+    personas = json.loads(personas_path.read_text(encoding="utf-8"))
+    personas[0]["conversation_count"] = 4
+    personas_path.write_text(json.dumps(personas), encoding="utf-8")
+    questions_path = data_dir / "mini_persona" / "questions.json"
+    questions = json.loads(questions_path.read_text(encoding="utf-8"))
+    questions.append(
+        {
+            "question_id": "held-q1",
+            "question_text": "What is the first isolated fact?",
+            "ground_truth": "Isolated fact 1.",
+            "answer_type": "exact_match",
+            "category_tags": ["holdout"],
+            "evidence_turn_ids": ["held-t1"],
+            "grader": "exact_match",
+        }
+    )
+    questions_path.write_text(json.dumps(questions), encoding="utf-8")
+
+    runner = AtagiaBenchRunner(
+        llm_provider="openai",
+        llm_api_key=None,
+        llm_model="static-model",
+        judge_model="judge-model",
+        data_dir=data_dir,
+    )
+    observed_conversations: list[list[str]] = []
+    observed_excluded_questions: list[set[str] | None] = []
+
+    async def fake_run_persona(persona_data, **kwargs):
+        observed_conversations.append(
+            [conversation.conversation_id for conversation in persona_data.conversations]
+        )
+        observed_excluded_questions.append(kwargs["exclude_question_filter"])
+        return [], {}, {}
+
+    monkeypatch.setattr(runner, "_run_persona", fake_run_persona)
+    excluded_conversations = [
+        "held-conv-1",
+        "held-conv-2",
+        "held-conv-3",
+    ]
+
+    report = await runner.run(
+        benchmark_split="development",
+        holdout_question_ids=["held-q1"],
+        exclude_conversation_ids=excluded_conversations,
+    )
+
+    assert observed_conversations == [["mini-conv-1"]]
+    assert observed_excluded_questions == [{"held-q1"}]
+    assert report.config["excluded_conversation_ids"] == excluded_conversations
+    assert report.config["holdout_evidence_isolation_mode"] == (
+        "conversation_isolated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_persona_development_projects_global_holdout_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_dir = _write_minimal_atagia_bench_data(
+        tmp_path,
+        question={
+            "question_id": "mini-development-q",
+            "question_text": "What color is the notebook?",
+            "ground_truth": "red",
+            "answer_type": "exact_match",
+            "category_tags": ["smoke"],
+            "evidence_turn_ids": ["mini-t1"],
+            "grader": "exact_match",
+        },
+    )
+    mini_conversations_path = data_dir / "mini_persona" / "conversations.json"
+    mini_conversations = json.loads(
+        mini_conversations_path.read_text(encoding="utf-8")
+    )
+    mini_conversations.append(
+        {
+            "conversation_id": "mini-held-conv",
+            "assistant_mode_id": "general_qa",
+            "timestamp_base": "2026-01-02T10:00:00",
+            "turns": [
+                {
+                    "turn_id": "mini-held-t1",
+                    "role": "user",
+                    "text": "The held notebook is blue.",
+                    "timestamp": "2026-01-02T10:00:00",
+                }
+            ],
+        }
+    )
+    mini_conversations_path.write_text(
+        json.dumps(mini_conversations),
+        encoding="utf-8",
+    )
+    mini_questions_path = data_dir / "mini_persona" / "questions.json"
+    mini_questions = json.loads(mini_questions_path.read_text(encoding="utf-8"))
+    mini_questions.append(
+        {
+            "question_id": "mini-held-q",
+            "question_text": "What color is the held notebook?",
+            "ground_truth": "blue",
+            "answer_type": "exact_match",
+            "category_tags": ["holdout"],
+            "evidence_turn_ids": ["mini-held-t1"],
+            "grader": "exact_match",
+        }
+    )
+    mini_questions_path.write_text(json.dumps(mini_questions), encoding="utf-8")
+
+    personas_path = data_dir / "personas.json"
+    personas = json.loads(personas_path.read_text(encoding="utf-8"))
+    personas[0]["conversation_count"] = 2
+    personas.append(
+        {
+            "persona_id": "other_persona",
+            "display_name": "Other Persona",
+            "age": 37,
+            "occupation": "Tester",
+            "profile": "Second fixture persona.",
+            "assistant_modes": ["general_qa"],
+            "conversation_count": 1,
+            "test_scenarios": ["holdout isolation"],
+        }
+    )
+    personas_path.write_text(json.dumps(personas), encoding="utf-8")
+    other_dir = data_dir / "other_persona"
+    other_dir.mkdir()
+    (other_dir / "conversations.json").write_text(
+        json.dumps(
+            [
+                {
+                    "conversation_id": "other-held-conv",
+                    "assistant_mode_id": "general_qa",
+                    "timestamp_base": "2026-01-03T10:00:00",
+                    "turns": [
+                        {
+                            "turn_id": "other-held-t1",
+                            "role": "user",
+                            "text": "The other held notebook is green.",
+                            "timestamp": "2026-01-03T10:00:00",
+                        }
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (other_dir / "questions.json").write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "other-held-q",
+                    "question_text": "What color is the other held notebook?",
+                    "ground_truth": "green",
+                    "answer_type": "exact_match",
+                    "category_tags": ["holdout"],
+                    "evidence_turn_ids": ["other-held-t1"],
+                    "grader": "exact_match",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    runner = AtagiaBenchRunner(
+        llm_provider="openai",
+        llm_api_key=None,
+        llm_model="static-model",
+        judge_model="judge-model",
+        data_dir=data_dir,
+    )
+    observed_conversations: list[list[str]] = []
+    observed_excluded_questions: list[set[str] | None] = []
+
+    async def fake_run_persona(persona_data, **kwargs):
+        observed_conversations.append(
+            [conversation.conversation_id for conversation in persona_data.conversations]
+        )
+        observed_excluded_questions.append(kwargs["exclude_question_filter"])
+        return [], {}, {}
+
+    monkeypatch.setattr(runner, "_run_persona", fake_run_persona)
+    report = await runner.run(
+        persona_ids=["mini_persona"],
+        benchmark_split="development",
+        holdout_question_ids=["mini-held-q", "other-held-q"],
+        exclude_conversation_ids=["mini-held-conv", "other-held-conv"],
+    )
+
+    assert observed_conversations == [["mini-conv-1"]]
+    assert observed_excluded_questions == [{"mini-held-q"}]
+    assert report.config["holdout_question_ids"] == ["mini-held-q"]
+    assert report.config["excluded_conversation_ids"] == ["mini-held-conv"]
+
+
+@pytest.mark.asyncio
+async def test_development_split_fails_closed_without_conversation_isolation(
+    tmp_path: Path,
+) -> None:
+    data_dir = _write_minimal_atagia_bench_data(
+        tmp_path,
+        question={
+            "question_id": "mini-q5",
+            "question_text": "What color is the notebook?",
+            "ground_truth": "red",
+            "answer_type": "exact_match",
+            "category_tags": ["smoke"],
+            "evidence_turn_ids": ["mini-t1"],
+            "grader": "exact_match",
+        },
+    )
+    runner = AtagiaBenchRunner(
+        llm_provider="openai",
+        llm_api_key=None,
+        llm_model="static-model",
+        judge_model="judge-model",
+        data_dir=data_dir,
+    )
+
+    with pytest.raises(ValueError, match="development split requires"):
+        await runner.run(
+            benchmark_split="development",
+            holdout_question_ids=["held-q1"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_development_split_rejects_incomplete_evidence_isolation(
+    tmp_path: Path,
+) -> None:
+    data_dir = _write_minimal_atagia_bench_data(
+        tmp_path,
+        question={
+            "question_id": "held-q1",
+            "question_text": "What color is the notebook?",
+            "ground_truth": "red",
+            "answer_type": "exact_match",
+            "category_tags": ["smoke"],
+            "evidence_turn_ids": ["mini-t1"],
+            "grader": "exact_match",
+        },
+    )
+    conversations_path = data_dir / "mini_persona" / "conversations.json"
+    conversations = json.loads(conversations_path.read_text(encoding="utf-8"))
+    conversations.append(
+        {
+            "conversation_id": "held-decoy",
+            "assistant_mode_id": "general_qa",
+            "timestamp_base": "2026-01-02T10:00:00",
+            "turns": [
+                {
+                    "turn_id": "held-decoy-t1",
+                    "role": "user",
+                    "text": "A decoy isolated fact.",
+                    "timestamp": "2026-01-02T10:00:00",
+                }
+            ],
+        }
+    )
+    conversations_path.write_text(json.dumps(conversations), encoding="utf-8")
+    personas_path = data_dir / "personas.json"
+    personas = json.loads(personas_path.read_text(encoding="utf-8"))
+    personas[0]["conversation_count"] = 2
+    personas_path.write_text(json.dumps(personas), encoding="utf-8")
+    runner = AtagiaBenchRunner(
+        llm_provider="openai",
+        llm_api_key=None,
+        llm_model="static-model",
+        judge_model="judge-model",
+        data_dir=data_dir,
+    )
+
+    with pytest.raises(ValueError, match="does not isolate all holdout evidence"):
+        await runner.run(
+            benchmark_split="development",
+            holdout_question_ids=["held-q1"],
+            exclude_conversation_ids=["held-decoy"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_development_split_rejects_development_question_using_holdout_evidence(
+    tmp_path: Path,
+) -> None:
+    data_dir = _write_minimal_atagia_bench_data(
+        tmp_path,
+        question={
+            "question_id": "held-q1",
+            "question_text": "What color is the notebook?",
+            "ground_truth": "red",
+            "answer_type": "exact_match",
+            "category_tags": ["smoke"],
+            "evidence_turn_ids": ["mini-t1"],
+            "grader": "exact_match",
+        },
+    )
+    questions_path = data_dir / "mini_persona" / "questions.json"
+    questions = json.loads(questions_path.read_text(encoding="utf-8"))
+    questions.append(
+        {
+            "question_id": "development-q1",
+            "question_text": "Which notebook is red?",
+            "ground_truth": "the notebook",
+            "answer_type": "exact_match",
+            "category_tags": ["smoke"],
+            "evidence_turn_ids": ["mini-t1"],
+            "grader": "exact_match",
+        }
+    )
+    questions_path.write_text(json.dumps(questions), encoding="utf-8")
+    runner = AtagiaBenchRunner(
+        llm_provider="openai",
+        llm_api_key=None,
+        llm_model="static-model",
+        judge_model="judge-model",
+        data_dir=data_dir,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Development questions reference isolated holdout conversations",
+    ):
+        await runner.run(
+            benchmark_split="development",
+            holdout_question_ids=["held-q1"],
+            exclude_conversation_ids=["mini-conv-1"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_explicit_legacy_question_only_development_split_remains_supported(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_dir = _write_minimal_atagia_bench_data(
+        tmp_path,
+        question={
+            "question_id": "held-q1",
+            "question_text": "What color is the notebook?",
+            "ground_truth": "red",
+            "answer_type": "exact_match",
+            "category_tags": ["smoke"],
+            "evidence_turn_ids": ["mini-t1"],
+            "grader": "exact_match",
+        },
+    )
+    runner = AtagiaBenchRunner(
+        llm_provider="openai",
+        llm_api_key=None,
+        llm_model="static-model",
+        judge_model="judge-model",
+        data_dir=data_dir,
+    )
+
+    async def fake_run_persona(*_args, **_kwargs):
+        return [], {}, {}
+
+    monkeypatch.setattr(runner, "_run_persona", fake_run_persona)
+    report = await runner.run(
+        benchmark_split="development",
+        holdout_question_ids=["held-q1"],
+        allow_legacy_question_only_holdout=True,
+    )
+
+    assert report.config["excluded_conversation_ids"] is None
+    assert report.config["holdout_evidence_isolation_mode"] == (
+        "legacy_question_only"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reuse_db_rejects_isolated_holdout_conversation(
+    tmp_path: Path,
+) -> None:
+    data_dir = _write_minimal_atagia_bench_data(
+        tmp_path,
+        question={
+            "question_id": "held-q1",
+            "question_text": "What color is the notebook?",
+            "ground_truth": "red",
+            "answer_type": "exact_match",
+            "category_tags": ["holdout"],
+            "evidence_turn_ids": ["mini-t1"],
+            "grader": "exact_match",
+        },
+    )
+    db_path = tmp_path / "benchmark.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE conversations (id TEXT PRIMARY KEY)")
+        connection.execute(
+            "INSERT INTO conversations (id) VALUES (?)",
+            ("mini-conv-1",),
+        )
+    runner = AtagiaBenchRunner(
+        llm_provider="openai",
+        llm_api_key=None,
+        llm_model="static-model",
+        judge_model="judge-model",
+        data_dir=data_dir,
+    )
+
+    with pytest.raises(ValueError, match="mini-conv-1"):
+        await runner.run(
+            benchmark_split="development",
+            holdout_question_ids=["held-q1"],
+            exclude_conversation_ids=["mini-conv-1"],
+            reuse_db=db_path,
+        )
 
 
 def test_filter_questions_can_exclude_holdout_ids() -> None:
@@ -376,6 +920,7 @@ def test_runner_role_specific_model_config_uses_base_as_role_fallback(
         "answer_stance": "reactive",
         "answer_stance_prompt_variant": "baseline",
         "judge_model": "openai/gpt-5.4-mini",
+        "judge_protocol": "memory_quality",
     }
     assert runner._atagia_model_kwargs() == {
         "llm_ingest_model": "openai/gpt-5.5-instant",

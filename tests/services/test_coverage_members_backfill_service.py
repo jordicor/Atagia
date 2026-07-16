@@ -37,8 +37,8 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 _NO_PAYLOAD_LEFT = object()
 
@@ -190,7 +190,7 @@ async def test_scan_selects_only_key_absent_rows() -> None:
             clock,
             memory_id="mem_absent",
             user_id="usr_1",
-            canonical_text="Rosa sees Dr. A.",
+            canonical_text="Mira sees Dr. A.",
         )
         # Already processed with an empty list: MUST NOT be re-processed.
         await _create_memory(
@@ -207,7 +207,7 @@ async def test_scan_selects_only_key_absent_rows() -> None:
             clock,
             memory_id="mem_with_members",
             user_id="usr_1",
-            canonical_text="Rosa sees Dr. B.",
+            canonical_text="Mira sees Dr. B.",
             payload={"coverage_members": [{"member_key": "dr. b", "display_text": "Dr. B"}]},
         )
 
@@ -239,8 +239,8 @@ async def test_real_run_writes_key_and_increments_counters() -> None:
     clock = FrozenClock(datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc))
     provider = SequencedCoverageProvider(
         [
-            'cand_001 | [{"member_key": "dr. mendez", "display_text": "Dr. Mendez"},'
-            ' {"member_key": "dr. patel", "display_text": "Dr. Patel"}]',
+            'cand_001 | [{"member_key": "dr. navarro", "display_text": "Dr. Navarro"},'
+            ' {"member_key": "dr. okafor", "display_text": "Dr. Okafor"}]',
             "cand_001 | []",
         ]
     )
@@ -250,7 +250,7 @@ async def test_real_run_writes_key_and_increments_counters() -> None:
             clock,
             memory_id="mem_members",
             user_id="usr_1",
-            canonical_text="Rosa sees Dr. Mendez and Dr. Patel.",
+            canonical_text="Mira sees Dr. Navarro and Dr. Okafor.",
             payload={"existing_key": "kept"},
         )
         await _create_memory(
@@ -273,8 +273,8 @@ async def test_real_run_writes_key_and_increments_counters() -> None:
         assert result.failed == 0
         members_payload = await _payload(connection, clock, "mem_members", "usr_1")
         assert members_payload["coverage_members"] == [
-            {"member_key": "dr. mendez", "display_text": "Dr. Mendez"},
-            {"member_key": "dr. patel", "display_text": "Dr. Patel"},
+            {"member_key": "dr. navarro", "display_text": "Dr. Navarro"},
+            {"member_key": "dr. okafor", "display_text": "Dr. Okafor"},
         ]
         # Existing payload keys are preserved.
         assert members_payload["existing_key"] == "kept"
@@ -308,7 +308,7 @@ async def test_dry_run_writes_nothing() -> None:
             clock,
             memory_id="mem_absent",
             user_id="usr_1",
-            canonical_text="Rosa sees Dr. A.",
+            canonical_text="Mira sees Dr. A.",
         )
 
         result = await _service(connection, provider).run(
@@ -344,14 +344,14 @@ async def test_per_row_failure_counted_and_leaves_row_rerunnable() -> None:
             clock,
             memory_id="mem_fails",
             user_id="usr_1",
-            canonical_text="Rosa sees Dr. A.",
+            canonical_text="Mira sees Dr. A.",
         )
         await _create_memory(
             connection,
             clock,
             memory_id="mem_ok",
             user_id="usr_1",
-            canonical_text="Rosa sees Dr. B.",
+            canonical_text="Mira sees Dr. B.",
         )
 
         result = await _service(connection, provider).run(
@@ -395,7 +395,7 @@ async def test_malformed_card_output_fails_and_leaves_row_rerunnable(
             clock,
             memory_id="mem_malformed",
             user_id="usr_1",
-            canonical_text="Rosa sees Dr. A.",
+            canonical_text="Mira sees Dr. A.",
         )
 
         result = await _service(connection, provider).run(
@@ -429,7 +429,7 @@ async def test_user_id_scoping_does_not_touch_other_users() -> None:
             clock,
             memory_id="mem_usr_1",
             user_id="usr_1",
-            canonical_text="Rosa sees Dr. A.",
+            canonical_text="Mira sees Dr. A.",
         )
         await _create_memory(
             connection,

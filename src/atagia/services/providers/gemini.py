@@ -35,6 +35,7 @@ from atagia.services.llm_client import (
     LLMStreamEvent,
     OutputLimitExceededError,
     TransientLLMError,
+    normalize_completion_finish_reason,
     retry_after_seconds_from_exception,
 )
 from atagia.services.llm_schema import strip_json_schema_nullability
@@ -469,10 +470,16 @@ def _candidate_finish_reason(response: Any) -> str | None:
     return _finish_reason_label(_getattr_or_key(candidates[0], "finish_reason"))
 
 
-def _finish_reason_error(finish_reason: str | None) -> LLMError | None:
+def _finish_reason_error(
+    finish_reason: str | None,
+    *,
+    allow_truncation: bool = False,
+) -> LLMError | None:
     if finish_reason is None or finish_reason in _SUCCESS_FINISH_REASONS:
         return None
     if finish_reason in _TRUNCATION_FINISH_REASONS:
+        if allow_truncation:
+            return None
         return OutputLimitExceededError(
             "Gemini stopped because it reached max output tokens "
             f"(finish_reason={finish_reason})"
@@ -602,10 +609,20 @@ class GeminiProvider(LLMProvider):
 
         output_text, thinking, tool_calls = _collect_response_content(response)
         finish_reason = _candidate_finish_reason(response)
-        finish_error = _finish_reason_error(finish_reason)
+        finish_error = _finish_reason_error(
+            finish_reason,
+            allow_truncation=request.external_answer,
+        )
         if finish_error is not None:
             raise finish_error
-        if not output_text and not tool_calls:
+        if (
+            not output_text
+            and not tool_calls
+            and not (
+                request.external_answer
+                and finish_reason in _TRUNCATION_FINISH_REASONS
+            )
+        ):
             raise _empty_content_error(finish_reason)
 
         return LLMCompletionResponse(
@@ -615,6 +632,10 @@ class GeminiProvider(LLMProvider):
             thinking=thinking,
             tool_calls=tool_calls,
             usage=_usage_to_dict(_getattr_or_key(response, "usage_metadata")),
+            finish_reason=normalize_completion_finish_reason(
+                finish_reason,
+                has_tool_calls=bool(tool_calls),
+            ),
             raw_response=_model_dump(response),
         )
 
@@ -657,6 +678,7 @@ class GeminiProvider(LLMProvider):
     async def stream(self, request: LLMCompletionRequest) -> AsyncIterator[LLMStreamEvent]:
         emitted_any = False
         emitted_output_or_tool = False
+        emitted_tool_call = False
         usage: dict[str, int | float] = {}
         pending_error: Exception | None = None
         last_finish_reason: str | None = None
@@ -680,6 +702,7 @@ class GeminiProvider(LLMProvider):
                 for tool_call in tool_calls:
                     emitted_any = True
                     emitted_output_or_tool = True
+                    emitted_tool_call = True
                     yield LLMStreamEvent(type="tool_call", payload=tool_call)
                 block_reason = _blocked_reason(chunk)
                 if block_reason is not None:
@@ -690,7 +713,10 @@ class GeminiProvider(LLMProvider):
                 finish_reason = _candidate_finish_reason(chunk)
                 if finish_reason is not None:
                     last_finish_reason = finish_reason
-                finish_error = _finish_reason_error(finish_reason)
+                finish_error = _finish_reason_error(
+                    finish_reason,
+                    allow_truncation=request.external_answer,
+                )
                 if finish_error is not None:
                     pending_error = finish_error
                     break
@@ -702,9 +728,25 @@ class GeminiProvider(LLMProvider):
             if stream is not None:
                 await _close_provider_stream(stream)
 
-        if pending_error is None and not emitted_output_or_tool:
+        if (
+            pending_error is None
+            and not emitted_output_or_tool
+            and not (
+                request.external_answer
+                and last_finish_reason in _TRUNCATION_FINISH_REASONS
+            )
+        ):
             pending_error = _empty_content_error(last_finish_reason)
 
-        yield LLMStreamEvent(type="done", payload={"usage": usage})
+        done_payload: dict[str, Any] = {}
+        if usage:
+            done_payload["usage"] = usage
+        normalized_finish_reason = normalize_completion_finish_reason(
+            last_finish_reason,
+            has_tool_calls=emitted_tool_call,
+        )
+        if normalized_finish_reason is not None:
+            done_payload["finish_reason"] = normalized_finish_reason
+        yield LLMStreamEvent(type="done", payload=done_payload)
         if pending_error is not None:
             raise pending_error

@@ -91,6 +91,7 @@ class MindRepository:
         active_presence_display_name: str | None = None,
         character_id: str | None = None,
         topology: MindTopology | str | None = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
         resolved_topology = MindTopology(topology or MindTopology.UNIMIND.value)
         if mind_id is not None:
@@ -115,6 +116,7 @@ class MindRepository:
                 display_name="OjoCentauri",
                 source_kind="ojocentauri",
                 source_id=DEFAULT_OVERSEER_MIND_ID,
+                commit=commit,
             )
 
         if resolved_topology is MindTopology.MULTI_MIND:
@@ -126,6 +128,7 @@ class MindRepository:
                     display_name=active_presence_display_name or active_presence_id,
                     source_kind="active_presence",
                     source_id=active_presence_id,
+                    commit=commit,
                 )
             if character_id is not None:
                 return await self.resolve_mind(
@@ -135,6 +138,7 @@ class MindRepository:
                     display_name=character_id,
                     source_kind="character_id",
                     source_id=character_id,
+                    commit=commit,
                 )
 
         return await self.resolve_mind(
@@ -144,6 +148,7 @@ class MindRepository:
             display_name="Default Mind",
             source_kind="default_mind",
             source_id=DEFAULT_MIND_ID,
+            commit=commit,
         )
 
     async def resolve_mind(

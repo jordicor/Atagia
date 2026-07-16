@@ -21,6 +21,10 @@ from atagia.core.summary_repository import SummaryRepository
 from atagia.memory.applicability_scorer import ApplicabilityScorer
 from atagia.memory.candidate_search import CandidateSearch
 from atagia.memory.candidate_diversity import early_diversity_select
+from atagia.memory.carrier_dedupe import (
+    CarrierDedupeResult,
+    collapse_duplicate_carriers,
+)
 from atagia.memory.context_composer import ContextComposer
 from atagia.memory.contract_projection import ContractProjector
 from atagia.memory.context_envelope import (
@@ -831,22 +835,47 @@ class RetrievalPipeline:
             retrieval_plan=retrieval_plan,
             privacy_enforcement=effective_ablation.privacy_enforcement,
         )
+        # Collapse duplicate carriers of one fact between fusion and
+        # scoring so redundant copies stop consuming shortlist slots, card
+        # calls, and composer budget. Mechanical provenance joins only; the
+        # collapse runs AFTER regrounding/policy filtering so a representative
+        # can never be removed by a later filter its duplicates would have
+        # survived.
+        carrier_dedupe: CarrierDedupeResult
+        if effective_ablation.skip_fusion_dedupe:
+            carrier_dedupe = CarrierDedupeResult(
+                candidates=list(filtered_candidates),
+                collapsed_into={},
+                collapsed_ids_by_representative={},
+            )
+        else:
+            carrier_dedupe = collapse_duplicate_carriers(
+                filtered_candidates,
+                member_key_collapse=(
+                    retrieval_plan.coverage_mode == "exhaustive_known_set"
+                ),
+            )
+        scoring_pool = carrier_dedupe.candidates
         scoring_policy = self._expand_recall_or_recovery_scoring_budget(
             effective_policy,
             retrieval_plan,
             degraded_mode=degraded_mode,
             detected_needs=detected_needs,
-            item_count=len(filtered_candidates),
+            item_count=len(scoring_pool),
         )
         scoring_policy = self._policy_for_late_privacy_mode(
             scoring_policy,
             effective_ablation,
         )
         shortlist = early_diversity_select(
-            filtered_candidates,
+            scoring_pool,
             query_type=retrieval_plan.query_type,
             shortlist_k=scoring_policy.retrieval_params.rerank_top_k,
         )
+        # Obligation-driven support recovery still searches the PRE-dedupe
+        # pool: a summary's exact L0 support may be a collapsed carrier, and
+        # evidence obligations outrank the dedupe (recovered carriers are not
+        # custody-labeled as deduped).
         shortlist = await self._reground_summary_support_shortlist(
             shortlist=shortlist,
             filtered_candidates=filtered_candidates,
@@ -1006,6 +1035,8 @@ class RetrievalPipeline:
             selected_memory_ids=list(composed_context.selected_memory_ids),
             retrieval_plan=retrieval_plan,
             filter_reasons_by_id=filter_reasons_by_id,
+            deduped_into=carrier_dedupe.collapsed_into,
+            composer_eviction_by_id=composed_context.composer_eviction_reasons,
         )
 
         if trace is not None:
@@ -1315,6 +1346,7 @@ class RetrievalPipeline:
             selected_memory_ids=list(composed_context.selected_memory_ids),
             retrieval_plan=retrieval_plan,
             filter_reasons_by_id={},
+            composer_eviction_by_id=composed_context.composer_eviction_reasons,
         )
         retrieval_sufficiency = build_retrieval_sufficiency_diagnostic(
             raw_candidates=raw_candidates,
@@ -1531,6 +1563,7 @@ class RetrievalPipeline:
             selected_memory_ids=list(composed_context.selected_memory_ids),
             retrieval_plan=retrieval_plan,
             filter_reasons_by_id={},
+            composer_eviction_by_id=composed_context.composer_eviction_reasons,
         )
         retrieval_sufficiency = build_retrieval_sufficiency_diagnostic(
             raw_candidates=raw_candidates,
@@ -2124,6 +2157,7 @@ class RetrievalPipeline:
             selected_memory_ids=list(composed_context.selected_memory_ids),
             retrieval_plan=retrieval_plan,
             filter_reasons_by_id=filter_reasons_by_id,
+            composer_eviction_by_id=composed_context.composer_eviction_reasons,
         )
 
         if trace is not None:

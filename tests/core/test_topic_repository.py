@@ -13,7 +13,7 @@ from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository
 from atagia.core.topic_repository import TopicRepository
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
 
 async def _connection_and_clock() -> tuple[aiosqlite.Connection, FrozenClock]:

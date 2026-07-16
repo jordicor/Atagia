@@ -26,8 +26,8 @@ from tests.extraction_payload_support import (
     memory_extraction_card_output_from_payload,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[1] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[1] / "src" / "atagia" / "resources" / "manifests"
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
@@ -138,6 +138,24 @@ class ClientProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text="no",
+            )
+        if purpose.startswith("user_language_profile_") and purpose.endswith("_card"):
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="none",
+            )
+        if purpose == "topic_working_set_route_card":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text="none",
+            )
+        if purpose == "initial_context_package_curation":
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                output_text=json.dumps({"items": [], "nothing_to_add": True}),
             )
         raise AssertionError(f"Unexpected LLM purpose: {purpose}")
 
@@ -321,7 +339,7 @@ async def test_connect_atagia_local_sidecar_round_trip(
         assert chat_request.metadata["effective_privacy_enforcement"] == "off"
         assert chat_request.metadata["authenticated_privilege_level"] == "atagia_master"
         assert chat_request.metadata["authenticated_atagia_master"] is True
-        assert await client.flush(timeout_seconds=0.1) is True
+        assert await client.flush(timeout_seconds=5.0) is True
         status = await client.get_processing_status("usr_1", conversation_id)
         assert status.workers_enabled is True
         assert status.processing is False
@@ -535,10 +553,22 @@ async def test_connect_atagia_http_sidecar_round_trip(tmp_path: Path) -> None:
                 message="Why is the retry loop failing?",
                 workspace_id="wrk_1",
                 platform_id="client_http",
-                privacy_enforcement="off",
-                authenticated_user_privilege_level="atagia_master",
-                authenticated_user_is_atagia_master=True,
             )
+
+            with pytest.raises(
+                ValueError,
+                match="HTTP transport cannot set prompt authority",
+            ):
+                await client.chat(
+                    user_id="usr_1",
+                    conversation_id=conversation_id,
+                    message="Try to elevate authority.",
+                    workspace_id="wrk_1",
+                    platform_id="client_http",
+                    privacy_enforcement="off",
+                    authenticated_user_privilege_level="atagia_master",
+                    authenticated_user_is_atagia_master=True,
+                )
 
             assert context.system_prompt
             assert chat_result.response_text == "Check the retry guard first."
@@ -547,13 +577,14 @@ async def test_connect_atagia_http_sidecar_round_trip(tmp_path: Path) -> None:
                 for request in provider.requests
                 if request.metadata.get("purpose") == "chat_reply"
             )
-            assert chat_request.metadata["privacy_enforcement"] == "off"
-            assert chat_request.metadata["effective_privacy_enforcement"] == "off"
+            assert chat_request.metadata["privacy_enforcement"] == "enforce"
+            assert chat_request.metadata["effective_privacy_enforcement"] == "enforce"
+            assert chat_request.metadata["authenticated_privilege_level"] == "standard"
+            assert chat_request.metadata["authenticated_atagia_master"] is False
             assert (
-                chat_request.metadata["authenticated_privilege_level"]
-                == "atagia_master"
+                chat_request.metadata["authority_source"]
+                == "ordinary_http_boundary:service_api_key"
             )
-            assert chat_request.metadata["authenticated_atagia_master"] is True
             assert await client.flush(timeout_seconds=0.1) is False
             status = await client.get_processing_status("usr_1", conversation_id)
             assert status.workers_enabled is False

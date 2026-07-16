@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,7 +12,12 @@ import pytest
 from atagia.app import AppRuntime, initialize_runtime
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+)
 from atagia.core.space_repository import SpaceRepository
 from atagia.models.schemas_memory import (
     IntimacyBoundary,
@@ -21,6 +28,10 @@ from atagia.models.schemas_memory import (
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
+from atagia.models.schemas_api import (
+    ReplaceSelectedTranscriptRequest,
+    SelectedTranscriptMessage,
+)
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -30,19 +41,28 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.verbatim_pin_service import VerbatimPinService
+from atagia.services.selected_transcript_service import SelectedTranscriptService
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 class NoopProvider(LLMProvider):
     name = "noop-verbatim-pin-tests"
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        raise AssertionError(f"LLM should not be called in verbatim pin tests: {request.metadata}")
+        raise AssertionError(
+            f"LLM should not be called in verbatim pin tests: {request.metadata}"
+        )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        raise AssertionError(f"Embeddings should not be called in verbatim pin tests: {request.model}")
+        raise AssertionError(
+            f"Embeddings should not be called in verbatim pin tests: {request.model}"
+        )
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -99,7 +119,9 @@ async def test_verbatim_pin_service_resolves_message_memory_object_and_text_span
             service = VerbatimPinService(runtime)
 
             await users.create_user("usr_1")
-            await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "Chat")
+            await conversations.create_conversation(
+                "cnv_1", "usr_1", None, "coding_debug", "Chat"
+            )
             await messages.create_message(
                 "msg_1",
                 "cnv_1",
@@ -185,8 +207,12 @@ async def test_verbatim_pin_service_search_respects_conversation_scope(
             service = VerbatimPinService(runtime)
 
             await users.create_user("usr_1")
-            await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "Chat A")
-            await conversations.create_conversation("cnv_2", "usr_1", None, "coding_debug", "Chat B")
+            await conversations.create_conversation(
+                "cnv_1", "usr_1", None, "coding_debug", "Chat A"
+            )
+            await conversations.create_conversation(
+                "cnv_2", "usr_1", None, "coding_debug", "Chat B"
+            )
             await messages.create_message(
                 "msg_1",
                 "cnv_1",
@@ -305,7 +331,10 @@ async def test_verbatim_pin_service_enforces_space_boundaries_for_crud_and_searc
                     created_by="usr_1",
                 )
                 assert created_by_operation[operation]["space_id"] == space_id
-                assert created_by_operation[operation]["space_boundary_mode"] == boundary_mode.value
+                assert (
+                    created_by_operation[operation]["space_boundary_mode"]
+                    == boundary_mode.value
+                )
 
             derived = await service.create_verbatim_pin(
                 connection,
@@ -359,25 +388,34 @@ async def test_verbatim_pin_service_enforces_space_boundaries_for_crud_and_searc
             )
             assert outside_search == []
 
-            assert await service.get_verbatim_pin(
-                connection,
-                user_id="usr_1",
-                pin_id=created_by_operation["get"]["id"],
-                **outside_context,
-            ) is None
-            assert await service.update_verbatim_pin(
-                connection,
-                user_id="usr_1",
-                pin_id=created_by_operation["edit"]["id"],
-                canonical_text="outside edit must not land",
-                **outside_context,
-            ) is None
-            assert await service.delete_verbatim_pin(
-                connection,
-                user_id="usr_1",
-                pin_id=created_by_operation["delete"]["id"],
-                **outside_context,
-            ) is None
+            assert (
+                await service.get_verbatim_pin(
+                    connection,
+                    user_id="usr_1",
+                    pin_id=created_by_operation["get"]["id"],
+                    **outside_context,
+                )
+                is None
+            )
+            assert (
+                await service.update_verbatim_pin(
+                    connection,
+                    user_id="usr_1",
+                    pin_id=created_by_operation["edit"]["id"],
+                    canonical_text="outside edit must not land",
+                    **outside_context,
+                )
+                is None
+            )
+            assert (
+                await service.delete_verbatim_pin(
+                    connection,
+                    user_id="usr_1",
+                    pin_id=created_by_operation["delete"]["id"],
+                    **outside_context,
+                )
+                is None
+            )
 
             inside_list = await service.list_verbatim_pins(
                 connection,
@@ -406,7 +444,10 @@ async def test_verbatim_pin_service_enforces_space_boundaries_for_crud_and_searc
                 **inside_context,
             )
             assert inside_get is not None
-            assert inside_get["canonical_text"] == f"get boundary pin phrase for {space_id}"
+            assert (
+                inside_get["canonical_text"]
+                == f"get boundary pin phrase for {space_id}"
+            )
 
             inside_edit = await service.update_verbatim_pin(
                 connection,
@@ -446,7 +487,9 @@ async def test_verbatim_pin_service_uses_safe_index_text_for_high_privacy_discov
             service = VerbatimPinService(runtime)
 
             await users.create_user("usr_1")
-            await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "Chat")
+            await conversations.create_conversation(
+                "cnv_1", "usr_1", None, "coding_debug", "Chat"
+            )
 
             created = await service.create_verbatim_pin(
                 connection,
@@ -479,18 +522,21 @@ async def test_verbatim_pin_service_uses_safe_index_text_for_high_privacy_discov
             )
             assert [row["id"] for row in matching_rows] == [created["id"]]
 
-            assert await service.search_active_verbatim_pins(
-                connection,
-                user_id="usr_1",
-                query="4512",
-                privacy_ceiling=3,
-                scope_filter=[MemoryScope.CONVERSATION],
-                assistant_mode_id="coding_debug",
-                workspace_id=None,
-                conversation_id="cnv_1",
-                limit=10,
-                as_of="2026-03-30T12:00:00+00:00",
-            ) == []
+            assert (
+                await service.search_active_verbatim_pins(
+                    connection,
+                    user_id="usr_1",
+                    query="4512",
+                    privacy_ceiling=3,
+                    scope_filter=[MemoryScope.CONVERSATION],
+                    assistant_mode_id="coding_debug",
+                    workspace_id=None,
+                    conversation_id="cnv_1",
+                    limit=10,
+                    as_of="2026-03-30T12:00:00+00:00",
+                )
+                == []
+            )
 
             updated = await service.update_verbatim_pin(
                 connection,
@@ -510,5 +556,128 @@ async def test_verbatim_pin_service_uses_safe_index_text_for_high_privacy_discov
             assert deleted["status"] == VerbatimPinStatus.DELETED.value
         finally:
             await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_pin_create_and_selected_transcript_replacement_share_write_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = await _build_runtime(tmp_path, monkeypatch)
+    runtime.settings = replace(runtime.settings, workers_enabled=True)
+    try:
+        setup = await runtime.open_connection()
+        try:
+            await UserRepository(setup, runtime.clock).create_user("usr_fence")
+            await ConversationRepository(
+                setup,
+                runtime.clock,
+            ).create_conversation(
+                "cnv_fence",
+                "usr_fence",
+                None,
+                "coding_debug",
+                "Pin fence",
+                platform_id="openclaw",
+            )
+            messages = MessageRepository(setup, runtime.clock)
+            for message_id, role, seq, text in (
+                ("msg_keep_u", "user", 1, "keep user"),
+                ("msg_keep_a", "assistant", 2, "keep assistant"),
+                ("msg_old_u", "user", 3, "abandoned user"),
+                ("msg_old_a", "assistant", 4, "abandoned assistant"),
+            ):
+                await messages.create_message(
+                    message_id,
+                    "cnv_fence",
+                    role,
+                    seq,
+                    text,
+                )
+        finally:
+            await setup.close()
+
+        pin_connection = await runtime.open_connection()
+        pin_service = VerbatimPinService(runtime)
+        source_resolved = asyncio.Event()
+        release_source = asyncio.Event()
+        original_load = pin_service._load_source_row
+
+        async def paused_load(
+            *args: object, **kwargs: object
+        ) -> dict[str, object] | None:
+            source = await original_load(*args, **kwargs)
+            source_resolved.set()
+            await release_source.wait()
+            return source
+
+        monkeypatch.setattr(pin_service, "_load_source_row", paused_load)
+        pin_task = asyncio.create_task(
+            pin_service.create_verbatim_pin(
+                pin_connection,
+                user_id="usr_fence",
+                scope=MemoryScope.CONVERSATION,
+                target_kind=VerbatimPinTargetKind.MESSAGE,
+                target_id="msg_old_a",
+                conversation_id="cnv_fence",
+                platform_id="openclaw",
+                privacy_level=0,
+                created_by="usr_fence",
+            )
+        )
+        await asyncio.wait_for(source_resolved.wait(), timeout=2.0)
+
+        selected = [
+            SelectedTranscriptMessage(
+                message_id=message_id,
+                host_message_id=f"host:{message_id}",
+                generation_id="generation:retained",
+                source_namespace="openclaw:selected",
+                source_seq=seq,
+                role=role,
+                text=text,
+            )
+            for message_id, role, seq, text in (
+                ("msg_keep_u", "user", 1, "keep user"),
+                ("msg_keep_a", "assistant", 2, "keep assistant"),
+            )
+        ]
+        replacement_task = asyncio.create_task(
+            SelectedTranscriptService(runtime).replace(
+                conversation_id="cnv_fence",
+                request=ReplaceSelectedTranscriptRequest(
+                    user_id="usr_fence",
+                    platform_id="openclaw",
+                    operation_id="pin-fence-replacement",
+                    selection_epoch=1,
+                    mutation_kind="undo",
+                    retained_cutoff_message_id="msg_keep_a",
+                    messages=selected,
+                ),
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not replacement_task.done()
+
+        release_source.set()
+        created_pin, replacement = await asyncio.gather(pin_task, replacement_task)
+        assert replacement.status == "rebuilding"
+
+        verification = await runtime.open_connection()
+        try:
+            cursor = await verification.execute(
+                "SELECT COUNT(*) AS count FROM verbatim_pins WHERE id = ?",
+                (created_pin["id"],),
+            )
+            assert int((await cursor.fetchone())["count"]) == 0
+            cursor = await verification.execute(
+                "SELECT COUNT(*) AS count FROM messages WHERE id = 'msg_old_a'"
+            )
+            assert int((await cursor.fetchone())["count"]) == 0
+        finally:
+            await verification.close()
+            await pin_connection.close()
     finally:
         await runtime.close()

@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 import json
 import re
+import sqlite3
+from typing import Any
 
 import httpx
 import pytest
 
 from atagia.app import create_app
 from atagia.core.config import Settings
+from atagia.core.mind_repository import MindRepository
+from atagia.core.repositories import UserRepository
+from atagia.models.schemas_memory import MindKind
 from atagia.services.llm_client import (
     LLMError,
     LLMClient,
@@ -20,9 +27,14 @@ from atagia.services.llm_client import (
     LLMStreamEvent,
     TransientLLMError,
 )
+from atagia.services.openai_proxy_service import OpenAIProxyService
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
@@ -173,6 +185,41 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
+async def _ensure_capture_namespace(service, identity):
+    """Create only the namespace while a test replaces the real context path."""
+
+    from atagia.core.conversation_namespace import (
+        capture_conversation_namespace_snapshot,
+    )
+    from atagia.services.sidecar_service import SidecarService
+
+    connection = await service.runtime.open_connection()
+    try:
+        sidecar = SidecarService(service.runtime)
+        await sidecar.ensure_user_exists(connection, identity.user_id)
+        await sidecar.ensure_conversation(
+            connection,
+            user_id=identity.user_id,
+            conversation_id=identity.conversation_id,
+            workspace_id=None,
+            assistant_mode_id=identity.mode or identity.assistant_mode_id,
+            platform_id=identity.platform_id,
+            mode=identity.mode or identity.assistant_mode_id,
+            incognito=identity.incognito,
+            cross_chat_memory=identity.cross_chat_memory,
+        )
+        snapshot = await capture_conversation_namespace_snapshot(
+            connection,
+            service.runtime.clock,
+            user_id=identity.user_id,
+            conversation_id=identity.conversation_id,
+        )
+        assert snapshot is not None
+        return snapshot
+    finally:
+        await connection.close()
+
+
 @pytest.mark.asyncio
 async def test_openai_proxy_models_and_non_streaming_completion(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
@@ -219,7 +266,9 @@ async def test_openai_proxy_models_and_non_streaming_completion(tmp_path: Path) 
     assert payload["object"] == "chat.completion"
     assert payload["choices"][0]["message"]["content"] == "Proxy reply."
     chat_requests = [
-        request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
     ]
     assert chat_requests
     assert chat_requests[-1].metadata["user_persona_id"] == "persona_proxy"
@@ -263,7 +312,9 @@ async def test_openai_proxy_requires_explicit_conversation_id(
     assert response.status_code == 400
     assert "require X-Atagia-Conversation-Id" in response.json()["error"]["message"]
     assert not [
-        request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
     ]
 
 
@@ -297,8 +348,100 @@ async def test_openai_proxy_requires_explicit_platform_id(tmp_path: Path) -> Non
     assert response.status_code == 400
     assert "require X-Atagia-Platform-Id" in response.json()["error"]["message"]
     assert not [
-        request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True), ids=("non_stream", "stream"))
+@pytest.mark.parametrize("mind_case", ("missing", "cross_owner"))
+async def test_openai_proxy_rejects_unowned_mind_before_provider(
+    tmp_path: Path,
+    mind_case: str,
+    stream: bool,
+) -> None:
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    mind_id = f"mind_{mind_case}"
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        if mind_case == "cross_owner":
+            connection = await app.state.runtime.open_connection()
+            try:
+                await UserRepository(
+                    connection,
+                    app.state.runtime.clock,
+                ).create_user("usr_mind_owner")
+                await MindRepository(
+                    connection,
+                    app.state.runtime.clock,
+                ).resolve_mind(
+                    owner_user_id="usr_mind_owner",
+                    mind_id=mind_id,
+                    kind=MindKind.OWNED_AI,
+                    display_name="Foreign Mind",
+                    source_kind="test",
+                    source_id=mind_id,
+                )
+            finally:
+                await connection.close()
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_mind_requester",
+                    "X-Atagia-Conversation-Id": f"cnv_{mind_case}_{stream}",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Mind-Id": mind_id,
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "messages": [
+                        {"role": "user", "content": "Use the requested mind."}
+                    ],
+                    "stream": stream,
+                },
+            )
+
+        verification = await app.state.runtime.open_connection()
+        try:
+            message_count = int(
+                (
+                    await (
+                        await verification.execute(
+                            "SELECT COUNT(*) AS count FROM messages"
+                        )
+                    ).fetchone()
+                )["count"]
+            )
+            run_count = int(
+                (
+                    await (
+                        await verification.execute(
+                            "SELECT COUNT(*) AS count FROM proxy_turn_runs"
+                        )
+                    ).fetchone()
+                )["count"]
+            )
+        finally:
+            await verification.close()
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "mind_not_found"
+    assert provider.requests == []
+    assert message_count == 0
+    assert run_count == 0
 
 
 @pytest.mark.asyncio
@@ -337,7 +480,9 @@ async def test_openai_proxy_reads_redesign_metadata_identity(tmp_path: Path) -> 
 
     assert response.status_code == 200
     chat_requests = [
-        request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
     ]
     assert chat_requests[-1].metadata["conversation_id"] == "cnv_proxy_metadata"
     assert chat_requests[-1].metadata["user_persona_id"] == "persona_meta"
@@ -359,17 +504,13 @@ async def test_openai_proxy_propagates_sidecar_control_fields(
         captured["context"] = kwargs
         return None
 
-    async def capture_response(self, **kwargs):
-        captured["response"] = kwargs
-        return None
-
     monkeypatch.setattr(
         "atagia.services.openai_proxy_service.SidecarService.get_context",
         capture_context,
     )
     monkeypatch.setattr(
-        "atagia.services.openai_proxy_service.SidecarService.add_response",
-        capture_response,
+        "atagia.services.openai_proxy_service.OpenAIProxyService._ensure_proxy_namespace",
+        _ensure_capture_namespace,
     )
     app = create_app(_settings(tmp_path))
     provider = ProxyProvider()
@@ -409,6 +550,16 @@ async def test_openai_proxy_propagates_sidecar_control_fields(
                     "messages": [{"role": "user", "content": "Hello controls"}],
                 },
             )
+        connection = await app.state.runtime.open_connection()
+        try:
+            stored_response = await (
+                await connection.execute(
+                    "SELECT id, seq FROM messages WHERE id = ?",
+                    ("host-assistant-1",),
+                )
+            ).fetchone()
+        finally:
+            await connection.close()
 
     assert response.status_code == 200
     assert captured["context"]["message_id"] == "host-user-1"
@@ -422,17 +573,15 @@ async def test_openai_proxy_propagates_sidecar_control_fields(
     assert captured["context"]["ingest_origin"] == "live_turn"
     assert captured["context"]["confirmation_strategy"] == "live_prompt_allowed"
     assert captured["context"]["memory_privacy_mode"] == "trusted_private"
-    assert captured["response"]["message_id"] == "host-assistant-1"
-    assert captured["response"]["active_presence_id"] == "presence_header"
-    assert captured["response"]["mind_id"] == "mind_header"
-    assert captured["response"]["mind_topology"] == "ojocentauri"
-    assert captured["response"]["embodiment_id"] == "body_header"
-    assert captured["response"]["realm_id"] == "realm_header"
-    assert captured["response"]["space_id"] == "space_header"
-    assert captured["response"]["source_seq"] == 8
-    assert captured["response"]["ingest_origin"] == "live_turn"
+    assert stored_response is not None
+    assert (stored_response["id"], stored_response["seq"]) == (
+        "host-assistant-1",
+        8,
+    )
     chat_requests = [
-        request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
     ]
     assert chat_requests[-1].metadata["message_id"] == "host-user-1"
     assert chat_requests[-1].metadata["active_presence_id"] == "presence_header"
@@ -456,17 +605,13 @@ async def test_openai_proxy_accepts_control_fields_from_metadata(
         captured["context"] = kwargs
         return None
 
-    async def capture_response(self, **kwargs):
-        captured["response"] = kwargs
-        return None
-
     monkeypatch.setattr(
         "atagia.services.openai_proxy_service.SidecarService.get_context",
         capture_context,
     )
     monkeypatch.setattr(
-        "atagia.services.openai_proxy_service.SidecarService.add_response",
-        capture_response,
+        "atagia.services.openai_proxy_service.OpenAIProxyService._ensure_proxy_namespace",
+        _ensure_capture_namespace,
     )
     app = create_app(_settings(tmp_path))
     provider = ProxyProvider()
@@ -488,7 +633,9 @@ async def test_openai_proxy_accepts_control_fields_from_metadata(
                 },
                 json={
                     "model": "atagia-memory-proxy",
-                    "messages": [{"role": "user", "content": "Hello metadata controls"}],
+                    "messages": [
+                        {"role": "user", "content": "Hello metadata controls"}
+                    ],
                     "metadata": {
                         "conversation_id": "cnv_proxy_metadata_controls",
                         "platform_id": "proxy_metadata",
@@ -508,6 +655,16 @@ async def test_openai_proxy_accepts_control_fields_from_metadata(
                     },
                 },
             )
+        connection = await app.state.runtime.open_connection()
+        try:
+            stored_response = await (
+                await connection.execute(
+                    "SELECT id, seq FROM messages WHERE id = ?",
+                    ("meta-assistant-1",),
+                )
+            ).fetchone()
+        finally:
+            await connection.close()
 
     assert response.status_code == 200
     assert captured["context"]["message_id"] == "meta-user-1"
@@ -518,29 +675,30 @@ async def test_openai_proxy_accepts_control_fields_from_metadata(
     assert captured["context"]["realm_id"] == "realm_meta"
     assert captured["context"]["space_id"] == "space_meta"
     assert captured["context"]["source_seq"] == 3
-    assert captured["response"]["message_id"] == "meta-assistant-1"
-    assert captured["response"]["active_presence_id"] == "presence_meta"
-    assert captured["response"]["mind_id"] == "mind_meta"
-    assert captured["response"]["mind_topology"] == "ojocentauri"
-    assert captured["response"]["embodiment_id"] == "body_meta"
-    assert captured["response"]["realm_id"] == "realm_meta"
-    assert captured["response"]["space_id"] == "space_meta"
-    assert captured["response"]["source_seq"] == 4
-    assert captured["response"]["memory_privacy_mode"] == "balanced"
+    assert stored_response is not None
+    assert (stored_response["id"], stored_response["seq"]) == (
+        "meta-assistant-1",
+        4,
+    )
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_invalid_response_mode_header_keeps_context(
+@pytest.mark.parametrize(
+    ("headers", "metadata"),
+    [
+        ({"X-Atagia-Response-Mode": "turbo_nonsense"}, None),
+        ({"X-Atagia-Response-Mode": ""}, None),
+        (None, {"atagia_response_mode": "turbo_nonsense"}),
+        (None, {"response_mode": 7}),
+    ],
+)
+async def test_openai_proxy_invalid_response_mode_is_rejected_before_provider(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
+    headers: dict[str, str] | None,
+    metadata: dict[str, Any] | None,
 ) -> None:
-    """An invalid X-Atagia-Response-Mode must not nuke the memory context.
+    """An invalid explicit response_mode fails with a stable 400, never a fallback."""
 
-    The bad value is validated away in identity resolution (warned + treated as
-    None so the configured default applies), instead of propagating into the
-    sidecar where ``ResponseMode(...)`` would raise and the broad fail-open
-    except would drop the entire memory context.
-    """
     app = create_app(_settings(tmp_path))
     provider = ProxyProvider()
     async with app.router.lifespan_context(app):
@@ -553,39 +711,133 @@ async def test_openai_proxy_invalid_response_mode_header_keeps_context(
             transport=transport,
             base_url="http://testserver",
         ) as client:
-            with caplog.at_level("WARNING"):
-                response = await client.post(
-                    "/v1/chat/completions",
-                    headers={
-                        "Authorization": "Bearer service-key",
-                        "X-Atagia-User-Id": "usr_proxy",
-                        "X-Atagia-Platform-Id": "proxy_desktop",
-                        "X-Atagia-Conversation-Id": "cnv_proxy_bad_mode",
-                        "X-Atagia-Response-Mode": "turbo_nonsense",
-                    },
-                    json={
-                        "model": "atagia-memory-proxy",
-                        "messages": [
-                            {"role": "system", "content": "Base system"},
-                            {"role": "user", "content": "Keep my memory context."},
-                        ],
-                    },
+            payload: dict[str, Any] = {
+                "model": "atagia-memory-proxy",
+                "messages": [{"role": "user", "content": "Reject bad modes."}],
+            }
+            if metadata is not None:
+                payload["metadata"] = metadata
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": "cnv_proxy_bad_mode",
+                    **(headers or {}),
+                },
+                json=payload,
+            )
+        connection = await app.state.runtime.open_connection()
+        try:
+            stored_messages = await (
+                await connection.execute(
+                    "SELECT COUNT(*) AS message_count FROM messages"
                 )
+            ).fetchone()
+        finally:
+            await connection.close()
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_response_mode"
+    assert error["param"] == "response_mode"
+    assert not provider.requests
+    assert stored_messages["message_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_conflicting_response_mode_claims_are_rejected(
+    tmp_path: Path,
+) -> None:
+    """Two valid but different explicit response_mode claims fail with 400."""
+
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": "cnv_proxy_conflict_mode",
+                    "X-Atagia-Response-Mode": "fast",
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "messages": [{"role": "user", "content": "Conflicting modes."}],
+                    "metadata": {"atagia_response_mode": "smart_fast"},
+                    "response_mode": "fast",
+                },
+            )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "conflicting_response_mode"
+    assert error["param"] == "response_mode"
+    assert not provider.requests
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_agreeing_response_mode_claims_reach_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same explicit response_mode across every source stays valid."""
+
+    captured: dict[str, dict] = {}
+
+    async def capture_context(self, **kwargs):
+        captured["context"] = kwargs
+        return None
+
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.SidecarService.get_context",
+        capture_context,
+    )
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": "cnv_proxy_agree_mode",
+                    "X-Atagia-Response-Mode": "smart_fast",
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "messages": [{"role": "user", "content": "Matching modes."}],
+                    "metadata": {"atagia_response_mode": "smart_fast"},
+                    "response_mode": "smart_fast",
+                },
+            )
 
     assert response.status_code == 200
-    chat_requests = [
-        request
-        for request in provider.requests
-        if request.metadata.get("purpose") == "chat_reply"
-    ]
-    assert chat_requests
-    # Context assembled (not dropped) despite the invalid mode header.
-    assert "[ATAGIA MEMORY CONTEXT - INTERNAL]" in chat_requests[-1].messages[0].content
-    assert any(
-        "turbo_nonsense" in record.getMessage()
-        and "invalid response mode" in record.getMessage().lower()
-        for record in caplog.records
-    )
+    assert captured["context"]["response_mode"] == "smart_fast"
 
 
 @pytest.mark.asyncio
@@ -599,17 +851,9 @@ async def test_openai_proxy_valid_response_mode_header_passes_through(
         captured["context"] = kwargs
         return None
 
-    async def capture_response(self, **kwargs):
-        captured["response"] = kwargs
-        return None
-
     monkeypatch.setattr(
         "atagia.services.openai_proxy_service.SidecarService.get_context",
         capture_context,
-    )
-    monkeypatch.setattr(
-        "atagia.services.openai_proxy_service.SidecarService.add_response",
-        capture_response,
     )
     app = create_app(_settings(tmp_path))
     provider = ProxyProvider()
@@ -652,23 +896,11 @@ async def test_openai_proxy_adaptive_retrieval_header_reaches_context(
         captured["context"] = kwargs
         return None
 
-    async def capture_response(self, **kwargs):
-        captured["response"] = kwargs
-        return None
-
-    monkeypatch_targets = (
-        (
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
             "atagia.services.openai_proxy_service.SidecarService.get_context",
             capture_context,
-        ),
-        (
-            "atagia.services.openai_proxy_service.SidecarService.add_response",
-            capture_response,
-        ),
-    )
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        for target, replacement in monkeypatch_targets:
-            monkeypatch.setattr(target, replacement)
+        )
         app = create_app(_settings(tmp_path))
         provider = ProxyProvider()
         async with app.router.lifespan_context(app):
@@ -710,18 +942,10 @@ async def test_openai_proxy_adaptive_retrieval_metadata_reaches_context(
         captured["context"] = kwargs
         return None
 
-    async def capture_response(self, **kwargs):
-        captured["response"] = kwargs
-        return None
-
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
             "atagia.services.openai_proxy_service.SidecarService.get_context",
             capture_context,
-        )
-        monkeypatch.setattr(
-            "atagia.services.openai_proxy_service.SidecarService.add_response",
-            capture_response,
         )
         app = create_app(_settings(tmp_path))
         provider = ProxyProvider()
@@ -743,7 +967,9 @@ async def test_openai_proxy_adaptive_retrieval_metadata_reaches_context(
                     },
                     json={
                         "model": "atagia-memory-proxy",
-                        "messages": [{"role": "user", "content": "Hello metadata gate"}],
+                        "messages": [
+                            {"role": "user", "content": "Hello metadata gate"}
+                        ],
                         "metadata": {
                             "atagia_conversation_id": "cnv_proxy_adaptive_metadata",
                             "atagia_platform_id": "proxy_desktop",
@@ -757,27 +983,139 @@ async def test_openai_proxy_adaptive_retrieval_metadata_reaches_context(
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_invalid_adaptive_retrieval_header_falls_back_to_default(
+@pytest.mark.parametrize(
+    ("headers", "metadata"),
+    [
+        ({"X-Atagia-Adaptive-Retrieval": "maybe"}, None),
+        ({"X-Atagia-Adaptive-Retrieval": ""}, None),
+        (None, {"atagia_adaptive_retrieval": "sometimes"}),
+        (None, {"adaptive_retrieval": 7}),
+    ],
+)
+async def test_openai_proxy_invalid_adaptive_retrieval_is_rejected_before_provider(
+    tmp_path: Path,
+    headers: dict[str, str] | None,
+    metadata: dict[str, Any] | None,
+) -> None:
+    """An invalid explicit adaptive_retrieval fails with a stable 400, never a fallback."""
+
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            payload: dict[str, Any] = {
+                "model": "atagia-memory-proxy",
+                "messages": [{"role": "user", "content": "Reject bad gate flags."}],
+            }
+            if metadata is not None:
+                payload["metadata"] = metadata
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": "cnv_proxy_adaptive_bad",
+                    **(headers or {}),
+                },
+                json=payload,
+            )
+        connection = await app.state.runtime.open_connection()
+        try:
+            stored_messages = await (
+                await connection.execute(
+                    "SELECT COUNT(*) AS message_count FROM messages"
+                )
+            ).fetchone()
+        finally:
+            await connection.close()
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_adaptive_retrieval"
+    assert error["param"] == "adaptive_retrieval"
+    assert not provider.requests
+    assert stored_messages["message_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_conflicting_adaptive_retrieval_claims_are_rejected(
     tmp_path: Path,
 ) -> None:
+    """Two valid but different explicit adaptive_retrieval claims fail with 400."""
+
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": "cnv_proxy_adaptive_conflict",
+                    "X-Atagia-Adaptive-Retrieval": "true",
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "messages": [{"role": "user", "content": "Conflicting flags."}],
+                    "metadata": {"atagia_adaptive_retrieval": False},
+                    "adaptive_retrieval": True,
+                },
+            )
+        connection = await app.state.runtime.open_connection()
+        try:
+            stored_messages = await (
+                await connection.execute(
+                    "SELECT COUNT(*) AS message_count FROM messages"
+                )
+            ).fetchone()
+        finally:
+            await connection.close()
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "conflicting_adaptive_retrieval"
+    assert error["param"] == "adaptive_retrieval"
+    assert not provider.requests
+    assert stored_messages["message_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_agreeing_adaptive_retrieval_claims_reach_context(
+    tmp_path: Path,
+) -> None:
+    """The same explicit adaptive_retrieval across every source stays valid."""
+
     captured: dict[str, dict] = {}
 
     async def capture_context(self, **kwargs):
         captured["context"] = kwargs
         return None
 
-    async def capture_response(self, **kwargs):
-        captured["response"] = kwargs
-        return None
-
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
             "atagia.services.openai_proxy_service.SidecarService.get_context",
             capture_context,
-        )
-        monkeypatch.setattr(
-            "atagia.services.openai_proxy_service.SidecarService.add_response",
-            capture_response,
         )
         app = create_app(_settings(tmp_path))
         provider = ProxyProvider()
@@ -797,18 +1135,20 @@ async def test_openai_proxy_invalid_adaptive_retrieval_header_falls_back_to_defa
                         "Authorization": "Bearer service-key",
                         "X-Atagia-User-Id": "usr_proxy",
                         "X-Atagia-Platform-Id": "proxy_desktop",
-                        "X-Atagia-Conversation-Id": "cnv_proxy_adaptive_bad",
-                        "X-Atagia-Adaptive-Retrieval": "maybe",
+                        "X-Atagia-Conversation-Id": "cnv_proxy_adaptive_agree",
+                        "X-Atagia-Adaptive-Retrieval": "false",
                     },
                     json={
                         "model": "atagia-memory-proxy",
-                        "messages": [{"role": "user", "content": "Hello bad gate"}],
+                        "messages": [{"role": "user", "content": "Matching flags."}],
+                        "metadata": {"atagia_adaptive_retrieval": False},
+                        "adaptive_retrieval": False,
                     },
                 )
 
     assert response.status_code == 200
-    # An unrecognized value resolves to None so the engine/global default applies.
-    assert captured["context"]["adaptive_retrieval"] is None
+    # "false" everywhere must override the engine default (adaptive gate ON).
+    assert captured["context"]["adaptive_retrieval"] is False
 
 
 @pytest.mark.asyncio
@@ -853,7 +1193,105 @@ async def test_openai_proxy_streaming_completion(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_streaming_include_usage_chunk(tmp_path: Path) -> None:
+async def test_concurrent_burst_streams_renew_by_time_not_per_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BurstProvider(ProxyProvider):
+        async def stream(self, request: LLMCompletionRequest):
+            self.requests.append(request)
+            assert request.metadata.get("purpose") == "chat_reply"
+            for _index in range(400):
+                yield LLMStreamEvent(type="text", content="x")
+            yield LLMStreamEvent(type="done", payload={})
+
+    renew_calls = 0
+
+    async def count_renewals(
+        _service: OpenAIProxyService,
+        claim: Any,
+    ) -> bool:
+        nonlocal renew_calls
+        assert claim is not None
+        renew_calls += 1
+        return True
+
+    @asynccontextmanager
+    async def no_heartbeat(
+        _service: OpenAIProxyService,
+        claim: Any,
+    ):
+        assert claim is not None
+        yield asyncio.Event()
+
+    monkeypatch.setattr(OpenAIProxyService, "_renew_claim", count_renewals)
+    monkeypatch.setattr(OpenAIProxyService, "_renewing_claim", no_heartbeat)
+    app = create_app(_settings(tmp_path))
+    provider = BurstProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(provider.name, [provider])
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+
+            async def run_stream(conversation_id: str) -> httpx.Response:
+                return await client.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer service-key",
+                        "X-Atagia-User-Id": "usr_proxy",
+                        "X-Atagia-Platform-Id": "proxy_desktop",
+                        "X-Atagia-Conversation-Id": conversation_id,
+                    },
+                    json={
+                        "model": "atagia-memory-proxy",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "Burst."}],
+                    },
+                )
+
+            responses = await asyncio.gather(
+                run_stream("cnv_proxy_burst_a"),
+                run_stream("cnv_proxy_burst_b"),
+            )
+
+    assert all(response.status_code == 200 for response in responses)
+    assert all("data: [DONE]" in response.text for response in responses)
+    assert renew_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_claim_heartbeat_marks_lost_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = OpenAIProxyService(runtime=None)
+    ownership_lost = asyncio.Event()
+
+    async def no_delay(_seconds: float) -> None:
+        return None
+
+    async def lose_claim(
+        _service: OpenAIProxyService,
+        _claim: Any,
+    ) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.asyncio.sleep",
+        no_delay,
+    )
+    monkeypatch.setattr(OpenAIProxyService, "_renew_claim", lose_claim)
+
+    await service._claim_heartbeat(object(), ownership_lost)
+
+    assert ownership_lost.is_set()
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_streaming_does_not_fabricate_missing_usage(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path))
     provider = ProxyProvider()
     async with app.router.lifespan_context(app):
@@ -886,9 +1324,9 @@ async def test_openai_proxy_streaming_include_usage_chunk(tmp_path: Path) -> Non
 
     assert response.status_code == 200
     text = body.decode("utf-8")
-    assert '"choices": []' in text
-    assert '"usage":' in text
-    assert text.rfind('"usage":') < text.rfind("data: [DONE]")
+    assert '"choices": []' not in text
+    assert '"usage":' not in text
+    assert "data: [DONE]" in text
 
 
 @pytest.mark.asyncio
@@ -920,7 +1358,7 @@ async def test_openai_proxy_rejects_unknown_model_id(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_maps_tool_requests_and_tool_results(
+async def test_openai_proxy_rejects_tool_results_without_persisted_parent(
     tmp_path: Path,
 ) -> None:
     app = create_app(_settings(tmp_path))
@@ -956,7 +1394,7 @@ async def test_openai_proxy_maps_tool_requests_and_tool_results(
                                     "type": "function",
                                     "function": {
                                         "name": "lookup",
-                                        "arguments": "{\"query\":\"previous\"}",
+                                        "arguments": '{"query":"previous"}',
                                     },
                                 }
                             ],
@@ -964,7 +1402,7 @@ async def test_openai_proxy_maps_tool_requests_and_tool_results(
                         {
                             "role": "tool",
                             "tool_call_id": "call_previous",
-                            "content": "{\"result\":\"ok\"}",
+                            "content": '{"result":"ok"}',
                         },
                     ],
                     "tools": [
@@ -984,19 +1422,13 @@ async def test_openai_proxy_maps_tool_requests_and_tool_results(
                 },
             )
 
-    assert response.status_code == 200
-    payload = response.json()
-    tool_call = payload["choices"][0]["message"]["tool_calls"][0]
-    assert tool_call["function"]["name"] == "lookup"
-    chat_request = [
-        request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
-    ][-1]
-    assert chat_request.tools[0].name == "lookup"
-    assert chat_request.metadata["openai_tool_choice"] == "auto"
-    assert chat_request.messages[-2].tool_calls[0]["id"] == "call_previous"
-    assert chat_request.messages[-1].role == "tool"
-    assert chat_request.messages[-1].name == "call_previous"
-    assert chat_request.messages[-1].content == "{\"result\":\"ok\"}"
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "proxy_tool_parent_conflict"
+    assert not [
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
+    ]
 
 
 @pytest.mark.asyncio
@@ -1042,7 +1474,9 @@ async def test_openai_proxy_honors_tool_choice_none_before_provider_dispatch(
     assert response.status_code == 200
     assert "tool_calls" not in response.json()["choices"][0]["message"]
     chat_request = [
-        request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
     ][-1]
     assert chat_request.tools == []
     assert chat_request.metadata["openai_tool_choice"] == "none"
@@ -1208,20 +1642,20 @@ async def test_streaming_openai_proxy_emits_sse_error_after_partial_failure(
     text = body.decode("utf-8")
     assert "Proxy " in text
     assert "atagia_upstream_stream_error" in text
-    assert "data: [DONE]" in text
+    assert "data: [DONE]" not in text
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_response_persistence_fails_open(
+async def test_openai_proxy_terminal_persistence_failure_is_not_fail_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fail_record_response(*args, **kwargs):
+    async def fail_finalize(*args, **kwargs):
         raise RuntimeError("persistence failed")
 
     monkeypatch.setattr(
-        "atagia.services.openai_proxy_service.OpenAIProxyService._record_response",
-        fail_record_response,
+        "atagia.services.openai_proxy_service.finalize_proxy_turn",
+        fail_finalize,
     )
     app = create_app(_settings(tmp_path))
     provider = ProxyProvider()
@@ -1230,7 +1664,7 @@ async def test_openai_proxy_response_persistence_fails_open(
             provider_name=provider.name,
             providers=[provider],
         )
-        transport = httpx.ASGITransport(app=app)
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://testserver",
@@ -1242,15 +1676,34 @@ async def test_openai_proxy_response_persistence_fails_open(
                     "X-Atagia-User-Id": "usr_proxy",
                     "X-Atagia-Platform-Id": "proxy_desktop",
                     "X-Atagia-Conversation-Id": "cnv_proxy_fail_open",
+                    "X-Atagia-Message-Id": "msg_failed_terminal_request",
+                    "X-Atagia-Response-Message-Id": "msg_failed_terminal_response",
                 },
                 json={
                     "model": "atagia-memory-proxy",
                     "messages": [{"role": "user", "content": "Hello"}],
                 },
             )
+        connection = await app.state.runtime.open_connection()
+        try:
+            assistant = await (
+                await connection.execute(
+                    "SELECT id FROM messages WHERE id = ?",
+                    ("msg_failed_terminal_response",),
+                )
+            ).fetchone()
+            run = await (
+                await connection.execute(
+                    "SELECT state FROM proxy_turn_runs WHERE request_message_id = ?",
+                    ("msg_failed_terminal_request",),
+                )
+            ).fetchone()
+        finally:
+            await connection.close()
 
-    assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"] == "Proxy reply."
+    assert response.status_code == 500
+    assert assistant is None
+    assert run is not None and run["state"] == "generating"
 
 
 @pytest.mark.asyncio
@@ -1302,7 +1755,7 @@ async def test_openai_proxy_conversation_id_collision_returns_404(
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_memory_context_failure_fails_open(
+async def test_openai_proxy_unexpected_context_runtime_error_is_internal_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1339,17 +1792,17 @@ async def test_openai_proxy_memory_context_failure_fails_open(
                 },
             )
 
-    assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"] == "Proxy reply."
-    chat_requests = [
-        request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "memory_context_internal_error"
+    assert not [
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
     ]
-    assert chat_requests
-    assert "[ATAGIA MEMORY CONTEXT - INTERNAL]" not in chat_requests[-1].messages[0].content
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_unexpected_context_value_error_fails_open(
+async def test_openai_proxy_unexpected_context_value_error_is_internal_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1386,8 +1839,126 @@ async def test_openai_proxy_unexpected_context_value_error_fails_open(
                 },
             )
 
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "memory_context_internal_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_openai_proxy_context_integrity_error_fails_closed_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    async def fail_context(*args, **kwargs):
+        raise sqlite3.IntegrityError("deterministic context invariant failure")
+
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.SidecarService.get_context",
+        fail_context,
+    )
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    conversation_id = f"cnv_proxy_integrity_{stream}"
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(provider.name, [provider])
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": conversation_id,
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "stream": stream,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+        connection = await app.state.runtime.open_connection()
+        try:
+            assistant_count = int(
+                (
+                    await (
+                        await connection.execute(
+                            """
+                            SELECT COUNT(*) AS count
+                            FROM messages
+                            WHERE conversation_id = ? AND role = 'assistant'
+                            """,
+                            (conversation_id,),
+                        )
+                    ).fetchone()
+                )["count"]
+            )
+        finally:
+            await connection.close()
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "memory_context_internal_error"
+    assert not [
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
+    ]
+    assert assistant_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_openai_proxy_busy_context_store_remains_fail_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    async def fail_context(*args, **kwargs):
+        error = sqlite3.OperationalError("database is busy")
+        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise error
+
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.SidecarService.get_context",
+        fail_context,
+    )
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(provider.name, [provider])
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": f"cnv_proxy_busy_{stream}",
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "stream": stream,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+
     assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"] == "Proxy reply."
+    assert (
+        len(
+            [
+                request
+                for request in provider.requests
+                if request.metadata.get("purpose") == "chat_reply"
+            ]
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -1461,7 +2032,9 @@ async def test_openai_proxy_workspace_mismatch_is_not_fail_open(tmp_path: Path) 
         == "Requested workspace does not match the existing conversation workspace"
     )
     assert not [
-        request for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
     ]
 
 

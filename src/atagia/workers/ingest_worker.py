@@ -14,8 +14,10 @@ from atagia.core.belief_repository import BeliefRepository
 from atagia.core.clock import Clock
 from atagia.core.communication_profile_repository import CommunicationProfileRepository
 from atagia.core.config import Settings
-from atagia.core.ids import new_job_id
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.ids import derive_child_job_id
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
 from atagia.core.storage_backend import StorageBackend
 from atagia.core.timestamps import parse_optional_datetime
 from atagia.core.repositories import (
@@ -31,12 +33,17 @@ from atagia.memory.consequence_detector import ConsequenceDetector
 from atagia.memory.extractor import MemoryExtractor
 from atagia.memory.intent_classifier import are_claim_keys_equivalent
 from atagia.memory.language_profile import UserCommunicationProfileService
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, ResolvedRetrievalPolicy
+from atagia.memory.policy_manifest import (
+    ManifestLoader,
+    PolicyResolver,
+    ResolvedRetrievalPolicy,
+)
 from atagia.memory.retrieval_surface_dry_run import (
     RetrievalSurfaceDryRunGenerator,
     RetrievalSurfaceWriter,
 )
 from atagia.models.schemas_jobs import (
+    ClaimedJob,
     COMPACT_STREAM_NAME,
     CompactionJobKind,
     CompactionJobPayload,
@@ -64,24 +71,34 @@ from atagia.models.schemas_memory import (
 from atagia.memory.text_chunker import ChunkingPlan, TextChunk
 from atagia.services.chat_support import apply_conversation_policy_overlay
 from atagia.services.job_tracking_service import JobTrackingService
-from atagia.services.llm_client import LLMClient, LLMError, StructuredOutputError, TransientLLMError
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMError,
+    StructuredOutputError,
+    TransientLLMError,
+)
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.initial_context_package_refresh_service import (
     InitialContextPackageRefreshEnqueuer,
 )
+from atagia.services.job_execution_context import current_derivation_dedupe_scope
 from atagia.services.model_resolution import resolve_component_model
-from atagia.services.worker_control_service import WorkerControlService, wait_if_worker_claims_paused
+from atagia.services.worker_control_service import (
+    WorkerControlService,
+    wait_if_worker_claims_paused,
+)
+from atagia.services.worker_effect_fence import WorkerEffectFence
+from atagia.services.worker_job_lease import JobLeaseLostError, WorkerJobLease
 from atagia.services.topic_working_set_service import TopicWorkingSetRefreshService
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
-STREAM_RECLAIM_IDLE_MS = 1_000
 MAX_STREAM_DELIVERIES = 3
 CONSEQUENCE_CONFIDENCE_THRESHOLD = 0.5
 CONVERSATION_CHUNK_TRIGGER_MESSAGES = 10
-COMPACTION_ENQUEUE_DEDUPE_TTL_SECONDS = 3600
 _TRANSIENT_OUTCOME_DEFERRED = "deferred"
 _TRANSIENT_OUTCOME_DEAD_LETTERED = "dead_lettered"
+_TRANSIENT_OUTCOME_NOT_FINALIZED = "not_finalized"
 
 
 class TransientDeferBudgetExceededError(RuntimeError):
@@ -100,6 +117,7 @@ class IngestWorker:
         manifest_loader: ManifestLoader,
         embedding_index: EmbeddingIndex | None = None,
         settings: Settings | None = None,
+        job_connection: aiosqlite.Connection | None = None,
     ) -> None:
         self._connection = connection
         self._storage_backend = storage_backend
@@ -119,11 +137,16 @@ class IngestWorker:
         )
         self._worker_control = WorkerControlService(connection, clock)
         resolved_settings = settings or Settings.from_env()
+        self._stream_reclaim_idle_ms = int(
+            resolved_settings.worker_stream_reclaim_idle_seconds * 1000
+        )
+        self._effect_fence = WorkerEffectFence(connection, clock)
         self._job_tracking = JobTrackingService(
-            connection,
+            job_connection or connection,
             clock,
             workers_enabled=resolved_settings.workers_enabled,
             settings=resolved_settings,
+            child_job_connection=connection,
         )
         self._initial_context_package_refresh = InitialContextPackageRefreshEnqueuer(
             storage_backend=storage_backend,
@@ -188,7 +211,9 @@ class IngestWorker:
         )
 
     async def run(self, consumer_name: str = "ingest-1") -> None:
-        await self._storage_backend.stream_ensure_group(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)
+        await self._storage_backend.stream_ensure_group(
+            EXTRACT_STREAM_NAME, WORKER_GROUP_NAME
+        )
         while True:
             try:
                 await self.run_once(consumer_name=consumer_name, block_ms=5000)
@@ -218,19 +243,44 @@ class IngestWorker:
         deferred = 0
         dead_lettered = 0
         for message in messages:
-            try:
-                await self._job_tracking.mark_running(message)
-                await self.process_job(message.payload)
-                await self._job_tracking.mark_succeeded(message)
+            claim = await self._job_tracking.claim_notification(
+                message,
+                owner_id=consumer_name,
+            )
+            if claim is None:
                 await self._storage_backend.stream_ack(
                     EXTRACT_STREAM_NAME,
                     WORKER_GROUP_NAME,
                     message.message_id,
                 )
                 acked += 1
+                continue
+            lease = WorkerJobLease(
+                self._job_tracking,
+                claim,
+                effect_fence=self._effect_fence,
+            )
+            try:
+                async with lease:
+                    await self.process_job(claim.envelope.model_dump(mode="json"))
+                    await lease.succeed()
+                await self._storage_backend.stream_ack(
+                    EXTRACT_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
+                acked += 1
+            except JobLeaseLostError:
+                await self._storage_backend.stream_ack(
+                    EXTRACT_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
             except Exception as exc:
                 transient_outcome = await self._handle_transient_provider_failure(
                     message,
+                    claim,
+                    lease,
                     exc,
                 )
                 if transient_outcome == _TRANSIENT_OUTCOME_DEFERRED:
@@ -240,12 +290,29 @@ class IngestWorker:
                     failed += 1
                     dead_lettered += 1
                     continue
+                if transient_outcome == _TRANSIENT_OUTCOME_NOT_FINALIZED:
+                    failed += 1
+                    continue
                 failed += 1
                 self._log_job_failure(message, exc)
-                if await self._dead_letter_if_exhausted(message, exc):
+                if claim.attempt_count >= MAX_STREAM_DELIVERIES:
+                    finalized = await lease.dead_letter(
+                        self._storage_backend,
+                        stream_name=EXTRACT_STREAM_NAME,
+                        group_name=WORKER_GROUP_NAME,
+                        message=message,
+                        exc=exc,
+                    )
+                    if not finalized:
+                        continue
                     dead_lettered += 1
                 else:
-                    await self._job_tracking.mark_retrying(message, exc)
+                    await lease.retry(exc)
+                    await self._storage_backend.stream_ack(
+                        EXTRACT_STREAM_NAME,
+                        WORKER_GROUP_NAME,
+                        message.message_id,
+                    )
         return WorkerIterationResult(
             received=len(messages),
             acked=acked,
@@ -279,21 +346,30 @@ class IngestWorker:
             envelope.conversation_id,
             envelope.user_id,
         )
-        if conversation is None or str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
+        if (
+            conversation is None
+            or str(conversation.get("status")) != ConversationStatus.ACTIVE.value
+        ):
             return
         manifest = self._manifest_loader.get(job_payload.assistant_mode_id)
         resolved_policy = self._policy_resolver.resolve(manifest, None, None)
-        resolved_policy = apply_conversation_policy_overlay(resolved_policy, conversation)
+        resolved_policy = apply_conversation_policy_overlay(
+            resolved_policy, conversation
+        )
         job_payload = job_payload.model_copy(
             update={
-                "temporary": bool(conversation.get("temporary")) or bool(job_payload.temporary),
+                "temporary": bool(conversation.get("temporary"))
+                or bool(job_payload.temporary),
                 "temporary_ttl_seconds": self._strictest_ttl(
                     job_payload.temporary_ttl_seconds,
                     conversation.get("temporary_ttl_seconds"),
                 ),
-                "purge_on_close": bool(conversation.get("purge_on_close")) or bool(job_payload.purge_on_close),
-                "isolated_mode": bool(conversation.get("isolated_mode")) or bool(job_payload.isolated_mode),
-                "incognito": bool(conversation.get("incognito")) or bool(job_payload.incognito),
+                "purge_on_close": bool(conversation.get("purge_on_close"))
+                or bool(job_payload.purge_on_close),
+                "isolated_mode": bool(conversation.get("isolated_mode"))
+                or bool(job_payload.isolated_mode),
+                "incognito": bool(conversation.get("incognito"))
+                or bool(job_payload.incognito),
                 "active_embodiment_id": (
                     job_payload.active_embodiment_id
                     or conversation.get("active_embodiment_id")
@@ -304,8 +380,7 @@ class IngestWorker:
                     or "direct_if_same_body"
                 ),
                 "active_realm_id": (
-                    job_payload.active_realm_id
-                    or conversation.get("active_realm_id")
+                    job_payload.active_realm_id or conversation.get("active_realm_id")
                 ),
                 "cross_realm_mode": (
                     job_payload.cross_realm_mode
@@ -324,7 +399,9 @@ class IngestWorker:
         )
         character_id = job_payload.character_id
         if character_id is None:
-            character_id = conversation.get("character_id") or conversation.get("workspace_id")
+            character_id = conversation.get("character_id") or conversation.get(
+                "workspace_id"
+            )
         context = ExtractionConversationContext(
             user_id=envelope.user_id,
             conversation_id=envelope.conversation_id,
@@ -336,7 +413,9 @@ class IngestWorker:
                 if job_payload.user_persona_id is not None
                 else conversation.get("user_persona_id")
             ),
-            platform_id=str(job_payload.platform_id or conversation.get("platform_id") or "default"),
+            platform_id=str(
+                job_payload.platform_id or conversation.get("platform_id") or "default"
+            ),
             character_id=character_id,
             active_presence_id=(
                 job_payload.active_presence_id or conversation.get("active_presence_id")
@@ -383,8 +462,7 @@ class IngestWorker:
                 or "direct_if_same_body"
             ),
             active_realm_id=(
-                job_payload.active_realm_id
-                or conversation.get("active_realm_id")
+                job_payload.active_realm_id or conversation.get("active_realm_id")
             ),
             active_realm_display_name=job_payload.active_realm_display_name,
             cross_realm_mode=(
@@ -392,7 +470,11 @@ class IngestWorker:
                 or conversation.get("cross_realm_mode")
                 or "none"
             ),
-            mode=str(job_payload.mode or conversation.get("mode") or job_payload.assistant_mode_id),
+            mode=str(
+                job_payload.mode
+                or conversation.get("mode")
+                or job_payload.assistant_mode_id
+            ),
             recent_messages=[
                 ExtractionContextMessage.model_validate(item)
                 for item in job_payload.recent_messages
@@ -416,12 +498,14 @@ class IngestWorker:
             ),
         )
         try:
-            extraction_details = await self._extractor.extract_with_persistence_and_chunk_plan(
-                message_text=job_payload.message_text,
-                role=job_payload.role,
-                conversation_context=context,
-                resolved_policy=resolved_policy,
-                occurred_at=job_payload.message_occurred_at,
+            extraction_details = (
+                await self._extractor.extract_with_persistence_and_chunk_plan(
+                    message_text=job_payload.message_text,
+                    role=job_payload.role,
+                    conversation_context=context,
+                    resolved_policy=resolved_policy,
+                    occurred_at=job_payload.message_occurred_at,
+                )
             )
             result = extraction_details.result
             persisted = extraction_details.persisted
@@ -478,6 +562,8 @@ class IngestWorker:
     async def _handle_transient_provider_failure(
         self,
         message: StreamMessage,
+        claim: ClaimedJob,
+        lease: WorkerJobLease,
         exc: Exception,
     ) -> str | None:
         if not isinstance(exc, TransientLLMError):
@@ -489,28 +575,36 @@ class IngestWorker:
             "Deferring extraction job after transient provider failure "
             "message_id=%s delivery_count=%s delay_seconds=%.2f error=%s",
             message.message_id,
-            message.delivery_count,
+            claim.attempt_count,
             delay_seconds,
             exc.__class__.__name__,
         )
-        deferred_job = await self._job_tracking.mark_deferred(
-            message,
-            exc,
-            deferred_until=deferred_until,
+        current_job = await self._job_tracking.get_job_run(claim.envelope.job_id)
+        projected_job = dict(current_job or {})
+        projected_job["transient_defer_count"] = (
+            int(projected_job.get("transient_defer_count") or 0) + 1
         )
-        if self._transient_defer_budget_exhausted(deferred_job, now):
-            await self._dead_letter_transient_defer_budget_exhausted(
+        projected_job["first_deferred_at"] = (
+            projected_job.get("first_deferred_at") or now.isoformat()
+        )
+        if self._transient_defer_budget_exhausted(projected_job, now):
+            finalized = await self._dead_letter_transient_defer_budget_exhausted(
                 message,
+                claim,
+                lease,
                 exc,
-                deferred_job,
+                projected_job,
             )
-            return _TRANSIENT_OUTCOME_DEAD_LETTERED
-        await self._storage_backend.stream_defer(
+            return (
+                _TRANSIENT_OUTCOME_DEAD_LETTERED
+                if finalized
+                else _TRANSIENT_OUTCOME_NOT_FINALIZED
+            )
+        await lease.defer(exc, deferred_until=deferred_until)
+        await self._storage_backend.stream_ack(
             EXTRACT_STREAM_NAME,
             WORKER_GROUP_NAME,
             message.message_id,
-            message.payload,
-            delay_seconds=delay_seconds,
         )
         return _TRANSIENT_OUTCOME_DEFERRED
 
@@ -531,7 +625,9 @@ class IngestWorker:
         defer_count = int(deferred_job.get("transient_defer_count") or 0)
         if defer_count > self._settings.worker_transient_defer_max_count:
             return True
-        first_deferred_at = parse_optional_datetime(deferred_job.get("first_deferred_at"))
+        first_deferred_at = parse_optional_datetime(
+            deferred_job.get("first_deferred_at")
+        )
         if first_deferred_at is None:
             return False
         age_seconds = max(0.0, (now - first_deferred_at).total_seconds())
@@ -540,9 +636,11 @@ class IngestWorker:
     async def _dead_letter_transient_defer_budget_exhausted(
         self,
         message: StreamMessage,
+        claim: ClaimedJob,
+        lease: WorkerJobLease,
         original_error: TransientLLMError,
         deferred_job: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         defer_count = int(deferred_job.get("transient_defer_count") or 0)
         first_deferred_at = str(deferred_job.get("first_deferred_at") or "")
         budget_error = TransientDeferBudgetExceededError(
@@ -554,13 +652,13 @@ class IngestWorker:
             f"{original_error}"
         )
         self._log_job_failure(message, budget_error)
-        await self._enqueue_dead_letter(message, budget_error)
-        await self._storage_backend.stream_ack(
-            EXTRACT_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            message.message_id,
+        return await lease.dead_letter(
+            self._storage_backend,
+            stream_name=EXTRACT_STREAM_NAME,
+            group_name=WORKER_GROUP_NAME,
+            message=message,
+            exc=budget_error,
         )
-        await self._job_tracking.mark_dead_lettered(message, budget_error)
 
     async def _update_user_communication_profile(
         self,
@@ -602,6 +700,7 @@ class IngestWorker:
             source_message_ids=[job_payload.message_id],
             privacy_enforcement=job_payload.privacy_enforcement,
             operational_profile=envelope.operational_profile,
+            parent_job_id=envelope.job_id,
             fail_open=True,
         )
 
@@ -613,10 +712,14 @@ class IngestWorker:
         persisted: list[dict[str, object]],
     ) -> None:
         evidence_rows = [
-            row for row in persisted if row.get("object_type") == MemoryObjectType.EVIDENCE.value
+            row
+            for row in persisted
+            if row.get("object_type") == MemoryObjectType.EVIDENCE.value
         ]
         belief_rows = [
-            row for row in persisted if row.get("object_type") == MemoryObjectType.BELIEF.value
+            row
+            for row in persisted
+            if row.get("object_type") == MemoryObjectType.BELIEF.value
         ]
         evidence_ids = [str(row["id"]) for row in evidence_rows]
 
@@ -641,7 +744,11 @@ class IngestWorker:
                     if isinstance(belief_row.get("user_persona_id"), str)
                     else job_payload.user_persona_id
                 ),
-                platform_id=str(belief_row.get("platform_id") or job_payload.platform_id or "default"),
+                platform_id=str(
+                    belief_row.get("platform_id")
+                    or job_payload.platform_id
+                    or "default"
+                ),
                 character_id=(
                     str(belief_row["character_id"])
                     if belief_row.get("character_id") is not None
@@ -672,8 +779,14 @@ class IngestWorker:
                     assistant_mode_id=job_payload.assistant_mode_id,
                     workspace_id=job_payload.workspace_id,
                     conversation_id=envelope.conversation_id,
-                    user_persona_id=belief_row.get("user_persona_id") if isinstance(belief_row.get("user_persona_id"), str) else job_payload.user_persona_id,
-                    platform_id=str(belief_row.get("platform_id") or job_payload.platform_id or "default"),
+                    user_persona_id=belief_row.get("user_persona_id")
+                    if isinstance(belief_row.get("user_persona_id"), str)
+                    else job_payload.user_persona_id,
+                    platform_id=str(
+                        belief_row.get("platform_id")
+                        or job_payload.platform_id
+                        or "default"
+                    ),
                     character_id=(
                         str(belief_row["character_id"])
                         if belief_row.get("character_id") is not None
@@ -709,7 +822,9 @@ class IngestWorker:
                     temporary=bool(job_payload.temporary),
                     temporary_ttl_seconds=job_payload.temporary_ttl_seconds,
                     purge_on_close=bool(job_payload.purge_on_close),
-                    valid_to=str(belief_row["valid_to"]) if belief_row.get("valid_to") is not None else job_payload.valid_to,
+                    valid_to=str(belief_row["valid_to"])
+                    if belief_row.get("valid_to") is not None
+                    else job_payload.valid_to,
                     sensitivity=str(belief_row.get("sensitivity") or "unknown"),
                     platform_locked=bool(belief_row.get("platform_locked")),
                     platform_id_lock=(
@@ -717,7 +832,11 @@ class IngestWorker:
                         if belief_row.get("platform_id_lock") is not None
                         else None
                     ),
-                    scope_canonical=str(belief_row.get("scope_canonical") or belief_row.get("scope") or ""),
+                    scope_canonical=str(
+                        belief_row.get("scope_canonical")
+                        or belief_row.get("scope")
+                        or ""
+                    ),
                     scope=str(belief_row["scope"]),
                     isolated_mode=bool(job_payload.isolated_mode),
                 ),
@@ -750,7 +869,11 @@ class IngestWorker:
                         if isinstance(evidence_row.get("user_persona_id"), str)
                         else job_payload.user_persona_id
                     ),
-                    platform_id=str(evidence_row.get("platform_id") or job_payload.platform_id or "default"),
+                    platform_id=str(
+                        evidence_row.get("platform_id")
+                        or job_payload.platform_id
+                        or "default"
+                    ),
                     character_id=(
                         str(evidence_row["character_id"])
                         if evidence_row.get("character_id") is not None
@@ -786,7 +909,9 @@ class IngestWorker:
                     temporary=bool(job_payload.temporary),
                     temporary_ttl_seconds=job_payload.temporary_ttl_seconds,
                     purge_on_close=bool(job_payload.purge_on_close),
-                    valid_to=str(evidence_row["valid_to"]) if evidence_row.get("valid_to") is not None else job_payload.valid_to,
+                    valid_to=str(evidence_row["valid_to"])
+                    if evidence_row.get("valid_to") is not None
+                    else job_payload.valid_to,
                     sensitivity=str(evidence_row.get("sensitivity") or "unknown"),
                     platform_locked=bool(evidence_row.get("platform_locked")),
                     platform_id_lock=(
@@ -794,7 +919,11 @@ class IngestWorker:
                         if evidence_row.get("platform_id_lock") is not None
                         else None
                     ),
-                    scope_canonical=str(evidence_row.get("scope_canonical") or evidence_row.get("scope") or ""),
+                    scope_canonical=str(
+                        evidence_row.get("scope_canonical")
+                        or evidence_row.get("scope")
+                        or ""
+                    ),
                     scope=str(evidence_row["scope"]),
                     isolated_mode=bool(job_payload.isolated_mode),
                 ),
@@ -807,9 +936,14 @@ class IngestWorker:
         payload: RevisionJobPayload,
     ) -> None:
         revision_job = JobEnvelope(
-            job_id=new_job_id(),
+            job_id=derive_child_job_id(
+                envelope.job_id,
+                JobType.REVISE_BELIEFS.value,
+                json_utils.dumps(payload.model_dump(mode="json"), sort_keys=True),
+            ),
             job_type=JobType.REVISE_BELIEFS,
             user_id=envelope.user_id,
+            parent_job_id=envelope.job_id,
             conversation_id=envelope.conversation_id,
             message_ids=[payload.source_message_id],
             payload=payload.model_dump(mode="json"),
@@ -846,9 +980,7 @@ class IngestWorker:
         graph_payload = GraphProjectionJobPayload(
             **job_payload.model_dump(mode="json"),
             source_memory_ids=[
-                str(row["id"])
-                for row in persisted
-                if isinstance(row.get("id"), str)
+                str(row["id"]) for row in persisted if isinstance(row.get("id"), str)
             ],
             chunks=self._graph_projection_chunks(
                 chunk_plan=chunk_plan,
@@ -856,9 +988,14 @@ class IngestWorker:
             ),
         )
         graph_job = JobEnvelope(
-            job_id=new_job_id(),
+            job_id=derive_child_job_id(
+                envelope.job_id,
+                JobType.SYNC_GRAPH.value,
+                json_utils.dumps(graph_payload.model_dump(mode="json"), sort_keys=True),
+            ),
             job_type=JobType.SYNC_GRAPH,
             user_id=envelope.user_id,
+            parent_job_id=envelope.job_id,
             conversation_id=envelope.conversation_id,
             message_ids=[job_payload.message_id],
             payload=graph_payload.model_dump(mode="json"),
@@ -874,9 +1011,7 @@ class IngestWorker:
         persisted: list[dict[str, object]],
     ) -> list[GraphProjectionChunkPayload]:
         all_memory_ids = [
-            str(row["id"])
-            for row in persisted
-            if isinstance(row.get("id"), str)
+            str(row["id"]) for row in persisted if isinstance(row.get("id"), str)
         ]
         chunks: list[GraphProjectionChunkPayload] = []
         for chunk in chunk_plan.chunks:
@@ -932,23 +1067,28 @@ class IngestWorker:
             envelope.user_id,
             envelope.conversation_id,
         )
-        last_chunk_end_seq = 0 if latest_chunk is None else int(latest_chunk["source_message_end_seq"])
+        last_chunk_end_seq = (
+            0 if latest_chunk is None else int(latest_chunk["source_message_end_seq"])
+        )
         if message_count - last_chunk_end_seq < CONVERSATION_CHUNK_TRIGGER_MESSAGES:
             return
-        if not await self._storage_backend.remember_dedupe(
-            self._compaction_dedupe_key(
-                user_id=envelope.user_id,
-                conversation_id=envelope.conversation_id,
-                last_chunk_end_seq=last_chunk_end_seq,
-            ),
-            COMPACTION_ENQUEUE_DEDUPE_TTL_SECONDS,
-        ):
-            return
-
         compaction_job = JobEnvelope(
-            job_id=new_job_id(),
+            job_id=derive_child_job_id(
+                envelope.job_id,
+                JobType.COMPACT_SUMMARIES.value,
+                self._compaction_dedupe_key(
+                    user_id=envelope.user_id,
+                    conversation_id=envelope.conversation_id,
+                    last_chunk_end_seq=last_chunk_end_seq,
+                    derivation_scope=current_derivation_dedupe_scope(
+                        user_id=envelope.user_id,
+                        job_id=envelope.job_id,
+                    ),
+                ),
+            ),
             job_type=JobType.COMPACT_SUMMARIES,
             user_id=envelope.user_id,
+            parent_job_id=envelope.job_id,
             conversation_id=envelope.conversation_id,
             message_ids=[job_payload.message_id],
             payload=CompactionJobPayload(
@@ -980,8 +1120,12 @@ class IngestWorker:
         user_id: str,
         conversation_id: str,
         last_chunk_end_seq: int,
+        derivation_scope: str = "unclaimed",
     ) -> str:
-        return f"compaction:conversation_chunk:{user_id}:{conversation_id}:{last_chunk_end_seq}"
+        return (
+            "compaction:conversation_chunk:"
+            f"{user_id}:{conversation_id}:{last_chunk_end_seq}:{derivation_scope}"
+        )
 
     async def _maybe_refresh_topic_working_set(
         self,
@@ -989,7 +1133,10 @@ class IngestWorker:
         envelope: JobEnvelope,
         job_payload: MessageJobPayload,
     ) -> None:
-        if envelope.conversation_id is None or not self._settings.topic_working_set_enabled:
+        if (
+            envelope.conversation_id is None
+            or not self._settings.topic_working_set_enabled
+        ):
             return
         try:
             await TopicWorkingSetRefreshService(
@@ -1020,7 +1167,9 @@ class IngestWorker:
         try:
             await self._connection.rollback()
         except Exception:
-            logger.warning("Failed to rollback Topic Working Set refresh failure", exc_info=True)
+            logger.warning(
+                "Failed to rollback Topic Working Set refresh failure", exc_info=True
+            )
 
     async def _process_consequence_detection(
         self,
@@ -1064,7 +1213,9 @@ class IngestWorker:
         source_message_id: str,
         limit: int = 8,
     ) -> list[dict[str, object]]:
-        source_message = await self._message_repository.get_message(source_message_id, user_id)
+        source_message = await self._message_repository.get_message(
+            source_message_id, user_id
+        )
         if source_message is None:
             return []
         cursor = await self._connection.execute(
@@ -1115,16 +1266,18 @@ class IngestWorker:
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
     ) -> str | None:
-        candidates = await self._belief_repository.find_active_belief_candidates_by_claim_key(
-            user_id,
-            claim_key,
-            user_persona_id=user_persona_id,
-            platform_id=platform_id,
-            character_id=character_id,
-            conversation_id=conversation_id,
-            incognito=incognito or isolated_mode,
-            remember_across_chats=remember_across_chats,
-            remember_across_devices=remember_across_devices,
+        candidates = (
+            await self._belief_repository.find_active_belief_candidates_by_claim_key(
+                user_id,
+                claim_key,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                conversation_id=conversation_id,
+                incognito=incognito or isolated_mode,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+            )
         )
         ranked: list[tuple[int, str]] = []
         for candidate in candidates:
@@ -1157,15 +1310,25 @@ class IngestWorker:
             ):
                 continue
             payload_json = candidate.get("payload_json")
-            source_ids = payload_json.get("source_message_ids", []) if isinstance(payload_json, dict) else []
+            source_ids = (
+                payload_json.get("source_message_ids", [])
+                if isinstance(payload_json, dict)
+                else []
+            )
             if source_message_id in source_ids:
                 continue
             score = 0
             if candidate.get("scope") == scope:
                 score += 4
-            if conversation_id is not None and candidate.get("conversation_id") == conversation_id:
+            if (
+                conversation_id is not None
+                and candidate.get("conversation_id") == conversation_id
+            ):
                 score += 3
-            if workspace_id is not None and candidate.get("workspace_id") == workspace_id:
+            if (
+                workspace_id is not None
+                and candidate.get("workspace_id") == workspace_id
+            ):
                 score += 2
             if candidate.get("assistant_mode_id") == assistant_mode_id:
                 score += 1
@@ -1219,7 +1382,9 @@ class IngestWorker:
             return candidate_realm_id is None
         return candidate_realm_id is None or candidate_realm_id == active_realm_id
 
-    async def _conversation_message_count(self, *, user_id: str, conversation_id: str) -> int:
+    async def _conversation_message_count(
+        self, *, user_id: str, conversation_id: str
+    ) -> int:
         cursor = await self._connection.execute(
             """
             SELECT COUNT(*) AS count
@@ -1243,7 +1408,7 @@ class IngestWorker:
             EXTRACT_STREAM_NAME,
             WORKER_GROUP_NAME,
             consumer_name,
-            min_idle_ms=0 if block_ms == 0 else STREAM_RECLAIM_IDLE_MS,
+            min_idle_ms=self._stream_reclaim_idle_ms,
             count=1,
         )
         if reclaimed:
@@ -1256,46 +1421,5 @@ class IngestWorker:
             block_ms=block_ms,
         )
 
-    async def _dead_letter_if_exhausted(
-        self,
-        message: StreamMessage,
-        exc: Exception,
-    ) -> bool:
-        if message.delivery_count < MAX_STREAM_DELIVERIES:
-            return False
-        await self._enqueue_dead_letter(message, exc)
-        await self._storage_backend.stream_ack(
-            EXTRACT_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            message.message_id,
-        )
-        await self._job_tracking.mark_dead_lettered(message, exc)
-        return True
-
-    async def _enqueue_dead_letter(
-        self,
-        message: StreamMessage,
-        exc: Exception,
-    ) -> None:
-        await self._storage_backend.enqueue_job(
-            f"dead_letter:{EXTRACT_STREAM_NAME}",
-            {
-                "message_id": message.message_id,
-                "delivery_count": message.delivery_count,
-                "payload": message.payload,
-                "error": str(exc),
-                # Populated only for StructuredOutputError; other exceptions collapse to [].
-                "error_details": list(exc.details) if isinstance(exc, StructuredOutputError) else [],
-            },
-        )
-
     async def _enqueue_tracked_job(self, stream_name: str, job: JobEnvelope) -> None:
-        await self._job_tracking.create_queued_job(stream_name, job)
-        try:
-            await self._storage_backend.stream_add(
-                stream_name,
-                job.model_dump(mode="json"),
-            )
-        except Exception as exc:
-            await self._job_tracking.mark_enqueue_failed(job, exc)
-            raise
+        await self._job_tracking.enqueue_job(self._storage_backend, stream_name, job)

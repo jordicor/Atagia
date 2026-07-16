@@ -15,9 +15,12 @@ class ContextCacheEntry(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: int = Field(default=2, ge=2)
+    version: int = Field(default=4, ge=4)
     cache_key: str = Field(min_length=1)
     user_id: str = Field(min_length=1)
+    lifecycle_epoch: str = Field(min_length=1)
+    cache_revision: int = Field(ge=0)
+    derivation_revision: int = Field(ge=0)
     conversation_id: str = Field(min_length=1)
     assistant_mode_id: str = Field(min_length=1)
     policy_prompt_hash: str = Field(min_length=1)

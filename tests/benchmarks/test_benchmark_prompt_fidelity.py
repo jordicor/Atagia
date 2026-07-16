@@ -1,4 +1,4 @@
-"""Benchmark Prompt Fidelity guard (CLAUDE.md -> "Benchmark Prompt Fidelity").
+"""Benchmark prompt fidelity guard: shadow benchmarks must import engine prompts.
 
 Every shadow/micro benchmark that exercises an engine component WITHOUT booting
 the full Atagia engine must render the PRODUCTION ("champion") prompt imported
@@ -39,16 +39,19 @@ alongside a non-empty engine rendering.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+
 from atagia.core.clock import FrozenClock
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MANIFESTS_DIR = PROJECT_ROOT / "manifests"
+MANIFESTS_DIR = PROJECT_ROOT / "src" / "atagia" / "resources" / "manifests"
 
 
 def _bench_settings(**overrides: Any) -> Settings:
@@ -59,8 +62,8 @@ def _bench_settings(**overrides: Any) -> Settings:
     """
     base = Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         openai_api_key=None,
@@ -110,6 +113,16 @@ def _benchmark_source_text(*module_relative_paths: str) -> str:
     return "\n".join(parts)
 
 
+def _module_string_literals(module_relative_path: str) -> tuple[str, ...]:
+    source = (PROJECT_ROOT / module_relative_path).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    return tuple(
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+
+
 def _instruction_head_anchor(rendered_prompt: str, line_count: int = 2) -> str:
     """First ``line_count`` raw lines of a rendered champion prompt, contiguous.
 
@@ -118,7 +131,9 @@ def _instruction_head_anchor(rendered_prompt: str, line_count: int = 2) -> str:
     """
     raw_lines = rendered_prompt.splitlines()
     anchor = "\n".join(raw_lines[:line_count])
-    assert anchor in rendered_prompt, "instruction anchor must be present in the champion"
+    assert anchor in rendered_prompt, (
+        "instruction anchor must be present in the champion"
+    )
     assert anchor.strip(), "instruction anchor must be non-empty"
     return anchor
 
@@ -151,7 +166,9 @@ def _assert_champion_text_absent(
     exactly the duplication class this guard prevents -- regardless of the
     enclosing symbol's name.
     """
-    reintroduced = sorted(label for label, anchor in anchors.items() if anchor in benchmark_source)
+    reintroduced = sorted(
+        label for label, anchor in anchors.items() if anchor in benchmark_source
+    )
     assert not reintroduced, (
         f"{family} benchmark reintroduced a champion card prompt as a source "
         f"literal (a faithful benchmark imports the engine prompt instead): "
@@ -202,7 +219,14 @@ def _extraction_engine_prompts(include_examples: bool) -> str:
             include_examples=include_examples,
         )
     ]
-    for card in ("kind_scope", "evidence", "index", "temporal", "belief", "coverage_members"):
+    for card in (
+        "kind_scope",
+        "evidence",
+        "index",
+        "temporal",
+        "belief",
+        "coverage_members",
+    ):
         prompts.append(
             build_enrichment_prompt(
                 card,
@@ -263,7 +287,14 @@ def test_memory_extraction_cards_use_engine_prompt() -> None:
                 include_examples=include_examples,
             )
         ]
-        for card in ("kind_scope", "evidence", "index", "temporal", "belief", "coverage_members"):
+        for card in (
+            "kind_scope",
+            "evidence",
+            "index",
+            "temporal",
+            "belief",
+            "coverage_members",
+        ):
             bench_prompts.append(
                 bench.build_enrichment_prompt(
                     card,
@@ -279,6 +310,24 @@ def test_memory_extraction_cards_use_engine_prompt() -> None:
                 )
             )
         assert "\n".join(bench_prompts) == engine_text
+
+
+def test_coverage_format_champion_system_message_uses_engine_prompt() -> None:
+    import benchmarks.memory_extraction_cards.coverage_format_compare as bench
+    import atagia.memory.extraction_cards as engine
+
+    champion = engine.card_system_prompt("coverage_members")
+    assert champion.strip()
+    assert bench.card_system_prompt is engine.card_system_prompt
+    assert bench.system_message("json_shipped") == champion
+
+    literals = _module_string_literals(
+        "benchmarks/memory_extraction_cards/coverage_format_compare.py"
+    )
+    assert all(champion not in literal for literal in literals), (
+        "coverage-format benchmark copied the production system prompt instead "
+        "of importing card_system_prompt"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +350,12 @@ def test_memory_extraction_cards_use_engine_prompt() -> None:
 #   and is deliberately NOT gated here (parallel to the topic _build_artifact_prompt
 #   probe note above). The engine-faithful surface is the naked path asserted below.
 def test_need_detection_cards_use_engine_prompt() -> None:
+    # The need-detection card harness ships only with the private checkout, so
+    # this fidelity assertion skips visibly when it is absent.
+    pytest.importorskip(
+        "benchmarks.need_detection_cards.__main__",
+        reason="need-detection card harness is not present in this checkout",
+    )
     from benchmarks.need_detection_cards.__main__ import (
         _NAKED_CARD_NAMES,
         _authority_context_from_extraction_context,
@@ -434,15 +489,20 @@ def test_applicability_cards_use_engine_prompt() -> None:
     )
     from atagia.services.llm_client import LLMClient
 
+    engine_test_helpers = pytest.importorskip(
+        "tests.memory.test_applicability_scorer",
+        reason="private applicability scorer tests are not present in this checkout",
+    )
+
     # Reuse the engine test's synthetic-case helpers (same shapes the leak-guard
     # test feeds through score_shortlist) so the rendered prompt is a faithful
     # engine production prompt, not a hand-built candidate dict.
-    from tests.memory.test_applicability_scorer import (
-        CannedApplicabilityCardProvider,
-        _candidate,
-        _context,
-        _resolved_policy,
+    CannedApplicabilityCardProvider = (
+        engine_test_helpers.CannedApplicabilityCardProvider
     )
+    _candidate = engine_test_helpers._candidate
+    _context = engine_test_helpers._context
+    _resolved_policy = engine_test_helpers._resolved_policy
 
     # Structural invariant: benchmark uses the engine scorer, not a copy.
     assert bench.ApplicabilityScorer is engine.ApplicabilityScorer
@@ -543,20 +603,22 @@ def test_topic_working_set_cards_use_engine_prompt() -> None:
         ) -> LLMCompletionResponse:
             raise AssertionError("no completion expected in topic fidelity test")
 
-        async def embed(
-            self, request: LLMEmbeddingRequest
-        ) -> LLMEmbeddingResponse:
+        async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
             raise AssertionError("embeddings unused in topic fidelity test")
 
     updater = TopicWorkingSetUpdater(
-        llm_client=LLMClient(provider_name="topic-fidelity", providers=[_SilentProvider()]),
+        llm_client=LLMClient(
+            provider_name="topic-fidelity", providers=[_SilentProvider()]
+        ),
         clock=FrozenClock(datetime(2026, 4, 26, 2, 45, tzinfo=timezone.utc)),
         topic_repository=cast(Any, None),
         message_repository=cast(Any, None),
         settings=_bench_settings(),
     )
     snapshot = {"active_topics": [], "parked_topics": []}
-    messages = [{"id": "msg_1", "seq": 1, "role": "user", "text": "Plan a budget for the move."}]
+    messages = [
+        {"id": "msg_1", "seq": 1, "role": "user", "text": "Plan a budget for the move."}
+    ]
     route = _TopicRoute(
         action=TopicUpdateActionType.CREATE,
         target_id="tmp1",
@@ -673,14 +735,20 @@ def _all_benchmark_source_text() -> str:
 
 
 def test_compactor_segmentation_cards_use_engine_prompt() -> None:
-    import benchmarks.model_casting.roles as roles
+    roles = pytest.importorskip(
+        "benchmarks.model_casting.roles",
+        reason="model-casting benchmark roles are not present in this checkout",
+    )
     from atagia.memory import compactor as engine
 
     # Card 1 structural invariant: the model-casting mirror imports the engine
     # range-card constants and renderer, not local copies.
     assert roles._SEGMENTATION_RANGE_CARD_HEAD is engine._SEGMENTATION_RANGE_CARD_HEAD
     assert roles._SEGMENTATION_RANGE_CARD_TAIL is engine._SEGMENTATION_RANGE_CARD_TAIL
-    assert roles._SEGMENTATION_RANGE_CARD_EXAMPLES is engine._SEGMENTATION_RANGE_CARD_EXAMPLES
+    assert (
+        roles._SEGMENTATION_RANGE_CARD_EXAMPLES
+        is engine._SEGMENTATION_RANGE_CARD_EXAMPLES
+    )
     assert roles.Compactor is engine.Compactor
 
     benchmark_source = _all_benchmark_source_text()
@@ -689,9 +757,13 @@ def test_compactor_segmentation_cards_use_engine_prompt() -> None:
     # nor its examples head may be hand-copied into any benchmark source.
     anchors = {
         "range_head": _instruction_head_anchor(engine._SEGMENTATION_RANGE_CARD_HEAD),
-        "range_examples": _instruction_head_anchor(engine._SEGMENTATION_RANGE_CARD_EXAMPLES),
+        "range_examples": _instruction_head_anchor(
+            engine._SEGMENTATION_RANGE_CARD_EXAMPLES
+        ),
         "summary_head": _instruction_head_anchor(engine._RANGE_SUMMARY_CARD_HEAD),
-        "summary_examples": _instruction_head_anchor(engine._RANGE_SUMMARY_CARD_EXAMPLES),
+        "summary_examples": _instruction_head_anchor(
+            engine._RANGE_SUMMARY_CARD_EXAMPLES
+        ),
     }
     _assert_champion_text_absent(
         anchors=anchors,

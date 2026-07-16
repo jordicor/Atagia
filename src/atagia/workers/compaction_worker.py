@@ -10,8 +10,10 @@ import aiosqlite
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
-from atagia.core.ids import new_job_id
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.ids import derive_child_job_id
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
 from atagia.core.repositories import ConversationRepository, UserRepository
 from atagia.core.storage_backend import StorageBackend
 from atagia.memory.compactor import Compactor
@@ -32,12 +34,20 @@ from atagia.services.initial_context_package_refresh_service import (
     InitialContextPackageRefreshEnqueuer,
 )
 from atagia.services.job_tracking_service import JobTrackingService
-from atagia.services.llm_client import LLMClient, StructuredOutputError, TransientLLMError
-from atagia.services.worker_control_service import WorkerControlService, wait_if_worker_claims_paused
+from atagia.services.llm_client import (
+    LLMClient,
+    StructuredOutputError,
+    TransientLLMError,
+)
+from atagia.services.worker_control_service import (
+    WorkerControlService,
+    wait_if_worker_claims_paused,
+)
+from atagia.services.worker_effect_fence import WorkerEffectFence
+from atagia.services.worker_job_lease import JobLeaseLostError, WorkerJobLease
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
-STREAM_RECLAIM_IDLE_MS = 1_000
 MAX_STREAM_DELIVERIES = 3
 
 
@@ -52,6 +62,7 @@ class CompactionWorker:
         clock: Clock,
         embedding_index: EmbeddingIndex | None = None,
         settings: Settings | None = None,
+        job_connection: aiosqlite.Connection | None = None,
     ) -> None:
         self._storage_backend = storage_backend
         self._connection = connection
@@ -60,11 +71,16 @@ class CompactionWorker:
         self._user_repository = UserRepository(connection, clock)
         self._worker_control = WorkerControlService(connection, clock)
         resolved_settings = settings or Settings.from_env()
+        self._stream_reclaim_idle_ms = int(
+            resolved_settings.worker_stream_reclaim_idle_seconds * 1000
+        )
+        self._effect_fence = WorkerEffectFence(connection, clock)
         self._job_tracking = JobTrackingService(
-            connection,
+            job_connection or connection,
             clock,
             workers_enabled=resolved_settings.workers_enabled,
             settings=resolved_settings,
+            child_job_connection=connection,
         )
         self._initial_context_package_refresh = InitialContextPackageRefreshEnqueuer(
             storage_backend=storage_backend,
@@ -82,7 +98,9 @@ class CompactionWorker:
         )
 
     async def run(self, consumer_name: str = "compact-1") -> None:
-        await self._storage_backend.stream_ensure_group(COMPACT_STREAM_NAME, WORKER_GROUP_NAME)
+        await self._storage_backend.stream_ensure_group(
+            COMPACT_STREAM_NAME, WORKER_GROUP_NAME
+        )
         while True:
             try:
                 await self.run_once(consumer_name=consumer_name, block_ms=5000)
@@ -100,7 +118,9 @@ class CompactionWorker:
     ) -> WorkerIterationResult:
         if await wait_if_worker_claims_paused(self._worker_control, block_ms=block_ms):
             return WorkerIterationResult()
-        messages = await self._next_messages(consumer_name=consumer_name, block_ms=block_ms)
+        messages = await self._next_messages(
+            consumer_name=consumer_name, block_ms=block_ms
+        )
         if not messages:
             return WorkerIterationResult()
 
@@ -108,23 +128,60 @@ class CompactionWorker:
         failed = 0
         dead_lettered = 0
         for message in messages:
-            try:
-                await self._job_tracking.mark_running(message)
-                await self.process_job(message.payload)
-                await self._job_tracking.mark_succeeded(message)
+            claim = await self._job_tracking.claim_notification(
+                message,
+                owner_id=consumer_name,
+            )
+            if claim is None:
                 await self._storage_backend.stream_ack(
                     COMPACT_STREAM_NAME,
                     WORKER_GROUP_NAME,
                     message.message_id,
                 )
                 acked += 1
+                continue
+            lease = WorkerJobLease(
+                self._job_tracking,
+                claim,
+                effect_fence=self._effect_fence,
+            )
+            try:
+                async with lease:
+                    await self.process_job(claim.envelope.model_dump(mode="json"))
+                    await lease.succeed()
+                await self._storage_backend.stream_ack(
+                    COMPACT_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
+                acked += 1
+            except JobLeaseLostError:
+                await self._storage_backend.stream_ack(
+                    COMPACT_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
             except Exception as exc:
                 failed += 1
                 self._log_job_failure(message, exc)
-                if await self._dead_letter_if_exhausted(message, exc):
+                if claim.attempt_count >= MAX_STREAM_DELIVERIES:
+                    finalized = await lease.dead_letter(
+                        self._storage_backend,
+                        stream_name=COMPACT_STREAM_NAME,
+                        group_name=WORKER_GROUP_NAME,
+                        message=message,
+                        exc=exc,
+                    )
+                    if not finalized:
+                        continue
                     dead_lettered += 1
                 else:
-                    await self._job_tracking.mark_retrying(message, exc)
+                    await lease.retry(exc)
+                    await self._storage_backend.stream_ack(
+                        COMPACT_STREAM_NAME,
+                        WORKER_GROUP_NAME,
+                        message.message_id,
+                    )
         return WorkerIterationResult(
             received=len(messages),
             acked=acked,
@@ -173,6 +230,7 @@ class CompactionWorker:
             summary_ids = await self._compactor.generate_conversation_chunks(
                 user_id=job_payload.user_id,
                 conversation_id=job_payload.conversation_id,
+                force=job_payload.force_rebuild,
             )
             await self._enqueue_initial_context_package_refresh(
                 user_id=job_payload.user_id,
@@ -181,12 +239,11 @@ class CompactionWorker:
                 parent=envelope,
                 privacy_enforcement=job_payload.privacy_enforcement,
             )
-            if (
-                not await self._broad_hierarchy_blocked(job_payload)
-                and await self._conversation_allows_hierarchy(
-                    user_id=job_payload.user_id,
-                    conversation_id=job_payload.conversation_id,
-                )
+            if not await self._broad_hierarchy_blocked(
+                job_payload
+            ) and await self._conversation_allows_hierarchy(
+                user_id=job_payload.user_id,
+                conversation_id=job_payload.conversation_id,
             ):
                 await self._enqueue_hierarchy_job(
                     user_id=job_payload.user_id,
@@ -197,7 +254,9 @@ class CompactionWorker:
         if job_payload.job_kind is CompactionJobKind.WORKSPACE_ROLLUP:
             character_id = job_payload.character_id or job_payload.workspace_id
             if character_id is None:
-                raise ValueError("workspace_rollup jobs require workspace_id or character_id")
+                raise ValueError(
+                    "workspace_rollup jobs require workspace_id or character_id"
+                )
             if await self._broad_hierarchy_blocked(job_payload):
                 return {"job_kind": job_payload.job_kind.value, "summary_id": None}
             summary_id = await self._compactor.generate_character_rollup(
@@ -233,7 +292,9 @@ class CompactionWorker:
         if job_payload.job_kind is CompactionJobKind.THEMATIC_PROFILE:
             if await self._broad_hierarchy_blocked(job_payload):
                 return {"job_kind": job_payload.job_kind.value, "summary_ids": []}
-            summary_ids = await self._compactor.generate_thematic_profiles(job_payload.user_id)
+            summary_ids = await self._compactor.generate_thematic_profiles(
+                job_payload.user_id
+            )
             await self._enqueue_initial_context_package_refresh(
                 user_id=job_payload.user_id,
                 conversation_id=None,
@@ -260,6 +321,7 @@ class CompactionWorker:
             reason=InitialContextPackageRefreshReason.SUMMARY_COMPACTION,
             privacy_enforcement=privacy_enforcement,
             operational_profile=parent.operational_profile,
+            parent_job_id=parent.job_id,
             fail_open=True,
         )
 
@@ -271,12 +333,19 @@ class CompactionWorker:
         parent: JobEnvelope,
     ) -> None:
         job = JobEnvelope(
-            job_id=new_job_id(),
+            job_id=derive_child_job_id(
+                parent.job_id,
+                JobType.COMPACT_SUMMARIES.value,
+                job_kind.value,
+            ),
             job_type=JobType.COMPACT_SUMMARIES,
             user_id=user_id,
+            parent_job_id=parent.job_id,
             payload=CompactionJobPayload(
                 **{
-                    **CompactionJobPayload.model_validate(parent.payload).model_dump(mode="json"),
+                    **CompactionJobPayload.model_validate(parent.payload).model_dump(
+                        mode="json"
+                    ),
                     "user_id": user_id,
                     "job_kind": job_kind.value,
                 }
@@ -284,15 +353,11 @@ class CompactionWorker:
             created_at=None,
             operational_profile=parent.operational_profile,
         )
-        await self._job_tracking.create_queued_job(COMPACT_STREAM_NAME, job)
-        try:
-            await self._storage_backend.stream_add(
-                COMPACT_STREAM_NAME,
-                job.model_dump(mode="json"),
-            )
-        except Exception as exc:
-            await self._job_tracking.mark_enqueue_failed(job, exc)
-            raise
+        await self._job_tracking.enqueue_job(
+            self._storage_backend,
+            COMPACT_STREAM_NAME,
+            job,
+        )
 
     async def _broad_hierarchy_blocked(self, payload: CompactionJobPayload) -> bool:
         active_user = await self._user_repository.get_active_user(payload.user_id)
@@ -308,18 +373,26 @@ class CompactionWorker:
             or not bool(active_user["remember_across_devices"])
         )
 
-    async def _conversation_allows_local_chunk(self, *, user_id: str, conversation_id: str) -> bool:
+    async def _conversation_allows_local_chunk(
+        self, *, user_id: str, conversation_id: str
+    ) -> bool:
         active_user = await self._user_repository.get_active_user(user_id)
         if active_user is None or not bool(active_user["remember_across_devices"]):
             return False
-        conversation = await self._conversation_repository.get_conversation(conversation_id, user_id)
+        conversation = await self._conversation_repository.get_conversation(
+            conversation_id, user_id
+        )
         if conversation is None:
             return False
-        if bool(conversation.get("temporary")) or bool(conversation.get("purge_on_close")):
+        if bool(conversation.get("temporary")) or bool(
+            conversation.get("purge_on_close")
+        ):
             return False
         return str(conversation.get("status")) == ConversationStatus.ACTIVE.value
 
-    async def _conversation_allows_hierarchy(self, *, user_id: str, conversation_id: str) -> bool:
+    async def _conversation_allows_hierarchy(
+        self, *, user_id: str, conversation_id: str
+    ) -> bool:
         active_user = await self._user_repository.get_active_user(user_id)
         if (
             active_user is None
@@ -327,7 +400,9 @@ class CompactionWorker:
             or not bool(active_user["remember_across_devices"])
         ):
             return False
-        conversation = await self._conversation_repository.get_conversation(conversation_id, user_id)
+        conversation = await self._conversation_repository.get_conversation(
+            conversation_id, user_id
+        )
         if conversation is None:
             return False
         if (
@@ -349,7 +424,7 @@ class CompactionWorker:
             COMPACT_STREAM_NAME,
             WORKER_GROUP_NAME,
             consumer_name,
-            min_idle_ms=0 if block_ms == 0 else STREAM_RECLAIM_IDLE_MS,
+            min_idle_ms=self._stream_reclaim_idle_ms,
             count=1,
         )
         if reclaimed:
@@ -361,32 +436,3 @@ class CompactionWorker:
             count=1,
             block_ms=block_ms,
         )
-
-    async def _dead_letter_if_exhausted(
-        self,
-        message: StreamMessage,
-        exc: Exception,
-    ) -> bool:
-        if message.delivery_count < MAX_STREAM_DELIVERIES:
-            return False
-        await self._storage_backend.enqueue_job(
-            f"dead_letter:{COMPACT_STREAM_NAME}",
-            {
-                "message_id": message.message_id,
-                "delivery_count": message.delivery_count,
-                "payload": message.payload,
-                "error": str(exc),
-                "error_details": (
-                    list(exc.details)
-                    if isinstance(exc, StructuredOutputError)
-                    else []
-                ),
-            },
-        )
-        await self._storage_backend.stream_ack(
-            COMPACT_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            message.message_id,
-        )
-        await self._job_tracking.mark_dead_lettered(message, exc)
-        return True

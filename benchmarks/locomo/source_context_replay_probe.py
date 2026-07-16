@@ -56,11 +56,11 @@ _DEFAULT_VARIANTS = (
     "gold_source_window",
 )
 _CATEGORY_NAMES = {
-    1: "single-hop",
-    2: "multi-hop",
-    3: "temporal",
-    4: "open-domain",
-    5: "unscored",
+    1: "multi-hop",
+    2: "temporal",
+    3: "open-domain",
+    4: "single-hop",
+    5: "adversarial-unscored",
 }
 
 
@@ -74,7 +74,7 @@ def build_source_context_cases(
 ) -> dict[str, Any]:
     """Build fixed-context replay cases from retained DB artifacts."""
     specs = [_normalize_report_spec(spec) for spec in report_specs]
-    category_filter = categories or {"single-hop", "temporal"}
+    category_filter = categories or {"multi-hop", "open-domain"}
     dataset = LoCoMoAdapter(data_path).load()
     conversations_by_id = {
         conversation.conversation_id: conversation
@@ -791,7 +791,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--category",
         action="append",
-        default=["single-hop", "temporal"],
+        default=["multi-hop", "open-domain"],
         help="Category name to include. Repeatable.",
     )
     parser.add_argument("--max-cases", type=int, default=12)
@@ -819,7 +819,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default=str(_default_output_path()),
-        help="Output JSON path. Defaults to docs/tmp with a timestamp.",
+        help="Output JSON path. Defaults to the benchmark output root with a timestamped filename.",
     )
     args = parser.parse_args()
     if args.max_cases < 1:

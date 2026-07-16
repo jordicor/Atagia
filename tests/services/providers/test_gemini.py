@@ -9,7 +9,7 @@ import httpx
 import pytest
 from google.genai import errors as genai_errors
 
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 from atagia.models.schemas_memory import ExtractionResult
 from atagia.services.llm_client import (
     ConfigurationError,
@@ -211,7 +211,10 @@ async def test_gemini_complete_maps_text_and_request_shape() -> None:
     assert call["config"].max_output_tokens == 8192
     assert call["config"].thinking_config.include_thoughts is True
     from google.genai import types as genai_types
-    assert call["config"].thinking_config.thinking_level == genai_types.ThinkingLevel.HIGH
+
+    assert (
+        call["config"].thinking_config.thinking_level == genai_types.ThinkingLevel.HIGH
+    )
 
 
 @pytest.mark.asyncio
@@ -287,7 +290,10 @@ async def test_gemini_complete_uses_structured_output_and_sanitizes_schema() -> 
     assert config.response_mime_type == "application/json"
     assert "additionalProperties" not in schema
     assert "$defs" not in schema
-    assert schema["properties"]["status"] == {"type": "string", "enum": ["ok", "warning"]}
+    assert schema["properties"]["status"] == {
+        "type": "string",
+        "enum": ["ok", "warning"],
+    }
     assert "minimum" not in schema["properties"]["score"]
     assert "maximum" not in schema["properties"]["score"]
     assert schema["properties"]["note"] == {"type": "string"}
@@ -331,9 +337,7 @@ async def test_gemini_complete_maps_tools_and_function_calls() -> None:
 
 @pytest.mark.asyncio
 async def test_gemini_tool_result_uses_prior_function_name_for_call_id() -> None:
-    models = FakeGeminiModels(
-        completion_response=_response(parts=[_part(text="done")])
-    )
+    models = FakeGeminiModels(completion_response=_response(parts=[_part(text="done")]))
     provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
     request = _request(
         messages=[
@@ -352,7 +356,7 @@ async def test_gemini_tool_result_uses_prior_function_name_for_call_id() -> None
             ),
             LLMMessage(
                 role="tool",
-                content="{\"result\":\"ok\"}",
+                content='{"result":"ok"}',
                 name="call_lookup",
             ),
         ]
@@ -371,9 +375,7 @@ async def test_gemini_tool_result_uses_prior_function_name_for_call_id() -> None
 
 @pytest.mark.asyncio
 async def test_gemini_tool_result_preserves_ids_for_same_function_calls() -> None:
-    models = FakeGeminiModels(
-        completion_response=_response(parts=[_part(text="done")])
-    )
+    models = FakeGeminiModels(completion_response=_response(parts=[_part(text="done")]))
     provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
     request = _request(
         messages=[
@@ -432,6 +434,29 @@ async def test_gemini_complete_raises_non_transient_on_max_tokens() -> None:
 
     assert isinstance(exc_info.value, LLMError)
     assert not isinstance(exc_info.value, TransientLLMError)
+
+
+@pytest.mark.asyncio
+async def test_gemini_external_answer_preserves_limit_stop_and_exact_budget() -> None:
+    models = FakeGeminiModels(
+        completion_response=_response(
+            parts=[_part(text="partial")],
+            usage=_usage(prompt_token_count=7, response_token_count=1),
+            finish_reason="MAX_TOKENS",
+        )
+    )
+    provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
+    request = _request(
+        max_output_tokens=1,
+        external_answer=True,
+    )
+
+    completion = await provider.complete(request)
+
+    assert completion.output_text == "partial"
+    assert completion.finish_reason == "length"
+    assert completion.usage == {"input_tokens": 7, "output_tokens": 1}
+    assert models.generate_content_calls[0]["config"].max_output_tokens == 1
 
 
 @pytest.mark.asyncio
@@ -529,7 +554,10 @@ async def test_gemini_stream_maps_text_tool_call_and_done() -> None:
         "input": {"q": "x"},
     }
     assert events[3].payload["usage"] == {"input_tokens": 3, "output_tokens": 2}
-    assert models.generate_content_stream_calls[0]["config"].system_instruction == "You are helpful."
+    assert (
+        models.generate_content_stream_calls[0]["config"].system_instruction
+        == "You are helpful."
+    )
 
 
 @pytest.mark.asyncio
@@ -550,7 +578,9 @@ async def test_gemini_stream_does_not_duplicate_response_parts_helper() -> None:
 @pytest.mark.asyncio
 async def test_gemini_stream_propagates_errors_after_partial_output() -> None:
     stream_error = RuntimeError("stream broke")
-    stream = FakeAsyncStream([_response(parts=[_part(text="partial")])], error=stream_error)
+    stream = FakeAsyncStream(
+        [_response(parts=[_part(text="partial")])], error=stream_error
+    )
     models = FakeGeminiModels(stream_response=stream)
     provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
 
@@ -584,7 +614,39 @@ async def test_gemini_stream_emits_done_then_raises_on_max_tokens() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gemini_stream_emits_done_then_raises_on_transient_finish_reason() -> None:
+async def test_gemini_external_stream_emits_real_usage_and_length_without_error() -> (
+    None
+):
+    stream = FakeAsyncStream(
+        [
+            _response(
+                parts=[_part(text="partial")],
+                usage=_usage(prompt_token_count=4, response_token_count=1),
+                finish_reason="MAX_TOKENS",
+            )
+        ]
+    )
+    models = FakeGeminiModels(stream_response=stream)
+    provider = GeminiProvider(api_key="test", client=FakeGeminiClient(models))
+    request = _request(
+        max_output_tokens=1,
+        external_answer=True,
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == ["text", "done"]
+    assert events[-1].payload == {
+        "usage": {"input_tokens": 4, "output_tokens": 1},
+        "finish_reason": "length",
+    }
+    assert models.generate_content_stream_calls[0]["config"].max_output_tokens == 1
+
+
+@pytest.mark.asyncio
+async def test_gemini_stream_emits_done_then_raises_on_transient_finish_reason() -> (
+    None
+):
     stream = FakeAsyncStream(
         [
             _response(parts=[_part(text="partial")]),
@@ -643,7 +705,13 @@ async def test_gemini_embed_maps_vectors_and_dimension_config() -> None:
         (
             lambda: genai_errors.ClientError(
                 429,
-                {"error": {"code": 429, "message": "rate limit", "status": "RESOURCE_EXHAUSTED"}},
+                {
+                    "error": {
+                        "code": 429,
+                        "message": "rate limit",
+                        "status": "RESOURCE_EXHAUSTED",
+                    }
+                },
             ),
             TransientLLMError,
         ),
@@ -657,19 +725,33 @@ async def test_gemini_embed_maps_vectors_and_dimension_config() -> None:
         (
             lambda: genai_errors.ClientError(
                 503,
-                {"error": {"code": 503, "message": "unavailable", "status": "UNAVAILABLE"}},
+                {
+                    "error": {
+                        "code": 503,
+                        "message": "unavailable",
+                        "status": "UNAVAILABLE",
+                    }
+                },
             ),
             TransientLLMError,
         ),
         (
             lambda: genai_errors.ClientError(
                 400,
-                {"error": {"code": 400, "message": "bad schema", "status": "INVALID_ARGUMENT"}},
+                {
+                    "error": {
+                        "code": 400,
+                        "message": "bad schema",
+                        "status": "INVALID_ARGUMENT",
+                    }
+                },
             ),
             LLMError,
         ),
         (
-            lambda: json.JSONDecodeError("Expecting value", "<html>bad gateway</html>", 0),
+            lambda: json.JSONDecodeError(
+                "Expecting value", "<html>bad gateway</html>", 0
+            ),
             TransientLLMError,
         ),
         (lambda: RuntimeError("surprise"), LLMError),
@@ -699,7 +781,9 @@ async def test_gemini_maps_400_invalid_argument_to_request_error() -> None:
     assert not isinstance(exc_info.value, TransientLLMError)
 
 
-def test_gemini_schema_sanitizer_handles_nested_refs_arrays_and_strips_nullable() -> None:
+def test_gemini_schema_sanitizer_handles_nested_refs_arrays_and_strips_nullable() -> (
+    None
+):
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -815,8 +899,12 @@ async def test_build_llm_client_registers_gemini_and_uses_gemini_embeddings(
             captured["api_key"] = api_key
             captured["request_timeout_seconds"] = request_timeout_seconds
 
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
+            return LLMCompletionResponse(
+                provider=self.name, model=request.model, output_text="ok"
+            )
 
         async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
             return LLMEmbeddingResponse(
@@ -829,8 +917,8 @@ async def test_build_llm_client_registers_gemini_and_uses_gemini_embeddings(
 
     settings = Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         openai_api_key=None,
@@ -970,8 +1058,8 @@ async def test_gemini_stream_closes_underlying_stream_on_cancel() -> None:
 def test_build_llm_client_requires_gemini_credentials() -> None:
     settings = Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         openai_api_key=None,

@@ -1,0 +1,6 @@
+name: atagia
+version: 0.4.0
+description: "Atagia applicability-governed context and durable transcript sync for Hermes Agent."
+pip_dependencies: []
+hooks:
+  - on_session_end

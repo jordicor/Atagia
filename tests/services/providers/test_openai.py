@@ -82,7 +82,9 @@ class FakeEmbeddings:
 
 
 class FakeOpenAIClient:
-    def __init__(self, completions: FakeChatCompletions, embeddings: FakeEmbeddings) -> None:
+    def __init__(
+        self, completions: FakeChatCompletions, embeddings: FakeEmbeddings
+    ) -> None:
         self.chat = SimpleNamespace(completions=completions)
         self.embeddings = embeddings
 
@@ -90,7 +92,10 @@ class FakeOpenAIClient:
 def _request(model: str = "gpt-5-mini") -> LLMCompletionRequest:
     return LLMCompletionRequest(
         model=model,
-        messages=[LLMMessage(role="system", content="You are helpful."), LLMMessage(role="user", content="Hello")],
+        messages=[
+            LLMMessage(role="system", content="You are helpful."),
+            LLMMessage(role="user", content="Hello"),
+        ],
         max_output_tokens=8192,
         temperature=0.2,
         response_schema={
@@ -108,7 +113,13 @@ def _request(model: str = "gpt-5-mini") -> LLMCompletionRequest:
             },
             "$defs": {"Status": {"type": "string", "enum": ["ok", "warning"]}},
         },
-        tools=[LLMToolSpec(name="lookup", description="Lookup data", input_schema={"type": "object"})],
+        tools=[
+            LLMToolSpec(
+                name="lookup",
+                description="Lookup data",
+                input_schema={"type": "object"},
+            )
+        ],
         metadata={"user_id": "usr_1"},
     )
 
@@ -180,17 +191,26 @@ async def test_openai_complete_maps_response_and_uses_structured_output() -> Non
                         SimpleNamespace(
                             id="tool_1",
                             type="function",
-                            function=SimpleNamespace(name="lookup", arguments='{"q":"x"}'),
+                            function=SimpleNamespace(
+                                name="lookup", arguments='{"q":"x"}'
+                            ),
                         )
                     ],
                 )
             )
         ],
-        usage=SimpleNamespace(model_dump=lambda exclude_none=True: {"prompt_tokens": 11, "completion_tokens": 7}),
+        usage=SimpleNamespace(
+            model_dump=lambda exclude_none=True: {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+            }
+        ),
         model_dump=lambda: {"id": "cmpl_1"},
     )
     completions = FakeChatCompletions(create_result=response)
-    provider = OpenAIProvider(api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()))
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings())
+    )
 
     completion = await provider.complete(_request())
 
@@ -212,7 +232,9 @@ async def test_openai_complete_maps_response_and_uses_structured_output() -> Non
 
 
 @pytest.mark.asyncio
-async def test_openai_preserves_nullable_optionals_for_strict_structured_output() -> None:
+async def test_openai_preserves_nullable_optionals_for_strict_structured_output() -> (
+    None
+):
     response = SimpleNamespace(
         model="gpt-5-mini",
         choices=[SimpleNamespace(message=SimpleNamespace(content='{"label":"ok"}'))],
@@ -220,7 +242,9 @@ async def test_openai_preserves_nullable_optionals_for_strict_structured_output(
         model_dump=lambda: {},
     )
     completions = FakeChatCompletions(create_result=response)
-    provider = OpenAIProvider(api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()))
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings())
+    )
     request = _request().model_copy(
         update={
             "response_schema": {
@@ -242,7 +266,10 @@ async def test_openai_preserves_nullable_optionals_for_strict_structured_output(
     assert response_format["json_schema"]["strict"] is True
     schema = response_format["json_schema"]["schema"]
     assert schema["required"] == ["label", "note"]
-    assert schema["properties"]["note"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
+    assert schema["properties"]["note"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "null"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -290,7 +317,9 @@ async def test_openai_complete_preserves_native_tool_call_history() -> None:
         model_dump=lambda: {},
     )
     completions = FakeChatCompletions(create_result=response)
-    provider = OpenAIProvider(api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()))
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings())
+    )
     request = _request().model_copy(
         update={
             "messages": [
@@ -304,14 +333,14 @@ async def test_openai_complete_preserves_native_tool_call_history() -> None:
                             "type": "tool_use",
                             "function": {
                                 "name": "lookup",
-                                "arguments": "{\"query\":\"atagia\"}",
+                                "arguments": '{"query":"atagia"}',
                             },
                         }
                     ],
                 ),
                 LLMMessage(
                     role="tool",
-                    content="{\"result\":\"ok\"}",
+                    content='{"result":"ok"}',
                     name="call_lookup",
                 ),
             ],
@@ -329,7 +358,7 @@ async def test_openai_complete_preserves_native_tool_call_history() -> None:
             "type": "function",
             "function": {
                 "name": "lookup",
-                "arguments": "{\"query\":\"atagia\"}",
+                "arguments": '{"query":"atagia"}',
             },
         }
     ]
@@ -349,7 +378,9 @@ async def test_openai_complete_forwards_provider_extra_body_from_metadata() -> N
         model_dump=lambda: {},
     )
     completions = FakeChatCompletions(create_result=response)
-    provider = OpenAIProvider(api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()))
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings())
+    )
 
     request = _request(model="deepseek/deepseek-v4-flash").model_copy(
         update={
@@ -398,7 +429,9 @@ async def test_openrouter_openai_reasoning_model_omits_temperature() -> None:
 
 
 @pytest.mark.asyncio
-async def test_openai_chat_latest_uses_completion_tokens_and_omits_temperature() -> None:
+async def test_openai_chat_latest_uses_completion_tokens_and_omits_temperature() -> (
+    None
+):
     response = SimpleNamespace(
         model="chat-latest",
         choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
@@ -406,7 +439,9 @@ async def test_openai_chat_latest_uses_completion_tokens_and_omits_temperature()
         model_dump=lambda: {},
     )
     completions = FakeChatCompletions(create_result=response)
-    provider = OpenAIProvider(api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()))
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings())
+    )
 
     await provider.complete(_request(model="chat-latest"))
 
@@ -417,7 +452,9 @@ async def test_openai_chat_latest_uses_completion_tokens_and_omits_temperature()
 
 
 @pytest.mark.asyncio
-async def test_openai_complete_falls_back_to_request_model_when_response_model_is_null() -> None:
+async def test_openai_complete_falls_back_to_request_model_when_response_model_is_null() -> (
+    None
+):
     response = SimpleNamespace(
         model=None,
         choices=[SimpleNamespace(message=SimpleNamespace(content="hello world"))],
@@ -425,7 +462,9 @@ async def test_openai_complete_falls_back_to_request_model_when_response_model_i
         model_dump=lambda: {"id": "cmpl_1", "model": None},
     )
     completions = FakeChatCompletions(create_result=response)
-    provider = OpenAIProvider(api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()))
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings())
+    )
 
     completion = await provider.complete(_request(model="qwen/qwen3.6-plus"))
 
@@ -449,7 +488,9 @@ async def test_openai_complete_maps_reasoning_content_alias() -> None:
         model_dump=lambda: {"id": "cmpl_1"},
     )
     completions = FakeChatCompletions(create_result=response)
-    provider = OpenAIProvider(api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()))
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings())
+    )
 
     completion = await provider.complete(_request(model="qwen/qwen3.6-plus"))
 
@@ -485,6 +526,44 @@ async def test_openai_complete_raises_non_transient_on_length_finish_reason() ->
 
 
 @pytest.mark.asyncio
+async def test_openai_external_answer_preserves_limit_stop_and_exact_budget() -> None:
+    response = SimpleNamespace(
+        model="gpt-5-mini",
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="partial"),
+                finish_reason="length",
+            )
+        ],
+        usage=SimpleNamespace(
+            model_dump=lambda exclude_none=True: {
+                "prompt_tokens": 11,
+                "completion_tokens": 1,
+            }
+        ),
+        model_dump=lambda: {"id": "cmpl_external_limit"},
+    )
+    completions = FakeChatCompletions(response)
+    provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(completions, FakeEmbeddings()),
+    )
+    request = _request().model_copy(
+        update={"max_output_tokens": 1, "external_answer": True}
+    )
+
+    completion = await provider.complete(request)
+
+    assert completion.output_text == "partial"
+    assert completion.finish_reason == "length"
+    assert completion.usage == {"prompt_tokens": 11, "completion_tokens": 1}
+    assert completions.calls[0].get(
+        "max_completion_tokens",
+        completions.calls[0].get("max_tokens"),
+    ) == 1
+
+
+@pytest.mark.asyncio
 async def test_openai_complete_raises_on_content_filter_finish_reason() -> None:
     response = SimpleNamespace(
         model="gpt-5-mini",
@@ -509,7 +588,9 @@ async def test_openai_complete_raises_on_content_filter_finish_reason() -> None:
 
 
 @pytest.mark.asyncio
-async def test_openai_compatible_complete_raises_transient_on_error_finish_reason() -> None:
+async def test_openai_compatible_complete_raises_transient_on_error_finish_reason() -> (
+    None
+):
     response = SimpleNamespace(
         model="gpt-5-mini",
         choices=[
@@ -576,6 +657,52 @@ async def test_openai_stream_emits_done_then_raises_on_length_finish_reason() ->
     assert raised.finish_reason == "length"
     assert raised.partial_output_chars == len("partial")
     assert raised.partial_output_excerpt == "partial"
+
+
+@pytest.mark.asyncio
+async def test_openai_external_stream_emits_real_usage_and_length_without_error() -> (
+    None
+):
+    chunks = [
+        SimpleNamespace(
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="partial", tool_calls=None),
+                    finish_reason=None,
+                )
+            ],
+        ),
+        SimpleNamespace(
+            usage={"prompt_tokens": 4, "completion_tokens": 1},
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, tool_calls=None),
+                    finish_reason="length",
+                )
+            ],
+        ),
+    ]
+    completions = FakeChatCompletions(FakeStream(chunks))
+    provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(completions, FakeEmbeddings()),
+    )
+    request = _request().model_copy(
+        update={"max_output_tokens": 1, "external_answer": True}
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == ["text", "done"]
+    assert events[-1].payload == {
+        "usage": {"prompt_tokens": 4, "completion_tokens": 1},
+        "finish_reason": "length",
+    }
+    assert completions.calls[0].get(
+        "max_completion_tokens",
+        completions.calls[0].get("max_tokens"),
+    ) == 1
 
 
 @pytest.mark.asyncio
@@ -701,7 +828,9 @@ async def test_openai_embed_can_use_separate_embedding_base_url(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_openai_embed_falls_back_to_request_model_when_response_model_is_null() -> None:
+async def test_openai_embed_falls_back_to_request_model_when_response_model_is_null() -> (
+    None
+):
     embeddings = FakeEmbeddings(
         result=SimpleNamespace(
             model=None,
@@ -742,21 +871,30 @@ async def test_openai_maps_retryable_and_permanent_errors() -> None:
     )
     permanent_error = openai.BadRequestError(
         "bad request",
-        response=httpx.Response(400, request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions")),
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
         body={},
     )
 
     transient_provider = OpenAIProvider(
         api_key="test",
-        client=FakeOpenAIClient(FakeChatCompletions(error=transient_error), FakeEmbeddings()),
+        client=FakeOpenAIClient(
+            FakeChatCompletions(error=transient_error), FakeEmbeddings()
+        ),
     )
     permanent_provider = OpenAIProvider(
         api_key="test",
-        client=FakeOpenAIClient(FakeChatCompletions(error=permanent_error), FakeEmbeddings()),
+        client=FakeOpenAIClient(
+            FakeChatCompletions(error=permanent_error), FakeEmbeddings()
+        ),
     )
     rate_limit_provider = OpenAIProvider(
         api_key="test",
-        client=FakeOpenAIClient(FakeChatCompletions(error=rate_limit_error), FakeEmbeddings()),
+        client=FakeOpenAIClient(
+            FakeChatCompletions(error=rate_limit_error), FakeEmbeddings()
+        ),
     )
 
     with pytest.raises(TransientLLMError):
@@ -836,7 +974,9 @@ async def test_openai_maps_non_transient_4xx_status_error_to_request_error() -> 
     )
     provider = OpenAIProvider(
         api_key="test",
-        client=FakeOpenAIClient(FakeChatCompletions(error=not_found_error), FakeEmbeddings()),
+        client=FakeOpenAIClient(
+            FakeChatCompletions(error=not_found_error), FakeEmbeddings()
+        ),
     )
 
     with pytest.raises(LLMRequestError) as exc_info:
@@ -858,7 +998,9 @@ async def test_openai_transient_status_error_preserves_retry_after() -> None:
     )
     provider = OpenAIProvider(
         api_key="test",
-        client=FakeOpenAIClient(FakeChatCompletions(error=rate_limit_error), FakeEmbeddings()),
+        client=FakeOpenAIClient(
+            FakeChatCompletions(error=rate_limit_error), FakeEmbeddings()
+        ),
     )
 
     with pytest.raises(TransientLLMError) as exc_info:
@@ -872,7 +1014,10 @@ async def test_openrouter_maps_bad_request_to_request_error() -> None:
     bad_request = openai.BadRequestError(
         "bad request",
         response=httpx.Response(
-            400, request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+            400,
+            request=httpx.Request(
+                "POST", "https://openrouter.ai/api/v1/chat/completions"
+            ),
         ),
         body={},
     )
@@ -880,7 +1025,9 @@ async def test_openrouter_maps_bad_request_to_request_error() -> None:
         api_key="test",
         site_url="https://example.test",
         app_name="Atagia",
-        client=FakeOpenAIClient(FakeChatCompletions(error=bad_request), FakeEmbeddings()),
+        client=FakeOpenAIClient(
+            FakeChatCompletions(error=bad_request), FakeEmbeddings()
+        ),
     )
 
     with pytest.raises(LLMRequestError) as exc_info:
@@ -926,7 +1073,9 @@ async def test_openai_maps_non_json_provider_response_as_transient() -> None:
         api_key="test",
         client=FakeOpenAIClient(
             FakeChatCompletions(
-                error=json.JSONDecodeError("Expecting value", "<html>gateway error</html>", 0)
+                error=json.JSONDecodeError(
+                    "Expecting value", "<html>gateway error</html>", 0
+                )
             ),
             FakeEmbeddings(),
         ),

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from atagia.core.clock import FrozenClock
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 from atagia.memory.need_detector import NeedDetector
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.models.schemas_memory import (
@@ -28,7 +28,7 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 class CannedCardProvider(LLMProvider):
@@ -81,8 +81,8 @@ def _clock() -> FrozenClock:
 def _settings() -> Settings:
     return Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         openai_api_key=None,

@@ -15,7 +15,7 @@ def normalize_evidence_turn_ids(raw_evidence: Any) -> list[str]:
     """Normalize structured benchmark citation fields into turn ids.
 
     LoCoMo occasionally stores multiple citations in one string, such as
-    ``"D8:6; D9:17"`` or ``"D9:1 D4:4 D4:6"``. This helper only parses the
+    ``"D71:3; D72:8"`` or ``"D73:5 D74:9 D75:4"``. This helper only parses the
     mechanical citation grammar and preserves order; it does not infer missing
     or semantically related evidence.
     """

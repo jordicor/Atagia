@@ -22,7 +22,6 @@ from atagia.core.repositories import (
     MessageRepository,
     UserRepository,
 )
-from atagia.models.schemas_jobs import EXTRACT_STREAM_NAME, WORKER_GROUP_NAME
 from atagia.models.schemas_memory import (
     MemoryCategory,
     MemoryObjectType,
@@ -32,6 +31,7 @@ from atagia.models.schemas_memory import (
     MemoryStatus,
 )
 from atagia.services.chat_service import ChatService
+from atagia.services.durable_job_dispatcher import DurableJobDispatcher
 from atagia.services.sidecar_service import SidecarService
 from atagia.services.errors import LLMUnavailableError
 from atagia.services.llm_client import (
@@ -49,8 +49,8 @@ from tests.extraction_payload_support import (
     memory_extraction_card_output_from_payload,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
@@ -202,6 +202,14 @@ class ConfirmationFlowProvider(LLMProvider):
             )
         if is_memory_extraction_card_purpose(purpose):
             if purpose == "memory_extraction_candidate_card":
+                if '<source_message role="assistant">' in request.messages[1].content:
+                    self._active_extraction_payload = None
+                    self._active_extraction_consumed = set()
+                    return LLMCompletionResponse(
+                        provider=self.name,
+                        model=request.model,
+                        output_text="none",
+                    )
                 if not self.extraction_outputs:
                     raise AssertionError(f"No extraction output left for purpose={purpose}")
                 self._active_extraction_payload = self.extraction_outputs.pop(0)
@@ -358,26 +366,24 @@ def _pin_output(*, canonical_text: str, index_text: str) -> str:
 
 
 async def _drain_user_extract_jobs(runtime: AppRuntime, ingest_worker: IngestWorker) -> None:
-    while True:
-        messages = await runtime.storage_backend.stream_read(
-            EXTRACT_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            "confirmation-flow-consumer",
-            count=20,
+    dispatcher = DurableJobDispatcher(
+        ingest_worker._connection,
+        runtime.clock,
+        storage_backend=runtime.storage_backend,
+        target_backend=runtime.settings.storage_backend,
+        visibility_seconds=runtime.settings.worker_dispatch_visibility_seconds,
+        sweep_interval_seconds=runtime.settings.worker_dispatch_sweep_interval_seconds,
+        batch_size=runtime.settings.worker_dispatch_batch_size,
+    )
+    for _ in range(100):
+        await dispatcher.dispatch_once()
+        result = await ingest_worker.run_once(
+            consumer_name="confirmation-flow-consumer",
             block_ms=0,
         )
-        if not messages:
+        if result.received == 0:
             return
-        for message in messages:
-            payload = message.payload
-            role = str(payload.get("payload", {}).get("role", ""))
-            if role == "user":
-                await ingest_worker.process_job(payload)
-            await runtime.storage_backend.stream_ack(
-                EXTRACT_STREAM_NAME,
-                WORKER_GROUP_NAME,
-                message.message_id,
-            )
+    raise AssertionError("Extraction jobs did not drain")
 
 
 async def _list_all_memories(runtime: AppRuntime) -> list[dict[str, object]]:
@@ -678,7 +684,7 @@ async def test_walk_b_second_sensitive_share_still_requires_confirmation_below_t
         tmp_path,
         monkeypatch,
         extraction_outputs=[
-            _pin_output(canonical_text="Gym membership card PIN: 9988", index_text="gym card PIN"),
+            _pin_output(canonical_text="Workshop locker PIN: 9988", index_text="workshop locker PIN"),
             _NO_DURABLE_OUTPUT,
             _NO_DURABLE_OUTPUT,
         ],
@@ -700,7 +706,7 @@ async def test_walk_b_second_sensitive_share_still_requires_confirmation_below_t
         await service.chat_reply(
             user_id="usr_1",
             conversation_id="cnv_1",
-            message_text="My gym membership card PIN is 9988.",
+            message_text="My workshop locker PIN is 9988.",
             assistant_mode_id="personal_assistant",
         )
         await _drain_user_extract_jobs(runtime, ingest_worker)
@@ -715,7 +721,7 @@ async def test_walk_b_second_sensitive_share_still_requires_confirmation_below_t
             assistant_mode_id="personal_assistant",
         )
         await _drain_user_extract_jobs(runtime, ingest_worker)
-        assert prompted.response_text.startswith("Before I answer, I noted gym card PIN earlier.")
+        assert prompted.response_text.startswith("Before I answer, I noted workshop locker PIN earlier.")
 
         await service.chat_reply(
             user_id="usr_1",
@@ -800,7 +806,7 @@ async def test_walk_d_declines_twice_then_suppresses_future_category(
             _pin_output(canonical_text="Company card PIN: 7000", index_text="company card PIN"),
             _NO_DURABLE_OUTPUT,
             _NO_DURABLE_OUTPUT,
-            _pin_output(canonical_text="Gym membership card PIN: 9988", index_text="gym card PIN"),
+            _pin_output(canonical_text="Workshop locker PIN: 9988", index_text="workshop locker PIN"),
             _NO_DURABLE_OUTPUT,
             _NO_DURABLE_OUTPUT,
             _pin_output(canonical_text="Locker code: 1234", index_text="locker PIN"),
@@ -843,7 +849,7 @@ async def test_walk_d_declines_twice_then_suppresses_future_category(
         await service.chat_reply(
             user_id="usr_1",
             conversation_id="cnv_1",
-            message_text="My gym membership card PIN is 9988.",
+            message_text="My workshop locker PIN is 9988.",
             assistant_mode_id="personal_assistant",
         )
         await _drain_user_extract_jobs(runtime, ingest_worker)
@@ -855,7 +861,7 @@ async def test_walk_d_declines_twice_then_suppresses_future_category(
             assistant_mode_id="personal_assistant",
         )
         await _drain_user_extract_jobs(runtime, ingest_worker)
-        assert prompt_two.response_text.startswith("Before I answer, I noted gym card PIN earlier.")
+        assert prompt_two.response_text.startswith("Before I answer, I noted workshop locker PIN earlier.")
 
         await service.chat_reply(
             user_id="usr_1",
@@ -910,7 +916,7 @@ async def test_chat_reply_batches_same_category_confirmations_and_keeps_prompt_e
             runtime,
             memory_id="mem_pin_2",
             category=MemoryCategory.PIN_OR_PASSWORD,
-            index_text="gym card PIN",
+            index_text="workshop locker PIN",
         )
 
         result = await ChatService(runtime).chat_reply(
@@ -922,7 +928,7 @@ async def test_chat_reply_batches_same_category_confirmations_and_keeps_prompt_e
         )
         await _drain_user_extract_jobs(runtime, ingest_worker)
 
-        assert "bank card PIN and gym card PIN" in result.response_text
+        assert "bank card PIN and workshop locker PIN" in result.response_text
         assert "Want me to keep your PINs or passwords for next time?" in result.response_text
         assert await _stored_assistant_text(runtime) == "Forecast looks clear."
         assert result.debug is not None
@@ -932,9 +938,13 @@ async def test_chat_reply_batches_same_category_confirmations_and_keeps_prompt_e
             if request.metadata.get("purpose") == "chat_reply"
         )
         assert all("Before I answer" not in message.content for message in chat_request.messages)
-        stored_cache = await runtime.storage_backend.get_context_view(str(result.debug["cache"]["cache_key"]))
-        assert stored_cache is not None
-        assert stored_cache["last_user_message_text"] == "What's the weather?"
+        # Marking both confirmation prompts as asked is canonical state: each
+        # update advances the SQLite cache revision. The entry captured before
+        # those updates must fail closed instead of being rebased and published.
+        rejected_cache = await runtime.storage_backend.get_context_view(
+            str(result.debug["cache"]["cache_key"])
+        )
+        assert rejected_cache is None
         marker_one = await _get_marker(runtime, "mem_pin_1")
         marker_two = await _get_marker(runtime, "mem_pin_2")
         assert marker_one is not None and marker_one["asked_at"] is not None
@@ -1096,7 +1106,7 @@ async def test_mixed_batch_only_implicitly_declines_items_already_reasked(
             runtime,
             memory_id="mem_first_ask",
             category=MemoryCategory.PIN_OR_PASSWORD,
-            index_text="gym card PIN",
+            index_text="workshop locker PIN",
             asked_at="2026-04-06T12:00:00+00:00",
             confirmation_asked_once=False,
         )

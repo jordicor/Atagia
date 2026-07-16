@@ -14,7 +14,11 @@ from atagia.core.consent_repository import (
     PendingMemoryConfirmationRepository,
 )
 from atagia.core.db_sqlite import initialize_database
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    UserRepository,
+)
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import (
     MemoryCategory,
@@ -25,10 +29,23 @@ from atagia.models.schemas_memory import (
     MemoryStatus,
 )
 from atagia.services.confirmation_service import PendingConfirmationService
-from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMCompletionResponse, LLMProvider
+from atagia.services.errors import (
+    TranscriptRebuildInProgressError,
+    TranscriptRebuildRemediationRequiredError,
+)
+from atagia.services.llm_client import (
+    LLMClient,
+    LLMCompletionRequest,
+    LLMCompletionResponse,
+    LLMProvider,
+)
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 class RecordingEmbeddingIndex:
@@ -37,7 +54,9 @@ class RecordingEmbeddingIndex:
     def __init__(self) -> None:
         self.upserts: list[dict[str, object]] = []
 
-    async def upsert(self, memory_id: str, text: str, metadata: dict[str, object]) -> None:
+    async def upsert(
+        self, memory_id: str, text: str, metadata: dict[str, object]
+    ) -> None:
         self.upserts.append(
             {
                 "memory_id": memory_id,
@@ -90,6 +109,48 @@ def _settings() -> Settings:
     )
 
 
+async def _install_blocking_selection(
+    connection: object,
+    clock: FrozenClock,
+    *,
+    state: str,
+) -> None:
+    now = clock.now().isoformat()
+    workflow_id = f"trw_confirmation_{state}"
+    await connection.execute(
+        """
+        INSERT INTO transcript_rebuild_workflows(
+            id, operation_id, user_id, conversation_id, selection_epoch,
+            transcript_hash, mutation_kind, selected_message_ids_json,
+            abandoned_message_ids_json, supporting_message_ids_json,
+            affected_memory_ids_json, affected_summary_ids_json,
+            orchestrator_job_id, stage, start_derivation_revision,
+            created_at, updated_at
+        ) VALUES (?, ?, 'usr_1', 'cnv_1', 1, ?, 'replace', '[]', '[]',
+                  '[]', '[]', '[]', ?, ?, 0, ?, ?)
+        """,
+        (
+            workflow_id,
+            f"op_confirmation_{state}",
+            f"hash_confirmation_{state}",
+            f"job_confirmation_{state}",
+            "remediation_required" if state == "remediation_required" else "aggregates",
+            now,
+            now,
+        ),
+    )
+    await connection.execute(
+        """
+        INSERT INTO conversation_transcript_selections(
+            user_id, conversation_id, selection_epoch, transcript_hash,
+            current_workflow_id, state, updated_at
+        ) VALUES ('usr_1', 'cnv_1', 1, ?, ?, ?, ?)
+        """,
+        (f"hash_confirmation_{state}", workflow_id, state, now),
+    )
+    await connection.commit()
+
+
 @pytest.mark.asyncio
 async def test_confirming_pending_memory_upserts_embedding_with_safe_payload() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
@@ -97,7 +158,9 @@ async def test_confirming_pending_memory_upserts_embedding_with_safe_payload() -
     embedding_index = RecordingEmbeddingIndex()
     provider = ConfirmationProvider("confirm")
     try:
-        await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+        await sync_assistant_modes(
+            connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+        )
         users = UserRepository(connection, clock)
         conversations = ConversationRepository(connection, clock)
         memories = MemoryObjectRepository(connection, clock)
@@ -178,7 +241,7 @@ async def test_confirming_pending_memory_upserts_embedding_with_safe_payload() -
                 "metadata": {
                     "user_id": "usr_1",
                     "object_type": "evidence",
-                        "scope": "user",
+                    "scope": "user",
                     "created_at": str(pending["created_at"]),
                     "index_text": None,
                 },
@@ -190,12 +253,16 @@ async def test_confirming_pending_memory_upserts_embedding_with_safe_payload() -
 
 
 @pytest.mark.asyncio
-async def test_unproven_pending_policy_confirmation_moves_to_review_not_active() -> None:
+async def test_unproven_pending_policy_confirmation_moves_to_review_not_active() -> (
+    None
+):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 6, 12, 0, tzinfo=timezone.utc))
     provider = ConfirmationProvider("confirm")
     try:
-        await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+        await sync_assistant_modes(
+            connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+        )
         users = UserRepository(connection, clock)
         conversations = ConversationRepository(connection, clock)
         memories = MemoryObjectRepository(connection, clock)
@@ -269,7 +336,9 @@ async def test_confirmation_rechecks_current_preferences_before_activation() -> 
     clock = FrozenClock(datetime(2026, 4, 6, 12, 0, tzinfo=timezone.utc))
     provider = ConfirmationProvider("confirm")
     try:
-        await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+        await sync_assistant_modes(
+            connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+        )
         users = UserRepository(connection, clock)
         conversations = ConversationRepository(connection, clock)
         memories = MemoryObjectRepository(connection, clock)
@@ -337,11 +406,110 @@ async def test_confirmation_rechecks_current_preferences_before_activation() -> 
 
         updated = await memories.get_memory_object("mem_current_narrowed", "usr_1")
         profile = await profiles.get_profile("usr_1", MemoryCategory.PIN_OR_PASSWORD)
-        marker = await confirmations.get_marker_for_memory("usr_1", "mem_current_narrowed")
+        marker = await confirmations.get_marker_for_memory(
+            "usr_1", "mem_current_narrowed"
+        )
 
         assert updated is not None
         assert updated["status"] == MemoryStatus.REVIEW_REQUIRED.value
         assert profile is None
         assert marker is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_error"),
+    [
+        ("rebuilding", TranscriptRebuildInProgressError),
+        (
+            "remediation_required",
+            TranscriptRebuildRemediationRequiredError,
+        ),
+    ],
+)
+@pytest.mark.parametrize("operation", ["list", "confirm", "decline"])
+@pytest.mark.asyncio
+async def test_pending_confirmation_public_operations_respect_rebuild_fence(
+    state: str,
+    expected_error: type[Exception],
+    operation: str,
+) -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 6, 12, 0, tzinfo=timezone.utc))
+    try:
+        await sync_assistant_modes(
+            connection,
+            ManifestLoader(MANIFESTS_DIR).load_all(),
+            clock,
+        )
+        await UserRepository(connection, clock).create_user("usr_1")
+        await ConversationRepository(
+            connection,
+            clock,
+        ).create_conversation(
+            "cnv_1",
+            "usr_1",
+            None,
+            "personal_assistant",
+            "Chat",
+        )
+        pending = await MemoryObjectRepository(
+            connection,
+            clock,
+        ).create_memory_object(
+            memory_id="mem_blocked_confirmation",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="personal_assistant",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.USER,
+            canonical_text="Sensitive value",
+            index_text="sensitive value",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.97,
+            privacy_level=3,
+            memory_category=MemoryCategory.PIN_OR_PASSWORD,
+            status=MemoryStatus.PENDING_USER_CONFIRMATION,
+            commit=False,
+        )
+        markers = PendingMemoryConfirmationRepository(connection, clock)
+        await markers.create_marker(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            memory_id=str(pending["id"]),
+            category=MemoryCategory.PIN_OR_PASSWORD,
+            created_at=str(pending["created_at"]),
+            commit=False,
+        )
+        await connection.commit()
+        await _install_blocking_selection(connection, clock, state=state)
+
+        service = PendingConfirmationService(connection, clock)
+        with pytest.raises(expected_error):
+            if operation == "list":
+                await service.list_pending_confirmations(user_id="usr_1")
+            elif operation == "confirm":
+                await service.confirm_pending_memory(
+                    user_id="usr_1",
+                    memory_id="mem_blocked_confirmation",
+                )
+            else:
+                await service.decline_pending_memory(
+                    user_id="usr_1",
+                    memory_id="mem_blocked_confirmation",
+                )
+
+        unchanged = await MemoryObjectRepository(
+            connection,
+            clock,
+        ).get_memory_object("mem_blocked_confirmation", "usr_1")
+        marker = await markers.get_marker_for_memory(
+            "usr_1",
+            "mem_blocked_confirmation",
+        )
+        assert unchanged is not None
+        assert unchanged["status"] == MemoryStatus.PENDING_USER_CONFIRMATION.value
+        assert marker is not None
     finally:
         await connection.close()

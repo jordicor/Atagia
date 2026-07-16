@@ -1,0 +1,92 @@
+{
+  "id": "atagia-memory",
+  "name": "Atagia Memory",
+  "description": "Atagia continuity context and post-turn memory for OpenClaw.",
+  "version": "0.2.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "baseUrl": {
+        "type": "string"
+      },
+      "apiKey": {
+        "type": "string"
+      },
+      "installationId": {
+        "type": "string"
+      },
+      "hostAccountId": {
+        "type": "string"
+      },
+      "userId": {
+        "type": "string"
+      },
+      "mode": {
+        "type": "string"
+      },
+      "memoryPrivacyMode": {
+        "type": "string",
+        "enum": [
+          "balanced",
+          "trusted_private"
+        ]
+      },
+      "failOpen": {
+        "type": "boolean"
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 120000
+      },
+      "selectedTranscriptWaitMs": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 25000
+      },
+      "selectedTranscriptPollIntervalMs": {
+        "type": "integer",
+        "minimum": 25,
+        "maximum": 2000
+      },
+      "characterId": {
+        "type": "string"
+      },
+      "userPersonaId": {
+        "type": "string"
+      },
+      "incognito": {
+        "type": "boolean"
+      }
+    }
+  },
+  "uiHints": {
+    "baseUrl": {
+      "label": "Atagia Base URL",
+      "placeholder": "http://127.0.0.1:8100"
+    },
+    "apiKey": {
+      "label": "Atagia Service API Key",
+      "sensitive": true
+    },
+    "installationId": {
+      "label": "OpenClaw Installation ID",
+      "help": "Stable identifier for this OpenClaw installation."
+    },
+    "hostAccountId": {
+      "label": "OpenClaw Host Account ID",
+      "help": "Stable account namespace owned by the OpenClaw deployment."
+    },
+    "userId": {
+      "label": "Mapped Atagia User ID",
+      "help": "Atagia user mapped to this OpenClaw account."
+    }
+  }
+}

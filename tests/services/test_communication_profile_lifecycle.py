@@ -8,12 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from atagia.core.artifact_repository import ArtifactRepository
 from atagia.core.clock import FrozenClock
 from atagia.core.communication_profile_repository import CommunicationProfileRepository
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
+    MessageRepository,
     UserRepository,
     WorkspaceRepository,
 )
@@ -34,8 +36,12 @@ from atagia.services.lifecycle_service import (
     ConversationLifecycleService,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 class _NoopEmbeddingIndex:
@@ -46,9 +52,13 @@ class _NoopEmbeddingIndex:
 async def _seed_connection():
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 5, 20, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     await UserRepository(connection, clock).create_user("usr_1")
-    await WorkspaceRepository(connection, clock).create_workspace("wrk_1", "usr_1", "Workspace")
+    await WorkspaceRepository(connection, clock).create_workspace(
+        "wrk_1", "usr_1", "Workspace"
+    )
     await ConversationRepository(connection, clock).create_conversation(
         "cnv_1",
         "usr_1",
@@ -68,7 +78,6 @@ def _runtime(clock: FrozenClock) -> SimpleNamespace:
         llm_client=None,
         storage_backend=InProcessBackend(),
         database_path=":memory:",
-        artifact_blob_store=None,
         embedding_index=_NoopEmbeddingIndex(),
     )
 
@@ -106,7 +115,9 @@ def _profile(*, source_message_id: str = "msg_1") -> UserCommunicationProfile:
     )
 
 
-def _memory_source_profile(*, memory_id: str = "mem_language_source") -> UserCommunicationProfile:
+def _memory_source_profile(
+    *, memory_id: str = "mem_language_source"
+) -> UserCommunicationProfile:
     return UserCommunicationProfile(
         observed_user_languages=[
             ObservedUserLanguage(
@@ -131,6 +142,13 @@ async def _create_source_memory(
     *,
     memory_id: str = "mem_language_source",
 ) -> None:
+    await MessageRepository(connection, clock).create_message(
+        "msg_1",
+        "cnv_1",
+        "user",
+        1,
+        "The user writes in Catalan in this source memory.",
+    )
     await MemoryObjectRepository(connection, clock).create_memory_object(
         user_id="usr_1",
         workspace_id="wrk_1",
@@ -144,6 +162,7 @@ async def _create_source_memory(
         privacy_level=0,
         memory_id=memory_id,
         language_codes=["en"],
+        payload={"source_message_ids": ["msg_1"]},
     )
 
 
@@ -164,7 +183,9 @@ async def test_archiving_conversation_marks_user_language_profile_stale() -> Non
             conversation_id="cnv_1",
         )
 
-        assert await repository.get_user_language_profile_for_context(_context()) is None
+        assert (
+            await repository.get_user_language_profile_for_context(_context()) is None
+        )
         row = await repository.get_profile_row_by_target(
             _context(),
             scope=MemoryScope.CHARACTER,
@@ -176,7 +197,9 @@ async def test_archiving_conversation_marks_user_language_profile_stale() -> Non
 
 
 @pytest.mark.asyncio
-async def test_archiving_conversation_marks_memory_sourced_language_profile_stale() -> None:
+async def test_archiving_conversation_marks_memory_sourced_language_profile_stale() -> (
+    None
+):
     connection, clock = await _seed_connection()
     try:
         await _create_source_memory(connection, clock)
@@ -193,7 +216,9 @@ async def test_archiving_conversation_marks_memory_sourced_language_profile_stal
             conversation_id="cnv_1",
         )
 
-        assert await repository.get_user_language_profile_for_context(_context()) is None
+        assert (
+            await repository.get_user_language_profile_for_context(_context()) is None
+        )
         row = await repository.get_profile_row_by_target(
             _context(),
             scope=MemoryScope.CHARACTER,
@@ -205,7 +230,9 @@ async def test_archiving_conversation_marks_memory_sourced_language_profile_stal
 
 
 @pytest.mark.asyncio
-async def test_deleting_conversation_marks_memory_sourced_language_profile_stale() -> None:
+async def test_deleting_conversation_marks_memory_sourced_language_profile_stale() -> (
+    None
+):
     connection, clock = await _seed_connection()
     try:
         await _create_source_memory(connection, clock)
@@ -223,7 +250,9 @@ async def test_deleting_conversation_marks_memory_sourced_language_profile_stale
             confirmation=DELETE_CONVERSATION_CONFIRMATION,
         )
 
-        assert await repository.get_user_language_profile_for_context(_context()) is None
+        assert (
+            await repository.get_user_language_profile_for_context(_context()) is None
+        )
         row = await repository.get_profile_row_by_target(
             _context(),
             scope=MemoryScope.CHARACTER,
@@ -235,7 +264,9 @@ async def test_deleting_conversation_marks_memory_sourced_language_profile_stale
 
 
 @pytest.mark.asyncio
-async def test_right_to_erasure_deletes_user_language_profiles_before_user_row() -> None:
+async def test_right_to_erasure_deletes_user_language_profiles_before_user_row() -> (
+    None
+):
     connection, clock = await _seed_connection()
     try:
         repository = CommunicationProfileRepository(connection, clock)
@@ -243,6 +274,17 @@ async def test_right_to_erasure_deletes_user_language_profiles_before_user_row()
             _context(),
             _profile(),
             scope=MemoryScope.CHARACTER,
+        )
+        await ArtifactRepository(connection, clock).create_artifact(
+            artifact_id="art_erasure",
+            user_id="usr_1",
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+            message_id=None,
+            artifact_type="file",
+            source_kind="host_embedded",
+            storage_kind="sqlite_blob",
+            blob_bytes=b"erase this SQLite payload",
         )
 
         report = await ConversationLifecycleService(_runtime(clock)).erase_user_data(
@@ -264,6 +306,14 @@ async def test_right_to_erasure_deletes_user_language_profiles_before_user_row()
         )
         assert profile_count == 0
         assert user_count == 0
+        assert (
+            await _count(
+                connection,
+                "SELECT COUNT(*) AS count FROM artifact_blobs WHERE artifact_id = ?",
+                ("art_erasure",),
+            )
+            == 0
+        )
     finally:
         await connection.close()
 

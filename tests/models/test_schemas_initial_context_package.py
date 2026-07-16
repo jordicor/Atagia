@@ -112,6 +112,11 @@ def test_record_fields_must_match_key() -> None:
         "source_refs_json": {},
         "diagnostics_json": {},
         "build_status": "active",
+        "source_user_lifecycle_epoch": "ule_test_active",
+        "source_user_revision": 3,
+        "package_row_version": 1,
+        "active_build_attempt_id": "icpa_test",
+        "refresh_generation": 1,
         "created_at": "2026-06-08T00:00:00+00:00",
         "updated_at": "2026-06-08T00:00:00+00:00",
     }

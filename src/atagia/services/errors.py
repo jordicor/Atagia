@@ -15,8 +15,51 @@ class ConversationNotActiveError(AtagiaServiceError):
     """Raised when a write path targets a non-active conversation."""
 
 
+class TranscriptRebuildInProgressError(AtagiaServiceError):
+    """Raised while selected-transcript derived state is not safe to read/write."""
+
+
+class TranscriptSelectionConflictError(AtagiaServiceError):
+    """Raised when a host selection epoch or operation is reused incompatibly."""
+
+
+class TranscriptRebuildRemediationRequiredError(AtagiaServiceError):
+    """Raised when a failed selected-transcript rebuild requires an explicit retry."""
+
+
+class TranscriptRebuildUnavailableError(AtagiaServiceError):
+    """Raised when durable selected-transcript workers are unavailable."""
+
+
 class MessageIdConflictError(AtagiaServiceError):
     """Raised when a caller reuses a message id for incompatible content."""
+
+
+class ProxyTurnError(AtagiaServiceError):
+    """Base error carrying a stable OpenAI-proxy conflict code."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retry_after_seconds = retry_after_seconds
+
+
+class ProxyTurnConflictError(ProxyTurnError):
+    """Raised when stable proxy IDs are reused incompatibly."""
+
+
+class ProxyTurnInProgressError(ProxyTurnError):
+    """Raised when a compatible live generation owner already exists."""
+
+
+class ProxyTurnStaleOwnerError(ProxyTurnError):
+    """Raised when a superseded proxy generation owner attempts an effect."""
 
 
 class SourceSequenceConflictError(AtagiaServiceError):
@@ -43,12 +86,24 @@ class UserDeletedError(AtagiaServiceError):
     """Raised when a user-facing path targets an erased user marker."""
 
 
+class UserErasureCleanupPendingError(AtagiaServiceError):
+    """Raised when canonical erasure succeeded but durable cleanup is pending."""
+
+
+class UserErasureReconciliationRequiredError(AtagiaServiceError):
+    """Raised when a legacy erasure marker lacks current-protocol evidence."""
+
+
 class MemoryNotFoundError(AtagiaServiceError):
     """Raised when a memory object does not exist for the requested user."""
 
 
 class MemoryNotEditableError(AtagiaServiceError):
     """Raised when a memory object cannot be edited in its current state."""
+
+
+class MemoryProvenanceRepairRequiredError(AtagiaServiceError):
+    """Raised when a destructive memory mutation cannot be fenced safely."""
 
 
 class DeletionConfirmationError(AtagiaServiceError):

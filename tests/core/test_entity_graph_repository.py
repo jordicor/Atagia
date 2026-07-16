@@ -14,7 +14,7 @@ from atagia.core.entity_graph_repository import EntityGraphRepository
 from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository, WorkspaceRepository
 from atagia.models.schemas_memory import ConversationStatus, IntimacyBoundary, MemoryScope, MemorySensitivity
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
 
 async def _connection_and_clock() -> tuple[aiosqlite.Connection, FrozenClock]:

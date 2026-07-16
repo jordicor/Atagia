@@ -8,11 +8,18 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+import sqlite3
 from typing import Any, Literal
 
 from atagia import Atagia
 from atagia.core.env import env_bool as _env_bool
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
+from atagia.core.conversation_namespace import (
+    ConversationNamespaceSnapshot,
+    capture_conversation_namespace_snapshot,
+)
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
@@ -20,17 +27,21 @@ from atagia.core.repositories import (
     UserRepository,
     conversation_visibility_clause,
 )
-from atagia.core.space_repository import SpaceRepository, space_snapshot
 from atagia.core.ids import new_job_id
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.core.timestamps import resolve_message_occurred_at
+from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
 from atagia.models.schemas_jobs import (
     CONTRACT_STREAM_NAME,
     EXTRACT_STREAM_NAME,
     JobEnvelope,
     JobType,
 )
-from atagia.models.schemas_memory import ExtractionConversationContext, MemoryScope, MemoryStatus
+from atagia.models.schemas_memory import (
+    ExtractionConversationContext,
+    MemoryScope,
+    MemoryStatus,
+)
 from atagia.models.schemas_replay import AblationConfig
 from atagia.memory.operational_profile import (
     OperationalProfileNotAuthorizedError,
@@ -40,6 +51,7 @@ from atagia.memory.embodiment_policy import embodiment_visibility_sql_clause_for
 from atagia.memory.realm_policy import realm_visibility_sql_clause_for_context
 from atagia.memory.space_policy import space_visibility_sql_clause_for_context
 from atagia.memory.mind_policy import mind_visibility_sql_clause_for_context
+from atagia.memory.retrieval_planner import build_safe_fts_queries
 from atagia.services.chat_support import (
     RECENT_FETCH_LIMIT,
     build_job_payload,
@@ -57,6 +69,8 @@ from atagia.services.errors import (
     InvalidConversationTransitionError,
     MemoryNotEditableError,
     MemoryNotFoundError,
+    TranscriptRebuildInProgressError,
+    TranscriptRebuildRemediationRequiredError,
     UnknownAssistantModeError,
     WorkspaceMismatchError,
     WorkspaceNotFoundError,
@@ -70,13 +84,17 @@ from atagia.services.presence_resolution import (
     resolve_source_presence_for_role,
 )
 from atagia.services.embodiment_resolution import ensure_conversation_active_embodiment
+from atagia.services.mind_resolution import ensure_conversation_active_mind
 from atagia.services.realm_resolution import ensure_conversation_active_realm
+from atagia.services.space_resolution import ensure_conversation_active_space
 from atagia.services.worker_control_service import WorkerControlService
 
 try:
     from mcp.server.fastmcp import Context, FastMCP
     from mcp.server.session import ServerSession
-except ImportError as exc:  # pragma: no cover - exercised only without the extra installed
+except (
+    ImportError
+) as exc:  # pragma: no cover - exercised only without the extra installed
     raise ImportError(
         "MCP support requires the 'mcp' extra. Install with: pip install 'atagia[mcp]'"
     ) from exc
@@ -177,7 +195,63 @@ async def _runtime(engine: Atagia):
     return runtime
 
 
-async def _mcp_namespace_kwargs(
+async def _resolve_mcp_namespace_snapshot(
+    connection: Any,
+    runtime: Any,
+    user_id: str,
+    *,
+    platform_id: str,
+    conversation_id: str,
+    user_persona_id: str | None,
+    character_id: str | None,
+    incognito: bool,
+    embodiment_id: str | None,
+    realm_id: str | None,
+    require_active: bool,
+) -> ConversationNamespaceSnapshot:
+    conversation = await ConversationRepository(
+        connection,
+        runtime.clock,
+    ).get_conversation(conversation_id, user_id)
+    if conversation is None:
+        raise ConversationNotFoundError("Conversation not found for user")
+    if require_active and str(conversation.get("status")) != "active":
+        raise ConversationNotFoundError("Conversation not found for namespace")
+    if (
+        conversation.get("platform_id") != platform_id
+        or conversation.get("user_persona_id") != user_persona_id
+        or conversation.get("character_id") != character_id
+        or bool(conversation.get("incognito")) != bool(incognito)
+    ):
+        raise ConversationNotFoundError("Conversation not found for namespace")
+    if embodiment_id is not None:
+        conversation, _active_embodiment = await ensure_conversation_active_embodiment(
+            connection,
+            runtime.clock,
+            conversation=conversation,
+            embodiment_id=embodiment_id,
+            commit=False,
+        )
+    if realm_id is not None:
+        conversation, _active_realm = await ensure_conversation_active_realm(
+            connection,
+            runtime.clock,
+            conversation=conversation,
+            realm_id=realm_id,
+            commit=False,
+        )
+    snapshot = await capture_conversation_namespace_snapshot(
+        connection,
+        runtime.clock,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    if snapshot is None:
+        raise ValueError("User or conversation namespace was not found")
+    return snapshot
+
+
+async def _mcp_namespace_snapshot(
     engine: Atagia,
     user_id: str,
     *,
@@ -189,7 +263,7 @@ async def _mcp_namespace_kwargs(
     embodiment_id: str | None = None,
     realm_id: str | None = None,
     require_active: bool = True,
-) -> dict[str, Any]:
+) -> ConversationNamespaceSnapshot:
     if conversation_id is None:
         raise ValueError(
             "conversation_id is required for MCP namespace mutations; pass it or set "
@@ -198,62 +272,32 @@ async def _mcp_namespace_kwargs(
     runtime = await _runtime(engine)
     connection = await runtime.open_connection()
     try:
-        conversation = await ConversationRepository(
+        rebuilds = TranscriptRebuildRepository(
             connection,
             runtime.clock,
-        ).get_conversation(conversation_id, user_id)
-        if conversation is None:
-            raise ConversationNotFoundError("Conversation not found for user")
-        if require_active and str(conversation.get("status")) != "active":
-            raise ConversationNotFoundError("Conversation not found for namespace")
-        if (
-            conversation.get("platform_id") != platform_id
-            or conversation.get("user_persona_id") != user_persona_id
-            or conversation.get("character_id") != character_id
-            or bool(conversation.get("incognito")) != bool(incognito)
-        ):
-            raise ConversationNotFoundError("Conversation not found for namespace")
-        if embodiment_id is not None:
-            conversation, _active_embodiment = await ensure_conversation_active_embodiment(
+        )
+        availability = await rebuilds.capture_user_availability_snapshot(user_id)
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            await rebuilds.require_user_availability_snapshot(user_id, availability)
+            namespace = await _resolve_mcp_namespace_snapshot(
                 connection,
-                runtime.clock,
-                conversation=conversation,
+                runtime,
+                user_id,
+                platform_id=platform_id,
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                character_id=character_id,
+                incognito=incognito,
                 embodiment_id=embodiment_id,
-            )
-        if realm_id is not None:
-            conversation, _active_realm = await ensure_conversation_active_realm(
-                connection,
-                runtime.clock,
-                conversation=conversation,
                 realm_id=realm_id,
+                require_active=require_active,
             )
-        preferences = await UserRepository(connection, runtime.clock).get_memory_preferences(user_id)
-        if preferences is None:
-            raise ValueError("User not found")
-        active_space_id = conversation.get("active_space_id")
-        active_space_boundary_mode = None
-        if active_space_id is not None:
-            space_row = await SpaceRepository(connection, runtime.clock).get_space(
-                owner_user_id=user_id,
-                space_id=str(active_space_id),
-            )
-            if space_row is not None:
-                active_space_boundary_mode = space_snapshot(space_row).boundary_mode.value
-        return {
-            "conversation_id": conversation_id,
-            "user_persona_id": user_persona_id,
-            "platform_id": platform_id,
-            "character_id": character_id,
-            "incognito": incognito,
-            "remember_across_chats": bool(preferences["remember_across_chats"]),
-            "remember_across_devices": bool(preferences["remember_across_devices"]),
-            "active_space_id": active_space_id,
-            "active_space_boundary_mode": active_space_boundary_mode,
-            "active_mind_id": conversation.get("active_mind_id"),
-            "mind_topology": conversation.get("mind_topology") or "unimind",
-            "active_embodiment_id": conversation.get("active_embodiment_id"),
-            "active_realm_id": conversation.get("active_realm_id"),
-        }
+            await connection.commit()
+            return namespace
+        except BaseException:
+            await connection.rollback()
+            raise
     finally:
         await connection.close()
 
@@ -416,23 +460,37 @@ async def _add_memory_impl(
     incognito: bool = False,
 ) -> str:
     """Store a user message and enqueue extraction jobs."""
-    resolved_conversation_id = await _ensure_conversation_id(
-        engine,
-        user_id,
-        platform_id,
-        conversation_id,
-        default_conversation_id=default_conversation_id,
-        user_persona_id=user_persona_id,
-        character_id=character_id,
-        active_presence_id=active_presence_id,
-        mind_id=mind_id,
-        mind_topology=mind_topology,
-        embodiment_id=embodiment_id,
-        realm_id=realm_id,
-        space_id=space_id,
-        incognito=incognito,
-    )
+    resolved_conversation_id = conversation_id or default_conversation_id
+    if resolved_conversation_id is None:
+        raise ValueError(
+            "conversation_id is required for MCP tools; pass it or set "
+            "ATAGIA_CONVERSATION_ID"
+        )
     runtime = await _runtime(engine)
+    bootstrap_connection = await runtime.open_connection()
+    try:
+        existing_conversation = await ConversationRepository(
+            bootstrap_connection,
+            runtime.clock,
+        ).get_conversation(resolved_conversation_id, user_id)
+    finally:
+        await bootstrap_connection.close()
+    if existing_conversation is None:
+        resolved_conversation_id = await _ensure_conversation_id(
+            engine,
+            user_id,
+            platform_id,
+            resolved_conversation_id,
+            user_persona_id=user_persona_id,
+            character_id=character_id,
+            active_presence_id=active_presence_id,
+            mind_id=mind_id,
+            mind_topology=mind_topology,
+            embodiment_id=embodiment_id,
+            realm_id=realm_id,
+            space_id=space_id,
+            incognito=incognito,
+        )
     resolved_operational_profile = resolve_operational_profile(
         loader=runtime.operational_profile_loader,
         settings=runtime.settings,
@@ -444,34 +502,99 @@ async def _add_memory_impl(
         await wait_for_in_memory_worker_quiescence(runtime)
         connection = await runtime.open_connection()
         try:
+            rebuilds = TranscriptRebuildRepository(
+                connection,
+                runtime.clock,
+            )
+            availability = await rebuilds.capture_user_availability_snapshot(user_id)
             conversations = ConversationRepository(connection, runtime.clock)
             users = UserRepository(connection, runtime.clock)
             messages = MessageRepository(connection, runtime.clock)
-            conversation = await conversations.get_conversation(resolved_conversation_id, user_id)
-            if conversation is None:
-                raise ValueError("Conversation not found for user")
-            conversation, active_presence = await ensure_conversation_active_presence(
-                connection,
-                runtime.clock,
-                conversation=conversation,
-                active_presence_id=active_presence_id,
-                character_id=character_id,
-            )
-            source_presence = await resolve_source_presence_for_role(
-                connection,
-                runtime.clock,
-                owner_user_id=user_id,
-                role="user",
-                active_presence=active_presence,
-            )
-            memory_preferences = await users.get_memory_preferences(user_id)
-            prior_messages = await messages.get_recent_messages(
-                resolved_conversation_id,
-                user_id,
-                limit=RECENT_FETCH_LIMIT,
-            )
-            await connection.execute("BEGIN")
+            await connection.execute("BEGIN IMMEDIATE")
             try:
+                await rebuilds.require_user_availability_snapshot(
+                    user_id,
+                    availability,
+                )
+                conversation = await conversations.get_conversation(
+                    resolved_conversation_id,
+                    user_id,
+                )
+                if conversation is None:
+                    raise ValueError("Conversation not found for user")
+                if str(conversation.get("status")) != "active":
+                    raise ConversationNotActiveError("Conversation is not active")
+                if (
+                    conversation.get("platform_id") != platform_id
+                    or conversation.get("user_persona_id") != user_persona_id
+                    or conversation.get("character_id") != character_id
+                    or bool(conversation.get("incognito")) != bool(incognito)
+                ):
+                    raise ConversationNotFoundError(
+                        "Conversation not found for namespace"
+                    )
+                (
+                    conversation,
+                    active_presence,
+                ) = await ensure_conversation_active_presence(
+                    connection,
+                    runtime.clock,
+                    conversation=conversation,
+                    active_presence_id=active_presence_id,
+                    character_id=character_id,
+                    commit=False,
+                )
+                source_presence = await resolve_source_presence_for_role(
+                    connection,
+                    runtime.clock,
+                    owner_user_id=user_id,
+                    role="user",
+                    active_presence=active_presence,
+                    commit=False,
+                )
+                conversation, _active_mind = await ensure_conversation_active_mind(
+                    connection,
+                    runtime.clock,
+                    conversation=conversation,
+                    mind_id=mind_id,
+                    mind_topology=mind_topology,
+                    active_presence=active_presence,
+                    character_id=character_id,
+                    commit=False,
+                )
+                (
+                    conversation,
+                    _active_embodiment,
+                ) = await ensure_conversation_active_embodiment(
+                    connection,
+                    runtime.clock,
+                    conversation=conversation,
+                    embodiment_id=embodiment_id,
+                    commit=False,
+                )
+                conversation, _active_realm = await ensure_conversation_active_realm(
+                    connection,
+                    runtime.clock,
+                    conversation=conversation,
+                    realm_id=realm_id,
+                    commit=False,
+                )
+                conversation, _active_space = await ensure_conversation_active_space(
+                    connection,
+                    runtime.clock,
+                    conversation=conversation,
+                    space_id=space_id,
+                    workspace_id=conversation.get("workspace_id"),
+                    commit=False,
+                )
+                memory_preferences = await users.get_memory_preferences(user_id)
+                if memory_preferences is None:
+                    raise ValueError("User not found")
+                prior_messages = await messages.get_recent_messages(
+                    resolved_conversation_id,
+                    user_id,
+                    limit=RECENT_FETCH_LIMIT,
+                )
                 message_occurred_at = runtime.clock.now().isoformat()
                 user_message = await messages.create_message(
                     message_id=None,
@@ -508,63 +631,82 @@ async def _add_memory_impl(
                     message_occurred_at=resolve_message_occurred_at(user_message),
                     role="user",
                 ).model_dump(mode="json")
-                await cache_service.invalidate_conversation_cache_for_conversation(conversation)
+                jobs = [
+                    (
+                        EXTRACT_STREAM_NAME,
+                        JobEnvelope(
+                            job_id=new_job_id(),
+                            job_type=JobType.EXTRACT_MEMORY_CANDIDATES,
+                            user_id=user_id,
+                            conversation_id=resolved_conversation_id,
+                            message_ids=[str(user_message["id"])],
+                            payload=payload,
+                            created_at=runtime.clock.now(),
+                            operational_profile=resolved_operational_profile.snapshot,
+                        ),
+                    ),
+                    (
+                        CONTRACT_STREAM_NAME,
+                        JobEnvelope(
+                            job_id=new_job_id(),
+                            job_type=JobType.PROJECT_CONTRACT,
+                            user_id=user_id,
+                            conversation_id=resolved_conversation_id,
+                            message_ids=[str(user_message["id"])],
+                            payload=payload,
+                            created_at=runtime.clock.now(),
+                            operational_profile=resolved_operational_profile.snapshot,
+                        ),
+                    ),
+                ]
+                job_tracking = JobTrackingService(
+                    connection,
+                    runtime.clock,
+                    workers_enabled=runtime.settings.workers_enabled,
+                    settings=runtime.settings,
+                )
+                await enqueue_message_jobs(
+                    storage_backend=runtime.storage_backend,
+                    jobs=jobs,
+                    job_tracking_service=job_tracking,
+                    worker_control_service=WorkerControlService(
+                        connection,
+                        runtime.clock,
+                    ),
+                    initial_context_package_repository=(
+                        InitialContextPackageRepository(
+                            connection,
+                            runtime.clock,
+                        )
+                    ),
+                    initial_context_package_refresh_enabled=(
+                        runtime.settings.initial_context_package_refresh_enabled
+                    ),
+                    commit=False,
+                    dispatch=False,
+                )
                 await connection.commit()
-            except Exception:
+            except BaseException:
                 await connection.rollback()
                 raise
+            try:
+                await job_tracking.dispatch_pending_jobs(runtime.storage_backend)
+            except Exception:
+                logger.warning(
+                    "Durable MCP add-memory jobs await dispatcher recovery",
+                    exc_info=True,
+                )
+            try:
+                await cache_service.invalidate_conversation_cache_for_conversation(
+                    conversation
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to invalidate MCP add-memory context cache",
+                    exc_info=True,
+                )
         finally:
             await connection.close()
-
-        extract_job = JobEnvelope(
-            job_id=new_job_id(),
-            job_type=JobType.EXTRACT_MEMORY_CANDIDATES,
-            user_id=user_id,
-            conversation_id=resolved_conversation_id,
-            message_ids=[str(user_message["id"])],
-            payload=payload,
-            created_at=runtime.clock.now(),
-            operational_profile=resolved_operational_profile.snapshot,
-        )
-        contract_job = JobEnvelope(
-            job_id=new_job_id(),
-            job_type=JobType.PROJECT_CONTRACT,
-            user_id=user_id,
-            conversation_id=resolved_conversation_id,
-            message_ids=[str(user_message["id"])],
-            payload=payload,
-            created_at=runtime.clock.now(),
-            operational_profile=resolved_operational_profile.snapshot,
-        )
-        tracking_connection = await runtime.open_connection()
-        try:
-            job_tracking = JobTrackingService(
-                tracking_connection,
-                runtime.clock,
-                workers_enabled=runtime.settings.workers_enabled,
-                settings=runtime.settings,
-            )
-            await enqueue_message_jobs(
-                storage_backend=runtime.storage_backend,
-                jobs=[
-                    (EXTRACT_STREAM_NAME, extract_job),
-                    (CONTRACT_STREAM_NAME, contract_job),
-                ],
-                job_tracking_service=job_tracking,
-                worker_control_service=WorkerControlService(
-                    tracking_connection,
-                    runtime.clock,
-                ),
-                initial_context_package_repository=InitialContextPackageRepository(
-                    tracking_connection,
-                    runtime.clock,
-                ),
-                initial_context_package_refresh_enabled=(
-                    runtime.settings.initial_context_package_refresh_enabled
-                ),
-            )
-        finally:
-            await tracking_connection.close()
     return (
         f"Stored memory candidate message {user_message['id']} "
         f"in conversation {resolved_conversation_id}."
@@ -612,26 +754,46 @@ async def _search_memories_impl(
 ) -> str:
     """Search memories via FTS and return a JSON array string."""
     runtime = await _runtime(engine)
-    namespace_kwargs = await _mcp_namespace_kwargs(
-        engine,
-        user_id,
-        platform_id=platform_id,
-        conversation_id=conversation_id,
-        user_persona_id=user_persona_id,
-        character_id=character_id,
-        embodiment_id=embodiment_id,
-        realm_id=realm_id,
-        incognito=incognito,
-    )
+    if conversation_id is None:
+        raise ValueError(
+            "conversation_id is required for MCP namespace mutations; pass it or set "
+            "ATAGIA_CONVERSATION_ID"
+        )
     connection = await runtime.open_connection()
     try:
-        rows = await _search_visible_mcp_memories(
+        rebuilds = TranscriptRebuildRepository(
             connection,
-            user_id=user_id,
-            query=query,
-            limit=limit,
-            **namespace_kwargs,
+            runtime.clock,
         )
+        availability = await rebuilds.capture_user_availability_snapshot(user_id)
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            await rebuilds.require_user_availability_snapshot(user_id, availability)
+            namespace = await _resolve_mcp_namespace_snapshot(
+                connection,
+                runtime,
+                user_id,
+                platform_id=platform_id,
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                character_id=character_id,
+                incognito=incognito,
+                embodiment_id=embodiment_id,
+                realm_id=realm_id,
+                require_active=True,
+            )
+            rows = await _search_visible_mcp_memories(
+                connection,
+                user_id=user_id,
+                query=query,
+                limit=limit,
+                **namespace.memory_visibility_kwargs(),
+            )
+            await rebuilds.require_user_availability_snapshot(user_id, availability)
+            await connection.commit()
+        except BaseException:
+            await connection.rollback()
+            raise
     finally:
         await connection.close()
     filtered = [
@@ -664,27 +826,46 @@ async def _list_memories_impl(
 ) -> str:
     """List stored memories as a JSON array string."""
     runtime = await _runtime(engine)
-    namespace_kwargs = await _mcp_namespace_kwargs(
-        engine,
-        user_id,
-        platform_id=platform_id,
-        conversation_id=conversation_id,
-        user_persona_id=user_persona_id,
-        character_id=character_id,
-        embodiment_id=embodiment_id,
-        realm_id=realm_id,
-        incognito=incognito,
-        require_active=False,
-    )
+    if conversation_id is None:
+        raise ValueError(
+            "conversation_id is required for MCP namespace mutations; pass it or set "
+            "ATAGIA_CONVERSATION_ID"
+        )
     connection = await runtime.open_connection()
     try:
-        rows = await _list_visible_mcp_memories(
+        rebuilds = TranscriptRebuildRepository(
             connection,
-            user_id=user_id,
-            memory_type=memory_type,
-            limit=limit,
-            **namespace_kwargs,
+            runtime.clock,
         )
+        availability = await rebuilds.capture_user_availability_snapshot(user_id)
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            await rebuilds.require_user_availability_snapshot(user_id, availability)
+            namespace = await _resolve_mcp_namespace_snapshot(
+                connection,
+                runtime,
+                user_id,
+                platform_id=platform_id,
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                character_id=character_id,
+                incognito=incognito,
+                embodiment_id=embodiment_id,
+                realm_id=realm_id,
+                require_active=False,
+            )
+            rows = await _list_visible_mcp_memories(
+                connection,
+                user_id=user_id,
+                memory_type=memory_type,
+                limit=limit,
+                **namespace.memory_visibility_kwargs(),
+            )
+            await rebuilds.require_user_availability_snapshot(user_id, availability)
+            await connection.commit()
+        except BaseException:
+            await connection.rollback()
+            raise
     finally:
         await connection.close()
     payload = [
@@ -720,17 +901,19 @@ async def _list_visible_mcp_memories(
     active_embodiment_id: str | None,
     active_realm_id: str | None,
 ) -> list[dict[str, Any]]:
-    visibility_clauses, visibility_parameters = MemoryObjectRepository.namespace_visibility_clauses(
-        [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
-        user_persona_id=user_persona_id,
-        platform_id=platform_id,
-        character_id=character_id,
-        conversation_id=conversation_id,
-        remember_across_chats=remember_across_chats,
-        remember_across_devices=remember_across_devices,
-        incognito=incognito,
-        sensitivity_gates_enabled=False,
-        table_alias="mo",
+    visibility_clauses, visibility_parameters = (
+        MemoryObjectRepository.namespace_visibility_clauses(
+            [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            conversation_id=conversation_id,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+            incognito=incognito,
+            sensitivity_gates_enabled=False,
+            table_alias="mo",
+        )
     )
     if not visibility_clauses:
         return []
@@ -744,9 +927,11 @@ async def _list_visible_mcp_memories(
         mind_topology=mind_topology,
         alias="mo",
     )
-    embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
-        active_embodiment_id=active_embodiment_id,
-        alias="mo",
+    embodiment_clause, embodiment_parameters = (
+        embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="mo",
+        )
     )
     realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
         active_realm_id=active_realm_id,
@@ -812,17 +997,25 @@ async def _search_visible_mcp_memories(
     active_embodiment_id: str | None,
     active_realm_id: str | None,
 ) -> list[dict[str, Any]]:
-    visibility_clauses, visibility_parameters = MemoryObjectRepository.namespace_visibility_clauses(
-        [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
-        user_persona_id=user_persona_id,
-        platform_id=platform_id,
-        character_id=character_id,
-        conversation_id=conversation_id,
-        remember_across_chats=remember_across_chats,
-        remember_across_devices=remember_across_devices,
-        incognito=incognito,
-        sensitivity_gates_enabled=False,
-        table_alias="mo",
+    # Keep ``query`` as the original user text and derive a separate,
+    # grammar-safe representation solely for SQLite FTS5 MATCH.
+    fts_queries = build_safe_fts_queries(query)
+    if not fts_queries:
+        return []
+    fts_query = fts_queries[0]
+    visibility_clauses, visibility_parameters = (
+        MemoryObjectRepository.namespace_visibility_clauses(
+            [MemoryScope.CHAT, MemoryScope.CHARACTER, MemoryScope.USER],
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            conversation_id=conversation_id,
+            remember_across_chats=remember_across_chats,
+            remember_across_devices=remember_across_devices,
+            incognito=incognito,
+            sensitivity_gates_enabled=False,
+            table_alias="mo",
+        )
     )
     if not visibility_clauses:
         return []
@@ -836,9 +1029,11 @@ async def _search_visible_mcp_memories(
         mind_topology=mind_topology,
         alias="mo",
     )
-    embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
-        active_embodiment_id=active_embodiment_id,
-        alias="mo",
+    embodiment_clause, embodiment_parameters = (
+        embodiment_visibility_sql_clause_for_context(
+            active_embodiment_id=active_embodiment_id,
+            alias="mo",
+        )
     )
     realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
         active_realm_id=active_realm_id,
@@ -858,7 +1053,7 @@ async def _search_visible_mcp_memories(
     ]
     parameters: list[Any] = [
         user_id,
-        query,
+        fts_query,
         MemoryStatus.ACTIVE.value,
         conversation_id,
         *visibility_parameters,
@@ -868,19 +1063,25 @@ async def _search_visible_mcp_memories(
         *realm_parameters,
         max(1, min(100, int(limit))),
     ]
-    cursor = await connection.execute(
-        """
-        SELECT
-            mo.*,
-            bm25(memory_objects_fts) AS rank
-        FROM memory_objects_fts
-        JOIN memory_objects AS mo ON mo._rowid = memory_objects_fts.rowid
-        WHERE {clauses}
-        ORDER BY rank ASC, mo.created_at DESC
-        LIMIT ?
-        """.format(clauses=" AND ".join(clauses)),
-        tuple(parameters),
-    )
+    try:
+        cursor = await connection.execute(
+            """
+            SELECT
+                mo.*,
+                bm25(memory_objects_fts) AS rank
+            FROM memory_objects_fts
+            JOIN memory_objects AS mo ON mo._rowid = memory_objects_fts.rowid
+            WHERE {clauses}
+            ORDER BY rank ASC, mo.created_at DESC
+            LIMIT ?
+            """.format(clauses=" AND ".join(clauses)),
+            tuple(parameters),
+        )
+    except sqlite3.OperationalError as exc:
+        logger.warning(
+            "MCP FTS query failed after mechanical sanitization", exc_info=True
+        )
+        raise ValueError("Memory search query could not be processed") from exc
     return [dict(row) for row in await cursor.fetchall()]
 
 
@@ -901,7 +1102,7 @@ async def _delete_memory_impl(
 ) -> str:
     """Archive or hard-delete a memory object and return a confirmation string."""
     runtime = await _runtime(engine)
-    namespace_kwargs = await _mcp_namespace_kwargs(
+    namespace = await _mcp_namespace_snapshot(
         engine,
         user_id,
         platform_id=platform_id,
@@ -912,21 +1113,24 @@ async def _delete_memory_impl(
         realm_id=realm_id,
         incognito=incognito,
     )
-    cache_service = ContextCacheService(runtime)
-    async with cache_service.user_cache_guard(user_id):
-        await wait_for_in_memory_worker_quiescence(runtime)
-        connection = await runtime.open_connection()
-        try:
-            await ConversationLifecycleService(runtime).delete_memory(
-                connection,
-                user_id=user_id,
-                memory_id=memory_id,
-                hard=hard,
-                confirmation=confirmation,
-                **namespace_kwargs,
-            )
-        finally:
-            await connection.close()
+    await wait_for_in_memory_worker_quiescence(runtime)
+    connection = await runtime.open_connection()
+    try:
+        await TranscriptRebuildRepository(
+            connection,
+            runtime.clock,
+        ).require_user_available(user_id)
+        await ConversationLifecycleService(runtime).delete_memory(
+            connection,
+            user_id=user_id,
+            memory_id=memory_id,
+            hard=hard,
+            confirmation=confirmation,
+            **namespace.memory_visibility_kwargs(),
+            namespace_guard=namespace,
+        )
+    finally:
+        await connection.close()
     action = "Hard-deleted" if hard else "Archived"
     return f"{action} memory {memory_id}."
 
@@ -946,7 +1150,7 @@ async def _edit_memory_impl(
     incognito: bool = False,
 ) -> str:
     runtime = await _runtime(engine)
-    namespace_kwargs = await _mcp_namespace_kwargs(
+    namespace = await _mcp_namespace_snapshot(
         engine,
         user_id,
         platform_id=platform_id,
@@ -957,21 +1161,24 @@ async def _edit_memory_impl(
         realm_id=realm_id,
         incognito=incognito,
     )
-    cache_service = ContextCacheService(runtime)
-    async with cache_service.user_cache_guard(user_id):
-        await wait_for_in_memory_worker_quiescence(runtime)
-        connection = await runtime.open_connection()
-        try:
-            memory = await ConversationLifecycleService(runtime).edit_memory(
-                connection,
-                user_id=user_id,
-                memory_id=memory_id,
-                new_text=canonical_text,
-                edit_source="mcp",
-                **namespace_kwargs,
-            )
-        finally:
-            await connection.close()
+    await wait_for_in_memory_worker_quiescence(runtime)
+    connection = await runtime.open_connection()
+    try:
+        await TranscriptRebuildRepository(
+            connection,
+            runtime.clock,
+        ).require_user_available(user_id)
+        memory = await ConversationLifecycleService(runtime).edit_memory(
+            connection,
+            user_id=user_id,
+            memory_id=memory_id,
+            new_text=canonical_text,
+            edit_source="mcp",
+            **namespace.memory_visibility_kwargs(),
+            namespace_guard=namespace,
+        )
+    finally:
+        await connection.close()
     return json.dumps(
         {"id": memory["id"], "canonical_text": memory["canonical_text"]},
         ensure_ascii=False,
@@ -990,7 +1197,7 @@ async def _close_conversation_impl(
     incognito: bool = False,
 ) -> str:
     runtime = await _runtime(engine)
-    await _mcp_namespace_kwargs(
+    namespace = await _mcp_namespace_snapshot(
         engine,
         user_id,
         platform_id=platform_id,
@@ -1001,10 +1208,15 @@ async def _close_conversation_impl(
     )
     connection = await runtime.open_connection()
     try:
+        await TranscriptRebuildRepository(
+            connection,
+            runtime.clock,
+        ).require_user_available(user_id)
         result = await ConversationLifecycleService(runtime).close_conversation(
             connection,
             user_id=user_id,
             conversation_id=conversation_id,
+            namespace_guard=namespace,
         )
     finally:
         await connection.close()
@@ -1026,7 +1238,7 @@ async def _archive_conversation_impl(
     incognito: bool = False,
 ) -> str:
     runtime = await _runtime(engine)
-    await _mcp_namespace_kwargs(
+    namespace = await _mcp_namespace_snapshot(
         engine,
         user_id,
         platform_id=platform_id,
@@ -1038,10 +1250,15 @@ async def _archive_conversation_impl(
     )
     connection = await runtime.open_connection()
     try:
+        await TranscriptRebuildRepository(
+            connection,
+            runtime.clock,
+        ).require_user_available(user_id)
         result = await ConversationLifecycleService(runtime).archive_conversation(
             connection,
             user_id=user_id,
             conversation_id=conversation_id,
+            namespace_guard=namespace,
         )
     finally:
         await connection.close()
@@ -1060,7 +1277,7 @@ async def _delete_conversation_impl(
     confirmation: str | None = None,
 ) -> str:
     runtime = await _runtime(engine)
-    await _mcp_namespace_kwargs(
+    namespace = await _mcp_namespace_snapshot(
         engine,
         user_id,
         platform_id=platform_id,
@@ -1070,20 +1287,25 @@ async def _delete_conversation_impl(
         incognito=incognito,
         require_active=False,
     )
-    cache_service = ContextCacheService(runtime)
-    async with cache_service.user_cache_guard(user_id):
-        await wait_for_in_memory_worker_quiescence(runtime)
-        connection = await runtime.open_connection()
-        try:
-            report = await ConversationLifecycleService(runtime).delete_conversation(
-                connection,
-                user_id=user_id,
-                conversation_id=conversation_id,
-                confirmation=confirmation,
-            )
-        finally:
-            await connection.close()
-    return json.dumps(report.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+    await wait_for_in_memory_worker_quiescence(runtime)
+    connection = await runtime.open_connection()
+    try:
+        await TranscriptRebuildRepository(
+            connection,
+            runtime.clock,
+        ).require_user_available(user_id)
+        report = await ConversationLifecycleService(runtime).delete_conversation(
+            connection,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            confirmation=confirmation,
+            namespace_guard=namespace,
+        )
+    finally:
+        await connection.close()
+    return json.dumps(
+        report.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
+    )
 
 
 def _conversation_context(
@@ -1120,12 +1342,14 @@ def _conversation_context(
         source_presence_kind=source_presence_kind,
         source_presence_display_name=source_presence_display_name,
         active_space_id=conversation.get("active_space_id"),
-        active_space_boundary_mode=conversation.get("active_space_boundary_mode") or "focus",
+        active_space_boundary_mode=conversation.get("active_space_boundary_mode")
+        or "focus",
         active_mind_id=conversation.get("active_mind_id"),
         source_mind_id=conversation.get("active_mind_id"),
         mind_topology=conversation.get("mind_topology") or "unimind",
         active_embodiment_id=conversation.get("active_embodiment_id"),
-        cross_embodiment_mode=conversation.get("cross_embodiment_mode") or "direct_if_same_body",
+        cross_embodiment_mode=conversation.get("cross_embodiment_mode")
+        or "direct_if_same_body",
         active_realm_id=conversation.get("active_realm_id"),
         cross_realm_mode=conversation.get("cross_realm_mode") or "none",
         mode=str(conversation.get("mode") or conversation["assistant_mode_id"]),
@@ -1134,7 +1358,8 @@ def _conversation_context(
         temporary_ttl_seconds=conversation.get("temporary_ttl_seconds"),
         purge_on_close=bool(conversation.get("purge_on_close")),
         isolated_mode=bool(conversation.get("isolated_mode")),
-        incognito=bool(conversation.get("incognito")) or bool(conversation.get("isolated_mode")),
+        incognito=bool(conversation.get("incognito"))
+        or bool(conversation.get("isolated_mode")),
         remember_across_chats=bool(preferences.get("remember_across_chats", True)),
         remember_across_devices=bool(preferences.get("remember_across_devices", True)),
         memory_privacy_mode=str(preferences.get("memory_privacy_mode") or "balanced"),
@@ -1157,6 +1382,8 @@ _EXPECTED_TOOL_ERRORS = (
     MemoryNotEditableError,
     MemoryNotFoundError,
     OperationalProfileNotAuthorizedError,
+    TranscriptRebuildInProgressError,
+    TranscriptRebuildRemediationRequiredError,
     UnknownAssistantModeError,
     UnknownOperationalProfileError,
     ValueError,
@@ -1205,8 +1432,7 @@ async def atagia_get_context(
             ),
             mind_id=mind_id or ctx.request_context.lifespan_context.mind_id,
             mind_topology=(
-                mind_topology
-                or ctx.request_context.lifespan_context.mind_topology
+                mind_topology or ctx.request_context.lifespan_context.mind_topology
             ),
             embodiment_id=(
                 embodiment_id or ctx.request_context.lifespan_context.embodiment_id
@@ -1257,8 +1483,7 @@ async def atagia_add_memory(
             ),
             mind_id=mind_id or ctx.request_context.lifespan_context.mind_id,
             mind_topology=(
-                mind_topology
-                or ctx.request_context.lifespan_context.mind_topology
+                mind_topology or ctx.request_context.lifespan_context.mind_topology
             ),
             embodiment_id=(
                 embodiment_id or ctx.request_context.lifespan_context.embodiment_id

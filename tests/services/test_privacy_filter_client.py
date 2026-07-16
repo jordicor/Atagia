@@ -28,14 +28,14 @@ async def test_detect_uses_primary_endpoint_and_strips_raw_span_text() -> None:
             200,
             json={
                 "spans": [
-                    {"label": "private_address", "start": 7, "end": 11, "text": "3847"}
+                    {"label": "private_address", "start": 7, "end": 11, "text": "8642"}
                 ]
             },
         )
 
     client = _client(httpx.MockTransport(handler))
 
-    detection = await client.detect("code is 3847")
+    detection = await client.detect("code is 8642")
 
     assert detection.endpoint_used == "http://primary.test"
     assert detection.span_count == 1

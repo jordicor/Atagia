@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from atagia.core.clock import FrozenClock
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 from atagia.memory.need_detector import NeedDetector
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.models.schemas_memory import (
@@ -26,7 +26,7 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 class CannedCardProvider(LLMProvider):
@@ -75,8 +75,8 @@ def _clock() -> FrozenClock:
 def _settings() -> Settings:
     return Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         openai_api_key=None,
@@ -112,7 +112,7 @@ async def _detect(message: str, outputs: dict[str, str]):
 @pytest.mark.asyncio
 async def test_exact_slot_fill_for_spanish_address_query() -> None:
     result, provider = await _detect(
-        "Cual es la direccion del nuevo apartamento de Ben?",
+        "Cual es la direccion del nuevo estudio de Nora?",
         {
             "need_detection_needs_card": "none",
             "need_detection_language_card": "es\nes",
@@ -121,7 +121,7 @@ async def test_exact_slot_fill_for_spanish_address_query() -> None:
             "need_detection_shape_card": "slot",
             "need_detection_facets_card": "location",
             "need_detection_callback_card": "no",
-            "need_detection_search_words_card": "Ben\napartamento\ndireccion",
+            "need_detection_search_words_card": "Nora\nestudio\ndireccion",
             "need_detection_search_words_other_language_card": "none",
         },
     )
@@ -134,8 +134,8 @@ async def test_exact_slot_fill_for_spanish_address_query() -> None:
     assert result.exact_recall_needed is True
     assert result.exact_facets == [ExactFacet.LOCATION]
     assert result.sparse_query_hints[0].must_keep_terms == [
-        "Ben",
-        "apartamento",
+        "Nora",
+        "estudio",
         "direccion",
     ]
 
@@ -174,7 +174,7 @@ async def test_exact_facets_cover_multiple_saved_detail_types() -> None:
 @pytest.mark.asyncio
 async def test_broad_list_exact_recall_keeps_original_query_as_single_sub_query() -> None:
     result, _provider = await _detect(
-        "What concrete things was Ben planning for Sarah's birthday trip?",
+        "What concrete items was Nora packing for Imani's field expedition?",
         {
             "need_detection_needs_card": "none",
             "need_detection_language_card": "en\nen",
@@ -183,7 +183,7 @@ async def test_broad_list_exact_recall_keeps_original_query_as_single_sub_query(
             "need_detection_shape_card": "list",
             "need_detection_facets_card": "location\nquantity\nwording",
             "need_detection_callback_card": "no",
-            "need_detection_search_words_card": "Ben\nSarah\nbirthday\ntrip",
+            "need_detection_search_words_card": "Nora\nImani\nfield\nexpedition",
             "need_detection_search_words_other_language_card": "none",
         },
     )
@@ -191,13 +191,13 @@ async def test_broad_list_exact_recall_keeps_original_query_as_single_sub_query(
     assert result.query_type == "broad_list"
     assert result.exact_recall_needed is True
     assert result.sub_queries == [
-        "What concrete things was Ben planning for Sarah's birthday trip?"
+        "What concrete items was Nora packing for Imani's field expedition?"
     ]
     assert result.sparse_query_hints[0].must_keep_terms == [
-        "Ben",
-        "Sarah",
-        "birthday",
-        "trip",
+        "Nora",
+        "Imani",
+        "field",
+        "expedition",
     ]
 
 

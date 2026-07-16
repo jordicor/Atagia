@@ -23,46 +23,46 @@ from atagia.services.llm_client import LLMCompletionResponse
 
 def test_deterministic_coverage_requires_every_required_item() -> None:
     spec = CoverageSpec(
-        question_id="conv-30:q25",
+        question_id="synthetic-coverage:q1",
         required_items=[
-            CoverageItem(label="fair"),
-            CoverageItem(label="networking events", aliases=["networking event"]),
-            CoverageItem(label="dance competition"),
+            CoverageItem(label="amber sundial"),
+            CoverageItem(label="folding beacon", aliases=["collapsible beacon"]),
+            CoverageItem(label="ceramic weather sensor"),
         ],
     )
 
     verdict, checks = deterministic_coverage_verdict(
-        "Jon went to a fair and networking events.",
+        "Mira completed the amber sundial and a folding beacon.",
         spec,
     )
 
     assert checks == {
-        "fair": True,
-        "networking events": True,
-        "dance competition": False,
+        "amber sundial": True,
+        "folding beacon": True,
+        "ceramic weather sensor": False,
     }
     assert verdict.binary_score == 0
-    assert verdict.required_items_missing == ["dance competition"]
+    assert verdict.required_items_missing == ["ceramic weather sensor"]
 
 
 def test_report_separates_legacy_judge_from_strict_coverage() -> None:
     spec = CoverageSpec(
-        question_id="conv-30:q24",
+        question_id="fixture-broad-list",
         required_items=[
-            CoverageItem(label="artist collaboration", aliases=["local artist"]),
-            CoverageItem(label="limited-edition sweatshirts"),
+            CoverageItem(label="copper kite", aliases=["kite prototype"]),
+            CoverageItem(label="maple lantern"),
         ],
     )
     record = AnswerRecord(
-        question_id="conv-30:q24",
-        question_text="How did Gina promote her clothes store?",
-        ground_truth="artist collaboration, limited-edition sweatshirts",
-        prediction="She teamed up with a local artist.",
+        question_id="fixture-broad-list",
+        question_text="Which prototype exhibits did I finish this month?",
+        ground_truth="I finished the copper kite and the maple lantern.",
+        prediction="I finished the copper kite.",
         report_source="report.json",
         source_kind="unit",
         legacy_judge_score=1,
-        legacy_judge_reasoning="Close enough.",
-        selected_context_text="Gina made limited-edition sweatshirts.",
+        legacy_judge_reasoning="Semantically close.",
+        selected_context_text="The notes also mention the maple lantern.",
     )
 
     report = build_coverage_report(
@@ -76,7 +76,7 @@ def test_report_separates_legacy_judge_from_strict_coverage() -> None:
     assert result.legacy_judge_score == 1
     assert result.strict_coverage_score == 0
     assert report.legacy_pass_strict_fail == 1
-    assert result.missing_items_selected_context == ["limited-edition sweatshirts"]
+    assert result.missing_items_selected_context == ["maple lantern"]
     assert result.failure_categories == [
         "legacy_judge_permissive",
         "evidence_selected_but_omitted",

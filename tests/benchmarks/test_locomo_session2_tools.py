@@ -139,13 +139,13 @@ def test_full_runner_skips_evaluate_when_ingest_fails(
 def test_mode_comparison_reports_pairwise_question_deltas() -> None:
     before = _report(
         score=0,
-        prediction="blue",
+        prediction="plain steel",
         diagnosis="retrieval_or_ranking_miss",
         total_correct=0,
     )
     after = _report(
         score=1,
-        prediction="red",
+        prediction="obsidian-glazed",
         diagnosis="passed",
         total_correct=1,
     )
@@ -168,7 +168,7 @@ def test_mode_comparison_reports_pairwise_question_deltas() -> None:
             "conversation_id": "conv-1",
             "question_id": "conv-1:q1",
             "category": 1,
-            "question": "What color notebooks?",
+            "question": "Which finish do the calibration barometers have?",
             "score_before": 0,
             "score_after": 1,
             "score_delta": 1,
@@ -187,10 +187,10 @@ def _report(
     total_correct: int,
 ) -> BenchmarkReport:
     question = BenchmarkQuestion(
-        question_text="What color notebooks?",
-        ground_truth="red",
+        question_text="Which finish do the calibration barometers have?",
+        ground_truth="obsidian-glazed",
         category=1,
-        evidence_turn_ids=["D1:1"],
+        evidence_turn_ids=["D97:9701"],
         question_id="conv-1:q1",
     )
     result = QuestionResult(

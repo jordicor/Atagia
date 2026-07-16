@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from atagia.core.config import Settings
+from atagia.core.clock import Clock
 from atagia.services.llm_client import ConfigurationError, LLMClient
 
 
@@ -35,7 +36,9 @@ class EmbeddingIndex(ABC):
         """Insert or update an embedding."""
 
     @abstractmethod
-    async def search(self, query: str, user_id: str, top_k: int) -> list[EmbeddingMatch]:
+    async def search(
+        self, query: str, user_id: str, top_k: int
+    ) -> list[EmbeddingMatch]:
         """Search the embedding index."""
 
     @abstractmethod
@@ -56,7 +59,9 @@ class NoneBackend(EmbeddingIndex):
     async def upsert(self, memory_id: str, text: str, metadata: dict[str, Any]) -> None:
         return None
 
-    async def search(self, query: str, user_id: str, top_k: int) -> list[EmbeddingMatch]:
+    async def search(
+        self, query: str, user_id: str, top_k: int
+    ) -> list[EmbeddingMatch]:
         return []
 
     async def delete(self, memory_id: str) -> None:
@@ -67,6 +72,7 @@ async def create_embedding_index(
     settings: Settings,
     connection: Any,
     llm_client: LLMClient[Any],
+    clock: Clock | None = None,
 ) -> EmbeddingIndex:
     if settings.embedding_backend == "none":
         return NoneBackend()
@@ -77,7 +83,7 @@ async def create_embedding_index(
             )
         from atagia.services.sqlite_vec_backend import SQLiteVecBackend
 
-        backend = SQLiteVecBackend(connection, llm_client, settings)
+        backend = SQLiteVecBackend(connection, llm_client, settings, clock)
         await backend.initialize()
         return backend
     raise ConfigurationError(f"Unknown embedding backend: {settings.embedding_backend}")

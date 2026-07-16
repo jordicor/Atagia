@@ -139,6 +139,8 @@ class ArtifactRepository(BaseRepository):
         realm_id: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
+        if storage_kind == "local_file":
+            raise ValueError("local_file artifact storage is retired; use sqlite_blob")
         resolved_artifact_id = artifact_id or generate_prefixed_id("art")
         resolved_intimacy_boundary = normalize_intimacy_boundary(intimacy_boundary)
         resolved_sensitivity = sensitivity or _derive_sensitivity_from_privacy(
@@ -256,6 +258,8 @@ class ArtifactRepository(BaseRepository):
         )
         if blob_bytes is not None or storage_kind is not None or storage_uri is not None:
             resolved_storage_kind = storage_kind or ("external_ref" if storage_uri is not None else "sqlite_blob")
+            if resolved_storage_kind == "local_file":
+                raise ValueError("local_file artifact storage is retired; use sqlite_blob")
             resolved_byte_size = blob_byte_size if blob_byte_size is not None else (
                 len(blob_bytes) if blob_bytes is not None else 0
             )

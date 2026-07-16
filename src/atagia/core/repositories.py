@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import hashlib
 import math
 import re
+import sqlite3
 from typing import Any
 
 import aiosqlite
@@ -44,7 +45,11 @@ from atagia.memory.realm_policy import (
     realm_visibility_sql_clause_for_context,
 )
 from atagia.memory.space_policy import space_visibility_sql_clause_for_context
-from atagia.services.errors import ConversationNotActiveError, UserDeletedError
+from atagia.services.errors import (
+    ConversationNotActiveError,
+    MessageIdConflictError,
+    UserDeletedError,
+)
 
 RETRIEVAL_ELIGIBLE_MEMORY_STATUSES: tuple[MemoryStatus, ...] = (MemoryStatus.ACTIVE,)
 _SAFE_SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -167,9 +172,17 @@ def _derive_sensitivity_from_privacy(
 def _legacy_scope_to_canonical(scope: MemoryScope) -> str:
     """Map any accepted scope alias to the post-redesign storage scope."""
 
-    if scope is MemoryScope.GLOBAL_USER or scope is MemoryScope.ASSISTANT_MODE or scope is MemoryScope.USER:
+    if (
+        scope is MemoryScope.GLOBAL_USER
+        or scope is MemoryScope.ASSISTANT_MODE
+        or scope is MemoryScope.USER
+    ):
         return "user"
-    if scope is MemoryScope.CONVERSATION or scope is MemoryScope.EPHEMERAL_SESSION or scope is MemoryScope.CHAT:
+    if (
+        scope is MemoryScope.CONVERSATION
+        or scope is MemoryScope.EPHEMERAL_SESSION
+        or scope is MemoryScope.CHAT
+    ):
         return "chat"
     if scope is MemoryScope.WORKSPACE or scope is MemoryScope.CHARACTER:
         return "character"
@@ -227,7 +240,9 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def _normalize_optional_text(value: Any, *, max_length: int | None = None) -> str | None:
+def _normalize_optional_text(
+    value: Any, *, max_length: int | None = None
+) -> str | None:
     if value is None:
         return None
     normalized = " ".join(str(value).split())
@@ -417,12 +432,16 @@ class BaseRepository:
     async def rollback(self) -> None:
         await self._connection.rollback()
 
-    async def _fetch_one(self, query: str, parameters: tuple[Any, ...]) -> dict[str, Any] | None:
+    async def _fetch_one(
+        self, query: str, parameters: tuple[Any, ...]
+    ) -> dict[str, Any] | None:
         cursor = await self._connection.execute(query, parameters)
         row = await cursor.fetchone()
         return _decode_json_columns(row)
 
-    async def _fetch_all(self, query: str, parameters: tuple[Any, ...]) -> list[dict[str, Any]]:
+    async def _fetch_all(
+        self, query: str, parameters: tuple[Any, ...]
+    ) -> list[dict[str, Any]]:
         cursor = await self._connection.execute(query, parameters)
         rows = await cursor.fetchall()
         return [_decode_json_columns(row) for row in rows]
@@ -730,19 +749,46 @@ class MemoryRetrievalSurfaceRepository(BaseRepository):
 class UserRepository(BaseRepository):
     """Persistence operations for users."""
 
-    async def create_user(self, user_id: str | None = None, external_ref: str | None = None) -> dict[str, Any]:
+    async def create_user(
+        self, user_id: str | None = None, external_ref: str | None = None
+    ) -> dict[str, Any]:
         resolved_user_id = user_id or generate_prefixed_id("usr")
         if await self.has_user_erasure_marker(resolved_user_id):
             raise UserDeletedError("User has been erased")
         timestamp = self._timestamp()
-        await self._connection.execute(
-            """
-            INSERT INTO users(id, external_ref, created_at, updated_at, deleted_at)
-            VALUES (?, ?, ?, ?, NULL)
-            """,
-            (resolved_user_id, external_ref, timestamp, timestamp),
-        )
-        await self._connection.commit()
+        try:
+            await self._connection.execute(
+                """
+                INSERT INTO users(id, external_ref, created_at, updated_at, deleted_at)
+                VALUES (?, ?, ?, ?, NULL)
+                """,
+                (resolved_user_id, external_ref, timestamp, timestamp),
+            )
+            await self._connection.execute(
+                """
+                INSERT INTO user_lifecycles(
+                    user_id,
+                    lifecycle_epoch,
+                    lifecycle_cleanup_key,
+                    cache_revision,
+                    state,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, 0, 'active', ?, ?)
+                """,
+                (
+                    resolved_user_id,
+                    generate_prefixed_id("ule"),
+                    generate_prefixed_id("ulk"),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            await self._connection.commit()
+        except BaseException:
+            await self._connection.rollback()
+            raise
         return await self.get_user(resolved_user_id)
 
     async def get_user(self, user_id: str) -> dict[str, Any] | None:
@@ -793,9 +839,7 @@ class UserRepository(BaseRepository):
     # Namespace redesign: cross-chat / cross-device memory preferences.
     # ------------------------------------------------------------------
 
-    async def get_memory_preferences(
-        self, user_id: str
-    ) -> dict[str, Any] | None:
+    async def get_memory_preferences(self, user_id: str) -> dict[str, Any] | None:
         """Return resolved memory preferences for the user.
 
         Defaults are baked into the schema (both flags start at 1) so a
@@ -829,6 +873,7 @@ class UserRepository(BaseRepository):
         remember_across_chats: bool | None = None,
         remember_across_devices: bool | None = None,
         memory_privacy_mode: str | None = None,
+        commit: bool = True,
     ) -> dict[str, Any] | None:
         """Update one or both memory preferences and bump updated_at.
 
@@ -882,7 +927,8 @@ class UserRepository(BaseRepository):
                 user_id,
             ),
         )
-        await self._connection.commit()
+        if commit:
+            await self._connection.commit()
         return {
             "remember_across_chats": new_chats,
             "remember_across_devices": new_devices,
@@ -920,12 +966,21 @@ class WorkspaceRepository(BaseRepository):
             INSERT INTO workspaces(id, user_id, name, metadata_json, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (resolved_workspace_id, user_id, name, _encode_json(metadata), timestamp, timestamp),
+            (
+                resolved_workspace_id,
+                user_id,
+                name,
+                _encode_json(metadata),
+                timestamp,
+                timestamp,
+            ),
         )
         await self._connection.commit()
         return await self.get_workspace(resolved_workspace_id, user_id)
 
-    async def get_workspace(self, workspace_id: str, user_id: str) -> dict[str, Any] | None:
+    async def get_workspace(
+        self, workspace_id: str, user_id: str
+    ) -> dict[str, Any] | None:
         return await self._fetch_one(
             """
             SELECT *
@@ -991,6 +1046,7 @@ class ConversationRepository(BaseRepository):
         active_realm_id: str | None = None,
         mode: str | None = None,
         incognito: bool | None = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
         resolved_conversation_id = conversation_id or generate_prefixed_id("cnv")
         timestamp = self._timestamp()
@@ -1071,7 +1127,8 @@ class ConversationRepository(BaseRepository):
                 resolved_incognito,
             ),
         )
-        await self._connection.commit()
+        if commit:
+            await self._connection.commit()
         return await self.get_conversation(resolved_conversation_id, user_id)
 
     async def set_active_presence(
@@ -1079,6 +1136,8 @@ class ConversationRepository(BaseRepository):
         conversation_id: str,
         user_id: str,
         active_presence_id: str,
+        *,
+        commit: bool = True,
     ) -> dict[str, Any] | None:
         timestamp = self._timestamp()
         await self._connection.execute(
@@ -1091,7 +1150,8 @@ class ConversationRepository(BaseRepository):
             """,
             (active_presence_id, timestamp, conversation_id, user_id),
         )
-        await self._connection.commit()
+        if commit:
+            await self._connection.commit()
         return await self.get_conversation(conversation_id, user_id)
 
     async def set_active_space(
@@ -1099,6 +1159,8 @@ class ConversationRepository(BaseRepository):
         conversation_id: str,
         user_id: str,
         active_space_id: str,
+        *,
+        commit: bool = True,
     ) -> dict[str, Any] | None:
         timestamp = self._timestamp()
         await self._connection.execute(
@@ -1111,7 +1173,8 @@ class ConversationRepository(BaseRepository):
             """,
             (active_space_id, timestamp, conversation_id, user_id),
         )
-        await self._connection.commit()
+        if commit:
+            await self._connection.commit()
         return await self.get_conversation(conversation_id, user_id)
 
     async def set_active_mind(
@@ -1120,6 +1183,8 @@ class ConversationRepository(BaseRepository):
         user_id: str,
         active_mind_id: str,
         mind_topology: MindTopology | str,
+        *,
+        commit: bool = True,
     ) -> dict[str, Any] | None:
         timestamp = self._timestamp()
         await self._connection.execute(
@@ -1139,7 +1204,8 @@ class ConversationRepository(BaseRepository):
                 user_id,
             ),
         )
-        await self._connection.commit()
+        if commit:
+            await self._connection.commit()
         return await self.get_conversation(conversation_id, user_id)
 
     async def set_active_embodiment(
@@ -1147,6 +1213,8 @@ class ConversationRepository(BaseRepository):
         conversation_id: str,
         user_id: str,
         active_embodiment_id: str,
+        *,
+        commit: bool = True,
     ) -> dict[str, Any] | None:
         timestamp = self._timestamp()
         await self._connection.execute(
@@ -1159,7 +1227,8 @@ class ConversationRepository(BaseRepository):
             """,
             (active_embodiment_id, timestamp, conversation_id, user_id),
         )
-        await self._connection.commit()
+        if commit:
+            await self._connection.commit()
         return await self.get_conversation(conversation_id, user_id)
 
     async def set_active_realm(
@@ -1167,6 +1236,8 @@ class ConversationRepository(BaseRepository):
         conversation_id: str,
         user_id: str,
         active_realm_id: str,
+        *,
+        commit: bool = True,
     ) -> dict[str, Any] | None:
         timestamp = self._timestamp()
         await self._connection.execute(
@@ -1179,10 +1250,13 @@ class ConversationRepository(BaseRepository):
             """,
             (active_realm_id, timestamp, conversation_id, user_id),
         )
-        await self._connection.commit()
+        if commit:
+            await self._connection.commit()
         return await self.get_conversation(conversation_id, user_id)
 
-    async def get_conversation(self, conversation_id: str, user_id: str) -> dict[str, Any] | None:
+    async def get_conversation(
+        self, conversation_id: str, user_id: str
+    ) -> dict[str, Any] | None:
         return await self._fetch_one(
             """
             SELECT *
@@ -1193,7 +1267,9 @@ class ConversationRepository(BaseRepository):
             (conversation_id, user_id),
         )
 
-    async def get_active_conversation(self, conversation_id: str, user_id: str) -> dict[str, Any] | None:
+    async def get_active_conversation(
+        self, conversation_id: str, user_id: str
+    ) -> dict[str, Any] | None:
         return await self._fetch_one(
             """
             SELECT *
@@ -1233,7 +1309,9 @@ class ConversationRepository(BaseRepository):
             clauses.append("platform_id = ?")
             clauses.append("character_id IS ?")
             clauses.append("incognito = ?")
-            parameters.extend([user_persona_id, platform_id, character_id, 1 if incognito else 0])
+            parameters.extend(
+                [user_persona_id, platform_id, character_id, 1 if incognito else 0]
+            )
         if status is not None:
             ConversationStatus(status)
             clauses.append("status = ?")
@@ -1263,7 +1341,9 @@ class ConversationRepository(BaseRepository):
             tuple(parameters),
         )
 
-    async def mark_conversation_isolated(self, conversation_id: str, user_id: str) -> dict[str, Any] | None:
+    async def mark_conversation_isolated(
+        self, conversation_id: str, user_id: str
+    ) -> dict[str, Any] | None:
         timestamp = self._timestamp()
         await self._connection.execute(
             """
@@ -1315,7 +1395,9 @@ class ConversationRepository(BaseRepository):
             await self._connection.commit()
         return await self.get_conversation(conversation_id, user_id)
 
-    async def update_conversation_status(self, conversation_id: str, user_id: str, status: str) -> None:
+    async def update_conversation_status(
+        self, conversation_id: str, user_id: str, status: str
+    ) -> None:
         ConversationStatus(status)
         timestamp = self._timestamp()
         await self._connection.execute(
@@ -1346,9 +1428,13 @@ class MessageRepository(BaseRepository):
         metadata: dict[str, Any] | None,
     ) -> dict[str, Any]:
         metadata = metadata or {}
-        explicit_content_kind = _normalize_optional_text(metadata.get("content_kind"), max_length=64)
+        explicit_content_kind = _normalize_optional_text(
+            metadata.get("content_kind"), max_length=64
+        )
         explicit_include_raw = "include_raw" in metadata
-        explicit_policy_reason = _normalize_optional_text(metadata.get("policy_reason"), max_length=128)
+        explicit_policy_reason = _normalize_optional_text(
+            metadata.get("policy_reason"), max_length=128
+        )
         explicit_context_placeholder = _normalize_optional_text(
             metadata.get("context_placeholder"),
             max_length=300,
@@ -1360,7 +1446,9 @@ class MessageRepository(BaseRepository):
         verbatim_required = _coerce_bool(metadata.get("verbatim_required"))
         skip_by_default = _coerce_bool(metadata.get("skip_by_default"))
         include_raw = _coerce_bool(metadata.get("include_raw"), True)
-        requires_explicit_request = _coerce_bool(metadata.get("requires_explicit_request"))
+        requires_explicit_request = _coerce_bool(
+            metadata.get("requires_explicit_request")
+        )
 
         if heavy_content or artifact_backed or verbatim_required or skip_by_default:
             if not explicit_include_raw:
@@ -1378,7 +1466,9 @@ class MessageRepository(BaseRepository):
             or verbatim_required
         )
         if explicit_include_raw and include_raw:
-            requires_explicit_request = _coerce_bool(metadata.get("requires_explicit_request"))
+            requires_explicit_request = _coerce_bool(
+                metadata.get("requires_explicit_request")
+            )
 
         if explicit_content_kind is not None:
             content_kind = explicit_content_kind
@@ -1454,9 +1544,102 @@ class MessageRepository(BaseRepository):
         source_mind_id: str | None = None,
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
+        proxy_claim_token: str | None = None,
+        proxy_pair_role: str | None = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        started_transaction = False
+        if not self._connection.in_transaction:
+            if not commit:
+                raise RuntimeError(
+                    "MessageRepository.create_message(commit=False) requires "
+                    "an active caller-owned transaction"
+                )
+            await self._connection.execute("BEGIN IMMEDIATE")
+            started_transaction = True
+        try:
+            if not started_transaction:
+                await self._acquire_message_claim_write_lock()
+            return await self._create_message_in_current_transaction(
+                message_id=message_id,
+                conversation_id=conversation_id,
+                role=role,
+                seq=seq,
+                text=text,
+                token_count=token_count,
+                metadata=metadata,
+                occurred_at=occurred_at,
+                active_presence_id=active_presence_id,
+                source_presence_id=source_presence_id,
+                space_id=space_id,
+                active_mind_id=active_mind_id,
+                source_mind_id=source_mind_id,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
+                proxy_claim_token=proxy_claim_token,
+                proxy_pair_role=proxy_pair_role,
+                commit=commit,
+            )
+        except BaseException:
+            if started_transaction and self._connection.in_transaction:
+                await self._connection.rollback()
+            raise
+
+    async def _acquire_message_claim_write_lock(self) -> None:
+        """Upgrade a caller-owned transaction before inspecting global claims."""
+
+        try:
+            # A no-row UPDATE still upgrades the main-database transaction to a
+            # writer without changing claim data or firing row triggers.
+            await self._connection.execute(
+                """
+                UPDATE proxy_message_id_claims
+                SET message_id = message_id
+                WHERE 0
+                """
+            )
+        except aiosqlite.OperationalError as exc:
+            error_code = getattr(exc, "sqlite_errorcode", None)
+            if isinstance(error_code, int) and (error_code & 0xFF) in {
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }:
+                raise MessageIdConflictError(
+                    "Caller-owned transaction could not serialize message_id "
+                    "claim validation"
+                ) from exc
+            raise
+
+    async def _create_message_in_current_transaction(
+        self,
+        message_id: str | None,
+        conversation_id: str,
+        role: str,
+        seq: int | None,
+        text: str,
+        token_count: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        occurred_at: str | None = None,
+        *,
+        active_presence_id: str | None = None,
+        source_presence_id: str | None = None,
+        space_id: str | None = None,
+        active_mind_id: str | None = None,
+        source_mind_id: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
+        proxy_claim_token: str | None = None,
+        proxy_pair_role: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         resolved_message_id = message_id or generate_prefixed_id("msg")
+        await self._validate_proxy_message_id_claim(
+            message_id=resolved_message_id,
+            conversation_id=conversation_id,
+            message_role=role,
+            claim_token=proxy_claim_token,
+            pair_role=proxy_pair_role,
+        )
         timestamp = self._timestamp()
         resolved_occurred_at = normalize_optional_timestamp(occurred_at)
         message_policy = self._derive_message_policy(
@@ -1701,6 +1884,48 @@ class MessageRepository(BaseRepository):
                 created["context_placeholder"] = generated_placeholder
         return created
 
+    async def _validate_proxy_message_id_claim(
+        self,
+        *,
+        message_id: str,
+        conversation_id: str,
+        message_role: str,
+        claim_token: str | None,
+        pair_role: str | None,
+    ) -> None:
+        """Enforce globally reserved proxy IDs at the central insert boundary."""
+
+        cursor = await self._connection.execute(
+            """
+            SELECT
+                claim.claim_token,
+                claim.pair_role,
+                claim.message_role,
+                claim.conversation_id
+            FROM proxy_message_id_claims AS claim
+            WHERE claim.message_id = ?
+            """,
+            (message_id,),
+        )
+        claim = await cursor.fetchone()
+        if claim is None:
+            if claim_token is not None or pair_role is not None:
+                raise MessageIdConflictError(
+                    "Proxy message claim does not exist for the requested message_id"
+                )
+            return
+        if (
+            claim_token is None
+            or pair_role is None
+            or str(claim["claim_token"]) != claim_token
+            or str(claim["pair_role"]) != pair_role
+            or str(claim["message_role"]) != message_role
+            or str(claim["conversation_id"]) != conversation_id
+        ):
+            raise MessageIdConflictError(
+                "message_id is reserved by a different proxy turn claim"
+            )
+
     async def get_messages(
         self,
         conversation_id: str,
@@ -1886,7 +2111,9 @@ class MessageRepository(BaseRepository):
         *,
         allow_conversation_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        isolate_to_allowed = await self._conversation_is_isolated(allow_conversation_id, user_id)
+        isolate_to_allowed = await self._conversation_is_isolated(
+            allow_conversation_id, user_id
+        )
         return await self._fetch_all(
             """
             SELECT
@@ -1902,7 +2129,9 @@ class MessageRepository(BaseRepository):
             ORDER BY rank ASC, m.seq ASC
             LIMIT ?
             """.format(
-                visibility_clause=conversation_visibility_clause("c", conversation_id_col="id"),
+                visibility_clause=conversation_visibility_clause(
+                    "c", conversation_id_col="id"
+                ),
             ),
             (
                 user_id,
@@ -1942,7 +2171,9 @@ class MessageRepository(BaseRepository):
         """
         if limit <= 0:
             return []
-        isolate_to_allowed = await self._conversation_is_isolated(allow_conversation_id, user_id)
+        isolate_to_allowed = await self._conversation_is_isolated(
+            allow_conversation_id, user_id
+        )
         return await self._fetch_all(
             """
             SELECT
@@ -1978,7 +2209,9 @@ class MessageRepository(BaseRepository):
             ORDER BY rank ASC, m.seq ASC
             LIMIT ?
             """.format(
-                visibility_clause=conversation_visibility_clause("c", conversation_id_col="id"),
+                visibility_clause=conversation_visibility_clause(
+                    "c", conversation_id_col="id"
+                ),
             ),
             (
                 user_id,
@@ -2094,7 +2327,9 @@ class MessageRepository(BaseRepository):
               AND {visibility_clause}
             """.format(
                 clauses=" OR ".join(clauses),
-                visibility_clause=conversation_visibility_clause("c", conversation_id_col="id"),
+                visibility_clause=conversation_visibility_clause(
+                    "c", conversation_id_col="id"
+                ),
             ),
             tuple([user_id, *parameters, conversation_id]),
         )
@@ -2138,7 +2373,9 @@ class MessageRepository(BaseRepository):
             ORDER BY c.created_at ASC, m.conversation_id ASC, m.seq ASC
             """.format(
                 clauses=" OR ".join(clauses),
-                visibility_clause=conversation_visibility_clause("c", conversation_id_col="id"),
+                visibility_clause=conversation_visibility_clause(
+                    "c", conversation_id_col="id"
+                ),
             ),
             tuple([user_id, *parameters, conversation_id]),
         )
@@ -2219,7 +2456,9 @@ class MemoryObjectRepository(BaseRepository):
         )
         return int(cursor.rowcount or 0)
 
-    async def get_memory_object(self, memory_id: str, user_id: str) -> dict[str, Any] | None:
+    async def get_memory_object(
+        self, memory_id: str, user_id: str
+    ) -> dict[str, Any] | None:
         return await self._fetch_one(
             """
             SELECT *
@@ -2276,9 +2515,11 @@ class MemoryObjectRepository(BaseRepository):
             mind_topology=mind_topology,
             alias="mo",
         )
-        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
-            active_embodiment_id=active_embodiment_id,
-            alias="mo",
+        embodiment_clause, embodiment_parameters = (
+            embodiment_visibility_sql_clause_for_context(
+                active_embodiment_id=active_embodiment_id,
+                alias="mo",
+            )
         )
         realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
             active_realm_id=active_realm_id,
@@ -2387,7 +2628,10 @@ class MemoryObjectRepository(BaseRepository):
         existing = await self.get_memory_object(memory_id, user_id)
         if existing is None:
             return None
-        if expected_current_status is not None and existing["status"] != expected_current_status.value:
+        if (
+            expected_current_status is not None
+            and existing["status"] != expected_current_status.value
+        ):
             return None
 
         payload = existing.get("payload_json")
@@ -2474,9 +2718,7 @@ class MemoryObjectRepository(BaseRepository):
         existing = await self.get_memory_object(mirror_id, user_id)
         language_codes_json = _encode_language_codes(language_codes)
         normalized_source_ids = [
-            str(item).strip()
-            for item in source_object_ids
-            if str(item).strip()
+            str(item).strip() for item in source_object_ids if str(item).strip()
         ]
         normalized_payload = {
             **(payload or {}),
@@ -2883,12 +3125,16 @@ class MemoryObjectRepository(BaseRepository):
         language_codes_json = _encode_language_codes(language_codes)
 
         resolved_sensitivity = (
-            sensitivity if sensitivity is not None
-            else _derive_sensitivity_from_privacy(privacy_level, intimacy_boundary, memory_category)
+            sensitivity
+            if sensitivity is not None
+            else _derive_sensitivity_from_privacy(
+                privacy_level, intimacy_boundary, memory_category
+            )
         )
         resolved_themes_json = _encode_json(list(themes or []))
         resolved_auto_expires = (
-            int(auto_expires) if auto_expires is not None
+            int(auto_expires)
+            if auto_expires is not None
             else (1 if scope is MemoryScope.EPHEMERAL_SESSION else 0)
         )
         resolved_storage_scope = _legacy_scope_to_canonical(scope)
@@ -3002,7 +3248,9 @@ class MemoryObjectRepository(BaseRepository):
         except aiosqlite.IntegrityError:
             if extraction_hash is None:
                 raise
-            existing = await self.get_memory_object_by_extraction_hash(user_id, extraction_hash)
+            existing = await self.get_memory_object_by_extraction_hash(
+                user_id, extraction_hash
+            )
             if existing is None:
                 raise
             return existing, False
@@ -3208,7 +3456,9 @@ class MemoryObjectRepository(BaseRepository):
         source_ids_changed = merged_source_ids != current_source_ids
         normalized_payload["source_message_ids"] = merged_source_ids
         if source_ids_changed:
-            normalized_payload["confirmation_count"] = int(normalized_payload.get("confirmation_count", 0)) + 1
+            normalized_payload["confirmation_count"] = (
+                int(normalized_payload.get("confirmation_count", 0)) + 1
+            )
 
         identifiers_changed = any(
             existing.get(key) != value
@@ -3324,9 +3574,13 @@ class MemoryObjectRepository(BaseRepository):
         if existing is None:
             raise ValueError(f"Unknown memory_id: {memory_id}")
 
-        existing_sensitivity = MemorySensitivity(str(existing.get("sensitivity") or "unknown"))
+        existing_sensitivity = MemorySensitivity(
+            str(existing.get("sensitivity") or "unknown")
+        )
         resolved_sensitivity = _max_sensitivity(existing_sensitivity, sensitivity)
-        existing_boundary = IntimacyBoundary(str(existing.get("intimacy_boundary") or "ordinary"))
+        existing_boundary = IntimacyBoundary(
+            str(existing.get("intimacy_boundary") or "ordinary")
+        )
         resolved_boundary = _max_intimacy_boundary(existing_boundary, intimacy_boundary)
         existing_platform_locked = bool(int(existing.get("platform_locked") or 0))
         resolved_platform_locked = existing_platform_locked or platform_locked
@@ -3335,7 +3589,12 @@ class MemoryObjectRepository(BaseRepository):
         resolved_status = str(existing.get("status"))
 
         if platform_locked:
-            if existing_platform_locked and existing_lock and platform_id_lock and existing_lock != platform_id_lock:
+            if (
+                existing_platform_locked
+                and existing_lock
+                and platform_id_lock
+                and existing_lock != platform_id_lock
+            ):
                 resolved_status = MemoryStatus.REVIEW_REQUIRED.value
             elif not existing_platform_locked:
                 resolved_platform_id_lock = platform_id_lock
@@ -3347,15 +3606,22 @@ class MemoryObjectRepository(BaseRepository):
         existing_themes = existing.get("themes_json") or []
         if not isinstance(existing_themes, list):
             existing_themes = []
-        if _SENSITIVITY_RANK[resolved_sensitivity] > _SENSITIVITY_RANK[existing_sensitivity]:
+        if (
+            _SENSITIVITY_RANK[resolved_sensitivity]
+            > _SENSITIVITY_RANK[existing_sensitivity]
+        ):
             resolved_themes = themes or [str(theme) for theme in existing_themes]
         elif existing_themes:
             resolved_themes = [str(theme) for theme in existing_themes]
         else:
             resolved_themes = themes
 
-        resolved_privacy_level = max(int(existing.get("privacy_level") or 0), int(privacy_level))
-        resolved_auto_expires = bool(int(existing.get("auto_expires") or 0)) or auto_expires
+        resolved_privacy_level = max(
+            int(existing.get("privacy_level") or 0), int(privacy_level)
+        )
+        resolved_auto_expires = (
+            bool(int(existing.get("auto_expires") or 0)) or auto_expires
+        )
         resolved_extraction_hash = extraction_hash or existing.get("extraction_hash")
 
         timestamp = self._timestamp()
@@ -3512,9 +3778,11 @@ class MemoryObjectRepository(BaseRepository):
             mind_topology=mind_topology,
             alias="memory_objects",
         )
-        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
-            active_embodiment_id=active_embodiment_id,
-            alias="memory_objects",
+        embodiment_clause, embodiment_parameters = (
+            embodiment_visibility_sql_clause_for_context(
+                active_embodiment_id=active_embodiment_id,
+                alias="memory_objects",
+            )
         )
         realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
             active_realm_id=active_realm_id,
@@ -3537,7 +3805,9 @@ class MemoryObjectRepository(BaseRepository):
               AND {realm_clause}
             """.format(
                 clauses=clause_joiner.join(clauses),
-                status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                status_placeholders=", ".join(
+                    "?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES
+                ),
                 visibility_clause=conversation_visibility_clause("memory_objects"),
                 mind_clause=mind_clause,
                 embodiment_clause=embodiment_clause,
@@ -3622,9 +3892,11 @@ class MemoryObjectRepository(BaseRepository):
             mind_topology=mind_topology,
             alias="memory_objects",
         )
-        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
-            active_embodiment_id=active_embodiment_id,
-            alias="memory_objects",
+        embodiment_clause, embodiment_parameters = (
+            embodiment_visibility_sql_clause_for_context(
+                active_embodiment_id=active_embodiment_id,
+                alias="memory_objects",
+            )
         )
         realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
             active_realm_id=active_realm_id,
@@ -3650,7 +3922,9 @@ class MemoryObjectRepository(BaseRepository):
               AND {intimacy_filter}
             """.format(
                 clauses=clause_joiner.join(clauses),
-                status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                status_placeholders=", ".join(
+                    "?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES
+                ),
                 visibility_clause=conversation_visibility_clause("memory_objects"),
                 space_clause=space_clause,
                 mind_clause=mind_clause,
@@ -3737,9 +4011,11 @@ class MemoryObjectRepository(BaseRepository):
             mind_topology=mind_topology,
             alias="memory_objects",
         )
-        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
-            active_embodiment_id=active_embodiment_id,
-            alias="memory_objects",
+        embodiment_clause, embodiment_parameters = (
+            embodiment_visibility_sql_clause_for_context(
+                active_embodiment_id=active_embodiment_id,
+                alias="memory_objects",
+            )
         )
         realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
             active_realm_id=active_realm_id,
@@ -3766,7 +4042,9 @@ class MemoryObjectRepository(BaseRepository):
             ORDER BY updated_at DESC, id ASC
             """.format(
                 clauses=clause_joiner.join(clauses),
-                status_placeholders=", ".join("?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES),
+                status_placeholders=", ".join(
+                    "?" for _ in RETRIEVAL_ELIGIBLE_MEMORY_STATUSES
+                ),
                 visibility_clause=conversation_visibility_clause("memory_objects"),
                 space_clause=space_clause,
                 mind_clause=mind_clause,
@@ -3853,7 +4131,11 @@ class MemoryObjectRepository(BaseRepository):
                         f"AND {prefix}conversation_id = ?)"
                     )
                     parameters.extend([user_persona_id, conversation_id])
-            elif scope is MemoryScope.CHARACTER and cross_chat and character_id is not None:
+            elif (
+                scope is MemoryScope.CHARACTER
+                and cross_chat
+                and character_id is not None
+            ):
                 clauses.append(
                     f"({prefix}scope_canonical = 'character' "
                     f"AND {prefix}user_persona_id IS ? "
@@ -3912,22 +4194,26 @@ class MemoryObjectRepository(BaseRepository):
     ) -> tuple[list[str], list[Any]]:
         """Build the Phase 7 namespace/platform/sensitivity reader filters."""
 
-        scope_clauses, scope_parameters = MemoryObjectRepository.namespace_scope_clauses(
-            MemoryObjectRepository.canonical_retrieval_scopes(scopes),
-            user_persona_id=user_persona_id,
-            character_id=character_id,
-            conversation_id=conversation_id,
-            remember_across_chats=remember_across_chats,
-            incognito=incognito,
-            table_alias=table_alias,
-            allow_cross_conversation_chat=allow_cross_conversation_chat,
+        scope_clauses, scope_parameters = (
+            MemoryObjectRepository.namespace_scope_clauses(
+                MemoryObjectRepository.canonical_retrieval_scopes(scopes),
+                user_persona_id=user_persona_id,
+                character_id=character_id,
+                conversation_id=conversation_id,
+                remember_across_chats=remember_across_chats,
+                incognito=incognito,
+                table_alias=table_alias,
+                allow_cross_conversation_chat=allow_cross_conversation_chat,
+            )
         )
         if not scope_clauses:
             return [], []
-        platform_clause, platform_parameters = MemoryObjectRepository.platform_lock_clause(
-            platform_id=platform_id,
-            remember_across_devices=remember_across_devices,
-            table_alias=table_alias,
+        platform_clause, platform_parameters = (
+            MemoryObjectRepository.platform_lock_clause(
+                platform_id=platform_id,
+                remember_across_devices=remember_across_devices,
+                table_alias=table_alias,
+            )
         )
         return (
             [
@@ -4091,9 +4377,11 @@ class MemoryObjectRepository(BaseRepository):
             alias="memory_objects",
             allow_overseer_grants=False,
         )
-        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
-            active_embodiment_id=active_embodiment_id,
-            alias="memory_objects",
+        embodiment_clause, embodiment_parameters = (
+            embodiment_visibility_sql_clause_for_context(
+                active_embodiment_id=active_embodiment_id,
+                alias="memory_objects",
+            )
         )
         realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
             active_realm_id=active_realm_id,
@@ -4155,9 +4443,7 @@ class MemoryObjectRepository(BaseRepository):
             if not isinstance(payload, dict):
                 continue
             row_realm_id = (
-                str(row["realm_id"])
-                if row.get("realm_id") is not None
-                else None
+                str(row["realm_id"]) if row.get("realm_id") is not None else None
             )
             for key, value in payload.items():
                 current = resolved.get(key)
@@ -4175,7 +4461,10 @@ class MemoryObjectRepository(BaseRepository):
                             "cross_realm_mode": "applicable",
                         },
                     }
-                if current is None or (scope_rank, updated_at) > (current[0], current[1]):
+                if current is None or (scope_rank, updated_at) > (
+                    current[0],
+                    current[1],
+                ):
                     resolved[key] = (scope_rank, updated_at, resolved_value)
         return {key: value for key, (_, _, value) in resolved.items()}
 

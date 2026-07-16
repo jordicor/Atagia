@@ -24,7 +24,7 @@ def _question_result(
             question_text=f"Question {question_id}?",
             ground_truth="answer",
             category=category,
-            evidence_turn_ids=["D1:1"],
+            evidence_turn_ids=["D97:9701"],
             question_id=question_id,
         ),
         prediction=prediction,

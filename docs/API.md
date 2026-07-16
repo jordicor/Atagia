@@ -25,17 +25,27 @@ Two API keys are recognized in service mode:
 
 | Key | Used by | Required by |
 |---|---|---|
-| `ATAGIA_SERVICE_API_KEY` | Core user-facing routes | All non-admin routes below |
+| `ATAGIA_SERVICE_API_KEY` | Shared server-side clients | All non-admin routes below |
 | `ATAGIA_ADMIN_API_KEY` | Admin / operational routes | All `/v1/admin/*` routes |
 
-Service mode also requires the `X-Atagia-User-Id` header on user-facing
-routes. The handler rejects any request whose path or body `user_id` does
-not match the authenticated claim. Admin routes do not require the user-id
-header because they operate across users by design.
+`ATAGIA_SERVICE_API_KEY` is one shared non-admin service credential, not a
+per-user token. Keep it in trusted server-side components and never expose it
+to browser code or another untrusted client. Service mode separately requires
+the trusted `X-Atagia-User-Id` header on user-facing routes. The handler rejects
+any request whose path or body `user_id` does not match that asserted identity.
+Admin routes do not require the user-id header because they operate across
+users by design.
 
 The OpenAI-compatible proxy (`/v1/models`, `/v1/chat/completions`) uses the
 same `ATAGIA_SERVICE_API_KEY` but emits OpenAI-shaped error envelopes
 instead of FastAPI's default error format.
+
+Ordinary chat, sidecar, and proxy requests always run with server-derived
+standard authority and privacy enforcement enabled. Request bodies, metadata,
+and headers cannot select a privilege level, master authority, or a different
+privacy-enforcement mode. The admin API key is valid only on `/v1/admin/*`; it
+does not grant master authority on ordinary routes. Trusted library and
+evaluation callers can still set these internal controls without using HTTP.
 
 ---
 
@@ -127,6 +137,40 @@ confirmation strategy, memory privacy mode) and applies the standard
 retrieval pipeline before delegating to the underlying LLM. Errors are
 returned in the OpenAI error envelope.
 
+`max_tokens` and `max_completion_tokens` are external answer ceilings. When
+both are present, Atagia uses the smaller; the server also caps the result with
+`ATAGIA_PROXY_MAX_OUTPUT_TOKENS`. A positive client ceiling is never increased
+to an internal structured-output floor. Provider-supplied usage is returned
+unchanged when available (and, for streams, only when
+`stream_options.include_usage=true`); absent usage is omitted rather than
+estimated. Provider stop reasons are normalized to `stop`, `tool_calls`,
+`length`, or `error` where applicable.
+
+String message content is always literal, even when it looks like a JSON
+array or object. Only content that arrived as typed structured blocks takes
+the multimodal/tool projection path.
+
+`message_id` and `response_message_id` form an all-or-none proxy-turn pair.
+Supplying one without the other returns `400` before retrieval, mutation, or
+provider execution. A source sequence is valid only with its corresponding
+message ID, while request and response sequences are independently optional.
+With neither ID, each HTTP request creates a new turn. With both IDs, an
+identical completed retry replays the stored normalized response without
+another context or provider call; streaming and non-streaming framing may be
+interchanged. Response-determining request changes, shared IDs, swapped roles,
+or cross-namespace reuse return a stable `409` conflict. A live compatible
+request returns `request_in_progress` with `Retry-After`; an interrupted stream
+that exposed bytes requires a new pair and returns
+`stream_retry_requires_new_ids` on reuse.
+
+Tool-only assistant turns and trailing tool-result batches are stored as
+lossless ordered structured metadata with stable call IDs and causal links.
+The proxy atomically commits the response, replay envelope, reciprocal links,
+and every required durable post-response root job before returning a buffered
+success or emitting a streaming finish/usage/`[DONE]` event. Transient context
+infrastructure failures may fail open without memory, but terminal transcript
+persistence does not.
+
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/v1/models` | List the Atagia-routable models exposed by the proxy. |
@@ -137,8 +181,9 @@ returned in the OpenAI error envelope.
 ## Admin routes
 
 All admin routes share the `/v1/admin` prefix and authenticate with
-`ATAGIA_ADMIN_API_KEY` in service mode. Every admin call writes an entry
-to the admin audit log. There are 28 admin endpoints in total.
+`ATAGIA_ADMIN_API_KEY` in service mode. Routes with an explicit audited action
+write to the existing admin audit log; audit coverage is route-specific rather
+than implicit for every admin read. There are 29 admin endpoints in total.
 
 ### Worker control
 
@@ -154,6 +199,13 @@ to the admin audit log. There are 28 admin endpoints in total.
 | `GET` | `/v1/admin/memory-review` | List memory candidates in `review_required` status with optional namespace and category filters. |
 | `POST` | `/v1/admin/memory-review/{user_id}/{memory_id}/archive` | Archive a review-required memory (soft-delete) under the admin actor. |
 | `POST` | `/v1/admin/memory-review/{user_id}/{memory_id}/delete` | Hard-delete a review-required memory using the built-in admin confirmation token. |
+
+The sensitive `GET /v1/admin/memory-review` operation audits successful,
+denied, validation-failed, and repository-failed attempts with the actor,
+normalized filters, result count, status, HTTP status, and error class. It
+never copies canonical memory text, payloads, raw source content, or API keys
+into the audit row. A successful sensitive read fails closed if its audit row
+cannot be persisted.
 
 ### Rebuild
 
@@ -226,6 +278,12 @@ to the admin audit log. There are 28 admin endpoints in total.
 |---|---|---|
 | `POST` | `/v1/admin/embeddings/backfill` | Backfill missing embeddings, optionally scoped to a single user, in batches with configurable inter-batch delay. |
 
+### Coverage backfill
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/admin/memory/coverage/backfill` | Recompute missing memory coverage members, optionally scoped to one user, under the durable admin-maintenance fence. |
+
 ### LLM run guard
 
 | Method | Path | Description |
@@ -270,6 +328,11 @@ in the request schema. Missing or wrong tokens fail with `400 Bad Request`.
   or conflicting sequences fail with `409 Conflict` (`SourceSequenceConflictError`)
   so the host can detect drift.
 
+Deterministic message-ID, source-sequence, and namespace/mind conflicts are
+hard errors. They do not fall through to the upstream provider and do not
+create an assistant response. Transient infrastructure failures follow only
+the explicitly documented fail-open paths.
+
 `POST /v1/users` and `POST /v1/conversations` are themselves idempotent on
 their resource ids: re-posting with the same id returns the existing record
 unchanged.
@@ -290,6 +353,48 @@ coordinates (`conversation_id`, `platform_id`, optional `user_persona_id`,
 uses (`active_presence_id`, `mind_id`, `mind_topology`, `embodiment_id`,
 `realm_id`, `space_id`) so candidate selection is scoped before ranking.
 Service mode additionally rejects any request without a `platform_id`.
+
+For an existing conversation, `user_persona_id`, `platform_id`, and
+`character_id` are optional identity hints: an omitted or JSON-null hint uses
+the persisted conversation identity, while every supplied non-null value must
+match exactly. A conflict returns the same non-disclosing `404` as an unknown
+conversation. The service-mode requirement for `platform_id` remains a route
+boundary requirement and does not change this comparison rule for library
+callers.
+
+`incognito` and `cross_chat_memory` use one strict request-boundary rule. The
+proxy accepts their typed request fields, `atagia_*` or unprefixed metadata
+keys, and the documented `X-Atagia-Incognito` and
+`X-Atagia-Cross-Chat-Memory` headers. Conversation creation, chat, and sidecar
+routes use their typed fields; conversation creation and chat also accept the
+same metadata keys. Repeated claims must agree, and every explicit value must
+be a JSON boolean or one of the strings
+`true`/`false`, `1`/`0`, `yes`/`no`, or `on`/`off`. Invalid or contradictory
+claims return `400`.
+After validation, `incognito=true` disables cross-chat memory, while
+`incognito=false` never overrides an explicit `cross_chat_memory=false`.
+With both settings absent, cross-chat memory retains its documented default of
+enabled.
+
+### Request budgets
+
+External requests are bounded before attachment decoding, SQLite writes, or
+provider execution. Defaults are 32 MiB for the encoded body, 256 KiB per
+message text, 16 attachments, 10 MiB per decoded attachment, 20 MiB decoded in
+aggregate, and 64 KiB of compact serialized metadata. The corresponding
+`ATAGIA_REQUEST_MAX_*` settings are documented in the configuration reference.
+Encoded/decoded size and count overruns return `413`; invalid base64 and other
+payload-structure failures return `422`. Rejected requests leave no partial
+message, artifact, blob, or provider call.
+
+### Path identifiers
+
+The SDK and importers use Atagia's reversible path-ID encoding for route
+segments. Routes decode exactly once before repository access. IDs containing
+slashes, literal percent sequences such as `%2F`, spaces, Unicode, or the
+reserved `__atagia_b64_` prefix therefore round-trip without percent-decoding
+ambiguity; ordinary path-safe IDs remain unchanged. A malformed reserved
+transport value returns `400`.
 
 ---
 

@@ -21,21 +21,29 @@ def test_parse_minimal_dataset(tmp_path: Path) -> None:
         tmp_path,
         [
             {
-                "sample_id": "conv-1",
+                "sample_id": "synthetic-minimal",
                 "conversation": {
-                    "speaker_a": "Alice",
-                    "speaker_b": "Bob",
+                    "speaker_a": "Mira",
+                    "speaker_b": "Theo",
                     "session_1": [
-                        {"speaker": "Alice", "dia_id": "D1:1", "text": "Alice likes red notebooks."},
-                        {"speaker": "Bob", "dia_id": "D1:2", "text": "Bob remembers that."},
+                        {
+                            "speaker": "Mira",
+                            "dia_id": "SYNMIN:101",
+                            "text": "Mira prefers copper compasses.",
+                        },
+                        {
+                            "speaker": "Theo",
+                            "dia_id": "SYNMIN:102",
+                            "text": "Theo remembers that preference.",
+                        },
                     ],
-                    "session_1_date_time": "1:56 pm on 8 May, 2023",
+                    "session_1_date_time": "1:56 pm on 8 March, 2026",
                 },
                 "qa": [
                     {
-                        "question": "What does Alice like?",
-                        "answer": "red notebooks",
-                        "evidence": ["D1:1"],
+                        "question": "Which instruments does Mira prefer?",
+                        "answer": "copper compasses",
+                        "evidence": ["SYNMIN:101"],
                         "category": 1,
                     }
                 ],
@@ -48,13 +56,15 @@ def test_parse_minimal_dataset(tmp_path: Path) -> None:
     assert dataset.name == "LoCoMo"
     assert len(dataset.conversations) == 1
     conversation = dataset.conversations[0]
-    assert conversation.conversation_id == "conv-1"
+    assert conversation.conversation_id == "synthetic-minimal"
     assert [turn.role for turn in conversation.turns] == ["user", "assistant"]
-    assert conversation.turns[0].timestamp == "2023-05-08T13:56:00"
-    assert conversation.turns[0].turn_id == "D1:1"
-    assert conversation.questions[0].question_text == "What does Alice like?"
-    assert conversation.questions[0].ground_truth == "red notebooks"
-    assert conversation.questions[0].evidence_turn_ids == ["D1:1"]
+    assert conversation.turns[0].timestamp == "2026-03-08T13:56:00"
+    assert conversation.turns[0].turn_id == "SYNMIN:101"
+    assert conversation.questions[0].question_text == (
+        "Which instruments does Mira prefer?"
+    )
+    assert conversation.questions[0].ground_truth == "copper compasses"
+    assert conversation.questions[0].evidence_turn_ids == ["SYNMIN:101"]
 
 
 def test_parse_evidence_citation_strings_into_turn_ids(tmp_path: Path) -> None:
@@ -67,17 +77,17 @@ def test_parse_evidence_citation_strings_into_turn_ids(tmp_path: Path) -> None:
                     "speaker_a": "Alice",
                     "speaker_b": "Bob",
                     "session_1": [
-                        {"speaker": "Alice", "dia_id": "D8:6", "text": "Sunset."},
-                        {"speaker": "Bob", "dia_id": "D9:17", "text": "Also sunset."},
-                        {"speaker": "Alice", "dia_id": "D30:5", "text": "Camera."},
+                        {"speaker": "Alice", "dia_id": "D73:301", "text": "Moonrise."},
+                        {"speaker": "Bob", "dia_id": "D73:302", "text": "Also moonrise."},
+                        {"speaker": "Alice", "dia_id": "D73:303", "text": "Telescope."},
                     ],
-                    "session_1_date_time": "1:56 pm on 8 May, 2023",
+                    "session_1_date_time": "1:56 pm on 8 March, 2026",
                 },
                 "qa": [
                     {
                         "question": "What happened?",
-                        "answer": "sunset and camera",
-                        "evidence": ["D8:6; D9:17", "D30:05"],
+                        "answer": "moonrise and telescope",
+                        "evidence": ["D73:301; D73:302", "D73:303"],
                         "category": 1,
                     }
                 ],
@@ -87,7 +97,7 @@ def test_parse_evidence_citation_strings_into_turn_ids(tmp_path: Path) -> None:
 
     question = LoCoMoAdapter(data_path).load().conversations[0].questions[0]
 
-    assert question.evidence_turn_ids == ["D8:6", "D9:17", "D30:5"]
+    assert question.evidence_turn_ids == ["D73:301", "D73:302", "D73:303"]
 
 
 def test_parse_image_caption_as_attachment(tmp_path: Path) -> None:
@@ -95,21 +105,24 @@ def test_parse_image_caption_as_attachment(tmp_path: Path) -> None:
         tmp_path,
         [
             {
-                "sample_id": "conv-image",
+                "sample_id": "synthetic-image-caption",
                 "conversation": {
-                    "speaker_a": "Alice",
-                    "speaker_b": "Bob",
+                    "speaker_a": "Mira",
+                    "speaker_b": "Theo",
                     "session_1": [
                         {
-                            "speaker": "Bob",
-                            "dia_id": "D1:1",
-                            "text": "The kids made this with clay.",
-                            "img_url": ["https://example.test/dog-cup.jpg"],
-                            "blip_caption": "a photo of a cup with a dog face on it",
-                            "query": "kids pottery finished pieces",
+                            "speaker": "Theo",
+                            "dia_id": "SYNIMG:101",
+                            "text": "I mounted the finished weather vane above the orangerie.",
+                            "img_url": ["https://example.test/heron-vane.jpg"],
+                            "blip_caption": (
+                                "A copper weather vane shaped like a heron above the "
+                                "orangerie."
+                            ),
+                            "query": "orangerie weather vane installation",
                         },
                     ],
-                    "session_1_date_time": "1:56 pm on 8 May, 2023",
+                    "session_1_date_time": "9:14 am on 14 February, 2026",
                 },
                 "qa": [],
             }
@@ -118,29 +131,35 @@ def test_parse_image_caption_as_attachment(tmp_path: Path) -> None:
 
     turn = LoCoMoAdapter(data_path).load().conversations[0].turns[0]
 
-    assert turn.metadata["blip_caption"] == "a photo of a cup with a dog face on it"
-    assert turn.metadata["img_url"] == ["https://example.test/dog-cup.jpg"]
+    assert turn.metadata["blip_caption"] == (
+        "A copper weather vane shaped like a heron above the orangerie."
+    )
+    assert turn.metadata["img_url"] == ["https://example.test/heron-vane.jpg"]
     assert turn.attachments == [
         {
             "kind": "image",
             "content_text": (
-                "Visual description of attached image: a photo of a cup with a dog face on it\n"
-                "Associated message speaker: Bob\n"
-                "Associated message text: The kids made this with clay.\n"
-                "Associated message timestamp: 2023-05-08T13:56:00"
+                "Visual description of attached image: A copper weather vane shaped like a "
+                "heron above the orangerie.\n"
+                "Associated message speaker: Theo\n"
+                "Associated message text: I mounted the finished weather vane above the "
+                "orangerie.\n"
+                "Associated message timestamp: 2026-02-14T09:14:00"
             ),
-            "url": "https://example.test/dog-cup.jpg",
-            "title": "LoCoMo image caption D1:1",
+            "url": "https://example.test/heron-vane.jpg",
+            "title": "LoCoMo image caption SYNIMG:101",
             "metadata": {
                 "source": "locomo",
                 "caption_kind": "blip_caption",
-                "turn_id": "D1:1",
+                "turn_id": "SYNIMG:101",
                 "image_index": 1,
                 "locomo_metadata": {
-                    "dia_id": "D1:1",
-                    "img_url": ["https://example.test/dog-cup.jpg"],
-                    "blip_caption": "a photo of a cup with a dog face on it",
-                    "query": "kids pottery finished pieces",
+                    "dia_id": "SYNIMG:101",
+                    "img_url": ["https://example.test/heron-vane.jpg"],
+                    "blip_caption": (
+                        "A copper weather vane shaped like a heron above the orangerie."
+                    ),
+                    "query": "orangerie weather vane installation",
                 },
             },
             "privacy_level": 0,
@@ -161,22 +180,26 @@ def test_category_filtering(tmp_path: Path) -> None:
                     "speaker_a": "Alice",
                     "speaker_b": "Bob",
                     "session_1": [
-                        {"speaker": "Alice", "dia_id": "D1:1", "text": "Alice likes red notebooks."},
-                        {"speaker": "Bob", "dia_id": "D1:2", "text": "Bob remembers that."},
+                        {
+                            "speaker": "Alice",
+                            "dia_id": "D71:101",
+                            "text": "Alice likes brass astrolabes.",
+                        },
+                        {"speaker": "Bob", "dia_id": "D71:102", "text": "Bob remembers that."},
                     ],
-                    "session_1_date_time": "1:56 pm on 8 May, 2023",
+                    "session_1_date_time": "1:56 pm on 8 March, 2026",
                 },
                 "qa": [
                     {
                         "question": "Scored question?",
                         "answer": "yes",
-                        "evidence": ["D1:1"],
+                        "evidence": ["D71:101"],
                         "category": 1,
                     },
                     {
                         "question": "Adversarial question?",
                         "answer": "no",
-                        "evidence": ["D1:2"],
+                        "evidence": ["D71:102"],
                         "category": 5,
                     },
                 ],
@@ -203,11 +226,11 @@ def test_speaker_mapping(tmp_path: Path) -> None:
                     "speaker_a": "Alice",
                     "speaker_b": "Bob",
                     "session_1": [
-                        {"speaker": "Bob", "dia_id": "D1:1", "text": "Bob speaks first."},
-                        {"speaker": "Alice", "dia_id": "D1:2", "text": "Alice replies."},
-                        {"speaker": "Bob", "dia_id": "D1:3", "text": "Bob closes the loop."},
+                        {"speaker": "Bob", "dia_id": "D71:101", "text": "Bob speaks first."},
+                        {"speaker": "Alice", "dia_id": "D71:102", "text": "Alice replies."},
+                        {"speaker": "Bob", "dia_id": "D74:401", "text": "Bob closes the loop."},
                     ],
-                    "session_1_date_time": "3:14 pm on August 13, 2023",
+                    "session_1_date_time": "3:14 pm on March 8, 2026",
                 },
                 "qa": [],
             }
@@ -217,7 +240,7 @@ def test_speaker_mapping(tmp_path: Path) -> None:
     conversation = LoCoMoAdapter(data_path).load().conversations[0]
 
     assert [turn.role for turn in conversation.turns] == ["user", "assistant", "user"]
-    assert conversation.turns[0].timestamp == "2023-08-13T15:14:00"
+    assert conversation.turns[0].timestamp == "2026-03-08T15:14:00"
 
 
 def test_missing_category_fails_fast(tmp_path: Path) -> None:
@@ -230,15 +253,19 @@ def test_missing_category_fails_fast(tmp_path: Path) -> None:
                     "speaker_a": "Alice",
                     "speaker_b": "Bob",
                     "session_1": [
-                        {"speaker": "Alice", "dia_id": "D1:1", "text": "Alice likes red notebooks."},
+                        {
+                            "speaker": "Alice",
+                            "dia_id": "D71:101",
+                            "text": "Alice likes brass astrolabes.",
+                        },
                     ],
-                    "session_1_date_time": "1:56 pm on 8 May, 2023",
+                    "session_1_date_time": "1:56 pm on 8 March, 2026",
                 },
                 "qa": [
                     {
                         "question": "What does Alice like?",
-                        "answer": "red notebooks",
-                        "evidence": ["D1:1"],
+                        "answer": "brass astrolabes",
+                        "evidence": ["D71:101"],
                     }
                 ],
             }

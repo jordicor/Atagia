@@ -38,8 +38,8 @@ from atagia.models.schemas_memory import (
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.embeddings import EmbeddingIndex, EmbeddingMatch
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def _clock() -> FrozenClock:
@@ -957,6 +957,9 @@ def test_context_cache_key_partitions_by_active_realm() -> None:
         "active_mind_id": None,
         "mind_topology": "unimind",
         "active_embodiment_id": "body_real",
+        "lifecycle_epoch": "ule-current",
+        "cache_revision": 17,
+        "derivation_revision": 23,
     }
     real_key = ContextCacheService.build_cache_key(
         **base,

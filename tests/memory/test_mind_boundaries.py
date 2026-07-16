@@ -46,8 +46,8 @@ from atagia.models.schemas_memory import (
 )
 from atagia.services.context_cache_service import ContextCacheService
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def _clock() -> FrozenClock:
@@ -1089,6 +1089,9 @@ def test_context_cache_key_partitions_by_active_mind() -> None:
         "operational_profile_token": "default",
         "active_presence_id": "presence_1",
         "active_space_id": None,
+        "lifecycle_epoch": "ule-current",
+        "cache_revision": 17,
+        "derivation_revision": 23,
     }
     alpha_key = ContextCacheService.build_cache_key(
         **base,

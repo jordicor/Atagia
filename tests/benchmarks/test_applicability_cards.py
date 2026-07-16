@@ -13,8 +13,8 @@ def test_applicability_card_cases_load() -> None:
     cases = load_cases(_DEFAULT_CASES_PATH)
 
     assert len(cases) == 8
-    assert cases[0].case_id == "slot_current_city"
-    assert cases[0].candidates[0]["id"] == "mem_city_current"
+    assert cases[0].case_id == "slot_current_drone_location"
+    assert cases[0].candidates[0]["id"] == "mem_drone_current"
 
 
 def test_applicability_card_cases_expand_deterministically() -> None:
@@ -31,8 +31,8 @@ def test_score_output_accepts_expected_top_and_useful_hits() -> None:
 
     score = score_output(
         [
-            {"memory_id": "mem_city_current", "resolved_date": None},
-            {"memory_id": "mem_city_trip", "resolved_date": None},
+            {"memory_id": "mem_drone_current", "resolved_date": None},
+            {"memory_id": "mem_robotics_trip", "resolved_date": None},
         ],
         case,
     )
@@ -47,14 +47,14 @@ def test_score_output_rejects_expected_drop_in_top3() -> None:
 
     score = score_output(
         [
-            {"memory_id": "mem_art", "resolved_date": None},
-            {"memory_id": "mem_city_current", "resolved_date": None},
+            {"memory_id": "mem_workshop_pigment", "resolved_date": None},
+            {"memory_id": "mem_drone_current", "resolved_date": None},
         ],
         case,
     )
 
     assert score["exact_match"] is False
-    assert score["expected_drop_top3_hits"] == ["mem_art"]
+    assert score["expected_drop_top3_hits"] == ["mem_workshop_pigment"]
 
 
 def test_estimate_cost_uses_cached_minimax_input_rate() -> None:

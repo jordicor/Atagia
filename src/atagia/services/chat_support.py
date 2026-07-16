@@ -10,7 +10,9 @@ from typing import Any
 
 from atagia.core.ids import new_job_id
 from atagia.core.config import Settings
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
 from atagia.core.language_codes import normalize_optional_iso_639_1_code
 from atagia.core.timestamps import normalize_optional_timestamp
 from atagia.memory.context_composer import ContextComposer
@@ -85,9 +87,7 @@ RECENT_TRANSCRIPT_TOKEN_OVERAGE_RATIO = 0.025
 RECENT_TRANSCRIPT_TOKEN_OMISSION_TEXT = (
     "Recent message omitted because it exceeds the immediate transcript token budget."
 )
-RECENT_TRANSCRIPT_POLICY_OMISSION_TEXT = (
-    "Recent message omitted from verbatim transcript by message policy; a placeholder is shown."
-)
+RECENT_TRANSCRIPT_POLICY_OMISSION_TEXT = "Recent message omitted from verbatim transcript by message policy; a placeholder is shown."
 TOPIC_WORKING_SET_DETAIL_LIMIT = 3
 RECENT_TRANSCRIPT_BUDGET_GUIDANCE = (
     "Some recent conversation messages are not included in the immediate transcript "
@@ -273,7 +273,9 @@ def apply_conversation_policy_overlay(
     conversation: dict[str, Any],
 ) -> ResolvedRetrievalPolicy:
     """Apply conversation-local policy restrictions."""
-    if not bool(conversation.get("temporary")) and not bool(conversation.get("isolated_mode")):
+    if not bool(conversation.get("temporary")) and not bool(
+        conversation.get("isolated_mode")
+    ):
         return resolved_policy
     return resolved_policy.model_copy(
         update={
@@ -442,7 +444,9 @@ def render_topic_working_set_block(
     if not active and not parked:
         return ""
 
-    freshness = payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
+    freshness = (
+        payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
+    )
     lines = [
         "[Topic Working Set]",
         (
@@ -515,7 +519,9 @@ def filter_topic_working_set_snapshot(
             privacy_ceiling=privacy_ceiling,
         )
     ]
-    freshness = payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
+    freshness = (
+        payload.get("freshness") if isinstance(payload.get("freshness"), dict) else {}
+    )
     return {
         "active_topics": active,
         "parked_topics": parked,
@@ -710,7 +716,9 @@ def build_transcript_window(
             continue
         if not _message_should_skip_by_default(message) or allow_skipped_raw:
             continue
-        entry = _transcript_entry_for_message(message, allow_skipped_raw=allow_skipped_raw)
+        entry = _transcript_entry_for_message(
+            message, allow_skipped_raw=allow_skipped_raw
+        )
         if entry.seq in seen_seqs:
             continue
         entries.append(entry)
@@ -722,7 +730,9 @@ def build_transcript_window(
         seq = int(message["seq"])
         if seq in seen_seqs:
             continue
-        entry = _transcript_entry_for_message(message, allow_skipped_raw=allow_skipped_raw)
+        entry = _transcript_entry_for_message(
+            message, allow_skipped_raw=allow_skipped_raw
+        )
         entries.append(entry)
         seen_seqs.add(entry.seq)
         remaining_tokens -= entry.token_estimate
@@ -735,7 +745,9 @@ def build_transcript_window(
     ]
 
     for message in reversed(uncovered_messages):
-        entry = _transcript_entry_for_message(message, allow_skipped_raw=allow_skipped_raw)
+        entry = _transcript_entry_for_message(
+            message, allow_skipped_raw=allow_skipped_raw
+        )
         if entry.token_estimate > remaining_tokens:
             continue
         entries.append(entry)
@@ -1084,7 +1096,9 @@ def render_assistant_guidance_block(guidance: list[str]) -> str:
     """Render optional assistant guidance into a prompt data section."""
     if not guidance:
         return ""
-    return render_prompt_data_section("assistant_guidance", "\n".join(f"- {item}" for item in guidance))
+    return render_prompt_data_section(
+        "assistant_guidance", "\n".join(f"- {item}" for item in guidance)
+    )
 
 
 def render_answer_stance_instruction(
@@ -1095,9 +1109,7 @@ def render_answer_stance_instruction(
     """Return compact answer behavior guidance for the configured stance."""
     if prompt_variant == "stance_gate_combo":
         prompt_variant = (
-            "strict_adjacent_silence"
-            if answer_stance == "reactive"
-            else "binary_gate"
+            "strict_adjacent_silence" if answer_stance == "reactive" else "binary_gate"
         )
     if prompt_variant == "template_v1":
         if answer_stance == "proactive":
@@ -1219,10 +1231,10 @@ def render_answer_stance_instruction(
             )
         return (
             "Answer stance: reactive. Apply this decision gate before answering: "
-                "if direct evidence proves the exact asked fact, answer yes; else "
-                "if direct evidence disproves it, answer no; else say the exact "
-                "fact is unsupported. Then stop. Adjacent evidence is not an "
-                "answer and must stay silent unless the user asks for it."
+            "if direct evidence proves the exact asked fact, answer yes; else "
+            "if direct evidence disproves it, answer no; else say the exact "
+            "fact is unsupported. Then stop. Adjacent evidence is not an "
+            "answer and must stay silent unless the user asks for it."
         )
     if prompt_variant == "label_precision":
         if answer_stance == "proactive":
@@ -1593,7 +1605,11 @@ def build_system_prompt(
     if topic_context_block:
         parts.append(render_prompt_data_section("topic_context", topic_context_block))
     if memory_processing_block:
-        parts.append(render_prompt_data_section("memory_processing_status", memory_processing_block))
+        parts.append(
+            render_prompt_data_section(
+                "memory_processing_status", memory_processing_block
+            )
+        )
     if recent_transcript_block:
         parts.append(recent_transcript_block)
     if memory_block:
@@ -1735,9 +1751,7 @@ def build_message_jobs(
     resolved_active_mind_id = _optional_text(
         active_mind_id or conversation.get("active_mind_id")
     )
-    resolved_source_mind_id = _optional_text(
-        source_mind_id or resolved_active_mind_id
-    )
+    resolved_source_mind_id = _optional_text(source_mind_id or resolved_active_mind_id)
     resolved_active_embodiment_id = _optional_text(
         active_embodiment_id or conversation.get("active_embodiment_id")
     )
@@ -1775,11 +1789,7 @@ def build_message_jobs(
         active_mind_id=resolved_active_mind_id,
         source_mind_id=resolved_source_mind_id,
         active_mind_display_name=_optional_text(active_mind_display_name),
-        mind_topology=(
-            mind_topology
-            or conversation.get("mind_topology")
-            or "unimind"
-        ),
+        mind_topology=(mind_topology or conversation.get("mind_topology") or "unimind"),
         active_embodiment_id=resolved_active_embodiment_id,
         active_embodiment_display_name=_optional_text(active_embodiment_display_name),
         cross_embodiment_mode=(
@@ -1790,9 +1800,7 @@ def build_message_jobs(
         active_realm_id=resolved_active_realm_id,
         active_realm_display_name=_optional_text(active_realm_display_name),
         cross_realm_mode=(
-            cross_realm_mode
-            or conversation.get("cross_realm_mode")
-            or "none"
+            cross_realm_mode or conversation.get("cross_realm_mode") or "none"
         ),
         mode=str(conversation.get("mode") or conversation["assistant_mode_id"]),
         incognito=resolved_incognito,
@@ -1865,6 +1873,8 @@ async def enqueue_message_jobs(
     worker_control_service: WorkerControlService | None = None,
     initial_context_package_repository: InitialContextPackageRepository | None = None,
     initial_context_package_refresh_enabled: bool = True,
+    commit: bool = True,
+    dispatch: bool = True,
 ) -> list[str]:
     """Enqueue message-derived worker jobs and return their job identifiers."""
     blocked_refresh_groups = _initial_context_package_refresh_groups(jobs)
@@ -1879,19 +1889,23 @@ async def enqueue_message_jobs(
             job_tracking_service=None,
             initial_context_package_repository=initial_context_package_repository,
             refresh_enabled=False,
+            commit=commit,
+            dispatch=dispatch,
         )
         return []
     job_ids: list[str] = []
     refresh_groups: dict[tuple[str, str, str | None, str], dict[str, Any]] = {}
+    if job_tracking_service is None and jobs:
+        raise RuntimeError("Durable job tracking is required before queue publication")
     for stream_name, job in jobs:
-        if job_tracking_service is not None:
-            await job_tracking_service.create_queued_job(stream_name, job)
-        try:
-            await storage_backend.stream_add(stream_name, job.model_dump(mode="json"))
-        except Exception as exc:
-            if job_tracking_service is not None:
-                await job_tracking_service.mark_enqueue_failed(job, exc)
-            raise
+        assert job_tracking_service is not None
+        await job_tracking_service.enqueue_job(
+            storage_backend,
+            stream_name,
+            job,
+            commit=commit,
+            dispatch=dispatch,
+        )
         job_ids.append(job.job_id)
         refresh_group = _initial_context_package_refresh_group(job)
         if refresh_group is not None:
@@ -1920,6 +1934,8 @@ async def enqueue_message_jobs(
                 job_tracking_service=job_tracking_service,
                 initial_context_package_repository=initial_context_package_repository,
                 refresh_enabled=initial_context_package_refresh_enabled,
+                commit=commit,
+                dispatch=dispatch,
             )
         )
     return job_ids
@@ -1933,6 +1949,8 @@ async def _enqueue_initial_context_package_refresh_groups(
     job_tracking_service: JobTrackingService | None,
     initial_context_package_repository: InitialContextPackageRepository | None,
     refresh_enabled: bool,
+    commit: bool,
+    dispatch: bool,
 ) -> list[str]:
     if not refresh_groups or not jobs:
         return []
@@ -1953,7 +1971,9 @@ async def _enqueue_initial_context_package_refresh_groups(
             source_message_ids=refresh_group["source_message_ids"],
             privacy_enforcement=refresh_group["privacy_enforcement"],
             operational_profile=refresh_group["operational_profile"],
-            fail_open=True,
+            fail_open=commit,
+            commit=commit,
+            dispatch=dispatch,
         )
         if refresh_job_id is not None:
             job_ids.append(refresh_job_id)

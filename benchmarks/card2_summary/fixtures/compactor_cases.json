@@ -1,0 +1,352 @@
+{
+  "cases": [
+    {
+      "case_id": "public_errand_checklist",
+      "reference_time_utc": "2026-04-26T12:00:00+00:00",
+      "messages": [
+        {
+          "seq": 1,
+          "role": "user",
+          "occurred_at": "2026-04-20T09:00:00+00:00",
+          "text": "The rechargeable batteries are mixed together, and I cannot tell which ones are ready to use."
+        },
+        {
+          "seq": 2,
+          "role": "assistant",
+          "occurred_at": "2026-04-20T09:01:00+00:00",
+          "text": "Put charged and depleted batteries in separate labeled trays, then test any uncertain ones before sorting them."
+        },
+        {
+          "seq": 3,
+          "role": "user",
+          "occurred_at": "2026-04-20T09:02:00+00:00",
+          "text": "I also want to organize the loose charging cables in the drawer."
+        },
+        {
+          "seq": 4,
+          "role": "assistant",
+          "occurred_at": "2026-04-20T09:03:00+00:00",
+          "text": "Group them by connector type and use a small reusable tie on each cable."
+        },
+        {
+          "seq": 5,
+          "role": "user",
+          "occurred_at": "2026-04-20T09:04:00+00:00",
+          "text": "The balcony planter drains too slowly after watering."
+        },
+        {
+          "seq": 6,
+          "role": "assistant",
+          "occurred_at": "2026-04-20T09:05:00+00:00",
+          "text": "Check that the drainage holes are clear and loosen the compacted top layer without disturbing the roots."
+        },
+        {
+          "seq": 7,
+          "role": "user",
+          "occurred_at": "2026-04-20T09:06:00+00:00",
+          "text": "I will reserve an hour on Sunday to scan the stack of paper receipts."
+        },
+        {
+          "seq": 8,
+          "role": "assistant",
+          "occurred_at": "2026-04-20T09:07:00+00:00",
+          "text": "That should be enough for a first pass if you scan by month and rename each file immediately."
+        }
+      ]
+    },
+    {
+      "case_id": "public_maker_space_planning",
+      "reference_time_utc": "2026-04-26T12:00:00+00:00",
+      "messages": [
+        {
+          "seq": 1,
+          "role": "user",
+          "occurred_at": "2026-04-21T10:00:00+00:00",
+          "text": "The weekend workshop needs enough cardboard, clips, and rulers for six small groups."
+        },
+        {
+          "seq": 2,
+          "role": "assistant",
+          "occurred_at": "2026-04-21T10:01:00+00:00",
+          "text": "Prepare one supply box per group and keep a seventh box as a shared reserve."
+        },
+        {
+          "seq": 3,
+          "role": "user",
+          "occurred_at": "2026-04-21T10:02:00+00:00",
+          "text": "I will add a cleanup bin and a printed inventory card to every table."
+        },
+        {
+          "seq": 4,
+          "role": "assistant",
+          "occurred_at": "2026-04-21T10:03:00+00:00",
+          "text": "For the storage area, measure the wall before choosing brackets for the new shelf."
+        },
+        {
+          "seq": 5,
+          "role": "user",
+          "occurred_at": "2026-04-21T10:04:00+00:00",
+          "text": "The available span is narrow, so two short shelves may fit better than one long shelf."
+        },
+        {
+          "seq": 6,
+          "role": "assistant",
+          "occurred_at": "2026-04-21T10:05:00+00:00",
+          "text": "Two short shelves will also make it easier to keep heavy materials close to their supports."
+        },
+        {
+          "seq": 7,
+          "role": "user",
+          "occurred_at": "2026-04-21T10:06:00+00:00",
+          "text": "I will label the upper shelf for light supplies and the lower shelf for tools."
+        },
+        {
+          "seq": 8,
+          "role": "assistant",
+          "occurred_at": "2026-04-21T10:07:00+00:00",
+          "text": "For the evening observation session, choose an open area with a clear view of the horizon."
+        },
+        {
+          "seq": 9,
+          "role": "user",
+          "occurred_at": "2026-04-21T10:08:00+00:00",
+          "text": "I found a suitable spot, but participants will need dim lights for their notes."
+        },
+        {
+          "seq": 10,
+          "role": "assistant",
+          "occurred_at": "2026-04-21T10:09:00+00:00",
+          "text": "Cover ordinary flashlights with red film so eyes remain adjusted to the dark."
+        },
+        {
+          "seq": 11,
+          "role": "user",
+          "occurred_at": "2026-04-21T10:10:00+00:00",
+          "text": "I will bring a printed sky map and mark three easy objects to locate first."
+        },
+        {
+          "seq": 12,
+          "role": "assistant",
+          "occurred_at": "2026-04-21T10:11:00+00:00",
+          "text": "A short starting list will keep the session focused and leave time for questions."
+        }
+      ]
+    },
+    {
+      "case_id": "public_photo_archive_workflow",
+      "reference_time_utc": "2026-04-26T12:00:00+00:00",
+      "messages": [
+        {
+          "seq": 1,
+          "role": "user",
+          "occurred_at": "2026-04-22T14:00:00+00:00",
+          "text": "I want to organize a folder of landscape photographs without losing the original files."
+        },
+        {
+          "seq": 2,
+          "role": "assistant",
+          "occurred_at": "2026-04-22T14:01:00+00:00",
+          "text": "Start with a read-only copy of the originals and perform all renaming on a separate working copy."
+        },
+        {
+          "seq": 3,
+          "role": "user",
+          "occurred_at": "2026-04-22T14:02:00+00:00",
+          "text": "The filenames are camera counters, so they do not show when or where each image was made."
+        },
+        {
+          "seq": 4,
+          "role": "assistant",
+          "occurred_at": "2026-04-22T14:03:00+00:00",
+          "text": "Build names from capture date plus a broad scene category, while keeping a unique numeric suffix."
+        },
+        {
+          "seq": 5,
+          "role": "user",
+          "occurred_at": "2026-04-22T14:04:00+00:00",
+          "text": "I also need a way to mark the strongest image from each sequence."
+        },
+        {
+          "seq": 6,
+          "role": "assistant",
+          "occurred_at": "2026-04-22T14:05:00+00:00",
+          "text": "Use a rating field in the catalog instead of altering filenames, so selections can change later."
+        },
+        {
+          "seq": 7,
+          "role": "user",
+          "occurred_at": "2026-04-22T14:06:00+00:00",
+          "text": "Once the catalog is clean, I want two backups stored in different places."
+        },
+        {
+          "seq": 8,
+          "role": "assistant",
+          "occurred_at": "2026-04-22T14:07:00+00:00",
+          "text": "Keep one encrypted backup on a removable drive and another in a separate storage service."
+        },
+        {
+          "seq": 9,
+          "role": "user",
+          "occurred_at": "2026-04-22T14:08:00+00:00",
+          "text": "I will verify a sample restore after each backup completes."
+        },
+        {
+          "seq": 10,
+          "role": "assistant",
+          "occurred_at": "2026-04-22T14:09:00+00:00",
+          "text": "Record the verification date and rotate the sample so every folder is tested over time."
+        }
+      ]
+    },
+    {
+      "case_id": "public_quick_task_switches",
+      "reference_time_utc": "2026-04-26T12:00:00+00:00",
+      "messages": [
+        {
+          "seq": 1,
+          "role": "user",
+          "occurred_at": "2026-04-23T08:00:00+00:00",
+          "text": "The desk lamp flickers for a few seconds whenever it is switched on."
+        },
+        {
+          "seq": 2,
+          "role": "assistant",
+          "occurred_at": "2026-04-23T08:01:00+00:00",
+          "text": "Test a known-good bulb first, and stop using the lamp if the socket looks damaged."
+        },
+        {
+          "seq": 3,
+          "role": "user",
+          "occurred_at": "2026-04-23T08:02:00+00:00",
+          "text": "I need an offline copy of the morning bus timetable."
+        },
+        {
+          "seq": 4,
+          "role": "assistant",
+          "occurred_at": "2026-04-23T08:03:00+00:00",
+          "text": "Save the official schedule as a document and note the date when you downloaded it."
+        },
+        {
+          "seq": 5,
+          "role": "user",
+          "occurred_at": "2026-04-23T08:04:00+00:00",
+          "text": "The freezer containers all look identical once frost covers their labels."
+        },
+        {
+          "seq": 6,
+          "role": "assistant",
+          "occurred_at": "2026-04-23T08:05:00+00:00",
+          "text": "Add a simple color mark to each lid and keep a matching list near the freezer."
+        },
+        {
+          "seq": 7,
+          "role": "user",
+          "occurred_at": "2026-04-23T08:06:00+00:00",
+          "text": "The blue storage box is empty and ready to be reused."
+        },
+        {
+          "seq": 8,
+          "role": "assistant",
+          "occurred_at": "2026-04-23T08:07:00+00:00",
+          "text": "For the tabletop game, place each set of pieces in its own small pouch before packing the box."
+        },
+        {
+          "seq": 9,
+          "role": "user",
+          "occurred_at": "2026-04-23T08:08:00+00:00",
+          "text": "One rule card is missing, but I have a digital copy of the instructions."
+        },
+        {
+          "seq": 10,
+          "role": "assistant",
+          "occurred_at": "2026-04-23T08:09:00+00:00",
+          "text": "Print only the missing card and write the edition number on the replacement."
+        },
+        {
+          "seq": 11,
+          "role": "user",
+          "occurred_at": "2026-04-23T08:10:00+00:00",
+          "text": "The moisture sensor for the houseplants reports the same value all day."
+        },
+        {
+          "seq": 12,
+          "role": "assistant",
+          "occurred_at": "2026-04-23T08:11:00+00:00",
+          "text": "Clean the probe, test it in dry and damp soil, and replace its battery if the value never changes."
+        },
+        {
+          "seq": 13,
+          "role": "user",
+          "occurred_at": "2026-04-23T08:12:00+00:00",
+          "text": "I want a short language-practice routine that fits before breakfast."
+        },
+        {
+          "seq": 14,
+          "role": "assistant",
+          "occurred_at": "2026-04-23T08:13:00+00:00",
+          "text": "Use ten minutes for review and five minutes to write three original sentences."
+        },
+        {
+          "seq": 15,
+          "role": "user",
+          "occurred_at": "2026-04-23T08:14:00+00:00",
+          "text": "I will prepare the review cards the night before so the routine starts immediately."
+        }
+      ]
+    },
+    {
+      "case_id": "public_digital_cleanup_reflection",
+      "reference_time_utc": "2026-04-26T12:00:00+00:00",
+      "messages": [
+        {
+          "seq": 1,
+          "role": "user",
+          "occurred_at": "2026-04-24T20:00:00+00:00",
+          "text": "My downloads folder has become a mix of installers, documents, and duplicate images."
+        },
+        {
+          "seq": 2,
+          "role": "assistant",
+          "occurred_at": "2026-04-24T20:01:00+00:00",
+          "text": "Begin by sorting by file type, but review each group before deleting anything in bulk."
+        },
+        {
+          "seq": 3,
+          "role": "user",
+          "occurred_at": "2026-04-24T20:02:00+00:00",
+          "text": "The duplicates are the hardest part because several copies have slightly different names."
+        },
+        {
+          "seq": 4,
+          "role": "assistant",
+          "occurred_at": "2026-04-24T20:03:00+00:00",
+          "text": "Compare file hashes and sizes rather than relying on names, then move suspected duplicates to a review folder."
+        },
+        {
+          "seq": 5,
+          "role": "user",
+          "occurred_at": "2026-04-24T20:04:00+00:00",
+          "text": "I feel better treating the review folder as a reversible step instead of deleting files immediately."
+        },
+        {
+          "seq": 6,
+          "role": "assistant",
+          "occurred_at": "2026-04-24T20:05:00+00:00",
+          "text": "Set a reminder to revisit that folder after a week, when it will be easier to judge what is still needed."
+        },
+        {
+          "seq": 7,
+          "role": "user",
+          "occurred_at": "2026-04-24T20:06:00+00:00",
+          "text": "I will do the first sorting pass tonight and leave the final review for next weekend."
+        },
+        {
+          "seq": 8,
+          "role": "assistant",
+          "occurred_at": "2026-04-24T20:07:00+00:00",
+          "text": "That separates the mechanical cleanup from the decisions and keeps the session manageable."
+        }
+      ]
+    }
+  ]
+}

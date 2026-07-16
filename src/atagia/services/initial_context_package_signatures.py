@@ -13,10 +13,11 @@ from pydantic import BaseModel
 from atagia.core import json_utils
 from atagia.core.canonical import canonical_json_hash
 from atagia.core.clock import Clock
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
 from atagia.core.mind_repository import DEFAULT_OVERSEER_MIND_ID
 from atagia.core.storage_backend import StorageBackend
-from atagia.memory.lifecycle_runner import cache_generation_key
 from atagia.memory.policy_manifest import (
     ResolvedRetrievalPolicy,
     compute_effective_policy_hash,
@@ -38,7 +39,6 @@ class InitialContextPackageCacheInvalidationResult:
     stale_package_count: int
     deleted_context_views: int
     deleted_recent_windows: int
-    cache_generation: int
 
 
 def build_initial_context_package_policy_signature(
@@ -151,8 +151,12 @@ async def build_initial_context_package_coordinate_signature(
             active_presence_id,
             conversation_row.get("active_presence_id"),
         )
-        active_space_id = _coalesce(active_space_id, conversation_row.get("active_space_id"))
-        active_mind_id = _coalesce(active_mind_id, conversation_row.get("active_mind_id"))
+        active_space_id = _coalesce(
+            active_space_id, conversation_row.get("active_space_id")
+        )
+        active_mind_id = _coalesce(
+            active_mind_id, conversation_row.get("active_mind_id")
+        )
         mind_topology = _coalesce(mind_topology, conversation_row.get("mind_topology"))
         active_embodiment_id = _coalesce(
             active_embodiment_id,
@@ -163,7 +167,9 @@ async def build_initial_context_package_coordinate_signature(
             conversation_row.get("active_realm_id"),
         )
         incognito = _coalesce_bool(incognito, conversation_row.get("incognito"))
-        isolated_mode = _coalesce_bool(isolated_mode, conversation_row.get("isolated_mode"))
+        isolated_mode = _coalesce_bool(
+            isolated_mode, conversation_row.get("isolated_mode")
+        )
         temporary = _coalesce_bool(temporary, conversation_row.get("temporary"))
         purge_on_close = _coalesce_bool(
             purge_on_close,
@@ -303,7 +309,9 @@ async def build_initial_context_package_coordinate_signature(
         },
         "lifecycle": {
             "incognito": bool(incognito) if incognito is not None else False,
-            "isolated_mode": bool(isolated_mode) if isolated_mode is not None else False,
+            "isolated_mode": bool(isolated_mode)
+            if isolated_mode is not None
+            else False,
             "temporary": bool(temporary) if temporary is not None else False,
             "purge_on_close": (
                 bool(purge_on_close) if purge_on_close is not None else False
@@ -533,17 +541,6 @@ async def build_initial_context_package_source_fingerprint(
             """,
             (user_id,),
         ),
-        "conversation_activity_stats": await _aggregate_one(
-            connection,
-            """
-            SELECT COUNT(*) AS row_count,
-                   MAX(updated_at) AS max_updated_at,
-                   MAX(last_message_at) AS max_last_message_at
-            FROM conversation_activity_stats
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ),
     }
     if conversation_id is not None:
         sources["conversation"] = await _single_row_marker(
@@ -572,6 +569,18 @@ async def build_initial_context_package_source_fingerprint(
             connection,
             user_id=user_id,
             conversation_id=conversation_id,
+        )
+        sources["conversation_activity_stats"] = await _aggregate_one(
+            connection,
+            """
+            SELECT COUNT(*) AS row_count,
+                   MAX(updated_at) AS max_updated_at,
+                   MAX(last_message_at) AS max_last_message_at
+            FROM conversation_activity_stats
+            WHERE user_id = ?
+              AND conversation_id = ?
+            """,
+            (user_id, conversation_id),
         )
         sources["memory_objects_conversation"] = await _aggregate_one(
             connection,
@@ -652,7 +661,6 @@ async def invalidate_initial_context_package_dependency(
     *,
     clock: Clock,
     storage_backend: StorageBackend,
-    database_path: str,
     user_id: str,
     conversation_id: str | None = None,
     package_kind: InitialContextPackageKind | str | None = None,
@@ -667,12 +675,12 @@ async def invalidate_initial_context_package_dependency(
         and package_kind is None
         and retrieval_profile_id is None
     ):
-        stale_count = await repository.mark_stale_for_user(
-            user_id,
+        stale_count = await repository.mark_stale_for_changed_sources(
+            user_id=user_id,
             commit=commit,
         )
     else:
-        stale_count = await repository.mark_stale_for_key_family(
+        stale_count = await repository.mark_stale_for_changed_sources(
             user_id=user_id,
             conversation_id=conversation_id,
             package_kind=package_kind,
@@ -680,27 +688,29 @@ async def invalidate_initial_context_package_dependency(
             commit=commit,
         )
     if conversation_id is not None:
-        deleted_context_views = await storage_backend.delete_context_views_for_conversation(
-            user_id,
-            conversation_id,
+        deleted_context_views = (
+            await storage_backend.delete_context_views_for_conversation(
+                user_id,
+                conversation_id,
+            )
         )
-        deleted_recent_windows = await storage_backend.delete_recent_window_for_conversation(
-            user_id,
-            conversation_id,
+        deleted_recent_windows = (
+            await storage_backend.delete_recent_window_for_conversation(
+                user_id,
+                conversation_id,
+            )
         )
     else:
-        deleted_context_views = await storage_backend.delete_context_views_for_user(user_id)
+        deleted_context_views = await storage_backend.delete_context_views_for_user(
+            user_id
+        )
         deleted_recent_windows = await storage_backend.delete_recent_windows_for_user(
             user_id
         )
-    cache_generation = await storage_backend.increment_cache_generation(
-        cache_generation_key(database_path, user_id)
-    )
     return InitialContextPackageCacheInvalidationResult(
         stale_package_count=stale_count,
         deleted_context_views=deleted_context_views,
         deleted_recent_windows=deleted_recent_windows,
-        cache_generation=cache_generation,
     )
 
 
@@ -717,9 +727,12 @@ async def _resolve_conversation(
             raise ValueError("conversation must belong to user_id")
         if conversation_id is not None and str(row.get("id")) != conversation_id:
             raise ValueError("conversation_id must match conversation")
-        return _decode_json_columns(row)
     if conversation_id is None:
-        return None
+        return (
+            None if conversation is None else _decode_json_columns(dict(conversation))
+        )
+    # Supplied rows are identity hints only. Always refetch canonical state so
+    # a stale caller cannot sign a package for superseded coordinates.
     return await _single_row_marker(
         connection,
         """

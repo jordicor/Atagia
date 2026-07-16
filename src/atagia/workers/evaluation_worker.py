@@ -23,12 +23,20 @@ from atagia.models.schemas_jobs import (
     WorkerIterationResult,
 )
 from atagia.services.job_tracking_service import JobTrackingService
-from atagia.services.llm_client import LLMClient, StructuredOutputError, TransientLLMError
-from atagia.services.worker_control_service import WorkerControlService, wait_if_worker_claims_paused
+from atagia.services.llm_client import (
+    LLMClient,
+    StructuredOutputError,
+    TransientLLMError,
+)
+from atagia.services.worker_control_service import (
+    WorkerControlService,
+    wait_if_worker_claims_paused,
+)
+from atagia.services.worker_effect_fence import WorkerEffectFence
+from atagia.services.worker_job_lease import JobLeaseLostError, WorkerJobLease
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
-STREAM_RECLAIM_IDLE_MS = 1_000
 MAX_STREAM_DELIVERIES = 3
 
 
@@ -42,23 +50,33 @@ class EvaluationWorker:
         llm_client: LLMClient[Any],
         clock: Clock,
         settings: Settings | None = None,
+        job_connection: aiosqlite.Connection | None = None,
     ) -> None:
         self._storage_backend = storage_backend
         self._llm_client = llm_client
         self._worker_control = WorkerControlService(connection, clock)
         resolved_settings = settings or Settings.from_env()
+        self._stream_reclaim_idle_ms = int(
+            resolved_settings.worker_stream_reclaim_idle_seconds * 1000
+        )
+        self._effect_fence = WorkerEffectFence(connection, clock)
         self._job_tracking = JobTrackingService(
-            connection,
+            job_connection or connection,
             clock,
             workers_enabled=resolved_settings.workers_enabled,
             settings=resolved_settings,
+            child_job_connection=connection,
         )
-        self._metrics_computer = MetricsComputer(connection, clock, settings=resolved_settings)
+        self._metrics_computer = MetricsComputer(
+            connection, clock, settings=resolved_settings
+        )
         self._metrics_repository = MetricsRepository(connection, clock)
         self._clock = clock
 
     async def run(self, consumer_name: str = "evaluate-1") -> None:
-        await self._storage_backend.stream_ensure_group(EVALUATION_STREAM_NAME, WORKER_GROUP_NAME)
+        await self._storage_backend.stream_ensure_group(
+            EVALUATION_STREAM_NAME, WORKER_GROUP_NAME
+        )
         while True:
             try:
                 await self.run_once(consumer_name=consumer_name, block_ms=5000)
@@ -76,7 +94,9 @@ class EvaluationWorker:
     ) -> WorkerIterationResult:
         if await wait_if_worker_claims_paused(self._worker_control, block_ms=block_ms):
             return WorkerIterationResult()
-        messages = await self._next_messages(consumer_name=consumer_name, block_ms=block_ms)
+        messages = await self._next_messages(
+            consumer_name=consumer_name, block_ms=block_ms
+        )
         if not messages:
             return WorkerIterationResult()
 
@@ -84,23 +104,60 @@ class EvaluationWorker:
         failed = 0
         dead_lettered = 0
         for message in messages:
-            try:
-                await self._job_tracking.mark_running(message)
-                await self.process_job(message.payload)
-                await self._job_tracking.mark_succeeded(message)
+            claim = await self._job_tracking.claim_notification(
+                message,
+                owner_id=consumer_name,
+            )
+            if claim is None:
                 await self._storage_backend.stream_ack(
                     EVALUATION_STREAM_NAME,
                     WORKER_GROUP_NAME,
                     message.message_id,
                 )
                 acked += 1
+                continue
+            lease = WorkerJobLease(
+                self._job_tracking,
+                claim,
+                effect_fence=self._effect_fence,
+            )
+            try:
+                async with lease:
+                    await self.process_job(claim.envelope.model_dump(mode="json"))
+                    await lease.succeed()
+                await self._storage_backend.stream_ack(
+                    EVALUATION_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
+                acked += 1
+            except JobLeaseLostError:
+                await self._storage_backend.stream_ack(
+                    EVALUATION_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
             except Exception as exc:
                 failed += 1
                 self._log_job_failure(message, exc)
-                if await self._dead_letter_if_exhausted(message, exc):
+                if claim.attempt_count >= MAX_STREAM_DELIVERIES:
+                    finalized = await lease.dead_letter(
+                        self._storage_backend,
+                        stream_name=EVALUATION_STREAM_NAME,
+                        group_name=WORKER_GROUP_NAME,
+                        message=message,
+                        exc=exc,
+                    )
+                    if not finalized:
+                        continue
                     dead_lettered += 1
                 else:
-                    await self._job_tracking.mark_retrying(message, exc)
+                    await lease.retry(exc)
+                    await self._storage_backend.stream_ack(
+                        EVALUATION_STREAM_NAME,
+                        WORKER_GROUP_NAME,
+                        message.message_id,
+                    )
         return WorkerIterationResult(
             received=len(messages),
             acked=acked,
@@ -155,7 +212,9 @@ class EvaluationWorker:
                     time_bucket=job_payload.time_bucket,
                     computed_at=self._clock.now().isoformat(),
                     user_id=None if is_system_metric else job_payload.user_id,
-                    assistant_mode_id=None if is_system_metric else job_payload.assistant_mode_id,
+                    assistant_mode_id=None
+                    if is_system_metric
+                    else job_payload.assistant_mode_id,
                 )
                 computed[stored_metric_name] = {
                     "value": result.value,
@@ -173,7 +232,7 @@ class EvaluationWorker:
             EVALUATION_STREAM_NAME,
             WORKER_GROUP_NAME,
             consumer_name,
-            min_idle_ms=0 if block_ms == 0 else STREAM_RECLAIM_IDLE_MS,
+            min_idle_ms=self._stream_reclaim_idle_ms,
             count=1,
         )
         if reclaimed:
@@ -185,32 +244,3 @@ class EvaluationWorker:
             count=1,
             block_ms=block_ms,
         )
-
-    async def _dead_letter_if_exhausted(
-        self,
-        message: StreamMessage,
-        exc: Exception,
-    ) -> bool:
-        if message.delivery_count < MAX_STREAM_DELIVERIES:
-            return False
-        await self._storage_backend.enqueue_job(
-            f"dead_letter:{EVALUATION_STREAM_NAME}",
-            {
-                "message_id": message.message_id,
-                "delivery_count": message.delivery_count,
-                "payload": message.payload,
-                "error": str(exc),
-                "error_details": (
-                    list(exc.details)
-                    if isinstance(exc, StructuredOutputError)
-                    else []
-                ),
-            },
-        )
-        await self._storage_backend.stream_ack(
-            EVALUATION_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            message.message_id,
-        )
-        await self._job_tracking.mark_dead_lettered(message, exc)
-        return True

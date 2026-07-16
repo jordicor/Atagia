@@ -37,7 +37,11 @@ from atagia.memory.extraction_cards import (
     build_enrichment_prompt,
 )
 from atagia.memory.extractor import MemoryExtractor
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
+from atagia.memory.policy_manifest import (
+    ManifestLoader,
+    PolicyResolver,
+    sync_assistant_modes,
+)
 from atagia.memory.retrieval_surface_dry_run import (
     RetrievalSurfaceDryRunGenerator,
     RetrievalSurfaceWriter,
@@ -66,8 +70,13 @@ from atagia.services.llm_client import (
     LLMStreamEvent,
     OutputLimitExceededError,
 )
+from atagia.services.embeddings import NoneBackend
+from atagia.services.lifecycle_service import ConversationLifecycleService
 from atagia.services.model_resolution import MINIMAX_M3_MODEL
-from atagia.services.privacy_filter_client import PrivacyFilterDetection, PrivacyFilterSpan
+from atagia.services.privacy_filter_client import (
+    PrivacyFilterDetection,
+    PrivacyFilterSpan,
+)
 from atagia.services.run_counters import (
     RunCounterAccumulator,
     use_run_counter_accumulator,
@@ -75,8 +84,12 @@ from atagia.services.run_counters import (
 from tests.extraction_payload_support import rich_extraction_payload_to_lean
 from tests.memory.card_leak_guard import assert_prompt_has_no_benchmark_leak
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 def _with_default_language_codes(payload: dict[str, object]) -> dict[str, object]:
@@ -103,7 +116,9 @@ def _is_memory_extraction_card_purpose(purpose: object) -> bool:
     return str(purpose or "") in _MEMORY_EXTRACTION_CARD_PURPOSES
 
 
-def _card_output_from_lean_payload(payload: dict[str, object] | str, purpose: object) -> str:
+def _card_output_from_lean_payload(
+    payload: dict[str, object] | str, purpose: object
+) -> str:
     if isinstance(payload, str):
         return payload
     candidates = payload.get("candidates")
@@ -112,22 +127,32 @@ def _card_output_from_lean_payload(payload: dict[str, object] | str, purpose: ob
     candidate_ids = [f"cand_{index + 1:03d}" for index in range(len(candidates))]
     purpose_text = str(purpose or "")
     if purpose_text == "memory_extraction_candidate_card":
-        return "\n".join(
-            f"{candidate_id} | {candidate.get('canonical_text') or ''}"
-            for candidate_id, candidate in zip(candidate_ids, candidates, strict=True)
-            if isinstance(candidate, dict) and candidate.get("canonical_text")
-        ) or "none"
-    if purpose_text == "memory_extraction_kind_scope_card":
-        return "\n".join(
-            (
-                f"{candidate_id} "
-                f"{candidate.get('kind') or 'evidence'} "
-                f"{candidate.get('subject_scope') or 'user'} "
-                f"{candidate.get('confidence', 0.75)}"
+        return (
+            "\n".join(
+                f"{candidate_id} | {candidate.get('canonical_text') or ''}"
+                for candidate_id, candidate in zip(
+                    candidate_ids, candidates, strict=True
+                )
+                if isinstance(candidate, dict) and candidate.get("canonical_text")
             )
-            for candidate_id, candidate in zip(candidate_ids, candidates, strict=True)
-            if isinstance(candidate, dict)
-        ) or "none"
+            or "none"
+        )
+    if purpose_text == "memory_extraction_kind_scope_card":
+        return (
+            "\n".join(
+                (
+                    f"{candidate_id} "
+                    f"{candidate.get('kind') or 'evidence'} "
+                    f"{candidate.get('subject_scope') or 'user'} "
+                    f"{candidate.get('confidence', 0.75)}"
+                )
+                for candidate_id, candidate in zip(
+                    candidate_ids, candidates, strict=True
+                )
+                if isinstance(candidate, dict)
+            )
+            or "none"
+        )
     if purpose_text == "memory_extraction_evidence_card":
         lines = []
         for candidate_id, candidate in zip(candidate_ids, candidates, strict=True):
@@ -145,11 +170,16 @@ def _card_output_from_lean_payload(payload: dict[str, object] | str, purpose: ob
             )
         return "\n".join(lines) or "none"
     if purpose_text == "memory_extraction_index_card":
-        return "\n".join(
-            f"{candidate_id} | {candidate.get('index_text') or 'none'}"
-            for candidate_id, candidate in zip(candidate_ids, candidates, strict=True)
-            if isinstance(candidate, dict)
-        ) or "none"
+        return (
+            "\n".join(
+                f"{candidate_id} | {candidate.get('index_text') or 'none'}"
+                for candidate_id, candidate in zip(
+                    candidate_ids, candidates, strict=True
+                )
+                if isinstance(candidate, dict)
+            )
+            or "none"
+        )
     if purpose_text == "memory_extraction_temporal_card":
         lines = []
         for candidate_id, candidate in zip(candidate_ids, candidates, strict=True):
@@ -185,7 +215,11 @@ def _card_output_from_lean_payload(payload: dict[str, object] | str, purpose: ob
     if purpose_text == "memory_extraction_coverage_members_card":
         lines = []
         for candidate_id, candidate in zip(candidate_ids, candidates, strict=True):
-            members = candidate.get("coverage_members") if isinstance(candidate, dict) else None
+            members = (
+                candidate.get("coverage_members")
+                if isinstance(candidate, dict)
+                else None
+            )
             members_json = json.dumps(members) if isinstance(members, list) else "[]"
             lines.append(f"{candidate_id} | {members_json}")
         return "\n".join(lines) or "none"
@@ -267,8 +301,7 @@ class RetrievalPacketDryRunProvider(LLMProvider):
             output_text=json.dumps(
                 {
                     "surfaces": [
-                        self._surface_for_memory(memory)
-                        for memory in source_memories
+                        self._surface_for_memory(memory) for memory in source_memories
                     ]
                 }
             ),
@@ -367,7 +400,9 @@ async def _build_runtime(
 ):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 3, 30, 18, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
 
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
@@ -377,10 +412,15 @@ async def _build_runtime(
     await users.create_user("usr_1")
     if workspace_id is not None:
         await workspaces.create_workspace(workspace_id, "usr_1", "Workspace")
-    await conversations.create_conversation("cnv_1", "usr_1", workspace_id, mode_id, "Chat")
+    await conversations.create_conversation(
+        "cnv_1", "usr_1", workspace_id, mode_id, "Chat"
+    )
 
     provider = CannedExtractionProvider(payload, explicit_result=explicit_result)
-    if retrieval_packet_surface_writer is None and enable_retrieval_packet_surface_write:
+    if (
+        retrieval_packet_surface_writer is None
+        and enable_retrieval_packet_surface_write
+    ):
         retrieval_packet_surface_writer = RetrievalSurfaceWriter(
             MemoryRetrievalSurfaceRepository(connection, clock),
             clock,
@@ -416,7 +456,9 @@ async def _build_runtime_with_provider(
 ):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 3, 30, 18, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
 
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
@@ -426,7 +468,9 @@ async def _build_runtime_with_provider(
     await users.create_user("usr_1")
     if workspace_id is not None:
         await workspaces.create_workspace(workspace_id, "usr_1", "Workspace")
-    await conversations.create_conversation("cnv_1", "usr_1", workspace_id, mode_id, "Chat")
+    await conversations.create_conversation(
+        "cnv_1", "usr_1", workspace_id, mode_id, "Chat"
+    )
 
     extractor = MemoryExtractor(
         llm_client=LLMClient(
@@ -490,7 +534,9 @@ class SequencedExtractionProvider(LLMProvider):
         if _is_memory_extraction_card_purpose(request.metadata.get("purpose")):
             if request.metadata.get("purpose") == "memory_extraction_candidate_card":
                 if not self._payloads:
-                    raise AssertionError("No payload left for sequenced extraction test")
+                    raise AssertionError(
+                        "No payload left for sequenced extraction test"
+                    )
                 self._active_payload = self._payloads.pop(0)
             if self._active_payload is None:
                 raise AssertionError("No active payload for extraction card test")
@@ -583,7 +629,9 @@ class WatchdogAbortProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         if request.metadata.get("purpose") == "extraction_watchdog":
-            raise AssertionError("Mechanical extraction watchdog must not call an LLM verdict")
+            raise AssertionError(
+                "Mechanical extraction watchdog must not call an LLM verdict"
+            )
         if _is_memory_extraction_card_purpose(request.metadata.get("purpose")):
             return LLMCompletionResponse(
                 provider=self.name,
@@ -634,7 +682,9 @@ class VerboseStreamingExtractionProvider(LLMProvider):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         self.requests.append(request)
         if request.metadata.get("purpose") == "extraction_watchdog":
-            raise AssertionError("Mechanical extraction watchdog must not call an LLM verdict")
+            raise AssertionError(
+                "Mechanical extraction watchdog must not call an LLM verdict"
+            )
         if request.metadata.get("purpose") == "intent_classifier_explicit":
             return LLMCompletionResponse(
                 provider=self.name,
@@ -774,13 +824,17 @@ def _retrieval_packet_generator(
 
 
 async def _retrieval_surface_count(connection) -> int:
-    cursor = await connection.execute("SELECT COUNT(*) AS count FROM memory_retrieval_surfaces")
+    cursor = await connection.execute(
+        "SELECT COUNT(*) AS count FROM memory_retrieval_surfaces"
+    )
     row = await cursor.fetchone()
     return int(row["count"])
 
 
 async def _retrieval_surface_fts_count(connection) -> int:
-    cursor = await connection.execute("SELECT COUNT(*) AS count FROM memory_retrieval_surfaces_fts")
+    cursor = await connection.execute(
+        "SELECT COUNT(*) AS count FROM memory_retrieval_surfaces_fts"
+    )
     row = await cursor.fetchone()
     return int(row["count"])
 
@@ -943,15 +997,26 @@ async def test_normal_extraction_persists_grounded_items() -> None:
         assert run_counters.snapshot() == {"counts": {}, "labeled_counts": {}}
         assert len(persisted) == 3
         assert provider.requests[0].model == MINIMAX_M3_MODEL
-        assert provider.requests[0].metadata["purpose"] == "memory_extraction_candidate_card"
+        assert (
+            provider.requests[0].metadata["purpose"]
+            == "memory_extraction_candidate_card"
+        )
         assert provider.requests[0].response_schema is None
-        assert "<message_timestamp>2023-05-08T13:56:00</message_timestamp>" in provider.requests[0].messages[1].content
+        assert (
+            "<message_timestamp>2023-05-08T13:56:00</message_timestamp>"
+            in provider.requests[0].messages[1].content
+        )
         assert "<message_text>" in provider.requests[0].messages[1].content
         assert "Do not write JSON." in provider.requests[0].messages[1].content
-        assert "Output format: cand_001 | concise canonical memory text" in provider.requests[0].messages[1].content
+        assert (
+            "Output format: cand_001 | concise canonical memory text"
+            in provider.requests[0].messages[1].content
+        )
         assert "plain-text card lines" in provider.requests[0].messages[0].content
         assert by_type["evidence"]["status"] == "active"
-        assert by_type["belief"]["payload_json"]["claim_key"] == "response_style.debugging"
+        assert (
+            by_type["belief"]["payload_json"]["claim_key"] == "response_style.debugging"
+        )
         assert by_type["belief"]["payload_json"]["claim_value"] == "concise_actionable"
         assert by_type["belief"]["payload_json"]["source_message_ids"] == ["msg_1"]
         assert "extraction_hash" in by_type["belief"]["payload_json"]
@@ -962,7 +1027,9 @@ async def test_normal_extraction_persists_grounded_items() -> None:
 
 
 @pytest.mark.asyncio
-async def test_extraction_persists_source_packet_with_lean_support_kind_and_span() -> None:
+async def test_extraction_persists_source_packet_with_lean_support_kind_and_span() -> (
+    None
+):
     # The lean contract carries support_kind and source_span but no trigger,
     # polarity, or speaker_relation fields. The mapper supplies the server-side
     # defaults (evidence_polarity=supports, speaker_relation=unknown), and the
@@ -970,12 +1037,12 @@ async def test_extraction_persists_source_packet_with_lean_support_kind_and_span
     payload = {
         "evidences": [
             {
-                "canonical_text": "Gina's favorite dance style is contemporary.",
+                "canonical_text": "Niko stores the calibrated prism in locker AXIS-903.",
                 "scope": "conversation",
                 "confidence": 0.91,
                 "source_kind": "extracted",
                 "support_kind": "direct",
-                "source_quote": "Contemporary dance is so expressive and graceful - it really speaks to me.",
+                "source_quote": "After calibration, I stored the prism in locker AXIS-903.",
                 "privacy_level": 0,
                 "payload": {},
             }
@@ -986,16 +1053,22 @@ async def test_extraction_persists_source_packet_with_lean_support_kind_and_span
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, _memories, extractor, provider, resolved_policy = (
-        await _build_runtime(payload)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        _memories,
+        extractor,
+        provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
             message_id="msg_source",
-            text="Gina: Yeah, me too! Contemporary dance is so expressive and graceful - it really speaks to me.",
+            text="After calibration, I stored the prism in locker AXIS-903.",
             seq=2,
-            occurred_at="2023-01-20T16:04:00+00:00",
+            occurred_at="2026-02-11T09:15:00+00:00",
         )
 
         await extractor.extract(
@@ -1014,7 +1087,7 @@ async def test_extraction_persists_source_packet_with_lean_support_kind_and_span
         assert packets[0]["message_id"] == "msg_source"
         assert (
             packets[0]["quote_text"]
-            == "Contemporary dance is so expressive and graceful - it really speaks to me."
+            == "After calibration, I stored the prism in locker AXIS-903."
         )
     finally:
         await connection.close()
@@ -1025,14 +1098,14 @@ async def test_extraction_degrades_contextual_direct_without_valid_trigger() -> 
     payload = {
         "evidences": [
             {
-                "canonical_text": "Gina's favorite dance style is contemporary.",
+                "canonical_text": "The prism is stored in locker NOVA-417.",
                 "scope": "conversation",
                 "confidence": 0.91,
                 "source_kind": "extracted",
                 "support_kind": "contextual_direct",
-                "source_quote": "Contemporary dance really speaks to me.",
+                "source_quote": "Raku glazing feels intuitive to me.",
                 "trigger_message_ids": ["msg_missing"],
-                "trigger_quote": "What's your fave?",
+                "trigger_quote": "Which ceramic finish feels most natural to you?",
                 "privacy_level": 0,
                 "payload": {},
             }
@@ -1043,13 +1116,19 @@ async def test_extraction_degrades_contextual_direct_without_valid_trigger() -> 
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, _memories, extractor, _provider, resolved_policy = (
-        await _build_runtime(payload)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        _memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
-            text="Gina: Contemporary dance really speaks to me.",
+            text="Niko: Raku glazing feels intuitive to me.",
         )
 
         await extractor.extract(
@@ -1072,7 +1151,7 @@ async def test_extraction_without_packet_fields_creates_minimal_source_packet() 
     payload = {
         "evidences": [
             {
-                "canonical_text": "Contemporary dance really speaks to me.",
+                "canonical_text": "Raku glazing feels intuitive to me.",
                 "scope": "conversation",
                 "confidence": 0.81,
                 "source_kind": "extracted",
@@ -1086,13 +1165,19 @@ async def test_extraction_without_packet_fields_creates_minimal_source_packet() 
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = (
-        await _build_runtime(payload)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
-            text="Gina: Contemporary dance really speaks to me.",
+            text="Niko: Raku glazing feels intuitive to me.",
         )
 
         await extractor.extract(
@@ -1135,9 +1220,15 @@ async def test_fact_facet_projection_disabled_by_default_makes_no_rows() -> None
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, _memories, extractor, _provider, resolved_policy = (
-        await _build_runtime(payload)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        _memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -1182,11 +1273,17 @@ async def test_fact_facet_projection_writes_source_backed_rows_when_enabled() ->
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, clock, messages, _memories, extractor, _provider, resolved_policy = (
-        await _build_runtime(
-            payload,
-            settings=_settings(fact_facet_surfaces_enabled=True),
-        )
+    (
+        connection,
+        clock,
+        messages,
+        _memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
+        payload,
+        settings=_settings(fact_facet_surfaces_enabled=True),
     )
     try:
         source_message = await _create_source_message(
@@ -1264,11 +1361,11 @@ async def test_fact_facet_projection_skips_defaulted_evidence_without_subject() 
     payload = {
         "evidences": [
             {
-                "canonical_text": "User mentioned that weekend birdwatching relaxes them.",
+                "canonical_text": "User mentioned that weekend museum inventory labels relaxes them.",
                 "scope": "conversation",
                 "confidence": 0.84,
                 "source_kind": "extracted",
-                "source_quote": "weekend birdwatching relaxes me",
+                "source_quote": "weekend museum inventory labels relaxes me",
                 "privacy_level": 0,
             }
         ],
@@ -1278,16 +1375,22 @@ async def test_fact_facet_projection_skips_defaulted_evidence_without_subject() 
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, _memories, extractor, _provider, resolved_policy = (
-        await _build_runtime(
-            payload,
-            settings=_settings(fact_facet_surfaces_enabled=True),
-        )
+    (
+        connection,
+        _clock,
+        messages,
+        _memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
+        payload,
+        settings=_settings(fact_facet_surfaces_enabled=True),
     )
     try:
         source_message = await _create_source_message(
             messages,
-            text="I noticed weekend birdwatching relaxes me.",
+            text="I noticed weekend museum inventory labels relaxes me.",
             occurred_at="2023-05-08T13:56:00+00:00",
         )
 
@@ -1467,7 +1570,9 @@ async def test_retrieval_packet_dry_run_disabled_by_default_makes_no_llm_call() 
 
 
 @pytest.mark.asyncio
-async def test_retrieval_packet_dry_run_uses_new_active_rows_only_without_writes() -> None:
+async def test_retrieval_packet_dry_run_uses_new_active_rows_only_without_writes() -> (
+    None
+):
     payload = {
         "evidences": [
             {
@@ -1545,7 +1650,8 @@ async def test_retrieval_packet_dry_run_uses_new_active_rows_only_without_writes
         spanish_memory_id = next(
             str(row["id"])
             for row in details.persisted
-            if row["canonical_text"] == "Uso alias de paquetes de recuperacion para soporte"
+            if row["canonical_text"]
+            == "Uso alias de paquetes de recuperacion para soporte"
         )
         assert next(
             memory
@@ -1562,7 +1668,10 @@ async def test_retrieval_packet_dry_run_uses_new_active_rows_only_without_writes
         # memories persist public (base_sensitivity_level 0) and produce public
         # alias surfaces. Private-surface differentiation is exercised by the
         # retrieval-surface suite, not the lean extraction path.
-        assert {surface.base_sensitivity_level for surface in details.retrieval_packet_dry_run.surfaces} == {0}
+        assert {
+            surface.base_sensitivity_level
+            for surface in details.retrieval_packet_dry_run.surfaces
+        } == {0}
         for surface in details.retrieval_packet_dry_run.surfaces:
             assert surface.non_evidential is True
             assert surface.preserve_verbatim is False
@@ -1598,7 +1707,9 @@ async def test_retrieval_packet_dry_run_uses_new_active_rows_only_without_writes
 
 
 @pytest.mark.asyncio
-async def test_retrieval_packet_writer_auto_writes_active_public_ordinary_surfaces() -> None:
+async def test_retrieval_packet_writer_auto_writes_active_public_ordinary_surfaces() -> (
+    None
+):
     # Under the lean contract every extracted memory persists public/ordinary
     # (the model no longer marks items private), so the Phase 6 auto-writer's
     # public/ordinary eligibility filter approves all of them. Restriction-based
@@ -1675,8 +1786,14 @@ async def test_retrieval_packet_writer_auto_writes_active_public_ordinary_surfac
         rows = await _retrieval_surface_rows(connection)
         assert {str(row["memory_id"]) for row in rows} == persisted_memory_ids
         derivation = json.loads(rows[0]["derivation_json"])
-        assert derivation["approval"]["approved_by"] == "system:phase6_slice2_policy"
-        assert "public/ordinary eligibility filter" in derivation["approval"]["approval_note"]
+        assert (
+            derivation["approval"]["approved_by"]
+            == "system:retrieval_surface_auto_policy_v1"
+        )
+        assert (
+            "ordinary-risk retrieval eligibility policy"
+            in derivation["approval"]["approval_note"]
+        )
 
         candidates = await CandidateSearch(connection, clock).search(
             _persisted_surface_plan("retrieval packet public alias"),
@@ -1717,6 +1834,7 @@ async def test_retrieval_packet_writer_keeps_restricted_sources_dry_run_only() -
         enable_retrieval_packet_surface_write=True,
     )
     try:
+
         async def create_memory(
             memory_id: str,
             *,
@@ -1780,7 +1898,9 @@ async def test_retrieval_packet_writer_keeps_restricted_sources_dry_run_only() -
         assert write_error is None
         assert await _retrieval_surface_count(connection) == 0
         assert await _retrieval_surface_fts_count(connection) == 0
-        source_ids = {str(memory["id"]) for memory in dry_provider.source_memory_payloads[0]}
+        source_ids = {
+            str(memory["id"]) for memory in dry_provider.source_memory_payloads[0]
+        }
         assert "mem_superseded" in source_ids
         assert "mem_review" not in source_ids
     finally:
@@ -1841,7 +1961,9 @@ async def test_retrieval_packet_writer_failure_does_not_rollback_memory_write() 
         assert details.retrieval_packet_write_report is None
         assert details.retrieval_packet_write_error is not None
         assert "surface write boom" in details.retrieval_packet_write_error
-        assert await memories.get_memory_object(str(details.persisted[0]["id"]), "usr_1")
+        assert await memories.get_memory_object(
+            str(details.persisted[0]["id"]), "usr_1"
+        )
         assert await _retrieval_surface_count(connection) == 0
         assert await _retrieval_surface_fts_count(connection) == 0
     finally:
@@ -1849,7 +1971,9 @@ async def test_retrieval_packet_writer_failure_does_not_rollback_memory_write() 
 
 
 @pytest.mark.asyncio
-async def test_retrieval_packet_dry_run_failure_does_not_rollback_memory_write() -> None:
+async def test_retrieval_packet_dry_run_failure_does_not_rollback_memory_write() -> (
+    None
+):
     payload = {
         "evidences": [
             {
@@ -1899,7 +2023,9 @@ async def test_retrieval_packet_dry_run_failure_does_not_rollback_memory_write()
         assert details.retrieval_packet_dry_run_error is not None
         assert "dry-run packet boom" in details.retrieval_packet_dry_run_error
         assert len(dry_provider.requests) == 1
-        assert await memories.get_memory_object(str(details.persisted[0]["id"]), "usr_1")
+        assert await memories.get_memory_object(
+            str(details.persisted[0]["id"]), "usr_1"
+        )
         assert await _retrieval_surface_count(connection) == 0
     finally:
         await connection.close()
@@ -1925,9 +2051,15 @@ async def test_extractor_retries_bounded_after_output_limit() -> None:
         "nothing_durable": False,
     }
     provider = OutputLimitThenBoundedProvider(bounded_payload)
-    connection, _clock, messages, memories, extractor, provider, resolved_policy = (
-        await _build_runtime_with_provider(provider)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider)
     try:
         source_message = await _create_source_message(
             messages,
@@ -1945,9 +2077,17 @@ async def test_extractor_retries_bounded_after_output_limit() -> None:
         persisted = await memories.list_for_user("usr_1")
         assert result.nothing_durable is False
         assert len(persisted) == 1
-        assert provider.requests[0].metadata["purpose"] == "memory_extraction_candidate_card"
-        assert provider.requests[1].metadata["purpose"] == "memory_extraction_candidate_card"
-        assert provider.requests[1].metadata["extraction_retry_mode"] == "bounded_output"
+        assert (
+            provider.requests[0].metadata["purpose"]
+            == "memory_extraction_candidate_card"
+        )
+        assert (
+            provider.requests[1].metadata["purpose"]
+            == "memory_extraction_candidate_card"
+        )
+        assert (
+            provider.requests[1].metadata["extraction_retry_mode"] == "bounded_output"
+        )
         assert (
             provider.requests[1].metadata["extraction_retry_trigger_class"]
             == "OutputLimitExceededError"
@@ -1955,13 +2095,18 @@ async def test_extractor_retries_bounded_after_output_limit() -> None:
         assert provider.requests[1].metadata["output_limit_finish_reason"] == "length"
         assert provider.requests[1].metadata["output_limit_partial_output_chars"] == 15
         assert provider.requests[1].max_output_tokens == 8192
-        assert "Extract at most 8 candidate memories" in provider.requests[1].messages[-1].content
+        assert (
+            "Extract at most 8 candidate memories"
+            in provider.requests[1].messages[-1].content
+        )
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_extractor_mechanical_watchdog_abort_retries_bounded_and_closes_stream() -> None:
+async def test_extractor_mechanical_watchdog_abort_retries_bounded_and_closes_stream() -> (
+    None
+):
     bounded_payload = {
         "evidences": [
             {
@@ -1982,9 +2127,15 @@ async def test_extractor_mechanical_watchdog_abort_retries_bounded_and_closes_st
     settings = _settings()
     provider = WatchdogAbortProvider(bounded_payload)
     run_counters = RunCounterAccumulator()
-    connection, _clock, messages, memories, extractor, provider, resolved_policy = (
-        await _build_runtime_with_provider(provider, settings=settings)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider, settings=settings)
     try:
         source_message = await _create_source_message(
             messages,
@@ -2047,9 +2198,15 @@ async def test_extractor_watchdog_does_not_cap_legitimate_verbose_extraction() -
     }
     settings = _settings()
     provider = VerboseStreamingExtractionProvider(payload)
-    connection, _clock, messages, memories, extractor, provider, resolved_policy = (
-        await _build_runtime_with_provider(provider, settings=settings)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider, settings=settings)
     try:
         source_message = await _create_source_message(
             messages,
@@ -2098,9 +2255,15 @@ async def test_bounded_retry_item_cap_prevents_persisting_excess_items() -> None
     }
     settings = _settings(extraction_watchdog_bounded_retry_max_items=1)
     provider = OutputLimitThenBoundedProvider(bounded_payload)
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = (
-        await _build_runtime_with_provider(provider, settings=settings)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider, settings=settings)
     try:
         source_message = await _create_source_message(
             messages,
@@ -2119,15 +2282,27 @@ async def test_bounded_retry_item_cap_prevents_persisting_excess_items() -> None
         assert result.nothing_durable is False
         assert len(persisted) == 1
         assert len(provider.requests) == 8
-        assert provider.requests[1].metadata["extraction_retry_mode"] == "bounded_output"
-        assert provider.requests[1].metadata["purpose"] == "memory_extraction_candidate_card"
+        assert (
+            provider.requests[1].metadata["extraction_retry_mode"] == "bounded_output"
+        )
+        assert (
+            provider.requests[1].metadata["purpose"]
+            == "memory_extraction_candidate_card"
+        )
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_disabled_extraction_watchdog_allows_different_provider_override() -> None:
-    payload = {"evidences": [], "beliefs": [], "contract_signals": [], "state_updates": []}
+async def test_disabled_extraction_watchdog_allows_different_provider_override() -> (
+    None
+):
+    payload = {
+        "evidences": [],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+    }
     provider = CannedExtractionProvider(payload)
     settings = _settings(
         extraction_watchdog_enabled=False,
@@ -2146,7 +2321,7 @@ async def test_opf_pre_signal_raises_privacy_level_without_raw_span_text() -> No
     payload = {
         "evidences": [
             {
-                "canonical_text": "The lobby code is 3847",
+                "canonical_text": "The lobby code is Q7X9",
                 "scope": "conversation",
                 "confidence": 0.9,
                 "source_kind": "extracted",
@@ -2174,7 +2349,15 @@ async def test_opf_pre_signal_raises_privacy_level_without_raw_span_text() -> No
             latency_ms=7.5,
         )
     )
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
         payload,
         settings=_settings(opf_privacy_filter_enabled=True),
         privacy_filter_client=privacy_filter,
@@ -2182,7 +2365,7 @@ async def test_opf_pre_signal_raises_privacy_level_without_raw_span_text() -> No
     try:
         source_message = await _create_source_message(
             messages,
-            text="The lobby code is 3847.",
+            text="The lobby code is Q7X9.",
         )
 
         result = await extractor.extract(
@@ -2195,7 +2378,7 @@ async def test_opf_pre_signal_raises_privacy_level_without_raw_span_text() -> No
         rows = await memories.list_for_user("usr_1", statuses=None)
         assert rows[0]["privacy_level"] == 2
         assert result.evidences[0].privacy_level == 2
-        assert privacy_filter.texts == ["The lobby code is 3847"]
+        assert privacy_filter.texts == ["The lobby code is Q7X9"]
         audit = rows[0]["payload_json"]["privacy_filter_pre_signal"]
         assert audit["triggered"] is True
         assert audit["labels"] == ["private_address"]
@@ -2207,7 +2390,7 @@ async def test_opf_pre_signal_raises_privacy_level_without_raw_span_text() -> No
                 "text_sha256": "hashed",
             }
         ]
-        assert "3847" not in json.dumps(audit)
+        assert "Q7X9" not in json.dumps(audit)
     finally:
         await connection.close()
 
@@ -2231,7 +2414,15 @@ async def test_low_confidence_items_are_marked_review_required() -> None:
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -2257,7 +2448,7 @@ async def test_temporal_fields_are_persisted_when_temporal_confidence_is_high() 
     payload = {
         "evidences": [
             {
-                "canonical_text": "User is traveling to Tokyo next week.",
+                "canonical_text": "User is traveling to Zephyr Port next week.",
                 "scope": "conversation",
                 "confidence": 0.9,
                 "source_kind": "extracted",
@@ -2275,11 +2466,19 @@ async def test_temporal_fields_are_persisted_when_temporal_confidence_is_high() 
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
-            text="I'm traveling to Tokyo next week.",
+            text="I'm traveling to Zephyr Port next week.",
             occurred_at="2023-05-08T13:56:00+00:00",
         )
 
@@ -2311,11 +2510,15 @@ async def test_temporal_fields_are_persisted_when_temporal_confidence_is_high() 
 
 
 @pytest.mark.asyncio
-async def test_extraction_prompt_requires_event_dates_for_relative_one_time_events() -> None:
+async def test_extraction_prompt_requires_event_dates_for_relative_one_time_events() -> (
+    None
+):
     payload = {
         "evidences": [
             {
-                "canonical_text": "The user celebrated their daughter's birthday with a concert last night.",
+                "canonical_text": (
+                    "The user completed a telescope alignment session last night."
+                ),
                 "scope": "conversation",
                 "confidence": 0.9,
                 "source_kind": "extracted",
@@ -2329,11 +2532,21 @@ async def test_extraction_prompt_requires_event_dates_for_relative_one_time_even
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, _memories, extractor, provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        _memories,
+        extractor,
+        provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
-            text="Last night was amazing! We celebrated my daughter's birthday with a concert.",
+            text=(
+                "Last night was productive! I completed a telescope alignment session."
+            ),
             occurred_at="2023-08-14T14:24:00+00:00",
         )
 
@@ -2360,7 +2573,9 @@ async def test_extraction_prompt_requires_event_dates_for_relative_one_time_even
 
 def test_extraction_result_schema_emits_temporal_type_enum() -> None:
     schema = ExtractionResult.model_json_schema()
-    temporal_type_schema = schema["$defs"]["ExtractedEvidence"]["properties"]["temporal_type"]
+    temporal_type_schema = schema["$defs"]["ExtractedEvidence"]["properties"][
+        "temporal_type"
+    ]
 
     assert temporal_type_schema["type"] == "string"
     assert temporal_type_schema["enum"] == [
@@ -2391,7 +2606,15 @@ async def test_extractor_requests_plain_text_cards_without_json_schema() -> None
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, _memories, extractor, provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        _memories,
+        extractor,
+        provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -2446,7 +2669,15 @@ async def test_temporal_type_accepts_ephemeral() -> None:
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -2563,7 +2794,9 @@ async def test_extraction_persists_presence_attribution_and_subjects() -> None:
             """,
             (memory["id"],),
         )
-        subject_ids = [str(row["subject_presence_id"]) for row in await cursor.fetchall()]
+        subject_ids = [
+            str(row["subject_presence_id"]) for row in await cursor.fetchall()
+        ]
         assert subject_ids == []
     finally:
         await connection.close()
@@ -2700,7 +2933,9 @@ async def test_extraction_persists_active_space_boundary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_isolated_extraction_forces_cross_chat_items_to_conversation_scope() -> None:
+async def test_isolated_extraction_forces_cross_chat_items_to_conversation_scope() -> (
+    None
+):
     payload = {
         "evidences": [
             {
@@ -2718,7 +2953,15 @@ async def test_isolated_extraction_forces_cross_chat_items_to_conversation_scope
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
         payload,
         workspace_id="wrk_1",
     )
@@ -2750,7 +2993,9 @@ async def test_isolated_extraction_forces_cross_chat_items_to_conversation_scope
 
 
 @pytest.mark.asyncio
-async def test_phase6_write_policy_stores_canonical_identity_and_default_gates() -> None:
+async def test_phase6_write_policy_stores_canonical_identity_and_default_gates() -> (
+    None
+):
     # Canonical identity (scope/persona/platform/character) is resolved from the
     # conversation context and is unaffected by the lean contract. The gating
     # fields the model used to supply (sensitivity/themes/platform_locked) are no
@@ -2775,7 +3020,15 @@ async def test_phase6_write_policy_stores_canonical_identity_and_default_gates()
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -2811,7 +3064,9 @@ async def test_phase6_write_policy_stores_canonical_identity_and_default_gates()
 
 
 @pytest.mark.asyncio
-async def test_phase6_incognito_preferences_and_temporary_force_chat_lock_and_expiry() -> None:
+async def test_phase6_incognito_preferences_and_temporary_force_chat_lock_and_expiry() -> (
+    None
+):
     payload = {
         "evidences": [
             {
@@ -2829,7 +3084,15 @@ async def test_phase6_incognito_preferences_and_temporary_force_chat_lock_and_ex
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -2884,7 +3147,15 @@ async def test_phase6_character_scope_without_character_id_never_becomes_user() 
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -2903,7 +3174,10 @@ async def test_phase6_character_scope_without_character_id_never_becomes_user() 
         assert rows[0]["scope"] == MemoryScope.CHAT.value
         assert rows[0]["scope_canonical"] == MemoryScope.CHAT.value
         assert rows[0]["status"] == MemoryStatus.REVIEW_REQUIRED.value
-        assert "character_scope_missing_character_id_forced_chat" in rows[0]["payload_json"]["write_policy_reasons"]
+        assert (
+            "character_scope_missing_character_id_forced_chat"
+            in rows[0]["payload_json"]["write_policy_reasons"]
+        )
     finally:
         await connection.close()
 
@@ -2929,7 +3203,15 @@ async def test_temporal_type_unexpected_string_is_dropped_by_card_assembly() -> 
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -2995,9 +3277,15 @@ async def test_extraction_cards_do_not_use_json_validation_retry_messages() -> N
             },
         ]
     )
-    connection, _clock, messages, _memories, extractor, sequenced_provider, resolved_policy = (
-        await _build_runtime_with_provider(provider)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        _memories,
+        extractor,
+        sequenced_provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider)
     try:
         source_message = await _create_source_message(
             messages,
@@ -3013,7 +3301,9 @@ async def test_extraction_cards_do_not_use_json_validation_retry_messages() -> N
         )
 
         assert len(sequenced_provider.requests) == 7
-        assert all(request.response_schema is None for request in sequenced_provider.requests)
+        assert all(
+            request.response_schema is None for request in sequenced_provider.requests
+        )
         assert all(
             "$.candidates[0].temporal_status.type" not in request.messages[-1].content
             for request in sequenced_provider.requests
@@ -3066,9 +3356,15 @@ async def test_extraction_persists_ephemeral_from_cards_without_json_retry() -> 
             },
         ]
     )
-    connection, _clock, messages, memories, extractor, sequenced_provider, resolved_policy = (
-        await _build_runtime_with_provider(provider)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        sequenced_provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider)
     try:
         source_message = await _create_source_message(
             messages,
@@ -3159,9 +3455,15 @@ async def test_extraction_drops_invalid_temporal_bounds_without_json_retry() -> 
             },
         ]
     )
-    connection, _clock, messages, memories, extractor, sequenced_provider, resolved_policy = (
-        await _build_runtime_with_provider(provider)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        sequenced_provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider)
     try:
         source_message = await _create_source_message(
             messages,
@@ -3187,7 +3489,9 @@ async def test_extraction_drops_invalid_temporal_bounds_without_json_retry() -> 
 
 
 @pytest.mark.asyncio
-async def test_extraction_invalid_temporal_repair_does_not_raise_or_retry_json() -> None:
+async def test_extraction_invalid_temporal_repair_does_not_raise_or_retry_json() -> (
+    None
+):
     provider = SequencedExtractionProvider(
         [
             {
@@ -3249,9 +3553,15 @@ async def test_extraction_invalid_temporal_repair_does_not_raise_or_retry_json()
             },
         ]
     )
-    connection, _clock, messages, memories, extractor, sequenced_provider, resolved_policy = (
-        await _build_runtime_with_provider(provider)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        sequenced_provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider)
     try:
         source_message = await _create_source_message(
             messages,
@@ -3352,11 +3662,11 @@ def test_extraction_cards_preserve_structured_fact_granularity() -> None:
 def test_coverage_members_card_parses_json_with_collision_prone_labels() -> None:
     from atagia.memory.extraction_cards import parse_coverage_members_card_output
 
-    # Labels carry interior commas, semicolons, and pipes: only the JSON wire
-    # format survives them. A ``;``/``,``-delimited shape would phantom-split.
     text = (
-        'cand_001 | [{"member_key": "dr. mendez", "display_text": "Dr. Mendez, MD; cardiology | clinic A"}, '
-        '{"member_key": "dr. patel", "display_text": "Dr. Patel"}]\n'
+        "cand_001 | [{\"member_key\": \"quartz-otter\", "
+        "\"display_text\": \"Quartz-otter token in the lunar gallery\"}, "
+        "{\"member_key\": \"quartz otter\", "
+        "\"display_text\": \"Quartz otter token in the river gallery\"}]\n"
         "cand_002 | []"
     )
     parsed, malformed = parse_coverage_members_card_output(text)
@@ -3364,9 +3674,11 @@ def test_coverage_members_card_parses_json_with_collision_prone_labels() -> None
     assert malformed == 0
     assert list(parsed.keys()) == ["cand_001", "cand_002"]
     members = parsed["cand_001"]
-    assert [member.member_key for member in members] == ["dr. mendez", "dr. patel"]
-    assert members[0].display_text == "Dr. Mendez, MD; cardiology | clinic A"
-    # Empty list is a valid "processed, no members" output, not malformed.
+    assert [member.member_key for member in members] == [
+        "quartz-otter",
+        "quartz otter",
+    ]
+    assert members[0].display_text == "Quartz-otter token in the lunar gallery"
     assert parsed["cand_002"] == []
 
 
@@ -3455,7 +3767,14 @@ def _all_extraction_card_prompts(include_examples: bool = True) -> str:
             include_examples=include_examples,
         )
     ]
-    for card in ("kind_scope", "evidence", "index", "temporal", "belief", "coverage_members"):
+    for card in (
+        "kind_scope",
+        "evidence",
+        "index",
+        "temporal",
+        "belief",
+        "coverage_members",
+    ):
         prompts.append(
             build_enrichment_prompt(
                 card,
@@ -3505,7 +3824,9 @@ def test_extraction_cards_examples_toggle_omits_demonstrations() -> None:
     assert "MAPLE-72-GOLD" not in without_examples
     # The toggle only drops demonstrations; the output format spec stays.
     assert "Output format: cand_001 | concise canonical memory text" in without_examples
-    assert "Format: cand_001 support preserve_verbatim language_codes" in without_examples
+    assert (
+        "Format: cand_001 support preserve_verbatim language_codes" in without_examples
+    )
 
 
 @pytest.mark.asyncio
@@ -3530,7 +3851,15 @@ async def test_ephemeral_state_update_is_persisted() -> None:
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -3576,7 +3905,15 @@ async def test_ephemeral_persistence_derives_valid_from_from_occurred_at() -> No
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -3600,7 +3937,9 @@ async def test_ephemeral_persistence_derives_valid_from_from_occurred_at() -> No
 
 
 @pytest.mark.asyncio
-async def test_temporal_bounds_are_not_persisted_when_temporal_status_is_absent() -> None:
+async def test_temporal_bounds_are_not_persisted_when_temporal_status_is_absent() -> (
+    None
+):
     # Under the lean contract, the model expresses temporal uncertainty by
     # omitting temporal_status entirely. The mapper then assigns
     # temporal_confidence=0.0, which falls below the persistence gate, so no
@@ -3622,7 +3961,15 @@ async def test_temporal_bounds_are_not_persisted_when_temporal_status_is_absent(
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -3667,7 +4014,15 @@ async def test_index_text_is_persisted_when_present() -> None:
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -3690,7 +4045,9 @@ async def test_index_text_is_persisted_when_present() -> None:
 
 
 @pytest.mark.asyncio
-async def test_workspace_scope_dedupe_merges_source_ids_and_clears_conversation_ownership() -> None:
+async def test_workspace_scope_dedupe_merges_source_ids_and_clears_conversation_ownership() -> (
+    None
+):
     payload = {
         "evidences": [
             {
@@ -3708,13 +4065,23 @@ async def test_workspace_scope_dedupe_merges_source_ids_and_clears_conversation_
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+    (
+        connection,
+        clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
         payload,
         workspace_id="wrk_1",
     )
     try:
         conversations = ConversationRepository(connection, clock)
-        await conversations.create_conversation("cnv_2", "usr_1", "wrk_1", "coding_debug", "Second")
+        await conversations.create_conversation(
+            "cnv_2", "usr_1", "wrk_1", "coding_debug", "Second"
+        )
         source_one = await _create_source_message(
             messages,
             message_id="msg_1",
@@ -3764,7 +4131,9 @@ async def test_workspace_scope_dedupe_merges_source_ids_and_clears_conversation_
 
 
 @pytest.mark.asyncio
-async def test_dedupe_hit_fills_missing_language_codes_from_validated_extraction() -> None:
+async def test_dedupe_hit_fills_missing_language_codes_from_validated_extraction() -> (
+    None
+):
     provider = SequencedExtractionProvider(
         [
             {
@@ -3787,9 +4156,15 @@ async def test_dedupe_hit_fills_missing_language_codes_from_validated_extraction
             }
         ]
     )
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = (
-        await _build_runtime_with_provider(provider)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider)
     try:
         await memories.create_memory_object(
             user_id="usr_1",
@@ -3869,9 +4244,15 @@ async def test_phase6_dedupe_merges_repeated_lean_extraction_into_one_memory() -
             },
         ]
     )
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = (
-        await _build_runtime_with_provider(provider)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider)
     try:
         source_one = await _create_source_message(
             messages,
@@ -3888,13 +4269,17 @@ async def test_phase6_dedupe_merges_repeated_lean_extraction_into_one_memory() -
         await extractor.extract(
             message_text=str(source_one["text"]),
             role="user",
-            conversation_context=_context(str(source_one["id"]), platform_id="client_a"),
+            conversation_context=_context(
+                str(source_one["id"]), platform_id="client_a"
+            ),
             resolved_policy=resolved_policy,
         )
         await extractor.extract(
             message_text=str(source_two["text"]),
             role="user",
-            conversation_context=_context(str(source_two["id"]), platform_id="client_a"),
+            conversation_context=_context(
+                str(source_two["id"]), platform_id="client_a"
+            ),
             resolved_policy=resolved_policy,
         )
 
@@ -3910,6 +4295,176 @@ async def test_phase6_dedupe_merges_repeated_lean_extraction_into_one_memory() -
 
 
 @pytest.mark.asyncio
+async def test_user_edit_suppresses_old_source_but_allows_new_restatement() -> None:
+    provider = SequencedExtractionProvider(
+        [
+            {
+                "evidences": [
+                    {
+                        "canonical_text": "I keep the launch code in the client vault",
+                        "scope": "user",
+                        "confidence": 0.9,
+                        "source_kind": "extracted",
+                        "source_quote": "I keep the launch code in the client vault.",
+                        "payload": {},
+                    }
+                ],
+                "beliefs": [],
+                "contract_signals": [],
+                "state_updates": [],
+                "mode_guess": None,
+                "nothing_durable": False,
+            },
+            {
+                "evidences": [
+                    {
+                        "canonical_text": "The launch code stays in the client vault",
+                        "scope": "conversation",
+                        "confidence": 0.9,
+                        "source_kind": "extracted",
+                        "source_quote": "I keep the launch code in the client vault.",
+                        "payload": {},
+                    }
+                ],
+                "beliefs": [],
+                "contract_signals": [],
+                "state_updates": [],
+                "mode_guess": None,
+                "nothing_durable": False,
+            },
+            {
+                "evidences": [
+                    {
+                        "canonical_text": "I keep the launch code in the client vault",
+                        "scope": "user",
+                        "confidence": 0.9,
+                        "source_kind": "extracted",
+                        "source_quote": "I keep the launch code in the client vault.",
+                        "payload": {},
+                    }
+                ],
+                "beliefs": [],
+                "contract_signals": [],
+                "state_updates": [],
+                "mode_guess": None,
+                "nothing_durable": False,
+            },
+        ]
+    )
+    (
+        connection,
+        clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider)
+    cache_backend = InProcessBackend()
+    try:
+        source = await _create_source_message(
+            messages,
+            message_id="msg_edit_replay",
+            text=(
+                "I keep the launch code in the client vault. "
+                "The launch code stays in that vault for this conversation."
+            ),
+        )
+        _result, first_persisted = await extractor.extract_with_persistence_details(
+            message_text=str(source["text"]),
+            role="user",
+            conversation_context=_context(str(source["id"])),
+            resolved_policy=resolved_policy,
+        )
+        assert len(first_persisted) == 1
+        memory_id = str(first_persisted[0]["id"])
+        original_hash = str(first_persisted[0]["extraction_hash"])
+
+        runtime = SimpleNamespace(
+            settings=SimpleNamespace(erasure_purge_streams=False),
+            clock=clock,
+            llm_client=None,
+            storage_backend=cache_backend,
+            database_path=":memory:",
+            embedding_index=NoneBackend(),
+        )
+        await ConversationLifecycleService(runtime).edit_memory(
+            connection,
+            user_id="usr_1",
+            memory_id=memory_id,
+            new_text="Store the launch code only in the rotated secure vault",
+        )
+
+        (
+            replay_result,
+            replay_persisted,
+        ) = await extractor.extract_with_persistence_details(
+            message_text=str(source["text"]),
+            role="user",
+            conversation_context=_context(str(source["id"])),
+            resolved_policy=resolved_policy,
+        )
+
+        assert replay_result.evidences[0].canonical_text == (
+            "The launch code stays in the client vault"
+        )
+        assert replay_result.evidences[0].scope is MemoryScope.CHAT
+        assert replay_persisted == []
+
+        restatement = await _create_source_message(
+            messages,
+            message_id="msg_edit_restatement",
+            text="I keep the launch code in the client vault.",
+            seq=2,
+        )
+        (
+            _result,
+            restatement_persisted,
+        ) = await extractor.extract_with_persistence_details(
+            message_text=str(restatement["text"]),
+            role="user",
+            conversation_context=_context(str(restatement["id"])),
+            resolved_policy=resolved_policy,
+        )
+
+        assert len(restatement_persisted) == 1
+        assert restatement_persisted[0]["id"] != memory_id
+        assert restatement_persisted[0]["canonical_text"] == (
+            "I keep the launch code in the client vault"
+        )
+        stored = await memories.list_for_user("usr_1")
+        assert len(stored) == 2
+        assert {row["canonical_text"] for row in stored} == {
+            "Store the launch code only in the rotated secure vault",
+            "I keep the launch code in the client vault",
+        }
+        cursor = await connection.execute(
+            """
+            SELECT
+                source_message_id,
+                extraction_hash,
+                reason,
+                replacement_memory_id
+            FROM memory_extraction_suppressions
+            WHERE user_id = ?
+            """,
+            ("usr_1",),
+        )
+        suppressions = [dict(row) for row in await cursor.fetchall()]
+        assert suppressions == [
+            {
+                "source_message_id": "msg_edit_replay",
+                "extraction_hash": original_hash,
+                "reason": "memory_edited",
+                "replacement_memory_id": memory_id,
+            }
+        ]
+    finally:
+        await cache_backend.close()
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_nothing_durable_skips_persistence() -> None:
     payload = {
         "evidences": [],
@@ -3919,9 +4474,19 @@ async def test_nothing_durable_skips_persistence() -> None:
         "mode_guess": None,
         "nothing_durable": True,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
-        source_message = await _create_source_message(messages, text="Thanks, that worked.")
+        source_message = await _create_source_message(
+            messages, text="Thanks, that worked."
+        )
 
         result = await extractor.extract(
             message_text=source_message["text"],
@@ -3955,9 +4520,19 @@ async def test_nothing_durable_with_items_persists_non_empty_extraction() -> Non
         "mode_guess": None,
         "nothing_durable": True,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
-        source_message = await _create_source_message(messages, text="I prefer concise debugging advice.")
+        source_message = await _create_source_message(
+            messages, text="I prefer concise debugging advice."
+        )
 
         result = await extractor.extract(
             message_text=source_message["text"],
@@ -3994,9 +4569,19 @@ async def test_deduplication_prevents_duplicate_memory_objects() -> None:
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
-        source_message = await _create_source_message(messages, text="I prefer concise debugging advice.")
+        source_message = await _create_source_message(
+            messages, text="I prefer concise debugging advice."
+        )
         context = _context(source_message["id"])
 
         await extractor.extract(
@@ -4037,9 +4622,19 @@ async def test_deduplication_survives_backend_restart() -> None:
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
-        source_message = await _create_source_message(messages, text="I prefer concise debugging advice.")
+        source_message = await _create_source_message(
+            messages, text="I prefer concise debugging advice."
+        )
         context = _context(source_message["id"])
 
         await extractor.extract(
@@ -4051,7 +4646,9 @@ async def test_deduplication_survives_backend_restart() -> None:
 
         restarted_provider = CannedExtractionProvider(payload)
         restarted_extractor = MemoryExtractor(
-            llm_client=LLMClient(provider_name=restarted_provider.name, providers=[restarted_provider]),
+            llm_client=LLMClient(
+                provider_name=restarted_provider.name, providers=[restarted_provider]
+            ),
             clock=clock,
             message_repository=messages,
             memory_repository=memories,
@@ -4071,7 +4668,9 @@ async def test_deduplication_survives_backend_restart() -> None:
 
 
 @pytest.mark.asyncio
-async def test_workspace_scoped_deduplication_does_not_merge_distinct_workspaces() -> None:
+async def test_workspace_scoped_deduplication_does_not_merge_distinct_workspaces() -> (
+    None
+):
     payload = {
         "evidences": [
             {
@@ -4091,7 +4690,9 @@ async def test_workspace_scoped_deduplication_does_not_merge_distinct_workspaces
     }
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 3, 30, 18, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -4100,8 +4701,12 @@ async def test_workspace_scoped_deduplication_does_not_merge_distinct_workspaces
     await users.create_user("usr_1")
     await workspaces.create_workspace("wrk_1", "usr_1", "Workspace 1")
     await workspaces.create_workspace("wrk_2", "usr_1", "Workspace 2")
-    await conversations.create_conversation("cnv_1", "usr_1", "wrk_1", "coding_debug", "First")
-    await conversations.create_conversation("cnv_2", "usr_1", "wrk_2", "coding_debug", "Second")
+    await conversations.create_conversation(
+        "cnv_1", "usr_1", "wrk_1", "coding_debug", "First"
+    )
+    await conversations.create_conversation(
+        "cnv_2", "usr_1", "wrk_2", "coding_debug", "Second"
+    )
 
     workspace_provider = CannedExtractionProvider(payload)
     extractor = MemoryExtractor(
@@ -4194,7 +4799,15 @@ async def test_explicit_user_statement_promotes_fast_during_cold_start() -> None
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -4237,7 +4850,15 @@ async def test_cold_start_raises_belief_threshold_until_memory_exists() -> None:
         "nothing_durable": False,
     }
 
-    cold_connection, cold_clock, cold_messages, cold_memories, cold_extractor, _provider, resolved_policy = await _build_runtime(
+    (
+        cold_connection,
+        cold_clock,
+        cold_messages,
+        cold_memories,
+        cold_extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
         payload,
         explicit_result=False,
     )
@@ -4258,7 +4879,15 @@ async def test_cold_start_raises_belief_threshold_until_memory_exists() -> None:
     finally:
         await cold_connection.close()
 
-    warm_connection, warm_clock, warm_messages, warm_memories, warm_extractor, _provider, warm_policy = await _build_runtime(payload)
+    (
+        warm_connection,
+        warm_clock,
+        warm_messages,
+        warm_memories,
+        warm_extractor,
+        _provider,
+        warm_policy,
+    ) = await _build_runtime(payload)
     try:
         await warm_memories.create_memory_object(
             user_id="usr_1",
@@ -4306,7 +4935,15 @@ async def test_profile_scope_list_does_not_block_user_memory() -> None:
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
         payload,
         mode_id="general_qa",
     )
@@ -4352,7 +4989,15 @@ async def test_lean_extraction_defaults_privacy_so_user_item_starts_active() -> 
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
         payload,
         mode_id="general_qa",
     )
@@ -4401,7 +5046,15 @@ async def test_lean_extraction_preserves_verbatim_and_defaults_category() -> Non
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
         payload,
         mode_id="personal_assistant",
     )
@@ -4414,7 +5067,9 @@ async def test_lean_extraction_preserves_verbatim_and_defaults_category() -> Non
         await extractor.extract(
             message_text=source_message["text"],
             role="user",
-            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            conversation_context=_context(
+                source_message["id"], mode_id="personal_assistant"
+            ),
             resolved_policy=resolved_policy,
         )
 
@@ -4450,7 +5105,15 @@ async def test_confirmed_category_skips_pending_for_later_high_privacy_items() -
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+    (
+        connection,
+        clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
         payload,
         mode_id="personal_assistant",
     )
@@ -4471,7 +5134,9 @@ async def test_confirmed_category_skips_pending_for_later_high_privacy_items() -
         await extractor.extract(
             message_text=source_message["text"],
             role="user",
-            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            conversation_context=_context(
+                source_message["id"], mode_id="personal_assistant"
+            ),
             resolved_policy=resolved_policy,
         )
 
@@ -4508,7 +5173,7 @@ async def test_lean_extraction_category_decline_does_not_suppress_items() -> Non
                 "source_kind": "extracted",
                 "preserve_verbatim": False,
                 "payload": {},
-            }
+            },
         ],
         "beliefs": [],
         "contract_signals": [],
@@ -4516,7 +5181,15 @@ async def test_lean_extraction_category_decline_does_not_suppress_items() -> Non
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+    (
+        connection,
+        clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
         payload,
         mode_id="personal_assistant",
     )
@@ -4537,14 +5210,18 @@ async def test_lean_extraction_category_decline_does_not_suppress_items() -> Non
         await extractor.extract(
             message_text=source_message["text"],
             role="user",
-            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            conversation_context=_context(
+                source_message["id"], mode_id="personal_assistant"
+            ),
             resolved_policy=resolved_policy,
         )
 
         persisted = await memories.list_for_user("usr_1", statuses=None)
         assert len(persisted) == 2
         assert {row["status"] for row in persisted} == {MemoryStatus.ACTIVE.value}
-        assert {row["memory_category"] for row in persisted} == {MemoryCategory.UNKNOWN.value}
+        assert {row["memory_category"] for row in persisted} == {
+            MemoryCategory.UNKNOWN.value
+        }
     finally:
         await connection.close()
 
@@ -4571,7 +5248,15 @@ async def test_assistant_messages_do_not_enter_pending_confirmation_branch() -> 
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(
         payload,
         mode_id="personal_assistant",
     )
@@ -4585,7 +5270,9 @@ async def test_assistant_messages_do_not_enter_pending_confirmation_branch() -> 
         await extractor.extract(
             message_text=source_message["text"],
             role="assistant",
-            conversation_context=_context(source_message["id"], mode_id="personal_assistant"),
+            conversation_context=_context(
+                source_message["id"], mode_id="personal_assistant"
+            ),
             resolved_policy=resolved_policy,
         )
 
@@ -4617,7 +5304,15 @@ async def test_anti_hallucination_rejects_ungrounded_items(
         "mode_guess": None,
         "nothing_durable": False,
     }
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = await _build_runtime(payload)
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime(payload)
     try:
         source_message = await _create_source_message(
             messages,
@@ -4651,7 +5346,9 @@ async def test_anti_hallucination_rejects_ungrounded_items(
 
 
 @pytest.mark.asyncio
-async def test_chunked_extraction_merges_chunk_results_and_persists_chunk_metadata() -> None:
+async def test_chunked_extraction_merges_chunk_results_and_persists_chunk_metadata() -> (
+    None
+):
     settings = _settings(
         chunking_extraction_threshold_tokens=20,
     )
@@ -4684,9 +5381,15 @@ async def test_chunked_extraction_merges_chunk_results_and_persists_chunk_metada
             },
         ]
     )
-    connection, _clock, messages, memories, extractor, sequenced_provider, resolved_policy = (
-        await _build_runtime_with_provider(provider, settings=settings)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        sequenced_provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider, settings=settings)
     try:
         source_message = await _create_source_message(
             messages,
@@ -4727,7 +5430,9 @@ async def test_chunked_extraction_merges_chunk_results_and_persists_chunk_metada
 
 
 @pytest.mark.asyncio
-async def test_chunked_cold_start_explicit_statement_classifies_belief_chunk_only() -> None:
+async def test_chunked_cold_start_explicit_statement_classifies_belief_chunk_only() -> (
+    None
+):
     settings = _settings(
         chunking_extraction_threshold_tokens=20,
     )
@@ -4762,16 +5467,25 @@ async def test_chunked_cold_start_explicit_statement_classifies_belief_chunk_onl
         ],
         explicit_result=True,
     )
-    connection, _clock, messages, memories, extractor, sequenced_provider, resolved_policy = (
-        await _build_runtime_with_provider(provider, settings=settings)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        sequenced_provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider, settings=settings)
     try:
         source_message = await _create_source_message(
             messages,
             text=(
                 ("I prefer concise debugging advice. " * 30)
                 + "\n\n"
-                + ("This unrelated long tail should not enter the explicit statement classifier. " * 18)
+                + (
+                    "This unrelated long tail should not enter the explicit statement classifier. "
+                    * 18
+                )
             ),
         )
 
@@ -4789,7 +5503,10 @@ async def test_chunked_cold_start_explicit_statement_classifies_belief_chunk_onl
         ]
         rows = await memories.list_for_user("usr_1")
         assert len(classifier_requests) == 1
-        assert "I prefer concise debugging advice" in classifier_requests[0].messages[1].content
+        assert (
+            "I prefer concise debugging advice"
+            in classifier_requests[0].messages[1].content
+        )
         assert "unrelated long tail" not in classifier_requests[0].messages[1].content
         assert rows[0]["status"] == MemoryStatus.ACTIVE.value
     finally:
@@ -4839,9 +5556,15 @@ async def test_chunked_extraction_grounds_against_each_local_chunk() -> None:
             },
         ]
     )
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = (
-        await _build_runtime_with_provider(provider, settings=settings)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider, settings=settings)
     try:
         source_message = await _create_source_message(
             messages,
@@ -4870,7 +5593,9 @@ async def test_chunked_extraction_grounds_against_each_local_chunk() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chunked_extraction_dedupes_semantically_equivalent_beliefs_across_chunks() -> None:
+async def test_chunked_extraction_dedupes_semantically_equivalent_beliefs_across_chunks() -> (
+    None
+):
     settings = _settings(
         chunking_extraction_threshold_tokens=20,
     )
@@ -4916,16 +5641,25 @@ async def test_chunked_extraction_dedupes_semantically_equivalent_beliefs_across
             },
         ]
     )
-    connection, _clock, messages, memories, extractor, sequenced_provider, resolved_policy = (
-        await _build_runtime_with_provider(provider, settings=settings)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        sequenced_provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider, settings=settings)
     try:
         source_message = await _create_source_message(
             messages,
             text=(
                 ("Speaker: I want concise debugging advice during incidents. " * 12)
                 + "\n\n"
-                + ("Responder: I also prefer short direct debugging help during incidents. " * 12)
+                + (
+                    "Responder: I also prefer short direct debugging help during incidents. "
+                    * 12
+                )
             ),
         )
 
@@ -4940,7 +5674,8 @@ async def test_chunked_extraction_dedupes_semantically_equivalent_beliefs_across
         equivalence_requests = [
             request
             for request in sequenced_provider.requests
-            if request.metadata.get("purpose") == "intent_classifier_claim_key_equivalence"
+            if request.metadata.get("purpose")
+            == "intent_classifier_claim_key_equivalence"
         ]
         assert len(result.beliefs) == 1
         assert len(persisted) == 1
@@ -4997,9 +5732,15 @@ async def test_chunked_persistence_starts_each_chunk_without_open_transaction(
             },
         ]
     )
-    connection, _clock, messages, _memories, extractor, _provider, resolved_policy = (
-        await _build_runtime_with_provider(provider, settings=settings)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        _memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider, settings=settings)
     try:
         source_message = await _create_source_message(
             messages,
@@ -5081,9 +5822,15 @@ async def test_chunked_persistence_keeps_completed_chunks_on_later_chunk_write_f
             },
         ]
     )
-    connection, _clock, messages, memories, extractor, _provider, resolved_policy = (
-        await _build_runtime_with_provider(provider, settings=settings)
-    )
+    (
+        connection,
+        _clock,
+        messages,
+        memories,
+        extractor,
+        _provider,
+        resolved_policy,
+    ) = await _build_runtime_with_provider(provider, settings=settings)
     try:
         source_message = await _create_source_message(
             messages,
@@ -5104,7 +5851,9 @@ async def test_chunked_persistence_keeps_completed_chunks_on_later_chunk_write_f
                 raise failure_type("forced chunk persistence failure")
             return await original_create_memory_object(*args, **kwargs)
 
-        monkeypatch.setattr(memories, "create_memory_object_with_flag", _failing_create_memory_object)
+        monkeypatch.setattr(
+            memories, "create_memory_object_with_flag", _failing_create_memory_object
+        )
 
         with pytest.raises(failure_type):
             await extractor.extract_with_persistence_details(

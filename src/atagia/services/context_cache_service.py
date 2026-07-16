@@ -6,6 +6,7 @@ import asyncio
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -17,12 +18,25 @@ from typing import TYPE_CHECKING, Any, Literal
 import aiosqlite
 
 from atagia.core.contract_repository import ContractDimensionRepository
+from atagia.core.conversation_lifecycle_repository import (
+    ConversationLifecycleIdentity,
+    ConversationLifecycleRepository,
+)
 from atagia.core.db_sqlite import close_connection, open_connection
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
     MessageRepository,
     UserRepository,
+)
+from atagia.core.storage_backend import build_recent_window_key
+from atagia.core.user_lifecycle_repository import (
+    UserLifecycleIdentity,
+    UserLifecycleRepository,
+)
+from atagia.core.transcript_rebuild_repository import (
+    TranscriptRebuildRepository,
+    UserAvailabilitySnapshot,
 )
 from atagia.core.canonical import canonical_json_bytes
 from atagia.memory.context_composer import ContextComposer
@@ -46,7 +60,6 @@ from atagia.models.schemas_memory import (
     ResponseMode,
     RetrievalTrace,
 )
-from atagia.memory.lifecycle_runner import cache_generation_key
 from atagia.models.schemas_replay import AblationConfig, PipelineResult
 
 if TYPE_CHECKING:
@@ -61,10 +74,13 @@ from atagia.services.chat_support import (
     resolve_operational_profile,
     resolve_policy,
 )
-from atagia.services.errors import ConversationNotFoundError
+from atagia.services.errors import AtagiaServiceError, ConversationNotFoundError
 from atagia.services.initial_context_package_signatures import (
     InitialContextPackageCacheInvalidationResult,
     invalidate_initial_context_package_dependency as invalidate_context_package_dependency,
+)
+from atagia.services.lifecycle_mirror_reconciler import (
+    reconcile_active_lifecycle_mirror,
 )
 from atagia.services.prompt_authority import (
     PromptAuthorityContext,
@@ -80,7 +96,11 @@ CACHE_GUARD_TTL_SECONDS = 5 * 60
 CACHE_GUARD_ACQUIRE_TIMEOUT_SECONDS = 30.0
 CACHE_GUARD_INITIAL_DELAY_SECONDS = 0.01
 CACHE_GUARD_MAX_DELAY_SECONDS = 0.25
-CONTEXT_CACHE_KEY_VERSION = 12
+CONTEXT_CACHE_KEY_VERSION = 15
+_CACHE_BACKEND_BYPASS: ContextVar[bool] = ContextVar(
+    "atagia_cache_backend_bypass",
+    default=False,
+)
 DISCARDABLE_CACHE_SIGNALS = frozenset(
     {
         "assistant_mode_id_mismatch",
@@ -129,7 +149,10 @@ class AdaptiveContextResolution:
     retrieval_trace: dict[str, Any] | None
     pending_cache_entry: ContextCacheEntry | None
     cache_ttl_seconds: int | None
-    cache_generation: int = 0
+    cache_lifecycle_epoch: str | None = None
+    cache_lifecycle_cleanup_key: str | None = None
+    cache_revision: int | None = None
+    source_derivation_revision: int | None = None
 
 
 @dataclass(slots=True)
@@ -147,17 +170,57 @@ class ContextCacheService:
         )
 
     @asynccontextmanager
-    async def user_cache_guard(self, user_id: str) -> AsyncIterator[None]:
-        """Serialize interactive cache reads and invalidations for one user."""
+    async def user_cache_guard(self, user_id: str) -> AsyncIterator[bool]:
+        """Attempt transient serialization without making it authoritative.
+
+        The yielded flag is false when the transient backend cannot provide the
+        guard. Callers still perform canonical SQLite mutations; cache reads and
+        publishes in the guarded scope fail closed to a cache miss.
+        """
         guard_key = self.build_user_guard_key(user_id)
-        token = await self._acquire_guard(guard_key)
+        token: str | None = None
+        bypass_token = None
+        lifecycle_identity: UserLifecycleIdentity | None = None
         try:
-            yield
+            try:
+                lifecycle_identity = await self._capture_cache_guard_identity(user_id)
+                if lifecycle_identity is None:
+                    raise RuntimeError(
+                        f"No active lifecycle is available for cache guard {guard_key}"
+                    )
+                token = await self._acquire_guard(
+                    guard_key,
+                    user_id=user_id,
+                    lifecycle_identity=lifecycle_identity,
+                )
+            except Exception:
+                logger.warning(
+                    "Cache guard unavailable for user %s; bypassing cache",
+                    user_id,
+                    exc_info=True,
+                )
+                bypass_token = _CACHE_BACKEND_BYPASS.set(True)
+            yield token is not None
         finally:
-            await self.runtime.storage_backend.release_lock(
-                guard_key,
-                token,
-            )
+            if bypass_token is not None:
+                _CACHE_BACKEND_BYPASS.reset(bypass_token)
+            if token is not None:
+                assert lifecycle_identity is not None
+                try:
+                    await self.runtime.storage_backend.release_lock(
+                        guard_key,
+                        token,
+                        lifecycle_cleanup_key=(
+                            lifecycle_identity.lifecycle_cleanup_key
+                        ),
+                        lifecycle_epoch=lifecycle_identity.lifecycle_epoch,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Cache guard release failed for user %s",
+                        user_id,
+                        exc_info=True,
+                    )
 
     async def resolve_with_connection(
         self,
@@ -179,9 +242,14 @@ class ContextCacheService:
         response_mode: ResponseMode = ResponseMode.NORMAL,
         adaptive_retrieval: bool = False,
     ) -> AdaptiveContextResolution:
-        cache_generation = await self.runtime.storage_backend.get_cache_generation(
-            cache_generation_key(self.runtime.database_path, user_id)
-        )
+        await TranscriptRebuildRepository(
+            connection,
+            self.runtime.clock,
+        ).require_user_available(user_id)
+        cache_identity = await UserLifecycleRepository(
+            connection,
+            self.runtime.clock,
+        ).get_active_identity(user_id)
         conversations = ConversationRepository(connection, self.runtime.clock)
         messages = MessageRepository(connection, self.runtime.clock)
         active_conversation = conversation or await conversations.get_conversation(
@@ -249,17 +317,64 @@ class ContextCacheService:
             authenticated_user_privilege_level=authority_context.normalized_privilege_level,
             authenticated_user_is_atagia_master=authority_context.authenticated_user_is_atagia_master,
             response_mode=response_mode,
+            lifecycle_epoch=(
+                cache_identity.lifecycle_epoch if cache_identity is not None else None
+            ),
+            cache_revision=(
+                cache_identity.cache_revision if cache_identity is not None else None
+            ),
+            derivation_revision=(
+                cache_identity.derivation_revision
+                if cache_identity is not None
+                else None
+            ),
         )
         current_message_seq = self._next_message_seq(current_messages)
         cache_lookup_started = perf_counter()
         cache_allowed = (
             self._cache_enabled(ablation)
+            and cache_identity is not None
+            and not _CACHE_BACKEND_BYPASS.get()
             and str(active_conversation.get("mind_topology") or "unimind")
             != "ojocentauri"
         )
         raw_entry: dict[str, Any] | None = None
         if cache_allowed:
-            raw_entry = await self.runtime.storage_backend.get_context_view(cache_key)
+            try:
+                raw_entry = await self.runtime.storage_backend.get_context_view(
+                    cache_key
+                )
+            except Exception:
+                logger.warning(
+                    "Context cache read failed for user %s; using SQLite",
+                    user_id,
+                    exc_info=True,
+                )
+                raw_entry = None
+                cache_allowed = False
+        if raw_entry is not None:
+            entry_matches_capture = self._entry_matches_identity(
+                raw_entry,
+                cache_identity,
+            )
+            captured_identity_is_current = bool(
+                cache_identity is not None
+                and await self._context_identity_is_current(
+                    user_id,
+                    lifecycle_epoch=cache_identity.lifecycle_epoch,
+                    cache_revision=cache_identity.cache_revision,
+                    derivation_revision=cache_identity.derivation_revision,
+                )
+            )
+            if not entry_matches_capture or not captured_identity_is_current:
+                await self._best_effort_delete_context_view(cache_key)
+                raw_entry = None
+                # A malformed or mismatched entry is disposable cache data;
+                # it does not invalidate the turn's still-current SQLite
+                # identity. Only a real lifecycle/revision change suppresses
+                # publishing the freshly recomputed replacement.
+                if not captured_identity_is_current:
+                    cache_allowed = False
         cache_lookup_elapsed = perf_counter() - cache_lookup_started
 
         cache_score: ContextStalenessScore | None = None
@@ -287,8 +402,17 @@ class ContextCacheService:
             staleness_elapsed = perf_counter() - staleness_started
             cache_age_seconds = self._cache_age_seconds(raw_entry)
             if self._should_discard_cache_entry(cache_score):
-                await self.runtime.storage_backend.delete_context_view(cache_key)
-            if not cache_score.should_refresh:
+                await self._best_effort_delete_context_view(cache_key)
+            identity_still_current = await self._entry_has_current_identity(
+                user_id=user_id,
+                raw_entry=raw_entry,
+                captured_identity=cache_identity,
+            )
+            if not identity_still_current:
+                await self._best_effort_delete_context_view(cache_key)
+                raw_entry = None
+                cache_allowed = False
+            if raw_entry is not None and not cache_score.should_refresh:
                 entry = ContextCacheEntry.model_validate(raw_entry)
                 return AdaptiveContextResolution(
                     conversation=active_conversation,
@@ -322,7 +446,10 @@ class ContextCacheService:
                     retrieval_trace=None,
                     pending_cache_entry=None,
                     cache_ttl_seconds=None,
-                    cache_generation=cache_generation,
+                    cache_lifecycle_epoch=cache_identity.lifecycle_epoch,
+                    cache_lifecycle_cleanup_key=cache_identity.lifecycle_cleanup_key,
+                    cache_revision=cache_identity.cache_revision,
+                    source_derivation_revision=(cache_identity.derivation_revision),
                 )
         else:
             staleness_elapsed = 0.0
@@ -372,9 +499,7 @@ class ContextCacheService:
         # it must stay a clean plan dump. The adaptive-gate block lives only on
         # ``retrieval_diagnostics_for_guard`` (never re-parsed into a strict
         # model), which is where the answer guard and bench scorer read it.
-        source_retrieval_plan = pipeline_result.retrieval_plan.model_dump(
-            mode="json"
-        )
+        source_retrieval_plan = pipeline_result.retrieval_plan.model_dump(mode="json")
         # D6 (cache poisoning protection): a gate-skipped turn composed only the
         # contract block, never real memory context. Writing it would let a
         # contract-only view overwrite a good cached memory context, so a
@@ -386,6 +511,9 @@ class ContextCacheService:
             pending_entry = ContextCacheEntry(
                 cache_key=cache_key,
                 user_id=user_id,
+                lifecycle_epoch=cache_identity.lifecycle_epoch,
+                cache_revision=cache_identity.cache_revision,
+                derivation_revision=cache_identity.derivation_revision,
                 conversation_id=conversation_id,
                 assistant_mode_id=resolved_mode_id,
                 policy_prompt_hash=resolved_policy.prompt_hash,
@@ -457,7 +585,22 @@ class ContextCacheService:
             retrieval_trace=retrieval_trace_payload,
             pending_cache_entry=pending_entry,
             cache_ttl_seconds=cache_ttl_seconds,
-            cache_generation=cache_generation,
+            cache_lifecycle_epoch=(
+                cache_identity.lifecycle_epoch if cache_identity is not None else None
+            ),
+            cache_lifecycle_cleanup_key=(
+                cache_identity.lifecycle_cleanup_key
+                if cache_identity is not None
+                else None
+            ),
+            cache_revision=(
+                cache_identity.cache_revision if cache_identity is not None else None
+            ),
+            source_derivation_revision=(
+                cache_identity.derivation_revision
+                if cache_identity is not None
+                else None
+            ),
         )
 
     async def resolve_fast_with_connection(
@@ -490,10 +633,15 @@ class ContextCacheService:
         """
         if response_mode is ResponseMode.NORMAL:
             raise ValueError("resolve_fast_with_connection requires a non-normal mode")
+        await TranscriptRebuildRepository(
+            connection,
+            self.runtime.clock,
+        ).require_user_available(user_id)
         fast_started = perf_counter()
-        cache_generation = await self.runtime.storage_backend.get_cache_generation(
-            cache_generation_key(self.runtime.database_path, user_id)
-        )
+        cache_identity = await UserLifecycleRepository(
+            connection,
+            self.runtime.clock,
+        ).get_active_identity(user_id)
         conversations = ConversationRepository(connection, self.runtime.clock)
         messages = MessageRepository(connection, self.runtime.clock)
         active_conversation = conversation or await conversations.get_conversation(
@@ -557,6 +705,17 @@ class ContextCacheService:
             authenticated_user_privilege_level=authority_context.normalized_privilege_level,
             authenticated_user_is_atagia_master=authority_context.authenticated_user_is_atagia_master,
             response_mode=response_mode,
+            lifecycle_epoch=(
+                cache_identity.lifecycle_epoch if cache_identity is not None else None
+            ),
+            cache_revision=(
+                cache_identity.cache_revision if cache_identity is not None else None
+            ),
+            derivation_revision=(
+                cache_identity.derivation_revision
+                if cache_identity is not None
+                else None
+            ),
         )
         stage_timings: dict[str, float] = {}
         contract_started = perf_counter()
@@ -575,11 +734,29 @@ class ContextCacheService:
         warmed_entry: ContextCacheEntry | None = None
         warmed_memory_summaries: list[MemorySummary] = []
         warmed_composed: ComposedContext | None = None
-        if response_mode is ResponseMode.SMART_FAST:
+        if (
+            response_mode is ResponseMode.SMART_FAST
+            and cache_identity is not None
+            and not _CACHE_BACKEND_BYPASS.get()
+        ):
             warm_started = perf_counter()
-            raw_warm = await self.runtime.storage_backend.get_context_view(cache_key)
+            try:
+                raw_warm = await self.runtime.storage_backend.get_context_view(
+                    cache_key
+                )
+            except Exception:
+                logger.warning(
+                    "Smart-fast cache read failed for user %s; using canonical state",
+                    user_id,
+                    exc_info=True,
+                )
+                raw_warm = None
             stage_timings["smart_fast_warm_lookup"] = perf_counter() - warm_started
-            if raw_warm is not None:
+            if raw_warm is not None and await self._entry_has_current_identity(
+                user_id=user_id,
+                raw_entry=raw_warm,
+                captured_identity=cache_identity,
+            ):
                 try:
                     warmed_entry = ContextCacheEntry.model_validate(raw_warm)
                 except Exception:
@@ -590,6 +767,8 @@ class ContextCacheService:
                         conversation_id,
                     )
                     warmed_entry = None
+            elif raw_warm is not None:
+                await self._best_effort_delete_context_view(cache_key)
             if warmed_entry is not None:
                 warmed_composed = warmed_entry.composed_context
                 warmed_memory_summaries = list(warmed_entry.memory_summaries)
@@ -667,7 +846,22 @@ class ContextCacheService:
             retrieval_trace=retrieval_trace.model_dump(mode="json"),
             pending_cache_entry=None,
             cache_ttl_seconds=None,
-            cache_generation=cache_generation,
+            cache_lifecycle_epoch=(
+                cache_identity.lifecycle_epoch if cache_identity is not None else None
+            ),
+            cache_lifecycle_cleanup_key=(
+                cache_identity.lifecycle_cleanup_key
+                if cache_identity is not None
+                else None
+            ),
+            cache_revision=(
+                cache_identity.cache_revision if cache_identity is not None else None
+            ),
+            source_derivation_revision=(
+                cache_identity.derivation_revision
+                if cache_identity is not None
+                else None
+            ),
         )
 
     async def _fast_contract_lookup(
@@ -843,9 +1037,7 @@ class ContextCacheService:
                 published,
                 len(resolution.composed_context.selected_memory_ids),
                 resolution.from_cache,
-                gate_status.get("status")
-                if isinstance(gate_status, dict)
-                else None,
+                gate_status.get("status") if isinstance(gate_status, dict) else None,
             )
         except Exception:
             logger.warning(
@@ -864,33 +1056,174 @@ class ContextCacheService:
         if (
             resolution.pending_cache_entry is None
             or resolution.cache_ttl_seconds is None
+            or resolution.cache_lifecycle_epoch is None
+            or resolution.cache_lifecycle_cleanup_key is None
+            or resolution.cache_revision is None
+            or resolution.source_derivation_revision is None
+            or _CACHE_BACKEND_BYPASS.get()
         ):
             return False
-        current_gen = await self.runtime.storage_backend.get_cache_generation(
-            cache_generation_key(
-                self.runtime.database_path,
-                resolution.pending_cache_entry.user_id,
-            )
-        )
-        if current_gen != resolution.cache_generation:
+        entry = resolution.pending_cache_entry
+        if (
+            entry.lifecycle_epoch != resolution.cache_lifecycle_epoch
+            or entry.cache_revision != resolution.cache_revision
+            or entry.derivation_revision != resolution.source_derivation_revision
+        ):
+            return False
+        if not await self._context_identity_is_current(
+            entry.user_id,
+            lifecycle_epoch=entry.lifecycle_epoch,
+            cache_revision=entry.cache_revision,
+            derivation_revision=entry.derivation_revision,
+        ):
             logger.debug(
-                "Skipping stale cache publish for user %s (gen %d != %d)",
-                resolution.pending_cache_entry.user_id,
-                resolution.cache_generation,
-                current_gen,
+                "Skipping stale cache publish for user %s",
+                entry.user_id,
             )
             return False
-        entry = resolution.pending_cache_entry.model_copy(
+        entry = entry.model_copy(
             update={
                 "cached_at": self.runtime.clock.now().isoformat(),
                 "last_retrieval_message_seq": last_retrieval_message_seq,
             }
         )
-        return await self.runtime.storage_backend.set_context_view_if_newer(
-            entry.cache_key,
-            entry.model_dump(mode="json"),
-            ttl_seconds=resolution.cache_ttl_seconds,
-            monotonic_seq=last_retrieval_message_seq,
+        if not await self._ensure_cache_lifecycle_mirror(
+            entry.user_id,
+            lifecycle_epoch=entry.lifecycle_epoch,
+            lifecycle_cleanup_key=resolution.cache_lifecycle_cleanup_key,
+            cache_revision=entry.cache_revision,
+        ):
+            return False
+        try:
+            published = await self.runtime.storage_backend.set_context_view_if_newer_for_lifecycle(
+                entry.cache_key,
+                entry.model_dump(mode="json"),
+                ttl_seconds=resolution.cache_ttl_seconds,
+                monotonic_seq=last_retrieval_message_seq,
+                lifecycle_cleanup_key=resolution.cache_lifecycle_cleanup_key,
+                lifecycle_epoch=entry.lifecycle_epoch,
+            )
+        except Exception:
+            logger.warning(
+                "Context cache publish failed for user %s",
+                entry.user_id,
+                exc_info=True,
+            )
+            return False
+        if not published:
+            return False
+        if await self._context_identity_is_current(
+            entry.user_id,
+            lifecycle_epoch=entry.lifecycle_epoch,
+            cache_revision=entry.cache_revision,
+            derivation_revision=entry.derivation_revision,
+        ):
+            return True
+        await self._best_effort_delete_context_view(entry.cache_key)
+        return False
+
+    async def publish_recent_window(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+        lifecycle_epoch: str,
+        lifecycle_cleanup_key: str,
+        cache_revision: int,
+        derivation_revision: int,
+        conversation_lifecycle_epoch: str,
+        conversation_source_revision: int,
+    ) -> bool:
+        """Publish only for one exact, unblocked canonical source identity."""
+
+        if not await self._recent_window_identity_is_current(
+            user_id,
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
+            conversation_id=conversation_id,
+            conversation_lifecycle_epoch=conversation_lifecycle_epoch,
+            conversation_source_revision=conversation_source_revision,
+        ):
+            return False
+        if not await self._ensure_cache_lifecycle_mirror(
+            user_id,
+            lifecycle_epoch=lifecycle_epoch,
+            lifecycle_cleanup_key=lifecycle_cleanup_key,
+            cache_revision=cache_revision,
+        ):
+            return False
+        try:
+            published = (
+                await self.runtime.storage_backend.set_recent_window_for_lifecycle(
+                    build_recent_window_key(user_id, conversation_id),
+                    messages,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    lifecycle_cleanup_key=lifecycle_cleanup_key,
+                    lifecycle_epoch=lifecycle_epoch,
+                    cache_revision=cache_revision,
+                    derivation_revision=derivation_revision,
+                    conversation_lifecycle_epoch=(conversation_lifecycle_epoch),
+                    conversation_source_revision=conversation_source_revision,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Recent-window publish failed for user %s conversation %s",
+                user_id,
+                conversation_id,
+                exc_info=True,
+            )
+            return False
+        if not published:
+            return False
+        if await self._recent_window_identity_is_current(
+            user_id,
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
+            conversation_id=conversation_id,
+            conversation_lifecycle_epoch=conversation_lifecycle_epoch,
+            conversation_source_revision=conversation_source_revision,
+        ):
+            return True
+        await self._best_effort_delete_recent_window_if_cache_identity(
+            user_id,
+            conversation_id,
+            lifecycle_cleanup_key=lifecycle_cleanup_key,
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
+            conversation_lifecycle_epoch=conversation_lifecycle_epoch,
+            conversation_source_revision=conversation_source_revision,
+        )
+        return False
+
+    async def discard_recent_window_publication(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        lifecycle_cleanup_key: str,
+        lifecycle_epoch: str,
+        cache_revision: int,
+        derivation_revision: int,
+        conversation_lifecycle_epoch: str,
+        conversation_source_revision: int,
+    ) -> None:
+        """Best-effort delete only one exact recent-window publication."""
+
+        await self._best_effort_delete_recent_window_if_cache_identity(
+            user_id,
+            conversation_id,
+            lifecycle_cleanup_key=lifecycle_cleanup_key,
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
+            conversation_lifecycle_epoch=conversation_lifecycle_epoch,
+            conversation_source_revision=conversation_source_revision,
         )
 
     async def invalidate_conversation_cache(
@@ -962,28 +1295,43 @@ class ContextCacheService:
         user_id: str,
         conversation_id: str,
     ) -> int:
-        deleted = (
-            await self.runtime.storage_backend.delete_context_views_for_conversation(
+        try:
+            deleted = await self.runtime.storage_backend.delete_context_views_for_conversation(
                 user_id,
                 conversation_id,
             )
-        )
-        deleted += (
-            await self.runtime.storage_backend.delete_recent_window_for_conversation(
+            deleted += await self.runtime.storage_backend.delete_recent_window_for_conversation(
                 user_id,
                 conversation_id,
             )
-        )
-        return deleted
+            return deleted
+        except Exception:
+            logger.warning(
+                "Conversation cache cleanup deferred for user %s conversation %s",
+                user_id,
+                conversation_id,
+                exc_info=True,
+            )
+            return 0
 
     async def invalidate_user_cache(self, user_id: str) -> int:
-        deleted = await self.runtime.storage_backend.delete_context_views_for_user(
-            user_id
-        )
-        deleted += await self.runtime.storage_backend.delete_recent_windows_for_user(
-            user_id
-        )
-        return deleted
+        try:
+            deleted = await self.runtime.storage_backend.delete_context_views_for_user(
+                user_id
+            )
+            deleted += (
+                await self.runtime.storage_backend.delete_recent_windows_for_user(
+                    user_id
+                )
+            )
+            return deleted
+        except Exception:
+            logger.warning(
+                "User cache cleanup deferred for user %s",
+                user_id,
+                exc_info=True,
+            )
+            return 0
 
     async def invalidate_initial_context_package_dependency(
         self,
@@ -1001,7 +1349,6 @@ class ContextCacheService:
                 connection,
                 clock=self.runtime.clock,
                 storage_backend=self.runtime.storage_backend,
-                database_path=self.runtime.database_path,
                 user_id=user_id,
                 conversation_id=conversation_id,
                 package_kind=package_kind,
@@ -1038,6 +1385,9 @@ class ContextCacheService:
         authenticated_user_privilege_level: str | None = None,
         authenticated_user_is_atagia_master: bool = False,
         response_mode: ResponseMode | str = ResponseMode.NORMAL,
+        lifecycle_epoch: str | None = None,
+        cache_revision: int | None = None,
+        derivation_revision: int | None = None,
     ) -> str:
         cache_subject = {
             "v": CONTEXT_CACHE_KEY_VERSION,
@@ -1049,6 +1399,9 @@ class ContextCacheService:
             "assistant_mode_id": assistant_mode_id,
             "conversation_id": conversation_id,
             "mind_topology": mind_topology or "unimind",
+            "lifecycle_epoch": lifecycle_epoch,
+            "cache_revision": cache_revision,
+            "derivation_revision": derivation_revision,
             "operational_profile_token": operational_profile_token,
             "privacy_enforcement": privacy_enforcement,
             "authenticated_user_privilege_level": authenticated_user_privilege_level
@@ -1076,6 +1429,201 @@ class ContextCacheService:
             f"ctx:v{CONTEXT_CACHE_KEY_VERSION}:"
             + hashlib.sha256(canonical_json_bytes(cache_subject)).hexdigest()
         )
+
+    async def _cache_identity_is_current(
+        self,
+        user_id: str,
+        *,
+        lifecycle_epoch: str,
+        cache_revision: int,
+    ) -> bool:
+        connection = await open_connection(self.runtime.database_path)
+        try:
+            return await UserLifecycleRepository(
+                connection,
+                self.runtime.clock,
+            ).matches_active_cache_identity(
+                user_id,
+                lifecycle_epoch=lifecycle_epoch,
+                cache_revision=cache_revision,
+            )
+        finally:
+            await close_connection(connection)
+
+    async def _context_identity_is_current(
+        self,
+        user_id: str,
+        *,
+        lifecycle_epoch: str,
+        cache_revision: int,
+        derivation_revision: int,
+    ) -> bool:
+        connection = await open_connection(self.runtime.database_path)
+        try:
+            return await UserLifecycleRepository(
+                connection,
+                self.runtime.clock,
+            ).matches_active_context_identity(
+                user_id,
+                lifecycle_epoch=lifecycle_epoch,
+                cache_revision=cache_revision,
+                derivation_revision=derivation_revision,
+            )
+        finally:
+            await close_connection(connection)
+
+    async def _recent_window_identity_is_current(
+        self,
+        user_id: str,
+        *,
+        lifecycle_epoch: str,
+        cache_revision: int,
+        derivation_revision: int,
+        conversation_id: str,
+        conversation_lifecycle_epoch: str,
+        conversation_source_revision: int,
+    ) -> bool:
+        """Check cache coordinates and selected-transcript availability together."""
+
+        connection = await open_connection(self.runtime.database_path)
+        try:
+            await connection.execute("BEGIN")
+            lifecycle_repository = UserLifecycleRepository(
+                connection,
+                self.runtime.clock,
+            )
+            if not await lifecycle_repository.matches_active_context_identity(
+                user_id,
+                lifecycle_epoch=lifecycle_epoch,
+                cache_revision=cache_revision,
+                derivation_revision=derivation_revision,
+            ):
+                return False
+            try:
+                await TranscriptRebuildRepository(
+                    connection,
+                    self.runtime.clock,
+                ).require_user_availability_snapshot(
+                    user_id,
+                    UserAvailabilitySnapshot(
+                        lifecycle_epoch=lifecycle_epoch,
+                        derivation_revision=derivation_revision,
+                    ),
+                )
+            except AtagiaServiceError:
+                return False
+            return await ConversationLifecycleRepository(
+                connection,
+                self.runtime.clock,
+            ).matches_active_identity(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                identity=ConversationLifecycleIdentity(
+                    lifecycle_epoch=conversation_lifecycle_epoch,
+                    source_revision=conversation_source_revision,
+                ),
+            )
+        finally:
+            await close_connection(connection)
+
+    async def _entry_has_current_identity(
+        self,
+        *,
+        user_id: str,
+        raw_entry: dict[str, Any],
+        captured_identity: UserLifecycleIdentity | None,
+    ) -> bool:
+        if not self._entry_matches_identity(raw_entry, captured_identity):
+            return False
+        assert captured_identity is not None
+        return await self._context_identity_is_current(
+            user_id,
+            lifecycle_epoch=captured_identity.lifecycle_epoch,
+            cache_revision=captured_identity.cache_revision,
+            derivation_revision=captured_identity.derivation_revision,
+        )
+
+    async def _ensure_cache_lifecycle_mirror(
+        self,
+        user_id: str,
+        *,
+        lifecycle_epoch: str,
+        lifecycle_cleanup_key: str,
+        cache_revision: int,
+    ) -> bool:
+        connection = await open_connection(self.runtime.database_path)
+        try:
+            repository = UserLifecycleRepository(connection, self.runtime.clock)
+            if not await repository.matches_active_cache_identity(
+                user_id,
+                lifecycle_epoch=lifecycle_epoch,
+                cache_revision=cache_revision,
+            ):
+                return False
+            return await reconcile_active_lifecycle_mirror(
+                connection,
+                self.runtime.storage_backend,
+                user_id=user_id,
+                lifecycle_epoch=lifecycle_epoch,
+                lifecycle_cleanup_key=lifecycle_cleanup_key,
+            )
+        finally:
+            await close_connection(connection)
+
+    @staticmethod
+    def _entry_matches_identity(
+        raw_entry: dict[str, Any],
+        identity: UserLifecycleIdentity | None,
+    ) -> bool:
+        if identity is None:
+            return False
+        return (
+            raw_entry.get("lifecycle_epoch") == identity.lifecycle_epoch
+            and raw_entry.get("cache_revision") == identity.cache_revision
+            and raw_entry.get("derivation_revision") == identity.derivation_revision
+        )
+
+    async def _best_effort_delete_context_view(self, cache_key: str) -> None:
+        try:
+            await self.runtime.storage_backend.delete_context_view(cache_key)
+        except Exception:
+            logger.warning(
+                "Context cache cleanup deferred for key %s",
+                cache_key,
+                exc_info=True,
+            )
+
+    async def _best_effort_delete_recent_window_if_cache_identity(
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        lifecycle_cleanup_key: str,
+        lifecycle_epoch: str,
+        cache_revision: int,
+        derivation_revision: int,
+        conversation_lifecycle_epoch: str,
+        conversation_source_revision: int,
+    ) -> None:
+        try:
+            await self.runtime.storage_backend.delete_recent_window_if_cache_identity(
+                build_recent_window_key(user_id, conversation_id),
+                user_id=user_id,
+                conversation_id=conversation_id,
+                lifecycle_cleanup_key=lifecycle_cleanup_key,
+                lifecycle_epoch=lifecycle_epoch,
+                cache_revision=cache_revision,
+                derivation_revision=derivation_revision,
+                conversation_lifecycle_epoch=conversation_lifecycle_epoch,
+                conversation_source_revision=conversation_source_revision,
+            )
+        except Exception:
+            logger.warning(
+                "Conditional recent-window cleanup deferred for user %s conversation %s",
+                user_id,
+                conversation_id,
+                exc_info=True,
+            )
 
     def _cache_enabled(self, ablation: AblationConfig | None) -> bool:
         if not self.runtime.settings.context_cache_enabled:
@@ -1230,9 +1778,7 @@ class ContextCacheService:
         )
         if answer_evidence is not None:
             diagnostics["answer_evidence"] = answer_evidence
-        answer_support = answer_support_prompt_payload(
-            pipeline_result.composed_context
-        )
+        answer_support = answer_support_prompt_payload(pipeline_result.composed_context)
         if answer_support is not None:
             diagnostics["answer_support"] = answer_support
         if trace is not None:
@@ -1351,8 +1897,7 @@ class ContextCacheService:
             for item in compact_items
             if str(item.get("memory_id") or "")
             and (
-                str(item.get("support_kind") or "")
-                in {"direct", "contextual_direct"}
+                str(item.get("support_kind") or "") in {"direct", "contextual_direct"}
                 or str(item.get("quote_source") or "")
                 in {
                     "evidence_packet_source",
@@ -1426,16 +1971,76 @@ class ContextCacheService:
                 seen.add(candidate_id)
         return ids
 
-    async def _acquire_guard(self, guard_key: str) -> str:
+    async def _capture_cache_guard_identity(
+        self,
+        user_id: str,
+    ) -> UserLifecycleIdentity | None:
+        connection = await open_connection(self.runtime.database_path)
+        try:
+            identity = await UserLifecycleRepository(
+                connection,
+                self.runtime.clock,
+            ).get_active_identity(user_id)
+            if identity is None:
+                return None
+            if not await reconcile_active_lifecycle_mirror(
+                connection,
+                self.runtime.storage_backend,
+                user_id=user_id,
+                lifecycle_epoch=identity.lifecycle_epoch,
+                lifecycle_cleanup_key=identity.lifecycle_cleanup_key,
+            ):
+                return None
+            return identity
+        finally:
+            await close_connection(connection)
+
+    async def _cache_guard_identity_is_current(
+        self,
+        user_id: str,
+        identity: UserLifecycleIdentity,
+    ) -> bool:
+        connection = await open_connection(self.runtime.database_path)
+        try:
+            current = await UserLifecycleRepository(
+                connection,
+                self.runtime.clock,
+            ).get_active_identity(user_id)
+            return current is not None and (
+                current.lifecycle_cleanup_key,
+                current.lifecycle_epoch,
+            ) == (
+                identity.lifecycle_cleanup_key,
+                identity.lifecycle_epoch,
+            )
+        finally:
+            await close_connection(connection)
+
+    async def _acquire_guard(
+        self,
+        guard_key: str,
+        *,
+        user_id: str,
+        lifecycle_identity: UserLifecycleIdentity,
+    ) -> str:
         deadline = perf_counter() + CACHE_GUARD_ACQUIRE_TIMEOUT_SECONDS
         delay_seconds = CACHE_GUARD_INITIAL_DELAY_SECONDS
         while True:
             token = await self.runtime.storage_backend.acquire_lock(
                 guard_key,
                 ttl_seconds=CACHE_GUARD_TTL_SECONDS,
+                lifecycle_cleanup_key=lifecycle_identity.lifecycle_cleanup_key,
+                lifecycle_epoch=lifecycle_identity.lifecycle_epoch,
             )
             if token is not None:
                 return token
+            if not await self._cache_guard_identity_is_current(
+                user_id,
+                lifecycle_identity,
+            ):
+                raise RuntimeError(
+                    f"Lifecycle changed while acquiring cache guard {guard_key}"
+                )
             if perf_counter() >= deadline:
                 raise RuntimeError(f"Could not acquire cache guard for {guard_key}")
             await asyncio.sleep(delay_seconds)

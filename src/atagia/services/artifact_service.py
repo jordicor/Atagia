@@ -20,7 +20,6 @@ from atagia.memory.intimacy_boundary_policy import (
     minimum_privacy_for_intimacy_boundary,
 )
 from atagia.models.schemas_api import AttachmentInput
-from atagia.services.artifact_blob_store import ArtifactBlobStore
 from atagia.services.artifact_payload_service import ArtifactPayloadService
 
 _ATTACHMENT_PROMPT_HEADER = "[Attachments omitted]"
@@ -98,12 +97,9 @@ class ArtifactService:
         self,
         connection: aiosqlite.Connection,
         clock: Clock,
-        *,
-        blob_store: ArtifactBlobStore | None = None,
     ) -> None:
         self._connection = connection
         self._clock = clock
-        self._blob_store = blob_store
 
     def prepare_attachments(
         self,
@@ -161,7 +157,6 @@ class ArtifactService:
         payload_service = ArtifactPayloadService(
             self._connection,
             self._clock,
-            blob_store=self._blob_store,
         )
         created: list[dict[str, Any]] = []
         for prepared in bundle.artifacts:
@@ -282,11 +277,9 @@ class ArtifactService:
         storage_uri = None
         if raw_available and raw_block_reason is None:
             if storage_kind == "local_file":
-                if self._blob_store is None:
-                    raw_block_reason = "local_file_store_unavailable"
-                else:
-                    content_bytes = self._blob_store.read_bytes(str(blob["storage_uri"]))
-                    storage_uri = str(blob["storage_uri"])
+                raise RuntimeError(
+                    "Legacy local_file artifact rows require the offline artifact blob migration"
+                )
             else:
                 content_bytes = blob.get("blob_bytes")
                 storage_uri = blob.get("storage_uri")
@@ -470,21 +463,12 @@ class ArtifactService:
         *,
         user_id: str,
     ) -> dict[str, Any] | None:
+        del user_id
         if blob is None:
             return None
-        if blob.get("storage_kind") != "local_file" or blob.get("blob_bytes") is None:
-            return blob
-        if self._blob_store is None:
-            raise ValueError("Local artifact blob storage is not configured")
-        stored = self._blob_store.store_bytes(user_id=user_id, content_bytes=bytes(blob["blob_bytes"]))
-        return {
-            **blob,
-            "storage_kind": stored.storage_kind,
-            "blob_bytes": stored.blob_bytes,
-            "storage_uri": stored.storage_uri,
-            "byte_size": stored.byte_size,
-            "sha256": stored.sha256,
-        }
+        if blob.get("storage_kind") == "local_file":
+            raise ValueError("local_file artifact storage is retired; use sqlite_blob")
+        return blob
 
     @staticmethod
     def _validate_blob_hash(content_bytes: bytes, expected_sha256: str) -> None:
@@ -557,14 +541,10 @@ class ArtifactService:
             return "external_ref", None, storage_uri, 0, sha256
         if decoded_bytes is not None:
             sha256 = hashlib.sha256(decoded_bytes).hexdigest()
-            if self._blob_store is not None:
-                return "local_file", decoded_bytes, None, len(decoded_bytes), sha256
             return "sqlite_blob", decoded_bytes, None, len(decoded_bytes), sha256
         if text_payload is not None:
             encoded = text_payload.encode("utf-8")
             sha256 = hashlib.sha256(encoded).hexdigest()
-            if self._blob_store is not None:
-                return "local_file", encoded, None, len(encoded), sha256
             return "sqlite_blob", encoded, None, len(encoded), sha256
         reference = self._source_ref(attachment)
         if reference is not None:

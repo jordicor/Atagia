@@ -16,6 +16,7 @@ from atagia.core.repositories import (
     MemoryObjectRepository,
     UserRepository,
 )
+from atagia.core.user_lifecycle_repository import UserLifecycleRepository
 from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
@@ -35,8 +36,8 @@ from atagia.services.llm_client import (
 )
 from atagia.services.sidecar_service import SidecarService
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
@@ -307,6 +308,32 @@ async def test_fast_mode_chat_skips_retrieval_pipeline_and_records_mode(
 
 
 @pytest.mark.asyncio
+async def test_invalid_response_mode_fails_fast_at_the_sidecar_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invalid response_mode raises immediately instead of falling back."""
+
+    runtime, provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime)
+
+        sidecar = SidecarService(runtime)
+        with pytest.raises(ValueError):
+            await sidecar.get_context(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message="This mode does not exist.",
+                mode="coding_debug",
+                response_mode="turbo_nonsense",
+                message_id="host-user-invalid-mode",
+            )
+        assert provider.retrieval_pipeline_purpose_count() == 0
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_fast_mode_sidecar_context_has_contract_and_no_retrieval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -427,6 +454,9 @@ async def test_smart_fast_warms_dedicated_keyspace_and_next_turn_reads_it(
         await _drain_background_tasks(runtime)
 
         snapshot = await _seed_conversation_snapshot(runtime)
+        lifecycle_epoch, cache_revision, derivation_revision = (
+            await _active_cache_identity(runtime)
+        )
         smart_fast_key = cache_service.build_cache_key(
             user_id="usr_1",
             assistant_mode_id="coding_debug",
@@ -440,6 +470,9 @@ async def test_smart_fast_warms_dedicated_keyspace_and_next_turn_reads_it(
             active_realm_id=snapshot.get("active_realm_id"),
             operational_profile_token=_profile_token(runtime),
             response_mode=ResponseMode.SMART_FAST,
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
         )
         normal_key = cache_service.build_cache_key(
             user_id="usr_1",
@@ -453,6 +486,9 @@ async def test_smart_fast_warms_dedicated_keyspace_and_next_turn_reads_it(
             active_embodiment_id=snapshot.get("active_embodiment_id"),
             active_realm_id=snapshot.get("active_realm_id"),
             operational_profile_token=_profile_token(runtime),
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
         )
         assert smart_fast_key != normal_key
 
@@ -503,6 +539,9 @@ async def test_normal_turn_after_smart_fast_reads_only_normal_keyspace(
         await _drain_background_tasks(runtime)
 
         snapshot = await _seed_conversation_snapshot(runtime)
+        lifecycle_epoch, cache_revision, derivation_revision = (
+            await _active_cache_identity(runtime)
+        )
         normal_key = cache_service.build_cache_key(
             user_id="usr_1",
             assistant_mode_id="coding_debug",
@@ -515,6 +554,9 @@ async def test_normal_turn_after_smart_fast_reads_only_normal_keyspace(
             active_embodiment_id=snapshot.get("active_embodiment_id"),
             active_realm_id=snapshot.get("active_realm_id"),
             operational_profile_token=_profile_token(runtime),
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
         )
         # No normal-keyspace entry exists yet (only smart_fast warmed).
         assert await runtime.storage_backend.get_context_view(normal_key) is None
@@ -616,6 +658,23 @@ async def _seed_conversation_snapshot(
         ).get_conversation(conversation_id, user_id)
         assert conversation is not None
         return conversation
+    finally:
+        await connection.close()
+
+
+async def _active_cache_identity(runtime: AppRuntime) -> tuple[str, int, int]:
+    connection = await runtime.open_connection()
+    try:
+        identity = await UserLifecycleRepository(
+            connection,
+            runtime.clock,
+        ).get_active_identity("usr_1")
+        assert identity is not None
+        return (
+            identity.lifecycle_epoch,
+            identity.cache_revision,
+            identity.derivation_revision,
+        )
     finally:
         await connection.close()
 

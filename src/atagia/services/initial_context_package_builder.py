@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
 from typing import Any, Mapping
 
 import aiosqlite
@@ -11,7 +12,14 @@ import aiosqlite
 from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.core.contract_repository import ContractDimensionRepository
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.ids import generate_prefixed_id
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
+from atagia.core.initial_context_package_revision_repository import (
+    InitialContextPackageRevisionRepository,
+    InitialContextPackageSourceCoordinates,
+)
 from atagia.core.repositories import (
     BaseRepository,
     MemoryObjectRepository,
@@ -39,6 +47,7 @@ from atagia.models.schemas_initial_context_package import (
     InitialContextPackageKind,
     InitialContextPackageProfileItem,
     InitialContextPackageRecord,
+    initial_context_package_key_hash,
 )
 from atagia.models.schemas_memory import (
     MemoryObjectType,
@@ -66,6 +75,51 @@ from atagia.services.initial_context_package_curator import InitialContextPackag
 from atagia.services.prompt_authority import PromptAuthorityContext
 
 INITIAL_CONTEXT_PACKAGE_SCHEMA_VERSION = 2
+logger = logging.getLogger(__name__)
+
+# Reviewed canonical SQLite inputs consumed by this builder, its signature
+# helpers, and the repositories it invokes while materializing package blocks.
+# Startup compares this declaration with the database trigger map.
+INITIAL_CONTEXT_PACKAGE_SQLITE_SOURCE_TABLES = frozenset(
+    {
+        "artifact_chunks",
+        "artifact_links",
+        "artifact_payload_blobs",
+        "artifacts",
+        "belief_versions",
+        "consequence_chains",
+        "contract_dimensions_current",
+        "conversation_activity_stats",
+        "conversation_topic_events",
+        "conversation_topic_sources",
+        "conversation_topics",
+        "conversations",
+        "embodiments",
+        "graph_entities",
+        "graph_entity_mentions",
+        "graph_relationship_sources",
+        "graph_relationships",
+        "memory_consent_profile",
+        "memory_evidence_spans",
+        "memory_links",
+        "memory_object_subjects",
+        "memory_objects",
+        "memory_retrieval_surfaces",
+        "memory_support_edges",
+        "messages",
+        "minds",
+        "overseer_grants",
+        "pending_memory_confirmations",
+        "presences",
+        "realm_bridges",
+        "realms",
+        "spaces",
+        "summary_views",
+        "user_communication_profiles",
+        "users",
+        "verbatim_pins",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,10 +198,26 @@ class InitialContextPackageBuilder(BaseRepository):
         privacy_enforcement: str = "enforce",
         authority_context: PromptAuthorityContext | None = None,
         operational_profile: OperationalProfileSnapshot | None = None,
+        refresh_generation: int | None = None,
+        refresh_request_job_id: str | None = None,
+        source_coordinates: InitialContextPackageSourceCoordinates | None = None,
         commit: bool = True,
     ) -> InitialContextPackageRecord:
         """Build a query-independent baseline package for an active context."""
 
+        captured_coordinates = source_coordinates
+        if captured_coordinates is None:
+            captured_coordinates = await InitialContextPackageRevisionRepository(
+                self._connection,
+                self._clock,
+            ).capture_active_coordinates(
+                user_id=user_id,
+                conversation_id=None,
+            )
+        if captured_coordinates is None:
+            raise ValueError("Initial-context-package source lifecycle is not active")
+        if captured_coordinates.is_conversation_scoped:
+            raise ValueError("Baseline packages require user-scoped source coordinates")
         user_preferences = await self._fetch_user_preferences(user_id)
         resolved_remember_chats = self._resolve_user_bool(
             remember_across_chats,
@@ -183,6 +253,9 @@ class InitialContextPackageBuilder(BaseRepository):
             privacy_enforcement=privacy_enforcement,
             authority_context=authority_context,
             operational_profile=operational_profile,
+            refresh_generation=refresh_generation,
+            refresh_request_job_id=refresh_request_job_id,
+            source_coordinates=captured_coordinates,
             commit=commit,
         )
 
@@ -198,21 +271,41 @@ class InitialContextPackageBuilder(BaseRepository):
         operational_profile: OperationalProfileSnapshot | None = None,
         remember_across_chats: bool | None = None,
         remember_across_devices: bool | None = None,
+        refresh_generation: int | None = None,
+        refresh_request_job_id: str | None = None,
+        source_coordinates: InitialContextPackageSourceCoordinates | None = None,
         commit: bool = True,
     ) -> InitialContextPackageRecord:
         """Build a package with bounded same-chat orientation."""
 
-        conversation_row = (
-            dict(conversation)
-            if conversation is not None
-            else await self._fetch_conversation(user_id=user_id, conversation_id=conversation_id)
+        captured_coordinates = source_coordinates
+        if captured_coordinates is None:
+            captured_coordinates = await InitialContextPackageRevisionRepository(
+                self._connection,
+                self._clock,
+            ).capture_active_coordinates(
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
+        if captured_coordinates is None:
+            raise ValueError("Initial-context-package source lifecycle is not active")
+        if not captured_coordinates.is_conversation_scoped:
+            raise ValueError(
+                "Conversation packages require conversation-scoped source coordinates"
+            )
+        if conversation is not None:
+            if str(conversation.get("user_id")) != user_id:
+                raise ValueError("conversation must belong to user_id")
+            if str(conversation.get("id")) != conversation_id:
+                raise ValueError("conversation_id must match conversation")
+        # Callers may hold a pre-mutation row. Only the canonical row fetched
+        # after the durable coordinate capture may drive package visibility.
+        conversation_row = await self._fetch_conversation(
+            user_id=user_id,
+            conversation_id=conversation_id,
         )
         if conversation_row is None:
             raise ValueError("conversation_id must belong to user_id")
-        if str(conversation_row.get("user_id")) != user_id:
-            raise ValueError("conversation must belong to user_id")
-        if str(conversation_row.get("id")) != conversation_id:
-            raise ValueError("conversation_id must match conversation")
 
         user_preferences = await self._fetch_user_preferences(user_id)
         resolved_remember_chats = self._resolve_user_bool(
@@ -239,26 +332,35 @@ class InitialContextPackageBuilder(BaseRepository):
                 self._optional_text(conversation_row.get("assistant_mode_id"))
                 or resolved_policy.profile_id.value
             ),
-            user_persona_id=self._optional_text(conversation_row.get("user_persona_id")),
+            user_persona_id=self._optional_text(
+                conversation_row.get("user_persona_id")
+            ),
             platform_id=self._optional_text(conversation_row.get("platform_id")),
             character_id=self._optional_text(conversation_row.get("character_id")),
             active_presence_id=self._optional_text(
                 conversation_row.get("active_presence_id")
             ),
-            active_space_id=self._optional_text(conversation_row.get("active_space_id")),
+            active_space_id=self._optional_text(
+                conversation_row.get("active_space_id")
+            ),
             active_space_boundary_mode=None,
             active_mind_id=self._optional_text(conversation_row.get("active_mind_id")),
             mind_topology=self._optional_text(conversation_row.get("mind_topology")),
             active_embodiment_id=self._optional_text(
                 conversation_row.get("active_embodiment_id")
             ),
-            active_realm_id=self._optional_text(conversation_row.get("active_realm_id")),
+            active_realm_id=self._optional_text(
+                conversation_row.get("active_realm_id")
+            ),
             incognito=incognito,
             remember_across_chats=resolved_remember_chats,
             remember_across_devices=resolved_remember_devices,
             privacy_enforcement=privacy_enforcement,
             authority_context=authority_context,
             operational_profile=operational_profile,
+            refresh_generation=refresh_generation,
+            refresh_request_job_id=refresh_request_job_id,
+            source_coordinates=captured_coordinates,
             commit=commit,
         )
 
@@ -288,9 +390,139 @@ class InitialContextPackageBuilder(BaseRepository):
         privacy_enforcement: str,
         authority_context: PromptAuthorityContext | None,
         operational_profile: OperationalProfileSnapshot | None,
+        refresh_generation: int | None,
+        refresh_request_job_id: str | None,
+        source_coordinates: InitialContextPackageSourceCoordinates,
+        commit: bool,
+    ) -> InitialContextPackageRecord:
+        """Own one generation and terminalize any attempt that it starts."""
+
+        revision_repository = InitialContextPackageRevisionRepository(
+            self._connection,
+            self._clock,
+        )
+        resolved_refresh_generation = refresh_generation
+        if resolved_refresh_generation is None:
+            resolved_refresh_generation = (
+                await revision_repository.reserve_refresh_generation(
+                    user_id=user_id,
+                    expected_user_lifecycle_epoch=(
+                        source_coordinates.user_lifecycle_epoch
+                    ),
+                    commit=commit,
+                )
+            )
+        if resolved_refresh_generation is None:
+            raise ValueError(
+                "Initial-context-package refresh generation is unavailable"
+            )
+        try:
+            await revision_repository.fail_building_attempts_for_generation(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                refresh_generation=resolved_refresh_generation,
+                error_class="AbandonedBuildAttempt",
+                commit=commit,
+            )
+            return await self._build_package_candidate(
+                package_kind=package_kind,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                conversation=conversation,
+                resolved_policy=resolved_policy,
+                workspace_id=workspace_id,
+                assistant_mode_id=assistant_mode_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                active_presence_id=active_presence_id,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
+                incognito=incognito,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                privacy_enforcement=privacy_enforcement,
+                authority_context=authority_context,
+                operational_profile=operational_profile,
+                refresh_generation=resolved_refresh_generation,
+                refresh_request_job_id=refresh_request_job_id,
+                source_coordinates=source_coordinates,
+                commit=commit,
+            )
+        except BaseException as exc:
+            if self._connection.in_transaction:
+                try:
+                    await self._connection.rollback()
+                except BaseException:
+                    logger.warning(
+                        "initial_context_package_failed_attempt_rollback_failed",
+                        exc_info=True,
+                    )
+            try:
+                await revision_repository.fail_building_attempts_for_generation(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    refresh_generation=resolved_refresh_generation,
+                    error_class=exc.__class__.__name__,
+                    commit=commit,
+                )
+            except BaseException:
+                if self._connection.in_transaction:
+                    try:
+                        await self._connection.rollback()
+                    except BaseException:
+                        pass
+                logger.warning(
+                    "initial_context_package_failed_attempt_terminalization_deferred",
+                    extra={
+                        "user_id": user_id,
+                        "conversation_id": conversation_id,
+                        "refresh_generation": resolved_refresh_generation,
+                    },
+                    exc_info=True,
+                )
+            raise
+
+    async def _build_package_candidate(
+        self,
+        *,
+        package_kind: InitialContextPackageKind,
+        user_id: str,
+        conversation_id: str | None,
+        conversation: Mapping[str, Any] | None,
+        resolved_policy: ResolvedRetrievalPolicy,
+        workspace_id: str | None,
+        assistant_mode_id: str,
+        user_persona_id: str | None,
+        platform_id: str | None,
+        character_id: str | None,
+        active_presence_id: str | None,
+        active_space_id: str | None,
+        active_space_boundary_mode: str | None,
+        active_mind_id: str | None,
+        mind_topology: str | None,
+        active_embodiment_id: str | None,
+        active_realm_id: str | None,
+        incognito: bool,
+        remember_across_chats: bool,
+        remember_across_devices: bool,
+        privacy_enforcement: str,
+        authority_context: PromptAuthorityContext | None,
+        operational_profile: OperationalProfileSnapshot | None,
+        refresh_generation: int,
+        refresh_request_job_id: str | None,
+        source_coordinates: InitialContextPackageSourceCoordinates,
         commit: bool,
     ) -> InitialContextPackageRecord:
         retrieval_profile_id = resolved_policy.profile_id.value
+        revision_repository = InitialContextPackageRevisionRepository(
+            self._connection,
+            self._clock,
+        )
         policy_signature = build_initial_context_package_policy_signature(
             resolved_policy,
             privacy_enforcement=privacy_enforcement,
@@ -327,6 +559,38 @@ class InitialContextPackageBuilder(BaseRepository):
             self._connection,
             user_id=user_id,
             conversation_id=conversation_id,
+        )
+        key = build_initial_context_package_key(
+            version=INITIAL_CONTEXT_PACKAGE_SCHEMA_VERSION,
+            package_kind=package_kind,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            retrieval_profile_id=retrieval_profile_id,
+            subject_json=initial_context_package_subject(
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                workspace_id=workspace_id,
+                assistant_mode_id=assistant_mode_id,
+                mode=(
+                    str(conversation.get("mode"))
+                    if conversation is not None and conversation.get("mode") is not None
+                    else None
+                ),
+            ),
+            policy_signature=policy_signature,
+            coordinate_signature=coordinate_signature,
+            operational_profile=operational_profile,
+        )
+        package_key_hash = initial_context_package_key_hash(key)
+        build_attempt = await revision_repository.begin_build_attempt(
+            attempt_id=generate_prefixed_id("ica"),
+            user_id=user_id,
+            conversation_id=conversation_id,
+            package_key_hash=package_key_hash,
+            refresh_generation=refresh_generation,
+            source_coordinates=source_coordinates,
+            refresh_request_job_id=refresh_request_job_id,
         )
         contract_block, contract_refs = await self._build_contract_block(
             user_id=user_id,
@@ -366,10 +630,12 @@ class InitialContextPackageBuilder(BaseRepository):
             active_realm_id=active_realm_id,
         )
         profile_items_before_budget = len(profile_items)
-        profile_block, profile_items, dropped_profile_for_budget = self._render_profile_block(
-            profile_items
+        profile_block, profile_items, dropped_profile_for_budget = (
+            self._render_profile_block(profile_items)
         )
-        dropped_profile_for_limit = max(0, profile_candidate_count - profile_items_before_budget)
+        dropped_profile_for_limit = max(
+            0, profile_candidate_count - profile_items_before_budget
+        )
         current_state_block, state_refs = await self._build_current_state_block(
             user_id=user_id,
             workspace_id=workspace_id,
@@ -405,7 +671,11 @@ class InitialContextPackageBuilder(BaseRepository):
             user_id=user_id,
             conversation_id=conversation_id,
         )
-        curated_items, curated_block, curation_warnings = await self._build_curated_orientation(
+        (
+            curated_items,
+            curated_block,
+            curation_warnings,
+        ) = await self._build_curated_orientation(
             user_id=user_id,
             package_kind=package_kind.value,
             retrieval_profile_id=retrieval_profile_id,
@@ -456,14 +726,10 @@ class InitialContextPackageBuilder(BaseRepository):
         source_refs_json = {
             "contract": contract_refs,
             "curated_orientation": [
-                ref
-                for item in blocks.curated_items
-                for ref in item.source_refs
+                ref for item in blocks.curated_items for ref in item.source_refs
             ],
             "profile_items": [
-                ref
-                for item in blocks.profile_items
-                for ref in item.source_refs
+                ref for item in blocks.profile_items for ref in item.source_refs
             ],
             "current_state": state_refs if blocks.current_state_block else [],
             "conversation_summary": (
@@ -489,6 +755,7 @@ class InitialContextPackageBuilder(BaseRepository):
             ),
             selected_curated_items=len(blocks.curated_items),
             dropped_curated_items=extra_curated_dropped,
+            refresh_job_id=refresh_request_job_id,
             warnings=[
                 *(
                     ["coordinate_signature_incomplete"]
@@ -498,28 +765,6 @@ class InitialContextPackageBuilder(BaseRepository):
                 *curation_warnings,
                 *budget_warnings,
             ],
-        )
-        key = build_initial_context_package_key(
-            version=INITIAL_CONTEXT_PACKAGE_SCHEMA_VERSION,
-            package_kind=package_kind,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            retrieval_profile_id=retrieval_profile_id,
-            subject_json=initial_context_package_subject(
-                user_persona_id=user_persona_id,
-                platform_id=platform_id,
-                character_id=character_id,
-                workspace_id=workspace_id,
-                assistant_mode_id=assistant_mode_id,
-                mode=(
-                    str(conversation.get("mode"))
-                    if conversation is not None and conversation.get("mode") is not None
-                    else None
-                ),
-            ),
-            policy_signature=policy_signature,
-            coordinate_signature=coordinate_signature,
-            operational_profile=operational_profile,
         )
         return await self._package_repository.upsert_package(
             package_kind=package_kind,
@@ -535,6 +780,10 @@ class InitialContextPackageBuilder(BaseRepository):
             source_refs_json=source_refs_json,
             diagnostics_json=diagnostics,
             build_status=InitialContextPackageBuildStatus.ACTIVE,
+            package_key_hash=package_key_hash,
+            source_coordinates=source_coordinates,
+            build_attempt=build_attempt,
+            refresh_request_job_id=refresh_request_job_id,
             commit=commit,
         )
 
@@ -583,7 +832,11 @@ class InitialContextPackageBuilder(BaseRepository):
             dimension = str(row["dimension_name"])
             value_json = dict(row.get("value_json") or {})
             row_realm_id = self._optional_text(row.get("realm_id"))
-            if active_realm_id is not None and row_realm_id is not None and row_realm_id != active_realm_id:
+            if (
+                active_realm_id is not None
+                and row_realm_id is not None
+                and row_realm_id != active_realm_id
+            ):
                 value_json.setdefault(
                     "realm",
                     {
@@ -599,16 +852,16 @@ class InitialContextPackageBuilder(BaseRepository):
                 value_json,
                 row,
             )
-            if current is None or (candidate[0], candidate[1]) > (current[0], current[1]):
+            if current is None or (candidate[0], candidate[1]) > (
+                current[0],
+                current[1],
+            ):
                 merged[dimension] = candidate
 
         current_contract = {
-            dimension: value
-            for dimension, (_, _, value, _) in merged.items()
+            dimension: value for dimension, (_, _, value, _) in merged.items()
         }
-        for dimension in await self._contract_repository.get_mode_contract_dimensions_priority(
-            assistant_mode_id
-        ):
+        for dimension in resolved_policy.contract_dimensions_priority:
             current_contract.setdefault(
                 dimension,
                 {"label": "default", "source": "manifest_default"},
@@ -737,7 +990,9 @@ class InitialContextPackageBuilder(BaseRepository):
                     source_refs=refs_by_memory_id.get(memory_id)
                     or [self._base_memory_ref(row)],
                     scope_json=self._scope_metadata(row),
-                    coordinate_visibility_json=self._coordinate_visibility_metadata(row),
+                    coordinate_visibility_json=self._coordinate_visibility_metadata(
+                        row
+                    ),
                     freshness_json=self._freshness_metadata(row),
                     status=self._profile_item_status(row),
                     salience=self._salience(row),
@@ -861,13 +1116,19 @@ class InitialContextPackageBuilder(BaseRepository):
         ]
         for item in items:
             refs = ", ".join(
-                str(ref.get("memory_id") or ref.get("source_id") or ref.get("source_kind"))
+                str(
+                    ref.get("memory_id")
+                    or ref.get("source_id")
+                    or ref.get("source_kind")
+                )
                 for ref in item.source_refs[:2]
             )
-            scope = item.scope_json.get("scope_canonical") or item.scope_json.get("scope")
-            freshness = item.freshness_json.get("updated_at") or item.freshness_json.get(
-                "created_at"
+            scope = item.scope_json.get("scope_canonical") or item.scope_json.get(
+                "scope"
             )
+            freshness = item.freshness_json.get(
+                "updated_at"
+            ) or item.freshness_json.get("created_at")
             suffix_parts = [f"source: {refs}"]
             if scope:
                 suffix_parts.append(f"scope: {scope}")
@@ -971,19 +1232,26 @@ class InitialContextPackageBuilder(BaseRepository):
             payload = row.get("payload_json") or {}
             if not isinstance(payload, dict):
                 payload = {}
-            entries = payload.items() if payload else (("state", row.get("canonical_text")),)
+            entries = (
+                payload.items() if payload else (("state", row.get("canonical_text")),)
+            )
             emitted_for_row = False
             for key, value in entries:
                 line = self._state_line(str(key), value, row)
                 if not line:
                     continue
                 trial = "\n".join([*lines, line])
-                if self._estimate(trial) > self._budget.current_state_block_budget_tokens:
+                if (
+                    self._estimate(trial)
+                    > self._budget.current_state_block_budget_tokens
+                ):
                     break
                 lines.append(line)
                 emitted_for_row = True
             if emitted_for_row:
-                refs.extend(refs_by_memory_id.get(memory_id) or [self._base_memory_ref(row)])
+                refs.extend(
+                    refs_by_memory_id.get(memory_id) or [self._base_memory_ref(row)]
+                )
         if len(lines) == 1:
             return "", []
         return "\n".join(lines), refs
@@ -1046,9 +1314,11 @@ class InitialContextPackageBuilder(BaseRepository):
             alias="mo",
             allow_overseer_grants=True,
         )
-        embodiment_clause, embodiment_parameters = embodiment_visibility_sql_clause_for_context(
-            active_embodiment_id=active_embodiment_id,
-            alias="mo",
+        embodiment_clause, embodiment_parameters = (
+            embodiment_visibility_sql_clause_for_context(
+                active_embodiment_id=active_embodiment_id,
+                alias="mo",
+            )
         )
         realm_clause, realm_parameters = realm_visibility_sql_clause_for_context(
             active_realm_id=active_realm_id,
@@ -1195,7 +1465,9 @@ class InitialContextPackageBuilder(BaseRepository):
                     "AND mo.platform_locked = 0)"
                 )
                 parameters.append(user_persona_id)
-            elif scope is MemoryScope.CHARACTER and (character_id is not None or workspace_id is not None):
+            elif scope is MemoryScope.CHARACTER and (
+                character_id is not None or workspace_id is not None
+            ):
                 clauses.append(
                     f"({scope_expr} = 'character' "
                     "AND mo.user_persona_id IS ? "
@@ -1229,7 +1501,10 @@ class InitialContextPackageBuilder(BaseRepository):
         rows: list[dict[str, Any]],
     ) -> dict[str, list[dict[str, Any]]]:
         memory_ids = [str(row["id"]) for row in rows]
-        refs = {memory_id: [self._base_memory_ref(row)] for memory_id, row in zip(memory_ids, rows)}
+        refs = {
+            memory_id: [self._base_memory_ref(row)]
+            for memory_id, row in zip(memory_ids, rows)
+        }
         if not memory_ids:
             return refs
         placeholders = ", ".join("?" for _ in memory_ids)
@@ -1369,7 +1644,9 @@ class InitialContextPackageBuilder(BaseRepository):
             return "", []
         from atagia.core.topic_repository import TopicRepository
 
-        snapshot = await TopicRepository(self._connection, self._clock).get_topic_snapshot(
+        snapshot = await TopicRepository(
+            self._connection, self._clock
+        ).get_topic_snapshot(
             user_id=user_id,
             conversation_id=conversation_id,
         )
@@ -1383,7 +1660,9 @@ class InitialContextPackageBuilder(BaseRepository):
         bounded_snapshot = self._bounded_topic_snapshot(
             filtered_snapshot,
             active_limit=len(list(filtered_snapshot.get("active_topics") or [])),
-            parked_limit=min(2, len(list(filtered_snapshot.get("parked_topics") or []))),
+            parked_limit=min(
+                2, len(list(filtered_snapshot.get("parked_topics") or []))
+            ),
         )
         block = render_topic_working_set_block(
             bounded_snapshot,
@@ -1538,10 +1817,14 @@ class InitialContextPackageBuilder(BaseRepository):
             row = realm.get("row")
             if isinstance(row, dict) and row:
                 bridge_count = len(list(realm.get("bridges") or []))
-                lines.append(f"- realm: {self._coordinate_label(row)} bridges={bridge_count}")
+                lines.append(
+                    f"- realm: {self._coordinate_label(row)} bridges={bridge_count}"
+                )
         missing = markers.get("missing")
         if missing:
-            lines.append(f"- missing_coordinate_markers: {', '.join(map(str, missing))}")
+            lines.append(
+                f"- missing_coordinate_markers: {', '.join(map(str, missing))}"
+            )
         return "\n".join(lines) if len(lines) > 1 else ""
 
     def _coordinate_label(self, row: Mapping[str, Any]) -> str:
@@ -1665,7 +1948,10 @@ class InitialContextPackageBuilder(BaseRepository):
                 "package_budget_trimmed_current_state",
             ),
         ):
-            if self._estimate_blocks_tokens(current) <= self._budget.package_budget_tokens:
+            if (
+                self._estimate_blocks_tokens(current)
+                <= self._budget.package_budget_tokens
+            ):
                 break
             if not getattr(current, block_name):
                 continue
@@ -1892,8 +2178,10 @@ class InitialContextPackageBuilder(BaseRepository):
         if reference_time is None:
             return False
         age_seconds = (self._clock.now() - reference_time).total_seconds()
-        return 0 <= age_seconds <= (
-            self._budget.max_historical_profile_age_days * 24 * 60 * 60
+        return (
+            0
+            <= age_seconds
+            <= (self._budget.max_historical_profile_age_days * 24 * 60 * 60)
         )
 
     @staticmethod
@@ -1932,7 +2220,9 @@ class InitialContextPackageBuilder(BaseRepository):
             (user_id,),
         )
         if row is None:
-            raise ValueError("user_id must exist before building an initial context package")
+            raise ValueError(
+                "user_id must exist before building an initial context package"
+            )
         return row
 
     async def _fetch_conversation(
@@ -1979,7 +2269,11 @@ class InitialContextPackageBuilder(BaseRepository):
 
     @staticmethod
     def _scope_rank(scope: str) -> int:
-        if scope in {MemoryScope.CHAT.value, MemoryScope.CONVERSATION.value, MemoryScope.EPHEMERAL_SESSION.value}:
+        if scope in {
+            MemoryScope.CHAT.value,
+            MemoryScope.CONVERSATION.value,
+            MemoryScope.EPHEMERAL_SESSION.value,
+        }:
             return 3
         if scope in {MemoryScope.CHARACTER.value, MemoryScope.WORKSPACE.value}:
             return 2

@@ -13,7 +13,7 @@ from atagia.core.repositories import MemoryObjectRepository, UserRepository
 from atagia.memory.grounding_analyzer import GroundingAnalyzer
 from atagia.models.schemas_memory import ComposedContext, MemoryObjectType, MemoryScope, MemorySourceKind
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
 
 async def _build_runtime():

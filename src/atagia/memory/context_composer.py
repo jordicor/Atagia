@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import math
 from typing import Any, Literal
@@ -10,6 +10,11 @@ from typing import Any, Literal
 from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.core.text_utils import truncate_inline
+from atagia.memory.coverage_keys import (
+    COVERAGE_VALUE_PAYLOAD_KEYS as _COVERAGE_VALUE_PAYLOAD_KEYS,
+    normalize_coverage_key as _normalize_coverage_key,
+    resolve_member_keys,
+)
 from atagia.memory.high_risk_policy import HighRiskDisclosureAction, disclosure_action
 from atagia.memory.intimacy_boundary_policy import candidate_allows_intimacy_boundary
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
@@ -26,6 +31,75 @@ from atagia.models.schemas_memory import (
 
 
 ComposerStrategy = Literal["score_first", "budgeted_marginal"]
+
+# Composer eviction labels split the formerly conflated `budget_exhausted`
+# custody bucket into distinct causes so the funnel/custody can tell a token
+# wall from an item-cap wall from a per-class cap from a diversity demotion.
+EVICTION_BUDGET_EXHAUSTED = "budget_exhausted"
+EVICTION_ITEM_CAP_REACHED = "item_cap_reached"
+EVICTION_CLASS_CAP_REACHED = "class_cap_reached"
+EVICTION_DIVERSITY_DEMOTED = "diversity_demoted"
+# Single source of truth for the labels the composer may emit (validated in
+# retrieval_custody before overriding the generic heuristic).
+COMPOSER_EVICTION_REASONS: frozenset[str] = frozenset(
+    {
+        EVICTION_BUDGET_EXHAUSTED,
+        EVICTION_ITEM_CAP_REACHED,
+        EVICTION_CLASS_CAP_REACHED,
+        EVICTION_DIVERSITY_DEMOTED,
+    }
+)
+
+# Per-class budget shares within the retrieved-context (memory-entry) budget.
+# Summaries are date-corruptible non-canonical carriers and verbatim windows
+# are token-heavy; both are capped so they cannot
+# crowd out compact direct evidence. Direct evidence and beliefs are uncapped.
+_SUMMARY_BUDGET_CLASS = "summary"
+_VERBATIM_WINDOW_BUDGET_CLASS = "verbatim_window"
+
+
+@dataclass(slots=True)
+class _ClassBudget:
+    """Per-class token budget tracker for composer admission.
+
+    ``caps`` maps a budget class to its token ceiling; classes absent from
+    ``caps`` are uncapped. ``consumed`` accumulates admitted tokens per class,
+    including obligation admissions (obligations bypass the cap CHECK but still
+    consume their share so later same-class non-obligation items are limited).
+    """
+
+    caps: dict[str, int]
+    consumed: dict[str, int]
+
+    @classmethod
+    def from_base(
+        cls,
+        base_budget: int,
+        *,
+        summary_ratio: float,
+        window_ratio: float,
+    ) -> _ClassBudget:
+        base = max(0, int(base_budget))
+        return cls(
+            caps={
+                _SUMMARY_BUDGET_CLASS: int(base * summary_ratio),
+                _VERBATIM_WINDOW_BUDGET_CLASS: int(base * window_ratio),
+            },
+            consumed={},
+        )
+
+    def admits(self, budget_class: str | None, tokens: int) -> bool:
+        if budget_class is None:
+            return True
+        cap = self.caps.get(budget_class)
+        if cap is None:
+            return True
+        return self.consumed.get(budget_class, 0) + tokens <= cap
+
+    def record(self, budget_class: str | None, tokens: int) -> None:
+        if budget_class is None:
+            return
+        self.consumed[budget_class] = self.consumed.get(budget_class, 0) + tokens
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +126,20 @@ class _MemorySelection:
     selected: list[ScoredCandidate]
     memory_lines: list[str]
     remaining_budget: int
+    # memory_id -> composer eviction label recorded during the walk for
+    # candidates a strategy actively skipped (class cap or token wall). compose()
+    # fills the terminal (item-cap / budget) and diversity-demoted causes.
+    eviction_reasons: dict[str, str] = field(default_factory=dict)
+    # Candidates skipped for a composer-policy cause (e.g. an L1 summary with no
+    # source-grounded support, or one superseded by a fresher conflicting L0).
+    # These are NOT capacity evictions and must stay out of the eviction labels;
+    # custody keeps its generic heuristic for them.
+    policy_skips: set[str] = field(default_factory=set)
+    # L0 candidates the walk promoted out of feed order via the hierarchical
+    # pairing branch (supporting/conflicting L0). Like obligations, these are
+    # policy-funded selections, not diversity choices, so the diversity_demoted
+    # classification must not use them as its reference.
+    pair_promotions: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -70,16 +158,6 @@ class _CoverageMetadata:
     missing_slots: list[dict[str, Any]]
 
 
-_COVERAGE_VALUE_PAYLOAD_KEYS = (
-    "value_norm_key",
-    "value_key",
-    "normalized_key",
-    "value_text",
-    "value",
-    "display_text",
-    "surface",
-    "subject_surface",
-)
 _COVERAGE_DISPLAY_PAYLOAD_KEYS = ("value_text", "value", "display_text", "surface")
 _COVERAGE_MISSING_SLOT_MODES = frozenset({"exhaustive_known_set", "chronology"})
 
@@ -124,6 +202,11 @@ class ContextComposer:
     SOURCE_CHAIN_MAX_MESSAGES = 7
     SOURCE_CHAIN_MAX_CHARS = 960
     RENDERED_SOURCE_QUOTE_DEDUPE_MIN_CHARS = 24
+    # Per-class budget shares of the retrieved-context (memory-entry)
+    # budget. Summaries capped tighter (non-canonical, date-corruptible carriers),
+    # verbatim windows next; direct evidence and beliefs stay uncapped.
+    SUMMARY_CLASS_BUDGET_RATIO = 0.25
+    VERBATIM_WINDOW_CLASS_BUDGET_RATIO = 0.35
 
     def __init__(self, clock: Clock) -> None:
         self._clock = clock
@@ -185,9 +268,21 @@ class ContextComposer:
                 candidate.memory_id,
             ),
         )
-        candidates = self._selection_order(
+        # Admission invariant: the pre-diversity 3-key order above IS the
+        # authoritative "rank". Record it before any reorder so the walk and the
+        # custody labeler can tell a rank-protected top-K item from a candidate the
+        # diversity reranker deprioritized.
+        pre_diversity_rank_by_id = {
+            candidate.memory_id: index
+            for index, candidate in enumerate(candidates)
+        }
+        max_items = resolved_policy.retrieval_params.final_context_items
+        diversity_remainder_ids = {
+            candidate.memory_id for candidate in candidates[max(0, max_items):]
+        }
+        candidates = self._rank_respecting_selection_order(
             candidates,
-            max_items=resolved_policy.retrieval_params.final_context_items,
+            max_items=max_items,
             query_text=query_text,
             query_type=query_type,
             exact_recall_mode=exact_recall_mode,
@@ -196,7 +291,7 @@ class ContextComposer:
         evidence_obligation_candidates = (
             self._evidence_obligation_candidates(
                 candidates,
-                max_items=resolved_policy.retrieval_params.final_context_items,
+                max_items=max_items,
                 query_type=query_type,
                 answer_shape=answer_shape,
                 coverage_mode=coverage_mode,
@@ -259,7 +354,6 @@ class ContextComposer:
             exact_recall_mode=exact_recall_mode,
             context_budget_tokens=budget_tokens,
         )
-        max_items = resolved_policy.retrieval_params.final_context_items
         answer_evidence_pack = self._build_answer_evidence_pack(
             candidates,
             query_text=query_text,
@@ -306,6 +400,16 @@ class ContextComposer:
             if answer_evidence_pack.block
             else candidates
         )
+        # Per-class caps operate on the memory-entry budget the walk sees
+        # (after the fixed blocks and any answer-evidence pack were deducted).
+        # Obligations bypass the cap check (correctness floor) but still consume
+        # their share, so bulky summaries/windows cannot crowd out compact direct
+        # evidence beyond the class share.
+        class_budget = _ClassBudget.from_base(
+            remaining_budget,
+            summary_ratio=self.SUMMARY_CLASS_BUDGET_RATIO,
+            window_ratio=self.VERBATIM_WINDOW_CLASS_BUDGET_RATIO,
+        )
         strategy = composer_strategy or "score_first"
         if strategy == "score_first":
             selection = self._select_score_first(
@@ -318,6 +422,8 @@ class ContextComposer:
                 fact_facet_span_coadmission_enabled=(
                     fact_facet_span_coadmission_enabled
                 ),
+                class_budget=class_budget,
+                cap_exempt_ids=frozenset(evidence_obligation_ids),
             )
         elif strategy == "budgeted_marginal":
             selection = self._select_budgeted_marginal(
@@ -375,6 +481,18 @@ class ContextComposer:
             raise RuntimeError("Context composition exceeded the resolved token budget")
         items_included = len(selected)
         items_dropped = len(candidates) - items_included
+        selected_ids = {candidate.memory_id for candidate in selection.selected}
+        composer_eviction_reasons = self._build_composer_eviction_reasons(
+            selection_candidates=selection_candidates,
+            selected_ids=selected_ids,
+            walk_reasons=selection.eviction_reasons,
+            policy_skip_ids=selection.policy_skips,
+            item_cap_bound=len(selection.selected) >= regular_max_items,
+            budget_bound=selection.remaining_budget <= 0,
+            pre_diversity_rank_by_id=pre_diversity_rank_by_id,
+            diversity_remainder_ids=diversity_remainder_ids,
+            policy_funded_ids=evidence_obligation_ids | selection.pair_promotions,
+        )
         coverage_metadata = self._coverage_metadata(
             candidates=candidates,
             selected=selected,
@@ -402,6 +520,7 @@ class ContextComposer:
             memory_block=memory_block,
             state_block=state_block,
             selected_memory_ids=[candidate.memory_id for candidate in selected],
+            composer_eviction_reasons=composer_eviction_reasons,
             total_tokens_estimate=total_tokens_estimate,
             budget_tokens=budget_tokens,
             items_included=items_included,
@@ -419,11 +538,16 @@ class ContextComposer:
         active_realm_id: str | None,
         redact_high_risk_secret_literals: bool,
         fact_facet_span_coadmission_enabled: bool = False,
+        class_budget: _ClassBudget | None = None,
+        cap_exempt_ids: frozenset[str] = frozenset(),
     ) -> _MemorySelection:
         selected: list[ScoredCandidate] = []
         selected_ids: set[str] = set()
         memory_lines: list[str] = []
         rendered_source_quote_keys: set[str] = set()
+        eviction_reasons: dict[str, str] = {}
+        policy_skips: set[str] = set()
+        pair_promotions: set[str] = set()
         for candidate in candidates:
             if len(selected) >= max_items or remaining_budget <= 0:
                 break
@@ -450,7 +574,15 @@ class ContextComposer:
                             fact_facet_span_coadmission_enabled
                         ),
                         rendered_source_quote_keys=rendered_source_quote_keys,
+                        class_budget=class_budget,
+                        cap_exempt=conflicting_l0.memory_id in cap_exempt_ids,
+                        eviction_reasons=eviction_reasons,
                     )
+                    if conflicting_l0.memory_id in selected_ids:
+                        pair_promotions.add(conflicting_l0.memory_id)
+                    # The summary is skipped because a fresher conflicting L0
+                    # supersedes it -- a composer-policy cause, not capacity.
+                    policy_skips.add(candidate.memory_id)
                     continue
 
                 supporting_l0 = cls._supporting_l0_candidate(
@@ -459,7 +591,37 @@ class ContextComposer:
                     selected_ids,
                 )
                 if supporting_l0 is None:
+                    # Composer-policy skip (no source-grounded support), not a
+                    # capacity cause: keep it out of the terminal eviction labels.
+                    policy_skips.add(candidate.memory_id)
                     continue
+                # The L1 summary itself is subject to the summary class
+                # cap. Check it BEFORE admitting the supporting L0 so the pair
+                # co-admits or co-skips -- never an orphan L0 holding a slot for
+                # a summary the cap then rejects.
+                if (
+                    class_budget is not None
+                    and candidate.memory_id not in cap_exempt_ids
+                ):
+                    summary_tokens = cls._action_token_cost(
+                        (candidate,),
+                        selected_count=len(selected)
+                        + int(supporting_l0.memory_id not in selected_ids),
+                        active_realm_id=active_realm_id,
+                        redact_high_risk_secret_literals=redact_high_risk_secret_literals,
+                        fact_facet_span_coadmission_enabled=(
+                            fact_facet_span_coadmission_enabled
+                        ),
+                        rendered_source_quote_keys=rendered_source_quote_keys,
+                    )
+                    if not class_budget.admits(
+                        cls._candidate_budget_class(candidate),
+                        summary_tokens,
+                    ):
+                        eviction_reasons[candidate.memory_id] = (
+                            EVICTION_CLASS_CAP_REACHED
+                        )
+                        continue
                 if supporting_l0.memory_id not in selected_ids:
                     required_items = 2
                     required_tokens = cls._action_token_cost(
@@ -490,7 +652,12 @@ class ContextComposer:
                             fact_facet_span_coadmission_enabled
                         ),
                         rendered_source_quote_keys=rendered_source_quote_keys,
+                        class_budget=class_budget,
+                        cap_exempt=supporting_l0.memory_id in cap_exempt_ids,
+                        eviction_reasons=eviction_reasons,
                     )
+                    if supporting_l0.memory_id in selected_ids:
+                        pair_promotions.add(supporting_l0.memory_id)
                 remaining_budget = cls._append_candidate_if_possible(
                     candidate,
                     selected=selected,
@@ -504,6 +671,9 @@ class ContextComposer:
                         fact_facet_span_coadmission_enabled
                     ),
                     rendered_source_quote_keys=rendered_source_quote_keys,
+                    class_budget=class_budget,
+                    cap_exempt=candidate.memory_id in cap_exempt_ids,
+                    eviction_reasons=eviction_reasons,
                 )
                 continue
 
@@ -520,11 +690,62 @@ class ContextComposer:
                     fact_facet_span_coadmission_enabled
                 ),
                 rendered_source_quote_keys=rendered_source_quote_keys,
+                class_budget=class_budget,
+                cap_exempt=candidate.memory_id in cap_exempt_ids,
+                eviction_reasons=eviction_reasons,
             )
+
+        # Per-class caps govern funding ORDER, not a hard exclusion.
+        # Uncapped direct evidence and within-share summaries/windows admitted
+        # above already claimed their budget first; whatever slots and budget
+        # remain are offered back to the capped-out candidates in feed order
+        # (rank-protected top-K first, then the diversity-ordered remainder).
+        # This protects direct evidence from summary/window crowding without
+        # wasting capacity when a pool is mostly one class. Hierarchical
+        # summaries stay capped so the L1->L0 support-pairing invariant is not
+        # bypassed by a bare recovery admission.
+        if class_budget is not None and remaining_budget > 0:
+            for candidate in candidates:
+                if len(selected) >= max_items or remaining_budget <= 0:
+                    break
+                if (
+                    eviction_reasons.get(candidate.memory_id)
+                    != EVICTION_CLASS_CAP_REACHED
+                    or cls._is_hierarchical_summary_candidate(candidate)
+                ):
+                    continue
+                before = len(selected)
+                # A recovery candidate that no longer fits the leftover budget
+                # keeps its class_cap_reached label deliberately: without the
+                # cap it would have been admitted at its original walk position
+                # (budget existed then), so the cap -- not the token wall -- is
+                # the counterfactual cause. A successful admission clears it.
+                remaining_budget = cls._append_candidate_if_possible(
+                    candidate,
+                    selected=selected,
+                    selected_ids=selected_ids,
+                    memory_lines=memory_lines,
+                    remaining_budget=remaining_budget,
+                    max_items=max_items,
+                    active_realm_id=active_realm_id,
+                    redact_high_risk_secret_literals=redact_high_risk_secret_literals,
+                    fact_facet_span_coadmission_enabled=(
+                        fact_facet_span_coadmission_enabled
+                    ),
+                    rendered_source_quote_keys=rendered_source_quote_keys,
+                    class_budget=None,
+                    cap_exempt=True,
+                    eviction_reasons=None,
+                )
+                if len(selected) > before:
+                    eviction_reasons.pop(candidate.memory_id, None)
         return _MemorySelection(
             selected=selected,
             memory_lines=memory_lines,
             remaining_budget=remaining_budget,
+            eviction_reasons=eviction_reasons,
+            policy_skips=policy_skips,
+            pair_promotions=pair_promotions,
         )
 
     @classmethod
@@ -769,6 +990,127 @@ class ContextComposer:
             return None
         if compact_tokens - bare_tokens <= leftover_budget:
             return compact_block
+        return None
+
+    @classmethod
+    def _rank_respecting_selection_order(
+        cls,
+        candidates: list[ScoredCandidate],
+        *,
+        max_items: int,
+        query_text: str | None,
+        query_type: QueryType,
+        exact_recall_mode: bool,
+        source_messages_by_id: dict[str, dict[str, Any]],
+    ) -> list[ScoredCandidate]:
+        """Order candidates so the pre-diversity top-K keep their rank.
+
+        ``candidates`` arrives in the authoritative pre-diversity 3-key order.
+        The first ``max_items`` (K = ``final_context_items``) are the admission
+        top-K: they stay in pure rank order so a top-K candidate can only be
+        displaced by a higher-ranked item, never lost to a slot/budget consumed
+        by a lower-ranked one. The diversity-aware reranker then orders only the
+        REMAINING seats (rank > K) -- the candidates that compete for any slot a
+        size-skipped top-K item frees. Contention order across the whole
+        pipeline: obligations > top-K reservation > diversity fill.
+        """
+        if max_items <= 0:
+            return candidates
+        rank_protected = candidates[:max_items]
+        remainder = candidates[max_items:]
+        if not remainder:
+            return rank_protected
+        diversity_remainder = cls._selection_order(
+            remainder,
+            max_items=max_items,
+            query_text=query_text,
+            query_type=query_type,
+            exact_recall_mode=exact_recall_mode,
+            source_messages_by_id=source_messages_by_id,
+        )
+        return [*rank_protected, *diversity_remainder]
+
+    @classmethod
+    def _build_composer_eviction_reasons(
+        cls,
+        *,
+        selection_candidates: list[ScoredCandidate],
+        selected_ids: set[str],
+        walk_reasons: dict[str, str],
+        policy_skip_ids: set[str],
+        item_cap_bound: bool,
+        budget_bound: bool,
+        pre_diversity_rank_by_id: dict[str, int],
+        diversity_remainder_ids: set[str],
+        policy_funded_ids: set[str],
+    ) -> dict[str, str]:
+        """Resolve the composer eviction label for each non-selected candidate.
+
+        ``walk_reasons`` already carries the causes a strategy observed directly
+        (``class_cap_reached`` and token-wall ``budget_exhausted`` size-skips).
+        This fills the terminal causes: when the walk stopped on the item cap the
+        remaining candidates are ``item_cap_reached``; when it stopped on the
+        token budget they are ``budget_exhausted``. A remainder candidate that
+        lost an item-cap seat to a WORSE pre-diversity-ranked remainder item is
+        relabelled ``diversity_demoted`` -- that inversion can only come from the
+        diversity reranker, so policy-funded selections (evidence obligations and
+        hierarchical pair promotions, ``policy_funded_ids``) are excluded from
+        the reference: they outrank the feed by design and must not read as
+        diversity demotions. Composer-policy skips (``policy_skip_ids``) and
+        candidates the walk passed over with slots AND budget still free are left
+        unlabelled for the generic custody heuristic.
+        """
+        # Drop stale walk labels for candidates a later branch re-admitted
+        # (e.g. a class-capped standalone later pulled in as an L0 support).
+        reasons = {
+            memory_id: reason
+            for memory_id, reason in walk_reasons.items()
+            if memory_id not in selected_ids
+        }
+        worst_selected_remainder_rank = -1
+        for memory_id in selected_ids:
+            if (
+                memory_id not in diversity_remainder_ids
+                or memory_id in policy_funded_ids
+            ):
+                continue
+            rank = pre_diversity_rank_by_id.get(memory_id)
+            if rank is not None and rank > worst_selected_remainder_rank:
+                worst_selected_remainder_rank = rank
+        for candidate in selection_candidates:
+            memory_id = candidate.memory_id
+            if (
+                memory_id in selected_ids
+                or memory_id in reasons
+                or memory_id in policy_skip_ids
+            ):
+                continue
+            if item_cap_bound:
+                rank = pre_diversity_rank_by_id.get(memory_id)
+                if (
+                    memory_id in diversity_remainder_ids
+                    and rank is not None
+                    and rank < worst_selected_remainder_rank
+                ):
+                    reasons[memory_id] = EVICTION_DIVERSITY_DEMOTED
+                else:
+                    reasons[memory_id] = EVICTION_ITEM_CAP_REACHED
+            elif budget_bound:
+                reasons[memory_id] = EVICTION_BUDGET_EXHAUSTED
+        return reasons
+
+    @staticmethod
+    def _candidate_budget_class(candidate: ScoredCandidate) -> str | None:
+        """Return the per-class budget bucket, or None when uncapped.
+
+        Summaries are checked first so a candidate that looks like both a summary
+        and a window counts against the tighter summary share. Direct evidence and
+        beliefs return None (uncapped).
+        """
+        if ContextComposer._is_summary_like_candidate(candidate):
+            return _SUMMARY_BUDGET_CLASS
+        if ContextComposer._is_verbatim_evidence_window_candidate(candidate):
+            return _VERBATIM_WINDOW_BUDGET_CLASS
         return None
 
     @classmethod
@@ -1501,32 +1843,12 @@ class ContextComposer:
     def _coverage_member_keys(cls, candidate: ScoredCandidate) -> frozenset[str]:
         """Mechanical resolution ladder for a candidate's member identities.
 
-        Shared by reservation and metadata so they can never disagree:
-          1. ``coverage_members`` key present -> the set of normalized
-             ``member_key`` values (possibly empty).
-          2. else a legacy ``_COVERAGE_VALUE_PAYLOAD_KEYS`` value present ->
-             single-element set with the normalized value (preserving the
-             existing ``("value", normalized)`` grouping shape).
-          3. else -> empty set (treated as UNKEYED by callers).
+        Delegates to the shared ``coverage_keys.resolve_member_keys`` ladder —
+        the SAME resolver the fusion-stage carrier dedupe uses — so
+        reservation, metadata, and the dedupe can never disagree about which
+        member identities a carrier holds.
         """
-        members = cls._coverage_members_payload(candidate)
-        if members is not None:
-            keys: set[str] = set()
-            for member in members:
-                if not isinstance(member, dict):
-                    continue
-                member_key = cls._optional_text(member.get("member_key"))
-                if member_key is not None:
-                    keys.add(cls._normalize_coverage_key(member_key))
-            return frozenset(keys)
-
-        payload_json = candidate.memory_object.get("payload_json") or {}
-        if isinstance(payload_json, dict):
-            for key in _COVERAGE_VALUE_PAYLOAD_KEYS:
-                value = cls._optional_text(payload_json.get(key))
-                if value is not None:
-                    return frozenset({cls._normalize_coverage_key(value)})
-        return frozenset()
+        return resolve_member_keys(candidate.memory_object.get("payload_json"))
 
     @classmethod
     def _coverage_member_display_map(
@@ -1555,7 +1877,7 @@ class ContextComposer:
                     # caller's canonical-text fallback fires instead of an empty
                     # label.
                     continue
-                normalized = cls._normalize_coverage_key(member_key)
+                normalized = _normalize_coverage_key(member_key)
                 mapping[normalized] = cls._truncate_inline(display, 160)
             return mapping
 
@@ -1565,7 +1887,7 @@ class ContextComposer:
                 value = cls._optional_text(payload_json.get(key))
                 if value is not None:
                     return {
-                        cls._normalize_coverage_key(value): cls._coverage_display_text(
+                        _normalize_coverage_key(value): cls._coverage_display_text(
                             candidate
                         )
                     }
@@ -1578,7 +1900,7 @@ class ContextComposer:
             for key in _COVERAGE_VALUE_PAYLOAD_KEYS:
                 value = cls._optional_text(payload_json.get(key))
                 if value is not None:
-                    return ("value", cls._normalize_coverage_key(value))
+                    return ("value", _normalize_coverage_key(value))
 
         source_ids = cls._candidate_source_message_ids(candidate)
         packet_ids = cls._evidence_packet_message_ids(candidate.memory_object)
@@ -1594,12 +1916,8 @@ class ContextComposer:
             "support_kind",
         )
         if support_kind:
-            return ("support", cls._normalize_coverage_key(support_kind))
+            return ("support", _normalize_coverage_key(support_kind))
         return ("candidate", candidate.memory_id)
-
-    @staticmethod
-    def _normalize_coverage_key(value: str) -> str:
-        return " ".join(str(value).casefold().split())
 
     @classmethod
     def _coverage_support_ids(
@@ -3949,6 +4267,9 @@ class ContextComposer:
         redact_high_risk_secret_literals: bool = True,
         fact_facet_span_coadmission_enabled: bool = False,
         rendered_source_quote_keys: set[str] | None = None,
+        class_budget: _ClassBudget | None = None,
+        cap_exempt: bool = False,
+        eviction_reasons: dict[str, str] | None = None,
     ) -> int:
         """Admit a candidate priced on its bare (quote-free) form only.
 
@@ -3956,6 +4277,12 @@ class ContextComposer:
         post-selection upgrade pass from budget left over after all bare
         admissions, so enabling quotes can never change the set of selected
         memory entries (see ``_upgrade_entries_with_source_quotes``).
+
+        When ``class_budget`` is set, a non-exempt candidate whose
+        per-class share is already spent is skipped and recorded as
+        ``class_cap_reached``; a token-wall size-skip is recorded as
+        ``budget_exhausted``. Obligations pass ``cap_exempt=True`` (they bypass
+        the cap check but still consume their class share once admitted).
         """
         if (
             candidate.memory_id in selected_ids
@@ -3972,7 +4299,20 @@ class ContextComposer:
             suppressed_source_quote_keys=frozenset(rendered_source_quote_keys or ()),
         )
         candidate_tokens = cls.estimate_tokens(candidate_block)
+        budget_class = (
+            cls._candidate_budget_class(candidate) if class_budget is not None else None
+        )
+        if (
+            class_budget is not None
+            and not cap_exempt
+            and not class_budget.admits(budget_class, candidate_tokens)
+        ):
+            if eviction_reasons is not None:
+                eviction_reasons[candidate.memory_id] = EVICTION_CLASS_CAP_REACHED
+            return remaining_budget
         if candidate_tokens > remaining_budget:
+            if eviction_reasons is not None:
+                eviction_reasons[candidate.memory_id] = EVICTION_BUDGET_EXHAUSTED
             return remaining_budget
         memory_lines.append(candidate_block)
         if rendered_source_quote_keys is not None:
@@ -3981,6 +4321,8 @@ class ContextComposer:
             )
         selected.append(candidate)
         selected_ids.add(candidate.memory_id)
+        if class_budget is not None:
+            class_budget.record(budget_class, candidate_tokens)
         return remaining_budget - candidate_tokens
 
     @staticmethod

@@ -234,7 +234,7 @@ client = await connect_atagia(
 async with client:
     result = await client.chat(
         user_id="user-123",
-        conversation_id="conv-42",
+        conversation_id="conversation-example-001",
         message="Summarize my pending tasks.",
     )
 ```
@@ -246,7 +246,9 @@ client backed by `db_path` (resolved from `ATAGIA_DB_PATH`,
 read by auto mode:
 
 - `ATAGIA_BASE_URL` -- HTTP service base URL
-- `ATAGIA_SERVICE_API_KEY` -- per-user HTTP API key
+- `ATAGIA_SERVICE_API_KEY` -- shared server-side credential for non-admin HTTP
+  routes; never expose it to a browser or other untrusted client. User
+  partitioning is carried separately by the trusted `X-Atagia-User-Id` header.
 - `ATAGIA_ADMIN_API_KEY` -- admin HTTP API key for worker-control and review
 - `ATAGIA_DB_PATH` or `ATAGIA_SQLITE_PATH` -- local SQLite database path
 

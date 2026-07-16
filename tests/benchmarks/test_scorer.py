@@ -93,18 +93,18 @@ async def test_judge_includes_official_source_evidence_when_available() -> None:
     )
 
     result = await scorer.score(
-        question="Is Elena expecting a baby, and if so, when?",
-        prediction="Elena is expecting a baby in May 2026.",
-        ground_truth="Elena is expecting a baby in May.",
+        question="When is Priya's astronomy workshop?",
+        prediction="Priya's astronomy workshop is on April 18 at 7 PM.",
+        ground_truth="April 18 at 7 PM.",
         source_evidence=[
             {
-                "turn_id": "rosa-04-t07",
-                "session_id": "session_4",
-                "timestamp": "2025-12-02T11:07:00",
+                "turn_id": "fixture-04-t07",
+                "session_id": "fixture_session_4",
+                "timestamp": "2027-04-02T11:07:00",
                 "speaker": "user",
-                "text": "She is expecting a baby. She is due in May.",
-                "blip_caption": "a calendar marked May",
-                "attachment_text": "Visual description of attached image: a calendar marked May",
+                "text": "Priya's astronomy workshop is April 18 at 7 PM.",
+                "blip_caption": "a calendar marked April 18",
+                "attachment_text": "Visual description of attached image: a calendar marked April 18",
             }
         ],
     )
@@ -115,11 +115,11 @@ async def test_judge_includes_official_source_evidence_when_available() -> None:
     assert "official source evidence" in system_prompt.lower()
     assert "Temporal specificity rule" in system_prompt
     assert "next applicable future occurrence" in system_prompt
-    assert "session_id=session_4" in provider.requests[0].messages[1].content
-    assert "timestamp=2025-12-02T11:07:00" in provider.requests[0].messages[1].content
+    assert "session_id=fixture_session_4" in provider.requests[0].messages[1].content
+    assert "timestamp=2027-04-02T11:07:00" in provider.requests[0].messages[1].content
     assert "[Image caption]" in provider.requests[0].messages[1].content
     assert "[Attachment text]" in provider.requests[0].messages[1].content
-    assert "May 2026" in provider.requests[0].messages[1].content
+    assert "April 18 at 7 PM" in provider.requests[0].messages[1].content
 
 
 @pytest.mark.asyncio

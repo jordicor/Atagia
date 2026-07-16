@@ -1,1 +1,0 @@
-ALTER TABLE summary_views ADD COLUMN model TEXT NOT NULL DEFAULT '';

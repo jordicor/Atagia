@@ -19,7 +19,7 @@ from time import perf_counter
 from typing import Any
 
 from atagia.core.clock import FrozenClock
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import (
     ConversationRepository,
@@ -44,9 +44,8 @@ from benchmarks.card2_summary.cases import (
     Card2Case,
 )
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-MIGRATIONS_DIR = _REPO_ROOT / "migrations"
-MANIFESTS_DIR = _REPO_ROOT / "manifests"
+MIGRATIONS_DIR = Path(default_resource_path("migrations"))
+MANIFESTS_DIR = Path(default_resource_path("manifests"))
 
 _SUMMARY_PURPOSE = "summary_chunk_segmentation_summaries_card"
 

@@ -76,7 +76,7 @@ CardName = Literal[
 ]
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
+_MANIFESTS_DIR = _PROJECT_ROOT / "src" / "atagia" / "resources" / "manifests"
 _DEFAULT_CASES_PATH = _PROJECT_ROOT / "benchmarks" / "memory_extraction_cards" / "cases.jsonl"
 _DIRECT_GEMINI_FLASH_LITE_MODEL = "google/gemini-3.1-flash-lite"
 _DIRECT_MINIMAX_M3_MODEL = "minimax/MiniMax-M3"

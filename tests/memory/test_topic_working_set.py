@@ -38,7 +38,7 @@ from benchmarks.topic_working_set_cards.compare import (
 )
 from tests.memory.card_leak_guard import assert_prompt_has_no_benchmark_leak
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
 
 def _prompt_only_updater(*, card_examples_enabled: bool = True) -> TopicWorkingSetUpdater:

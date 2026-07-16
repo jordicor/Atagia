@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +101,31 @@ class AtagiaBenchDataset(BaseModel):
         return sum(len(p.conversations) for p in self.personas)
 
 
+def render_persona_transcript(
+    conversations: Sequence[AtagiaBenchConversation],
+) -> str:
+    """Render a persona's authored conversations as ground-truth transcript text.
+
+    The ``memory_quality`` judge protocol treats the conversation itself as the
+    ground truth for extra content, so it needs the full authored transcript for
+    the persona (not only the official evidence turns). Atagia-bench personas are
+    small (roughly 1k-2.5k tokens each), so rendering every turn is cheap and
+    gives the judge complete coverage to verify whether an answer's additions are
+    true and correctly attributed.
+    """
+    lines: list[str] = []
+    for conversation in conversations:
+        lines.append(
+            f"[conversation {conversation.conversation_id} "
+            f"mode={conversation.assistant_mode_id}]"
+        )
+        for turn in conversation.turns:
+            turn_id = f" {turn.turn_id}" if turn.turn_id else ""
+            header = f"[{turn.timestamp}{turn_id}] {turn.role}:"
+            lines.append(f"{header} {turn.text}".rstrip())
+    return "\n".join(lines)
+
+
 # ---- Loader ----
 
 
@@ -139,6 +165,12 @@ class AtagiaBenchAdapter:
         for persona in all_personas:
             persona_dir = self._data_dir / persona.persona_id
             conversations = self._load_conversations(persona_dir)
+            if len(conversations) != persona.conversation_count:
+                raise ValueError(
+                    f"Persona {persona.persona_id} declares "
+                    f"conversation_count={persona.conversation_count}, but "
+                    f"{len(conversations)} conversations were loaded"
+                )
             questions = self._load_questions(persona_dir)
             self._validate_source_evidence(
                 persona_id=persona.persona_id,

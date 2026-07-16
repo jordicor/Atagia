@@ -19,7 +19,7 @@ from atagia.models.schemas_memory import (
     MemoryStatus,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
 
 @pytest.mark.asyncio

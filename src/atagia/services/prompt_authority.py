@@ -91,6 +91,38 @@ def normalize_request_authority_context(
     )
 
 
+def resolve_request_authority_context(
+    prompt_authority_context: PromptAuthorityContext | None,
+    *,
+    privacy_enforcement: str = "enforce",
+    authenticated_user_privilege_level: str | None = None,
+    authenticated_user_is_atagia_master: bool = False,
+    trusted_evaluation: bool = False,
+    user_id: str | None = None,
+    purpose: str | None = None,
+    authority_source: str = "server_authenticated",
+) -> PromptAuthorityContext:
+    """Use explicit trusted authority or normalize internal raw controls."""
+
+    if prompt_authority_context is None:
+        return normalize_request_authority_context(
+            privacy_enforcement=privacy_enforcement,
+            authenticated_user_privilege_level=authenticated_user_privilege_level,
+            authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
+            trusted_evaluation=trusted_evaluation,
+            user_id=user_id,
+            purpose=purpose,
+            authority_source=authority_source,
+        )
+    if (
+        prompt_authority_context.user_id is not None
+        and user_id is not None
+        and prompt_authority_context.user_id != user_id
+    ):
+        raise ValueError("Prompt authority user_id does not match the request user_id")
+    return prompt_authority_context
+
+
 def privacy_sql_filters_disabled(ablation: AblationConfig) -> bool:
     """Whether SQL sensitivity gating runs in privacy-off (relaxed) mode.
 

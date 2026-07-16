@@ -36,7 +36,7 @@ from atagia.models.schemas_memory import (
 )
 from atagia.services.errors import ConversationNotActiveError
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
 
 async def _connection_and_clock() -> tuple[aiosqlite.Connection, FrozenClock]:

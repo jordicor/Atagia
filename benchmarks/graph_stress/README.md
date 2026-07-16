@@ -36,7 +36,12 @@ python -m benchmarks.atagia_bench \
   --data-dir <dataset-dir> \
   --holdout-file <dataset-dir>/holdout_v0.json \
   --benchmark-split development \
+  --allow-legacy-question-only-holdout \
   --categories graph_stress \
   --provider anthropic \
   --model claude-sonnet-4-6
 ```
+
+The explicit legacy flag is required because this historical stress manifest
+predates conversation-level evidence isolation. Do not use that flag with the
+active Atagia-bench holdout.

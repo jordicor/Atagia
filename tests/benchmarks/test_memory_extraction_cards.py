@@ -108,13 +108,13 @@ def test_enrichment_parsers_accept_line_formats() -> None:
 
 def test_coverage_members_card_parser_handles_json_labels() -> None:
     parsed, malformed = parse_coverage_members_card_output(
-        'cand_001 | [{"member_key": "dr. mendez", "display_text": "Dr. Mendez; cardiology, clinic A | room 3"}]\n'
+        'cand_001 | [{"member_key": "dr. navarro", "display_text": "Dr. Navarro; cardiology, clinic A | room 3"}]\n'
         "cand_002 | []"
     )
 
     assert malformed == 0
-    assert parsed["cand_001"][0].member_key == "dr. mendez"
-    assert parsed["cand_001"][0].display_text == "Dr. Mendez; cardiology, clinic A | room 3"
+    assert parsed["cand_001"][0].member_key == "dr. navarro"
+    assert parsed["cand_001"][0].display_text == "Dr. Navarro; cardiology, clinic A | room 3"
     assert parsed["cand_002"] == []
 
 

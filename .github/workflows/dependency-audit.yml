@@ -1,0 +1,99 @@
+name: Dependency profiles
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/dependency-audit.yml"
+      - "_blog_engine/**"
+      - "integrations/openclaw/plugin/**"
+      - "integrations/sillytavern/server-plugin/**"
+      - "LICENSE"
+      - "pyproject.toml"
+      - "README.md"
+      - "requirements/**"
+      - "scripts/verify_dependency_profiles.py"
+      - "setup.py"
+      - "src/**"
+      - "tests/packaging/**"
+      - "tools/verify_installed_resources.py"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/dependency-audit.yml"
+      - "_blog_engine/**"
+      - "integrations/openclaw/plugin/**"
+      - "integrations/sillytavern/server-plugin/**"
+      - "LICENSE"
+      - "pyproject.toml"
+      - "README.md"
+      - "requirements/**"
+      - "scripts/verify_dependency_profiles.py"
+      - "setup.py"
+      - "src/**"
+      - "tests/packaging/**"
+      - "tools/verify_installed_resources.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-profiles:
+    name: Python ${{ matrix.python-version }} profiles
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install locked gate tooling
+        shell: bash
+        run: |
+          lock="requirements/locks/dev-py${PYTHON_VERSION/./}.txt"
+          python -m pip install --requirement requirements/locks/bootstrap.txt
+          python -m pip install --constraint "$lock" build pip-audit pip-tools
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+      - name: Reject stale locks
+        run: python scripts/verify_dependency_profiles.py check-locks --python "$(command -v python)"
+      - name: Build, install, smoke, inventory, and audit
+        run: python scripts/verify_dependency_profiles.py verify --python "$(command -v python)" --profile core --profile mcp --profile dev --profile blog
+        env:
+          # The public checkout intentionally excludes the private Journal
+          # engine. Its dependency resolution is still audited here; the same
+          # command performs the full staged build/publication smoke in the
+          # private checkout where the artifact exists.
+          ATAGIA_ALLOW_MISSING_PRIVATE_BLOG_ARTIFACT: "1"
+      - name: Preserve dependency evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dependency-audit-python-${{ matrix.python-version }}
+          path: build/dependency-audit
+          if-no-files-found: ignore
+
+  node-artifacts:
+    name: Node artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22.14.0"
+          package-manager-cache: false
+      - name: Install, test, inventory, and audit
+        run: python scripts/verify_dependency_profiles.py verify --python "$(command -v python)" --profile node
+      - name: Preserve dependency evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dependency-audit-node
+          path: build/dependency-audit
+          if-no-files-found: ignore

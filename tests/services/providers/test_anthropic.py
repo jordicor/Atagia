@@ -23,7 +23,9 @@ from atagia.services.providers.anthropic import AnthropicProvider
 
 
 class FakeAnthropicMessages:
-    def __init__(self, completion_response=None, stream_manager=None, error=None) -> None:
+    def __init__(
+        self, completion_response=None, stream_manager=None, error=None
+    ) -> None:
         self.completion_response = completion_response
         self.stream_manager = stream_manager
         self.error = error
@@ -80,7 +82,13 @@ def _request() -> LLMCompletionRequest:
         max_output_tokens=8192,
         include_thinking=True,
         metadata={"anthropic_prompt_cache": True, "thinking_budget_tokens": -1},
-        tools=[LLMToolSpec(name="lookup", description="Lookup data", input_schema={"type": "object"})],
+        tools=[
+            LLMToolSpec(
+                name="lookup",
+                description="Lookup data",
+                input_schema={"type": "object"},
+            )
+        ],
         response_schema={"type": "object", "properties": {"label": {"type": "string"}}},
     )
 
@@ -241,9 +249,16 @@ async def test_anthropic_complete_maps_blocks_and_request_shape() -> None:
         content=[
             SimpleNamespace(type="thinking", thinking="internal"),
             SimpleNamespace(type="text", text="final answer"),
-            SimpleNamespace(type="tool_use", id="tool_1", name="lookup", input={"q": "x"}),
+            SimpleNamespace(
+                type="tool_use", id="tool_1", name="lookup", input={"q": "x"}
+            ),
         ],
-        usage=SimpleNamespace(model_dump=lambda exclude_none=True: {"input_tokens": 11, "output_tokens": 7}),
+        usage=SimpleNamespace(
+            model_dump=lambda exclude_none=True: {
+                "input_tokens": 11,
+                "output_tokens": 7,
+            }
+        ),
         model_dump=lambda: {"id": "msg_1"},
     )
     messages = FakeAnthropicMessages(completion_response=response)
@@ -253,7 +268,9 @@ async def test_anthropic_complete_maps_blocks_and_request_shape() -> None:
 
     assert completion.output_text == "final answer"
     assert completion.thinking == "internal"
-    assert completion.tool_calls == [{"id": "tool_1", "type": "tool_use", "name": "lookup", "input": {"q": "x"}}]
+    assert completion.tool_calls == [
+        {"id": "tool_1", "type": "tool_use", "name": "lookup", "input": {"q": "x"}}
+    ]
     create_call = messages.create_calls[0]
     assert create_call["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert create_call["thinking"] == {"type": "adaptive"}
@@ -262,7 +279,39 @@ async def test_anthropic_complete_maps_blocks_and_request_shape() -> None:
 
 
 @pytest.mark.asyncio
-async def test_anthropic_complete_falls_back_to_request_model_when_response_model_is_null() -> None:
+async def test_anthropic_external_answer_preserves_limit_stop_and_exact_budget() -> (
+    None
+):
+    response = SimpleNamespace(
+        model="claude-opus-4-6",
+        content=[SimpleNamespace(type="text", text="partial")],
+        stop_reason="max_tokens",
+        usage=SimpleNamespace(
+            model_dump=lambda exclude_none=True: {
+                "input_tokens": 9,
+                "output_tokens": 1,
+            }
+        ),
+        model_dump=lambda: {"id": "msg_external_limit"},
+    )
+    messages = FakeAnthropicMessages(completion_response=response)
+    provider = AnthropicProvider(api_key="test", client=FakeAnthropicClient(messages))
+    request = _request().model_copy(
+        update={"max_output_tokens": 1, "external_answer": True}
+    )
+
+    completion = await provider.complete(request)
+
+    assert completion.output_text == "partial"
+    assert completion.finish_reason == "length"
+    assert completion.usage == {"input_tokens": 9, "output_tokens": 1}
+    assert messages.create_calls[0]["max_tokens"] == 1
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_falls_back_to_request_model_when_response_model_is_null() -> (
+    None
+):
     response = SimpleNamespace(
         model=None,
         content=[SimpleNamespace(type="text", text="final answer")],
@@ -446,7 +495,9 @@ async def test_anthropic_complete_raises_transient_on_empty_end_turn() -> None:
 @pytest.mark.asyncio
 async def test_anthropic_stream_maps_text_thinking_and_tool_calls() -> None:
     final_message = SimpleNamespace(
-        usage=SimpleNamespace(model_dump=lambda exclude_none=True: {"input_tokens": 3, "output_tokens": 5})
+        usage=SimpleNamespace(
+            model_dump=lambda exclude_none=True: {"input_tokens": 3, "output_tokens": 5}
+        )
     )
     stream_manager = FakeStreamManager(
         events=[
@@ -454,7 +505,9 @@ async def test_anthropic_stream_maps_text_thinking_and_tool_calls() -> None:
             SimpleNamespace(type="text", text="answer"),
             SimpleNamespace(
                 type="content_block_stop",
-                content_block=SimpleNamespace(type="tool_use", id="tool_1", name="lookup", input={"q": "x"}),
+                content_block=SimpleNamespace(
+                    type="tool_use", id="tool_1", name="lookup", input={"q": "x"}
+                ),
             ),
         ],
         final_message=final_message,
@@ -478,7 +531,9 @@ async def test_anthropic_stream_maps_text_thinking_and_tool_calls() -> None:
 async def test_anthropic_stream_buffers_sdk_tool_use_events() -> None:
     final_message = SimpleNamespace(
         stop_reason="tool_use",
-        usage=SimpleNamespace(model_dump=lambda exclude_none=True: {"input_tokens": 3, "output_tokens": 5}),
+        usage=SimpleNamespace(
+            model_dump=lambda exclude_none=True: {"input_tokens": 3, "output_tokens": 5}
+        ),
     )
     stream_manager = FakeStreamManager(
         events=[
@@ -546,6 +601,39 @@ async def test_anthropic_stream_emits_done_then_raises_on_max_tokens() -> None:
 
 
 @pytest.mark.asyncio
+async def test_anthropic_external_stream_emits_real_usage_and_length_without_error() -> (
+    None
+):
+    final_message = SimpleNamespace(
+        stop_reason="max_tokens",
+        usage=SimpleNamespace(
+            model_dump=lambda exclude_none=True: {
+                "input_tokens": 3,
+                "output_tokens": 1,
+            }
+        ),
+    )
+    stream_manager = FakeStreamManager(
+        events=[SimpleNamespace(type="text", text="partial")],
+        final_message=final_message,
+    )
+    messages = FakeAnthropicMessages(stream_manager=stream_manager)
+    provider = AnthropicProvider(api_key="test", client=FakeAnthropicClient(messages))
+    request = _request().model_copy(
+        update={"max_output_tokens": 1, "external_answer": True}
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == ["text", "done"]
+    assert events[-1].payload == {
+        "usage": {"input_tokens": 3, "output_tokens": 1},
+        "finish_reason": "length",
+    }
+    assert messages.stream_calls[0]["max_tokens"] == 1
+
+
+@pytest.mark.asyncio
 async def test_anthropic_sanitizes_schema_and_filters_non_numeric_usage() -> None:
     request = _request().model_copy(
         update={
@@ -577,7 +665,7 @@ async def test_anthropic_sanitizes_schema_and_filters_non_numeric_usage() -> Non
                                 "type": "number",
                                 "exclusiveMinimum": 0,
                                 "exclusiveMaximum": 1,
-                            }
+                            },
                         },
                     },
                 },
@@ -632,10 +720,22 @@ async def test_anthropic_sanitizes_schema_and_filters_non_numeric_usage() -> Non
     assert completion_schema["properties"]["note"] == {"type": "string"}
     assert "minimum" not in completion_schema["properties"]["score"]
     assert "maximum" not in completion_schema["properties"]["score"]
-    assert "minItems" not in completion_schema["properties"]["nested"]["properties"]["tags"]
-    assert "maxItems" not in completion_schema["properties"]["nested"]["properties"]["tags"]
-    assert "exclusiveMinimum" not in completion_schema["properties"]["nested"]["properties"]["ratio"]
-    assert "exclusiveMaximum" not in completion_schema["properties"]["nested"]["properties"]["ratio"]
+    assert (
+        "minItems"
+        not in completion_schema["properties"]["nested"]["properties"]["tags"]
+    )
+    assert (
+        "maxItems"
+        not in completion_schema["properties"]["nested"]["properties"]["tags"]
+    )
+    assert (
+        "exclusiveMinimum"
+        not in completion_schema["properties"]["nested"]["properties"]["ratio"]
+    )
+    assert (
+        "exclusiveMaximum"
+        not in completion_schema["properties"]["nested"]["properties"]["ratio"]
+    )
     assert stream_schema == completion_schema
 
 
@@ -687,7 +787,9 @@ async def test_anthropic_maps_retryable_and_permanent_errors() -> None:
     )
     permanent_error = anthropic.BadRequestError(
         "bad request",
-        response=httpx.Response(400, request=httpx.Request("POST", "https://example.com")),
+        response=httpx.Response(
+            400, request=httpx.Request("POST", "https://example.com")
+        ),
         body={},
     )
 
@@ -713,7 +815,9 @@ async def test_anthropic_maps_non_transient_4xx_status_error_to_request_error() 
     request = _request()
     not_found_error = anthropic.APIStatusError(
         "not found",
-        response=httpx.Response(404, request=httpx.Request("POST", "https://example.com")),
+        response=httpx.Response(
+            404, request=httpx.Request("POST", "https://example.com")
+        ),
         body={},
     )
     provider = AnthropicProvider(

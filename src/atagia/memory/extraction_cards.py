@@ -77,6 +77,13 @@ _CARD_SYSTEM_PROMPTS: dict[CardName, str] = {
     "coverage_members": _COVERAGE_MEMBERS_CARD_SYSTEM_PROMPT,
 }
 
+
+def card_system_prompt(card_name: CardName) -> str:
+    """Return the canonical production system prompt for an extraction card."""
+
+    return _CARD_SYSTEM_PROMPTS[card_name]
+
+
 # Display labels reaching the answer prompt verbatim are bounded to the same
 # length/whitespace-collapse the composer applies to coverage display text.
 _COVERAGE_DISPLAY_TEXT_MAX_CHARS = 160
@@ -211,7 +218,7 @@ async def _run_card(
             messages=[
                 LLMMessage(
                     role="system",
-                    content=_CARD_SYSTEM_PROMPTS[card_name],
+                    content=card_system_prompt(card_name),
                 ),
                 LLMMessage(role="user", content=prompt),
             ],
@@ -256,6 +263,7 @@ def build_candidate_prompt(
         "Do not translate candidate text. Keep it in the source language unless the source itself mixes languages.",
         "For non-English source messages, write the candidate in that same language.",
         "Only use facts, preferences, instructions, states, and events that the message actually supports.",
+        "Record only what the source message and the recent messages state. Do not complete or enrich a candidate from world knowledge: do not add a name, author, brand, species, place, quantity, or attribute that the source does not mention. If a detail is unknown, leave that detail out or keep it generic; do not drop the subject's name.",
         "Use the recent messages to understand short answers. If a nearby question asks what to call, use, prefer, or choose, a short answer can be durable.",
         "Use the earlier-chunk notes only to avoid duplicate candidates from earlier chunks; every candidate must still be supported by this source message.",
         "Split independent facts into separate lines.",
@@ -266,10 +274,14 @@ def build_candidate_prompt(
         "Do not treat quoted or pasted third-party text as the user's own view.",
         "If quoted or pasted third-party text is contrasted with the user's own explicit view, store only the user's view.",
         "If the message says someone addressed, called, mislabeled, nicknamed, or confused a person with a name, keep it as that event or alias; do not rewrite it as the person's true name unless the source says that.",
-        "Respect the source role. If role is assistant, do not rewrite the assistant's words as the user's own facts.",
-        "When role=\"assistant\", keep useful assistant suggestions, decisions, plans, results, or warnings as chat memories.",
-        "When role=\"assistant\", exact findings such as totals, IDs, root causes, and decisions are useful chat memories.",
-        "For assistant memories, write the candidate as 'The assistant ...', not 'The user ...'.",
+        "Do not rewrite one speaker's words as another speaker's own facts.",
+        "Give every candidate an explicit subject: name who or what it is about. Never output a bare fragment or a quote with no subject; if you cannot tell who or what it is about, output none for that content.",
+        'Attribute each candidate to the speaker the source names. When the source message names its speaker (for example a leading "Name:" prefix, a transcript, or a named person), write that name as the subject.',
+        'Write "The user ..." only when a user-role message does not name its speaker; write "The assistant ..." only for content the assistant itself authored when the source names no human speaker.',
+        'When role="assistant" but the message names a human speaker, attribute the memory to that named human, not to the assistant. Reserve "the assistant" for the AI\'s own contributions.',
+        "Keep useful suggestions, decisions, plans, results, or warnings from an assistant-role turn as chat memories; exact findings such as totals, IDs, root causes, and decisions are useful chat memories.",
+        "If a candidate keeps a quote, keep who said it inside the candidate text.",
+        'Resolve what a pronoun or a phrase like "it", "this", "that", or "the <thing>" refers to, using this message and the recent messages, and write the resolved subject or object into the candidate text. If you cannot tell what it refers to, do not output that candidate.',
         "If the source explicitly says placeholder, test, demo, or example, treat the value as a normal exact value, not as a secret to avoid.",
         "Keep codes, names, emails, addresses, quantities, dates, and exact phrases exactly as written.",
         "When a sensitive or exact value has a scope, purpose, or disclosure condition, keep that condition attached to the candidate text.",
@@ -282,8 +294,14 @@ def build_candidate_prompt(
         "I am in Paris this week. -> cand_001 | The user is in Paris this week.",
         "Prefiero comida picante. -> cand_001 | El usuario prefiere comida picante.",
         "Question: What should I call your project? Message: Use Quillstone. -> cand_001 | The user's project name is Quillstone.",
+        "PERSON_A: I moved to Lisbon in March. -> cand_001 | PERSON_A moved to Lisbon in March.",
+        "PERSON_A: I just finished the novel Tidewater Reckoning — I forget the author's name. -> cand_001 | PERSON_A finished the novel Tidewater Reckoning.",
+        "role=assistant PERSON_B: I work as a marine biologist. -> cand_001 | PERSON_B works as a marine biologist.",
         "role=assistant: I recommended checking logs. -> cand_001 | The assistant recommended checking logs.",
         "role=assistant: I found that the invoice total is $3,675 after tax. -> cand_001 | The assistant found that the invoice total is $3,675 after tax.",
+        "role=assistant PERSON_B: I found the outage was caused by an expired certificate. -> cand_001 | PERSON_B found the outage was caused by an expired certificate.",
+        'PERSON_A: My mentor keeps telling me, "Ship early, iterate often." -> cand_001 | PERSON_A\'s mentor keeps telling PERSON_A, "Ship early, iterate often."',
+        "Question: How was the bookbinding workshop? Message: Loved it, I'm hooked. -> cand_001 | The user loved the bookbinding workshop.",
         "My backup code is GR7Q-58. -> cand_001 | The user's backup code is GR7Q-58.",
     ]
     tail = [
@@ -425,12 +443,12 @@ def build_enrichment_prompt(
             "member_key is the normalized identity of the member: lowercase, no surrounding punctuation, collapse whitespace. Two surface forms of the same member must share one member_key.",
             "display_text is a short human-readable label for the member, kept in the candidate's language.",
             "Output one line per candidate, with a JSON array of members to the right of a single | separator.",
-            "Format: cand_001 | [{\"member_key\": \"<member_key>\", \"display_text\": \"<label>\"}]",
+            'Format: cand_001 | [{"member_key": "<member_key>", "display_text": "<label>"}]',
         ]
         examples = [
             EXAMPLES_HEADER,
-            "PERSON_A sees Dr. <name_1> and Dr. <name_2> -> cand_001 | [{\"member_key\": \"dr. <name_1>\", \"display_text\": \"Dr. <name_1>\"}, {\"member_key\": \"dr. <name_2>\", \"display_text\": \"Dr. <name_2>\"}]",
-            "PERSON_A has lived in CITY_X and CITY_Y -> cand_002 | [{\"member_key\": \"city_x\", \"display_text\": \"CITY_X\"}, {\"member_key\": \"city_y\", \"display_text\": \"CITY_Y\"}]",
+            'PERSON_A sees Dr. <name_1> and Dr. <name_2> -> cand_001 | [{"member_key": "dr. <name_1>", "display_text": "Dr. <name_1>"}, {"member_key": "dr. <name_2>", "display_text": "Dr. <name_2>"}]',
+            'PERSON_A has lived in CITY_X and CITY_Y -> cand_002 | [{"member_key": "city_x", "display_text": "CITY_X"}, {"member_key": "city_y", "display_text": "CITY_Y"}]',
             "PERSON_A asked PERSON_B about Dr. <name_3> -> cand_003 | []",
             "PERSON_A prefers short replies -> cand_004 | []",
         ]
@@ -479,7 +497,9 @@ def parse_candidate_card_output(text: str) -> tuple[tuple[CandidateDraft, ...], 
     for line in lines:
         if "|" in line:
             raw_id, raw_text = line.split("|", 1)
-            candidate_id = _clean_candidate_id(raw_id) or f"cand_{len(candidates) + 1:03d}"
+            candidate_id = (
+                _clean_candidate_id(raw_id) or f"cand_{len(candidates) + 1:03d}"
+            )
             canonical_text = _clean_text_value(raw_text)
         else:
             candidate_id = f"cand_{len(candidates) + 1:03d}"
@@ -514,7 +534,11 @@ def parse_kind_scope_card_output(text: str) -> tuple[dict[str, dict[str, Any]], 
         kind = _clean_atom(tokens[1])
         scope = _clean_atom(tokens[2])
         confidence = _float_or_none(tokens[3] if len(tokens) >= 4 else None)
-        if candidate_id is None or kind not in _VALID_KINDS or scope not in _VALID_SCOPES:
+        if (
+            candidate_id is None
+            or kind not in _VALID_KINDS
+            or scope not in _VALID_SCOPES
+        ):
             malformed += 1
             continue
         parsed[candidate_id] = {
@@ -576,7 +600,9 @@ def parse_index_card_output(text: str) -> tuple[dict[str, str | None], int]:
     return parsed, malformed
 
 
-def parse_temporal_card_output(text: str) -> tuple[dict[str, dict[str, str | None]], int]:
+def parse_temporal_card_output(
+    text: str,
+) -> tuple[dict[str, dict[str, str | None]], int]:
     lines = _card_lines(text)
     if _lines_are_none(lines):
         return {}, 0
@@ -729,7 +755,9 @@ def assemble_card_result(
         if kind == "belief" and (claim_key is None or claim_value is None):
             repairs.append(f"{candidate_id}: belief_without_claim_fields_downgraded")
             kind = "evidence"
-        language_codes = tuple(evidence_row.get("language_codes") or candidate.language_codes)
+        language_codes = tuple(
+            evidence_row.get("language_codes") or candidate.language_codes
+        )
         if not language_codes:
             repairs.append(f"{candidate_id}: missing_language_defaulted_en")
             language_codes = ("en",)
@@ -754,18 +782,25 @@ def assemble_card_result(
                     language_codes=list(language_codes),
                     index_text=index.get(candidate_id) or candidate.index_text,
                     preserve_verbatim=bool(
-                        evidence_row.get("preserve_verbatim", candidate.preserve_verbatim)
+                        evidence_row.get(
+                            "preserve_verbatim", candidate.preserve_verbatim
+                        )
                     ),
-                    source_span=evidence_row.get("source_span") or candidate.source_span,
+                    source_span=evidence_row.get("source_span")
+                    or candidate.source_span,
                     temporal_status=temporal_status,
-                    support_kind=str(evidence_row.get("support_kind") or candidate.support_kind),
+                    support_kind=str(
+                        evidence_row.get("support_kind") or candidate.support_kind
+                    ),
                     claim_key=claim_key,
                     claim_value=claim_value,
                     coverage_members=member_list,
                 )
             )
         except Exception as exc:  # noqa: BLE001
-            repairs.append(f"{candidate_id}: dropped_after_validation:{exc.__class__.__name__}")
+            repairs.append(
+                f"{candidate_id}: dropped_after_validation:{exc.__class__.__name__}"
+            )
     return LeanExtractionResult(
         nothing_durable=not lean_candidates,
         candidates=lean_candidates,
@@ -796,7 +831,7 @@ def _source_context_block(
     )
     return "\n".join(
         [
-            f"<source_message role=\"{html.escape(role)}\">",
+            f'<source_message role="{html.escape(role)}">',
             timestamp_block,
             "<message_text>",
             html.escape(message_text),
@@ -835,7 +870,9 @@ def _temporal_status_from_row(
             valid_to_iso=row.get("valid_to_iso"),
         )
     except Exception as exc:  # noqa: BLE001
-        repairs.append(f"{candidate_id}: temporal_status_dropped:{exc.__class__.__name__}")
+        repairs.append(
+            f"{candidate_id}: temporal_status_dropped:{exc.__class__.__name__}"
+        )
         return None
 
 
@@ -872,7 +909,9 @@ def _card_lines(text: str) -> list[str]:
 
 
 def _lines_are_none(lines: list[str]) -> bool:
-    return not lines or all(_clean_atom(line) in {"none", "no", "nothing"} for line in lines)
+    return not lines or all(
+        _clean_atom(line) in {"none", "no", "nothing"} for line in lines
+    )
 
 
 def _line_tokens(line: str) -> list[str]:
@@ -938,7 +977,10 @@ def _language_codes_from_token(value: Any) -> tuple[str, ...]:
     raw = str(value or "")
     pieces = [
         piece.strip()
-        for piece in raw.replace("/", ",").replace("+", ",").replace(";", ",").split(",")
+        for piece in raw.replace("/", ",")
+        .replace("+", ",")
+        .replace(";", ",")
+        .split(",")
         if piece.strip()
     ]
     codes: list[str] = []

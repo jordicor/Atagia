@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
     "relative_path",
     [
         "integrations/sillytavern/extension/test.mjs",
+        "integrations/sillytavern/server-plugin/test.cjs",
         "integrations/openclaw/plugin/test.mjs",
     ],
 )

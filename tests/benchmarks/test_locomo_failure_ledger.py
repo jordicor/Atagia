@@ -131,7 +131,7 @@ def test_failure_ledger_filters_report_conversations_and_excludes_text(tmp_path:
     assert ledger["source_result_summary"]["total_questions"] == 2
     assert ledger["source_result_summary"]["total_correct"] == 1
     assert ledger["ledger_summary"]["item_count"] == 1
-    assert ledger["ledger_summary"]["failed_by_category_name"] == {"single-hop": 1}
+    assert ledger["ledger_summary"]["failed_by_category_name"] == {"multi-hop": 1}
     item = ledger["items"][0]
     assert item["conversation_id"] == "conv-a"
     assert item["question_id"] == "conv-a:q1"
@@ -220,7 +220,7 @@ def _result(
             "question_text": "RAW QUESTION TEXT",
             "ground_truth": "RAW GROUND TRUTH",
             "category": 1,
-            "evidence_turn_ids": ["D1:1"],
+            "evidence_turn_ids": ["D97:9701"],
         },
         "prediction": prediction,
         "score_result": {
@@ -248,7 +248,7 @@ def _trace(
         "benchmark_privacy_enforcement": "off",
         "benchmark_answer_privacy_override": True,
         "benchmark_high_risk_secret_redaction_disabled": True,
-        "evidence_turn_ids": ["D1:1"],
+        "evidence_turn_ids": ["D97:9701"],
         "missing_evidence_turn_ids": [],
         "evidence_memory_count": 1,
         "active_evidence_count": 1,

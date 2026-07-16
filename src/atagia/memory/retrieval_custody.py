@@ -1,7 +1,9 @@
 """Safe per-candidate retrieval custody records.
 
-Composer-stage rejections use generic composer reasons; ``missing_source_span``
-was retired with C2.2 instead of adding composer-to-custody plumbing.
+Composer-stage rejections carry the composer's own eviction label when it
+supplies one (``budget_exhausted`` token wall / ``item_cap_reached`` /
+``class_cap_reached`` / ``diversity_demoted``); otherwise they fall back to the
+generic heuristic. Older traces without composer labels read exactly as before.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from atagia.memory.context_composer import COMPOSER_EVICTION_REASONS
 from atagia.memory.embodiment_policy import candidate_allows_embodiment_boundary
 from atagia.memory.mind_policy import candidate_allows_mind_boundary
 from atagia.memory.realm_policy import candidate_allows_realm_boundary
@@ -33,9 +36,30 @@ def build_candidate_custody(
     selected_memory_ids: list[str],
     retrieval_plan: RetrievalPlan,
     filter_reasons_by_id: dict[str, str] | None = None,
+    deduped_into: dict[str, str] | None = None,
+    composer_eviction_by_id: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build text-free custody records for retrieval candidates."""
+    """Build text-free custody records for retrieval candidates.
+
+    ``deduped_into`` maps a collapsed duplicate-carrier id to its surviving
+    representative id after fusion dedupe. A collapsed candidate that was
+    later recovered into the shortlist (obligation regrounding) keeps its
+    normal labels; only carriers the dedupe actually removed from the scoring
+    pool read ``deduped_duplicate_carrier``.
+
+    ``composer_eviction_by_id`` maps a scored-but-unselected candidate
+    to the composer's precise eviction cause. It overrides only the generic
+    ``budget_exhausted`` terminal branch, so ``lower_score`` and every earlier
+    reason are unchanged and traces produced without it read identically.
+    """
     filter_reasons = filter_reasons_by_id or {}
+    deduped_map = deduped_into or {}
+    composer_eviction = composer_eviction_by_id or {}
+    collapsed_ids_by_representative: dict[str, list[str]] = {}
+    for collapsed_id, representative_id in deduped_map.items():
+        collapsed_ids_by_representative.setdefault(representative_id, []).append(
+            collapsed_id
+        )
     candidate_rows = _ordered_candidate_rows(
         raw_candidates=raw_candidates,
         shortlist=shortlist,
@@ -85,12 +109,20 @@ def build_candidate_custody(
         shortlisted = candidate_id in shortlist_ranks
         scored = scored_by_id.get(candidate_id)
         selected = candidate_id in selection_ranks
+        deduped_representative_id = deduped_map.get(candidate_id)
+        deduped = (
+            deduped_representative_id is not None
+            and not shortlisted
+            and scored is None
+            and not selected
+        )
         source_backed, summary_only = candidate_stage_flags[candidate_id]
         shortlist_status = _shortlist_status(
             candidate_id,
             shortlisted=shortlisted,
             filter_reason=filter_reason,
             filtered_ids=filtered_ids,
+            deduped=deduped,
         )
         score_status = _score_status(
             shortlisted=shortlisted,
@@ -111,6 +143,7 @@ def build_candidate_custody(
             shortlist_status=shortlist_status,
             score_status=score_status,
             composer_decision=composer_decision,
+            deduped=deduped,
         )
         eviction_reason = _eviction_reason(
             candidate=candidate,
@@ -123,6 +156,8 @@ def build_candidate_custody(
             selected_summary_only_count=selected_summary_only_count,
             selected_source_backed_count=selected_source_backed_count,
             selected_min_score=selected_min_score,
+            deduped=deduped,
+            composer_reason=composer_eviction.get(candidate_id),
         )
         high_value_rejected = _is_high_value_rejected(
             selected=selected,
@@ -193,6 +228,11 @@ def build_candidate_custody(
         surface_class = _fact_facet_surface_class(candidate)
         if surface_class is not None:
             record["surface_class"] = surface_class
+        if deduped:
+            record["deduped_into"] = deduped_representative_id
+        collapsed_ids = collapsed_ids_by_representative.get(candidate_id)
+        if collapsed_ids:
+            record["deduped_carrier_ids"] = sorted(collapsed_ids)
         custody.append(record)
     return custody
 
@@ -350,11 +390,15 @@ def _eviction_reason(
     selected_summary_only_count: int,
     selected_source_backed_count: int,
     selected_min_score: float | None,
+    deduped: bool = False,
+    composer_reason: str | None = None,
 ) -> str | None:
     if selected:
         return None
     if filter_reason is not None:
         return "policy_filtered"
+    if deduped:
+        return "deduped_duplicate_carrier"
     if str(candidate.get("status") or "") in _STALE_STATUSES:
         return "stale_or_superseded"
     if score_status == "llm_score_missing":
@@ -373,6 +417,15 @@ def _eviction_reason(
             and float(scored.final_score) < selected_min_score
         ):
             return "lower_score"
+        # The composer's precise cause replaces the conflated
+        # `budget_exhausted` label (token wall / item cap / class cap / diversity
+        # demotion) when it supplied one for this scored-but-unselected candidate.
+        if composer_reason is not None:
+            if composer_reason not in COMPOSER_EVICTION_REASONS:
+                raise ValueError(
+                    f"Unexpected composer eviction reason: {composer_reason!r}"
+                )
+            return composer_reason
         if selected_min_score is not None:
             return "budget_exhausted"
         return "composer_strategy"
@@ -753,11 +806,14 @@ def _shortlist_status(
     shortlisted: bool,
     filter_reason: str | None,
     filtered_ids: set[str],
+    deduped: bool = False,
 ) -> str:
     if shortlisted:
         return "shortlisted"
     if filter_reason is not None or candidate_id not in filtered_ids:
         return "filtered_before_shortlist"
+    if deduped:
+        return "deduped_duplicate_carrier"
     return "not_shortlisted"
 
 
@@ -795,6 +851,7 @@ def _drop_stage_and_reason(
     shortlist_status: str,
     score_status: str,
     composer_decision: str,
+    deduped: bool = False,
 ) -> tuple[str | None, str | None]:
     if selected:
         return None, None
@@ -802,6 +859,8 @@ def _drop_stage_and_reason(
         return "post_scope_coordinate_lifecycle", filter_reason
     if candidate_id not in filtered_ids:
         return "post_scope_coordinate_lifecycle", shortlist_status
+    if deduped:
+        return "fusion_dedupe", "deduped_duplicate_carrier"
     if not shortlisted:
         return "shortlist", shortlist_status
     if not scored:

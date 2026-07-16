@@ -50,7 +50,7 @@ VariantName = Literal[
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CASES_PATH = _PROJECT_ROOT / "benchmarks" / "applicability_cards" / "cases.jsonl"
-_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
+_MANIFESTS_DIR = _PROJECT_ROOT / "src" / "atagia" / "resources" / "manifests"
 _DIRECT_GEMINI_FLASH_LITE_MODEL = "google/gemini-3.1-flash-lite"
 _MINIMAX_M3_MODEL = "minimax/MiniMax-M3"
 _DEFAULT_VARIANTS: tuple[VariantName, ...] = ("cards_batch_4",)

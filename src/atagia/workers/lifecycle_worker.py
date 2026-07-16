@@ -34,7 +34,6 @@ class LifecycleWorker:
         settings: Settings,
         embedding_index: EmbeddingIndex,
         storage_backend: StorageBackend,
-        artifact_blob_store: Any | None = None,
         llm_client: Any | None = None,
     ) -> None:
         self._database_path = database_path
@@ -42,7 +41,6 @@ class LifecycleWorker:
         self._settings = settings
         self._embedding_index = embedding_index
         self._storage_backend = storage_backend
-        self._artifact_blob_store = artifact_blob_store
         self._llm_client = llm_client
 
     async def run(self) -> None:
@@ -58,7 +56,6 @@ class LifecycleWorker:
                         settings=self._settings,
                         embedding_index=self._embedding_index,
                         storage_backend=self._storage_backend,
-                        artifact_blob_store=self._artifact_blob_store,
                         llm_client=self._llm_client,
                     )
             except asyncio.CancelledError:

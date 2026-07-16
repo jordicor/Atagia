@@ -66,8 +66,8 @@ from atagia.services.llm_client import (
 )
 from atagia.services.retrieval_pipeline import RetrievalPipeline
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 _MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
@@ -879,8 +879,8 @@ async def test_pipeline_promotes_summary_source_window_for_privacy_off_benchmark
 ) -> None:
     from atagia.core.repositories import MessageRepository
 
-    message_text = "What does Jon plan to do at the grand opening?"
-    source_window_id = "ssw_sum_grand_opening_277_283"
+    message_text = "When does the kinetic clock exhibit open?"
+    source_window_id = "ssw_sum_clock_opening_277_283"
     provider = PipelineProvider(
         need_response={
             "needs": [],
@@ -889,14 +889,14 @@ async def test_pipeline_promotes_summary_source_window_for_privacy_off_benchmark
             "sparse_query_hints": [
                 {
                     "sub_query_text": message_text,
-                    "fts_phrase": "grand opening plan",
+                    "fts_phrase": "kinetic clock opening",
                 }
             ],
             "query_type": "slot_fill",
             "retrieval_levels": [0, 1],
         },
         score_map={
-            "sum_grand_opening": 0.72,
+            "sum_clock_opening": 0.72,
             source_window_id: 0.96,
         },
     )
@@ -916,15 +916,15 @@ async def test_pipeline_promotes_summary_source_window_for_privacy_off_benchmark
         clock = FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc))
         messages = MessageRepository(connection, clock)
         for seq, role, text in [
-            (275, "assistant", "Jon: I need to sort out permits first."),
-            (276, "user", "Gina: The lease papers finally cleared."),
-            (277, "assistant", "Jon: Still working on opening a dance studio."),
-            (278, "user", "Gina: When are you opening the studio?"),
-            (279, "assistant", "Jon: The official opening night is tomorrow."),
-            (280, "user", "Gina: Congrats, Jon! The studio looks amazing."),
-            (281, "assistant", "Jon: Thanks, Gina! I'm excited!"),
-            (282, "user", "Gina: Take some time to savor it."),
-            (283, "assistant", "Jon: I want to savor all the good vibes."),
+            (275, "assistant", "The archive inventory is complete."),
+            (276, "user", "Please keep the inventory note."),
+            (277, "assistant", "Curator: Which exhibit date belongs on the calendar?"),
+            (278, "user", "Rin Vale: The kinetic clock exhibit opens on October 12."),
+            (279, "assistant", "Curator: I will note the public opening date."),
+            (280, "user", "Rin Vale: The preview tour starts at 09:30."),
+            (281, "assistant", "Curator: Recorded the preview tour time."),
+            (282, "user", "Rin Vale: The brass pendulum arrives two days earlier."),
+            (283, "assistant", "Curator: I will keep the delivery date with the notes."),
         ]:
             await messages.create_message(
                 message_id=f"msg_{seq}",
@@ -932,13 +932,16 @@ async def test_pipeline_promotes_summary_source_window_for_privacy_off_benchmark
                 role=role,
                 seq=seq,
                 text=text,
-                occurred_at="2023-06-19T10:04:00+00:00",
+                occurred_at="2026-03-08T10:00:00+00:00",
             )
 
         candidates = [
             _candidate_record(
-                memory_id="sum_grand_opening",
-                canonical_text="Jon and Gina discussed the dance studio grand opening.",
+                memory_id="sum_clock_opening",
+                canonical_text=(
+                    "Museum planning summary: the kinetic clock exhibit opens "
+                    "on October 12."
+                ),
                 object_type=MemoryObjectType.SUMMARY_VIEW,
                 rrf_score=1.0,
                 payload_json={
@@ -990,7 +993,7 @@ async def test_pipeline_promotes_summary_source_window_for_privacy_off_benchmark
             source_window.memory_object["payload_json"]["source_kind_variant"]
             == "summary_source_window"
         )
-        assert "savor all the good vibes" in source_window.memory_object["canonical_text"]
+        assert "kinetic clock exhibit" in source_window.memory_object["canonical_text"]
         assert source_window_id in result.composed_context.selected_memory_ids
     finally:
         await connection.close()
@@ -1847,7 +1850,7 @@ async def test_pipeline_forwards_answer_coverage_shape_to_composer_and_trace(
 async def test_pipeline_hydrates_evidence_packets_only_when_ablation_enabled() -> None:
     from atagia.core.repositories import MessageRepository
 
-    provider = PipelineProvider(score_map={"mem_gina": 0.95})
+    provider = PipelineProvider(score_map={"mem_prism": 0.95})
     (
         connection,
         memories,
@@ -1868,8 +1871,8 @@ async def test_pipeline_hydrates_evidence_packets_only_when_ablation_enabled() -
             conversation_id="cnv_1",
             role="user",
             seq=None,
-            text="Gina: Contemporary dance really speaks to me.",
-            occurred_at="2023-01-20T16:04:00+00:00",
+            text="I stored the prism in locker NOVA-417 after calibration.",
+            occurred_at="2026-02-11T09:15:00+00:00",
         )
         await memories.create_memory_object(
             user_id="usr_1",
@@ -1878,16 +1881,16 @@ async def test_pipeline_hydrates_evidence_packets_only_when_ablation_enabled() -
             assistant_mode_id="general_qa",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.CONVERSATION,
-            canonical_text="Gina's favorite dance style is contemporary.",
+            canonical_text="The prism is stored in locker NOVA-417.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
             payload={"source_message_ids": ["msg_source"]},
-            memory_id="mem_gina",
+            memory_id="mem_prism",
         )
         await MemoryEvidenceRepository(connection, clock).create_support_edge_with_spans(
             user_id="usr_1",
-            memory_id="mem_gina",
+            memory_id="mem_prism",
             support_kind="contextual_direct",
             evidence_polarity="supports",
             speaker_relation_to_subject="self_report",
@@ -1896,24 +1899,24 @@ async def test_pipeline_hydrates_evidence_packets_only_when_ablation_enabled() -
                 {
                     "span_role": "source",
                     "message_id": "msg_source",
-                    "quote_text": "Contemporary dance really speaks to me.",
+                    "quote_text": "I stored the prism in locker NOVA-417.",
                 }
             ],
         )
 
         default_packets = await pipeline.execute(
-            message_text="What is Gina's favorite style of dance?",
+            message_text="Which locker code did I use for the prism?",
             conversation_context=context.model_copy(
                 update={"assistant_mode_id": "general_qa"}
             ),
             resolved_policy=resolved_policy,
             cold_start=False,
             conversation_messages=[
-                {"role": "user", "text": "What is Gina's favorite style of dance?"}
+                {"role": "user", "text": "Which locker code did I use for the prism?"}
             ],
         )
         without_packets = await pipeline.execute(
-            message_text="What is Gina's favorite style of dance?",
+            message_text="Which locker code did I use for the prism?",
             conversation_context=context.model_copy(
                 update={"assistant_mode_id": "general_qa"}
             ),
@@ -1921,13 +1924,13 @@ async def test_pipeline_hydrates_evidence_packets_only_when_ablation_enabled() -
             cold_start=False,
             ablation=AblationConfig(enable_evidence_packets=False),
             conversation_messages=[
-                {"role": "user", "text": "What is Gina's favorite style of dance?"}
+                {"role": "user", "text": "Which locker code did I use for the prism?"}
             ],
         )
 
         assert "evidence_packet:" not in without_packets.composed_context.memory_block
-        assert "evidence_packet: support: contextual_direct" in default_packets.composed_context.memory_block
-        assert "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 1: Contemporary dance really speaks to me." in default_packets.composed_context.memory_block
+        assert "NOVA-417" in default_packets.composed_context.memory_block
+        assert "source_quote: user @ 2026-02-11T09:15:00+00:00 seq 1: I stored the prism in locker NOVA-417." in default_packets.composed_context.memory_block
     finally:
         await connection.close()
 
@@ -1973,7 +1976,7 @@ async def test_pipeline_applies_structural_context_envelope_budget_by_default(
             ],
         )
 
-        assert observed_budgets == [2_744]
+        assert observed_budgets == [5_489]
     finally:
         await connection.close()
 
@@ -3336,11 +3339,11 @@ async def test_pipeline_backfills_source_quote_for_selected_memory_source_messag
         need_response={
             "needs": [],
             "temporal_range": None,
-            "sub_queries": ["Jon banker job"],
+            "sub_queries": ["Nia observatory badge"],
             "sparse_query_hints": [
                 {
-                    "sub_query_text": "Jon banker job",
-                    "fts_phrase": "Jon banker job",
+                    "sub_query_text": "Nia observatory badge",
+                    "fts_phrase": "Nia observatory badge",
                 }
             ],
             "query_type": "temporal",
@@ -3348,7 +3351,7 @@ async def test_pipeline_backfills_source_quote_for_selected_memory_source_messag
             "exact_recall_needed": True,
             "exact_facets": ["date"],
         },
-        score_map={"mem_job_loss": 0.95},
+        score_map={"mem_badge_expiry": 0.95},
     )
     (
         connection,
@@ -3372,8 +3375,11 @@ async def test_pipeline_backfills_source_quote_for_selected_memory_source_messag
             conversation_id="cnv_1",
             role="user",
             seq=None,
-            text="Jon: Lost my job as a banker yesterday, so I'm gonna take a shot at starting my own business.",
-            occurred_at="2023-01-20T16:04:00+00:00",
+            text=(
+                "Nia: My observatory access badge expired yesterday, so I requested "
+                "a replacement at the west desk."
+            ),
+            occurred_at="2024-02-12T08:40:00+00:00",
         )
         await memories.create_memory_object(
             user_id="usr_1",
@@ -3382,33 +3388,39 @@ async def test_pipeline_backfills_source_quote_for_selected_memory_source_messag
             assistant_mode_id="general_qa",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.CONVERSATION,
-            canonical_text="Jon is no longer in a secure banker job and is starting a business.",
+            canonical_text=(
+                "Nia's observatory access badge expired and she requested a replacement."
+            ),
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
             payload={
                 "source_message_ids": ["msg_source"],
-                "source_message_window_start_occurred_at": "2023-01-20T16:04:00+00:00",
-                "source_message_window_end_occurred_at": "2023-01-20T16:04:00+00:00",
+                "source_message_window_start_occurred_at": "2024-02-12T08:40:00+00:00",
+                "source_message_window_end_occurred_at": "2024-02-12T08:40:00+00:00",
             },
-            memory_id="mem_job_loss",
+            memory_id="mem_badge_expiry",
         )
 
         result = await pipeline.execute(
-            message_text="When did Jon lose his job as a banker?",
+            message_text="When did Nia's observatory access badge expire?",
             conversation_context=context.model_copy(
                 update={"assistant_mode_id": "general_qa"}
             ),
             resolved_policy=resolved_policy,
             cold_start=False,
             conversation_messages=[
-                {"role": "user", "text": "When did Jon lose his job as a banker?"},
+                {
+                    "role": "user",
+                    "text": "When did Nia's observatory access badge expire?",
+                },
             ],
         )
 
-        assert "mem_job_loss" in result.composed_context.selected_memory_ids
+        assert "mem_badge_expiry" in result.composed_context.selected_memory_ids
         assert (
-            "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 1: Jon: Lost my job as a banker yesterday"
+            "source_quote: user @ 2024-02-12T08:40:00+00:00 seq 1: "
+            "Nia: My observatory access badge expired yesterday"
             in result.composed_context.memory_block
         )
     finally:
@@ -4338,8 +4350,8 @@ def test_under_specified_recovery_expands_context_items_with_low_cap() -> None:
         item_count=32,
     )
 
-    assert policy.retrieval_params.final_context_items == 8
-    assert expanded.retrieval_params.final_context_items == 12
+    assert policy.retrieval_params.final_context_items == 12
+    assert expanded.retrieval_params.final_context_items == 16
 
 
 def test_default_queries_do_not_expand_context_items_without_recovery_need() -> None:
@@ -4362,7 +4374,7 @@ def test_default_queries_do_not_expand_context_items_without_recovery_need() -> 
         item_count=32,
     )
 
-    assert expanded.retrieval_params.final_context_items == 8
+    assert expanded.retrieval_params.final_context_items == 12
 
 
 def _exhaustive_plan() -> RetrievalPlan:
@@ -4469,7 +4481,7 @@ def test_exhaustive_mode_expands_final_context_items_to_member_count() -> None:
     policy = PolicyResolver().resolve(manifest, None, None)
     plan = _exhaustive_plan()
     scored = [
-        _member_scored_candidate(f"mem_{i}", f"member{i}") for i in range(12)
+        _member_scored_candidate(f"mem_{i}", f"member{i}") for i in range(16)
     ]
 
     expanded = RetrievalPipeline._expand_exhaustive_coverage_budget(
@@ -4478,8 +4490,8 @@ def test_exhaustive_mode_expands_final_context_items_to_member_count() -> None:
         scored,
     )
 
-    assert policy.retrieval_params.final_context_items == 8
-    assert expanded.retrieval_params.final_context_items == 12
+    assert policy.retrieval_params.final_context_items == 12
+    assert expanded.retrieval_params.final_context_items == 16
 
 
 def test_exhaustive_mode_expands_final_context_items_for_reserved_windows() -> None:
@@ -4561,11 +4573,11 @@ def test_exhaustive_budget_expansion_bounded_by_candidate_count() -> None:
     manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
     policy = PolicyResolver().resolve(manifest, None, None)
     plan = _exhaustive_plan()
-    # 10 candidates, each carrying many distinct members -> distinct member count
-    # (70) far exceeds both the default final_context_items (8) and the candidate
-    # count (10). The expansion is bounded by the candidate count, since members
+    # 14 candidates, each carrying many distinct members -> distinct member count
+    # (98) far exceeds both the default final_context_items (12) and the candidate
+    # count (14). The expansion is bounded by the candidate count, since members
     # beyond the available candidates cannot be admitted anyway.
-    assert policy.retrieval_params.final_context_items == 8
+    assert policy.retrieval_params.final_context_items == 12
     scored = [
         ScoredCandidate(
             memory_id=f"mem_{i}",
@@ -4588,7 +4600,7 @@ def test_exhaustive_budget_expansion_bounded_by_candidate_count() -> None:
             penalty=0.0,
             final_score=0.9,
         )
-        for i in range(10)
+        for i in range(14)
     ]
 
     expanded = RetrievalPipeline._expand_exhaustive_coverage_budget(
@@ -4597,7 +4609,7 @@ def test_exhaustive_budget_expansion_bounded_by_candidate_count() -> None:
         scored,
     )
 
-    assert expanded.retrieval_params.final_context_items == 10
+    assert expanded.retrieval_params.final_context_items == 14
 
 
 def test_non_exhaustive_mode_does_not_expand_budgets() -> None:
@@ -4755,12 +4767,12 @@ async def test_pipeline_exact_recall_comes_from_parallel_cards_without_legacy_re
         need_response={
             "needs": [],
             "temporal_range": None,
-            "sub_queries": ["What country is Caroline's grandma from?"],
+            "sub_queries": ["Which country did the mentor of Dr Imani grow up in?"],
             "sparse_query_hints": [
                 {
-                    "sub_query_text": "What country is Caroline's grandma from?",
-                    "fts_phrase": "What country is Caroline's grandma from?",
-                    "must_keep_terms": ["Caroline", "grandma", "country"],
+                    "sub_query_text": "Which country did the mentor of Dr Imani grow up in?",
+                    "fts_phrase": "Which country did the mentor of Dr Imani grow up in?",
+                    "must_keep_terms": ["Imani","mentor","country"],
                 }
             ],
             "query_type": "slot_fill",
@@ -4768,7 +4780,7 @@ async def test_pipeline_exact_recall_comes_from_parallel_cards_without_legacy_re
             "exact_facets": ["location", "person_name"],
             "exact_recall_needed": True,
         },
-        score_map={"mem_country": 0.9},
+        score_map={"mem_mentor_country": 0.9},
     )
     (
         connection,
@@ -4782,24 +4794,24 @@ async def test_pipeline_exact_recall_comes_from_parallel_cards_without_legacy_re
     try:
         await _seed_memory(
             memories,
-            memory_id="mem_country",
-            canonical_text="Caroline's grandma is from Norway.",
+            memory_id="mem_mentor_country",
+            canonical_text="The mentor of Dr Imani grew up in Lydora.",
             scope=MemoryScope.CONVERSATION,
         )
         trace = RetrievalTrace(
-            query_text="What country is Caroline's grandma from?",
+            query_text="Which country did the mentor of Dr Imani grow up in?",
             user_id="usr_1",
             conversation_id="cnv_1",
             timestamp_iso="2026-04-09T12:00:00Z",
         )
 
         result = await pipeline.execute(
-            message_text="What country is Caroline's grandma from?",
+            message_text="Which country did the mentor of Dr Imani grow up in?",
             conversation_context=context,
             resolved_policy=resolved_policy,
             cold_start=False,
             conversation_messages=[
-                {"role": "user", "text": "What country is Caroline's grandma from?"},
+                {"role": "user", "text": "Which country did the mentor of Dr Imani grow up in?"},
             ],
             trace=trace,
         )
@@ -5030,13 +5042,17 @@ async def test_summary_support_regrounding_fetches_missing_support_by_id() -> No
         await _seed_memory(
             memories,
             memory_id="mem_support_a",
-            canonical_text="Payment reconciliation worker leaked connections on timeout exceptions.",
+            canonical_text=(
+                "Telemetry batching worker left file descriptors open after retry exhaustion."
+            ),
             scope=MemoryScope.CONVERSATION,
         )
         await _seed_memory(
             memories,
             memory_id="mem_support_b",
-            canonical_text="Fix was wrapping the connection logic in try/finally blocks.",
+            canonical_text=(
+                "The repair moved descriptor cleanup into an unconditional finally clause."
+            ),
             scope=MemoryScope.CONVERSATION,
         )
         summary = _candidate_record(
@@ -5269,7 +5285,7 @@ async def test_summary_support_regrounding_caps_total_promotions() -> None:
 async def test_pipeline_summary_support_regrounding_reaches_composer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    message_text = "What was the root cause of the connection pool exhaustion?"
+    message_text = "What caused the synthetic connection-pool incident?"
     provider = PipelineProvider(
         need_response={
             "needs": [],
@@ -5308,14 +5324,14 @@ async def test_pipeline_summary_support_regrounding_reaches_composer(
             memories,
             memory_id="mem_support_a",
             canonical_text=(
-                "The payment reconciliation worker was leaking connections on timeout exceptions."
+                "The invoice worker leaked pool slots whenever cancellation interrupted a task."
             ),
             scope=MemoryScope.CONVERSATION,
         )
         await _seed_memory(
             memories,
             memory_id="mem_support_b",
-            canonical_text="The fix was adding proper try/finally blocks around the connection handling.",
+            canonical_text="The fix wrapped slot checkout in an async context manager.",
             scope=MemoryScope.CONVERSATION,
         )
 
@@ -5323,7 +5339,7 @@ async def test_pipeline_summary_support_regrounding_reaches_composer(
         candidates = [
             _candidate_record(
                 memory_id="sum_episode",
-                canonical_text="Abstract summary of the connection-pool incident.",
+                canonical_text="Abstract summary of the synthetic pool incident.",
                 object_type=MemoryObjectType.SUMMARY_VIEW,
                 rrf_score=1.0,
                 payload_json={
@@ -5370,5 +5386,396 @@ async def test_pipeline_summary_support_regrounding_reaches_composer(
         assert "sum_episode" in result.composed_context.selected_memory_ids
         assert "mem_support_a" in result.composed_context.selected_memory_ids
         assert "mem_support_b" in _score_request_memory_ids(provider)
+    finally:
+        await connection.close()
+
+
+async def _seed_carrier(
+    memories: MemoryObjectRepository,
+    *,
+    memory_id: str,
+    canonical_text: str,
+    source_message_ids: list[str],
+    coverage_members: list[dict[str, str]] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {"source_message_ids": list(source_message_ids)}
+    if coverage_members is not None:
+        payload["coverage_members"] = coverage_members
+    return await memories.create_memory_object(
+        user_id="usr_1",
+        workspace_id="wrk_1",
+        conversation_id="cnv_1",
+        assistant_mode_id="coding_debug",
+        object_type=MemoryObjectType.EVIDENCE,
+        scope=MemoryScope.CONVERSATION,
+        canonical_text=canonical_text,
+        source_kind=MemorySourceKind.EXTRACTED,
+        confidence=0.8,
+        privacy_level=0,
+        payload=payload,
+        memory_id=memory_id,
+        platform_id="default",
+        scope_canonical=MemoryScope.CHAT.value,
+    )
+
+
+def _crowding_pool() -> list[dict[str, object]]:
+    """Fused-ordered pool: five duplicate carriers of one fact ranked above
+    two distinct facts (the RC1 crowding shape)."""
+    pool: list[dict[str, object]] = []
+    for index in range(1, 6):
+        pool.append(
+            _candidate_record(
+                memory_id=f"mem_dup_{index}",
+                canonical_text="The user runs a pottery workshop downtown.",
+                rrf_score=0.9 - (index - 1) * 0.01,
+                payload_json={"source_message_ids": ["msg_dup_span"]},
+            )
+        )
+    pool.append(
+        _candidate_record(
+            memory_id="mem_other_1",
+            canonical_text="The user teaches evening ceramics classes.",
+            rrf_score=0.5,
+            payload_json={"source_message_ids": ["msg_other_1"]},
+        )
+    )
+    pool.append(
+        _candidate_record(
+            memory_id="mem_other_2",
+            canonical_text="The user rents a kiln space monthly.",
+            rrf_score=0.4,
+            payload_json={"source_message_ids": ["msg_other_2"]},
+        )
+    )
+    return pool
+
+
+_CROWDING_DUPLICATE_IDS = {f"mem_dup_{index}" for index in range(1, 6)}
+_CROWDING_DISTINCT_IDS = ["mem_other_1", "mem_other_2"]
+_CROWDING_QUERY = "pottery workshop downtown ceramics classes kiln space"
+_CROWDING_SCORE_MAP = {
+    **{f"mem_dup_{index}": 0.9 for index in range(1, 6)},
+    "mem_other_1": 0.8,
+    "mem_other_2": 0.8,
+}
+
+
+@pytest.mark.asyncio
+async def test_fusion_dedupe_frees_shortlist_slots_for_distinct_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CS-2.3 crowding shape: duplicate carriers collapse to ONE slot and the
+    previously crowded-out distinct facts get scored and admitted."""
+    provider = PipelineProvider(score_map=dict(_CROWDING_SCORE_MAP))
+    connection, _memories, _contracts, pipeline, _p, resolved_policy, context = (
+        await _build_runtime(provider=provider)
+    )
+    try:
+        pool = _crowding_pool()
+
+        async def fake_search(
+            _plan: RetrievalPlan,
+            _user_id: str,
+            **_kwargs: object,
+        ) -> list[dict[str, object]]:
+            return [dict(candidate) for candidate in pool]
+
+        monkeypatch.setattr(pipeline._candidate_search, "search", fake_search)
+        trace = RetrievalTrace(
+            query_text=_CROWDING_QUERY,
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-05T12:00:00Z",
+        )
+        result = await pipeline.execute(
+            message_text=_CROWDING_QUERY,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": _CROWDING_QUERY}],
+            ablation=AblationConfig(
+                skip_need_detection=True,
+                override_retrieval_params={"rerank_top_k": 3},
+            ),
+            trace=trace,
+        )
+
+        scored_ids = [candidate.memory_id for candidate in result.scored_candidates]
+        assert len(scored_ids) == 3
+        scored_duplicates = [
+            memory_id for memory_id in scored_ids
+            if memory_id in _CROWDING_DUPLICATE_IDS
+        ]
+        assert scored_duplicates == ["mem_dup_1"]
+        assert set(_CROWDING_DISTINCT_IDS) <= set(scored_ids)
+
+        selected_ids = set(result.composed_context.selected_memory_ids)
+        assert selected_ids & _CROWDING_DUPLICATE_IDS == {"mem_dup_1"}
+        assert set(_CROWDING_DISTINCT_IDS) <= selected_ids
+
+        custody_by_id = {
+            record["candidate_id"]: record for record in result.candidate_custody
+        }
+        collapsed_ids = _CROWDING_DUPLICATE_IDS - {"mem_dup_1"}
+        for collapsed_id in collapsed_ids:
+            record = custody_by_id[collapsed_id]
+            assert record["drop_stage"] == "fusion_dedupe"
+            assert record["drop_reason"] == "deduped_duplicate_carrier"
+            assert record["eviction_reason"] == "deduped_duplicate_carrier"
+            assert record["shortlist_status"] == "deduped_duplicate_carrier"
+            assert record["deduped_into"] == "mem_dup_1"
+        representative_record = custody_by_id["mem_dup_1"]
+        assert representative_record["deduped_carrier_ids"] == sorted(collapsed_ids)
+        assert representative_record["selected"] is True
+        assert trace.custody.drop_counts_by_stage["fusion_dedupe"] == 4
+        assert trace.custody.drop_counts_by_reason["deduped_duplicate_carrier"] == 4
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fusion_dedupe_skip_ablation_reproduces_crowding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the dedupe ablated off, duplicate carriers crowd out distinct facts."""
+    provider = PipelineProvider(score_map=dict(_CROWDING_SCORE_MAP))
+    connection, _memories, _contracts, pipeline, _p, resolved_policy, context = (
+        await _build_runtime(provider=provider)
+    )
+    try:
+        pool = _crowding_pool()
+
+        async def fake_search(
+            _plan: RetrievalPlan,
+            _user_id: str,
+            **_kwargs: object,
+        ) -> list[dict[str, object]]:
+            return [dict(candidate) for candidate in pool]
+
+        monkeypatch.setattr(pipeline._candidate_search, "search", fake_search)
+        result = await pipeline.execute(
+            message_text=_CROWDING_QUERY,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": _CROWDING_QUERY}],
+            ablation=AblationConfig(
+                skip_need_detection=True,
+                skip_fusion_dedupe=True,
+                override_retrieval_params={"rerank_top_k": 3},
+            ),
+        )
+
+        scored_ids = [candidate.memory_id for candidate in result.scored_candidates]
+        assert scored_ids == ["mem_dup_1", "mem_dup_2", "mem_dup_3"]
+        assert not set(_CROWDING_DISTINCT_IDS) & set(
+            result.composed_context.selected_memory_ids
+        )
+        assert all(
+            record.get("drop_stage") != "fusion_dedupe"
+            for record in result.candidate_custody
+        )
+        assert all(
+            "deduped_into" not in record for record in result.candidate_custody
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fusion_dedupe_never_merges_differing_provenance() -> None:
+    """Identical text on disjoint spans and distinct facts on a shared span
+    both survive: provenance differs, so the collapse must not guess."""
+    provider = PipelineProvider(
+        score_map={
+            "mem_rep_a": 0.9,
+            "mem_rep_b": 0.9,
+            "mem_fact_1": 0.8,
+            "mem_fact_2": 0.8,
+        },
+    )
+    connection, memories, _contracts, pipeline, _p, resolved_policy, context = (
+        await _build_runtime(provider=provider)
+    )
+    try:
+        await _seed_carrier(
+            memories,
+            memory_id="mem_rep_a",
+            canonical_text="The user visited the harbor market.",
+            source_message_ids=["msg_a"],
+        )
+        await _seed_carrier(
+            memories,
+            memory_id="mem_rep_b",
+            canonical_text="The user visited the harbor market.",
+            source_message_ids=["msg_b"],
+        )
+        await _seed_carrier(
+            memories,
+            memory_id="mem_fact_1",
+            canonical_text="The user lost a set of keys.",
+            source_message_ids=["msg_c"],
+        )
+        await _seed_carrier(
+            memories,
+            memory_id="mem_fact_2",
+            canonical_text="The user found a new apartment.",
+            source_message_ids=["msg_c"],
+        )
+        result = await pipeline.execute(
+            message_text="harbor market keys apartment visited lost found",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {
+                    "role": "user",
+                    "text": "harbor market keys apartment visited lost found",
+                }
+            ],
+            ablation=AblationConfig(skip_need_detection=True),
+        )
+
+        scored_ids = {candidate.memory_id for candidate in result.scored_candidates}
+        assert scored_ids == {"mem_rep_a", "mem_rep_b", "mem_fact_1", "mem_fact_2"}
+        assert all(
+            record.get("drop_stage") != "fusion_dedupe"
+            for record in result.candidate_custody
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fusion_dedupe_collapses_equal_member_sets_across_sessions() -> None:
+    """Under exhaustive known-set coverage (broad_list), carriers sharing the
+    engine-minted member key collapse across sessions; a carrier enumerating a
+    different member set survives (B3)."""
+    query = "pottery workshop archery fencing practices owns opening"
+    provider = PipelineProvider(
+        need_response={
+            "needs": [],
+            "temporal_range": None,
+            "sub_queries": [query],
+            "sparse_query_hints": [
+                {"sub_query_text": query, "fts_phrase": query}
+            ],
+            "query_type": "broad_list",
+            "retrieval_levels": [0],
+        },
+        score_map={
+            "mem_m1": 0.9,
+            "mem_m2": 0.9,
+            "mem_m3": 0.8,
+            "mem_m4": 0.8,
+        },
+    )
+    connection, memories, _contracts, pipeline, _p, resolved_policy, context = (
+        await _build_runtime(provider=provider)
+    )
+    try:
+        await _seed_carrier(
+            memories,
+            memory_id="mem_m1",
+            canonical_text="The user is opening a pottery workshop.",
+            source_message_ids=["msg_1"],
+            coverage_members=[
+                {"member_key": "pottery workshop", "display_text": "pottery workshop"}
+            ],
+        )
+        await _seed_carrier(
+            memories,
+            memory_id="mem_m2",
+            canonical_text="The user owns a pottery workshop.",
+            source_message_ids=["msg_2"],
+            coverage_members=[
+                {"member_key": "pottery workshop", "display_text": "pottery workshop"}
+            ],
+        )
+        await _seed_carrier(
+            memories,
+            memory_id="mem_m3",
+            canonical_text="The user practices archery and fencing.",
+            source_message_ids=["msg_3"],
+            coverage_members=[
+                {"member_key": "archery", "display_text": "archery"},
+                {"member_key": "fencing", "display_text": "fencing"},
+            ],
+        )
+        await _seed_carrier(
+            memories,
+            memory_id="mem_m4",
+            canonical_text="The user practices archery weekly.",
+            source_message_ids=["msg_4"],
+            coverage_members=[{"member_key": "archery", "display_text": "archery"}],
+        )
+        result = await pipeline.execute(
+            message_text=query,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": query}],
+        )
+        assert result.retrieval_plan.coverage_mode == "exhaustive_known_set"
+
+        scored_ids = {candidate.memory_id for candidate in result.scored_candidates}
+        assert len(scored_ids & {"mem_m1", "mem_m2"}) == 1
+        assert {"mem_m3", "mem_m4"} <= scored_ids
+        dedupe_records = [
+            record
+            for record in result.candidate_custody
+            if record.get("drop_stage") == "fusion_dedupe"
+        ]
+        assert len(dedupe_records) == 1
+        assert dedupe_records[0]["candidate_id"] in {"mem_m1", "mem_m2"}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fusion_dedupe_member_join_inactive_outside_exhaustive_coverage() -> (
+    None
+):
+    """On a non-exhaustive plan, same-member carriers stay separate: they can
+    carry distinct secondary facts (dates, events) around one member value."""
+    provider = PipelineProvider(
+        score_map={"mem_m1": 0.9, "mem_m2": 0.9},
+    )
+    connection, memories, _contracts, pipeline, _p, resolved_policy, context = (
+        await _build_runtime(provider=provider)
+    )
+    try:
+        await _seed_carrier(
+            memories,
+            memory_id="mem_m1",
+            canonical_text="The user has a pet named Ivo.",
+            source_message_ids=["msg_1"],
+            coverage_members=[{"member_key": "ivo", "display_text": "Ivo"}],
+        )
+        await _seed_carrier(
+            memories,
+            memory_id="mem_m2",
+            canonical_text="The user adopted Ivo last spring.",
+            source_message_ids=["msg_2"],
+            coverage_members=[{"member_key": "ivo", "display_text": "Ivo"}],
+        )
+        query = "pet named Ivo adopted spring"
+        result = await pipeline.execute(
+            message_text=query,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": query}],
+            ablation=AblationConfig(skip_need_detection=True),
+        )
+
+        assert result.retrieval_plan.coverage_mode != "exhaustive_known_set"
+        scored_ids = {candidate.memory_id for candidate in result.scored_candidates}
+        assert {"mem_m1", "mem_m2"} <= scored_ids
+        assert all(
+            record.get("drop_stage") != "fusion_dedupe"
+            for record in result.candidate_custody
+        )
     finally:
         await connection.close()

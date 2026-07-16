@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from atagia.core.conversation_namespace import (
+    ConversationNamespaceSnapshot,
+    capture_conversation_namespace_snapshot,
+)
 from atagia.core.repositories import ConversationRepository, MemoryObjectRepository
 from atagia.core.space_repository import SpaceRepository, space_snapshot
+from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
 from atagia.core.verbatim_pin_repository import VerbatimPinRepository
 from atagia.memory.intimacy_boundary_policy import (
     constrained_scope_for_intimacy_boundary,
@@ -23,6 +28,7 @@ from atagia.models.schemas_memory import (
     VerbatimPinStatus,
     VerbatimPinTargetKind,
 )
+from atagia.services.errors import ConversationNotFoundError
 
 if TYPE_CHECKING:
     from atagia.app import AppRuntime
@@ -64,6 +70,95 @@ class VerbatimPinService:
         self.runtime = runtime
 
     async def create_verbatim_pin(
+        self,
+        connection: Any,
+        *,
+        user_id: str,
+        scope: MemoryScope,
+        target_kind: VerbatimPinTargetKind,
+        target_id: str,
+        workspace_id: str | None = None,
+        conversation_id: str | None = None,
+        assistant_mode_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool | None = None,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: MindTopology | str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
+        canonical_text: str | None = None,
+        index_text: str | None = None,
+        target_span_start: int | None = None,
+        target_span_end: int | None = None,
+        privacy_level: int = 0,
+        intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY,
+        intimacy_boundary_confidence: float = 0.0,
+        reason: str | None = None,
+        created_by: str | None = None,
+        expires_at: str | None = None,
+        payload_json: dict[str, Any] | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
+    ) -> dict[str, Any]:
+        """Resolve and create a pin inside the selected-transcript write fence."""
+
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+            await self._require_namespace_guard(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                namespace_guard=namespace_guard,
+            )
+            created = await self._create_verbatim_pin_locked(
+                connection,
+                user_id=user_id,
+                scope=scope,
+                target_kind=target_kind,
+                target_id=target_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                assistant_mode_id=assistant_mode_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
+                canonical_text=canonical_text,
+                index_text=index_text,
+                target_span_start=target_span_start,
+                target_span_end=target_span_end,
+                privacy_level=privacy_level,
+                intimacy_boundary=intimacy_boundary,
+                intimacy_boundary_confidence=intimacy_boundary_confidence,
+                reason=reason,
+                created_by=created_by,
+                expires_at=expires_at,
+                payload_json=payload_json,
+            )
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
+        return created
+
+    async def _create_verbatim_pin_locked(
         self,
         connection: Any,
         *,
@@ -167,11 +262,13 @@ class VerbatimPinService:
         )
         if is_blocked_intimacy_boundary(resolved_intimacy_boundary):
             raise ValueError("safety_blocked verbatim pins cannot be created")
-        resolved_intimacy_boundary_confidence = self._resolve_intimacy_boundary_confidence(
-            explicit_confidence=intimacy_boundary_confidence,
-            resolved_boundary=resolved_intimacy_boundary,
-            payload_json=namespace_payload,
-            source_row=source_row,
+        resolved_intimacy_boundary_confidence = (
+            self._resolve_intimacy_boundary_confidence(
+                explicit_confidence=intimacy_boundary_confidence,
+                resolved_boundary=resolved_intimacy_boundary,
+                payload_json=namespace_payload,
+                source_row=source_row,
+            )
         )
         scope = constrained_scope_for_intimacy_boundary(
             resolved_intimacy_boundary,
@@ -229,7 +326,9 @@ class VerbatimPinService:
         elif source_text is not None:
             resolved_canonical_text = source_text
         else:
-            raise ValueError("canonical_text is required when the pin target cannot be resolved")
+            raise ValueError(
+                "canonical_text is required when the pin target cannot be resolved"
+            )
         if resolved_canonical_text is None:
             raise ValueError("canonical_text must be non-empty")
 
@@ -237,9 +336,13 @@ class VerbatimPinService:
             if source_text is None:
                 raise ValueError("target spans require a resolvable source text")
             span_start = target_span_start or 0
-            span_end = target_span_end if target_span_end is not None else len(source_text)
+            span_end = (
+                target_span_end if target_span_end is not None else len(source_text)
+            )
             if span_end < span_start:
-                raise ValueError("target_span_end must be greater than or equal to target_span_start")
+                raise ValueError(
+                    "target_span_end must be greater than or equal to target_span_start"
+                )
             if span_start < 0 or span_end < 0:
                 raise ValueError("target span offsets must be non-negative")
             if span_end > len(source_text):
@@ -254,7 +357,9 @@ class VerbatimPinService:
         resolved_payload.setdefault("source_target_kind", target_kind.value)
         resolved_payload.setdefault("source_target_id", resolved_target_id)
         resolved_payload["intimacy_boundary"] = resolved_intimacy_boundary.value
-        resolved_payload["intimacy_boundary_confidence"] = resolved_intimacy_boundary_confidence
+        resolved_payload["intimacy_boundary_confidence"] = (
+            resolved_intimacy_boundary_confidence
+        )
         if is_restricted_intimacy_boundary(resolved_intimacy_boundary):
             resolved_payload.setdefault(
                 "intimacy_boundary_policy",
@@ -263,7 +368,9 @@ class VerbatimPinService:
         if source_row is not None:
             resolved_payload.setdefault(
                 "source_snapshot",
-                self._source_snapshot_metadata(source_row, target_kind, resolved_target_id),
+                self._source_snapshot_metadata(
+                    source_row, target_kind, resolved_target_id
+                ),
             )
         if source_space["space_id"] is not None:
             space_payload = {
@@ -301,56 +408,49 @@ class VerbatimPinService:
                 resolved_index_text = resolved_canonical_text
 
         repository = VerbatimPinRepository(connection, self.runtime.clock)
-        await connection.execute("BEGIN")
-        try:
-            created = await repository.create_verbatim_pin(
-                user_id=user_id,
-                scope=scope,
-                target_kind=target_kind,
-                target_id=resolved_target_id,
-                workspace_id=scope_anchors["workspace_id"],
-                conversation_id=scope_anchors["conversation_id"],
-                assistant_mode_id=scope_anchors["assistant_mode_id"],
-                canonical_text=resolved_canonical_text,
-                index_text=resolved_index_text,
-                privacy_level=privacy_level,
-                intimacy_boundary=resolved_intimacy_boundary,
-                intimacy_boundary_confidence=resolved_intimacy_boundary_confidence,
-                created_by=resolved_created_by,
-                reason=reason,
-                target_span_start=span_start,
-                target_span_end=span_end,
-                expires_at=expires_at,
-                payload_json=resolved_payload,
-                user_persona_id=source_namespace["user_persona_id"],
-                platform_id=source_namespace["platform_id"],
-                character_id=source_namespace["character_id"],
-                sensitivity=source_namespace["sensitivity"],
-                themes=source_namespace["themes"],
-                platform_locked=bool(source_namespace["platform_locked"]),
-                platform_id_lock=source_namespace["platform_id_lock"],
-                scope_canonical=source_namespace["scope_canonical"],
-                incognito_snapshot=bool(source_namespace["incognito_snapshot"]),
-                remember_across_chats_snapshot=bool(
-                    source_namespace["remember_across_chats_snapshot"]
-                ),
-                remember_across_devices_snapshot=bool(
-                    source_namespace["remember_across_devices_snapshot"]
-                ),
-                policy_snapshot=source_namespace["policy_snapshot"],
-                space_id=source_space["space_id"],
-                space_boundary_mode=source_space["space_boundary_mode"],
-                memory_owner_id=source_mind["memory_owner_id"],
-                source_mind_id=source_mind["source_mind_id"],
-                embodiment_id=source_embodiment["embodiment_id"],
-                realm_id=source_realm["realm_id"],
-                commit=False,
-            )
-            await connection.commit()
-        except Exception:
-            await connection.rollback()
-            raise
-        return created
+        return await repository.create_verbatim_pin(
+            user_id=user_id,
+            scope=scope,
+            target_kind=target_kind,
+            target_id=resolved_target_id,
+            workspace_id=scope_anchors["workspace_id"],
+            conversation_id=scope_anchors["conversation_id"],
+            assistant_mode_id=scope_anchors["assistant_mode_id"],
+            canonical_text=resolved_canonical_text,
+            index_text=resolved_index_text,
+            privacy_level=privacy_level,
+            intimacy_boundary=resolved_intimacy_boundary,
+            intimacy_boundary_confidence=resolved_intimacy_boundary_confidence,
+            created_by=resolved_created_by,
+            reason=reason,
+            target_span_start=span_start,
+            target_span_end=span_end,
+            expires_at=expires_at,
+            payload_json=resolved_payload,
+            user_persona_id=source_namespace["user_persona_id"],
+            platform_id=source_namespace["platform_id"],
+            character_id=source_namespace["character_id"],
+            sensitivity=source_namespace["sensitivity"],
+            themes=source_namespace["themes"],
+            platform_locked=bool(source_namespace["platform_locked"]),
+            platform_id_lock=source_namespace["platform_id_lock"],
+            scope_canonical=source_namespace["scope_canonical"],
+            incognito_snapshot=bool(source_namespace["incognito_snapshot"]),
+            remember_across_chats_snapshot=bool(
+                source_namespace["remember_across_chats_snapshot"]
+            ),
+            remember_across_devices_snapshot=bool(
+                source_namespace["remember_across_devices_snapshot"]
+            ),
+            policy_snapshot=source_namespace["policy_snapshot"],
+            space_id=source_space["space_id"],
+            space_boundary_mode=source_space["space_boundary_mode"],
+            memory_owner_id=source_mind["memory_owner_id"],
+            source_mind_id=source_mind["source_mind_id"],
+            embodiment_id=source_embodiment["embodiment_id"],
+            realm_id=source_realm["realm_id"],
+            commit=False,
+        )
 
     async def get_verbatim_pin(
         self,
@@ -372,7 +472,9 @@ class VerbatimPinService:
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
     ) -> dict[str, Any] | None:
-        return await VerbatimPinRepository(connection, self.runtime.clock).get_verbatim_pin(
+        return await VerbatimPinRepository(
+            connection, self.runtime.clock
+        ).get_verbatim_pin(
             pin_id,
             user_id,
             conversation_id=conversation_id,
@@ -418,7 +520,9 @@ class VerbatimPinService:
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        return await VerbatimPinRepository(connection, self.runtime.clock).list_verbatim_pins(
+        return await VerbatimPinRepository(
+            connection, self.runtime.clock
+        ).list_verbatim_pins(
             user_id,
             limit=limit,
             offset=offset,
@@ -474,10 +578,21 @@ class VerbatimPinService:
         mind_topology: MindTopology | str | None = None,
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
     ) -> dict[str, Any] | None:
         repository = VerbatimPinRepository(connection, self.runtime.clock)
-        await connection.execute("BEGIN")
+        await connection.execute("BEGIN IMMEDIATE")
         try:
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+            await self._require_namespace_guard(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                namespace_guard=namespace_guard,
+            )
             updated = await repository.update_verbatim_pin(
                 pin_id,
                 user_id,
@@ -532,10 +647,21 @@ class VerbatimPinService:
         mind_topology: MindTopology | str | None = None,
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
     ) -> dict[str, Any] | None:
         repository = VerbatimPinRepository(connection, self.runtime.clock)
-        await connection.execute("BEGIN")
+        await connection.execute("BEGIN IMMEDIATE")
         try:
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+            await self._require_namespace_guard(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                namespace_guard=namespace_guard,
+            )
             deleted = await repository.delete_verbatim_pin(
                 pin_id,
                 user_id,
@@ -559,6 +685,30 @@ class VerbatimPinService:
             await connection.rollback()
             raise
         return deleted
+
+    async def _require_namespace_guard(
+        self,
+        connection: Any,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        namespace_guard: ConversationNamespaceSnapshot | None,
+    ) -> None:
+        if namespace_guard is None:
+            return
+        if (
+            namespace_guard.user_id != user_id
+            or namespace_guard.conversation_id != conversation_id
+        ):
+            raise ConversationNotFoundError("Conversation namespace changed")
+        current = await capture_conversation_namespace_snapshot(
+            connection,
+            self.runtime.clock,
+            user_id=user_id,
+            conversation_id=namespace_guard.conversation_id,
+        )
+        if current != namespace_guard:
+            raise ConversationNotFoundError("Conversation namespace changed")
 
     async def search_active_verbatim_pins(
         self,
@@ -587,7 +737,9 @@ class VerbatimPinService:
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        return await VerbatimPinRepository(connection, self.runtime.clock).search_active_verbatim_pins(
+        return await VerbatimPinRepository(
+            connection, self.runtime.clock
+        ).search_active_verbatim_pins(
             user_id=user_id,
             query=query,
             privacy_ceiling=privacy_ceiling,
@@ -640,11 +792,15 @@ class VerbatimPinService:
             return float(explicit_confidence)
         if (
             source_row is not None
-            and normalize_intimacy_boundary(source_row.get("intimacy_boundary")) is resolved_boundary
+            and normalize_intimacy_boundary(source_row.get("intimacy_boundary"))
+            is resolved_boundary
         ):
             return float(source_row.get("intimacy_boundary_confidence", 0.0) or 0.0)
         payload = payload_json or {}
-        if normalize_intimacy_boundary(payload.get("intimacy_boundary")) is resolved_boundary:
+        if (
+            normalize_intimacy_boundary(payload.get("intimacy_boundary"))
+            is resolved_boundary
+        ):
             return float(payload.get("intimacy_boundary_confidence", 0.0) or 0.0)
         return 0.0
 
@@ -777,7 +933,9 @@ class VerbatimPinService:
                     "c.character_id IS ?",
                 ]
             )
-            parameters.extend([conversation_id, platform_id, user_persona_id, character_id])
+            parameters.extend(
+                [conversation_id, platform_id, user_persona_id, character_id]
+            )
             if incognito is not None:
                 clauses.append("c.incognito = ?")
                 parameters.append(1 if incognito else 0)
@@ -793,8 +951,10 @@ class VerbatimPinService:
         )
         clauses.append(mind_clause)
         parameters.extend(mind_parameters)
-        embodiment_clause, embodiment_parameters = self._message_embodiment_visibility_clause(
-            active_embodiment_id=active_embodiment_id,
+        embodiment_clause, embodiment_parameters = (
+            self._message_embodiment_visibility_clause(
+                active_embodiment_id=active_embodiment_id,
+            )
         )
         clauses.append(embodiment_clause)
         parameters.extend(embodiment_parameters)
@@ -861,7 +1021,9 @@ class VerbatimPinService:
             or active_embodiment_id is not None
             or active_realm_id is not None
         ):
-            raw_policy = payload.get("source_turn_policy") or payload.get("policy_snapshot_json")
+            raw_policy = payload.get("source_turn_policy") or payload.get(
+                "policy_snapshot_json"
+            )
             policy = dict(raw_policy) if isinstance(raw_policy, dict) else {}
             if incognito is not None:
                 policy["incognito"] = bool(incognito)
@@ -893,14 +1055,20 @@ class VerbatimPinService:
         assistant_mode_id: str | None,
     ) -> dict[str, str | None]:
         payload = payload_json or {}
-        resolved_workspace_id = _normalize_text(workspace_id or payload.get("workspace_id"))
-        resolved_conversation_id = _normalize_text(conversation_id or payload.get("conversation_id"))
+        resolved_workspace_id = _normalize_text(
+            workspace_id or payload.get("workspace_id")
+        )
+        resolved_conversation_id = _normalize_text(
+            conversation_id or payload.get("conversation_id")
+        )
         resolved_assistant_mode_id = _normalize_text(
             assistant_mode_id or payload.get("assistant_mode_id")
         )
 
         if source_row is not None:
-            resolved_workspace_id = _normalize_text(source_row.get("workspace_id")) or resolved_workspace_id
+            resolved_workspace_id = (
+                _normalize_text(source_row.get("workspace_id")) or resolved_workspace_id
+            )
             resolved_conversation_id = (
                 _normalize_text(source_row.get("conversation_id"))
                 or resolved_conversation_id
@@ -919,7 +1087,8 @@ class VerbatimPinService:
             ).get_conversation(resolved_conversation_id, user_id)
             if conversation is not None:
                 resolved_workspace_id = (
-                    _normalize_text(conversation.get("workspace_id")) or resolved_workspace_id
+                    _normalize_text(conversation.get("workspace_id"))
+                    or resolved_workspace_id
                 )
                 resolved_assistant_mode_id = (
                     _normalize_text(conversation.get("assistant_mode_id"))
@@ -931,10 +1100,11 @@ class VerbatimPinService:
         if scope is MemoryScope.WORKSPACE and (
             resolved_workspace_id is None or resolved_assistant_mode_id is None
         ):
-            raise ValueError("workspace_id and assistant_mode_id are required for workspace pins")
-        if (
-            scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION}
-            and (resolved_conversation_id is None or resolved_assistant_mode_id is None)
+            raise ValueError(
+                "workspace_id and assistant_mode_id are required for workspace pins"
+            )
+        if scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION} and (
+            resolved_conversation_id is None or resolved_assistant_mode_id is None
         ):
             raise ValueError(
                 "conversation_id and assistant_mode_id are required for conversation-scoped pins"
@@ -963,15 +1133,18 @@ class VerbatimPinService:
             "user_persona_id_snapshot",
         )
         platform_id = (
-            VerbatimPinService._source_value(source_row, payload, "platform_id", "platform_id_snapshot")
+            VerbatimPinService._source_value(
+                source_row, payload, "platform_id", "platform_id_snapshot"
+            )
             or "default"
         )
-        character_id = (
-            VerbatimPinService._source_value(source_row, payload, "character_id", "character_id_snapshot")
-            or scope_anchors.get("workspace_id")
-        )
+        character_id = VerbatimPinService._source_value(
+            source_row, payload, "character_id", "character_id_snapshot"
+        ) or scope_anchors.get("workspace_id")
         sensitivity = VerbatimPinService._source_sensitivity(source_row, payload)
-        raw_themes = VerbatimPinService._source_value(source_row, payload, "themes_json", "themes_json")
+        raw_themes = VerbatimPinService._source_value(
+            source_row, payload, "themes_json", "themes_json"
+        )
         themes = raw_themes if isinstance(raw_themes, list) else []
         platform_locked = bool(
             VerbatimPinService._source_value(
@@ -982,15 +1155,12 @@ class VerbatimPinService:
             )
             or source_policy.get("platform_locked")
         )
-        platform_id_lock = (
-            VerbatimPinService._source_value(
-                source_row,
-                payload,
-                "platform_id_lock",
-                "platform_id_lock",
-            )
-            or source_policy.get("platform_id_lock")
-        )
+        platform_id_lock = VerbatimPinService._source_value(
+            source_row,
+            payload,
+            "platform_id_lock",
+            "platform_id_lock",
+        ) or source_policy.get("platform_id_lock")
         return {
             "user_persona_id": user_persona_id,
             "platform_id": platform_id,
@@ -1001,8 +1171,14 @@ class VerbatimPinService:
             "platform_id_lock": platform_id_lock,
             "scope_canonical": VerbatimPinService._canonical_pin_scope(scope),
             "incognito_snapshot": bool(source_policy.get("incognito")),
-            "remember_across_chats_snapshot": source_policy.get("remember_across_chats", True) is not False,
-            "remember_across_devices_snapshot": source_policy.get("remember_across_devices", True) is not False,
+            "remember_across_chats_snapshot": source_policy.get(
+                "remember_across_chats", True
+            )
+            is not False,
+            "remember_across_devices_snapshot": source_policy.get(
+                "remember_across_devices", True
+            )
+            is not False,
             "policy_snapshot": source_policy,
         }
 
@@ -1016,7 +1192,9 @@ class VerbatimPinService:
         active_space_boundary_mode: SpaceBoundaryMode | str | None,
     ) -> dict[str, str | None]:
         resolved_space_id = _normalize_text(active_space_id)
-        resolved_boundary_mode = _normalize_space_boundary_mode(active_space_boundary_mode)
+        resolved_boundary_mode = _normalize_space_boundary_mode(
+            active_space_boundary_mode
+        )
 
         if resolved_space_id is None and conversation_id is not None:
             conversation = await ConversationRepository(
@@ -1056,7 +1234,9 @@ class VerbatimPinService:
             payload_boundary = {}
 
         resolved_space_id = (
-            _normalize_text(self._source_value(source_row, payload, "space_id", "space_id"))
+            _normalize_text(
+                self._source_value(source_row, payload, "space_id", "space_id")
+            )
             or _normalize_text(payload_boundary.get("active_space_id"))
             or _normalize_text(payload_boundary.get("space_id"))
             or _normalize_text(active_space_id)
@@ -1073,12 +1253,11 @@ class VerbatimPinService:
             or _normalize_space_boundary_mode(payload_boundary.get("boundary_mode"))
             or _normalize_space_boundary_mode(active_space_boundary_mode)
         )
-        resolved_display_name = (
-            _normalize_text(
-                self._source_value(source_row, payload, "space_display_name", "space_display_name")
+        resolved_display_name = _normalize_text(
+            self._source_value(
+                source_row, payload, "space_display_name", "space_display_name"
             )
-            or _normalize_text(payload_boundary.get("display_name"))
-        )
+        ) or _normalize_text(payload_boundary.get("display_name"))
 
         if resolved_space_id is None and conversation_id is not None:
             conversation = await ConversationRepository(
@@ -1097,14 +1276,17 @@ class VerbatimPinService:
             )
             if space_row is not None:
                 snapshot = space_snapshot(space_row)
-                resolved_boundary_mode = resolved_boundary_mode or snapshot.boundary_mode.value
+                resolved_boundary_mode = (
+                    resolved_boundary_mode or snapshot.boundary_mode.value
+                )
                 resolved_display_name = resolved_display_name or snapshot.display_name
 
         if resolved_space_id is None:
             return {"space_id": None, "space_boundary_mode": None, "display_name": None}
         return {
             "space_id": resolved_space_id,
-            "space_boundary_mode": resolved_boundary_mode or SpaceBoundaryMode.FOCUS.value,
+            "space_boundary_mode": resolved_boundary_mode
+            or SpaceBoundaryMode.FOCUS.value,
             "display_name": resolved_display_name,
         }
 
@@ -1120,7 +1302,9 @@ class VerbatimPinService:
         resolved_mind_id = _normalize_text(active_mind_id)
         resolved_topology = _normalize_mind_topology(mind_topology)
 
-        if conversation_id is not None and (resolved_mind_id is None or resolved_topology is None):
+        if conversation_id is not None and (
+            resolved_mind_id is None or resolved_topology is None
+        ):
             conversation = await ConversationRepository(
                 connection,
                 self.runtime.clock,
@@ -1173,9 +1357,7 @@ class VerbatimPinService:
                 self.runtime.clock,
             ).get_conversation(conversation_id, user_id)
             if conversation is not None:
-                resolved_realm_id = _normalize_text(
-                    conversation.get("active_realm_id")
-                )
+                resolved_realm_id = _normalize_text(conversation.get("active_realm_id"))
         return {"active_realm_id": resolved_realm_id}
 
     @staticmethod
@@ -1318,7 +1500,9 @@ class VerbatimPinService:
             return "(m.active_mind_id IS NULL)", []
         topology = _normalize_mind_topology(mind_topology) or MindTopology.UNIMIND.value
         if topology == MindTopology.UNIMIND.value:
-            return "(m.active_mind_id IS NULL OR m.active_mind_id = ?)", [normalized_active_mind]
+            return "(m.active_mind_id IS NULL OR m.active_mind_id = ?)", [
+                normalized_active_mind
+            ]
         return "(m.active_mind_id = ?)", [normalized_active_mind]
 
     @staticmethod
@@ -1368,7 +1552,9 @@ class VerbatimPinService:
         source_row: dict[str, Any] | None,
         payload: dict[str, Any],
     ) -> MemorySensitivity | None:
-        raw_value = VerbatimPinService._source_value(source_row, payload, "sensitivity", "sensitivity")
+        raw_value = VerbatimPinService._source_value(
+            source_row, payload, "sensitivity", "sensitivity"
+        )
         if raw_value is None:
             return None
         try:
@@ -1388,12 +1574,18 @@ class VerbatimPinService:
             if raw_policy is None and isinstance(row_payload, dict):
                 raw_policy = row_payload.get("source_turn_policy")
         if raw_policy is None:
-            raw_policy = payload.get("policy_snapshot_json") or payload.get("source_turn_policy")
+            raw_policy = payload.get("policy_snapshot_json") or payload.get(
+                "source_turn_policy"
+            )
         return dict(raw_policy) if isinstance(raw_policy, dict) else {}
 
     @staticmethod
     def _canonical_pin_scope(scope: MemoryScope) -> str:
-        if scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION, MemoryScope.CHAT}:
+        if scope in {
+            MemoryScope.CONVERSATION,
+            MemoryScope.EPHEMERAL_SESSION,
+            MemoryScope.CHAT,
+        }:
             return MemoryScope.CHAT.value
         if scope in {MemoryScope.WORKSPACE, MemoryScope.CHARACTER}:
             return MemoryScope.CHARACTER.value
@@ -1410,7 +1602,9 @@ class VerbatimPinService:
             return _normalize_text(source_row.get("text"))
         if target_kind is VerbatimPinTargetKind.MEMORY_OBJECT:
             return _normalize_text(source_row.get("canonical_text"))
-        return _normalize_text(source_row.get("text") or source_row.get("canonical_text"))
+        return _normalize_text(
+            source_row.get("text") or source_row.get("canonical_text")
+        )
 
     @staticmethod
     def _source_snapshot_metadata(

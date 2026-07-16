@@ -3,25 +3,45 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 import aiosqlite
 
+from atagia.core import json_utils
 from atagia.core.communication_profile_repository import CommunicationProfileRepository
+from atagia.core.conversation_namespace import (
+    ConversationNamespaceSnapshot,
+    capture_conversation_namespace_snapshot,
+)
 from atagia.core.ids import generate_prefixed_id
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
+from atagia.core.job_run_repository import JobRunRepository
+from atagia.core.memory_evidence_repository import MemoryEvidenceRepository
+from atagia.core.memory_extraction_suppression_repository import (
+    MemoryExtractionSuppressionRepository,
+)
 from atagia.core.repositories import (
     MemoryObjectRepository,
     _decode_json_columns,
     _encode_json,
     summary_mirror_id,
-    user_erasure_marker_hash,
 )
-from atagia.memory.lifecycle_runner import cache_generation_key
+from atagia.core.user_erasure_repository import (
+    ErasureCleanupTargetSpec,
+    UserErasureRepository,
+)
+from atagia.core.user_lifecycle_repository import UserLifecycleRepository
+from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
 from atagia.models.schemas_api import DeletionReport, ErasureReport
 from atagia.models.schemas_initial_context_package import InitialContextPackageKind
-from atagia.models.schemas_memory import ConversationStatus, MemoryObjectType, MemoryStatus, SpaceBoundaryMode
+from atagia.models.schemas_memory import (
+    ConversationStatus,
+    MemoryObjectType,
+    MemoryStatus,
+    SpaceBoundaryMode,
+)
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.errors import (
     ConversationAlreadyClosedError,
@@ -30,8 +50,12 @@ from atagia.services.errors import (
     InvalidConversationTransitionError,
     MemoryNotEditableError,
     MemoryNotFoundError,
+    MemoryProvenanceRepairRequiredError,
+    UserErasureCleanupPendingError,
+    UserErasureReconciliationRequiredError,
 )
-from atagia.services.artifact_blob_store import ArtifactBlobStore
+from atagia.services.artifact_blob_migration import LegacyArtifactBlobStateError
+from atagia.services.user_erasure_cleanup_service import UserErasureCleanupService
 
 if TYPE_CHECKING:
     from atagia.app import AppRuntime
@@ -57,33 +81,76 @@ class ConversationLifecycleService:
         conversation_id: str,
         purge: bool | None = None,
         confirmation: str | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
     ) -> DeletionReport | dict[str, Any]:
-        conversation = await self._get_conversation(connection, user_id, conversation_id)
-        if conversation is None:
-            raise ConversationNotFoundError("Conversation not found for user")
-        if str(conversation["status"]) == ConversationStatus.CLOSED.value:
-            raise ConversationAlreadyClosedError("Conversation is already closed")
-        if str(conversation["status"]) in {
-            ConversationStatus.ARCHIVED.value,
-            ConversationStatus.PENDING_DELETION.value,
-        }:
-            raise InvalidConversationTransitionError("Conversation cannot be closed from its current state")
-
-        should_purge = bool(conversation.get("purge_on_close")) if purge is None else bool(purge)
-        if should_purge:
-            if confirmation != PURGE_ON_CLOSE_CONFIRMATION:
-                raise DeletionConfirmationError("Missing PURGE_ON_CLOSE confirmation")
-            return await self._delete_conversation(
+        async with ContextCacheService(self.runtime).user_cache_guard(user_id):
+            return await self._close_conversation_guarded(
                 connection,
                 user_id=user_id,
                 conversation_id=conversation_id,
-                deletion_reason="purge_on_close",
-                confirmation_override=True,
+                purge=purge,
+                confirmation=confirmation,
+                namespace_guard=namespace_guard,
             )
 
-        timestamp = self.runtime.clock.now().isoformat()
+    async def _close_conversation_guarded(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        conversation_id: str,
+        purge: bool | None = None,
+        confirmation: str | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
+    ) -> DeletionReport | dict[str, Any]:
         await connection.execute("BEGIN IMMEDIATE")
         try:
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+            await self._require_namespace_guard(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                namespace_guard=namespace_guard,
+            )
+            conversation = await self._get_conversation(
+                connection, user_id, conversation_id
+            )
+            if conversation is None:
+                raise ConversationNotFoundError("Conversation not found for user")
+            if str(conversation["status"]) == ConversationStatus.CLOSED.value:
+                raise ConversationAlreadyClosedError("Conversation is already closed")
+            if str(conversation["status"]) in {
+                ConversationStatus.ARCHIVED.value,
+                ConversationStatus.PENDING_DELETION.value,
+            }:
+                raise InvalidConversationTransitionError(
+                    "Conversation cannot be closed from its current state"
+                )
+
+            should_purge = (
+                bool(conversation.get("purge_on_close"))
+                if purge is None
+                else bool(purge)
+            )
+            if should_purge:
+                if confirmation != PURGE_ON_CLOSE_CONFIRMATION:
+                    raise DeletionConfirmationError(
+                        "Missing PURGE_ON_CLOSE confirmation"
+                    )
+                await connection.rollback()
+                return await self._delete_conversation(
+                    connection,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    deletion_reason="purge_on_close",
+                    confirmation_override=True,
+                    namespace_guard=namespace_guard,
+                )
+
+            timestamp = self.runtime.clock.now().isoformat()
             cursor = await connection.execute(
                 """
                 UPDATE conversations
@@ -126,30 +193,88 @@ class ConversationLifecycleService:
         *,
         user_id: str,
         conversation_id: str,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
     ) -> dict[str, Any]:
-        conversation = await self._get_conversation(connection, user_id, conversation_id)
-        if conversation is None:
-            raise ConversationNotFoundError("Conversation not found for user")
-        if bool(conversation.get("temporary")) and bool(conversation.get("purge_on_close")):
-            raise InvalidConversationTransitionError("Temporary purge-on-close conversations cannot be archived")
-        if str(conversation["status"]) == ConversationStatus.PENDING_DELETION.value:
-            raise InvalidConversationTransitionError("Conversation is pending deletion")
+        async with ContextCacheService(self.runtime).user_cache_guard(user_id):
+            return await self._archive_conversation_guarded(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                namespace_guard=namespace_guard,
+            )
 
-        timestamp = self.runtime.clock.now().isoformat()
+    async def _archive_conversation_guarded(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        conversation_id: str,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
+    ) -> dict[str, Any]:
         await connection.execute("BEGIN IMMEDIATE")
         try:
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+            await self._require_namespace_guard(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                namespace_guard=namespace_guard,
+            )
+            conversation = await self._get_conversation(
+                connection, user_id, conversation_id
+            )
+            if conversation is None:
+                raise ConversationNotFoundError("Conversation not found for user")
+            if bool(conversation.get("temporary")) and bool(
+                conversation.get("purge_on_close")
+            ):
+                raise InvalidConversationTransitionError(
+                    "Temporary purge-on-close conversations cannot be archived"
+                )
+            if str(conversation["status"]) == ConversationStatus.PENDING_DELETION.value:
+                raise InvalidConversationTransitionError(
+                    "Conversation is pending deletion"
+                )
+
+            timestamp = self.runtime.clock.now().isoformat()
+            conversation_message_ids = await self._conversation_message_ids(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
             affected_memory_ids = await self._conversation_affected_memory_ids(
                 connection,
                 user_id=user_id,
                 conversation_id=conversation_id,
+            )
+            await self._require_extracted_source_provenance(
+                connection,
+                user_id=user_id,
+                memory_ids=affected_memory_ids,
+                operation="archive conversation",
             )
             summary_ids = await self._derived_summary_ids(
                 connection,
                 user_id=user_id,
                 seed_object_ids=affected_memory_ids,
             )
-            affected_trace_ids = [*affected_memory_ids, *self._summary_mirror_ids(summary_ids)]
-            await self._delete_summary_views(connection, user_id=user_id, summary_ids=summary_ids)
+            affected_trace_ids = [
+                *affected_memory_ids,
+                *self._summary_mirror_ids(summary_ids),
+            ]
+            await self._suppress_memory_extractions(
+                connection,
+                user_id=user_id,
+                memory_ids=affected_memory_ids,
+                reason="conversation_archived",
+            )
+            await self._delete_embeddings_for_ids(connection, affected_trace_ids)
+            await self._delete_summary_views(
+                connection, user_id=user_id, summary_ids=summary_ids
+            )
             await self._cleanup_projection_rows(
                 connection,
                 user_id=user_id,
@@ -222,13 +347,22 @@ class ConversationLifecycleService:
                 ),
             )
             if cursor.rowcount == 0:
-                raise InvalidConversationTransitionError("Conversation cannot be archived from its current state")
+                raise InvalidConversationTransitionError(
+                    "Conversation cannot be archived from its current state"
+                )
+            await self._bump_derivation_revision(
+                connection,
+                user_id=user_id,
+                excluded_source_message_ids=conversation_message_ids,
+                excluded_conversation_ids=[conversation_id],
+            )
             await connection.commit()
         except Exception:
             await connection.rollback()
             raise
         await self._invalidate_user_prompt_cache(user_id)
         await self._purge_conversation_jobs(user_id, conversation_id)
+        await self._delete_embedding_index_entries(affected_trace_ids)
         return await self._get_conversation(connection, user_id, conversation_id) or {}
 
     async def expire_idle_temporary_conversations(
@@ -280,7 +414,7 @@ class ConversationLifecycleService:
         dry_run: bool = False,
         limit: int = 100,
     ) -> int:
-        """Retry durable local-file deletion queue rows left open after erasure."""
+        """Reject legacy local-file deletion work owned by the offline migrator."""
         cursor = await connection.execute(
             """
             SELECT *
@@ -294,7 +428,12 @@ class ConversationLifecycleService:
         rows = await cursor.fetchall()
         if dry_run:
             return len(rows)
-        return await self._process_file_deletion_rows(connection, rows)
+        if rows:
+            raise LegacyArtifactBlobStateError(
+                "Legacy pending artifact-file deletions require "
+                "`atagia-artifact-blob-migrate run` while Atagia is stopped"
+            )
+        return 0
 
     async def purge_pending_deleted_conversations(
         self,
@@ -334,16 +473,19 @@ class ConversationLifecycleService:
         user_id: str,
         conversation_id: str,
         confirmation: str,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
     ) -> DeletionReport:
         if confirmation != DELETE_CONVERSATION_CONFIRMATION:
             raise DeletionConfirmationError("Missing DELETE_CONVERSATION confirmation")
-        return await self._delete_conversation(
-            connection,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            deletion_reason="user_request",
-            confirmation_override=True,
-        )
+        async with ContextCacheService(self.runtime).user_cache_guard(user_id):
+            return await self._delete_conversation(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                deletion_reason="user_request",
+                confirmation_override=True,
+                namespace_guard=namespace_guard,
+            )
 
     async def edit_memory(
         self,
@@ -367,6 +509,55 @@ class ConversationLifecycleService:
         mind_topology: str | None = None,
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
+    ) -> dict[str, Any]:
+        async with ContextCacheService(self.runtime).user_cache_guard(user_id):
+            return await self._edit_memory_guarded(
+                connection,
+                user_id=user_id,
+                memory_id=memory_id,
+                new_text=new_text,
+                edit_source=edit_source,
+                edited_by=edited_by,
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
+                namespace_guard=namespace_guard,
+            )
+
+    async def _edit_memory_guarded(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        memory_id: str,
+        new_text: str,
+        edit_source: str = "api",
+        edited_by: str = "system",
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
     ) -> dict[str, Any]:
         normalized_text = " ".join(new_text.split()).strip()
         if not normalized_text:
@@ -374,6 +565,16 @@ class ConversationLifecycleService:
         timestamp = self.runtime.clock.now().isoformat()
         await connection.execute("BEGIN IMMEDIATE")
         try:
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+            await self._require_namespace_guard(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                namespace_guard=namespace_guard,
+            )
             memory = await self._get_memory(
                 connection,
                 user_id,
@@ -398,7 +599,35 @@ class ConversationLifecycleService:
                 str(memory.get("status")) != MemoryStatus.ACTIVE.value
                 or str(memory.get("object_type")) != MemoryObjectType.EVIDENCE.value
             ):
-                raise MemoryNotEditableError("Only active evidence memories can be edited")
+                raise MemoryNotEditableError(
+                    "Only active evidence memories can be edited"
+                )
+            source_message_ids = await self._memory_source_message_ids(
+                connection,
+                user_id=user_id,
+                memory_ids=[memory_id],
+            )
+            if (
+                str(memory.get("source_kind") or "") == "extracted"
+                and not source_message_ids
+            ):
+                raise MemoryProvenanceRepairRequiredError(
+                    "Extracted memory is missing source provenance; repair is required before edit"
+                )
+            summary_ids = await self._derived_summary_ids(
+                connection,
+                user_id=user_id,
+                seed_object_ids=[memory_id],
+            )
+            summary_mirror_ids = self._summary_mirror_ids(summary_ids)
+            affected_trace_ids = [memory_id, *summary_mirror_ids]
+            await self._suppress_memory_extractions(
+                connection,
+                user_id=user_id,
+                memory_ids=[memory_id],
+                reason="memory_edited",
+                replacement_memory_id=memory_id,
+            )
             await connection.execute(
                 """
                 INSERT INTO memory_edit_history(
@@ -432,6 +661,29 @@ class ConversationLifecycleService:
                 """,
                 (normalized_text, timestamp, memory_id, user_id),
             )
+            await self._delete_summary_views(
+                connection,
+                user_id=user_id,
+                summary_ids=summary_ids,
+            )
+            await self._cleanup_memory_projection_rows(
+                connection,
+                user_id=user_id,
+                memory_ids=affected_trace_ids,
+            )
+            await self._delete_retrieval_events_for_memory_ids(
+                connection,
+                user_id=user_id,
+                memory_ids=affected_trace_ids,
+            )
+            await MemoryEvidenceRepository(
+                connection,
+                self.runtime.clock,
+            ).delete_for_memory_ids(
+                user_id=user_id,
+                memory_ids=[memory_id],
+                commit=False,
+            )
             await self._mark_retrieval_surfaces_stale_for_memory(
                 connection,
                 user_id=user_id,
@@ -441,9 +693,9 @@ class ConversationLifecycleService:
             await CommunicationProfileRepository(
                 connection,
                 self.runtime.clock,
-            ).mark_stale_for_memory(
+            ).mark_stale_for_memories(
                 user_id=user_id,
-                memory_id=memory_id,
+                memory_ids=affected_trace_ids,
                 reason="source_memory_edited",
                 commit=False,
             )
@@ -451,12 +703,17 @@ class ConversationLifecycleService:
                 connection,
                 user_id=user_id,
             )
-            await self._delete_embeddings_for_ids(connection, [memory_id])
+            await self._delete_embeddings_for_ids(connection, affected_trace_ids)
+            await self._bump_derivation_revision(
+                connection,
+                user_id=user_id,
+                excluded_source_message_ids=source_message_ids,
+            )
             await connection.commit()
         except Exception:
             await connection.rollback()
             raise
-        await self._delete_embedding_index_entries([memory_id])
+        await self._delete_embedding_index_entries(affected_trace_ids)
         await ContextCacheService(self.runtime).invalidate_user_cache(user_id)
         refreshed = await self._get_memory(
             connection,
@@ -501,6 +758,53 @@ class ConversationLifecycleService:
         mind_topology: str | None = None,
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
+    ) -> DeletionReport:
+        async with ContextCacheService(self.runtime).user_cache_guard(user_id):
+            return await self._delete_memory_guarded(
+                connection,
+                user_id=user_id,
+                memory_id=memory_id,
+                hard=hard,
+                confirmation=confirmation,
+                conversation_id=conversation_id,
+                user_persona_id=user_persona_id,
+                platform_id=platform_id,
+                character_id=character_id,
+                incognito=incognito,
+                remember_across_chats=remember_across_chats,
+                remember_across_devices=remember_across_devices,
+                active_space_id=active_space_id,
+                active_space_boundary_mode=active_space_boundary_mode,
+                active_mind_id=active_mind_id,
+                mind_topology=mind_topology,
+                active_embodiment_id=active_embodiment_id,
+                active_realm_id=active_realm_id,
+                namespace_guard=namespace_guard,
+            )
+
+    async def _delete_memory_guarded(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        memory_id: str,
+        hard: bool = False,
+        confirmation: str | None = None,
+        conversation_id: str | None = None,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        remember_across_chats: bool = True,
+        remember_across_devices: bool = True,
+        active_space_id: str | None = None,
+        active_space_boundary_mode: SpaceBoundaryMode | str | None = None,
+        active_mind_id: str | None = None,
+        mind_topology: str | None = None,
+        active_embodiment_id: str | None = None,
+        active_realm_id: str | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
     ) -> DeletionReport:
         if not hard:
             return await self._archive_memory(
@@ -520,6 +824,7 @@ class ConversationLifecycleService:
                 mind_topology=mind_topology,
                 active_embodiment_id=active_embodiment_id,
                 active_realm_id=active_realm_id,
+                namespace_guard=namespace_guard,
             )
         if confirmation != HARD_DELETE_MEMORY_CONFIRMATION:
             raise DeletionConfirmationError("Missing HARD_DELETE_MEMORY confirmation")
@@ -540,6 +845,7 @@ class ConversationLifecycleService:
             mind_topology=mind_topology,
             active_embodiment_id=active_embodiment_id,
             active_realm_id=active_realm_id,
+            namespace_guard=namespace_guard,
         )
 
     async def erase_user_data(
@@ -551,7 +857,8 @@ class ConversationLifecycleService:
     ) -> ErasureReport:
         if confirmation != ERASE_ALL_DATA_CONFIRMATION:
             raise DeletionConfirmationError("Missing ERASE_ALL_DATA confirmation")
-        return await self._erase_user_data(connection, user_id=user_id)
+        async with ContextCacheService(self.runtime).user_cache_guard(user_id):
+            return await self._erase_user_data(connection, user_id=user_id)
 
     async def _delete_conversation(
         self,
@@ -561,11 +868,27 @@ class ConversationLifecycleService:
         conversation_id: str,
         deletion_reason: str,
         confirmation_override: bool,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
     ) -> DeletionReport:
         del confirmation_override
         timestamp = self.runtime.clock.now().isoformat()
         await connection.execute("BEGIN IMMEDIATE")
         try:
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+            await self._require_namespace_guard(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                namespace_guard=namespace_guard,
+            )
+            conversation_message_ids = await self._conversation_message_ids(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
             cursor = await connection.execute(
                 """
                 UPDATE conversations
@@ -586,34 +909,19 @@ class ConversationLifecycleService:
                 ),
             )
             if cursor.rowcount == 0:
-                existing = await self._get_conversation(connection, user_id, conversation_id)
+                existing = await self._get_conversation(
+                    connection, user_id, conversation_id
+                )
                 if existing is None:
                     await connection.rollback()
                     return DeletionReport(
                         conversation_id=conversation_id,
                         already_deleted=True,
-                )
+                    )
                 if str(existing["status"]) != ConversationStatus.PENDING_DELETION.value:
-                    raise InvalidConversationTransitionError("Conversation cannot be deleted from its current state")
-            await self._delete_initial_context_packages_for_conversation(
-                connection,
-                user_id=user_id,
-                conversation_id=conversation_id,
-            )
-            await connection.commit()
-        except Exception:
-            await connection.rollback()
-            raise
-
-        await connection.execute("BEGIN IMMEDIATE")
-        try:
-            pending = await self._get_conversation(connection, user_id, conversation_id)
-            if pending is None:
-                await connection.rollback()
-                return DeletionReport(conversation_id=conversation_id, already_deleted=True)
-            if str(pending["status"]) != ConversationStatus.PENDING_DELETION.value:
-                raise InvalidConversationTransitionError("Conversation is not pending deletion")
-
+                    raise InvalidConversationTransitionError(
+                        "Conversation cannot be deleted from its current state"
+                    )
             memory_ids = await self._conversation_affected_memory_ids(
                 connection,
                 user_id=user_id,
@@ -626,6 +934,12 @@ class ConversationLifecycleService:
             )
             summary_mirror_ids = self._summary_mirror_ids(summary_ids)
             all_memory_ids = [*memory_ids, *summary_mirror_ids]
+            await self._suppress_memory_extractions(
+                connection,
+                user_id=user_id,
+                memory_ids=all_memory_ids,
+                reason="conversation_deleted",
+            )
             artifact_ids = await self._conversation_artifact_ids(
                 connection,
                 user_id=user_id,
@@ -638,14 +952,6 @@ class ConversationLifecycleService:
                 (user_id, conversation_id),
             )
             tombstone_id = generate_prefixed_id("tmb")
-            await self._queue_file_deletions_for_artifacts(
-                connection,
-                user_id=user_id,
-                artifact_ids=artifact_ids,
-                tombstone_id=tombstone_id,
-                reason="conversation_delete",
-                timestamp=timestamp,
-            )
             await self._delete_embeddings_for_ids(connection, all_memory_ids)
             await self._cleanup_projection_rows(
                 connection,
@@ -653,7 +959,9 @@ class ConversationLifecycleService:
                 memory_ids=all_memory_ids,
                 conversation_id=conversation_id,
             )
-            await self._delete_summary_views(connection, user_id=user_id, summary_ids=summary_ids)
+            await self._delete_summary_views(
+                connection, user_id=user_id, summary_ids=summary_ids
+            )
             await self._tombstone_memory_rows(
                 connection,
                 user_id=user_id,
@@ -684,7 +992,9 @@ class ConversationLifecycleService:
                 user_id=user_id,
                 conversation_id=conversation_id,
             )
-            await self._delete_artifacts(connection, user_id=user_id, artifact_ids=artifact_ids)
+            await self._delete_artifacts(
+                connection, user_id=user_id, artifact_ids=artifact_ids
+            )
             await connection.execute(
                 "DELETE FROM verbatim_pins WHERE user_id = ? AND conversation_id = ?",
                 (user_id, conversation_id),
@@ -719,6 +1029,12 @@ class ConversationLifecycleService:
                     "artifact_count": len(artifact_ids),
                 },
             )
+            await self._bump_derivation_revision(
+                connection,
+                user_id=user_id,
+                excluded_source_message_ids=conversation_message_ids,
+                excluded_conversation_ids=[conversation_id],
+            )
             await connection.commit()
         except Exception:
             await connection.rollback()
@@ -745,7 +1061,13 @@ class ConversationLifecycleService:
     ) -> None:
         await connection.execute("BEGIN IMMEDIATE")
         try:
-            conversation = await self._get_conversation(connection, user_id, conversation_id)
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+            conversation = await self._get_conversation(
+                connection, user_id, conversation_id
+            )
             if conversation is None:
                 await connection.rollback()
                 return
@@ -753,6 +1075,11 @@ class ConversationLifecycleService:
                 await connection.rollback()
                 return
 
+            conversation_message_ids = await self._conversation_message_ids(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
             memory_ids = await self._conversation_affected_memory_ids(
                 connection,
                 user_id=user_id,
@@ -765,6 +1092,12 @@ class ConversationLifecycleService:
             )
             summary_mirror_ids = self._summary_mirror_ids(summary_ids)
             all_memory_ids = [*memory_ids, *summary_mirror_ids]
+            await self._suppress_memory_extractions(
+                connection,
+                user_id=user_id,
+                memory_ids=all_memory_ids,
+                reason="conversation_purged",
+            )
             artifact_ids = await self._conversation_artifact_ids(
                 connection,
                 user_id=user_id,
@@ -777,8 +1110,12 @@ class ConversationLifecycleService:
                 memory_ids=all_memory_ids,
                 conversation_id=conversation_id,
             )
-            await self._delete_summary_views(connection, user_id=user_id, summary_ids=summary_ids)
-            await self._delete_memory_rows(connection, user_id=user_id, memory_ids=all_memory_ids)
+            await self._delete_summary_views(
+                connection, user_id=user_id, summary_ids=summary_ids
+            )
+            await self._delete_memory_rows(
+                connection, user_id=user_id, memory_ids=all_memory_ids
+            )
             await CommunicationProfileRepository(
                 connection,
                 self.runtime.clock,
@@ -802,7 +1139,9 @@ class ConversationLifecycleService:
                 user_id=user_id,
                 conversation_id=conversation_id,
             )
-            await self._delete_artifacts(connection, user_id=user_id, artifact_ids=artifact_ids)
+            await self._delete_artifacts(
+                connection, user_id=user_id, artifact_ids=artifact_ids
+            )
             await connection.execute(
                 "DELETE FROM verbatim_pins WHERE user_id = ? AND conversation_id = ?",
                 (user_id, conversation_id),
@@ -832,6 +1171,12 @@ class ConversationLifecycleService:
                 "DELETE FROM conversations WHERE id = ? AND user_id = ?",
                 (conversation_id, user_id),
             )
+            await self._bump_derivation_revision(
+                connection,
+                user_id=user_id,
+                excluded_source_message_ids=conversation_message_ids,
+                excluded_conversation_ids=[conversation_id],
+            )
             await connection.commit()
         except Exception:
             await connection.rollback()
@@ -859,10 +1204,21 @@ class ConversationLifecycleService:
         mind_topology: str | None = None,
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
     ) -> DeletionReport:
         timestamp = self.runtime.clock.now().isoformat()
         await connection.execute("BEGIN IMMEDIATE")
         try:
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+            await self._require_namespace_guard(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                namespace_guard=namespace_guard,
+            )
             memory = await self._get_memory(
                 connection,
                 user_id,
@@ -883,6 +1239,47 @@ class ConversationLifecycleService:
             )
             if memory is None:
                 raise MemoryNotFoundError("Memory object not found for user")
+            summary_ids = await self._derived_summary_ids(
+                connection,
+                user_id=user_id,
+                seed_object_ids=[memory_id],
+            )
+            summary_mirror_ids = self._summary_mirror_ids(summary_ids)
+            affected_trace_ids = [memory_id, *summary_mirror_ids]
+            source_message_ids = await self._memory_source_message_ids(
+                connection,
+                user_id=user_id,
+                memory_ids=[memory_id],
+            )
+            if (
+                str(memory.get("source_kind") or "") == "extracted"
+                and not source_message_ids
+            ):
+                raise MemoryProvenanceRepairRequiredError(
+                    "Extracted memory is missing source provenance; repair is required before archive"
+                )
+            await self._suppress_memory_extractions(
+                connection,
+                user_id=user_id,
+                memory_ids=[memory_id],
+                reason="memory_archived",
+            )
+            await self._delete_embeddings_for_ids(connection, affected_trace_ids)
+            await self._delete_summary_views(
+                connection,
+                user_id=user_id,
+                summary_ids=summary_ids,
+            )
+            await self._cleanup_memory_projection_rows(
+                connection,
+                user_id=user_id,
+                memory_ids=affected_trace_ids,
+            )
+            await self._delete_retrieval_events_for_memory_ids(
+                connection,
+                user_id=user_id,
+                memory_ids=affected_trace_ids,
+            )
             await connection.execute(
                 """
                 UPDATE memory_objects
@@ -902,9 +1299,9 @@ class ConversationLifecycleService:
             await CommunicationProfileRepository(
                 connection,
                 self.runtime.clock,
-            ).mark_stale_for_memory(
+            ).mark_stale_for_memories(
                 user_id=user_id,
-                memory_id=memory_id,
+                memory_ids=affected_trace_ids,
                 reason="source_memory_archived",
                 commit=False,
             )
@@ -912,14 +1309,22 @@ class ConversationLifecycleService:
                 connection,
                 user_id=user_id,
             )
-            await self._delete_embeddings_for_ids(connection, [memory_id])
+            await self._bump_derivation_revision(
+                connection,
+                user_id=user_id,
+                excluded_source_message_ids=source_message_ids,
+            )
             await connection.commit()
         except Exception:
             await connection.rollback()
             raise
-        await self._delete_embedding_index_entries([memory_id])
+        await self._delete_embedding_index_entries(affected_trace_ids)
         await ContextCacheService(self.runtime).invalidate_user_cache(user_id)
-        return DeletionReport(memory_id=memory_id, deleted_memories=1)
+        return DeletionReport(
+            memory_id=memory_id,
+            deleted_memories=1,
+            deleted_summaries=len(summary_ids),
+        )
 
     async def _hard_delete_memory(
         self,
@@ -940,9 +1345,20 @@ class ConversationLifecycleService:
         mind_topology: str | None = None,
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
+        namespace_guard: ConversationNamespaceSnapshot | None = None,
     ) -> DeletionReport:
         await connection.execute("BEGIN IMMEDIATE")
         try:
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+            await self._require_namespace_guard(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                namespace_guard=namespace_guard,
+            )
             memory = await self._get_memory(
                 connection,
                 user_id,
@@ -970,14 +1386,33 @@ class ConversationLifecycleService:
             )
             summary_mirror_ids = self._summary_mirror_ids(summary_ids)
             all_memory_ids = [memory_id, *summary_mirror_ids]
-            await self._delete_embeddings_for_ids(connection, all_memory_ids)
-            await self._cleanup_projection_rows(
+            source_message_ids = await self._memory_source_message_ids(
+                connection,
+                user_id=user_id,
+                memory_ids=[memory_id],
+            )
+            if (
+                str(memory.get("source_kind") or "") == "extracted"
+                and not source_message_ids
+            ):
+                raise MemoryProvenanceRepairRequiredError(
+                    "Extracted memory is missing source provenance; repair is required before hard delete"
+                )
+            await self._suppress_memory_extractions(
                 connection,
                 user_id=user_id,
                 memory_ids=all_memory_ids,
-                conversation_id=str(memory.get("conversation_id") or ""),
+                reason="memory_hard_deleted",
             )
-            await self._delete_summary_views(connection, user_id=user_id, summary_ids=summary_ids)
+            await self._delete_embeddings_for_ids(connection, all_memory_ids)
+            await self._cleanup_memory_projection_rows(
+                connection,
+                user_id=user_id,
+                memory_ids=all_memory_ids,
+            )
+            await self._delete_summary_views(
+                connection, user_id=user_id, summary_ids=summary_ids
+            )
             await self._delete_retrieval_events_for_memory_ids(
                 connection,
                 user_id=user_id,
@@ -997,7 +1432,14 @@ class ConversationLifecycleService:
                 connection,
                 user_id=user_id,
             )
-            await self._delete_memory_rows(connection, user_id=user_id, memory_ids=all_memory_ids)
+            await self._delete_memory_rows(
+                connection, user_id=user_id, memory_ids=all_memory_ids
+            )
+            await self._bump_derivation_revision(
+                connection,
+                user_id=user_id,
+                excluded_source_message_ids=source_message_ids,
+            )
             await connection.commit()
         except Exception:
             await connection.rollback()
@@ -1016,81 +1458,186 @@ class ConversationLifecycleService:
         *,
         user_id: str,
     ) -> ErasureReport:
-        timestamp = self.runtime.clock.now().isoformat()
-        await connection.execute("BEGIN IMMEDIATE")
-        try:
-            user = await self._fetch_one(connection, "SELECT * FROM users WHERE id = ?", (user_id,))
-            if user is None:
-                await connection.rollback()
+        repository = UserErasureRepository(connection, self.runtime.clock)
+        state = await repository.get_erasure_state_for_candidate(user_id)
+        user = await self._fetch_one(
+            connection,
+            "SELECT * FROM users WHERE id = ?",
+            (user_id,),
+        )
+        if user is None:
+            if state is None:
                 return ErasureReport(user_id=user_id, already_erased=True)
-            if user.get("deleted_at") is None:
-                await connection.execute(
-                    "UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ?",
-                    (timestamp, timestamp, user_id),
+            cleanup_id = state.get("cleanup_id")
+            if cleanup_id is not None:
+                await self._complete_user_erasure_cleanup(
+                    connection,
+                    cleanup_id=str(cleanup_id),
                 )
-            await connection.commit()
-        except Exception:
-            await connection.rollback()
-            raise
-
-        await connection.execute("BEGIN IMMEDIATE")
-        try:
-            memory_ids = await self._ids(connection, "memory_objects", "id", "user_id = ?", (user_id,))
-            conversation_ids = await self._ids(connection, "conversations", "id", "user_id = ?", (user_id,))
-            workspace_ids = await self._ids(connection, "workspaces", "id", "user_id = ?", (user_id,))
-            retrieval_event_ids = await self._ids(connection, "retrieval_events", "id", "user_id = ?", (user_id,))
-            artifact_ids = await self._ids(connection, "artifacts", "id", "user_id = ?", (user_id,))
-            tombstone_id = generate_prefixed_id("tmb")
-            await self._queue_file_deletions_for_artifacts(
-                connection,
-                user_id=user_id,
-                artifact_ids=artifact_ids,
-                tombstone_id=tombstone_id,
-                reason="user_erasure",
-                timestamp=timestamp,
+                counts = self._erasure_scope_counts(state.get("scope_summary"))
+                return ErasureReport(
+                    user_id=user_id,
+                    deleted_memories=counts["memory_count"],
+                    deleted_conversations=counts["conversation_count"],
+                    deleted_artifacts=counts["artifact_count"],
+                    tombstone_id=str(state["tombstone_id"]),
+                )
+            if state["erasure_cleanup_state"] == "verified":
+                return ErasureReport(
+                    user_id=user_id,
+                    tombstone_id=str(state["tombstone_id"]),
+                    already_erased=True,
+                )
+            raise UserErasureReconciliationRequiredError(
+                "The retained legacy erasure marker requires explicit historical cleanup reconciliation"
             )
+
+        identity = await UserLifecycleRepository(
+            connection,
+            self.runtime.clock,
+        ).get_active_identity(user_id)
+        if identity is None:
+            raise UserErasureCleanupPendingError(
+                "The user lifecycle is not active and cannot start a new erasure"
+            )
+
+        inventory: dict[str, list[str]] = {}
+
+        async def inventory_scope() -> dict[str, int]:
+            inventory["memory_ids"] = await self._ids(
+                connection,
+                "memory_objects",
+                "id",
+                "user_id = ?",
+                (user_id,),
+            )
+            inventory["conversation_ids"] = await self._ids(
+                connection,
+                "conversations",
+                "id",
+                "user_id = ?",
+                (user_id,),
+            )
+            inventory["workspace_ids"] = await self._ids(
+                connection,
+                "workspaces",
+                "id",
+                "user_id = ?",
+                (user_id,),
+            )
+            inventory["retrieval_event_ids"] = await self._ids(
+                connection,
+                "retrieval_events",
+                "id",
+                "user_id = ?",
+                (user_id,),
+            )
+            inventory["artifact_ids"] = await self._ids(
+                connection,
+                "artifacts",
+                "id",
+                "user_id = ?",
+                (user_id,),
+            )
+            return {
+                "memory_count": len(inventory["memory_ids"]),
+                "conversation_count": len(inventory["conversation_ids"]),
+                "artifact_count": len(inventory["artifact_ids"]),
+            }
+
+        async def canonical_delete() -> None:
+            memory_ids = inventory["memory_ids"]
             await self._delete_embeddings_for_ids(connection, memory_ids)
+            await self._delete_embeddings_for_user(connection, user_id)
             await self._delete_admin_audit_rows_for_erasure(
                 connection,
                 user_id=user_id,
-                conversation_ids=conversation_ids,
-                workspace_ids=workspace_ids,
-                retrieval_event_ids=retrieval_event_ids,
+                conversation_ids=inventory["conversation_ids"],
+                workspace_ids=inventory["workspace_ids"],
+                retrieval_event_ids=inventory["retrieval_event_ids"],
                 memory_ids=memory_ids,
-                artifact_ids=artifact_ids,
+                artifact_ids=inventory["artifact_ids"],
             )
             await self._delete_user_child_tables(connection, user_id=user_id)
-            await self._insert_tombstone(
-                connection,
-                tombstone_id=tombstone_id,
-                entity_type="user",
-                deletion_reason="right_to_erasure",
-                timestamp=timestamp,
-                scope_summary={
-                    "user_id_sha256": user_erasure_marker_hash(user_id),
-                    "memory_count": len(memory_ids),
-                    "conversation_count": len(conversation_ids),
-                    "artifact_count": len(artifact_ids),
-                },
-            )
             await connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
-            await connection.commit()
-        except Exception:
-            await connection.rollback()
-            raise
 
-        await self._process_pending_file_deletions(connection, tombstone_id=tombstone_id)
-        await ContextCacheService(self.runtime).invalidate_user_cache(user_id)
-        if self.runtime.settings.erasure_purge_streams:
-            await self.runtime.storage_backend.purge_user_jobs(user_id)
-        await self._delete_embedding_index_entries(memory_ids)
+        async def require_erasure_available() -> None:
+            await TranscriptRebuildRepository(
+                connection,
+                self.runtime.clock,
+            ).require_user_available(user_id)
+
+        preparation = await repository.prepare_current_erasure(
+            user_id=user_id,
+            scope_counts=None,
+            scope_counts_provider=inventory_scope,
+            target_specs=(
+                ErasureCleanupTargetSpec(
+                    target_kind="transient_backend",
+                    backend_name=self._storage_backend_name(),
+                    target_key=identity.lifecycle_cleanup_key,
+                    lifecycle_epoch=identity.lifecycle_epoch,
+                ),
+            ),
+            canonical_delete=canonical_delete,
+            transaction_precondition=require_erasure_available,
+            expected_lifecycle_epoch=identity.lifecycle_epoch,
+        )
+        await self._complete_user_erasure_cleanup(
+            connection,
+            cleanup_id=preparation.cleanup_id,
+        )
         return ErasureReport(
             user_id=user_id,
-            deleted_memories=len(memory_ids),
-            deleted_conversations=len(conversation_ids),
-            deleted_artifacts=len(artifact_ids),
-            tombstone_id=tombstone_id,
+            deleted_memories=len(inventory["memory_ids"]),
+            deleted_conversations=len(inventory["conversation_ids"]),
+            deleted_artifacts=len(inventory["artifact_ids"]),
+            tombstone_id=preparation.tombstone_id,
         )
+
+    async def _complete_user_erasure_cleanup(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        cleanup_id: str,
+    ) -> None:
+        try:
+            await UserErasureCleanupService(
+                connection,
+                self.runtime.clock,
+                self.runtime.storage_backend,
+                self._storage_backend_name(),
+            ).complete_cleanup(cleanup_id)
+        except Exception as exc:
+            raise UserErasureCleanupPendingError(
+                f"Canonical erasure completed; cleanup {cleanup_id} remains pending"
+            ) from exc
+
+    def _storage_backend_name(self) -> str:
+        return str(getattr(self.runtime.settings, "storage_backend", "inprocess"))
+
+    @staticmethod
+    def _erasure_scope_counts(scope_summary: Any) -> dict[str, int]:
+        if not isinstance(scope_summary, str):
+            return {
+                "memory_count": 0,
+                "conversation_count": 0,
+                "artifact_count": 0,
+            }
+        try:
+            decoded = json_utils.loads(scope_summary)
+        except json_utils.JSONDecodeError:
+            decoded = {}
+        if not isinstance(decoded, dict):
+            decoded = {}
+        counts: dict[str, int] = {}
+        for key in ("memory_count", "conversation_count", "artifact_count"):
+            value = decoded.get(key, 0)
+            try:
+                counts[key] = max(0, int(value))
+            except (TypeError, ValueError):
+                counts[key] = 0
+        return counts
 
     async def _delete_admin_audit_rows_for_erasure(
         self,
@@ -1151,12 +1698,13 @@ class ConversationLifecycleService:
             "DELETE FROM graph_entity_mentions WHERE user_id = ?",
             "DELETE FROM graph_projection_runs WHERE user_id = ?",
             "DELETE FROM graph_entities WHERE user_id = ?",
+            "DELETE FROM initial_context_package_build_attempts WHERE user_id = ?",
             "DELETE FROM initial_context_packages WHERE user_id = ?",
             "DELETE FROM conversation_topic_sources WHERE user_id = ?",
             "DELETE FROM conversation_topic_events WHERE user_id = ?",
             "DELETE FROM conversation_topics WHERE user_id = ?",
             "DELETE FROM conversation_activity_stats WHERE user_id = ?",
-            "DELETE FROM worker_job_runs WHERE user_id = ?",
+            "DELETE FROM proxy_turn_runs WHERE user_id = ?",
             "DELETE FROM artifact_links WHERE user_id = ?",
             "DELETE FROM artifact_chunks WHERE user_id = ?",
             "DELETE FROM artifact_blobs WHERE artifact_id IN (SELECT id FROM artifacts WHERE user_id = ?)",
@@ -1194,6 +1742,30 @@ class ConversationLifecycleService:
             "SELECT * FROM conversations WHERE id = ? AND user_id = ?",
             (conversation_id, user_id),
         )
+
+    async def _require_namespace_guard(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        namespace_guard: ConversationNamespaceSnapshot | None,
+    ) -> None:
+        if namespace_guard is None:
+            return
+        if (
+            namespace_guard.user_id != user_id
+            or conversation_id != namespace_guard.conversation_id
+        ):
+            raise ConversationNotFoundError("Conversation namespace changed")
+        current = await capture_conversation_namespace_snapshot(
+            connection,
+            self.runtime.clock,
+            user_id=user_id,
+            conversation_id=namespace_guard.conversation_id,
+        )
+        if current != namespace_guard:
+            raise ConversationNotFoundError("Conversation namespace changed")
 
     async def _get_memory(
         self,
@@ -1265,12 +1837,204 @@ class ConversationLifecycleService:
                       FROM messages
                       WHERE conversation_id = ?
                   )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM memory_evidence_spans AS evidence_span
+                      LEFT JOIN messages AS evidence_message
+                        ON evidence_message.id = evidence_span.message_id
+                      WHERE evidence_span.user_id = mo.user_id
+                        AND evidence_span.memory_id = mo.id
+                        AND (
+                            evidence_span.conversation_id = ?
+                            OR evidence_message.conversation_id = ?
+                        )
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM memory_fact_facets AS fact_facet
+                      JOIN messages AS fact_message
+                        ON fact_message.id = fact_facet.source_message_id
+                      WHERE fact_facet.user_id = mo.user_id
+                        AND fact_facet.memory_id = mo.id
+                        AND (
+                            fact_facet.conversation_id = ?
+                            OR fact_message.conversation_id = ?
+                        )
+                  )
               )
             ORDER BY mo.id ASC
             """,
-            (user_id, conversation_id, conversation_id),
+            (
+                user_id,
+                conversation_id,
+                conversation_id,
+                conversation_id,
+                conversation_id,
+                conversation_id,
+                conversation_id,
+            ),
         )
         return [str(row["id"]) for row in await cursor.fetchall()]
+
+    async def _bump_derivation_revision(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        excluded_source_message_ids: Iterable[str] = (),
+        excluded_conversation_ids: Iterable[str] = (),
+        allow_validated_requeue: bool = True,
+    ) -> int:
+        """Fence worker effects in the caller-owned source mutation transaction."""
+
+        repository = UserLifecycleRepository(connection, self.runtime.clock)
+        identity = await repository.get_active_identity(user_id)
+        if identity is None:
+            raise UserErasureCleanupPendingError(
+                "User lifecycle is not active; source mutation cannot commit"
+            )
+        revision = await repository.bump_derivation_revision(
+            user_id,
+            expected_lifecycle_epoch=identity.lifecycle_epoch,
+            commit=False,
+        )
+        if revision is None:
+            raise UserErasureCleanupPendingError(
+                "User lifecycle changed before source mutation could commit"
+            )
+        await JobRunRepository(
+            connection,
+            self.runtime.clock,
+        ).reconcile_stale_root_jobs_after_revision_bump(
+            user_id,
+            identity.derivation_revision,
+            revision,
+            excluded_source_message_ids=excluded_source_message_ids,
+            excluded_conversation_ids=excluded_conversation_ids,
+            allow_validated_requeue=allow_validated_requeue,
+        )
+        return revision
+
+    async def _memory_source_message_ids(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        memory_ids: list[str],
+    ) -> list[str]:
+        stable_ids = list(dict.fromkeys(memory_ids))
+        if not stable_ids:
+            return []
+        placeholders = self._placeholders(stable_ids)
+        cursor = await connection.execute(
+            f"""
+            SELECT *
+            FROM memory_objects
+            WHERE user_id = ?
+              AND id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            (user_id, *stable_ids),
+        )
+        memories = [_decode_json_columns(row) or {} for row in await cursor.fetchall()]
+        return await MemoryExtractionSuppressionRepository(
+            connection,
+            self.runtime.clock,
+        ).source_message_ids_for_memories(memories)
+
+    async def _require_extracted_source_provenance(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        memory_ids: list[str],
+        operation: str,
+    ) -> None:
+        stable_ids = list(dict.fromkeys(memory_ids))
+        if not stable_ids:
+            return
+        placeholders = self._placeholders(stable_ids)
+        cursor = await connection.execute(
+            f"""
+            SELECT *
+            FROM memory_objects
+            WHERE user_id = ?
+              AND source_kind = 'extracted'
+              AND id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            (user_id, *stable_ids),
+        )
+        repository = MemoryExtractionSuppressionRepository(
+            connection,
+            self.runtime.clock,
+        )
+        for row in await cursor.fetchall():
+            memory = _decode_json_columns(row) or {}
+            if await repository.source_message_ids_for_memories([memory]):
+                continue
+            raise MemoryProvenanceRepairRequiredError(
+                "Extracted memory "
+                f"{memory.get('id')} is missing source provenance; repair is required "
+                f"before {operation}"
+            )
+
+    @staticmethod
+    async def _conversation_message_ids(
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> list[str]:
+        cursor = await connection.execute(
+            """
+            SELECT message.id
+            FROM messages AS message
+            JOIN conversations AS conversation
+              ON conversation.id = message.conversation_id
+            WHERE conversation.user_id = ?
+              AND message.conversation_id = ?
+            ORDER BY message.seq ASC, message.id ASC
+            """,
+            (user_id, conversation_id),
+        )
+        return [str(row["id"]) for row in await cursor.fetchall()]
+
+    async def _suppress_memory_extractions(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        memory_ids: list[str],
+        reason: str,
+        replacement_memory_id: str | None = None,
+    ) -> int:
+        """Retire extraction identities before explicit source removal commits."""
+
+        stable_ids = list(dict.fromkeys(memory_ids))
+        if not stable_ids:
+            return 0
+        placeholders = self._placeholders(stable_ids)
+        cursor = await connection.execute(
+            f"""
+            SELECT *
+            FROM memory_objects
+            WHERE user_id = ?
+              AND id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            (user_id, *stable_ids),
+        )
+        memories = [_decode_json_columns(row) or {} for row in await cursor.fetchall()]
+        return await MemoryExtractionSuppressionRepository(
+            connection,
+            self.runtime.clock,
+        ).suppress_memories(
+            memories,
+            reason=reason,
+            replacement_memory_id=replacement_memory_id,
+            commit=False,
+        )
 
     async def _conversation_artifact_ids(
         self,
@@ -1333,7 +2097,9 @@ class ConversationLifecycleService:
                 """,
                 (user_id, MemoryObjectType.SUMMARY_VIEW.value, *sorted(frontier)),
             )
-            next_ids.update(str(row["summary_id"]) for row in await mirror_cursor.fetchall())
+            next_ids.update(
+                str(row["summary_id"]) for row in await mirror_cursor.fetchall()
+            )
             next_ids = next_ids - found
             found.update(next_ids)
             frontier = {
@@ -1375,6 +2141,21 @@ class ConversationLifecycleService:
             "DELETE FROM conversation_topic_events WHERE user_id = ? AND conversation_id = ?",
             (user_id, conversation_id),
         )
+        await self._cleanup_memory_projection_rows(
+            connection,
+            user_id=user_id,
+            memory_ids=memory_ids,
+        )
+
+    async def _cleanup_memory_projection_rows(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        memory_ids: list[str],
+    ) -> None:
+        """Remove only projections that directly depend on selected memories."""
+
         if not memory_ids:
             await self._delete_orphan_graph_rows(connection, user_id=user_id)
             return
@@ -1403,6 +2184,19 @@ class ConversationLifecycleService:
             """,
             (user_id, *memory_ids, *memory_ids, *memory_ids),
         )
+        topic_cursor = await connection.execute(
+            f"""
+            SELECT DISTINCT topic_id
+            FROM conversation_topic_sources
+            WHERE user_id = ?
+              AND source_kind = 'memory_object'
+              AND source_id IN ({placeholders})
+            """,
+            (user_id, *memory_ids),
+        )
+        affected_topic_ids = [
+            str(row["topic_id"]) for row in await topic_cursor.fetchall()
+        ]
         await connection.execute(
             f"""
             DELETE FROM conversation_topic_sources
@@ -1412,6 +2206,22 @@ class ConversationLifecycleService:
             """,
             (user_id, *memory_ids),
         )
+        if affected_topic_ids:
+            topic_placeholders = self._placeholders(affected_topic_ids)
+            await connection.execute(
+                f"""
+                DELETE FROM conversation_topics
+                WHERE user_id = ?
+                  AND id IN ({topic_placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM conversation_topic_sources AS source
+                      WHERE source.user_id = conversation_topics.user_id
+                        AND source.topic_id = conversation_topics.id
+                  )
+                """,
+                (user_id, *affected_topic_ids),
+            )
         await self._delete_orphan_graph_rows(connection, user_id=user_id)
 
     async def _delete_summary_views(
@@ -1561,9 +2371,6 @@ class ConversationLifecycleService:
 
     async def _invalidate_user_prompt_cache(self, user_id: str) -> None:
         await ContextCacheService(self.runtime).invalidate_user_cache(user_id)
-        await self.runtime.storage_backend.increment_cache_generation(
-            cache_generation_key(self.runtime.database_path, user_id)
-        )
 
     async def _delete_initial_context_packages_for_conversation(
         self,
@@ -1670,7 +2477,9 @@ class ConversationLifecycleService:
             """,
             (user_id, *artifact_ids),
         )
-        payload_blob_ids = [str(row["payload_blob_id"]) for row in await cursor.fetchall()]
+        payload_blob_ids = [
+            str(row["payload_blob_id"]) for row in await cursor.fetchall()
+        ]
         await connection.execute(
             f"DELETE FROM artifact_links WHERE user_id = ? AND artifact_id IN ({placeholders})",
             (user_id, *artifact_ids),
@@ -1705,249 +2514,6 @@ class ConversationLifecycleService:
                 (user_id, *payload_blob_ids, user_id),
             )
 
-    async def _queue_file_deletions_for_artifacts(
-        self,
-        connection: aiosqlite.Connection,
-        *,
-        user_id: str,
-        artifact_ids: list[str],
-        tombstone_id: str,
-        reason: str,
-        timestamp: str,
-    ) -> None:
-        if not artifact_ids:
-            return
-        placeholders = self._placeholders(artifact_ids)
-        queued_storage_uris: set[str] = set()
-        cursor = await connection.execute(
-            f"""
-            SELECT DISTINCT ab.storage_uri, ab.sha256
-            FROM artifact_blobs AS ab
-            JOIN artifacts AS a ON a.id = ab.artifact_id
-            WHERE a.user_id = ?
-              AND a.id IN ({placeholders})
-              AND ab.storage_kind = 'local_file'
-              AND ab.storage_uri IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM artifact_blobs AS live_ab
-                  JOIN artifacts AS live_a ON live_a.id = live_ab.artifact_id
-                  WHERE live_a.user_id = a.user_id
-                    AND live_a.id NOT IN ({placeholders})
-                    AND live_a.status NOT IN ('deleted', 'purged')
-                    AND live_ab.storage_kind = 'local_file'
-                    AND live_ab.storage_uri = ab.storage_uri
-              )
-            """,
-            (user_id, *artifact_ids, *artifact_ids),
-        )
-        storage_root = str(self.runtime.settings.artifact_blobs_dir())
-        for row in await cursor.fetchall():
-            await self._insert_pending_file_deletion(
-                connection,
-                storage_uri=str(row["storage_uri"]),
-                sha256=row["sha256"],
-                storage_root=storage_root,
-                reason=reason,
-                tombstone_id=tombstone_id,
-                timestamp=timestamp,
-                queued_storage_uris=queued_storage_uris,
-            )
-        cursor = await connection.execute(
-            f"""
-            SELECT DISTINCT apb.storage_key AS storage_uri, apb.content_sha256 AS sha256
-            FROM artifacts AS a
-            JOIN artifact_payload_blobs AS apb
-              ON apb.id = a.payload_blob_id
-             AND apb.user_id = a.user_id
-            WHERE a.user_id = ?
-              AND a.id IN ({placeholders})
-              AND apb.storage_kind = 'local_file'
-              AND apb.storage_key IS NOT NULL
-              AND apb.status IN ('pending', 'ready', 'gc_pending', 'quarantined')
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM artifacts AS live_a
-                  WHERE live_a.user_id = a.user_id
-                    AND live_a.payload_blob_id = apb.id
-                    AND live_a.id NOT IN ({placeholders})
-                    AND live_a.status NOT IN ('deleted', 'purged')
-              )
-            """,
-            (user_id, *artifact_ids, *artifact_ids),
-        )
-        for row in await cursor.fetchall():
-            await self._insert_pending_file_deletion(
-                connection,
-                storage_uri=str(row["storage_uri"]),
-                sha256=row["sha256"],
-                storage_root=storage_root,
-                reason=reason,
-                tombstone_id=tombstone_id,
-                timestamp=timestamp,
-                queued_storage_uris=queued_storage_uris,
-            )
-
-    async def _insert_pending_file_deletion(
-        self,
-        connection: aiosqlite.Connection,
-        *,
-        storage_uri: str,
-        sha256: str | None,
-        storage_root: str,
-        reason: str,
-        tombstone_id: str,
-        timestamp: str,
-        queued_storage_uris: set[str],
-    ) -> None:
-        if storage_uri in queued_storage_uris:
-            return
-        queued_storage_uris.add(storage_uri)
-        await connection.execute(
-            """
-            INSERT INTO pending_file_deletions(
-                id,
-                storage_uri,
-                storage_root,
-                sha256,
-                reason,
-                tombstone_id,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                generate_prefixed_id("pfd"),
-                storage_uri,
-                storage_root,
-                sha256,
-                reason,
-                tombstone_id,
-                timestamp,
-            ),
-        )
-
-    async def _process_pending_file_deletions(
-        self,
-        connection: aiosqlite.Connection,
-        *,
-        tombstone_id: str,
-    ) -> int:
-        cursor = await connection.execute(
-            """
-            SELECT *
-            FROM pending_file_deletions
-            WHERE tombstone_id = ?
-              AND deleted_at IS NULL
-            ORDER BY created_at ASC, id ASC
-            """,
-            (tombstone_id,),
-        )
-        rows = await cursor.fetchall()
-        if not rows:
-            return 0
-        return await self._process_file_deletion_rows(connection, rows)
-
-    async def _process_file_deletion_rows(
-        self,
-        connection: aiosqlite.Connection,
-        rows: Iterable[aiosqlite.Row],
-    ) -> int:
-        timestamp = self.runtime.clock.now().isoformat()
-        processed = 0
-        for row in rows:
-            error: str | None = None
-            deleted_at: str | None = timestamp
-            try:
-                storage_root = str(row["storage_root"] or "").strip()
-                if not storage_root:
-                    error = "No storage root recorded for pending artifact blob deletion"
-                    deleted_at = None
-                elif await self._storage_uri_has_live_references(
-                    connection,
-                    str(row["storage_uri"]),
-                    storage_root=storage_root,
-                ):
-                    error = "Artifact blob still has live references"
-                    deleted_at = None
-                else:
-                    ArtifactBlobStore(storage_root).delete_storage_uri(str(row["storage_uri"]))
-            except Exception as exc:
-                error = str(exc)
-                deleted_at = None
-            await connection.execute(
-                """
-                UPDATE pending_file_deletions
-                SET attempted_at = ?,
-                    deleted_at = ?,
-                    last_error = ?
-                WHERE id = ?
-                """,
-                (timestamp, deleted_at, error, row["id"]),
-            )
-            processed += 1
-        await connection.commit()
-        return processed
-
-    async def _storage_uri_has_live_references(
-        self,
-        connection: aiosqlite.Connection,
-        storage_uri: str,
-        *,
-        storage_root: str,
-    ) -> bool:
-        candidates: list[str] = []
-        legacy_cursor = await connection.execute(
-            """
-            SELECT DISTINCT ab.storage_uri
-            FROM artifact_blobs AS ab
-            JOIN artifacts AS a ON a.id = ab.artifact_id
-            WHERE ab.storage_kind = 'local_file'
-              AND ab.storage_uri IS NOT NULL
-              AND a.status NOT IN ('deleted', 'purged')
-            """
-        )
-        candidates.extend(str(row["storage_uri"]) for row in await legacy_cursor.fetchall())
-        payload_cursor = await connection.execute(
-            """
-            SELECT DISTINCT apb.storage_key AS storage_uri
-            FROM artifact_payload_blobs AS apb
-            WHERE apb.storage_kind = 'local_file'
-              AND apb.storage_key IS NOT NULL
-              AND apb.status IN ('pending', 'ready', 'gc_pending', 'quarantined')
-              AND EXISTS (
-                  SELECT 1
-                  FROM artifacts AS a
-                  WHERE a.user_id = apb.user_id
-                    AND a.payload_blob_id = apb.id
-                    AND a.status NOT IN ('deleted', 'purged')
-              )
-            """
-        )
-        candidates.extend(str(row["storage_uri"]) for row in await payload_cursor.fetchall())
-        if Path(storage_uri).expanduser().is_absolute() and storage_uri in candidates:
-            return True
-        target_store = ArtifactBlobStore(storage_root)
-        try:
-            target_path = target_store.path_for_storage_uri(storage_uri, strict=False)
-        except Exception:
-            return False
-        current_store = self.runtime.artifact_blob_store or target_store
-        for candidate in candidates:
-            try:
-                if self._resolve_live_storage_uri(candidate, current_store=current_store) == target_path:
-                    return True
-            except Exception:
-                continue
-        return False
-
-    @staticmethod
-    def _resolve_live_storage_uri(storage_uri: str, *, current_store: ArtifactBlobStore) -> Path:
-        raw_path = Path(storage_uri).expanduser()
-        if raw_path.is_absolute():
-            return raw_path.resolve(strict=False)
-        return current_store.path_for_storage_uri(storage_uri, strict=False)
-
     async def _delete_embeddings_for_ids(
         self,
         connection: aiosqlite.Connection,
@@ -1965,6 +2531,21 @@ class ConversationLifecycleService:
             except aiosqlite.OperationalError as exc:
                 if "no such table" not in str(exc).lower():
                     raise
+
+    @staticmethod
+    async def _delete_embeddings_for_user(
+        connection: aiosqlite.Connection,
+        user_id: str,
+    ) -> None:
+        try:
+            await connection.execute(
+                "DELETE FROM vec_memory_embeddings WHERE user_id = ?",
+                (user_id,),
+            )
+        except aiosqlite.OperationalError as exc:
+            normalized = str(exc).lower()
+            if "no such table" not in normalized and "no such column" not in normalized:
+                raise
 
     async def _delete_embedding_index_entries(self, memory_ids: list[str]) -> None:
         for memory_id in dict.fromkeys(memory_ids):
@@ -2004,9 +2585,13 @@ class ConversationLifecycleService:
             ),
         )
 
-    async def _purge_conversation_jobs(self, user_id: str, conversation_id: str) -> None:
+    async def _purge_conversation_jobs(
+        self, user_id: str, conversation_id: str
+    ) -> None:
         if self.runtime.settings.erasure_purge_streams:
-            await self.runtime.storage_backend.purge_conversation_jobs(user_id, conversation_id)
+            await self.runtime.storage_backend.purge_conversation_jobs(
+                user_id, conversation_id
+            )
 
     async def _fetch_one(
         self,
@@ -2051,7 +2636,11 @@ class ConversationLifecycleService:
 
     @staticmethod
     def _placeholders(values: Iterable[Any]) -> str:
-        count = len(list(values)) if not isinstance(values, (list, tuple, set)) else len(values)
+        count = (
+            len(list(values))
+            if not isinstance(values, (list, tuple, set))
+            else len(values)
+        )
         if count <= 0:
             raise ValueError("Cannot build placeholders for an empty value set")
         return ", ".join("?" for _ in range(count))

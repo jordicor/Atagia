@@ -20,8 +20,8 @@ from atagia.memory.lifecycle_runner import (
 )
 from atagia.services.embeddings import NoneBackend
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def _settings(db_path: Path) -> Settings:
@@ -54,7 +54,6 @@ class _RuntimeView:
     settings: Settings
     embedding_index: NoneBackend
     storage_backend: InProcessBackend
-    artifact_blob_store: None = None
     llm_client: None = None
 
 

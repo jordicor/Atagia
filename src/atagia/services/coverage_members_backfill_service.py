@@ -22,6 +22,11 @@ import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field
 
 from atagia.core import json_utils
+from atagia.core.admin_maintenance_repository import (
+    AdminMaintenanceOperation,
+    AdminMaintenanceRepository,
+)
+from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.memory.extraction_cards import (
     CandidateDraft,
@@ -93,12 +98,16 @@ class CoverageMembersBackfillService:
         connection: aiosqlite.Connection,
         llm_client: LLMClient[Any],
         settings: Settings | None = None,
+        clock: Clock | None = None,
+        maintenance_operation: AdminMaintenanceOperation | None = None,
         progress_callback: ProgressCallback | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._connection = connection
         self._llm_client = llm_client
         self._settings = settings or Settings.from_env()
+        self._clock = clock
+        self._maintenance_operation = maintenance_operation
         self._card_model = resolve_component_model(self._settings, "extractor")
         self._resolved_policy = PolicyResolver().resolve(
             ManifestLoader(self._settings.manifests_dir()).get(
@@ -255,25 +264,52 @@ class CoverageMembersBackfillService:
         row: aiosqlite.Row,
         members: list[CoverageMember],
     ) -> None:
-        payload = self._decode_payload(row["payload_json"])
-        payload[_COVERAGE_MEMBERS_PAYLOAD_KEY] = [
-            member.model_dump(mode="json") for member in members
-        ]
-        await self._connection.execute(
-            """
-            UPDATE memory_objects
-            SET payload_json = ?
-            WHERE id = ?
-              AND user_id = ?
-              AND json_extract(payload_json, '$.{key}') IS NULL
-            """.format(key=_COVERAGE_MEMBERS_PAYLOAD_KEY),
-            (
-                json_utils.dumps(payload, sort_keys=True),
-                str(row["id"]),
-                str(row["user_id"]),
-            ),
-        )
-        await self._connection.commit()
+        await self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self._maintenance_operation is not None:
+                if self._clock is None:
+                    raise RuntimeError("Maintenance validation requires a clock")
+                await AdminMaintenanceRepository(
+                    self._connection,
+                    self._clock,
+                ).require_current(self._maintenance_operation)
+                await AdminMaintenanceRepository(
+                    self._connection,
+                    self._clock,
+                ).mark_dirty(self._maintenance_operation)
+            current_cursor = await self._connection.execute(
+                """
+                SELECT payload_json
+                FROM memory_objects
+                WHERE id = ? AND user_id = ?
+                """,
+                (str(row["id"]), str(row["user_id"])),
+            )
+            current = await current_cursor.fetchone()
+            if current is None:
+                raise ValueError("Memory disappeared during coverage backfill")
+            payload = self._decode_payload(current["payload_json"])
+            payload[_COVERAGE_MEMBERS_PAYLOAD_KEY] = [
+                member.model_dump(mode="json") for member in members
+            ]
+            await self._connection.execute(
+                """
+                UPDATE memory_objects
+                SET payload_json = ?
+                WHERE id = ?
+                  AND user_id = ?
+                  AND json_extract(payload_json, '$.{key}') IS NULL
+                """.format(key=_COVERAGE_MEMBERS_PAYLOAD_KEY),
+                (
+                    json_utils.dumps(payload, sort_keys=True),
+                    str(row["id"]),
+                    str(row["user_id"]),
+                ),
+            )
+            await self._connection.commit()
+        except Exception:
+            await self._connection.rollback()
+            raise
 
     @staticmethod
     def _decode_payload(raw_payload: Any) -> dict[str, Any]:

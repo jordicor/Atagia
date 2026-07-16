@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -20,7 +21,6 @@ from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
 )
-from atagia.core.storage_backend import InProcessBackend
 from atagia.memory.belief_reviser import RevisionAction, RevisionDecision
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_jobs import (
@@ -29,8 +29,14 @@ from atagia.models.schemas_jobs import (
     REVISE_STREAM_NAME,
     RevisionJobPayload,
 )
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
+from atagia.models.schemas_memory import (
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    MemoryStatus,
+)
 from atagia.services.embeddings import EmbeddingIndex
+from atagia.services.job_execution_context import StaleParentJobFenceError
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -40,9 +46,14 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.workers.revision_worker import RevisionWorker
+from tests.durable_job_support import DurableJobTestBackend, bound_test_job_claim
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 class QueueProvider(LLMProvider):
@@ -88,7 +99,7 @@ class QueueProvider(LLMProvider):
 class FlipEquivalenceProvider(LLMProvider):
     """Equivalence True at the first call (match), False if ever re-called.
 
-    Models the conv-26 root cause: the non-deterministic claim-key equivalence
+    Models a previously observed root cause: non-deterministic claim-key equivalence
     LLM flips between match-time and revision-preview time. With Layer (b) the
     preview must trust the match and never re-call equivalence, so the flip is
     never observed and the revision succeeds.
@@ -110,7 +121,10 @@ class FlipEquivalenceProvider(LLMProvider):
                 provider=self.name,
                 model=request.model,
                 output_text=json.dumps(
-                    {"is_explicit": is_explicit, "reasoning": "Test classifier response."}
+                    {
+                        "is_explicit": is_explicit,
+                        "reasoning": "Test classifier response.",
+                    }
                 ),
             )
         if request.metadata.get("purpose") == "intent_classifier_claim_key_equivalence":
@@ -142,7 +156,9 @@ class RecordingEmbeddingIndex(EmbeddingIndex):
     def vector_limit(self) -> int:
         return 1
 
-    async def upsert(self, memory_id: str, text: str, metadata: dict[str, object]) -> None:
+    async def upsert(
+        self, memory_id: str, text: str, metadata: dict[str, object]
+    ) -> None:
         self.upsert_calls.append((memory_id, text, metadata))
 
     async def search(self, query: str, user_id: str, top_k: int):
@@ -191,7 +207,9 @@ async def _build_runtime(
 ):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 1, 18, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -200,8 +218,12 @@ async def _build_runtime(
     beliefs = BeliefRepository(connection, clock)
     await users.create_user("usr_1")
     await workspaces.create_workspace("wrk_1", "usr_1", "Workspace")
-    await conversations.create_conversation("cnv_1", "usr_1", "wrk_1", "coding_debug", "One")
-    await conversations.create_conversation("cnv_2", "usr_1", "wrk_1", "research_deep_dive", "Two")
+    await conversations.create_conversation(
+        "cnv_1", "usr_1", "wrk_1", "coding_debug", "One"
+    )
+    await conversations.create_conversation(
+        "cnv_2", "usr_1", "wrk_1", "research_deep_dive", "Two"
+    )
     await messages.create_message(
         "msg_1",
         "cnv_1",
@@ -229,7 +251,8 @@ async def _build_runtime(
         8,
         {},
     )
-    backend = InProcessBackend()
+    resolved_settings = _settings()
+    backend = DurableJobTestBackend(connection, clock, settings=resolved_settings)
     provider = provider if provider is not None else QueueProvider(outputs)
     worker = RevisionWorker(
         storage_backend=backend,
@@ -241,7 +264,7 @@ async def _build_runtime(
         ),
         clock=clock,
         embedding_index=embedding_index,
-        settings=_settings(),
+        settings=resolved_settings,
     )
     return connection, backend, memories, beliefs, worker
 
@@ -333,8 +356,13 @@ def _revision_job(
     remember_across_chats: bool = True,
     isolated_mode: bool = False,
 ) -> JobEnvelope:
+    job_identity = (
+        evidence_memory_ids[0]
+        if evidence_memory_ids
+        else f"{belief_id or 'no_belief'}_{source_message_id}"
+    )
     return JobEnvelope(
-        job_id="job_revision_1",
+        job_id=f"job_revision_{job_identity}",
         job_type=JobType.REVISE_BELIEFS,
         user_id="usr_1",
         conversation_id="cnv_1",
@@ -360,10 +388,68 @@ def _revision_job(
     )
 
 
+async def _process_direct(
+    worker: RevisionWorker,
+    payload: dict[str, object],
+) -> dict[str, Any] | None:
+    """Bind the same lifecycle claim required by production worker dispatch."""
+
+    connection = worker._memory_repository._connection
+    async with bound_test_job_claim(
+        connection,
+        worker._storage_backend,
+        worker._clock,
+        payload,
+    ):
+        return await worker.process_job(payload)
+
+
 @pytest.mark.asyncio
-async def test_revision_worker_processes_revision_job_end_to_end_and_releases_lock() -> None:
+async def test_revision_process_job_rejects_unclaimed_and_mismatched_invocations() -> (
+    None
+):
+    connection, backend, memories, _beliefs, worker = await _build_runtime([])
+    try:
+        target = _revision_job(
+            belief_id="",
+            evidence_memory_ids=[],
+            source_message_id="msg_unclaimed_revision",
+            scope=MemoryScope.USER.value,
+        )
+        target_payload = target.model_dump(mode="json")
+
+        with pytest.raises(StaleParentJobFenceError):
+            await worker.process_job(target_payload)
+
+        other = target.model_copy(update={"job_id": "job_other_revision_claim"})
+        async with bound_test_job_claim(
+            connection,
+            backend,
+            worker._clock,
+            other,
+        ):
+            with pytest.raises(StaleParentJobFenceError):
+                await worker.process_job(target_payload)
+
+        assert backend._lifecycle_locks == {}
+        assert await memories.list_for_user("usr_1") == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_revision_worker_processes_revision_job_end_to_end_and_releases_lock() -> (
+    None
+):
     connection, backend, memories, beliefs, worker = await _build_runtime(
-        [json.dumps({"action": "REINFORCE", "explanation": "This evidence reinforces the belief."})]
+        [
+            json.dumps(
+                {
+                    "action": "REINFORCE",
+                    "explanation": "This evidence reinforces the belief.",
+                }
+            )
+        ]
     )
     try:
         worker._settings = replace(worker._settings, belief_tension_threshold=0.1)
@@ -426,14 +512,15 @@ async def test_revision_worker_wires_embedding_index_into_successor_revisions() 
             source_message_id="msg_1",
         )
 
-        result = await worker.process_job(
+        result = await _process_direct(
+            worker,
             _revision_job(
                 belief_id=str(belief["id"]),
                 evidence_memory_ids=[str(evidence["id"])],
                 source_message_id="msg_1",
                 scope=MemoryScope.CONVERSATION.value,
                 claim_value="concise",
-            ).model_dump(mode="json")
+            ).model_dump(mode="json"),
         )
 
         assert result is not None
@@ -445,7 +532,9 @@ async def test_revision_worker_wires_embedding_index_into_successor_revisions() 
 
 
 @pytest.mark.asyncio
-async def test_revision_worker_defers_contradictory_revision_below_tension_threshold() -> None:
+async def test_revision_worker_defers_contradictory_revision_below_tension_threshold() -> (
+    None
+):
     connection, _backend, memories, beliefs, worker = await _build_runtime([])
     try:
         belief = await _seed_belief(memories, beliefs)
@@ -457,27 +546,32 @@ async def test_revision_worker_defers_contradictory_revision_below_tension_thres
             source_message_id="msg_1",
         )
 
-        result = await worker.process_job(
+        result = await _process_direct(
+            worker,
             _revision_job(
                 belief_id=str(belief["id"]),
                 evidence_memory_ids=[str(evidence["id"])],
                 source_message_id="msg_1",
                 scope=MemoryScope.CONVERSATION.value,
                 claim_value="verbose",
-            ).model_dump(mode="json")
+            ).model_dump(mode="json"),
         )
 
         assert result is not None
         assert result["status"] == "deferred_tension"
         assert result["signal_type"] == "contradictory"
         assert result["tension_score"] == pytest.approx(0.15)
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.15)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.15)
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_revision_worker_defers_same_value_scope_exception_after_preview() -> None:
+async def test_revision_worker_defers_same_value_scope_exception_after_preview() -> (
+    None
+):
     connection, _backend, memories, beliefs, worker = await _build_runtime(
         [_split_by_scope_output("This belief only holds in a narrower scope.")]
     )
@@ -498,29 +592,41 @@ async def test_revision_worker_defers_same_value_scope_exception_after_preview()
             source_message_id="msg_1",
         )
 
-        result = await worker.process_job(
+        result = await _process_direct(
+            worker,
             _revision_job(
                 belief_id=str(belief["id"]),
                 evidence_memory_ids=[str(evidence["id"])],
                 source_message_id="msg_1",
                 scope=MemoryScope.CONVERSATION.value,
                 claim_value="terse",
-            ).model_dump(mode="json")
+            ).model_dump(mode="json"),
         )
 
         assert result is not None
         assert result["status"] == "deferred_tension"
         assert result["signal_type"] == "ambiguous"
         assert result["preview_action"] == "SPLIT_BY_SCOPE"
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.15)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.15)
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_revision_worker_allows_same_value_narrower_scope_reinforcement_after_preview() -> None:
+async def test_revision_worker_allows_same_value_narrower_scope_reinforcement_after_preview() -> (
+    None
+):
     connection, _backend, memories, beliefs, worker = await _build_runtime(
-        [json.dumps({"action": "REINFORCE", "explanation": "The narrower evidence still reinforces the broader belief."})]
+        [
+            json.dumps(
+                {
+                    "action": "REINFORCE",
+                    "explanation": "The narrower evidence still reinforces the broader belief.",
+                }
+            )
+        ]
     )
     try:
         belief = await _seed_belief(
@@ -539,14 +645,15 @@ async def test_revision_worker_allows_same_value_narrower_scope_reinforcement_af
             source_message_id="msg_1",
         )
 
-        result = await worker.process_job(
+        result = await _process_direct(
+            worker,
             _revision_job(
                 belief_id=str(belief["id"]),
                 evidence_memory_ids=[str(evidence["id"])],
                 source_message_id="msg_1",
                 scope=MemoryScope.CONVERSATION.value,
                 claim_value="terse",
-            ).model_dump(mode="json")
+            ).model_dump(mode="json"),
         )
         cursor = await connection.execute(
             "SELECT support_count FROM belief_versions WHERE belief_id = ? AND is_current = 1",
@@ -558,15 +665,26 @@ async def test_revision_worker_allows_same_value_narrower_scope_reinforcement_af
         assert result["action"] == "REINFORCE"
         assert result["signal_type"] == "ambiguous"
         assert version["support_count"] == 2
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.0)
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_revision_worker_resets_tension_and_revises_once_threshold_is_reached() -> None:
+async def test_revision_worker_resets_tension_and_revises_once_threshold_is_reached() -> (
+    None
+):
     connection, _backend, memories, beliefs, worker = await _build_runtime(
-        [json.dumps({"action": "WEAKEN", "explanation": "Contradiction reached the threshold."})]
+        [
+            json.dumps(
+                {
+                    "action": "WEAKEN",
+                    "explanation": "Contradiction reached the threshold.",
+                }
+            )
+        ]
     )
     try:
         belief = await _seed_belief(memories, beliefs)
@@ -579,21 +697,24 @@ async def test_revision_worker_resets_tension_and_revises_once_threshold_is_reac
             source_message_id="msg_1",
         )
 
-        result = await worker.process_job(
+        result = await _process_direct(
+            worker,
             _revision_job(
                 belief_id=str(belief["id"]),
                 evidence_memory_ids=[str(evidence["id"])],
                 source_message_id="msg_1",
                 scope=MemoryScope.CONVERSATION.value,
                 claim_value="verbose",
-            ).model_dump(mode="json")
+            ).model_dump(mode="json"),
         )
 
         assert result is not None
         assert result["action"] == "WEAKEN"
         assert result["signal_type"] == "contradictory"
         assert result["trigger_tension_score"] == pytest.approx(0.60)
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.0)
     finally:
         await connection.close()
 
@@ -630,28 +751,40 @@ async def test_revision_worker_threshold_preview_runs_outside_write_transaction(
             preview_without_open_write_transaction,
         )
 
-        result = await worker.process_job(
+        result = await _process_direct(
+            worker,
             _revision_job(
                 belief_id=str(belief["id"]),
                 evidence_memory_ids=[str(evidence["id"])],
                 source_message_id="msg_1",
                 scope=MemoryScope.CONVERSATION.value,
                 claim_value="verbose",
-            ).model_dump(mode="json")
+            ).model_dump(mode="json"),
         )
 
         assert result is not None
         assert result["action"] == "WEAKEN"
         assert result["trigger_tension_score"] == pytest.approx(0.60)
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.0)
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_revision_worker_reinforcing_evidence_reduces_tension_before_reinforce() -> None:
+async def test_revision_worker_reinforcing_evidence_reduces_tension_before_reinforce() -> (
+    None
+):
     connection, _backend, memories, beliefs, worker = await _build_runtime(
-        [json.dumps({"action": "REINFORCE", "explanation": "This evidence reinforces the belief."})]
+        [
+            json.dumps(
+                {
+                    "action": "REINFORCE",
+                    "explanation": "This evidence reinforces the belief.",
+                }
+            )
+        ]
     )
     try:
         belief = await _seed_belief(memories, beliefs)
@@ -664,20 +797,23 @@ async def test_revision_worker_reinforcing_evidence_reduces_tension_before_reinf
             source_message_id="msg_1",
         )
 
-        result = await worker.process_job(
+        result = await _process_direct(
+            worker,
             _revision_job(
                 belief_id=str(belief["id"]),
                 evidence_memory_ids=[str(evidence["id"])],
                 source_message_id="msg_1",
                 scope=MemoryScope.CONVERSATION.value,
-            ).model_dump(mode="json")
+            ).model_dump(mode="json"),
         )
 
         assert result is not None
         assert result["action"] == "REINFORCE"
         assert result["signal_type"] == "ambiguous"
         assert result["tension_score"] == pytest.approx(0.15)
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.15)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.15)
     finally:
         await connection.close()
 
@@ -702,7 +838,9 @@ async def test_revision_worker_propagates_tension_decrement_failures_after_reinf
             del args, kwargs
             raise RuntimeError("decrement failed")
 
-        monkeypatch.setattr(worker._belief_repository, "decrement_tension", fail_decrement)
+        monkeypatch.setattr(
+            worker._belief_repository, "decrement_tension", fail_decrement
+        )
 
         with pytest.raises(RuntimeError, match="decrement failed"):
             await worker._post_revision_tension_update(  # noqa: SLF001
@@ -714,9 +852,18 @@ async def test_revision_worker_propagates_tension_decrement_failures_after_reinf
 
 
 @pytest.mark.asyncio
-async def test_revision_worker_replays_accumulated_contradictory_evidence_at_threshold() -> None:
+async def test_revision_worker_replays_accumulated_contradictory_evidence_at_threshold() -> (
+    None
+):
     connection, _backend, memories, beliefs, worker = await _build_runtime(
-        [json.dumps({"action": "WEAKEN", "explanation": "Accumulated contradictions reached the threshold."})]
+        [
+            json.dumps(
+                {
+                    "action": "WEAKEN",
+                    "explanation": "Accumulated contradictions reached the threshold.",
+                }
+            )
+        ]
     )
     try:
         belief = await _seed_belief(memories, beliefs)
@@ -730,14 +877,15 @@ async def test_revision_worker_replays_accumulated_contradictory_evidence_at_thr
                 source_message_id="msg_1",
             )
             evidence_ids.append(str(evidence["id"]))
-            result = await worker.process_job(
+            result = await _process_direct(
+                worker,
                 _revision_job(
                     belief_id=str(belief["id"]),
                     evidence_memory_ids=[str(evidence["id"])],
                     source_message_id="msg_1",
                     scope=MemoryScope.CONVERSATION.value,
                     claim_value="verbose",
-                ).model_dump(mode="json")
+                ).model_dump(mode="json"),
             )
             assert result is not None
 
@@ -753,20 +901,29 @@ async def test_revision_worker_replays_accumulated_contradictory_evidence_at_thr
         assert version["contradict_count"] == 4
         assert belief_row is not None
         assert belief_row["payload_json"].get("tension_evidence_memory_ids") is None
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.0)
         assert len(evidence_ids) == 4
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_revision_worker_clears_stale_contradiction_buffer_when_tension_returns_to_zero() -> None:
+async def test_revision_worker_clears_stale_contradiction_buffer_when_tension_returns_to_zero() -> (
+    None
+):
     connection, _backend, memories, beliefs, worker = await _build_runtime(
         [
             json.dumps({"action": "REINFORCE", "explanation": "Reinforcing evidence."}),
             json.dumps({"action": "REINFORCE", "explanation": "Reinforcing evidence."}),
             json.dumps({"action": "REINFORCE", "explanation": "Reinforcing evidence."}),
-            json.dumps({"action": "WEAKEN", "explanation": "Fresh contradictions reached the threshold."}),
+            json.dumps(
+                {
+                    "action": "WEAKEN",
+                    "explanation": "Fresh contradictions reached the threshold.",
+                }
+            ),
         ]
     )
     try:
@@ -778,14 +935,15 @@ async def test_revision_worker_clears_stale_contradiction_buffer_when_tension_re
             assistant_mode_id="coding_debug",
             source_message_id="msg_1",
         )
-        deferred = await worker.process_job(
+        deferred = await _process_direct(
+            worker,
             _revision_job(
                 belief_id=str(belief["id"]),
                 evidence_memory_ids=[str(contradiction["id"])],
                 source_message_id="msg_1",
                 scope=MemoryScope.CONVERSATION.value,
                 claim_value="verbose",
-            ).model_dump(mode="json")
+            ).model_dump(mode="json"),
         )
         assert deferred is not None
         assert deferred["status"] == "deferred_tension"
@@ -798,18 +956,21 @@ async def test_revision_worker_clears_stale_contradiction_buffer_when_tension_re
                 assistant_mode_id="coding_debug",
                 source_message_id="msg_1",
             )
-            reinforce = await worker.process_job(
+            reinforce = await _process_direct(
+                worker,
                 _revision_job(
                     belief_id=str(belief["id"]),
                     evidence_memory_ids=[str(reinforce_evidence["id"])],
                     source_message_id="msg_1",
                     scope=MemoryScope.CONVERSATION.value,
-                ).model_dump(mode="json")
+                ).model_dump(mode="json"),
             )
             assert reinforce is not None
             assert reinforce["action"] == "REINFORCE"
 
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.0)
 
         for index in range(1, 5):
             contradiction_evidence = await _seed_evidence(
@@ -819,14 +980,15 @@ async def test_revision_worker_clears_stale_contradiction_buffer_when_tension_re
                 assistant_mode_id="coding_debug",
                 source_message_id="msg_1",
             )
-            result = await worker.process_job(
+            result = await _process_direct(
+                worker,
                 _revision_job(
                     belief_id=str(belief["id"]),
                     evidence_memory_ids=[str(contradiction_evidence["id"])],
                     source_message_id="msg_1",
                     scope=MemoryScope.CONVERSATION.value,
                     claim_value="verbose",
-                ).model_dump(mode="json")
+                ).model_dump(mode="json"),
             )
             assert result is not None
 
@@ -843,7 +1005,9 @@ async def test_revision_worker_clears_stale_contradiction_buffer_when_tension_re
 
 
 @pytest.mark.asyncio
-async def test_revision_worker_reuses_threshold_preview_for_ambiguous_same_value_cases() -> None:
+async def test_revision_worker_reuses_threshold_preview_for_ambiguous_same_value_cases() -> (
+    None
+):
     connection, _backend, memories, beliefs, worker = await _build_runtime(
         [
             _split_by_scope_output("Preview 1."),
@@ -871,27 +1035,32 @@ async def test_revision_worker_reuses_threshold_preview_for_ambiguous_same_value
                 assistant_mode_id="coding_debug",
                 source_message_id="msg_1",
             )
-            result = await worker.process_job(
+            result = await _process_direct(
+                worker,
                 _revision_job(
                     belief_id=str(belief["id"]),
                     evidence_memory_ids=[str(evidence["id"])],
                     source_message_id="msg_1",
                     scope=MemoryScope.CONVERSATION.value,
                     claim_value="terse",
-                ).model_dump(mode="json")
+                ).model_dump(mode="json"),
             )
             assert result is not None
 
         assert result["action"] == "SPLIT_BY_SCOPE"
         assert result["signal_type"] == "ambiguous"
         assert result["trigger_tension_score"] == pytest.approx(0.60)
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.0)
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_revision_worker_preserves_contradiction_buffer_when_threshold_revision_fails() -> None:
+async def test_revision_worker_preserves_contradiction_buffer_when_threshold_revision_fails() -> (
+    None
+):
     connection, _backend, memories, beliefs, worker = await _build_runtime(["not-json"])
     try:
         belief = await _seed_belief(memories, beliefs)
@@ -904,34 +1073,38 @@ async def test_revision_worker_preserves_contradiction_buffer_when_threshold_rev
                 source_message_id="msg_1",
             )
             if index < 4:
-                result = await worker.process_job(
+                result = await _process_direct(
+                    worker,
                     _revision_job(
                         belief_id=str(belief["id"]),
                         evidence_memory_ids=[str(evidence["id"])],
                         source_message_id="msg_1",
                         scope=MemoryScope.CONVERSATION.value,
                         claim_value="verbose",
-                    ).model_dump(mode="json")
+                    ).model_dump(mode="json"),
                 )
                 assert result is not None
                 assert result["status"] == "deferred_tension"
                 continue
 
             with pytest.raises(Exception):
-                await worker.process_job(
+                await _process_direct(
+                    worker,
                     _revision_job(
                         belief_id=str(belief["id"]),
                         evidence_memory_ids=[str(evidence["id"])],
                         source_message_id="msg_1",
                         scope=MemoryScope.CONVERSATION.value,
                         claim_value="verbose",
-                    ).model_dump(mode="json")
+                    ).model_dump(mode="json"),
                 )
 
         belief_row = await memories.get_memory_object(str(belief["id"]), "usr_1")
 
         assert belief_row is not None
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.60)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.60)
         assert belief_row["payload_json"]["tension_evidence_memory_ids"] == [
             "mem_evidence_fail_contradiction_1",
             "mem_evidence_fail_contradiction_2",
@@ -943,7 +1116,9 @@ async def test_revision_worker_preserves_contradiction_buffer_when_threshold_rev
 
 
 @pytest.mark.asyncio
-async def test_revision_worker_preserves_ambiguous_buffer_when_threshold_preview_fails() -> None:
+async def test_revision_worker_preserves_ambiguous_buffer_when_threshold_preview_fails() -> (
+    None
+):
     connection, _backend, memories, beliefs, worker = await _build_runtime(
         [
             _split_by_scope_output("Preview 1."),
@@ -971,34 +1146,38 @@ async def test_revision_worker_preserves_ambiguous_buffer_when_threshold_preview
                 source_message_id="msg_1",
             )
             if index < 4:
-                result = await worker.process_job(
+                result = await _process_direct(
+                    worker,
                     _revision_job(
                         belief_id=str(belief["id"]),
                         evidence_memory_ids=[str(evidence["id"])],
                         source_message_id="msg_1",
                         scope=MemoryScope.CONVERSATION.value,
                         claim_value="terse",
-                    ).model_dump(mode="json")
+                    ).model_dump(mode="json"),
                 )
                 assert result is not None
                 assert result["status"] == "deferred_tension"
                 continue
 
             with pytest.raises(Exception):
-                await worker.process_job(
+                await _process_direct(
+                    worker,
                     _revision_job(
                         belief_id=str(belief["id"]),
                         evidence_memory_ids=[str(evidence["id"])],
                         source_message_id="msg_1",
                         scope=MemoryScope.CONVERSATION.value,
                         claim_value="terse",
-                    ).model_dump(mode="json")
+                    ).model_dump(mode="json"),
                 )
 
         belief_row = await memories.get_memory_object(str(belief["id"]), "usr_1")
 
         assert belief_row is not None
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.60)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.60)
         assert belief_row["payload_json"]["tension_evidence_memory_ids"] == [
             "mem_evidence_fail_ambiguous_1",
             "mem_evidence_fail_ambiguous_2",
@@ -1032,18 +1211,23 @@ async def test_revision_worker_dead_letters_after_max_failed_deliveries() -> Non
         await backend.stream_add(REVISE_STREAM_NAME, job)
 
         first = await worker.run_once()
+        await backend.advance_to_next_retry()
         second = await worker.run_once()
+        await backend.advance_to_next_retry()
         third = await worker.run_once()
-        dead_letter = await backend.dequeue_job(f"dead_letter:{REVISE_STREAM_NAME}", timeout_seconds=0)
+        dead_letter = await backend.dequeue_job(
+            f"dead_letter:{REVISE_STREAM_NAME}", timeout_seconds=0
+        )
 
         assert first.failed == 1
         assert second.failed == 1
         assert third.failed == 1
         assert third.dead_lettered == 1
         assert dead_letter is not None
-        assert dead_letter["delivery_count"] == 3
-        assert dead_letter["error_details"][0] == "$: Response was not valid JSON."
-        assert any("No JSON payload found" in detail for detail in dead_letter["error_details"])
+        assert dead_letter["attempt_count"] == 3
+        assert dead_letter["error_class"] == "StructuredOutputError"
+        assert "error" not in dead_letter
+        assert "error_details" not in dead_letter
     finally:
         await connection.close()
 
@@ -1475,17 +1659,30 @@ async def _set_belief_claim_key(connection, belief_id: str, claim_key: str) -> N
 
 
 @pytest.mark.asyncio
-async def test_promotion_path_trusts_match_and_does_not_revalidate_equivalence_at_preview() -> None:
+async def test_promotion_path_trusts_match_and_does_not_revalidate_equivalence_at_preview() -> (
+    None
+):
     # Layer (b): the promotion producer sets claim_key_already_validated=True after
     # resolving the existing belief via _matching_beliefs_for_claim_key. The preview
     # must trust that match and never re-call the (flipping) equivalence LLM.
     provider = FlipEquivalenceProvider(
-        [json.dumps({"action": "REINFORCE", "explanation": "Equivalent claim key, reinforced."})]
+        [
+            json.dumps(
+                {
+                    "action": "REINFORCE",
+                    "explanation": "Equivalent claim key, reinforced.",
+                }
+            )
+        ]
     )
-    connection, backend, memories, beliefs, worker = await _build_runtime([], provider=provider)
+    connection, backend, memories, beliefs, worker = await _build_runtime(
+        [], provider=provider
+    )
     try:
         belief = await _seed_belief(memories, beliefs)
-        await _set_belief_claim_key(connection, str(belief["id"]), "response_style.debug_response")
+        await _set_belief_claim_key(
+            connection, str(belief["id"]), "response_style.debug_response"
+        )
         evidence = await _seed_evidence(
             memories,
             memory_id="mem_evidence_flip_promotion",
@@ -1522,18 +1719,31 @@ async def test_promotion_path_trusts_match_and_does_not_revalidate_equivalence_a
 
 
 @pytest.mark.asyncio
-async def test_preset_belief_id_threshold_revision_trusts_match_without_revalidation() -> None:
+async def test_preset_belief_id_threshold_revision_trusts_match_without_revalidation() -> (
+    None
+):
     # Layer (b): ingest emits the belief-branch job with claim_key_already_validated
     # bound to the match. Drive a contradictory belief to threshold through the real
     # producer (process_job, pre-set belief_id). The equivalence LLM is never called
     # at preview, so the flip cannot fire and the revision completes.
     provider = FlipEquivalenceProvider(
-        [json.dumps({"action": "WEAKEN", "explanation": "Accumulated contradictions reached threshold."})]
+        [
+            json.dumps(
+                {
+                    "action": "WEAKEN",
+                    "explanation": "Accumulated contradictions reached threshold.",
+                }
+            )
+        ]
     )
-    connection, _backend, memories, beliefs, worker = await _build_runtime([], provider=provider)
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [], provider=provider
+    )
     try:
         belief = await _seed_belief(memories, beliefs)
-        await _set_belief_claim_key(connection, str(belief["id"]), "response_style.debug_response")
+        await _set_belief_claim_key(
+            connection, str(belief["id"]), "response_style.debug_response"
+        )
         await beliefs.increment_tension(str(belief["id"]), 0.45, user_id="usr_1")
         evidence = await _seed_evidence(
             memories,
@@ -1556,14 +1766,16 @@ async def test_preset_belief_id_threshold_revision_trusts_match_without_revalida
         # as ingest_worker._emit_revision_jobs does.
         envelope.payload["claim_key_already_validated"] = True
 
-        result = await worker.process_job(envelope.model_dump(mode="json"))
+        result = await _process_direct(worker, envelope.model_dump(mode="json"))
 
         assert result is not None
         assert result["action"] == "WEAKEN"
         assert result["trigger_tension_score"] == pytest.approx(0.60)
         # No equivalence call at all: the bit short-circuits validation at preview.
         assert provider.equivalence_calls == 0
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.0)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.0)
     finally:
         await connection.close()
 
@@ -1575,10 +1787,14 @@ async def test_claim_key_mismatch_at_preview_skips_and_preserves_buffer(
     # Layer (a), C-beta: force a bit=False preview that mismatches. The worker must
     # return a skip status, raise no exception, and PRESERVE the tension buffer.
     provider = FlipEquivalenceProvider([])
-    connection, _backend, memories, beliefs, worker = await _build_runtime([], provider=provider)
+    connection, _backend, memories, beliefs, worker = await _build_runtime(
+        [], provider=provider
+    )
     try:
         belief = await _seed_belief(memories, beliefs)
-        await _set_belief_claim_key(connection, str(belief["id"]), "response_style.debug_response")
+        await _set_belief_claim_key(
+            connection, str(belief["id"]), "response_style.debug_response"
+        )
         await beliefs.increment_tension(str(belief["id"]), 0.45, user_id="usr_1")
         evidence = await _seed_evidence(
             memories,
@@ -1608,7 +1824,7 @@ async def test_claim_key_mismatch_at_preview_skips_and_preserves_buffer(
             claim_key="response_style.debugging",
             claim_value="verbose",
         )
-        result = await worker.process_job(envelope.model_dump(mode="json"))
+        result = await _process_direct(worker, envelope.model_dump(mode="json"))
 
         assert result is not None
         assert result["status"] == "skipped_claim_key_mismatch"
@@ -1622,6 +1838,8 @@ async def test_claim_key_mismatch_at_preview_skips_and_preserves_buffer(
         assert belief_row["payload_json"]["tension_evidence_memory_ids"] == [
             "mem_evidence_mismatch_skip"
         ]
-        assert await beliefs.get_tension(str(belief["id"]), user_id="usr_1") == pytest.approx(0.60)
+        assert await beliefs.get_tension(
+            str(belief["id"]), user_id="usr_1"
+        ) == pytest.approx(0.60)
     finally:
         await connection.close()

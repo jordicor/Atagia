@@ -487,6 +487,95 @@ def test_candidate_custody_eviction_reason_matches_drop_stage() -> None:
     assert no_selection_custody[0]["eviction_reason"] == "composer_strategy"
 
 
+def _custody_candidate(memory_id: str) -> dict[str, object]:
+    return {
+        "id": memory_id,
+        "object_type": "evidence",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "source_kind": "extracted",
+    }
+
+
+def _custody_scored(memory_id: str, final_score: float) -> ScoredCandidate:
+    return ScoredCandidate(
+        memory_id=memory_id,
+        memory_object=_custody_candidate(memory_id),
+        llm_applicability=0.9,
+        retrieval_score=0.8,
+        vitality_boost=0.0,
+        confirmation_boost=0.0,
+        need_boost=0.0,
+        penalty=0.0,
+        final_score=final_score,
+    )
+
+
+def test_candidate_custody_composer_reason_splits_budget_exhausted() -> None:
+    # CS-2.2: the composer's precise cause replaces the conflated
+    # budget_exhausted label for scored-but-unselected candidates, while
+    # lower_score (below the selected floor) is untouched and traces without
+    # composer reasons read exactly as before.
+    ids = ["mem_selected", "mem_item", "mem_class", "mem_div", "mem_budget", "mem_low"]
+    scored = [
+        _custody_scored("mem_selected", 0.80),
+        _custody_scored("mem_item", 0.85),
+        _custody_scored("mem_class", 0.82),
+        _custody_scored("mem_div", 0.81),
+        _custody_scored("mem_budget", 0.83),
+        _custody_scored("mem_low", 0.50),
+    ]
+    raw = [_custody_candidate(memory_id) for memory_id in ids]
+
+    custody = build_candidate_custody(
+        raw_candidates=raw,
+        filtered_candidates=raw,
+        shortlist=raw,
+        scored_candidates=scored,
+        selected_memory_ids=["mem_selected"],
+        retrieval_plan=_plan(),
+        filter_reasons_by_id={},
+        composer_eviction_by_id={
+            "mem_item": "item_cap_reached",
+            "mem_class": "class_cap_reached",
+            "mem_div": "diversity_demoted",
+            # mem_low is below the selected floor: the composer label is ignored
+            # so the lower_score bucket stays stable.
+            "mem_low": "item_cap_reached",
+        },
+    )
+
+    by_id = {record["candidate_id"]: record for record in custody}
+    assert by_id["mem_item"]["eviction_reason"] == "item_cap_reached"
+    assert by_id["mem_class"]["eviction_reason"] == "class_cap_reached"
+    assert by_id["mem_div"]["eviction_reason"] == "diversity_demoted"
+    # No composer reason supplied -> unchanged conflated label.
+    assert by_id["mem_budget"]["eviction_reason"] == "budget_exhausted"
+    # Below the selected floor -> lower_score wins over the composer label.
+    assert by_id["mem_low"]["eviction_reason"] == "lower_score"
+
+
+def test_candidate_custody_rejects_unknown_composer_reason() -> None:
+    scored = [_custody_scored("mem_selected", 0.80), _custody_scored("mem_bad", 0.85)]
+    raw = [_custody_candidate("mem_selected"), _custody_candidate("mem_bad")]
+    try:
+        build_candidate_custody(
+            raw_candidates=raw,
+            filtered_candidates=raw,
+            shortlist=raw,
+            scored_candidates=scored,
+            selected_memory_ids=["mem_selected"],
+            retrieval_plan=_plan(),
+            filter_reasons_by_id={},
+            composer_eviction_by_id={"mem_bad": "not_a_real_reason"},
+        )
+    except ValueError as error:
+        assert "not_a_real_reason" in str(error)
+    else:  # pragma: no cover - explicit failure path
+        raise AssertionError("expected ValueError for unknown composer reason")
+
+
 def test_candidate_custody_high_value_rejected_requires_score_floor() -> None:
     evidence = {
         "id": "mem_evidence_low_score",
@@ -700,3 +789,87 @@ def test_coordinate_trace_marks_realm_bridge_eligibility() -> None:
     assert bridge_trace["realm"]["allowed"] is True
     assert bridge_trace["realm"]["decision"] == "allowed"
     assert bridge_trace["realm"]["reason"] == "allowed_by_realm_bridge_attributed"
+
+
+def _dedupe_candidate(candidate_id: str, *, rrf_score: float = 0.5) -> dict[str, object]:
+    return {
+        "id": candidate_id,
+        "object_type": "evidence",
+        "scope": "conversation",
+        "status": "active",
+        "privacy_level": 0,
+        "retrieval_level": 0,
+        "source_kind": "extracted",
+        "temporal_type": "unknown",
+        "canonical_text": "PERSON_A owns a pottery workshop.",
+        "payload_json": {"source_message_ids": ["msg_1"]},
+        "matched_sub_queries": [],
+        "channel_ranks": {"fts": 1},
+        "retrieval_sources": ["fts"],
+        "rrf_score": rrf_score,
+    }
+
+
+def test_candidate_custody_labels_deduped_duplicate_carriers() -> None:
+    representative = _dedupe_candidate("mem_rep", rrf_score=0.9)
+    duplicate = _dedupe_candidate("mem_dup", rrf_score=0.4)
+    scored = ScoredCandidate(
+        memory_id="mem_rep",
+        memory_object=dict(representative),
+        llm_applicability=0.9,
+        retrieval_score=0.9,
+        vitality_boost=0.0,
+        confirmation_boost=0.0,
+        need_boost=0.0,
+        penalty=0.0,
+        final_score=0.9,
+    )
+
+    custody = build_candidate_custody(
+        raw_candidates=[representative, duplicate],
+        filtered_candidates=[representative, duplicate],
+        shortlist=[representative],
+        scored_candidates=[scored],
+        selected_memory_ids=["mem_rep"],
+        retrieval_plan=_plan(),
+        filter_reasons_by_id={},
+        deduped_into={"mem_dup": "mem_rep"},
+    )
+
+    records = {record["candidate_id"]: record for record in custody}
+    duplicate_record = records["mem_dup"]
+    assert duplicate_record["drop_stage"] == "fusion_dedupe"
+    assert duplicate_record["drop_reason"] == "deduped_duplicate_carrier"
+    assert duplicate_record["eviction_reason"] == "deduped_duplicate_carrier"
+    assert duplicate_record["shortlist_status"] == "deduped_duplicate_carrier"
+    assert duplicate_record["deduped_into"] == "mem_rep"
+    representative_record = records["mem_rep"]
+    assert representative_record["deduped_carrier_ids"] == ["mem_dup"]
+    assert representative_record["selected"] is True
+    assert "deduped_into" not in representative_record
+
+
+def test_candidate_custody_recovered_deduped_carrier_keeps_normal_labels() -> None:
+    """A collapsed carrier later recovered into the shortlist (obligation
+    regrounding) is not labeled as deduped."""
+    representative = _dedupe_candidate("mem_rep", rrf_score=0.9)
+    recovered = _dedupe_candidate("mem_recovered", rrf_score=0.4)
+
+    custody = build_candidate_custody(
+        raw_candidates=[representative, recovered],
+        filtered_candidates=[representative, recovered],
+        shortlist=[representative, recovered],
+        scored_candidates=[],
+        selected_memory_ids=[],
+        retrieval_plan=_plan(),
+        filter_reasons_by_id={},
+        deduped_into={"mem_recovered": "mem_rep"},
+    )
+
+    records = {record["candidate_id"]: record for record in custody}
+    recovered_record = records["mem_recovered"]
+    assert recovered_record["shortlist_status"] == "shortlisted"
+    assert recovered_record["drop_stage"] != "fusion_dedupe"
+    assert "deduped_into" not in recovered_record
+    # The representative still records what the collapse merged.
+    assert records["mem_rep"]["deduped_carrier_ids"] == ["mem_recovered"]

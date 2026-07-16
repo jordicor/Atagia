@@ -47,7 +47,7 @@ from tests.extraction_payload_support import (
     rich_extraction_payload_to_lean,
 )
 
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
@@ -244,7 +244,7 @@ class BenchmarkProvider(LLMProvider):
         if purpose == "chat_reply":
             question = request.messages[-1].content
             answer_map = {
-                "What color notebooks does Alice keep?": "red notebooks",
+                "Which metal astrolabes does Alice keep?": "brass astrolabes",
                 "Where is Bob's mug stored?": "kitchen",
                 "What color is the studio lamp?": "yellow",
             }
@@ -311,7 +311,7 @@ class BenchmarkProvider(LLMProvider):
     @staticmethod
     def _extract_canonical_text(prompt_text: str) -> str | None:
         for candidate in (
-            "Alice keeps red notebooks in the studio.",
+            "Alice keeps brass astrolabes in the studio.",
             "Bob stores the blue mug in the kitchen.",
             "The studio lamp is green.",
         ):
@@ -438,60 +438,60 @@ def _write_dataset(tmp_path: Path) -> Path:
                         "session_1": [
                             {
                                 "speaker": "Alice",
-                                "dia_id": "D1:1",
-                                "text": "Alice keeps red notebooks in the studio.",
+                                "dia_id": "D71:101",
+                                "text": "Alice keeps brass astrolabes in the studio.",
                             },
                             {
                                 "speaker": "Bob",
-                                "dia_id": "D1:2",
-                                "text": "I will remember your notebooks.",
+                                "dia_id": "D71:102",
+                                "text": "I will remember your astrolabes.",
                             },
                         ],
-                        "session_1_date_time": "1:56 pm on 8 May, 2023",
+                        "session_1_date_time": "1:56 pm on 8 March, 2026",
                         "session_2": [
                             {
                                 "speaker": "Alice",
-                                "dia_id": "D2:1",
+                                "dia_id": "D72:201",
                                 "text": "Bob stores the blue mug in the kitchen.",
                             },
                             {
                                 "speaker": "Bob",
-                                "dia_id": "D2:2",
+                                "dia_id": "D72:202",
                                 "text": "Thanks for the reminder about the mug.",
                             },
                         ],
-                        "session_2_date_time": "2:10 pm on 9 May, 2023",
+                        "session_2_date_time": "2:10 pm on 9 March, 2026",
                         "session_3": [
                             {
                                 "speaker": "Alice",
-                                "dia_id": "D3:1",
+                                "dia_id": "D73:301",
                                 "text": "The studio lamp is green.",
                             },
                             {
                                 "speaker": "Bob",
-                                "dia_id": "D3:2",
+                                "dia_id": "D74:401",
                                 "text": "That lamp color sounds nice.",
                             },
                         ],
-                        "session_3_date_time": "3:10 pm on 10 May, 2023",
+                        "session_3_date_time": "3:10 pm on 10 March, 2026",
                     },
                     "qa": [
                         {
-                            "question": "What color notebooks does Alice keep?",
-                            "answer": "red notebooks",
-                            "evidence": ["D1:1"],
+                            "question": "Which metal astrolabes does Alice keep?",
+                            "answer": "brass astrolabes",
+                            "evidence": ["D71:101"],
                             "category": 1,
                         },
                         {
                             "question": "Where is Bob's mug stored?",
                             "answer": "kitchen",
-                            "evidence": ["D2:1"],
+                            "evidence": ["D72:201"],
                             "category": 2,
                         },
                         {
                             "question": "What color is the studio lamp?",
                             "answer": "green",
-                            "evidence": ["D3:1"],
+                            "evidence": ["D73:301"],
                             "category": 3,
                         },
                     ],
@@ -509,27 +509,32 @@ def _write_dataset_with_image_caption(tmp_path: Path) -> Path:
         json.dumps(
             [
                 {
-                    "sample_id": "conv-image",
+                    "sample_id": "synthetic-image-caption",
                     "conversation": {
-                        "speaker_a": "Alice",
-                        "speaker_b": "Bob",
+                        "speaker_a": "Mira",
+                        "speaker_b": "Theo",
                         "session_1": [
                             {
-                                "speaker": "Bob",
-                                "dia_id": "D1:1",
-                                "text": "The kids loved making something with clay. They made this!",
-                                "img_url": ["https://example.test/dog-cup.jpg"],
-                                "blip_caption": "a photo of a cup with a dog face on it",
-                                "query": "kids pottery finished pieces",
+                                "speaker": "Theo",
+                                "dia_id": "SYNIMG:101",
+                                "text": (
+                                    "I mounted the finished weather vane above the orangerie."
+                                ),
+                                "img_url": ["https://example.test/heron-vane.jpg"],
+                                "blip_caption": (
+                                    "A copper weather vane shaped like a heron above the "
+                                    "orangerie."
+                                ),
+                                "query": "orangerie weather vane installation",
                             },
                         ],
-                        "session_1_date_time": "1:56 pm on 8 May, 2023",
+                        "session_1_date_time": "9:14 am on 14 February, 2026",
                     },
                     "qa": [
                         {
-                            "question": "What kind of pot did Bob and the kids make with clay?",
-                            "answer": "a cup with a dog face on it",
-                            "evidence": ["D1:1"],
+                            "question": "What shape is Theo's orangerie weather vane?",
+                            "answer": "a heron",
+                            "evidence": ["SYNIMG:101"],
                             "category": 4,
                         },
                     ],
@@ -666,7 +671,7 @@ def test_locomo_cli_accepts_reuse_db_dir_and_flush_controls() -> None:
             "--answer-model",
             "openai/chat-latest",
             "--reuse-db-dir",
-            "docs/tmp/benchmark_dbs/full-locomo",
+            "bench_dbs/full-locomo",
             "--resume-checkpoint",
             "--adaptive-parallel-questions",
             "--parallel-conversations",
@@ -684,7 +689,7 @@ def test_locomo_cli_accepts_reuse_db_dir_and_flush_controls() -> None:
         ]
     )
 
-    assert args.reuse_db_dir == "docs/tmp/benchmark_dbs/full-locomo"
+    assert args.reuse_db_dir == "bench_dbs/full-locomo"
     assert args.parallel_conversations == 10
     assert args.parallel_questions == 3
     assert args.resume_checkpoint is True
@@ -704,11 +709,11 @@ def test_locomo_cli_accepts_reuse_db_dir_and_flush_controls() -> None:
             "--answer-model",
             "openai/chat-latest",
             "--resume-db-dir",
-            "docs/tmp/benchmark_dbs/full-locomo",
+            "bench_dbs/full-locomo",
         ]
     )
 
-    assert resume_args.resume_db_dir == "docs/tmp/benchmark_dbs/full-locomo"
+    assert resume_args.resume_db_dir == "bench_dbs/full-locomo"
 
     batch_args = _build_parser().parse_args(
         [
@@ -784,7 +789,7 @@ async def test_benchmark_single_conversation(
     assert len(conversation_report.results) == 3
     assert conversation_report.results[0].trace["diagnosis_bucket"] == "passed"
     assert conversation_report.results[0].trace["retrieval_trace"]["query_text"] == (
-        "What color notebooks does Alice keep?"
+        "Which metal astrolabes does Alice keep?"
     )
     assert conversation_report.results[0].trace["shadow_sufficiency_diagnostics"] is not None
     assert (
@@ -870,6 +875,7 @@ def test_critical_evidence_custody_marks_survival_stage() -> None:
                 "selected": False,
                 "drop_stage": "composer",
                 "drop_reason": "not_selected_after_scoring",
+                "eviction_reason": "diversity_demoted",
                 "composer_decision": "not_selected_after_scoring",
                 "score_rank": 4,
             },
@@ -901,6 +907,9 @@ def test_critical_evidence_custody_marks_survival_stage() -> None:
     assert by_id["mem_absent"]["source_message_ids"] == ["msg_absent"]
     assert by_id["mem_absent"]["survival_stage"] == "absent_from_raw_candidates"
     assert by_id["mem_dropped"]["drop_reason"] == "not_selected_after_scoring"
+    # CS-2.2: the precise composer eviction cause is carried through to the
+    # benchmark-side critical-evidence item.
+    assert by_id["mem_dropped"]["eviction_reason"] == "diversity_demoted"
     assert by_id["mem_selected"]["selected"] is True
 
 
@@ -1014,7 +1023,7 @@ async def test_benchmark_with_ablation(
         trace: object | None = None,
         adaptive_retrieval: bool = False,
     ):
-        if message_text == "What color notebooks does Alice keep?":
+        if message_text == "Which metal astrolabes does Alice keep?":
             observed_ablation.append(ablation)
         return await original_retrieve(
             self,
@@ -1150,7 +1159,7 @@ async def test_benchmark_writes_partial_checkpoint_before_interruption(
     assert len(checkpoint.conversations) == 1
     assert checkpoint.conversations[0].conversation_id == "conv-test-1"
     assert checkpoint.conversations[0].results[0].question.question_text == (
-        "What color notebooks does Alice keep?"
+        "Which metal astrolabes does Alice keep?"
     )
     assert checkpoint.model_info["checkpoint"] == {
         "partial": True,
@@ -1168,7 +1177,7 @@ async def test_score_question_labels_retrieval_error_without_cancelling_siblings
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    failing_question_text = "What color notebooks does Alice keep?"
+    failing_question_text = "Which metal astrolabes does Alice keep?"
     provider = BenchmarkProvider()
     _install_stub_client(monkeypatch, provider)
     original_retrieve = RetrievalService.retrieve_with_connection
@@ -1253,7 +1262,7 @@ async def test_score_question_labels_real_chat_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    failing_question_text = "What color notebooks does Alice keep?"
+    failing_question_text = "Which metal astrolabes does Alice keep?"
     provider = AnswerFailingForOneQuestionProvider(failing_question_text)
     _install_stub_client(monkeypatch, provider)
     benchmark = LoCoMoBenchmark(
@@ -1289,7 +1298,7 @@ async def test_score_question_tolerates_raw_transport_timeout_in_chat(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    failing_question_text = "What color notebooks does Alice keep?"
+    failing_question_text = "Which metal astrolabes does Alice keep?"
     provider = RawTimeoutAnswerProvider(failing_question_text)
     _install_stub_client(monkeypatch, provider)
     benchmark = LoCoMoBenchmark(
@@ -1324,7 +1333,7 @@ async def test_score_question_tolerates_judge_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    failing_question_text = "What color notebooks does Alice keep?"
+    failing_question_text = "Which metal astrolabes does Alice keep?"
     provider = JudgeFailingForOneQuestionProvider(failing_question_text)
     _install_stub_client(monkeypatch, provider)
     benchmark = LoCoMoBenchmark(
@@ -1379,7 +1388,7 @@ async def test_score_question_tolerates_raw_transport_timeout_in_judge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    failing_question_text = "What color notebooks does Alice keep?"
+    failing_question_text = "Which metal astrolabes does Alice keep?"
     provider = RawTimeoutJudgeProvider(failing_question_text)
     _install_stub_client(monkeypatch, provider)
     benchmark = LoCoMoBenchmark(
@@ -1607,7 +1616,7 @@ async def test_benchmark_adaptive_parallel_questions_retries_rate_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    failing_question_text = "What color notebooks does Alice keep?"
+    failing_question_text = "Which metal astrolabes does Alice keep?"
     provider = BenchmarkProvider()
     _install_stub_client(monkeypatch, provider)
     original_retrieve = RetrievalService.retrieve_with_connection
@@ -1748,8 +1757,8 @@ async def test_benchmark_max_turns_limits_ingestion(
 
     assert report.total_questions == 3
     assert ingested_messages == [
-        ("user", "Alice: Alice keeps red notebooks in the studio.", "2023-05-08T13:56:00"),
-        ("assistant", "Bob: I will remember your notebooks.", "2023-05-08T13:56:00"),
+        ("user", "Alice: Alice keeps brass astrolabes in the studio.", "2026-03-08T13:56:00"),
+        ("assistant", "Bob: I will remember your astrolabes.", "2026-03-08T13:56:00"),
     ]
 
 
@@ -1859,7 +1868,7 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
             JOIN memory_evidence_spans AS span
               ON span.support_edge_id = edge.id
             WHERE span.span_role = 'source'
-              AND span.quote_text LIKE '%Alice keeps red notebooks%'
+              AND span.quote_text LIKE '%Alice keeps brass astrolabes%'
             LIMIT 1
             """
         ).fetchone()
@@ -1921,7 +1930,7 @@ async def test_benchmark_bulk_ingest_rebuilds_without_per_turn_flush(
             await connection.close()
 
     assert len(messages) == 6
-    assert all("What color notebooks" not in str(message["text"]) for message in messages)
+    assert all("Which metal astrolabes" not in str(message["text"]) for message in messages)
 
 
 @pytest.mark.asyncio
@@ -2131,7 +2140,7 @@ async def test_benchmark_bulk_ingest_persists_locomo_image_captions_as_artifacts
     )
 
     await benchmark.run(
-        conversation_ids=["conv-image"],
+        conversation_ids=["synthetic-image-caption"],
         ingest_only=True,
         max_turns=1,
         benchmark_db_dir=db_dir,
@@ -2154,21 +2163,29 @@ async def test_benchmark_bulk_ingest_persists_locomo_image_captions_as_artifacts
         ).fetchall()
 
     assert message is not None
-    assert "a photo of a cup with a dog face on it" in message["text"]
+    assert (
+        "A copper weather vane shaped like a heron above the orangerie."
+        in message["text"]
+    )
     message_metadata = json.loads(message["metadata_json"])
     assert message_metadata["attachment_count"] == 1
     assert artifact is not None
     assert artifact["artifact_type"] == "image"
     assert artifact["source_kind"] == "url"
-    assert artifact["source_ref"] == "https://example.test/dog-cup.jpg"
+    assert artifact["source_ref"] == "https://example.test/heron-vane.jpg"
     artifact_metadata = json.loads(artifact["metadata_json"])
     assert artifact_metadata["source"] == "locomo"
     assert artifact_metadata["caption_kind"] == "blip_caption"
-    assert artifact_metadata["turn_id"] == "D1:1"
-    assert any("a photo of a cup with a dog face on it" in row["text"] for row in chunks)
+    assert artifact_metadata["turn_id"] == "SYNIMG:101"
+    assert any(
+        "A copper weather vane shaped like a heron above the orangerie."
+        in row["text"]
+        for row in chunks
+    )
     assert any(row["kind"] == "parsed" for row in chunks)
     assert any(
-        "a photo of a cup with a dog face on it" in request.messages[-1].content
+        "A copper weather vane shaped like a heron above the orangerie."
+        in request.messages[-1].content
         for request in provider.requests
         if request.metadata.get("purpose") == "memory_extraction_candidate_card"
     )
@@ -2240,7 +2257,7 @@ async def test_benchmark_corrections_overlay_substitutes_ground_truth(
             "conv-test-1:q3": {
                 "original_ground_truth": "green",
                 "corrected_ground_truth": "yellow",
-                "evidence_turn": "D3:2",
+                "evidence_turn": "D74:401",
                 "reason": "Test correction",
             }
         }),
@@ -2268,8 +2285,8 @@ async def test_benchmark_corrections_overlay_substitutes_ground_truth(
         for result in report.conversations[0].results
         if result.question.question_id == "conv-test-1:q3"
     )
-    assert lamp_result.question.evidence_turn_ids == ["D3:2"]
-    assert lamp_result.trace["grade_context"]["source_turn_ids"] == ["D3:2"]
+    assert lamp_result.question.evidence_turn_ids == ["D74:401"]
+    assert lamp_result.trace["grade_context"]["source_turn_ids"] == ["D74:401"]
 
 
 def test_benchmark_corrections_overlay_substitutes_evidence_turn_ids(
@@ -2283,7 +2300,7 @@ def test_benchmark_corrections_overlay_substitutes_evidence_turn_ids(
                 "conv-test-1:q3": {
                     "original_ground_truth": "green",
                     "corrected_ground_truth": "yellow",
-                    "evidence_turn": "D3:2",
+                    "evidence_turn": "D74:401",
                     "reason": "Test evidence correction",
                 }
             }
@@ -2310,7 +2327,7 @@ def test_benchmark_corrections_overlay_substitutes_evidence_turn_ids(
 
     corrected_question = inputs[0][2][0]
     assert corrected_question.ground_truth == "yellow"
-    assert corrected_question.evidence_turn_ids == ["D3:2"]
+    assert corrected_question.evidence_turn_ids == ["D74:401"]
 
 
 def test_benchmark_corrections_overlay_validates_bad_evidence_turn_ids(
@@ -2322,7 +2339,7 @@ def test_benchmark_corrections_overlay_validates_bad_evidence_turn_ids(
             {
                 "conv-test-1:q3": {
                     "corrected_ground_truth": "yellow",
-                    "corrected_evidence_turn_ids": ["D9:9"],
+                    "corrected_evidence_turn_ids": ["D79:909"],
                 }
             }
         ),
@@ -2339,7 +2356,7 @@ def test_benchmark_corrections_overlay_validates_bad_evidence_turn_ids(
     )
 
     dataset = benchmark._adapter.load()
-    with pytest.raises(ValueError, match="conv-test-1:q3.*D9:9"):
+    with pytest.raises(ValueError, match="conv-test-1:q3.*D79:909"):
         benchmark._conversation_inputs(
             dataset.conversations,
             scored_categories=[1, 2, 3, 4],
@@ -2393,7 +2410,7 @@ def test_locomo_source_evidence_for_question_includes_image_caption(
     )
 
     assert source_evidence[0]["blip_caption"] == (
-        "a photo of a cup with a dog face on it"
+        "A copper weather vane shaped like a heron above the orangerie."
     )
     assert "Visual description of attached image" in source_evidence[0]["attachment_text"]
 
@@ -2453,7 +2470,7 @@ async def test_benchmark_can_reuse_retained_ingestion_db_without_persisting_ques
     assert progress["total_turns"] == 6
     assert progress["selected_turns"] == 6
     assert progress["ingested_turns"] == 6
-    assert progress["last_turn_id"] == "D3:2"
+    assert progress["last_turn_id"] == "D74:401"
     assert progress["worker_drain"]["storage"]["drained"] is True
     assert "memory_objects" in progress["worker_drain"]["db_counts"]
     assert sum(
@@ -2507,7 +2524,7 @@ async def test_benchmark_can_reuse_retained_ingestion_db_without_persisting_ques
             await connection.close()
 
     assert len(messages) == 6
-    assert all("What color notebooks" not in str(message["text"]) for message in messages)
+    assert all("Which metal astrolabes" not in str(message["text"]) for message in messages)
 
 
 @pytest.mark.asyncio
@@ -2561,7 +2578,7 @@ async def test_benchmark_can_resume_partial_ingestion_db(
     metadata = json.loads((retained_db.parent / "run_metadata.json").read_text())
     assert progress["status"] == "workers_drained"
     assert progress["ingested_turns"] == 6
-    assert progress["last_turn_id"] == "D3:2"
+    assert progress["last_turn_id"] == "D74:401"
     assert metadata["status"] == "complete"
     assert metadata["turn_count"] == 6
     assert metadata["usable_for_evaluate_only"] is True
@@ -2891,7 +2908,7 @@ def test_format_report_summary_includes_key_sections(tmp_path: Path) -> None:
                             question_text="Question?",
                             ground_truth="answer",
                             category=1,
-                            evidence_turn_ids=["D1:1"],
+                            evidence_turn_ids=["D71:101"],
                             question_id="conv-test-1:q1",
                         ),
                         prediction="answer",
@@ -2908,7 +2925,7 @@ def test_format_report_summary_includes_key_sections(tmp_path: Path) -> None:
                             question_text="Question 2?",
                             ground_truth="answer 2",
                             category=1,
-                            evidence_turn_ids=["D1:2"],
+                            evidence_turn_ids=["D71:102"],
                             question_id="conv-test-1:q2",
                         ),
                         prediction="wrong",
@@ -2961,7 +2978,7 @@ def test_format_report_summary_includes_key_sections(tmp_path: Path) -> None:
     assert "Warning counts: failed_questions=1" in summary
     assert "Retrieval custody: candidates=2 selected=1" in summary
     assert "channels=fts=2" in summary
-    assert "Cat 1 (single-hop):" in summary
+    assert "Cat 1 (multi-hop):" in summary
     assert "Per-conversation:" in summary
     assert "conv-test-1:" in summary
     assert "Report saved to:" in summary
@@ -3004,7 +3021,7 @@ def test_build_run_manifest_includes_reproducibility_fields(
                             question_text="Question?",
                             ground_truth="answer",
                             category=1,
-                            evidence_turn_ids=["D1:1"],
+                            evidence_turn_ids=["D71:101"],
                             question_id="conv-test-1:q1",
                         ),
                         prediction="answer",
@@ -3302,7 +3319,7 @@ def test_format_benchmark_db_list_json_includes_progress_metadata(tmp_path: Path
 
 
 def test_format_benchmark_db_list_json_includes_db_only_snapshots(tmp_path: Path) -> None:
-    db_dir = tmp_path / "locomo_conv-42_20260426T061904Z"
+    db_dir = tmp_path / "locomo_fixture-retained-db_20260426T061904Z"
     db_dir.mkdir()
     (db_dir / "benchmark.db").write_bytes(b"sqlite placeholder")
     (db_dir / "benchmark.db-wal").write_bytes(b"wal bytes")
@@ -3315,7 +3332,7 @@ def test_format_benchmark_db_list_json_includes_db_only_snapshots(tmp_path: Path
     assert entry == {
         "source": "db",
         "timestamp": "20260426T061904Z",
-        "conversation_id": "conv-42",
+        "conversation_id": "fixture-retained-db",
         "turns": "",
         "turn_count": None,
         "selected_turns": None,
@@ -3346,7 +3363,7 @@ def test_format_benchmark_db_list_json_includes_db_only_snapshots(tmp_path: Path
 
 
 def test_format_benchmark_db_list_json_counts_sqlite_rows(tmp_path: Path) -> None:
-    db_dir = tmp_path / "locomo_conv-42_20260426T061904Z"
+    db_dir = tmp_path / "locomo_fixture-retained-db_20260426T061904Z"
     db_dir.mkdir()
     db_path = db_dir / "benchmark.db"
     connection = sqlite3.connect(db_path)
@@ -3622,3 +3639,109 @@ def test_format_run_log_summary_counts_common_failure_lines(tmp_path: Path) -> N
         "conversations=2 with_progress=2 complete=0"
     ) in summary
     assert "Question progress by conversation: conv-1=1/2" in summary
+
+
+def test_critical_evidence_custody_maps_fusion_dedupe_to_representative() -> None:
+    """CS-2.3: evidence collapsed into a selected duplicate carrier must be
+    visible as such in the benchmark-side custody mapping."""
+    evidence_rows_by_id = {
+        "mem_gold": {
+            "id": "mem_gold",
+            "object_type": "evidence",
+            "scope": "conversation",
+            "status": "active",
+            "privacy_level": 0,
+            "source_kind": "extracted",
+            "payload_json": {"source_message_ids": ["msg_1"]},
+        },
+    }
+    retrieval_custody = [
+        {
+            "candidate_id": "mem_gold",
+            "candidate_kind": "evidence",
+            "channels": ["fts"],
+            "scored": False,
+            "selected": False,
+            "shortlisted": False,
+            "drop_stage": "fusion_dedupe",
+            "drop_reason": "deduped_duplicate_carrier",
+            "deduped_into": "mem_rep",
+            "composer_decision": "not_scored",
+            "matched_subquery_indexes": [],
+        },
+        {
+            "candidate_id": "mem_rep",
+            "candidate_kind": "evidence",
+            "channels": ["fts"],
+            "scored": True,
+            "selected": True,
+            "shortlisted": True,
+            "drop_stage": None,
+            "drop_reason": None,
+            "composer_decision": "selected",
+            "matched_subquery_indexes": [],
+        },
+    ]
+
+    custody = LoCoMoBenchmark._critical_evidence_custody(
+        evidence_rows_by_id,
+        retrieval_custody,
+    )
+
+    assert custody["survival_stage_counts"] == {"fusion_dedupe_into_selected": 1}
+    item = custody["items"][0]
+    assert item["memory_id"] == "mem_gold"
+    assert item["survival_stage"] == "fusion_dedupe_into_selected"
+    assert item["deduped_into"] == "mem_rep"
+    assert item["deduped_into_selected"] is True
+
+
+def test_critical_evidence_custody_dedupe_into_unselected_stays_fusion_dedupe() -> None:
+    evidence_rows_by_id = {
+        "mem_gold": {
+            "id": "mem_gold",
+            "object_type": "evidence",
+            "scope": "conversation",
+            "status": "active",
+            "privacy_level": 0,
+            "source_kind": "extracted",
+            "payload_json": {},
+        },
+    }
+    retrieval_custody = [
+        {
+            "candidate_id": "mem_gold",
+            "candidate_kind": "evidence",
+            "channels": ["fts"],
+            "scored": False,
+            "selected": False,
+            "shortlisted": False,
+            "drop_stage": "fusion_dedupe",
+            "drop_reason": "deduped_duplicate_carrier",
+            "deduped_into": "mem_rep",
+            "composer_decision": "not_scored",
+            "matched_subquery_indexes": [],
+        },
+        {
+            "candidate_id": "mem_rep",
+            "candidate_kind": "evidence",
+            "channels": ["fts"],
+            "scored": True,
+            "selected": False,
+            "shortlisted": True,
+            "drop_stage": "composer",
+            "drop_reason": "not_selected_after_scoring",
+            "composer_decision": "not_selected_after_scoring",
+            "matched_subquery_indexes": [],
+        },
+    ]
+
+    custody = LoCoMoBenchmark._critical_evidence_custody(
+        evidence_rows_by_id,
+        retrieval_custody,
+    )
+
+    item = custody["items"][0]
+    assert item["survival_stage"] == "fusion_dedupe"
+    assert item["deduped_into"] == "mem_rep"
+    assert item["deduped_into_selected"] is False

@@ -15,7 +15,7 @@ from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, UserRepository
 
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
 
 @pytest.mark.asyncio
@@ -61,7 +61,6 @@ async def test_migrate_legacy_artifact_blobs_deduplicates_payload_records(tmp_pa
 
         result = await _migrate(
             connection,
-            storage_path=tmp_path / "artifact_blobs",
             target_storage_kind="sqlite_blob",
             batch_size=10,
         )
@@ -83,7 +82,7 @@ async def test_migrate_legacy_artifact_blobs_deduplicates_payload_records(tmp_pa
         assert blob["storage_kind"] == "sqlite_blob"
         assert blob["blob_bytes"] == payload_bytes
 
-        verify_result = await _verify(connection, storage_path=tmp_path / "artifact_blobs")
+        verify_result = await _verify(connection)
         assert verify_result.legacy_active_artifacts_without_payload == 0
         assert verify_result.hash_mismatches == 0
     finally:
@@ -134,7 +133,6 @@ async def test_migrate_rejects_legacy_blob_hash_mismatch_even_when_payload_exist
 
         result = await _migrate(
             connection,
-            storage_path=tmp_path / "artifact_blobs",
             target_storage_kind="sqlite_blob",
             batch_size=10,
         )

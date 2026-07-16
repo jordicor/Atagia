@@ -195,6 +195,14 @@ class InitialContextPackageRecord(BaseModel):
     build_status: InitialContextPackageBuildStatus = (
         InitialContextPackageBuildStatus.ACTIVE
     )
+    source_user_lifecycle_epoch: str | None = None
+    source_user_revision: int | None = Field(default=None, ge=0)
+    source_conversation_lifecycle_epoch: str | None = None
+    source_conversation_revision: int | None = Field(default=None, ge=0)
+    package_row_version: int = Field(default=0, ge=0)
+    active_build_attempt_id: str | None = None
+    refresh_generation: int = Field(default=0, ge=0)
+    last_refresh_request_job_id: str | None = None
     created_at: str = Field(min_length=1)
     updated_at: str = Field(min_length=1)
     valid_until: str | None = None
@@ -208,6 +216,10 @@ class InitialContextPackageRecord(BaseModel):
         "created_at",
         "updated_at",
         "valid_until",
+        "source_user_lifecycle_epoch",
+        "source_conversation_lifecycle_epoch",
+        "active_build_attempt_id",
+        "last_refresh_request_job_id",
     )
     @classmethod
     def normalize_optional_text(cls, value: str | None) -> str | None:
@@ -228,6 +240,21 @@ class InitialContextPackageRecord(BaseModel):
             raise ValueError("record conversation_id must match key_json")
         if self.retrieval_profile_id != self.key_json.retrieval_profile_id:
             raise ValueError("record retrieval_profile_id must match key_json")
+        if self.build_status == InitialContextPackageBuildStatus.ACTIVE:
+            if (
+                self.source_user_lifecycle_epoch is None
+                or self.source_user_revision is None
+                or self.active_build_attempt_id is None
+                or self.refresh_generation <= 0
+            ):
+                raise ValueError("active packages require exact user source coordinates")
+            if self.package_kind == InitialContextPackageKind.CONVERSATION and (
+                self.source_conversation_lifecycle_epoch is None
+                or self.source_conversation_revision is None
+            ):
+                raise ValueError(
+                    "active conversation packages require conversation source coordinates"
+                )
         return self
 
 

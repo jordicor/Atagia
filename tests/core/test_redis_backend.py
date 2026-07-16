@@ -9,7 +9,7 @@ from time import monotonic
 
 import pytest
 
-from atagia.core.redis_client import RedisBackend
+from atagia.core.redis_client import ATAGIA_QUEUE_PREFIX, RedisBackend
 
 
 class FakeRedisDrainClient:
@@ -52,9 +52,7 @@ class FakeRedisCacheClient:
         for key in expired:
             self._values.pop(key, None)
         expired_sets = [
-            key
-            for key, expires_at in self._set_expires.items()
-            if expires_at <= now
+            key for key, expires_at in self._set_expires.items() if expires_at <= now
         ]
         for key in expired_sets:
             self._sets.pop(key, None)
@@ -144,6 +142,76 @@ class FakeRedisCacheClient:
         del script
         keys = [str(value) for value in args[:numkeys]]
         argv = [str(value) for value in args[numkeys:]]
+        if numkeys == 5 and len(argv) == 6:
+            cache_key = argv[0]
+            owner = await self.get(keys[2])
+            conversation_owner = await self.get(keys[3])
+            expected_user = argv[4]
+            expected_conversation = argv[5]
+            if expected_user and owner and owner != expected_user:
+                await self.srem(f"{argv[1]}{expected_user}", cache_key)
+                return 0
+            if (
+                expected_conversation
+                and conversation_owner
+                and conversation_owner != expected_conversation
+            ):
+                await self.srem(f"{argv[2]}{expected_conversation}", cache_key)
+                return 0
+            if owner:
+                await self.srem(f"{argv[1]}{owner}", cache_key)
+            if conversation_owner:
+                await self.srem(f"{argv[2]}{conversation_owner}", cache_key)
+            lifecycle_owner = await self.get(keys[4])
+            if lifecycle_owner:
+                await self.srem(f"{argv[3]}{lifecycle_owner}", f"c\x1f{cache_key}")
+            existed = keys[0] in self._values
+            await self.delete(*keys)
+            return int(existed)
+        if numkeys == 7:
+            payload = argv[0]
+            ttl_seconds = int(argv[1])
+            user_id = argv[2]
+            cache_key = argv[3]
+            user_index_prefix = argv[4]
+            conversation_subject = argv[5]
+            conversation_index_prefix = argv[6]
+            lifecycle_index_prefix = argv[7]
+            old_owner = await self.get(keys[2])
+            old_conversation = await self.get(keys[4])
+            old_lifecycle_owner = await self.get(keys[6])
+            if old_owner and old_owner != user_id:
+                await self.srem(f"{user_index_prefix}{old_owner}", cache_key)
+            if old_conversation and old_conversation != conversation_subject:
+                await self.srem(
+                    f"{conversation_index_prefix}{old_conversation}",
+                    cache_key,
+                )
+            if old_lifecycle_owner:
+                await self.srem(
+                    f"{lifecycle_index_prefix}{old_lifecycle_owner}",
+                    f"c\x1f{cache_key}",
+                )
+            await self.set(keys[0], payload, ex=ttl_seconds)
+            await self.delete(keys[1], keys[6])
+            if user_id:
+                await self.set(keys[2], user_id, ex=ttl_seconds)
+                await self.sadd(keys[3], cache_key)
+                current_ttl = await self.ttl(keys[3])
+                if current_ttl < 0 or current_ttl < ttl_seconds:
+                    await self.expire(keys[3], ttl_seconds)
+            else:
+                await self.delete(keys[2])
+            if conversation_subject:
+                await self.set(keys[4], conversation_subject, ex=ttl_seconds)
+                await self.sadd(keys[5], cache_key)
+                current_ttl = await self.ttl(keys[5])
+                if current_ttl < 0 or current_ttl < ttl_seconds:
+                    await self.expire(keys[5], ttl_seconds)
+            else:
+                await self.delete(keys[4])
+            return 1
+
         payload = argv[0]
         ttl_seconds = int(argv[1])
         monotonic_seq = int(argv[2])
@@ -169,6 +237,13 @@ class FakeRedisCacheClient:
                 await self.expire(keys[3], ttl_seconds)
         else:
             await self.delete(keys[2])
+        old_lifecycle_owner = await self.get(keys[4])
+        if old_lifecycle_owner:
+            await self.srem(
+                f"{argv[6]}{old_lifecycle_owner}",
+                f"c\x1f{cache_key}",
+            )
+        await self.delete(keys[4])
         return 1
 
     async def aclose(self) -> None:
@@ -178,15 +253,39 @@ class FakeRedisCacheClient:
 class FakeRedisPurgeClient:
     def __init__(self) -> None:
         self._lists: dict[str, list[str]] = {
-            "queue:dead_letter:atagia:extract": [
-                json.dumps({"payload": {"user_id": "usr_1", "conversation_id": "cnv_1"}}),
-                json.dumps({"payload": {"user_id": "usr_2", "conversation_id": "cnv_2"}}),
-            ]
+            f"{ATAGIA_QUEUE_PREFIX}dead_letter:atagia:extract": [
+                json.dumps(
+                    {"payload": {"user_id": "usr_1", "conversation_id": "cnv_1"}}
+                ),
+                json.dumps(
+                    {"payload": {"user_id": "usr_2", "conversation_id": "cnv_2"}}
+                ),
+                "malformed-entry",
+            ],
+            "queue:foreign": [
+                json.dumps(
+                    {"payload": {"user_id": "usr_1", "conversation_id": "cnv_1"}}
+                )
+            ],
         }
         self._streams: dict[str, list[tuple[str, dict[str, str]]]] = {
             "atagia:extract": [
-                ("1-0", {"payload": json.dumps({"user_id": "usr_1", "conversation_id": "cnv_1"})}),
-                ("2-0", {"payload": json.dumps({"user_id": "usr_2", "conversation_id": "cnv_2"})}),
+                (
+                    "1-0",
+                    {
+                        "payload": json.dumps(
+                            {"user_id": "usr_1", "conversation_id": "cnv_1"}
+                        )
+                    },
+                ),
+                (
+                    "2-0",
+                    {
+                        "payload": json.dumps(
+                            {"user_id": "usr_2", "conversation_id": "cnv_2"}
+                        )
+                    },
+                ),
             ]
         }
         self.acked: list[tuple[str, str, str]] = []
@@ -212,6 +311,33 @@ class FakeRedisPurgeClient:
         self._lists.setdefault(key, []).extend(values)
         return len(self._lists[key])
 
+    async def eval(self, script: str, numkeys: int, *args: object) -> int:
+        del script
+        assert numkeys == 1
+        key = str(args[0])
+        user_id = str(args[1])
+        conversation_id = str(args[2])
+        retained: list[str] = []
+        purged = 0
+        for raw in self._lists.get(key, []):
+            try:
+                decoded = json.loads(raw)
+            except Exception:
+                retained.append(raw)
+                continue
+            job = decoded.get("payload", decoded) if isinstance(decoded, dict) else {}
+            matches = str(job.get("user_id", "")) == user_id
+            if conversation_id:
+                matches = (
+                    matches and str(job.get("conversation_id", "")) == conversation_id
+                )
+            if matches:
+                purged += 1
+            else:
+                retained.append(raw)
+        self._lists[key] = retained
+        return purged
+
     async def type(self, key: str) -> str:
         if key in self._streams:
             return "stream"
@@ -219,7 +345,9 @@ class FakeRedisPurgeClient:
             return "list"
         return "none"
 
-    async def xrange(self, key: str, start: str, end: str) -> list[tuple[str, dict[str, str]]]:
+    async def xrange(
+        self, key: str, start: str, end: str
+    ) -> list[tuple[str, dict[str, str]]]:
         del start, end
         return list(self._streams.get(key, []))
 
@@ -238,100 +366,6 @@ class FakeRedisPurgeClient:
             entry for entry in entries if entry[0] != message_id
         ]
         return 1
-
-    async def zrange(self, key: str, start: int, end: int) -> list[str]:
-        del start, end
-        return list(self._sorted_sets.get(key, {}))
-
-    async def zrem(self, key: str, member: str) -> int:
-        members = self._sorted_sets.get(key)
-        if members is None or member not in members:
-            return 0
-        members.pop(member, None)
-        return 1
-
-
-class FakeRedisDeferredClient:
-    def __init__(self, *, fail_promotion: bool = False) -> None:
-        self._streams: dict[str, list[tuple[str, dict[str, str]]]] = {}
-        self._sorted_sets: dict[str, dict[str, float]] = {}
-        self._groups: set[tuple[str, str]] = set()
-        self._next_stream_id = 1
-        self.eval_calls: list[tuple[str, int, tuple[object, ...]]] = []
-        self.fail_promotion = fail_promotion
-
-    async def xgroup_create(
-        self,
-        *,
-        name: str,
-        groupname: str,
-        id: str,
-        mkstream: bool,
-    ) -> None:
-        del id, mkstream
-        self._groups.add((name, groupname))
-        self._streams.setdefault(name, [])
-
-    async def eval(self, script: str, numkeys: int, *args: object) -> int:
-        self.eval_calls.append((script, numkeys, args))
-        keys = [str(value) for value in args[:numkeys]]
-        argv = [str(value) for value in args[numkeys:]]
-        script_lower = script.lower()
-        if "xack" in script_lower and "zadd" in script_lower:
-            deferred_key = keys[1]
-            member = argv[2]
-            score = float(argv[3])
-            self._sorted_sets.setdefault(deferred_key, {})[member] = score
-            return 1
-        if "zrangebyscore" in script_lower and "xadd" in script_lower:
-            if self.fail_promotion:
-                raise RuntimeError("xadd failed")
-            deferred_key, stream_name = keys
-            now = float(argv[0])
-            limit = int(argv[1])
-            candidates = [
-                (score, member)
-                for member, score in self._sorted_sets.get(deferred_key, {}).items()
-                if score <= now
-            ]
-            candidates.sort(key=lambda item: item[0])
-            promoted = 0
-            for _score, member in candidates[:limit]:
-                decoded = json.loads(member)
-                payload_json = decoded.get("payload_json")
-                if not isinstance(payload_json, str):
-                    self._sorted_sets.get(deferred_key, {}).pop(member, None)
-                    continue
-                message_id = f"{self._next_stream_id}-0"
-                self._next_stream_id += 1
-                self._streams.setdefault(stream_name, []).append(
-                    (
-                        message_id,
-                        {"payload": payload_json},
-                    )
-                )
-                self._sorted_sets.get(deferred_key, {}).pop(member, None)
-                promoted += 1
-            return promoted
-        raise AssertionError("Unexpected Redis eval script")
-
-    async def xreadgroup(
-        self,
-        *,
-        groupname: str,
-        consumername: str,
-        streams: dict[str, str],
-        count: int,
-        block: int | None,
-    ) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
-        del groupname, consumername, block
-        stream_name = next(iter(streams))
-        entries = self._streams.get(stream_name, [])[:count]
-        self._streams[stream_name] = self._streams.get(stream_name, [])[count:]
-        return [(stream_name, entries)] if entries else []
-
-    async def zcard(self, key: str) -> int:
-        return len(self._sorted_sets.get(key, {}))
 
     async def zrange(self, key: str, start: int, end: int) -> list[str]:
         del start, end
@@ -370,17 +404,6 @@ def _purge_backend() -> RedisBackend:
     return backend
 
 
-def _deferred_backend(*, fail_promotion: bool = False) -> RedisBackend:
-    backend = object.__new__(RedisBackend)
-    backend._client = FakeRedisDeferredClient(fail_promotion=fail_promotion)
-    backend._stream_groups = set()
-    backend._stream_add_counts = {}
-    backend._stream_read_counts = {}
-    backend._stream_claim_counts = {}
-    backend._stream_ack_counts = {}
-    return backend
-
-
 @pytest.mark.asyncio
 async def test_redis_backend_context_view_ttl_round_trip() -> None:
     backend = _cache_backend()
@@ -390,7 +413,10 @@ async def test_redis_backend_context_view_ttl_round_trip() -> None:
         {"user_id": "usr_1", "items": ["one"]},
         ttl_seconds=1,
     )
-    assert await backend.get_context_view("ctx:1") == {"user_id": "usr_1", "items": ["one"]}
+    assert await backend.get_context_view("ctx:1") == {
+        "user_id": "usr_1",
+        "items": ["one"],
+    }
     assert await backend._client.smembers("context_view_user:usr_1") == {"ctx:1"}
 
     await asyncio.sleep(1.05)
@@ -425,7 +451,10 @@ async def test_redis_backend_delete_context_view_and_user_wipe() -> None:
     assert await backend.get_context_view("ctx:1") is None
     assert deleted == 1
     assert await backend.get_context_view("ctx:2") is None
-    assert await backend.get_context_view("ctx:3") == {"user_id": "usr_2", "items": ["three"]}
+    assert await backend.get_context_view("ctx:3") == {
+        "user_id": "usr_2",
+        "items": ["three"],
+    }
 
 
 @pytest.mark.asyncio
@@ -478,11 +507,16 @@ async def test_redis_backend_monotonic_publish_rejects_older_write() -> None:
     assert first is True
     assert second is False
     assert third is True
-    assert await backend.get_context_view("ctx:1") == {"user_id": "usr_1", "value": "newer"}
+    assert await backend.get_context_view("ctx:1") == {
+        "user_id": "usr_1",
+        "value": "newer",
+    }
 
 
 @pytest.mark.asyncio
-async def test_redis_backend_user_index_ttl_does_not_shrink_for_monotonic_writes() -> None:
+async def test_redis_backend_user_index_ttl_does_not_shrink_for_monotonic_writes() -> (
+    None
+):
     backend = _cache_backend()
 
     await backend.set_context_view_if_newer(
@@ -529,82 +563,28 @@ async def test_redis_backend_monotonic_publish_expires_user_index_members() -> N
 
 
 @pytest.mark.asyncio
-async def test_redis_backend_purge_user_jobs_scans_persisted_streams_without_registered_groups() -> None:
+async def test_redis_backend_purge_user_jobs_scans_persisted_streams_without_registered_groups() -> (
+    None
+):
     backend = _purge_backend()
 
     purged = await backend.purge_user_jobs("usr_1")
 
     assert purged == 2
-    assert backend._client._lists["queue:dead_letter:atagia:extract"] == [
-        json.dumps({"payload": {"user_id": "usr_2", "conversation_id": "cnv_2"}})
+    assert backend._client._lists[
+        f"{ATAGIA_QUEUE_PREFIX}dead_letter:atagia:extract"
+    ] == [
+        json.dumps({"payload": {"user_id": "usr_2", "conversation_id": "cnv_2"}}),
+        "malformed-entry",
     ]
-    assert [message_id for message_id, _fields in backend._client._streams["atagia:extract"]] == ["2-0"]
+    assert backend._client._lists["queue:foreign"] == [
+        json.dumps({"payload": {"user_id": "usr_1", "conversation_id": "cnv_1"}})
+    ]
+    assert [
+        message_id for message_id, _fields in backend._client._streams["atagia:extract"]
+    ] == ["2-0"]
     assert backend._client.acked == [("atagia:extract", "atagia-workers", "1-0")]
     assert backend._client.deleted == [("atagia:extract", "1-0")]
-
-
-@pytest.mark.asyncio
-async def test_redis_backend_stream_defer_promotes_due_message_atomically() -> None:
-    backend = _deferred_backend()
-
-    await backend.stream_defer(
-        "atagia:test",
-        "atagia-workers",
-        "1-0",
-        {
-            "job_id": "job_1",
-            "recent_messages": [],
-            "source_message_ids": [],
-        },
-        delay_seconds=0,
-    )
-
-    assert await backend._client.zcard("stream_deferred:atagia:test") == 1
-    assert backend._stream_ack_counts == {"atagia:test": 1}
-
-    messages = await backend.stream_read(
-        "atagia:test",
-        "atagia-workers",
-        "consumer-1",
-        count=1,
-        block_ms=0,
-    )
-
-    assert [message.payload for message in messages] == [
-        {
-            "job_id": "job_1",
-            "recent_messages": [],
-            "source_message_ids": [],
-        }
-    ]
-    assert await backend._client.zcard("stream_deferred:atagia:test") == 0
-    assert backend._stream_add_counts == {"atagia:test": 1}
-    assert len(backend._client.eval_calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_redis_backend_stream_defer_keeps_due_message_when_promotion_fails() -> None:
-    backend = _deferred_backend(fail_promotion=True)
-
-    await backend.stream_defer(
-        "atagia:test",
-        "atagia-workers",
-        "1-0",
-        {"job_id": "job_1"},
-        delay_seconds=0,
-    )
-
-    with pytest.raises(RuntimeError, match="xadd failed"):
-        await backend.stream_read(
-            "atagia:test",
-            "atagia-workers",
-            "consumer-1",
-            count=1,
-            block_ms=0,
-        )
-
-    assert await backend._client.zcard("stream_deferred:atagia:test") == 1
-    assert backend._stream_add_counts == {}
 
 
 @pytest.mark.asyncio

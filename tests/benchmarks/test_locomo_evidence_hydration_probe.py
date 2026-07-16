@@ -55,7 +55,7 @@ def test_evidence_hydration_probe_flags_trace_mapping_missing_but_db_found(
         db_path,
         trace={
             "evidence_message_ids": [],
-            "missing_evidence_turn_ids": ["D1:1", "D1:2"],
+            "missing_evidence_turn_ids": ["D91:1", "D92:1"],
         },
     )
 
@@ -82,12 +82,12 @@ def _write_dataset(tmp_path: Path) -> Path:
                             {
                                 "speaker": "Alice",
                                 "text": "RAW SOURCE TEXT one",
-                                "dia_id": "D1:1",
+                                "dia_id": "D91:1",
                             },
                             {
                                 "speaker": "Bob",
                                 "text": "RAW SOURCE TEXT two",
-                                "dia_id": "D1:2",
+                                "dia_id": "D92:1",
                             },
                         ],
                     },
@@ -96,7 +96,7 @@ def _write_dataset(tmp_path: Path) -> Path:
                             "question": "RAW QUESTION TEXT",
                             "answer": "RAW GOLD",
                             "category": 1,
-                            "evidence": ["D1:1", "D1:2"],
+                            "evidence": ["D91:1", "D92:1"],
                         }
                     ],
                 }
@@ -152,7 +152,7 @@ def _write_report(
                                     "question_text": "RAW QUESTION TEXT",
                                     "ground_truth": "RAW GOLD",
                                     "category": 1,
-                                    "evidence_turn_ids": ["D1:1", "D1:2"],
+                                    "evidence_turn_ids": ["D91:1", "D92:1"],
                                 },
                                 "prediction": "RAW PREDICTION",
                                 "score_result": {

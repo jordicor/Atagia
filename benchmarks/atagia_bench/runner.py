@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import shutil
+import sqlite3
 import subprocess
 from collections import Counter
 from datetime import datetime, timezone
@@ -29,8 +30,14 @@ from benchmarks.atagia_bench.adapter import (
     AtagiaBenchDataset,
     AtagiaBenchPersonaData,
     AtagiaBenchQuestion,
+    render_persona_transcript,
 )
-from benchmarks.atagia_bench.graders import GradeResult, resolve_grader
+from benchmarks.atagia_bench.graders import (
+    MEASUREMENT_LAYERS,
+    GradeResult,
+    measurement_layer_for_grader,
+    resolve_grader,
+)
 from benchmarks.custody_summary import summarize_retrieval_custody
 from benchmarks.json_artifacts import write_json_atomic
 from benchmarks.llm_metrics import (
@@ -44,7 +51,7 @@ from benchmarks.migration_metadata import benchmark_migration_metadata
 from benchmarks.numeric_summary import summarize_numeric_values
 from benchmarks.output_root import assert_outside_repo, bench_output_root
 from benchmarks.retained_db_paths import validate_retained_benchmark_db_dir
-from benchmarks.scorer import LLMJudgeScorer
+from benchmarks.scorer import JudgeProtocol, LLMJudgeScorer
 from benchmarks.source_evidence import source_evidence_from_turns
 from benchmarks.trusted_eval import (
     activate_trusted_evaluation_memories,
@@ -75,8 +82,8 @@ from atagia.services.run_counters import (
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
-_DEFAULT_HOLDOUT_PATH = Path(__file__).resolve().parent / "data" / "holdout_v0.json"
+_DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "src" / "atagia" / "resources" / "manifests"
+_DEFAULT_HOLDOUT_PATH = Path(__file__).resolve().parent / "data" / "holdout_v1.json"
 _DEFAULT_BENCHMARK_DB_DIR = bench_output_root() / "atagia_bench" / "benchmark_dbs"
 _BENCHMARK_DB_FILENAME = "benchmark.db"
 _BENCHMARK_DB_METADATA_FILENAME = "run_metadata.json"
@@ -191,6 +198,7 @@ class AtagiaBenchRunner:
         llm_api_key: str | None,
         llm_model: str | None,
         judge_model: str | None = None,
+        judge_protocol: JudgeProtocol = JudgeProtocol.MEMORY_QUALITY,
         ingest_model: str | None = None,
         retrieval_model: str | None = None,
         answer_model: str | None = None,
@@ -267,6 +275,7 @@ class AtagiaBenchRunner:
             )
         self._answer_stance = answer_stance
         self._answer_stance_prompt_variant = answer_stance_prompt_variant
+        self._judge_protocol = judge_protocol
         self._llm_call_delay_ms = max(0, int(llm_call_delay_ms))
 
     async def run(
@@ -275,8 +284,11 @@ class AtagiaBenchRunner:
         category_tags: list[str] | None = None,
         question_ids: list[str] | None = None,
         exclude_question_ids: list[str] | None = None,
+        measurement_layers: list[str] | None = None,
         benchmark_split: str = "all",
         holdout_question_ids: list[str] | None = None,
+        exclude_conversation_ids: list[str] | None = None,
+        allow_legacy_question_only_holdout: bool = False,
         ablation: AblationConfig | None = None,
         trusted_evaluation: bool = False,
         parallel_personas: int = 1,
@@ -291,13 +303,69 @@ class AtagiaBenchRunner:
         """Run the benchmark and return a structured report."""
         if parallel_personas < 1:
             raise ValueError("parallel_personas must be at least 1")
+        if benchmark_split == "development" and not holdout_question_ids:
+            raise ValueError(
+                "development split requires holdout_question_ids so holdout "
+                "questions cannot enter iterative runs"
+            )
+        if (
+            benchmark_split == "development"
+            and not exclude_conversation_ids
+            and not allow_legacy_question_only_holdout
+        ):
+            raise ValueError(
+                "development split requires exclude_conversation_ids for "
+                "holdout evidence isolation; set "
+                "allow_legacy_question_only_holdout only for an explicit "
+                "legacy manifest without conversation_ids"
+            )
         dataset = self._adapter.load(persona_ids)
+        requested_holdout_question_ids = set(holdout_question_ids or [])
+        requested_excluded_conversation_ids = set(exclude_conversation_ids or [])
+        if benchmark_split == "development" and exclude_conversation_ids:
+            isolation_dataset = (
+                dataset if persona_ids is None else self._adapter.load()
+            )
+            self._validate_development_holdout_isolation(
+                isolation_dataset,
+                holdout_question_ids=requested_holdout_question_ids,
+                excluded_conversation_ids=requested_excluded_conversation_ids,
+            )
+        selected_question_ids = {
+            question.question_id
+            for persona_data in dataset.personas
+            for question in persona_data.questions
+        }
+        holdout_question_ids = sorted(
+            requested_holdout_question_ids & selected_question_ids
+        )
+        selected_conversation_ids = {
+            conversation.conversation_id
+            for persona_data in dataset.personas
+            for conversation in persona_data.conversations
+        }
+        excluded_conversation_ids = (
+            requested_excluded_conversation_ids & selected_conversation_ids
+        )
+        conversation_isolation_declared = bool(
+            requested_excluded_conversation_ids
+        )
         if evaluate_only and reuse_db is None:
             raise ValueError("evaluate_only requires reuse_db")
         if reuse_db is not None:
             evaluate_only = True
             if len(dataset.personas) != 1:
                 raise ValueError("reuse_db requires exactly one selected persona")
+        if reuse_db is not None and excluded_conversation_ids:
+            self._assert_reuse_db_excludes_conversations(
+                self._resolve_reuse_db(reuse_db),
+                excluded_conversation_ids,
+            )
+        if excluded_conversation_ids:
+            dataset = self._without_conversations(
+                dataset,
+                excluded_conversation_ids,
+            )
         effective_benchmark_db_dir: Path | None = None
         if keep_db:
             effective_benchmark_db_dir = validate_retained_benchmark_db_dir(
@@ -314,6 +382,29 @@ class AtagiaBenchRunner:
         exclude_question_filter = (
             set(exclude_question_ids) if exclude_question_ids else None
         )
+        if benchmark_split == "development":
+            exclude_question_filter = (
+                (exclude_question_filter or set()) | set(holdout_question_ids or [])
+            )
+        # Measurement-layer filter (V24): a memory-gate run selects the
+        # memory_content layer so stance/privacy product-behavior questions do
+        # not leak into the milestone. Folded into the existing question filter.
+        layer_question_ids = self._question_ids_for_measurement_layers(
+            dataset,
+            measurement_layers,
+        )
+        if layer_question_ids is not None:
+            question_filter = (
+                layer_question_ids
+                if question_filter is None
+                else question_filter & layer_question_ids
+            )
+            if not question_filter:
+                print(
+                    "No questions match the combined --questions / "
+                    "--measurement-layer filters; the report will be empty.",
+                    flush=True,
+                )
         parallel_limit = min(parallel_personas, len(dataset.personas) or 1)
 
         if parallel_limit == 1:
@@ -373,6 +464,16 @@ class AtagiaBenchRunner:
             exclude_question_ids=exclude_question_ids,
             benchmark_split=benchmark_split,
             holdout_question_ids=holdout_question_ids,
+            excluded_conversation_ids=sorted(excluded_conversation_ids) or None,
+            holdout_evidence_isolation_mode=(
+                "conversation_isolated"
+                if conversation_isolation_declared
+                else (
+                    "legacy_question_only"
+                    if benchmark_split == "development"
+                    else None
+                )
+            ),
             ablation=ablation,
             trusted_evaluation=trusted_evaluation,
             parallel_personas=parallel_limit,
@@ -710,6 +811,7 @@ class AtagiaBenchRunner:
                     judge = LLMJudgeScorer(
                         runtime.llm_client,
                         self._judge_model or chat_model(runtime.settings),
+                        self._judge_protocol,
                     )
                     result = await self._run_question(
                         question_engine,
@@ -829,6 +931,116 @@ class AtagiaBenchRunner:
         if not db_path.is_file():
             raise ValueError(f"Reusable benchmark DB is not a file: {db_path}")
         return db_path
+
+    @staticmethod
+    def _assert_reuse_db_excludes_conversations(
+        db_path: Path,
+        excluded_conversation_ids: set[str],
+    ) -> None:
+        """Reject a retained DB that already contains isolated holdout facts."""
+        if not excluded_conversation_ids:
+            return
+        placeholders = ", ".join("?" for _ in excluded_conversation_ids)
+        database_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(database_uri, uri=True) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            rows = connection.execute(
+                f"SELECT id FROM conversations WHERE id IN ({placeholders})",
+                sorted(excluded_conversation_ids),
+            ).fetchall()
+        found = sorted(str(row[0]) for row in rows)
+        if found:
+            raise ValueError(
+                "Reusable benchmark DB contains conversations isolated from "
+                f"the development split: {', '.join(found)}"
+            )
+
+    @staticmethod
+    def _without_conversations(
+        dataset: AtagiaBenchDataset,
+        excluded_conversation_ids: set[str],
+    ) -> AtagiaBenchDataset:
+        """Return a dataset view without conversations reserved for holdout."""
+        return dataset.model_copy(
+            update={
+                "personas": [
+                    persona_data.model_copy(
+                        update={
+                            "conversations": [
+                                conversation
+                                for conversation in persona_data.conversations
+                                if conversation.conversation_id
+                                not in excluded_conversation_ids
+                            ]
+                        }
+                    )
+                    for persona_data in dataset.personas
+                ]
+            }
+        )
+
+    @staticmethod
+    def _validate_development_holdout_isolation(
+        dataset: AtagiaBenchDataset,
+        *,
+        holdout_question_ids: set[str],
+        excluded_conversation_ids: set[str],
+    ) -> None:
+        """Validate that development excludes every holdout evidence source."""
+        questions = {
+            question.question_id: question
+            for persona_data in dataset.personas
+            for question in persona_data.questions
+        }
+        unknown_questions = holdout_question_ids - questions.keys()
+        if unknown_questions:
+            raise ValueError(
+                "Holdout manifest references unknown questions: "
+                f"{', '.join(sorted(unknown_questions))}"
+            )
+        conversation_ids = {
+            conversation.conversation_id
+            for persona_data in dataset.personas
+            for conversation in persona_data.conversations
+        }
+        unknown_conversations = excluded_conversation_ids - conversation_ids
+        if unknown_conversations:
+            raise ValueError(
+                "Holdout manifest references unknown conversations: "
+                f"{', '.join(sorted(unknown_conversations))}"
+            )
+        turn_conversations = {
+            turn.turn_id: conversation.conversation_id
+            for persona_data in dataset.personas
+            for conversation in persona_data.conversations
+            for turn in conversation.turns
+        }
+        required_conversations = {
+            turn_conversations[turn_id]
+            for question_id in holdout_question_ids
+            for turn_id in questions[question_id].evidence_turn_ids
+        }
+        missing_conversations = required_conversations - excluded_conversation_ids
+        if missing_conversations:
+            raise ValueError(
+                "Development split does not isolate all holdout evidence "
+                f"conversations: {', '.join(sorted(missing_conversations))}"
+            )
+        development_questions_using_holdout_evidence = sorted(
+            question_id
+            for question_id, question in questions.items()
+            if question_id not in holdout_question_ids
+            and any(
+                turn_conversations[turn_id] in excluded_conversation_ids
+                for turn_id in question.evidence_turn_ids
+            )
+        )
+        if development_questions_using_holdout_evidence:
+            raise ValueError(
+                "Development questions reference isolated holdout "
+                "conversations: "
+                f"{', '.join(development_questions_using_holdout_evidence)}"
+            )
 
     @staticmethod
     def _new_persistent_db_dir(
@@ -1344,6 +1556,14 @@ class AtagiaBenchRunner:
             source_evidence = cls._source_evidence_for_question(question, persona_data)
             if source_evidence:
                 config["source_evidence"] = source_evidence
+            # The memory_quality judge treats the conversation itself as the
+            # ground truth for extra content, so give the llm_judge grader the
+            # full authored persona transcript. Harmless for the strict protocol,
+            # which ignores it.
+            if question.grader == "llm_judge":
+                config["conversation_transcript"] = render_persona_transcript(
+                    persona_data.conversations
+                )
         config["benchmark_privacy_enforcement"] = cls._benchmark_privacy_enforcement(
             ablation,
         )
@@ -1403,6 +1623,7 @@ class AtagiaBenchRunner:
         ]
         return {
             "grader": question.grader,
+            "measurement_layer": measurement_layer_for_grader(question.grader),
             "judge_mode": (
                 "source_aware_llm_judge"
                 if question.grader == "llm_judge" and source_evidence
@@ -1908,6 +2129,32 @@ class AtagiaBenchRunner:
             )
         ]
 
+    @staticmethod
+    def _question_ids_for_measurement_layers(
+        dataset: AtagiaBenchDataset,
+        measurement_layers: list[str] | None,
+    ) -> set[str] | None:
+        """Return the question ids whose grader maps to the requested layers.
+
+        Returns ``None`` when no layer filter is requested (all questions run).
+        """
+        if not measurement_layers:
+            return None
+        requested = set(measurement_layers)
+        unknown = requested.difference(MEASUREMENT_LAYERS)
+        if unknown:
+            raise ValueError(
+                "Unknown measurement layer(s): "
+                f"{', '.join(sorted(unknown))}. Valid layers: "
+                f"{', '.join(MEASUREMENT_LAYERS)}"
+            )
+        return {
+            question.question_id
+            for persona in dataset.personas
+            for question in persona.questions
+            if measurement_layer_for_grader(question.grader) in requested
+        }
+
     def _model_config_summary(self) -> dict[str, Any]:
         if self._forced_global_model is not None:
             model_mode = "forced_global"
@@ -1931,6 +2178,7 @@ class AtagiaBenchRunner:
                 or self._forced_global_model
                 or ""
             ),
+            "judge_protocol": self._judge_protocol.value,
         }
 
     def _activation_flags(self) -> dict[str, Any]:
@@ -1967,6 +2215,8 @@ class AtagiaBenchRunner:
         requested_benchmark_db_dir: str | Path | None = None,
         invocation_args: list[str] | None = None,
         run_counters: dict[str, Any] | None = None,
+        excluded_conversation_ids: list[str] | None = None,
+        holdout_evidence_isolation_mode: str | None = None,
     ) -> AtagiaBenchReport:
         """Build the aggregated benchmark report."""
         total = len(results)
@@ -2013,6 +2263,10 @@ class AtagiaBenchRunner:
                 "exclude_question_filter": exclude_question_ids,
                 "benchmark_split": benchmark_split,
                 "holdout_question_ids": holdout_question_ids,
+                "excluded_conversation_ids": excluded_conversation_ids,
+                "holdout_evidence_isolation_mode": (
+                    holdout_evidence_isolation_mode
+                ),
                 "ablation_config": (
                     ablation.model_dump(mode="json", exclude_none=True)
                     if ablation is not None
@@ -2217,12 +2471,37 @@ class AtagiaBenchRunner:
 def load_holdout_question_ids(path: str | Path = _DEFAULT_HOLDOUT_PATH) -> list[str]:
     """Load the frozen Atagia-bench holdout question ID list."""
     payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    status = payload.get("status")
+    if isinstance(status, str) and status.startswith("retired"):
+        raise ValueError(
+            f"Holdout manifest is retired and cannot be used: {status}"
+        )
     question_ids = payload.get("question_ids")
     if not isinstance(question_ids, list) or not all(
         isinstance(item, str) for item in question_ids
     ):
         raise ValueError("Holdout manifest must contain a string question_ids list")
     return sorted(set(question_ids))
+
+
+def load_holdout_conversation_ids(
+    path: str | Path = _DEFAULT_HOLDOUT_PATH,
+) -> list[str]:
+    """Load conversation IDs whose evidence is isolated from development runs."""
+    payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    status = payload.get("status")
+    if isinstance(status, str) and status.startswith("retired"):
+        raise ValueError(
+            f"Holdout manifest is retired and cannot be used: {status}"
+        )
+    conversation_ids = payload.get("conversation_ids", [])
+    if not isinstance(conversation_ids, list) or not all(
+        isinstance(item, str) for item in conversation_ids
+    ):
+        raise ValueError(
+            "Holdout manifest conversation_ids must be a string list"
+        )
+    return sorted(set(conversation_ids))
 
 
 def _question_result_numeric_summary(

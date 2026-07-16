@@ -24,6 +24,7 @@ async def resolve_active_embodiment_snapshot(
     embodiment_id: str | None = None,
     cross_embodiment_mode: EmbodimentBoundaryMode | str | None = None,
     display_name: str | None = None,
+    commit: bool = True,
 ) -> EmbodimentSnapshot | None:
     """Resolve the active Embodiment row without mutating a conversation."""
 
@@ -32,6 +33,7 @@ async def resolve_active_embodiment_snapshot(
         embodiment_id=_optional_text(embodiment_id),
         cross_embodiment_mode=cross_embodiment_mode,
         display_name=display_name,
+        commit=commit,
     )
     if row is None:
         return None
@@ -46,6 +48,7 @@ async def ensure_conversation_active_embodiment(
     embodiment_id: str | None = None,
     cross_embodiment_mode: EmbodimentBoundaryMode | str | None = None,
     display_name: str | None = None,
+    commit: bool = True,
 ) -> tuple[dict[str, Any], EmbodimentSnapshot | None]:
     """Resolve and persist the active Embodiment for a conversation if present."""
 
@@ -60,6 +63,7 @@ async def ensure_conversation_active_embodiment(
         embodiment_id=requested_embodiment_id,
         cross_embodiment_mode=cross_embodiment_mode,
         display_name=display_name,
+        commit=commit,
     )
     if snapshot is None:
         return conversation, None
@@ -79,6 +83,7 @@ async def ensure_conversation_active_embodiment(
             str(conversation["id"]),
             owner_user_id,
             snapshot.embodiment_id,
+            commit=commit,
         )
         if updated is not None:
             conversation = {

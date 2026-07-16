@@ -81,7 +81,7 @@ class AnswerGuardProvider(LLMProvider):
 
 def _context() -> ComposedContext:
     return ComposedContext(
-        memory_block="[Retrieved Memories]\n1. naproxen 500 mg twice a day",
+        memory_block="[Retrieved Memories]\n1. luminex 12 mg once nightly",
         selected_memory_ids=["mem_1"],
         total_tokens_estimate=12,
         budget_tokens=100,
@@ -92,7 +92,7 @@ def _context() -> ComposedContext:
 
 def _secret_context() -> ComposedContext:
     return ComposedContext(
-        memory_block="[Retrieved Memories]\n1. production jump host password: K8sN0d3Jump!2024",
+        memory_block="[Retrieved Memories]\n1. production jump host password: FixtureJump-Cobalt-8642",
         selected_memory_ids=["mem_secret"],
         total_tokens_estimate=12,
         budget_tokens=100,
@@ -121,25 +121,25 @@ def _answer_evidence_context() -> ComposedContext:
     return ComposedContext(
         memory_block=(
             "[Retrieved Memories]\n"
-            "1. Jon talked about the studio opening and related celebration."
+            "1. Mira talked about the mural project and its final cleanup."
         ),
-        selected_memory_ids=["mem_vibes"],
+        selected_memory_ids=["mem_swatch"],
         answer_evidence_sufficiency={
             "state": "sufficient_direct_quote",
             "confidence": 0.96,
             "rendered": False,
-            "top_memory_id": "mem_vibes",
+            "top_memory_id": "mem_swatch",
         },
         answer_evidence_items=[
             {
-                "memory_id": "mem_vibes",
-                "claim": "Jon wanted to savor all the good vibes.",
-                "supporting_quote": "Jon: I want to savor all the good vibes.",
+                "memory_id": "mem_swatch",
+                "claim": "Mira wanted to keep one paint swatch.",
+                "supporting_quote": "Mira: I want to keep one paint swatch.",
                 "quote_source": "source_message",
                 "support_kind": "contextual_direct",
                 "source_chain": [
-                    "assistant seq 282: The studio looks amazing.",
-                    "user seq 283: I want to savor all the good vibes.",
+                    "assistant seq 42: The mural colors look balanced.",
+                    "user seq 43: I want to keep one paint swatch.",
                 ],
                 "selected_for_answer_pack": False,
                 "final_score": 0.96,
@@ -156,30 +156,39 @@ def _answer_support_context() -> ComposedContext:
     return ComposedContext(
         memory_block=(
             "[Retrieved Memories]\n"
-            "1. Caroline said Paris was one of the cities.\n"
-            "2. Caroline said Rome was one of the cities."
+            "1. Rhea said Northglass was one of the field stations.\n"
+            "2. Rhea said Ember Shoal was one of the field stations."
         ),
-        selected_memory_ids=["mem_paris", "mem_rome"],
+        selected_memory_ids=["mem_northglass", "mem_ember_shoal"],
         answer_shape="list",
         coverage_mode="exhaustive_known_set",
         source_precision="required",
         coverage_state="partial",
         support_map={
-            "mem_paris": ["memory:mem_paris", "message:msg_paris"],
-            "mem_rome": ["memory:mem_rome", "message:msg_rome"],
+            "mem_northglass": ["memory:mem_northglass", "message:msg_northglass"],
+            "mem_ember_shoal": [
+                "memory:mem_ember_shoal",
+                "message:msg_ember_shoal",
+            ],
         },
         allowed_values=[
             {
-                "display_text": "Paris",
-                "normalized_key": "value|paris",
-                "evidence_ids": ["memory:mem_paris", "message:msg_paris"],
-                "memory_ids": ["mem_paris"],
+                "display_text": "Northglass",
+                "normalized_key": "value|northglass",
+                "evidence_ids": [
+                    "memory:mem_northglass",
+                    "message:msg_northglass",
+                ],
+                "memory_ids": ["mem_northglass"],
             },
             {
-                "display_text": "Rome",
-                "normalized_key": "value|rome",
-                "evidence_ids": ["memory:mem_rome", "message:msg_rome"],
-                "memory_ids": ["mem_rome"],
+                "display_text": "Ember Shoal",
+                "normalized_key": "value|ember_shoal",
+                "evidence_ids": [
+                    "memory:mem_ember_shoal",
+                    "message:msg_ember_shoal",
+                ],
+                "memory_ids": ["mem_ember_shoal"],
             },
         ],
         missing_slots=[
@@ -255,18 +264,18 @@ def _answer_evidence_retrieval_diagnostics() -> dict[str, object]:
                 "state": "sufficient_direct_quote",
                 "confidence": 0.96,
                 "rendered": False,
-                "top_memory_id": "mem_vibes",
+                "top_memory_id": "mem_swatch",
             },
             "items": [
                 {
-                    "memory_id": "mem_vibes",
-                    "supporting_quote": "Jon: I want to savor all the good vibes.",
+                    "memory_id": "mem_swatch",
+                    "supporting_quote": "Mira: I want to keep one paint swatch.",
                     "quote_source": "source_message",
                     "support_kind": "contextual_direct",
                     "selected_for_answer_pack": False,
                 }
             ],
-            "direct_memory_ids": ["mem_vibes"],
+            "direct_memory_ids": ["mem_swatch"],
         },
         "cross_conversation_raw_policy": {
             "enabled": False,
@@ -286,21 +295,21 @@ def _broad_list_answer_evidence_retrieval_diagnostics() -> dict[str, object]:
             "state": "sufficient_direct_quote",
             "confidence": 0.90,
             "rendered": False,
-            "top_memory_id": "sum_rome",
+            "top_memory_id": "sum_ember_shoal",
         },
         "items": [
             {
-                "memory_id": "sum_rome",
+                "memory_id": "sum_ember_shoal",
                 "supporting_quote": (
-                    "Jon: Took a short trip last week to Rome to clear my mind."
+                    "Rhea: I made a short survey trip to Ember Shoal Station."
                 ),
                 "quote_source": "evidence_packet_source",
                 "support_kind": "inferred",
                 "selected_for_answer_pack": False,
             },
             {
-                "memory_id": "vew_paris",
-                "supporting_quote": "Jon: I've been to Paris yesterday!",
+                "memory_id": "vew_northglass",
+                "supporting_quote": "Rhea: I inspected Northglass Station yesterday.",
                 "quote_source": "source_message",
                 "support_kind": "",
                 "selected_for_answer_pack": False,
@@ -352,7 +361,7 @@ def _pass_verdict() -> dict[str, object]:
 @pytest.mark.asyncio
 async def test_answer_postcondition_passes_supported_answer() -> None:
     provider = AnswerGuardProvider(
-        outputs=["Rosa mentioned naproxen 500 mg twice a day."],
+        outputs=["Rosa mentioned luminex 12 mg once nightly."],
         verdicts=[_pass_verdict()],
     )
     result = await complete_answer_with_postcondition_guard(
@@ -363,7 +372,7 @@ async def test_answer_postcondition_passes_supported_answer() -> None:
         composed_context=_context(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     assert result.report.status == "passed"
     assert result.report.retry_count == 0
     assert result.report.token_budget is not None
@@ -398,7 +407,7 @@ async def test_answer_postcondition_verifier_receives_answer_stance() -> None:
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         request=_request(),
         verifier_model="openai/gpt-5-mini",
-        original_query="Does Rosa have any allergies?",
+        original_query="Is any allergy information available for the test persona?",
         composed_context=_context(),
         answer_stance="proactive",
     )
@@ -419,7 +428,7 @@ async def test_answer_postcondition_verifier_receives_answer_stance() -> None:
 @pytest.mark.asyncio
 async def test_answer_postcondition_verifier_receives_answer_evidence() -> None:
     provider = AnswerGuardProvider(
-        outputs=["Jon wanted to make awesome memories."],
+        outputs=["Mira wanted to remember the project."],
         verdicts=[
             _pass_verdict(),
             {
@@ -427,7 +436,7 @@ async def test_answer_postcondition_verifier_receives_answer_evidence() -> None:
                 "should_repair": False,
                 "reason": "The answer uses the required evidence.",
                 "missing_supported_obligations": [],
-                "evidence_ids_supporting_answer": ["mem_vibes"],
+                "evidence_ids_supporting_answer": ["mem_swatch"],
             },
         ],
     )
@@ -435,7 +444,7 @@ async def test_answer_postcondition_verifier_receives_answer_evidence() -> None:
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         request=_request(),
         verifier_model="openai/gpt-5-mini",
-        original_query="What did Jon want to savor?",
+        original_query="What did Mira want to keep?",
         composed_context=_answer_evidence_context(),
         privacy_enforcement="off",
     )
@@ -449,7 +458,7 @@ async def test_answer_postcondition_verifier_receives_answer_evidence() -> None:
     verifier_prompt = verifier_request.messages[1].content
     assert '"answer_evidence"' in verifier_prompt
     assert "sufficient_direct_quote" in verifier_prompt
-    assert "Jon: I want to savor all the good vibes." in verifier_prompt
+    assert "Mira: I want to keep one paint swatch." in verifier_prompt
     assert "conflicting nearby answer" in verifier_prompt
 
 
@@ -459,8 +468,8 @@ async def test_answer_postcondition_repairs_answer_that_ignores_answer_evidence(
 ):
     provider = AnswerGuardProvider(
         outputs=[
-            "Jon wanted to make awesome memories.",
-            "Jon wanted to savor all the good vibes.",
+            "Mira wanted to remember the project.",
+            "Mira wanted to keep one paint swatch.",
         ],
         verdicts=[
             _pass_verdict(),
@@ -469,7 +478,7 @@ async def test_answer_postcondition_repairs_answer_that_ignores_answer_evidence(
                 "should_repair": True,
                 "reason": "The answer replaced the direct quote with a nearby phrase.",
                 "missing_supported_obligations": [],
-                "evidence_ids_supporting_answer": ["mem_vibes"],
+                "evidence_ids_supporting_answer": ["mem_swatch"],
             },
             _pass_verdict(),
         ],
@@ -479,7 +488,7 @@ async def test_answer_postcondition_repairs_answer_that_ignores_answer_evidence(
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         request=_request(),
         verifier_model="openai/gpt-5-mini",
-        original_query="What did Jon want to savor?",
+        original_query="What did Mira want to keep?",
         composed_context=_answer_evidence_context(),
         retrieval_sufficiency={
             "state": "retrieval_sufficient",
@@ -489,7 +498,7 @@ async def test_answer_postcondition_repairs_answer_that_ignores_answer_evidence(
         privacy_enforcement="off",
     )
 
-    assert result.output_text == "Jon wanted to savor all the good vibes."
+    assert result.output_text == "Mira wanted to keep one paint swatch."
     assert result.report.status == "retry_passed"
     assert result.report.evidence_use_repair_count == 1
     assert result.report.evidence_use_repair_success_count == 1
@@ -508,7 +517,7 @@ async def test_answer_postcondition_repairs_answer_that_ignores_answer_evidence(
     repair_payload = "; ".join(
         repair_request.metadata["atagia_answer_evidence_use_repair_obligations"]
     )
-    assert "Jon: I want to savor all the good vibes." in repair_payload
+    assert "Mira: I want to keep one paint swatch." in repair_payload
 
 
 @pytest.mark.asyncio
@@ -517,8 +526,11 @@ async def test_answer_postcondition_repairs_unsupported_value_using_answer_suppo
 ):
     provider = AnswerGuardProvider(
         outputs=[
-            "Caroline mentioned Paris, Rome, and downtown.",
-            "Caroline mentioned Paris and Rome from the supported retrieved evidence.",
+            "Rhea mentioned Northglass, Ember Shoal, and the archive basement.",
+            (
+                "Rhea mentioned Northglass and Ember Shoal from the supported "
+                "retrieved evidence."
+            ),
         ],
         verdicts=[
             {
@@ -530,7 +542,9 @@ async def test_answer_postcondition_repairs_unsupported_value_using_answer_suppo
                 "requires_abstention": False,
                 "pass_postcondition": False,
                 "failure_reasons": ["unsupported_concrete_claim"],
-                "explanation": "The answer adds downtown, which is not allowed.",
+                "explanation": (
+                    "The answer adds the archive basement, which is not allowed."
+                ),
             },
             _pass_verdict(),
         ],
@@ -540,13 +554,14 @@ async def test_answer_postcondition_repairs_unsupported_value_using_answer_suppo
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         request=_request(),
         verifier_model="openai/gpt-5-mini",
-        original_query="Which cities did Caroline mention?",
+        original_query="Which field stations did Rhea mention?",
         composed_context=_answer_support_context(),
         privacy_enforcement="off",
     )
 
     assert result.output_text == (
-        "Caroline mentioned Paris and Rome from the supported retrieved evidence."
+        "Rhea mentioned Northglass and Ember Shoal from the supported retrieved "
+        "evidence."
     )
     assert result.report.status == "retry_passed"
     initial_answer_request = provider.requests[0]
@@ -571,9 +586,9 @@ async def test_answer_postcondition_repairs_unsupported_value_using_answer_suppo
 async def test_answer_postcondition_falls_back_to_supported_partial_answer() -> None:
     provider = AnswerGuardProvider(
         outputs=[
-            "Caroline mentioned Paris, Rome, and downtown.",
-            "Caroline mentioned Paris, Rome, and downtown again.",
-            "Caroline mentioned Paris, Rome, and downtown once more.",
+            "Rhea mentioned Northglass, Ember Shoal, and the archive basement.",
+            "Rhea again included the archive basement with both field stations.",
+            "Rhea once more included the archive basement with both field stations.",
         ],
         verdicts=[
             {
@@ -585,7 +600,7 @@ async def test_answer_postcondition_falls_back_to_supported_partial_answer() -> 
                 "requires_abstention": False,
                 "pass_postcondition": False,
                 "failure_reasons": ["unsupported_concrete_claim"],
-                "explanation": "The answer adds downtown.",
+                "explanation": "The answer adds the archive basement.",
             },
             {
                 "readable": True,
@@ -596,7 +611,7 @@ async def test_answer_postcondition_falls_back_to_supported_partial_answer() -> 
                 "requires_abstention": False,
                 "pass_postcondition": False,
                 "failure_reasons": ["unsupported_concrete_claim"],
-                "explanation": "The retry still adds downtown.",
+                "explanation": "The retry still adds the archive basement.",
             },
             {
                 "readable": True,
@@ -607,7 +622,7 @@ async def test_answer_postcondition_falls_back_to_supported_partial_answer() -> 
                 "requires_abstention": False,
                 "pass_postcondition": False,
                 "failure_reasons": ["unsupported_concrete_claim"],
-                "explanation": "The support repair still adds downtown.",
+                "explanation": "The support repair still adds the archive basement.",
             },
         ],
     )
@@ -616,12 +631,12 @@ async def test_answer_postcondition_falls_back_to_supported_partial_answer() -> 
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         request=_request(),
         verifier_model="openai/gpt-5-mini",
-        original_query="Which cities did Caroline mention?",
+        original_query="Which field stations did Rhea mention?",
         composed_context=_answer_support_context(),
         privacy_enforcement="off",
     )
 
-    assert result.output_text == "Paris, Rome"
+    assert result.output_text == "Northglass, Ember Shoal"
     assert result.report.status == "supported_partial_fallback"
     assert result.report.abstention_reason == "supported_answer_repair_failed"
     assert result.report.evidence_use_repair_count == 1
@@ -655,7 +670,9 @@ def test_supported_partial_fallback_requires_supported_repair_abstention_reason(
         response=LLMCompletionResponse(
             provider="answer-guard-tests",
             model="openai/gpt-5-mini",
-            output_text="Caroline mentioned Paris, Rome, and downtown.",
+            output_text=(
+                "Rhea mentioned Northglass, Ember Shoal, and the archive basement."
+            ),
         ),
         composed_context=_answer_support_context(),
         retry_count=0,
@@ -703,8 +720,8 @@ async def test_answer_postcondition_repair_includes_multiple_broad_list_evidence
 ):
     provider = AnswerGuardProvider(
         outputs=[
-            "Jon has visited Rome.",
-            "Jon has visited Paris and Rome.",
+            "Rhea inspected Ember Shoal Station.",
+            "Rhea inspected Northglass and Ember Shoal Stations.",
         ],
         verdicts=[
             _pass_verdict(),
@@ -713,9 +730,12 @@ async def test_answer_postcondition_repair_includes_multiple_broad_list_evidence
                 "should_repair": True,
                 "reason": "The answer omitted a direct list item.",
                 "missing_supported_obligations": [
-                    "The claim that Jon visited Paris is unsupported."
+                    "The claim that Rhea inspected Northglass is unsupported."
                 ],
-                "evidence_ids_supporting_answer": ["sum_rome", "vew_paris"],
+                "evidence_ids_supporting_answer": [
+                    "sum_ember_shoal",
+                    "vew_northglass",
+                ],
             },
             _pass_verdict(),
         ],
@@ -725,7 +745,7 @@ async def test_answer_postcondition_repair_includes_multiple_broad_list_evidence
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         request=_request(),
         verifier_model="openai/gpt-5-mini",
-        original_query="Which cities has Jon visited?",
+        original_query="Which field stations did Rhea inspect?",
         composed_context=_answer_evidence_context(),
         retrieval_sufficiency={
             "state": "retrieval_sufficient",
@@ -735,7 +755,7 @@ async def test_answer_postcondition_repair_includes_multiple_broad_list_evidence
         privacy_enforcement="off",
     )
 
-    assert result.output_text == "Jon has visited Paris and Rome."
+    assert result.output_text == "Rhea inspected Northglass and Ember Shoal Stations."
     repair_request = next(
         request
         for request in provider.requests
@@ -744,8 +764,8 @@ async def test_answer_postcondition_repair_includes_multiple_broad_list_evidence
     repair_payload = "; ".join(
         repair_request.metadata["atagia_answer_evidence_use_repair_obligations"]
     )
-    assert "Rome" in repair_payload
-    assert "Paris" in repair_payload
+    assert "Ember Shoal" in repair_payload
+    assert "Northglass" in repair_payload
 
 
 @pytest.mark.asyncio
@@ -758,7 +778,7 @@ async def test_answer_postcondition_reactive_verifier_distinguishes_category_fro
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         request=_request(),
         verifier_model="openai/gpt-5-mini",
-        original_query="Does Rosa have any allergies?",
+        original_query="Is any allergy information available for the test persona?",
         composed_context=_context(),
         answer_stance="reactive",
     )
@@ -779,7 +799,7 @@ async def test_answer_postcondition_privacy_off_ignores_policy_only_abstention()
     None
 ):
     provider = AnswerGuardProvider(
-        outputs=["The production jump host password is K8sN0d3Jump!2024."],
+        outputs=["The production jump host password is FixtureJump-Cobalt-8642."],
         verdicts=[
             {
                 **_pass_verdict(),
@@ -805,7 +825,7 @@ async def test_answer_postcondition_privacy_off_ignores_policy_only_abstention()
     )
 
     assert (
-        result.output_text == "The production jump host password is K8sN0d3Jump!2024."
+        result.output_text == "The production jump host password is FixtureJump-Cobalt-8642."
     )
     assert result.report.status == "passed"
     assert result.report.retry_count == 0
@@ -833,7 +853,7 @@ async def test_answer_postcondition_privacy_off_ignores_policy_only_abstention()
 @pytest.mark.asyncio
 async def test_answer_postcondition_retries_unreadable_answer() -> None:
     provider = AnswerGuardProvider(
-        outputs=["}?? garbled", "Rosa mentioned naproxen 500 mg twice a day."],
+        outputs=["}?? garbled", "Rosa mentioned luminex 12 mg once nightly."],
         verdicts=[
             {
                 **_pass_verdict(),
@@ -853,7 +873,7 @@ async def test_answer_postcondition_retries_unreadable_answer() -> None:
         composed_context=_context(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     assert result.report.status == "retry_passed"
     assert result.report.retry_count == 1
     retry_request = next(
@@ -867,7 +887,7 @@ async def test_answer_postcondition_retries_unreadable_answer() -> None:
 @pytest.mark.asyncio
 async def test_answer_postcondition_normalizes_free_form_failure_reasons() -> None:
     provider = AnswerGuardProvider(
-        outputs=["Rosa took aspirin.", "Rosa mentioned naproxen 500 mg twice a day."],
+        outputs=["Rosa took aspirin.", "Rosa mentioned luminex 12 mg once nightly."],
         verdicts=[
             {
                 **_pass_verdict(),
@@ -887,7 +907,7 @@ async def test_answer_postcondition_normalizes_free_form_failure_reasons() -> No
         composed_context=_context(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     retry_request = next(
         request
         for request in provider.requests
@@ -900,8 +920,8 @@ async def test_answer_postcondition_normalizes_free_form_failure_reasons() -> No
 async def test_answer_postcondition_retry_includes_claim_pruning_diagnostics() -> None:
     provider = AnswerGuardProvider(
         outputs=[
-            "Rosa mentioned naproxen 500 mg twice a day and also started aspirin.",
-            "Rosa mentioned naproxen 500 mg twice a day.",
+            "Rosa mentioned luminex 12 mg once nightly and also started aspirin.",
+            "Rosa mentioned luminex 12 mg once nightly.",
         ],
         verdicts=[
             {
@@ -923,7 +943,7 @@ async def test_answer_postcondition_retry_includes_claim_pruning_diagnostics() -
         composed_context=_context(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     retry_request = next(
         request
         for request in provider.requests
@@ -939,7 +959,7 @@ async def test_answer_postcondition_retry_includes_claim_pruning_diagnostics() -
 @pytest.mark.asyncio
 async def test_answer_postcondition_normalizes_unknown_bool_values() -> None:
     provider = AnswerGuardProvider(
-        outputs=["Rosa took aspirin.", "Rosa mentioned naproxen 500 mg twice a day."],
+        outputs=["Rosa took aspirin.", "Rosa mentioned luminex 12 mg once nightly."],
         verdicts=[
             {
                 **_pass_verdict(),
@@ -958,7 +978,7 @@ async def test_answer_postcondition_normalizes_unknown_bool_values() -> None:
         composed_context=_context(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     retry_request = next(
         request
         for request in provider.requests
@@ -972,7 +992,7 @@ async def test_answer_postcondition_accepts_explicit_pass_with_empty_failure_lab
     None
 ):
     provider = AnswerGuardProvider(
-        outputs=["Rosa mentioned naproxen 500 mg twice a day."],
+        outputs=["Rosa mentioned luminex 12 mg once nightly."],
         verdicts=[
             {
                 **_pass_verdict(),
@@ -989,7 +1009,7 @@ async def test_answer_postcondition_accepts_explicit_pass_with_empty_failure_lab
         composed_context=_context(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     assert result.report.status == "passed"
 
 
@@ -1091,7 +1111,7 @@ async def test_answer_postcondition_abstains_after_failed_retry() -> None:
 @pytest.mark.asyncio
 async def test_answer_postcondition_repairs_invalid_verifier_output() -> None:
     provider = AnswerGuardProvider(
-        outputs=["Rosa mentioned naproxen 500 mg twice a day."],
+        outputs=["Rosa mentioned luminex 12 mg once nightly."],
         verdicts=["not json", _pass_verdict()],
     )
     result = await complete_answer_with_postcondition_guard(
@@ -1106,7 +1126,7 @@ async def test_answer_postcondition_repairs_invalid_verifier_output() -> None:
         composed_context=_context(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     assert result.report.status == "passed"
     assert result.report.verifier_retry_count == 1
     assert result.report.verifier_structured_output_retry_count == 1
@@ -1127,7 +1147,7 @@ async def test_answer_postcondition_repairs_invalid_verifier_output() -> None:
 @pytest.mark.asyncio
 async def test_answer_postcondition_fails_closed_after_invalid_verifier_retry() -> None:
     provider = AnswerGuardProvider(
-        outputs=["Rosa mentioned naproxen 500 mg twice a day."],
+        outputs=["Rosa mentioned luminex 12 mg once nightly."],
         verdicts=["not json", "still not json"],
     )
     result = await complete_answer_with_postcondition_guard(
@@ -1160,7 +1180,7 @@ async def test_answer_postcondition_repairs_illegitimate_abstention() -> None:
     provider = AnswerGuardProvider(
         outputs=[
             "I do not have enough reliable retrieved evidence.",
-            "Rosa mentioned naproxen 500 mg twice a day.",
+            "Rosa mentioned luminex 12 mg once nightly.",
         ],
         verdicts=[
             {
@@ -1195,7 +1215,7 @@ async def test_answer_postcondition_repairs_illegitimate_abstention() -> None:
         retrieval_diagnostics=_supported_retrieval_diagnostics(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     assert result.report.status == "retry_passed"
     assert result.report.evidence_use_repair_count == 1
     assert result.report.evidence_use_repair_success_count == 1
@@ -1226,7 +1246,7 @@ async def test_answer_postcondition_repairs_abstention_when_legitimacy_has_evide
     provider = AnswerGuardProvider(
         outputs=[
             "I do not have enough reliable retrieved evidence.",
-            "Rosa mentioned naproxen 500 mg twice a day.",
+            "Rosa mentioned luminex 12 mg once nightly.",
         ],
         verdicts=[
             {
@@ -1263,7 +1283,7 @@ async def test_answer_postcondition_repairs_abstention_when_legitimacy_has_evide
         retrieval_diagnostics=_supported_retrieval_diagnostics(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     assert result.report.status == "retry_passed"
     assert result.report.evidence_use_repair_count == 1
     assert result.report.evidence_use_repair_success_count == 1
@@ -1286,7 +1306,7 @@ async def test_answer_postcondition_repairs_abstention_from_answer_evidence() ->
     provider = AnswerGuardProvider(
         outputs=[
             "I do not have enough reliable retrieved evidence.",
-            "Jon wanted to savor all the good vibes.",
+            "Mira wanted to keep one paint swatch.",
         ],
         verdicts=[
             {
@@ -1300,7 +1320,7 @@ async def test_answer_postcondition_repairs_abstention_from_answer_evidence() ->
                 "abstention_allowed": False,
                 "reason": "The answer evidence contains a direct source quote.",
                 "missing_supported_obligations": [],
-                "evidence_ids_supporting_answer": ["mem_vibes"],
+                "evidence_ids_supporting_answer": ["mem_swatch"],
                 "policy_or_scope_blocker": False,
                 "evidence_insufficient": False,
             },
@@ -1312,7 +1332,7 @@ async def test_answer_postcondition_repairs_abstention_from_answer_evidence() ->
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         request=_request(),
         verifier_model="openai/gpt-5-mini",
-        original_query="What did Jon want to savor?",
+        original_query="What did Mira want to keep?",
         composed_context=_answer_evidence_context(),
         retrieval_sufficiency={
             "state": "retrieval_sufficient",
@@ -1322,7 +1342,7 @@ async def test_answer_postcondition_repairs_abstention_from_answer_evidence() ->
         privacy_enforcement="off",
     )
 
-    assert result.output_text == "Jon wanted to savor all the good vibes."
+    assert result.output_text == "Mira wanted to keep one paint swatch."
     assert result.report.status == "retry_passed"
     assert result.report.evidence_use_repair_count == 1
     repair_request = next(
@@ -1333,8 +1353,8 @@ async def test_answer_postcondition_repairs_abstention_from_answer_evidence() ->
     repair_payload = "; ".join(
         repair_request.metadata["atagia_answer_evidence_use_repair_obligations"]
     )
-    assert "mem_vibes" in repair_payload
-    assert "Jon: I want to savor all the good vibes." in repair_payload
+    assert "mem_swatch" in repair_payload
+    assert "Mira: I want to keep one paint swatch." in repair_payload
 
 
 @pytest.mark.asyncio
@@ -1342,7 +1362,7 @@ async def test_answer_postcondition_repairs_abstention_with_plan_diagnostics() -
     provider = AnswerGuardProvider(
         outputs=[
             "I do not have enough reliable retrieved evidence.",
-            "Rosa mentioned naproxen 500 mg twice a day.",
+            "Rosa mentioned luminex 12 mg once nightly.",
         ],
         verdicts=[
             {
@@ -1377,7 +1397,7 @@ async def test_answer_postcondition_repairs_abstention_with_plan_diagnostics() -
         retrieval_diagnostics=_supported_retrieval_plan_diagnostics(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     assert result.report.status == "retry_passed"
     assert result.report.evidence_use_repair_count == 1
     assert result.report.abstention_legitimacy_verdict is not None
@@ -1398,9 +1418,9 @@ async def test_answer_postcondition_repairs_failed_retry_with_supported_evidence
 ):
     provider = AnswerGuardProvider(
         outputs=[
-            "Rosa mentioned naproxen 500 mg twice a day and also started aspirin.",
+            "Rosa mentioned luminex 12 mg once nightly and also started aspirin.",
             "Rosa started aspirin.",
-            "Rosa mentioned naproxen 500 mg twice a day.",
+            "Rosa mentioned luminex 12 mg once nightly.",
         ],
         verdicts=[
             {
@@ -1432,7 +1452,7 @@ async def test_answer_postcondition_repairs_failed_retry_with_supported_evidence
         retrieval_diagnostics=_supported_retrieval_diagnostics(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     assert result.report.status == "retry_passed"
     assert result.report.retry_count == 2
     assert result.report.evidence_use_repair_count == 1
@@ -1466,7 +1486,7 @@ async def test_answer_postcondition_privacy_off_disables_policy_abstention_block
     provider = AnswerGuardProvider(
         outputs=[
             "I cannot reveal that.",
-            "Rosa mentioned naproxen 500 mg twice a day.",
+            "Rosa mentioned luminex 12 mg once nightly.",
         ],
         verdicts=[
             {
@@ -1502,7 +1522,7 @@ async def test_answer_postcondition_privacy_off_disables_policy_abstention_block
         privacy_enforcement="off",
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     legitimacy_request = next(
         request
         for request in provider.requests
@@ -1598,7 +1618,7 @@ async def test_answer_postcondition_repairs_failed_illegitimate_abstention() -> 
     provider = AnswerGuardProvider(
         outputs=[
             "I cannot answer that safely.",
-            "Rosa mentioned naproxen 500 mg twice a day.",
+            "Rosa mentioned luminex 12 mg once nightly.",
         ],
         verdicts=[
             {
@@ -1635,7 +1655,7 @@ async def test_answer_postcondition_repairs_failed_illegitimate_abstention() -> 
         retrieval_diagnostics=_supported_retrieval_diagnostics(),
     )
 
-    assert result.output_text == "Rosa mentioned naproxen 500 mg twice a day."
+    assert result.output_text == "Rosa mentioned luminex 12 mg once nightly."
     assert result.report.status == "retry_passed"
     assert result.report.evidence_use_repair_count == 1
     assert result.report.evidence_use_repair_success_count == 1

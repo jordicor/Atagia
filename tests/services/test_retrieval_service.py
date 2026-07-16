@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,14 +10,23 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
+from atagia.app import initialize_runtime
 from atagia.core.clock import FrozenClock
+from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import ConversationRepository, UserRepository
 from atagia.core.topic_repository import TopicRepository
 from atagia.models.schemas_memory import RetrievalTrace
+from atagia.services.errors import TranscriptRebuildInProgressError
+from atagia.services.retrieval_pipeline import RetrievalPipeline
 from atagia.services.retrieval_service import RetrievalService
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 @dataclass(slots=True)
@@ -30,19 +40,30 @@ async def _connection_and_clock() -> tuple[aiosqlite.Connection, FrozenClock]:
     return connection, clock
 
 
-async def _insert_assistant_mode(connection: aiosqlite.Connection, mode_id: str = "coding_debug") -> None:
+async def _insert_assistant_mode(
+    connection: aiosqlite.Connection, mode_id: str = "coding_debug"
+) -> None:
     await connection.execute(
         """
         INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (mode_id, "Coding Debug", "hash_1", "{}", "2026-04-26T02:35:00+00:00", "2026-04-26T02:35:00+00:00"),
+        (
+            mode_id,
+            "Coding Debug",
+            "hash_1",
+            "{}",
+            "2026-04-26T02:35:00+00:00",
+            "2026-04-26T02:35:00+00:00",
+        ),
     )
     await connection.commit()
 
 
 @pytest.mark.asyncio
-async def test_attach_topic_snapshot_populates_trace_without_changing_retrieval_behavior() -> None:
+async def test_attach_topic_snapshot_populates_trace_without_changing_retrieval_behavior() -> (
+    None
+):
     connection, clock = await _connection_and_clock()
     try:
         users = UserRepository(connection, clock)
@@ -51,8 +72,12 @@ async def test_attach_topic_snapshot_populates_trace_without_changing_retrieval_
         await users.create_user("usr_a")
         await users.create_user("usr_b")
         await _insert_assistant_mode(connection)
-        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
-        await conversations.create_conversation("cnv_b", "usr_b", None, "coding_debug", "Chat B")
+        await conversations.create_conversation(
+            "cnv_a", "usr_a", None, "coding_debug", "Chat A"
+        )
+        await conversations.create_conversation(
+            "cnv_b", "usr_b", None, "coding_debug", "Chat B"
+        )
         active_topic = await topics.create_topic(
             topic_id="tpc_active",
             user_id="usr_a",
@@ -96,8 +121,12 @@ async def test_attach_topic_snapshot_populates_trace_without_changing_retrieval_
             trace=trace,
         )
 
-        assert [topic.id for topic in trace.topic_snapshot.active_topics] == ["tpc_active"]
-        assert [topic.id for topic in trace.topic_snapshot.parked_topics] == ["tpc_parked"]
+        assert [topic.id for topic in trace.topic_snapshot.active_topics] == [
+            "tpc_active"
+        ]
+        assert [topic.id for topic in trace.topic_snapshot.parked_topics] == [
+            "tpc_parked"
+        ]
         assert trace.topic_snapshot.active_topics[0].open_questions == [
             "Which candidate was filtered?"
         ]
@@ -111,3 +140,99 @@ async def test_attach_topic_snapshot_populates_trace_without_changing_retrieval_
         ]
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_retrieve_rejects_result_if_completed_replacement_changes_source_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = await initialize_runtime(
+        Settings(
+            sqlite_path=str(tmp_path / "retrieval-snapshot-race.db"),
+            migrations_path=str(MIGRATIONS_DIR),
+            manifests_path=str(MANIFESTS_DIR),
+            storage_backend="inprocess",
+            redis_url="redis://localhost:6379/0",
+            openai_api_key="test-openai-key",
+            openrouter_api_key=None,
+            openrouter_site_url="http://localhost",
+            openrouter_app_name="Atagia",
+            llm_chat_model="openai/test-model",
+            llm_ingest_model="openai/test-model",
+            llm_retrieval_model="openai/test-model",
+            service_mode=False,
+            service_api_key=None,
+            admin_api_key=None,
+            workers_enabled=False,
+            debug=False,
+            allow_insecure_http=True,
+        )
+    )
+    try:
+        setup = await runtime.open_connection()
+        try:
+            await UserRepository(setup, runtime.clock).create_user("usr_snapshot")
+            await ConversationRepository(
+                setup,
+                runtime.clock,
+            ).create_conversation(
+                "cnv_snapshot",
+                "usr_snapshot",
+                None,
+                "general_qa",
+                "Snapshot race",
+                platform_id="web",
+            )
+        finally:
+            await setup.close()
+
+        pipeline_started = asyncio.Event()
+        replacement_completed = asyncio.Event()
+        stale_result = object()
+
+        async def paused_execute(
+            _pipeline: RetrievalPipeline,
+            **_kwargs: object,
+        ) -> object:
+            pipeline_started.set()
+            await replacement_completed.wait()
+            return stale_result
+
+        monkeypatch.setattr(RetrievalPipeline, "execute", paused_execute)
+        retrieval_task = asyncio.create_task(
+            RetrievalService(runtime).retrieve(
+                user_id="usr_snapshot",
+                conversation_id="cnv_snapshot",
+                message_text="What do you remember?",
+            )
+        )
+        await asyncio.wait_for(pipeline_started.wait(), timeout=2.0)
+
+        # A selected-transcript finalization advances this exact canonical
+        # revision in its terminal transaction. Use a second connection to
+        # reproduce that completed-replacement boundary while retrieval is out
+        # of transaction in its (potentially LLM-backed) pipeline.
+        writer = await runtime.open_connection()
+        try:
+            await writer.execute("BEGIN IMMEDIATE")
+            await writer.execute(
+                """
+                UPDATE user_lifecycles
+                SET derivation_revision = derivation_revision + 1
+                WHERE user_id = ?
+                """,
+                ("usr_snapshot",),
+            )
+            await writer.commit()
+        finally:
+            await writer.close()
+        replacement_completed.set()
+
+        with pytest.raises(
+            TranscriptRebuildInProgressError,
+            match="Memory sources changed while the request was in progress",
+        ):
+            await retrieval_task
+    finally:
+        await runtime.close()

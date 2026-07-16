@@ -18,7 +18,7 @@ def test_failed_question_custody_report_extracts_failure_context(tmp_path: Path)
             question_text="What did I decide?",
             ground_truth="Use SQLite",
             category=1,
-            evidence_turn_ids=["D1:1"],
+            evidence_turn_ids=["D97:9701"],
             question_id="conv-test:q1",
         ),
         prediction="I do not know",
@@ -32,7 +32,7 @@ def test_failed_question_custody_report_extracts_failure_context(tmp_path: Path)
         trace={
             "diagnosis_bucket": "retrieval_no_candidates",
             "sufficiency_diagnostic": "missing_raw_evidence",
-            "evidence_turn_ids": ["D1:1"],
+            "evidence_turn_ids": ["D97:9701"],
             "selected_memory_ids": [],
             "retrieval_custody": [
                 {

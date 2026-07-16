@@ -16,7 +16,9 @@ The fastest way to bootstrap a working `.env` is:
 
 ```bash
 cp .env.example .env
-# fill in at least one provider API key
+# configure the provider keys required by your selected model routing
+# set distinct ATAGIA_SERVICE_API_KEY and ATAGIA_ADMIN_API_KEY values
+# because the shipped example enables service mode
 ```
 
 ---
@@ -62,11 +64,59 @@ deprecated `-preview` endpoint, for retrieval overrides.
 | `ATAGIA_DB_PATH` | `atagia.db` (MCP) | Optional | SQLite path used by the MCP server and the client SDK; falls back to `ATAGIA_SQLITE_PATH` in the client. |
 | `ATAGIA_STORAGE_BACKEND` | `inprocess` | Optional | Storage backend selector. `inprocess` keeps streams in memory; `redis` uses Redis Streams. |
 | `ATAGIA_REDIS_URL` | `redis://localhost:6379/0` | Optional | Redis connection URL when `ATAGIA_STORAGE_BACKEND=redis`. |
-| `ATAGIA_MIGRATIONS_PATH` | `./migrations` (or packaged) | Optional | Directory containing numbered SQL migration files. |
-| `ATAGIA_MANIFESTS_PATH` | `./manifests` (or packaged) | Optional | Directory containing assistant mode manifest JSON files. |
-| `ATAGIA_OPERATIONAL_PROFILES_PATH` | `./operational_profiles` (or packaged) | Optional | Directory containing operational profile JSON files. |
-| `ATAGIA_ARTIFACT_BLOB_STORAGE_KIND` | `sqlite_blob` | Optional | Where artifact blobs are stored. One of `sqlite_blob` or `local_file`. |
-| `ATAGIA_ARTIFACT_BLOB_STORAGE_PATH` | `./data/artifact_blobs` | Optional | Directory for artifact blobs when `ATAGIA_ARTIFACT_BLOB_STORAGE_KIND=local_file`. |
+| `ATAGIA_MIGRATIONS_PATH` | Packaged resources | Optional | Explicit custom directory containing numbered SQL migration files. |
+| `ATAGIA_MANIFESTS_PATH` | Packaged resources | Optional | Explicit custom directory containing assistant mode manifest JSON files. |
+| `ATAGIA_OPERATIONAL_PROFILES_PATH` | Packaged resources | Optional | Explicit custom directory containing operational profile JSON files. |
+| `ATAGIA_ARTIFACT_BLOB_STORAGE_KIND` | `sqlite_blob` | Optional | Artifact blob backend. `sqlite_blob` is the only supported runtime value. |
+| `ATAGIA_ARTIFACT_BLOB_STORAGE_PATH` | `./data/artifact_blobs` | Optional | Legacy blob root used only by the offline local-file migration command. |
+
+Deployments that previously used the retired local-file backend must stop all
+Atagia writers and lifecycle/GC workers, then run:
+
+```bash
+atagia-artifact-blob-migrate \
+  --sqlite-path /path/to/atagia.db \
+  --artifact-blob-storage-path /path/to/legacy/artifact_blobs \
+  run
+```
+
+The command inventories every declared blob-reference table, verifies file
+hashes and sizes, migrates references to SQLite in resumable row commits, and
+unlinks a file only after a committed global zero-reference check. Normal
+startup refuses legacy references, pending file deletions, or undrained cleanup
+intents and reports the migration command to run.
+
+### Durable worker dispatch and execution leases
+
+SQLite stores every complete validated recovery envelope and is authoritative
+for queued, claimed, running, retrying, deferred, and terminal job state. The
+selected storage backend carries only opaque wake-up notifications. A startup
+sweep and the continuous dispatcher recover nonterminal rows; Redis reset or
+notification loss therefore does not lose canonical work.
+
+Each worker renews an execution lease while it owns a job. Terminal writes,
+retries, and worker-created child jobs compare the owner, fence token,
+lifecycle epoch, and an unexpired lease. A stale owner may incur duplicate
+provider cost across a crash boundary, but cannot commit the logical effect.
+`inprocess` is a supported single-process backend only; configure Redis when
+more than one service or worker process participates.
+
+| Variable | Default | Required | Description |
+|---|---|---|---|
+| `ATAGIA_WORKERS_ENABLED` | `false` | Optional | Start the durable dispatcher and background workers in this process. Jobs are still committed durably when workers are disabled. |
+| `ATAGIA_SERVICE_PROCESS_COUNT` | `1` (or `WEB_CONCURRENCY`) | Optional | Declared service-process count. Values above one require the Redis storage backend. |
+| `ATAGIA_WORKER_DISPATCH_VISIBILITY_SECONDS` | `30` | Optional | Lifetime of one SQLite dispatch claim before another dispatcher may recover it. |
+| `ATAGIA_WORKER_DISPATCH_SWEEP_INTERVAL_SECONDS` | `0.5` | Optional | Maximum interval between continuous scans for publishable durable jobs. |
+| `ATAGIA_WORKER_DISPATCH_BATCH_SIZE` | `100` | Optional | Maximum durable rows considered in one dispatcher sweep. |
+| `ATAGIA_WORKER_EXECUTION_LEASE_SECONDS` | `120` | Optional | Renewable SQLite execution-lease lifetime. |
+| `ATAGIA_WORKER_EXECUTION_HEARTBEAT_SECONDS` | `30` | Optional | Lease-renewal cadence; it must be shorter than the execution lease. |
+| `ATAGIA_WORKER_STREAM_RECLAIM_IDLE_SECONDS` | `120` | Optional | Minimum idle time before reclaiming an abandoned transient delivery; it must not be shorter than dispatch visibility. |
+| `ATAGIA_WORKER_RETRY_BACKOFF_INITIAL_SECONDS` | `1` | Optional | Initial durable retry delay after a retryable worker failure. |
+| `ATAGIA_WORKER_RETRY_BACKOFF_MAX_SECONDS` | `30` | Optional | Maximum durable retry delay. |
+| `ATAGIA_WORKER_TRANSIENT_DEFER_SECONDS` | `60` | Optional | Initial delay for transient deferral when the worker circuit is unavailable. |
+| `ATAGIA_WORKER_TRANSIENT_DEFER_MAX_SECONDS` | `300` | Optional | Maximum per-deferral delay. |
+| `ATAGIA_WORKER_TRANSIENT_DEFER_MAX_COUNT` | `12` | Optional | Maximum transient deferrals before the job follows its bounded terminal policy. |
+| `ATAGIA_WORKER_TRANSIENT_DEFER_MAX_AGE_SECONDS` | `3600` | Optional | Maximum wall-clock age allowed for transient deferral. |
 
 ---
 
@@ -172,11 +222,11 @@ Answer-time prompts use one structural input envelope by default. The envelope
 allocates the full global budget across instructions, the current turn,
 retrieved context, and recent transcript; it does not force empty filler when a
 section has less useful material than its allocation. The current default is
-the retained-replay calibrated 4k budget.
+the retained-replay calibrated 8k budget.
 
 | Variable | Default | Required | Description |
 |---|---|---|---|
-| `ATAGIA_CONTEXT_ENVELOPE_BUDGET_TOKENS` | `4096` | Optional | Global answer-input envelope budget used to derive section budgets for retrieved context and recent transcript. |
+| `ATAGIA_CONTEXT_ENVELOPE_BUDGET_TOKENS` | `8192` | Optional | Global answer-input envelope budget used to derive section budgets for retrieved context and recent transcript. |
 | `ATAGIA_CONTEXT_ENVELOPE_RATIOS` | `instructions=0.10,current_turn=0.03,retrieved_context=0.67,recent_transcript=0.20` | Optional | Section allocation ratios. Accepts either a JSON object or comma-separated `key=value` pairs; values are normalized before allocation. |
 
 ---
@@ -309,7 +359,7 @@ with optional raw request/response bodies.
 |---|---|---|---|
 | `ATAGIA_DEBUG` | `false` | Optional | Generic debug toggle for verbose logging. |
 | `ATAGIA_DEBUG_LLM_IO` | `false` | Optional | Persist every LLM call to disk for inspection. |
-| `ATAGIA_DEBUG_LLM_IO_DIR` | `./docs/tmp/llm_debug` | Optional | Directory where LLM IO artifacts are written. |
+| `ATAGIA_DEBUG_LLM_IO_DIR` | `./data/llm_debug` | Optional | Directory where LLM IO artifacts are written. |
 | `ATAGIA_DEBUG_LLM_IO_PURPOSES` | _(empty)_ | Optional | Comma-separated allowlist of purposes to record. Empty means record all. |
 | `ATAGIA_DEBUG_LLM_IO_RAW` | `false` | Optional | Also persist raw provider request/response payloads alongside the structured artifact. |
 | `ATAGIA_DEBUG_LLM_IO_MAX_CHARS` | `50000` | Optional | Maximum characters per recorded field before truncation. |
@@ -324,8 +374,8 @@ the caller's `user_id`; the service mode requires an API key.
 | Variable | Default | Required | Description |
 |---|---|---|---|
 | `ATAGIA_SERVICE_MODE` | `false` | Optional | Enable HTTP service mode. The shipped `.env.example` sets this to `true`. |
-| `ATAGIA_SERVICE_API_KEY` | _(unset)_ | Required for service mode | API key required by every non-admin HTTP endpoint. |
-| `ATAGIA_ADMIN_API_KEY` | _(unset)_ | Required for admin endpoints | API key required by admin endpoints. Used by the client SDK for admin operations. |
+| `ATAGIA_SERVICE_API_KEY` | _(unset)_ | Required for service mode | Shared server-side credential required by every non-admin HTTP endpoint; never expose it to browser code or another untrusted client. |
+| `ATAGIA_ADMIN_API_KEY` | _(unset)_ | Required for service mode | Distinct API key required at service startup and by admin endpoints. It must not equal `ATAGIA_SERVICE_API_KEY`; the client SDK uses it for admin operations. |
 | `ATAGIA_BASE_URL` | _(unset)_ | Optional | Base URL used by the client SDK to reach the service. |
 | `ATAGIA_ALLOW_INSECURE_HTTP` | `false` | Optional | Local-only escape hatch that allows non-TLS HTTP outside loopback. Keep `false` in production. |
 | `ATAGIA_CORS_ALLOWED_ORIGINS` | _(empty)_ | Optional | Comma-separated origin allowlist for browser-based clients (e.g. `http://127.0.0.1:8000`). |
@@ -333,6 +383,18 @@ the caller's `user_id`; the service mode requires an API key.
 | `ATAGIA_PROXY_MODEL_ID` | `atagia-memory-proxy` | Optional | Visible model id surfaced to OpenAI-compatible proxy clients. |
 | `ATAGIA_PROXY_UPSTREAM_MODEL` | _(unset)_ | Optional | Provider-qualified upstream model used by the proxy. Falls back to the configured chat model when unset. |
 | `ATAGIA_PROXY_DEFAULT_MODE` | _(unset)_ | Optional | Default assistant mode applied by the proxy when the client does not send one. |
+| `ATAGIA_PROXY_MAX_OUTPUT_TOKENS` | `8192` | Optional | Server ceiling for externally visible proxy answers. If the client supplies `max_tokens`, `max_completion_tokens`, or both, the effective provider limit is the smallest positive client value and this server ceiling. Internal extraction/planning calls retain their separate output headroom. |
+| `ATAGIA_REQUEST_MAX_BODY_BYTES` | `33554432` (32 MiB) | Optional | Maximum encoded HTTP request body. Enforced for both `Content-Length` and chunked bodies. |
+| `ATAGIA_REQUEST_MAX_MESSAGE_TEXT_BYTES` | `262144` (256 KiB) | Optional | Maximum UTF-8 byte length of one external message text or typed text block. |
+| `ATAGIA_REQUEST_MAX_ATTACHMENTS` | `16` | Optional | Maximum attachment or typed multimodal attachment-block count per request. |
+| `ATAGIA_REQUEST_MAX_ATTACHMENT_DECODED_BYTES` | `10485760` (10 MiB) | Optional | Maximum decoded bytes for one attachment. Base64 length is validated before decoding. |
+| `ATAGIA_REQUEST_MAX_ATTACHMENTS_DECODED_BYTES` | `20971520` (20 MiB) | Optional | Maximum decoded bytes across all attachments in one request. Must be at least the per-attachment limit. |
+| `ATAGIA_REQUEST_MAX_METADATA_BYTES` | `65536` (64 KiB) | Optional | Maximum UTF-8 byte length of compact serialized request or attachment metadata. |
+
+Body and decoded-size overruns return `413`. Invalid base64 or other bounded
+payload-structure failures return `422`. These limits apply to both the direct
+chat/sidecar routes and the OpenAI-compatible proxy before provider execution
+or artifact persistence.
 
 ---
 

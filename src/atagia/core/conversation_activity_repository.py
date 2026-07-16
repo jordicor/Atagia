@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+
 from atagia.core.repositories import BaseRepository, _encode_json
 
 
@@ -135,10 +136,13 @@ class ConversationActivityRepository(BaseRepository):
         )
         if commit:
             await self._connection.commit()
-        return await self.get_activity_stats(
-            user_id=str(stats["user_id"]),
-            conversation_id=str(stats["conversation_id"]),
-        ) or stats
+        return (
+            await self.get_activity_stats(
+                user_id=str(stats["user_id"]),
+                conversation_id=str(stats["conversation_id"]),
+            )
+            or stats
+        )
 
     async def upsert_activity_stats_bulk(
         self,
@@ -160,15 +164,30 @@ class ConversationActivityRepository(BaseRepository):
         user_id: str,
         conversation_id: str,
     ) -> dict[str, Any] | None:
-        return await self._fetch_one(
+        row = await self._fetch_one(
             """
-            SELECT *
-            FROM conversation_activity_stats
-            WHERE user_id = ?
-              AND conversation_id = ?
+            SELECT
+                cas.*,
+                c.workspace_id AS _live_workspace_id,
+                c.assistant_mode_id AS _live_assistant_mode_id,
+                c.user_persona_id AS _live_user_persona_id,
+                c.platform_id AS _live_platform_id,
+                c.character_id AS _live_character_id,
+                c.incognito AS _live_incognito,
+                u.remember_across_chats AS _live_remember_across_chats,
+                u.remember_across_devices AS _live_remember_across_devices
+            FROM conversation_activity_stats AS cas
+            JOIN conversations AS c
+              ON c.id = cas.conversation_id
+             AND c.user_id = cas.user_id
+            JOIN users AS u ON u.id = c.user_id
+            WHERE cas.user_id = ?
+              AND c.user_id = ?
+              AND cas.conversation_id = ?
             """,
-            (user_id, conversation_id),
+            (user_id, user_id, conversation_id),
         )
+        return self._with_live_scope(row)
 
     async def list_activity_stats(
         self,
@@ -186,31 +205,38 @@ class ConversationActivityRepository(BaseRepository):
         active_only: bool = False,
     ) -> list[dict[str, Any]]:
         del as_of
-        clauses = ["cas.user_id = ?"]
-        parameters: list[Any] = [user_id]
-        if active_only:
-            clauses.append("c.status = 'active'")
-        if workspace_id is not None:
-            clauses.append("cas.workspace_id = ?")
-            parameters.append(workspace_id)
-        if assistant_mode_id is not None:
-            clauses.append("cas.assistant_mode_id = ?")
-            parameters.append(assistant_mode_id)
-        if namespace_filter:
-            clauses.append("cas.user_persona_id IS ?")
-            clauses.append("cas.platform_id = ?")
-            clauses.append("cas.character_id IS ?")
-            clauses.append("cas.incognito = ?")
-            parameters.extend([user_persona_id, platform_id, character_id, 1 if incognito else 0])
+        clauses, parameters = self._activity_filter_parts(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            assistant_mode_id=assistant_mode_id,
+            namespace_filter=namespace_filter,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            active_only=active_only,
+        )
         limit_clause = ""
         if limit is not None:
             limit_clause = "LIMIT ?"
             parameters.append(limit)
-        return await self._fetch_all(
+        rows = await self._fetch_all(
             """
-            SELECT cas.*
+            SELECT
+                cas.*,
+                c.workspace_id AS _live_workspace_id,
+                c.assistant_mode_id AS _live_assistant_mode_id,
+                c.user_persona_id AS _live_user_persona_id,
+                c.platform_id AS _live_platform_id,
+                c.character_id AS _live_character_id,
+                c.incognito AS _live_incognito,
+                u.remember_across_chats AS _live_remember_across_chats,
+                u.remember_across_devices AS _live_remember_across_devices
             FROM conversation_activity_stats AS cas
-            JOIN conversations AS c ON c.id = cas.conversation_id
+            JOIN conversations AS c
+              ON c.id = cas.conversation_id
+             AND c.user_id = cas.user_id
+            JOIN users AS u ON u.id = c.user_id
             WHERE {clauses}
             ORDER BY cas.likely_soon_score DESC, cas.main_thread_score DESC, cas.last_message_at DESC, cas.conversation_id ASC
             {limit_clause}
@@ -220,6 +246,106 @@ class ConversationActivityRepository(BaseRepository):
             ),
             tuple(parameters),
         )
+        return [self._with_live_scope(row) for row in rows if row is not None]
+
+    async def list_activity_membership_ids(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str | None = None,
+        workspace_id: str | None = None,
+        assistant_mode_id: str | None = None,
+        namespace_filter: bool = False,
+        user_persona_id: str | None = None,
+        platform_id: str | None = None,
+        character_id: str | None = None,
+        incognito: bool = False,
+        active_only: bool = False,
+    ) -> list[str]:
+        """Return the complete live membership behind an activity read."""
+
+        clauses, parameters = self._activity_filter_parts(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            assistant_mode_id=assistant_mode_id,
+            namespace_filter=namespace_filter,
+            user_persona_id=user_persona_id,
+            platform_id=platform_id,
+            character_id=character_id,
+            incognito=incognito,
+            active_only=active_only,
+        )
+        if conversation_id is not None:
+            clauses.append("cas.conversation_id = ?")
+            parameters.append(conversation_id)
+        rows = await self._fetch_all(
+            """
+            SELECT cas.conversation_id
+            FROM conversation_activity_stats AS cas
+            JOIN conversations AS c
+              ON c.id = cas.conversation_id
+             AND c.user_id = cas.user_id
+            WHERE {clauses}
+            ORDER BY cas.conversation_id ASC
+            """.format(clauses=" AND ".join(clauses)),
+            tuple(parameters),
+        )
+        return [str(row["conversation_id"]) for row in rows]
+
+    @staticmethod
+    def _activity_filter_parts(
+        *,
+        user_id: str,
+        workspace_id: str | None,
+        assistant_mode_id: str | None,
+        namespace_filter: bool,
+        user_persona_id: str | None,
+        platform_id: str | None,
+        character_id: str | None,
+        incognito: bool,
+        active_only: bool,
+    ) -> tuple[list[str], list[Any]]:
+        clauses = ["cas.user_id = ?", "c.user_id = ?"]
+        parameters: list[Any] = [user_id, user_id]
+        if active_only:
+            clauses.extend(["c.status = 'active'", "c.temporary = 0"])
+        if workspace_id is not None:
+            clauses.append("c.workspace_id = ?")
+            parameters.append(workspace_id)
+        if assistant_mode_id is not None:
+            clauses.append("c.assistant_mode_id = ?")
+            parameters.append(assistant_mode_id)
+        if namespace_filter:
+            clauses.extend(
+                [
+                    "c.user_persona_id IS ?",
+                    "c.platform_id = ?",
+                    "c.character_id IS ?",
+                    "c.incognito = ?",
+                ]
+            )
+            parameters.extend(
+                [user_persona_id, platform_id, character_id, 1 if incognito else 0]
+            )
+        return clauses, parameters
+
+    @staticmethod
+    def _with_live_scope(row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        resolved = dict(row)
+        for field in (
+            "workspace_id",
+            "assistant_mode_id",
+            "user_persona_id",
+            "platform_id",
+            "character_id",
+            "incognito",
+            "remember_across_chats",
+            "remember_across_devices",
+        ):
+            resolved[field] = resolved.pop(f"_live_{field}")
+        return resolved
 
     async def delete_activity_stats_for_user(self, user_id: str) -> int:
         cursor = await self._connection.execute(

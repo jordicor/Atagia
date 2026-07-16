@@ -24,7 +24,7 @@ from atagia.services.llm_client import (
     StructuredOutputError,
 )
 
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 OPERATIONAL_PROFILE = {
     "profile_id": "normal",
     "signals": {},
@@ -68,9 +68,12 @@ def _entry_payload(
 ) -> dict[str, object]:
     resolved_policy = _resolved_policy(mode_id)
     return {
-        "version": 2,
+        "version": 4,
         "cache_key": "ctx:v2:test",
         "user_id": "usr_1",
+        "lifecycle_epoch": "ule_test_active",
+        "cache_revision": 7,
+        "derivation_revision": 11,
         "conversation_id": "cnv_1",
         "assistant_mode_id": mode_id,
         "policy_prompt_hash": prompt_hash or resolved_policy.prompt_hash,

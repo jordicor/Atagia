@@ -12,7 +12,13 @@ import pytest
 from atagia.app import create_app
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
-from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository, WorkspaceRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MessageRepository,
+    UserRepository,
+    WorkspaceRepository,
+)
+from atagia.core.storage_backend import build_recent_window_key
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -22,18 +28,26 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 class NoopProvider(LLMProvider):
     name = "noop-activity-api-tests"
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        raise AssertionError(f"LLM should not be called in activity API tests: {request.metadata}")
+        raise AssertionError(
+            f"LLM should not be called in activity API tests: {request.metadata}"
+        )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        raise AssertionError(f"Embeddings should not be called in activity API tests: {request.model}")
+        raise AssertionError(
+            f"Embeddings should not be called in activity API tests: {request.model}"
+        )
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -98,7 +112,13 @@ def test_activity_routes_respect_service_user_claims_and_warmup_payloads(
             messages = MessageRepository(connection, runtime.clock)
 
             client.portal.call(users.create_user, "usr_1")
-            client.portal.call(workspaces.create_workspace, "wrk_1", "usr_1", "Workspace", {"timezone": "UTC"})
+            client.portal.call(
+                workspaces.create_workspace,
+                "wrk_1",
+                "usr_1",
+                "Workspace",
+                {"timezone": "UTC"},
+            )
             client.portal.call(
                 lambda: conversations.create_conversation(
                     "cnv_1",
@@ -170,12 +190,29 @@ def test_activity_routes_respect_service_user_claims_and_warmup_payloads(
         )
         assert invalid_limit.status_code == 422
 
+        wrong_namespace_warmup = client.post(
+            "/v1/conversations/cnv_1/warmup",
+            json={
+                "platform_id": "mobile",
+                "character_id": "wrk_1",
+                "max_messages": 2,
+            },
+            headers=headers,
+        )
+        assert wrong_namespace_warmup.status_code == 404
+        assert wrong_namespace_warmup.json()["detail"] == (
+            "Conversation not found for namespace"
+        )
+
         warmup = client.post(
             "/v1/conversations/cnv_1/warmup",
             json={"platform_id": "web", "character_id": "wrk_1", "max_messages": 2},
             headers=headers,
         )
         assert warmup.status_code == 200
-        assert warmup.json()["recent_window_key"] == "usr_1:cnv_1"
+        assert warmup.json()["recent_window_key"] == build_recent_window_key(
+            "usr_1",
+            "cnv_1",
+        )
         assert warmup.json()["recent_message_count"] == 2
         assert warmup.json()["recent_messages"] == []

@@ -21,6 +21,7 @@ async def resolve_active_space_snapshot(
     workspace_id: str | None = None,
     boundary_mode: SpaceBoundaryMode | str | None = None,
     display_name: str | None = None,
+    commit: bool = True,
 ) -> SpaceSnapshot | None:
     """Resolve the active Space row without mutating a conversation."""
 
@@ -48,6 +49,7 @@ async def resolve_active_space_snapshot(
         workspace_id=resolved_workspace_id,
         boundary_mode=resolved_mode,
         display_name=display_name,
+        commit=commit,
     )
     if row is None:
         return None
@@ -63,6 +65,7 @@ async def ensure_conversation_active_space(
     workspace_id: str | None = None,
     boundary_mode: SpaceBoundaryMode | str | None = None,
     display_name: str | None = None,
+    commit: bool = True,
 ) -> tuple[dict[str, Any], SpaceSnapshot | None]:
     """Resolve and persist the active Space for a conversation if one applies."""
 
@@ -81,6 +84,7 @@ async def ensure_conversation_active_space(
         workspace_id=effective_workspace_id,
         boundary_mode=boundary_mode,
         display_name=display_name,
+        commit=commit,
     )
     if snapshot is None:
         return conversation, None
@@ -99,6 +103,7 @@ async def ensure_conversation_active_space(
             str(conversation["id"]),
             owner_user_id,
             snapshot.space_id,
+            commit=commit,
         )
         if updated is not None:
             conversation = {

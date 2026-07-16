@@ -24,7 +24,7 @@ from atagia.models.schemas_memory import (
     OperationalSignals,
 )
 
-PROFILES_DIR = Path(__file__).resolve().parents[2] / "operational_profiles"
+PROFILES_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "operational_profiles"
 
 
 def _copy_profiles(tmp_path: Path) -> Path:

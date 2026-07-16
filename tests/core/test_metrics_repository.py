@@ -11,7 +11,7 @@ from atagia.core.clock import FrozenClock
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.metrics_repository import MetricsRepository
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
 
 async def _build_runtime() -> tuple[object, FrozenClock, MetricsRepository]:

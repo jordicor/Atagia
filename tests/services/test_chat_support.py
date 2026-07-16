@@ -29,7 +29,7 @@ from atagia.services.chat_support import (
 )
 from atagia.models.schemas_memory import ComposedContext, MemoryScope
 
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def test_requested_retrieval_profile_can_override_conversation_default() -> None:

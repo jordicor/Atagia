@@ -21,7 +21,7 @@ from benchmarks.atagia_bench_gate.runner import GateRunReport, GateSuiteRunner
 
 load_dotenv()
 
-_DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+_DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

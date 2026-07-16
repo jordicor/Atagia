@@ -6,7 +6,12 @@ from dataclasses import dataclass
 import logging
 from typing import Any
 
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.conversation_lifecycle_repository import (
+    ConversationLifecycleRepository,
+)
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
 from atagia.core.llm_output_limits import CHAT_REPLY_MAX_OUTPUT_TOKENS
 from atagia.core.repositories import (
     ConversationRepository,
@@ -17,6 +22,7 @@ from atagia.core.repositories import (
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.core.topic_repository import TopicRepository
+from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
 from atagia.memory.context_envelope import (
     ContextEnvelopeBudget,
     allocate_context_envelope_budget,
@@ -40,7 +46,6 @@ from atagia.models.schemas_memory import (
 from atagia.models.schemas_replay import AblationConfig
 from atagia.services.artifact_service import ArtifactService
 from atagia.services.chat_support import (
-    CONTEXT_VIEW_TTL_SECONDS,
     RECENT_FETCH_LIMIT,
     RECENT_WINDOW_MESSAGES,
     apply_conversation_policy_overlay,
@@ -70,18 +75,13 @@ from atagia.services.initial_context_package_prompt import (
     assemble_initial_context_package_prompt,
     drop_initial_context_package_for_overflow,
 )
+from atagia.services.initial_context_package_refresh_service import (
+    InitialContextPackageRefreshEnqueuer,
+)
 from atagia.services.job_tracking_service import (
     JobTrackingService,
     render_memory_processing_status_block,
 )
-from atagia.services.presence_resolution import (
-    ensure_conversation_active_presence,
-    resolve_source_presence_for_role,
-)
-from atagia.services.embodiment_resolution import ensure_conversation_active_embodiment
-from atagia.services.mind_resolution import ensure_conversation_active_mind
-from atagia.services.realm_resolution import ensure_conversation_active_realm
-from atagia.services.space_resolution import ensure_conversation_active_space
 from atagia.services.worker_control_service import WorkerControlService
 from atagia.services.errors import (
     ConversationNotActiveError,
@@ -100,7 +100,12 @@ from atagia.services.answer_postcondition import (
     complete_answer_with_postcondition_guard,
 )
 from atagia.services.model_resolution import resolve_component_model
-from atagia.services.prompt_authority import normalize_request_authority_context
+from atagia.services.identity_hints import validate_optional_identity_hints
+from atagia.services.prompt_authority import (
+    PromptAuthorityContext,
+    resolve_request_authority_context,
+)
+from atagia.services.sidecar_service import SidecarService
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +215,7 @@ class ChatService:
         authenticated_user_is_atagia_master: bool = False,
         response_mode: ResponseMode | str | None = None,
         adaptive_retrieval: bool | None = None,
+        prompt_authority_context: PromptAuthorityContext | None = None,
     ) -> ChatResult:
         """Run the full retrieval, generation, persistence, and background-job flow."""
         resolved_response_mode = (
@@ -222,7 +228,8 @@ class ChatService:
             if adaptive_retrieval is None
             else bool(adaptive_retrieval)
         )
-        authority_context = normalize_request_authority_context(
+        authority_context = resolve_request_authority_context(
+            prompt_authority_context,
             privacy_enforcement=privacy_enforcement,
             authenticated_user_privilege_level=authenticated_user_privilege_level,
             authenticated_user_is_atagia_master=authenticated_user_is_atagia_master,
@@ -235,6 +242,11 @@ class ChatService:
             connection = await self.runtime.open_connection()
             chat_result: ChatResult | None = None
             try:
+                rebuild_repository = TranscriptRebuildRepository(
+                    connection,
+                    self.runtime.clock,
+                )
+                await rebuild_repository.require_user_available(user_id)
                 conversations = ConversationRepository(connection, self.runtime.clock)
                 users = UserRepository(connection, self.runtime.clock)
                 messages = MessageRepository(connection, self.runtime.clock)
@@ -244,7 +256,6 @@ class ChatService:
                 artifacts = ArtifactService(
                     connection,
                     self.runtime.clock,
-                    blob_store=self.runtime.artifact_blob_store,
                 )
                 confirmations = PendingConfirmationService(
                     connection,
@@ -279,80 +290,57 @@ class ChatService:
                 )
                 if await users.get_active_user(user_id) is None:
                     raise UserDeletedError("User has been erased or does not exist")
-                memory_preferences = await users.get_memory_preferences(user_id)
                 if str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
                     raise ConversationNotActiveError("Conversation is not active")
-                if not cross_chat_memory and not bool(
-                    conversation.get("isolated_mode")
-                ):
-                    updated = await conversations.mark_conversation_isolated(
-                        conversation_id,
-                        user_id,
-                    )
-                    if updated is not None:
-                        await cache_service.invalidate_conversation_cache_for_conversation(
-                            updated
-                        )
-                        conversation = updated
-                if incognito is True and not bool(conversation.get("incognito")):
-                    updated = await conversations.mark_conversation_isolated(
-                        conversation_id,
-                        user_id,
-                    )
-                    if updated is not None:
-                        await cache_service.invalidate_conversation_cache_for_conversation(
-                            updated
-                        )
-                        conversation = updated
-
-                (
-                    conversation,
-                    active_presence,
-                ) = await ensure_conversation_active_presence(
+                sidecar_service = SidecarService(self.runtime)
+                conversation = await sidecar_service.ensure_conversation(
                     connection,
-                    self.runtime.clock,
-                    conversation=conversation,
-                    active_presence_id=active_presence_id,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    workspace_id=conversation.get("workspace_id"),
+                    assistant_mode_id=assistant_mode_id,
+                    cross_chat_memory=cross_chat_memory,
+                    user_persona_id=user_persona_id,
+                    platform_id=platform_id,
                     character_id=character_id,
-                )
-                user_source_presence = await resolve_source_presence_for_role(
-                    connection,
-                    self.runtime.clock,
-                    owner_user_id=user_id,
-                    role="user",
-                    active_presence=active_presence,
-                )
-                conversation, active_mind = await ensure_conversation_active_mind(
-                    connection,
-                    self.runtime.clock,
-                    conversation=conversation,
+                    active_presence_id=active_presence_id,
                     mind_id=mind_id,
                     mind_topology=mind_topology,
-                    active_presence=active_presence,
-                    character_id=character_id,
-                )
-                (
-                    conversation,
-                    active_embodiment,
-                ) = await ensure_conversation_active_embodiment(
-                    connection,
-                    self.runtime.clock,
-                    conversation=conversation,
                     embodiment_id=embodiment_id,
-                )
-                conversation, active_realm = await ensure_conversation_active_realm(
-                    connection,
-                    self.runtime.clock,
-                    conversation=conversation,
                     realm_id=realm_id,
-                )
-                conversation, active_space = await ensure_conversation_active_space(
-                    connection,
-                    self.runtime.clock,
-                    conversation=conversation,
                     space_id=space_id,
-                    workspace_id=conversation.get("workspace_id"),
+                    mode=mode,
+                    incognito=incognito,
                 )
+
+                request_snapshot = (
+                    await sidecar_service._capture_conversation_request_snapshot(
+                        connection,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        source_role="user",
+                        workspace_id=conversation.get("workspace_id"),
+                        user_persona_id=user_persona_id,
+                        platform_id=platform_id,
+                        character_id=character_id,
+                        active_presence_id=active_presence_id,
+                        mind_id=mind_id,
+                        mind_topology=mind_topology,
+                        embodiment_id=embodiment_id,
+                        realm_id=realm_id,
+                        space_id=space_id,
+                    )
+                )
+                conversation = request_snapshot.conversation
+                active_presence = request_snapshot.active_presence
+                user_source_presence = request_snapshot.source_presence
+                active_mind = request_snapshot.active_mind
+                active_embodiment = request_snapshot.active_embodiment
+                active_realm = request_snapshot.active_realm
+                active_space = request_snapshot.active_space
+                memory_preferences = await users.get_memory_preferences(user_id)
+                if memory_preferences is None:
+                    raise UserDeletedError("User has been erased or does not exist")
 
                 resolved_mode_id = resolve_retrieval_profile_id(
                     str(conversation["assistant_mode_id"]),
@@ -579,6 +567,18 @@ class ChatService:
                         prompt_budget_tokens=(
                             self.runtime.settings.initial_context_package_prompt_max_tokens
                         ),
+                        refresh_enqueuer=InitialContextPackageRefreshEnqueuer(
+                            storage_backend=self.runtime.storage_backend,
+                            clock=self.runtime.clock,
+                            job_tracking_service=job_tracking,
+                            package_repository=InitialContextPackageRepository(
+                                connection,
+                                self.runtime.clock,
+                            ),
+                            refresh_enabled=(
+                                self.runtime.settings.initial_context_package_refresh_enabled
+                            ),
+                        ),
                     )
                 except Exception:
                     logger.exception(
@@ -742,6 +742,7 @@ class ChatService:
                         "authenticated_atagia_master": (
                             authority_context.authenticated_user_is_atagia_master
                         ),
+                        "authority_source": authority_context.authority_source,
                         **self._chat_intimacy_metadata(
                             visible_topic_snapshot,
                             allow_intimacy_context=(
@@ -794,6 +795,14 @@ class ChatService:
 
                 await connection.execute("BEGIN IMMEDIATE")
                 try:
+                    # Re-check exact user and conversation authority after
+                    # acquiring the SQLite write lock. The initial read view
+                    # cannot exclude a cross-process namespace change while
+                    # the model response is being generated.
+                    await sidecar_service._require_conversation_request_snapshot(
+                        connection,
+                        request_snapshot,
+                    )
                     user_message = await messages.create_message(
                         message_id=None,
                         conversation_id=conversation_id,
@@ -941,6 +950,70 @@ class ChatService:
                                 commit=False,
                             )
                         )
+                    turn_jobs = _build_turn_jobs(
+                        clock=self.runtime.clock,
+                        conversation=conversation,
+                        user_message=user_message,
+                        assistant_message=assistant_message,
+                        prior_messages=prior_messages,
+                        prompt_message_text=prompt_message_text,
+                        assistant_output_text=assistant_output_text,
+                        operational_profile=(
+                            resolution.resolved_operational_profile.snapshot
+                        ),
+                        memory_preferences=memory_preferences,
+                        active_presence=active_presence,
+                        user_source_presence=user_source_presence,
+                        active_space=active_space,
+                        active_mind=active_mind,
+                        active_embodiment=active_embodiment,
+                        active_realm=active_realm,
+                    )
+                    enqueued_job_ids = await enqueue_message_jobs(
+                        storage_backend=self.runtime.storage_backend,
+                        jobs=turn_jobs,
+                        job_tracking_service=job_tracking,
+                        worker_control_service=WorkerControlService(
+                            connection,
+                            self.runtime.clock,
+                        ),
+                        initial_context_package_repository=(
+                            InitialContextPackageRepository(
+                                connection,
+                                self.runtime.clock,
+                            )
+                        ),
+                        initial_context_package_refresh_enabled=(
+                            self.runtime.settings.initial_context_package_refresh_enabled
+                        ),
+                        commit=False,
+                        dispatch=False,
+                    )
+                    recent_window_rows = await messages.get_recent_messages(
+                        conversation_id,
+                        user_id,
+                        limit=RECENT_WINDOW_MESSAGES,
+                    )
+                    recent_window_messages = [
+                        {
+                            "role": str(message["role"]),
+                            "content": str(message["text"]),
+                        }
+                        for message in recent_window_rows
+                    ]
+                    recent_window_conversation_identity = (
+                        await ConversationLifecycleRepository(
+                            connection,
+                            self.runtime.clock,
+                        ).get_active_identity(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                        )
+                    )
+                    if recent_window_conversation_identity is None:
+                        raise ConversationNotActiveError(
+                            "Conversation source identity is unavailable"
+                        )
                     await connection.commit()
                 except Exception:
                     await connection.rollback()
@@ -950,8 +1023,7 @@ class ChatService:
                 )
 
                 post_commit_errors: list[str] = []
-                enqueued_job_ids: list[str] = []
-                background_tasks_enqueued = False
+                background_tasks_enqueued = bool(enqueued_job_ids)
                 memory_processing = prompt_memory_processing
 
                 try:
@@ -992,17 +1064,32 @@ class ChatService:
                         adaptive_retrieval=resolved_adaptive_retrieval,
                     )
 
-                final_window = [
-                    {"role": str(message["role"]), "content": str(message["text"])}
-                    for message in [*prior_messages, user_message, assistant_message][
-                        -RECENT_WINDOW_MESSAGES:
-                    ]
-                ]
                 try:
-                    await self.runtime.storage_backend.set_recent_window(
-                        f"{user_id}:{conversation_id}",
-                        final_window,
+                    published_recent_window = (
+                        resolution.cache_lifecycle_epoch is not None
+                        and resolution.cache_lifecycle_cleanup_key is not None
+                        and resolution.cache_revision is not None
+                        and resolution.source_derivation_revision is not None
+                        and await cache_service.publish_recent_window(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            messages=recent_window_messages,
+                            lifecycle_epoch=resolution.cache_lifecycle_epoch,
+                            lifecycle_cleanup_key=(
+                                resolution.cache_lifecycle_cleanup_key
+                            ),
+                            cache_revision=resolution.cache_revision,
+                            derivation_revision=(resolution.source_derivation_revision),
+                            conversation_lifecycle_epoch=(
+                                recent_window_conversation_identity.lifecycle_epoch
+                            ),
+                            conversation_source_revision=(
+                                recent_window_conversation_identity.source_revision
+                            ),
+                        )
                     )
+                    if not published_recent_window:
+                        raise RuntimeError("user lifecycle is not publishable")
                 except Exception:
                     logger.exception(
                         "Failed to update recent window for conversation_id=%s",
@@ -1011,162 +1098,19 @@ class ChatService:
                     post_commit_errors.append("recent_window_failed")
 
                 try:
-                    await self.runtime.storage_backend.set_context_view(
-                        retrieval_event["id"],
-                        composed_context_json,
-                        ttl_seconds=CONTEXT_VIEW_TTL_SECONDS,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to store context view for retrieval_event_id=%s",
-                        retrieval_event["id"],
-                    )
-                    post_commit_errors.append("context_view_failed")
-
-                user_jobs = build_message_jobs(
-                    clock=self.runtime.clock,
-                    conversation=conversation,
-                    message_id=str(user_message["id"]),
-                    prior_messages=prior_messages,
-                    message_text=prompt_message_text,
-                    occurred_at=resolve_message_occurred_at(user_message),
-                    role="user",
-                    operational_profile=resolution.resolved_operational_profile.snapshot,
-                    memory_preferences=memory_preferences,
-                    active_presence_id=active_presence.presence_id,
-                    active_presence_kind=active_presence.kind.value,
-                    active_presence_display_name=active_presence.display_name,
-                    source_presence_id=user_source_presence.presence_id,
-                    source_presence_kind=user_source_presence.kind.value,
-                    source_presence_display_name=user_source_presence.display_name,
-                    active_space_id=active_space.space_id
-                    if active_space is not None
-                    else None,
-                    active_space_boundary_mode=(
-                        active_space.boundary_mode.value
-                        if active_space is not None
-                        else None
-                    ),
-                    active_space_display_name=(
-                        active_space.display_name if active_space is not None else None
-                    ),
-                    active_mind_id=active_mind.mind_id,
-                    source_mind_id=active_mind.mind_id,
-                    active_mind_display_name=active_mind.display_name,
-                    mind_topology=active_mind.topology.value,
-                    active_embodiment_id=(
-                        active_embodiment.embodiment_id
-                        if active_embodiment is not None
-                        else None
-                    ),
-                    active_embodiment_display_name=(
-                        active_embodiment.display_name
-                        if active_embodiment is not None
-                        else None
-                    ),
-                    cross_embodiment_mode=(
-                        active_embodiment.cross_embodiment_mode.value
-                        if active_embodiment is not None
-                        else None
-                    ),
-                    active_realm_id=(
-                        active_realm.realm_id if active_realm is not None else None
-                    ),
-                    active_realm_display_name=(
-                        active_realm.display_name if active_realm is not None else None
-                    ),
-                    cross_realm_mode=(
-                        active_realm.cross_realm_mode.value
-                        if active_realm is not None
-                        else None
-                    ),
-                )
-                assistant_jobs = build_message_jobs(
-                    clock=self.runtime.clock,
-                    conversation=conversation,
-                    message_id=str(assistant_message["id"]),
-                    prior_messages=[*prior_messages, user_message],
-                    message_text=assistant_output_text,
-                    occurred_at=resolve_message_occurred_at(assistant_message),
-                    role="assistant",
-                    operational_profile=resolution.resolved_operational_profile.snapshot,
-                    memory_preferences=memory_preferences,
-                    active_presence_id=active_presence.presence_id,
-                    active_presence_kind=active_presence.kind.value,
-                    active_presence_display_name=active_presence.display_name,
-                    source_presence_id=active_presence.presence_id,
-                    source_presence_kind=active_presence.kind.value,
-                    source_presence_display_name=active_presence.display_name,
-                    active_space_id=active_space.space_id
-                    if active_space is not None
-                    else None,
-                    active_space_boundary_mode=(
-                        active_space.boundary_mode.value
-                        if active_space is not None
-                        else None
-                    ),
-                    active_space_display_name=(
-                        active_space.display_name if active_space is not None else None
-                    ),
-                    active_mind_id=active_mind.mind_id,
-                    source_mind_id=active_mind.mind_id,
-                    active_mind_display_name=active_mind.display_name,
-                    mind_topology=active_mind.topology.value,
-                    active_embodiment_id=(
-                        active_embodiment.embodiment_id
-                        if active_embodiment is not None
-                        else None
-                    ),
-                    active_embodiment_display_name=(
-                        active_embodiment.display_name
-                        if active_embodiment is not None
-                        else None
-                    ),
-                    cross_embodiment_mode=(
-                        active_embodiment.cross_embodiment_mode.value
-                        if active_embodiment is not None
-                        else None
-                    ),
-                    active_realm_id=(
-                        active_realm.realm_id if active_realm is not None else None
-                    ),
-                    active_realm_display_name=(
-                        active_realm.display_name if active_realm is not None else None
-                    ),
-                    cross_realm_mode=(
-                        active_realm.cross_realm_mode.value
-                        if active_realm is not None
-                        else None
-                    ),
-                )
-                try:
-                    enqueued_job_ids = await enqueue_message_jobs(
-                        storage_backend=self.runtime.storage_backend,
-                        jobs=[*user_jobs, *assistant_jobs],
-                        job_tracking_service=job_tracking,
-                        worker_control_service=WorkerControlService(
-                            connection,
-                            self.runtime.clock,
-                        ),
-                        initial_context_package_repository=InitialContextPackageRepository(
-                            connection,
-                            self.runtime.clock,
-                        ),
-                        initial_context_package_refresh_enabled=(
-                            self.runtime.settings.initial_context_package_refresh_enabled
-                        ),
+                    await job_tracking.dispatch_pending_jobs(
+                        self.runtime.storage_backend
                     )
                     memory_processing = await job_tracking.get_status(
                         user_id=user_id,
                         conversation_id=conversation_id,
                     )
-                    background_tasks_enqueued = bool(enqueued_job_ids)
                 except Exception:
                     logger.exception(
-                        "Failed to enqueue post-response jobs for retrieval_event_id=%s",
+                        "Failed to dispatch durable post-response jobs for retrieval_event_id=%s",
                         retrieval_event["id"],
                     )
-                    post_commit_errors.append("job_enqueue_failed")
+                    post_commit_errors.append("job_dispatch_deferred")
 
                 try:
                     await events.update_outcome_fields(
@@ -1342,6 +1286,89 @@ class ChatService:
         return {}
 
 
+def _build_turn_jobs(
+    *,
+    clock: Any,
+    conversation: dict[str, Any],
+    user_message: dict[str, Any],
+    assistant_message: dict[str, Any],
+    prior_messages: list[dict[str, Any]],
+    prompt_message_text: str,
+    assistant_output_text: str,
+    operational_profile: Any,
+    memory_preferences: dict[str, Any],
+    active_presence: Any,
+    user_source_presence: Any,
+    active_space: Any,
+    active_mind: Any,
+    active_embodiment: Any,
+    active_realm: Any,
+) -> list[tuple[str, Any]]:
+    """Build all turn jobs before the caller commits their source messages."""
+
+    common = {
+        "clock": clock,
+        "conversation": conversation,
+        "operational_profile": operational_profile,
+        "memory_preferences": memory_preferences,
+        "active_presence_id": active_presence.presence_id,
+        "active_presence_kind": active_presence.kind.value,
+        "active_presence_display_name": active_presence.display_name,
+        "active_space_id": active_space.space_id if active_space is not None else None,
+        "active_space_boundary_mode": (
+            active_space.boundary_mode.value if active_space is not None else None
+        ),
+        "active_space_display_name": (
+            active_space.display_name if active_space is not None else None
+        ),
+        "active_mind_id": active_mind.mind_id,
+        "source_mind_id": active_mind.mind_id,
+        "active_mind_display_name": active_mind.display_name,
+        "mind_topology": active_mind.topology.value,
+        "active_embodiment_id": (
+            active_embodiment.embodiment_id if active_embodiment is not None else None
+        ),
+        "active_embodiment_display_name": (
+            active_embodiment.display_name if active_embodiment is not None else None
+        ),
+        "cross_embodiment_mode": (
+            active_embodiment.cross_embodiment_mode.value
+            if active_embodiment is not None
+            else None
+        ),
+        "active_realm_id": active_realm.realm_id if active_realm is not None else None,
+        "active_realm_display_name": (
+            active_realm.display_name if active_realm is not None else None
+        ),
+        "cross_realm_mode": (
+            active_realm.cross_realm_mode.value if active_realm is not None else None
+        ),
+    }
+    user_jobs = build_message_jobs(
+        **common,
+        message_id=str(user_message["id"]),
+        prior_messages=prior_messages,
+        message_text=prompt_message_text,
+        occurred_at=resolve_message_occurred_at(user_message),
+        role="user",
+        source_presence_id=user_source_presence.presence_id,
+        source_presence_kind=user_source_presence.kind.value,
+        source_presence_display_name=user_source_presence.display_name,
+    )
+    assistant_jobs = build_message_jobs(
+        **common,
+        message_id=str(assistant_message["id"]),
+        prior_messages=[*prior_messages, user_message],
+        message_text=assistant_output_text,
+        occurred_at=resolve_message_occurred_at(assistant_message),
+        role="assistant",
+        source_presence_id=active_presence.presence_id,
+        source_presence_kind=active_presence.kind.value,
+        source_presence_display_name=active_presence.display_name,
+    )
+    return [*user_jobs, *assistant_jobs]
+
+
 def _intimacy_boundary_counts(
     candidate_custody: list[dict[str, Any]],
 ) -> dict[str, int]:
@@ -1373,15 +1400,12 @@ def _validate_optional_identity(
     realm_id: str | None = None,
     space_id: str | None = None,
 ) -> None:
-    for field_name, expected in (
-        ("user_persona_id", user_persona_id),
-        ("platform_id", platform_id),
-        ("character_id", character_id),
-    ):
-        actual = conversation.get(field_name)
-        actual_text = None if actual is None else str(actual)
-        if actual_text != expected:
-            raise ConversationNotFoundError("Conversation not found for user")
+    validate_optional_identity_hints(
+        conversation,
+        user_persona_id=user_persona_id,
+        platform_id=platform_id,
+        character_id=character_id,
+    )
     if active_presence_id is not None:
         actual_presence = conversation.get("active_presence_id")
         actual_presence_text = None if actual_presence is None else str(actual_presence)

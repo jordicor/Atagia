@@ -43,6 +43,7 @@ from benchmarks.locomo.retrieval_readout import (
 )
 from benchmarks.output_root import assert_outside_repo, bench_output_root
 from benchmarks.retained_db_paths import default_benchmark_db_dir
+from benchmarks.scorer import JudgeProtocol
 from benchmarks.report_diff import (
     BenchmarkDiffReport,
     build_benchmark_diff,
@@ -54,17 +55,18 @@ from atagia.models.schemas_replay import AblationConfig
 from atagia.services.model_resolution import COMPONENTS_BY_ID
 
 _DEFAULT_OUTPUT_DIR = bench_output_root() / "locomo"
-_DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+_DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 _DEFAULT_JUDGE_MODEL = "kimi/kimi-k2.7-code"
 _DEFAULT_PRIVACY_ENFORCEMENT = "off"
 _BENCHMARK_DB_FILENAME = "benchmark.db"
 _BENCHMARK_DB_METADATA_FILENAME = "run_metadata.json"
 _BENCHMARK_INGESTION_PROGRESS_FILENAME = "ingestion_progress.json"
 _CATEGORY_NAMES = {
-    1: "single-hop",
-    2: "multi-hop",
-    3: "temporal",
-    4: "open-domain",
+    1: "multi-hop",
+    2: "temporal",
+    3: "open-domain",
+    4: "single-hop",
+    5: "adversarial-unscored",
 }
 _VALIDATION_FIELD_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*$")
 
@@ -178,6 +180,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional LLM model for scoring; defaults to direct Kimi "
             "kimi-k2.7-code for benchmark judging"
+        ),
+    )
+    parser.add_argument(
+        "--judge-protocol",
+        choices=[protocol.value for protocol in JudgeProtocol],
+        default=JudgeProtocol.SOURCE_AWARE_STRICT.value,
+        help=(
+            "Judge protocol: source_aware_strict (default, current behavior), "
+            "gold_only_lenient (Mem0 parity), or memory_quality (primary gate)."
         ),
     )
     parser.add_argument(
@@ -717,6 +728,7 @@ async def _run_async(
         corrections_path=args.corrections,
         community_corrections_path=args.community_corrections,
         answer_postcondition_guard_enabled=args.answer_postcondition_guard,
+        judge_protocol=JudgeProtocol(args.judge_protocol),
     )
     checkpoint_path = (
         Path(args.checkpoint_output).expanduser()

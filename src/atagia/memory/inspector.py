@@ -8,10 +8,20 @@ from typing import Any
 import aiosqlite
 
 from atagia.core import json_utils
+from atagia.core.admin_maintenance_repository import (
+    AdminMaintenanceOperation,
+    AdminMaintenanceRepository,
+)
 from atagia.core.clock import Clock
 from atagia.core.ids import generate_prefixed_id
+from atagia.core.job_run_repository import JobRunRepository
 from atagia.core.repositories import BaseRepository
-from atagia.core.retrieval_event_repository import AdminAuditRepository, RetrievalEventRepository
+from atagia.core.retrieval_event_repository import (
+    AdminAuditRepository,
+    RetrievalEventRepository,
+)
+from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
+from atagia.core.user_lifecycle_repository import UserLifecycleRepository
 from atagia.memory.mind_policy import OVERSEER_CONTEXT_GRANT_KINDS
 from atagia.memory.retrieval_custody import build_coordinate_trace
 from atagia.models.schemas_memory import RetrievalPlan, SpaceBoundaryMode
@@ -50,7 +60,9 @@ _MEMORY_INSPECTION_FIELDS: tuple[str, ...] = (
     "canonical_text",
 )
 
-_SPACE_BOUNDARY_VALUES: frozenset[str] = frozenset(mode.value for mode in SpaceBoundaryMode)
+_SPACE_BOUNDARY_VALUES: frozenset[str] = frozenset(
+    mode.value for mode in SpaceBoundaryMode
+)
 
 
 def _canonical_scope_filter(scope: str) -> str:
@@ -177,7 +189,9 @@ class _InspectionRepository(BaseRepository):
             targets.append(("realm", realm_id))
         if not targets:
             return []
-        clauses = " OR ".join("(og.target_kind = ? AND og.target_id = ?)" for _ in targets)
+        clauses = " OR ".join(
+            "(og.target_kind = ? AND og.target_id = ?)" for _ in targets
+        )
         parameters: list[Any] = [user_id, as_of]
         for target_kind, target_id in targets:
             parameters.extend((target_kind, target_id))
@@ -403,7 +417,9 @@ class _InspectionRepository(BaseRepository):
             tuple(parameters),
         )
 
-    async def list_belief_history(self, belief_id: str, user_id: str) -> list[dict[str, Any]]:
+    async def list_belief_history(
+        self, belief_id: str, user_id: str
+    ) -> list[dict[str, Any]]:
         return await self._fetch_all(
             """
             SELECT
@@ -490,7 +506,9 @@ class MemoryInspector:
         *,
         admin_user_id: str,
     ) -> dict[str, Any] | None:
-        row = await self._inspection_repository.get_memory_coordinate_view(memory_id, user_id)
+        row = await self._inspection_repository.get_memory_coordinate_view(
+            memory_id, user_id
+        )
         await self._audit_repository.create_audit_entry(
             admin_user_id=admin_user_id,
             action="inspect_memory_coordinates",
@@ -518,7 +536,9 @@ class MemoryInspector:
         admin_user_id: str,
     ) -> dict[str, Any] | None:
         event = await self._event_repository.get_event(event_id, user_id)
-        memory = await self._inspection_repository.get_memory_coordinate_view(memory_id, user_id)
+        memory = await self._inspection_repository.get_memory_coordinate_view(
+            memory_id, user_id
+        )
         await self._audit_repository.create_audit_entry(
             admin_user_id=admin_user_id,
             action="inspect_retrieval_memory_decision",
@@ -543,7 +563,11 @@ class MemoryInspector:
                 realm_id=_normalize_optional_text(memory.get("realm_id")),
                 as_of=self._clock.now().isoformat(),
             )
-        coordinate_trace, trace_source, unavailable_reason = await self._decision_coordinate_trace(
+        (
+            coordinate_trace,
+            trace_source,
+            unavailable_reason,
+        ) = await self._decision_coordinate_trace(
             event=event,
             memory=memory,
             custody_record=custody_record,
@@ -590,7 +614,11 @@ class MemoryInspector:
         candidate = _candidate_from_memory(memory)
         _annotate_reconstructed_mind_grant(candidate, plan, grants)
         await self._annotate_reconstructed_realm_bridge(candidate, plan)
-        return build_coordinate_trace(candidate, plan), "reconstructed_from_event_plan", None
+        return (
+            build_coordinate_trace(candidate, plan),
+            "reconstructed_from_event_plan",
+            None,
+        )
 
     async def _annotate_reconstructed_realm_bridge(
         self,
@@ -628,27 +656,69 @@ class MemoryInspector:
         updates: dict[str, Any],
         reason: str | None = None,
         invalidate_user_cache: Callable[[str], Awaitable[Any]] | None = None,
+        maintenance_operation: AdminMaintenanceOperation | None = None,
     ) -> dict[str, Any] | None:
-        current = await self._inspection_repository.get_memory_coordinate_view(memory_id, user_id)
-        if current is None:
-            await self._audit_repository.create_audit_entry(
-                admin_user_id=admin_user_id,
-                action="correct_memory_coordinates",
-                target_type="memory_object",
-                target_id=memory_id,
-                metadata={"user_id": user_id, "found": False},
-            )
-            return None
-
-        normalized_updates = await self._normalize_coordinate_updates(
-            current,
-            user_id=user_id,
-            updates=updates,
-        )
-        timestamp = self._clock.now().isoformat()
-        before = _coordinate_values(current)
         await self._connection.execute("BEGIN IMMEDIATE")
         try:
+            if maintenance_operation is None:
+                availability = await TranscriptRebuildRepository(
+                    self._connection,
+                    self._clock,
+                ).capture_user_availability_snapshot(user_id)
+            else:
+                if maintenance_operation.user_id != user_id:
+                    raise ValueError("Maintenance operation belongs to another user")
+                await AdminMaintenanceRepository(
+                    self._connection,
+                    self._clock,
+                ).require_current(maintenance_operation)
+                availability = maintenance_operation.availability_snapshot
+
+            current = await self._inspection_repository.get_memory_coordinate_view(
+                memory_id,
+                user_id,
+            )
+            if current is None:
+                await self._connection.commit()
+                await self._audit_repository.create_audit_entry(
+                    admin_user_id=admin_user_id,
+                    action="correct_memory_coordinates",
+                    target_type="memory_object",
+                    target_id=memory_id,
+                    metadata={"user_id": user_id, "found": False},
+                )
+                return None
+
+            normalized_updates = await self._normalize_coordinate_updates(
+                current,
+                user_id=user_id,
+                updates=updates,
+            )
+            timestamp = self._clock.now().isoformat()
+            before = _coordinate_values(current)
+            changed = any(
+                _normalize_optional_text(current.get(field)) != value
+                for field, value in normalized_updates.items()
+            )
+            new_revision: int | None = None
+            if changed:
+                if maintenance_operation is not None:
+                    await AdminMaintenanceRepository(
+                        self._connection,
+                        self._clock,
+                    ).mark_dirty(maintenance_operation)
+                new_revision = await UserLifecycleRepository(
+                    self._connection,
+                    self._clock,
+                ).bump_derivation_revision(
+                    user_id,
+                    expected_lifecycle_epoch=availability.lifecycle_epoch,
+                    commit=False,
+                )
+                if new_revision != availability.derivation_revision + 1:
+                    raise RuntimeError(
+                        "User lifecycle changed before coordinate correction"
+                    )
             updated = await self._inspection_repository.update_memory_coordinates(
                 memory_id=memory_id,
                 user_id=user_id,
@@ -657,6 +727,23 @@ class MemoryInspector:
             )
             if updated is None:
                 raise RuntimeError("Failed to update memory coordinates")
+            if new_revision is not None:
+                await JobRunRepository(
+                    self._connection,
+                    self._clock,
+                ).reconcile_stale_root_jobs_after_revision_bump(
+                    user_id,
+                    availability.derivation_revision,
+                    new_revision,
+                )
+                if maintenance_operation is not None:
+                    await AdminMaintenanceRepository(
+                        self._connection,
+                        self._clock,
+                    ).advance_derivation_revision(
+                        maintenance_operation,
+                        new_revision=new_revision,
+                    )
             await self._inspection_repository.insert_coordinate_correction_audit(
                 admin_user_id=admin_user_id,
                 memory_id=memory_id,
@@ -721,8 +808,7 @@ class MemoryInspector:
             raise ValueError(f"Unsupported coordinate fields: {', '.join(unknown)}")
 
         normalized: dict[str, str | None] = {
-            field: _normalize_optional_text(updates[field])
-            for field in updates
+            field: _normalize_optional_text(updates[field]) for field in updates
         }
         for field, coordinate_kind in (
             ("active_presence_id", "presence"),
@@ -743,7 +829,9 @@ class MemoryInspector:
             if not exists:
                 raise ValueError(f"Unknown {coordinate_kind} coordinate: {value}")
 
-        final_space_id = normalized.get("space_id", _normalize_optional_text(current.get("space_id")))
+        final_space_id = normalized.get(
+            "space_id", _normalize_optional_text(current.get("space_id"))
+        )
         final_space_boundary = normalized.get(
             "space_boundary_mode",
             _normalize_optional_text(current.get("space_boundary_mode")),
@@ -847,7 +935,9 @@ class MemoryInspector:
         *,
         admin_user_id: str,
     ) -> list[dict[str, Any]]:
-        history = await self._inspection_repository.list_belief_history(belief_id, user_id)
+        history = await self._inspection_repository.list_belief_history(
+            belief_id, user_id
+        )
         await self._audit_repository.create_audit_entry(
             admin_user_id=admin_user_id,
             action="inspect_belief_history",
@@ -906,9 +996,7 @@ def _coordinate_inspection(
 ) -> dict[str, Any]:
     return {
         "memory": {
-            field: row.get(field)
-            for field in _MEMORY_INSPECTION_FIELDS
-            if field in row
+            field: row.get(field) for field in _MEMORY_INSPECTION_FIELDS if field in row
         },
         "coordinates": {
             "namespace": {
@@ -952,7 +1040,9 @@ def _coordinate_inspection(
         },
         "provenance": {
             "source_kind": row.get("source_kind"),
-            "payload_coordinates": _payload_coordinate_provenance(row.get("payload_json")),
+            "payload_coordinates": _payload_coordinate_provenance(
+                row.get("payload_json")
+            ),
         },
     }
 
@@ -961,7 +1051,11 @@ def _presence_ref(row: dict[str, Any], prefix: str) -> dict[str, Any] | None:
     presence_id = _normalize_optional_text(row.get(f"{prefix}_id"))
     if presence_id is None:
         presence_id = _normalize_optional_text(
-            row.get("active_presence_id" if prefix == "active_presence" else "source_presence_id")
+            row.get(
+                "active_presence_id"
+                if prefix == "active_presence"
+                else "source_presence_id"
+            )
         )
     if presence_id is None:
         return None
@@ -1057,14 +1151,12 @@ def _payload_coordinate_provenance(payload: Any) -> dict[str, Any]:
         "embodiment",
         "realm",
     )
-    return {
-        key: payload[key]
-        for key in keys
-        if isinstance(payload.get(key), dict)
-    }
+    return {key: payload[key] for key in keys if isinstance(payload.get(key), dict)}
 
 
-def _retrieval_plan_from_event(event: dict[str, Any]) -> tuple[RetrievalPlan | None, str | None]:
+def _retrieval_plan_from_event(
+    event: dict[str, Any],
+) -> tuple[RetrievalPlan | None, str | None]:
     payload = event.get("retrieval_plan_json")
     if not isinstance(payload, dict):
         return None, "retrieval_plan_json_missing"
@@ -1105,11 +1197,7 @@ def _candidate_from_memory(memory: dict[str, Any]) -> dict[str, Any]:
         "realm_id",
         "active_realm_id",
     )
-    return {
-        field: memory.get(field)
-        for field in fields
-        if field in memory
-    }
+    return {field: memory.get(field) for field in fields if field in memory}
 
 
 def _annotate_reconstructed_mind_grant(
@@ -1118,7 +1206,9 @@ def _annotate_reconstructed_mind_grant(
     grants: list[dict[str, Any]],
 ) -> None:
     active_mind_id = _normalize_optional_text(plan.active_mind_id)
-    topology = _normalize_optional_text(getattr(plan.mind_topology, "value", plan.mind_topology))
+    topology = _normalize_optional_text(
+        getattr(plan.mind_topology, "value", plan.mind_topology)
+    )
     if topology != "ojocentauri" or active_mind_id is None:
         return
     candidate_owner_id = _normalize_optional_text(candidate.get("memory_owner_id"))
@@ -1188,7 +1278,9 @@ def _is_allowed_attribution_reason(gate: dict[str, Any], reason: str) -> bool:
     )
 
 
-def _find_custody_record(event: dict[str, Any], memory_id: str) -> dict[str, Any] | None:
+def _find_custody_record(
+    event: dict[str, Any], memory_id: str
+) -> dict[str, Any] | None:
     outcome = event.get("outcome_json")
     if not isinstance(outcome, dict):
         return None
@@ -1196,7 +1288,10 @@ def _find_custody_record(event: dict[str, Any], memory_id: str) -> dict[str, Any
     if not isinstance(custody, list):
         return None
     for record in custody:
-        if isinstance(record, dict) and str(record.get("candidate_id") or "") == memory_id:
+        if (
+            isinstance(record, dict)
+            and str(record.get("candidate_id") or "") == memory_id
+        ):
             return dict(record)
     return None
 

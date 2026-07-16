@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
@@ -13,12 +14,26 @@ import pytest
 from atagia.app import AppRuntime, initialize_runtime
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
+from atagia.core.conversation_lifecycle_repository import (
+    ConversationLifecycleRepository,
+)
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
-from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MessageRepository,
+    UserRepository,
+)
 from atagia.core.summary_repository import SummaryRepository
-from atagia.models.schemas_jobs import CONTRACT_STREAM_NAME, EXTRACT_STREAM_NAME, WORKER_GROUP_NAME
+from atagia.core.space_repository import SpaceRepository
+from atagia.core.storage_backend import build_recent_window_key
+from atagia.models.schemas_jobs import JobType
+from atagia.models.schemas_memory import SpaceBoundaryMode
 from atagia.services.chat_service import ChatService
-from atagia.services.errors import ConversationNotFoundError, LLMUnavailableError
+from atagia.services.errors import (
+    ConversationNotActiveError,
+    ConversationNotFoundError,
+    LLMUnavailableError,
+)
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -29,8 +44,12 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
@@ -91,7 +110,9 @@ class ChatServiceProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_relevance_card":
-            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
+                request.messages[1].content
+            )
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
@@ -100,7 +121,9 @@ class ChatServiceProvider(LLMProvider):
                 ),
             )
         if purpose == "applicability_date_card":
-            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(request.messages[1].content)
+            candidate_keys = _CANDIDATE_SCORE_KEY_PATTERN.findall(
+                request.messages[1].content
+            )
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
@@ -148,7 +171,9 @@ class ChatServiceProvider(LLMProvider):
         raise AssertionError(f"Unexpected purpose: {purpose}")
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        raise AssertionError(f"Embeddings are not used in chat service tests: {request.model}")
+        raise AssertionError(
+            f"Embeddings are not used in chat service tests: {request.model}"
+        )
 
 
 class FailingChatServiceProvider(ChatServiceProvider):
@@ -214,6 +239,9 @@ def _settings(tmp_path: Path) -> Settings:
         debug=False,
         allow_insecure_http=True,
         small_corpus_token_threshold_ratio=0.0,
+        # Pinned so transcript-window math below stays fixture-sized and
+        # independent of the production envelope default.
+        context_envelope_budget_tokens=4096,
     )
 
 
@@ -272,8 +300,13 @@ async def test_chat_reply_basic(
         connection = await runtime.open_connection()
         try:
             messages = MessageRepository(connection, runtime.clock)
-            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
-            assert [message["role"] for message in stored_messages[-2:]] == ["user", "assistant"]
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
+            assert [message["role"] for message in stored_messages[-2:]] == [
+                "user",
+                "assistant",
+            ]
             assert stored_messages[-1]["text"] == "Check the retry guard first."
             event = await RetrievalEventRepository(connection, runtime.clock).get_event(
                 result.retrieval_event_id,
@@ -288,6 +321,191 @@ async def test_chat_reply_basic(
             )
         finally:
             await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_rejects_namespace_change_while_provider_is_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, provider = await _build_runtime(tmp_path, monkeypatch)
+    provider_reached = asyncio.Event()
+    resume_provider = asyncio.Event()
+    original_complete = provider.complete
+
+    async def blocking_complete(
+        request: LLMCompletionRequest,
+    ) -> LLMCompletionResponse:
+        if request.metadata.get("purpose") == "chat_reply":
+            provider_reached.set()
+            await asyncio.wait_for(resume_provider.wait(), timeout=5.0)
+        return await original_complete(request)
+
+    monkeypatch.setattr(provider, "complete", blocking_complete)
+    try:
+        await _seed_conversation(
+            runtime,
+            user_id="usr_namespace_race",
+            conversation_id="cnv_namespace_race",
+        )
+        setup_connection = await runtime.open_connection()
+        try:
+            spaces = SpaceRepository(setup_connection, runtime.clock)
+            for space_id in ("space_old", "space_new"):
+                await spaces.resolve_space(
+                    owner_user_id="usr_namespace_race",
+                    space_id=space_id,
+                    boundary_mode=SpaceBoundaryMode.FOCUS,
+                    display_name=space_id,
+                    source_kind="explicit",
+                    source_id=space_id,
+                )
+            await setup_connection.execute(
+                """
+                UPDATE conversations
+                SET active_space_id = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    "space_old",
+                    runtime.clock.now().isoformat(),
+                    "cnv_namespace_race",
+                    "usr_namespace_race",
+                ),
+            )
+            await setup_connection.commit()
+        finally:
+            await setup_connection.close()
+
+        chat_task = asyncio.create_task(
+            ChatService(runtime).chat_reply(
+                user_id="usr_namespace_race",
+                conversation_id="cnv_namespace_race",
+                message_text="Do not persist this turn under stale coordinates.",
+                assistant_mode_id="coding_debug",
+            )
+        )
+        await asyncio.wait_for(provider_reached.wait(), timeout=5.0)
+        mutation_connection = await runtime.open_connection()
+        try:
+            await mutation_connection.execute(
+                """
+                UPDATE conversations
+                SET active_space_id = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    "space_new",
+                    runtime.clock.now().isoformat(),
+                    "cnv_namespace_race",
+                    "usr_namespace_race",
+                ),
+            )
+            await mutation_connection.commit()
+        finally:
+            await mutation_connection.close()
+            resume_provider.set()
+
+        with pytest.raises(ConversationNotActiveError):
+            await chat_task
+
+        verification = await runtime.open_connection()
+        try:
+            cursor = await verification.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM messages
+                WHERE conversation_id = ?
+                """,
+                ("cnv_namespace_race",),
+            )
+            assert int((await cursor.fetchone())["count"]) == 0
+        finally:
+            await verification.close()
+    finally:
+        resume_provider.set()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_publishes_committed_window_with_exact_conversation_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    original_publish = runtime.storage_backend.set_recent_window_for_lifecycle
+    captured: dict[str, object] = {}
+
+    async def capture_recent_window(
+        key: str,
+        messages: list[dict[str, object]],
+        **identity: object,
+    ) -> bool:
+        captured["key"] = key
+        captured["messages"] = messages
+        captured.update(identity)
+        return await original_publish(key, messages, **identity)
+
+    monkeypatch.setattr(
+        runtime.storage_backend,
+        "set_recent_window_for_lifecycle",
+        capture_recent_window,
+    )
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        result = await ChatService(runtime).chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="Please help me debug this retry loop.",
+            assistant_mode_id="coding_debug",
+        )
+
+        assert result.response_text == "Check the retry guard first."
+        expected_window = [
+            {
+                "role": "user",
+                "content": "Please help me debug this retry loop.",
+            },
+            {
+                "role": "assistant",
+                "content": "Check the retry guard first.",
+            },
+        ]
+        recent_window_key = build_recent_window_key("usr_1", "cnv_1")
+        assert captured["key"] == recent_window_key
+        assert captured["messages"] == expected_window
+        assert (
+            await runtime.storage_backend.get_recent_window(recent_window_key)
+            == expected_window
+        )
+
+        connection = await runtime.open_connection()
+        try:
+            stored_messages = await MessageRepository(
+                connection,
+                runtime.clock,
+            ).get_recent_messages("cnv_1", "usr_1", limit=20)
+            conversation_identity = await ConversationLifecycleRepository(
+                connection,
+                runtime.clock,
+            ).get_active_identity(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+            )
+        finally:
+            await connection.close()
+        assert conversation_identity is not None
+        assert captured["messages"] == [
+            {"role": row["role"], "content": row["text"]} for row in stored_messages
+        ]
+        assert captured["conversation_lifecycle_epoch"] == (
+            conversation_identity.lifecycle_epoch
+        )
+        assert captured["conversation_source_revision"] == (
+            conversation_identity.source_revision
+        )
     finally:
         await runtime.close()
 
@@ -325,7 +543,10 @@ async def test_chat_reply_records_answer_postcondition_report_when_enabled(
                 "usr_1",
             )
             assert event is not None
-            assert event["outcome_json"]["answer_postcondition_guard"]["status"] == "passed"
+            assert (
+                event["outcome_json"]["answer_postcondition_guard"]["status"]
+                == "passed"
+            )
         finally:
             await connection.close()
     finally:
@@ -338,12 +559,20 @@ async def test_chat_reply_does_not_raise_when_post_commit_recent_window_update_f
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
-    original_set_recent_window = runtime.storage_backend.set_recent_window
+    original_set_recent_window = runtime.storage_backend.set_recent_window_for_lifecycle
 
-    async def failing_set_recent_window(key: str, messages: list[dict[str, object]]) -> None:
+    async def failing_set_recent_window(
+        key: str,
+        messages: list[dict[str, object]],
+        **_kwargs: object,
+    ) -> bool:
         raise RuntimeError("Injected recent window failure")
 
-    monkeypatch.setattr(runtime.storage_backend, "set_recent_window", failing_set_recent_window)
+    monkeypatch.setattr(
+        runtime.storage_backend,
+        "set_recent_window_for_lifecycle",
+        failing_set_recent_window,
+    )
     try:
         await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
 
@@ -362,52 +591,71 @@ async def test_chat_reply_does_not_raise_when_post_commit_recent_window_update_f
         connection = await runtime.open_connection()
         try:
             messages = MessageRepository(connection, runtime.clock)
-            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
-            assert [message["role"] for message in stored_messages[-2:]] == ["user", "assistant"]
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
+            assert [message["role"] for message in stored_messages[-2:]] == [
+                "user",
+                "assistant",
+            ]
         finally:
             await connection.close()
     finally:
-        monkeypatch.setattr(runtime.storage_backend, "set_recent_window", original_set_recent_window)
+        monkeypatch.setattr(
+            runtime.storage_backend,
+            "set_recent_window_for_lifecycle",
+            original_set_recent_window,
+        )
         await runtime.close()
 
 
 @pytest.mark.asyncio
-async def test_chat_reply_marks_background_tasks_false_when_enqueue_fails(
+async def test_chat_reply_rolls_back_turn_when_durable_job_insert_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
 
-    async def failing_enqueue_message_jobs(*, storage_backend: object, jobs: list[object]) -> list[str]:
+    async def failing_enqueue_message_jobs(
+        *, storage_backend: object, jobs: list[object], **_kwargs: object
+    ) -> list[str]:
         del storage_backend
         del jobs
         raise RuntimeError("Injected enqueue failure")
 
-    monkeypatch.setattr("atagia.services.chat_service.enqueue_message_jobs", failing_enqueue_message_jobs)
+    monkeypatch.setattr(
+        "atagia.services.chat_service.enqueue_message_jobs",
+        failing_enqueue_message_jobs,
+    )
     try:
         await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
 
-        result = await ChatService(runtime).chat_reply(
-            user_id="usr_1",
-            conversation_id="cnv_1",
-            message_text="Please help me debug this retry loop.",
-            assistant_mode_id="coding_debug",
-            debug=True,
-        )
-
-        assert result.debug is not None
-        assert result.debug["enqueued_job_ids"] == []
-        assert "job_enqueue_failed" in result.debug["post_commit_errors"]
+        with pytest.raises(RuntimeError, match="Injected enqueue failure"):
+            await ChatService(runtime).chat_reply(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="Please help me debug this retry loop.",
+                assistant_mode_id="coding_debug",
+                debug=True,
+            )
 
         connection = await runtime.open_connection()
         try:
-            event = await RetrievalEventRepository(connection, runtime.clock).get_event(
-                result.retrieval_event_id,
-                "usr_1",
+            messages = await MessageRepository(
+                connection,
+                runtime.clock,
+            ).get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            turn_job_count = await connection.execute_fetchall(
+                """
+                SELECT COUNT(*) AS count
+                FROM worker_job_runs
+                WHERE user_id = ?
+                  AND job_type <> ?
+                """,
+                ("usr_1", JobType.REFRESH_INITIAL_CONTEXT_PACKAGE.value),
             )
-            assert event is not None
-            assert event["outcome_json"]["background_tasks_enqueued"] is False
-            assert "job_enqueue_failed" in event["outcome_json"]["post_commit_errors"]
+            assert messages == []
+            assert int(turn_job_count[0]["count"]) == 0
         finally:
             await connection.close()
     finally:
@@ -450,23 +698,25 @@ async def test_chat_reply_enqueues_jobs(
             assistant_mode_id="coding_debug",
         )
 
-        extract_messages = await runtime.storage_backend.stream_read(
-            EXTRACT_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            "test-consumer-extract",
-            count=2,
-            block_ms=0,
-        )
-        contract_messages = await runtime.storage_backend.stream_read(
-            CONTRACT_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            "test-consumer-contract",
-            count=2,
-            block_ms=0,
-        )
+        connection = await runtime.open_connection()
+        try:
+            rows = await connection.execute_fetchall(
+                """
+                SELECT job_type, COUNT(*) AS count
+                FROM worker_job_runs
+                WHERE user_id = ?
+                  AND status = 'queued'
+                  AND recovery_envelope_json IS NOT NULL
+                GROUP BY job_type
+                """,
+                ("usr_1",),
+            )
+        finally:
+            await connection.close()
 
-        assert len(extract_messages) == 2
-        assert len(contract_messages) == 1
+        counts = {str(row["job_type"]): int(row["count"]) for row in rows}
+        assert counts["extract_memory_candidates"] == 2
+        assert counts["project_contract"] == 1
     finally:
         await runtime.close()
 
@@ -491,7 +741,9 @@ async def test_chat_reply_applies_message_occurred_at_only_to_user_message(
         connection = await runtime.open_connection()
         try:
             messages = MessageRepository(connection, runtime.clock)
-            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
             assert stored_messages[0]["occurred_at"] == "2023-05-08T13:56:00"
             assert stored_messages[1]["occurred_at"] == "2026-03-31T04:00:00+00:00"
         finally:
@@ -525,7 +777,9 @@ async def test_chat_reply_rolls_back_messages_when_llm_reply_fails(
         connection = await runtime.open_connection()
         try:
             messages = MessageRepository(connection, runtime.clock)
-            assert await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0) == []
+            assert (
+                await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0) == []
+            )
         finally:
             await connection.close()
     finally:
@@ -587,7 +841,9 @@ async def test_chat_reply_raises_llm_unavailable_when_cache_signal_detection_fai
             assistant_mode_id="coding_debug",
         )
         provider = FailingChatServiceProvider("context_cache_signal_detection")
-        runtime.llm_client = LLMClient(provider_name=provider.name, providers=[provider])
+        runtime.llm_client = LLMClient(
+            provider_name=provider.name, providers=[provider]
+        )
         service = ChatService(runtime)
         with pytest.raises(LLMUnavailableError):
             await service.chat_reply(
@@ -600,7 +856,9 @@ async def test_chat_reply_raises_llm_unavailable_when_cache_signal_detection_fai
         connection = await runtime.open_connection()
         try:
             messages = MessageRepository(connection, runtime.clock)
-            stored_messages = await messages.get_messages("cnv_1", "usr_1", limit=10, offset=0)
+            stored_messages = await messages.get_messages(
+                "cnv_1", "usr_1", limit=10, offset=0
+            )
             assert len(stored_messages) == 2
         finally:
             await connection.close()
@@ -627,7 +885,9 @@ async def test_chat_reply_cache_hit_creates_retrieval_event_and_debug_metadata(
         )
         need_count_before = _need_detection_card_count(provider)
         chat_count_before = sum(
-            1 for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+            1
+            for request in provider.requests
+            if request.metadata.get("purpose") == "chat_reply"
         )
 
         second = await service.chat_reply(
@@ -640,7 +900,9 @@ async def test_chat_reply_cache_hit_creates_retrieval_event_and_debug_metadata(
 
         need_count_after = _need_detection_card_count(provider)
         chat_count_after = sum(
-            1 for request in provider.requests if request.metadata.get("purpose") == "chat_reply"
+            1
+            for request in provider.requests
+            if request.metadata.get("purpose") == "chat_reply"
         )
         assert first.retrieval_event_id is not None
         assert second.retrieval_event_id is not None
@@ -655,12 +917,17 @@ async def test_chat_reply_cache_hit_creates_retrieval_event_and_debug_metadata(
             events = RetrievalEventRepository(connection, runtime.clock)
             listed = await events.list_events("usr_1", "cnv_1", limit=10)
             latest = listed[0]
-            first_event = next(event for event in listed if event["id"] == first.retrieval_event_id)
+            first_event = next(
+                event for event in listed if event["id"] == first.retrieval_event_id
+            )
             assert latest["id"] == second.retrieval_event_id
             assert latest["outcome_json"]["from_cache"] is True
             assert latest["outcome_json"]["need_detection_skipped"] is True
             assert latest["outcome_json"]["detected_needs"] == []
-            assert latest["outcome_json"]["retrieval_custody_v2_status"] == "cache_hit_no_candidate_custody"
+            assert (
+                latest["outcome_json"]["retrieval_custody_v2_status"]
+                == "cache_hit_no_candidate_custody"
+            )
             assert latest["outcome_json"]["retrieval_custody_v2"] == []
             assert latest["outcome_json"]["sufficiency_diagnostics_v1_status"] == (
                 "cache_hit_no_sufficiency_diagnostics"
@@ -713,7 +980,7 @@ async def test_chat_reply_uses_windowed_transcript_and_records_trace(
                     "maya_score": 1.5,
                     "model": "classify-test-model",
                     "created_at": "2026-04-03T10:00:00+00:00",
-                }
+                },
             )
         finally:
             await connection.close()
@@ -761,12 +1028,16 @@ async def test_chat_reply_uses_windowed_transcript_and_records_trace(
                 "usr_1",
             )
             assert event is not None
-            assert event["outcome_json"]["transcript_window"]["transcript_message_seqs"] == [7, 8, 9, 10]
-            assert event["outcome_json"]["transcript_window"]["chunk_ids"] == ["sum_old"]
+            assert event["outcome_json"]["transcript_window"][
+                "transcript_message_seqs"
+            ] == [7, 8, 9, 10]
+            assert event["outcome_json"]["transcript_window"]["chunk_ids"] == [
+                "sum_old"
+            ]
             # The recent-transcript budget is derived from the unified context
-            # envelope (context_envelope_budget_tokens default 4096 * the
-            # recent_transcript ratio 0.20 = floor(819.2) = 819), not from the
-            # manifest's transcript_budget_tokens field.
+            # envelope (context_envelope_budget_tokens pinned to 4096 in
+            # _settings * the recent_transcript ratio 0.20 = floor(819.2) =
+            # 819), not from the manifest's transcript_budget_tokens field.
             assert event["outcome_json"]["transcript_window"]["budget_tokens"] == 819
             assert event["outcome_json"]["transcript_window"]["budget_used_tokens"] > 0
         finally:
@@ -815,8 +1086,8 @@ async def test_chat_reply_fetches_full_uncovered_tail_when_chunks_lag_behind(
 
         # No summary chunks exist, so the whole transcript window is the raw
         # uncovered tail. It is bounded by the recent-transcript budget derived
-        # from the unified context envelope (4096 default * 0.20 ratio = 819
-        # tokens), which fits the most recent 409 short messages, so the window
+        # from the unified context envelope (4096 pinned in _settings * 0.20
+        # ratio = 819 tokens), which fits the most recent 409 short messages, so the window
         # starts at tail-112 (520 - 409 + 1) rather than tail-1. The tail is
         # contiguous through the latest stored message and ends with the new
         # user turn.

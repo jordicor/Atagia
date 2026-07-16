@@ -12,7 +12,12 @@ from atagia.app import create_app
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.core.metrics_repository import MetricsRepository
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+)
 from atagia.core.retrieval_event_repository import (
     AdminAuditRepository,
     MemoryFeedbackRepository,
@@ -20,8 +25,12 @@ from atagia.core.retrieval_event_repository import (
 )
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -61,14 +70,20 @@ def test_admin_metrics_routes_require_admin_key(tmp_path: Path) -> None:
     with TestClient(app) as client:
         assert client.get("/v1/admin/metrics/latest").status_code == 401
         assert client.get("/v1/admin/metrics/mur/history").status_code == 401
-        assert client.post(
-            "/v1/admin/metrics/compute",
-            json={"time_bucket": "2026-03-31", "metrics": ["mur"]},
-        ).status_code == 401
-        assert client.get(
-            "/v1/admin/metrics/retrieval-summary",
-            params={"from_date": "2026-03-31", "to_date": "2026-03-31"},
-        ).status_code == 401
+        assert (
+            client.post(
+                "/v1/admin/metrics/compute",
+                json={"time_bucket": "2026-03-31", "metrics": ["mur"]},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.get(
+                "/v1/admin/metrics/retrieval-summary",
+                params={"from_date": "2026-03-31", "to_date": "2026-03-31"},
+            ).status_code
+            == 401
+        )
 
 
 def test_admin_metrics_validate_metric_names_at_api_boundary(tmp_path: Path) -> None:
@@ -88,7 +103,9 @@ def test_admin_metrics_validate_metric_names_at_api_boundary(tmp_path: Path) -> 
         assert compute.status_code == 422
 
 
-def test_admin_metrics_routes_support_compute_latest_history_and_summary(tmp_path: Path) -> None:
+def test_admin_metrics_routes_support_compute_latest_history_and_summary(
+    tmp_path: Path,
+) -> None:
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         runtime = client.app.state.runtime
@@ -111,8 +128,19 @@ def test_admin_metrics_routes_support_compute_latest_history_and_summary(tmp_pat
                 "coding_debug",
                 "Chat",
             )
-            client.portal.call(messages.create_message, "msg_1", "cnv_1", "user", 1, "Need help", 2, {})
-            client.portal.call(messages.create_message, "msg_2", "cnv_1", "assistant", 2, "Try this", 2, {})
+            client.portal.call(
+                messages.create_message, "msg_1", "cnv_1", "user", 1, "Need help", 2, {}
+            )
+            client.portal.call(
+                messages.create_message,
+                "msg_2",
+                "cnv_1",
+                "assistant",
+                2,
+                "Try this",
+                2,
+                {},
+            )
             client.portal.call(
                 lambda: memories.create_memory_object(
                     user_id="usr_1",
@@ -185,9 +213,18 @@ def test_admin_metrics_routes_support_compute_latest_history_and_summary(tmp_pat
             assert compute_payload["computed"]["mur"]["value"] == 1.0
             assert compute_payload["queued_metrics"] == ["ccr"]
 
-            queued = client.portal.call(runtime.storage_backend.dequeue_job, "stream:atagia:evaluate", 0)
-            assert queued is not None
-            assert queued["payload"]["job_type"] == "run_evaluation"
+            queued = client.portal.call(
+                connection.execute_fetchall,
+                """
+                SELECT job_type, status, recovery_envelope_json
+                FROM worker_job_runs
+                WHERE user_id = ? AND job_type = ?
+                """,
+                ("usr_1", "run_evaluation"),
+            )
+            assert len(queued) == 1
+            assert queued[0]["status"] == "queued"
+            assert queued[0]["recovery_envelope_json"] is not None
 
             latest_response = client.get(
                 "/v1/admin/metrics/latest",
@@ -199,22 +236,35 @@ def test_admin_metrics_routes_support_compute_latest_history_and_summary(tmp_pat
 
             history_response = client.get(
                 "/v1/admin/metrics/mur/history",
-                params={"user_id": "usr_1", "assistant_mode_id": "coding_debug", "limit": 5},
+                params={
+                    "user_id": "usr_1",
+                    "assistant_mode_id": "coding_debug",
+                    "limit": 5,
+                },
                 headers={"Authorization": "Bearer admin-key"},
             )
             assert history_response.status_code == 200
-            assert [row["time_bucket"] for row in history_response.json()] == ["2026-03-31", "2026-03-30"]
+            assert [row["time_bucket"] for row in history_response.json()] == [
+                "2026-03-31",
+                "2026-03-30",
+            ]
 
             summary_response = client.get(
                 "/v1/admin/metrics/retrieval-summary",
-                params={"user_id": "usr_1", "from_date": "2026-03-31", "to_date": "2026-03-31"},
+                params={
+                    "user_id": "usr_1",
+                    "from_date": "2026-03-31",
+                    "to_date": "2026-03-31",
+                },
                 headers={"Authorization": "Bearer admin-key"},
             )
             assert summary_response.status_code == 200
             assert summary_response.json()["total_events"] == 1
             assert summary_response.json()["avg_items_included"] == 1.0
 
-            audit_entries = client.portal.call(AdminAuditRepository(connection, runtime.clock).list_entries)
+            audit_entries = client.portal.call(
+                AdminAuditRepository(connection, runtime.clock).list_entries
+            )
             audit_actions = [entry["action"] for entry in audit_entries]
             assert "metrics_compute" in audit_actions
             assert "metrics_latest" in audit_actions

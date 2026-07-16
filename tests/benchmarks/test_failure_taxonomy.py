@@ -34,7 +34,7 @@ def test_failure_taxonomy_maps_locomo_diagnostics_without_raw_text(tmp_path) -> 
                             question_text="RAW QUESTION TEXT",
                             ground_truth="RAW GROUND TRUTH",
                             category=1,
-                            evidence_turn_ids=["D1:1"],
+                            evidence_turn_ids=["D97:9701"],
                             question_id="q1",
                         ),
                         prediction="RAW PREDICTION",
@@ -48,7 +48,7 @@ def test_failure_taxonomy_maps_locomo_diagnostics_without_raw_text(tmp_path) -> 
                         trace={
                             "diagnosis_bucket": "missing_extraction",
                             "sufficiency_diagnostic": "missing_memory_extraction",
-                            "evidence_turn_ids": ["D1:1"],
+                            "evidence_turn_ids": ["D97:9701"],
                             "evidence_memory_ids": [],
                             "selected_memory_ids": [],
                             "selected_evidence_memory_ids": [],

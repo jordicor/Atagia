@@ -8,7 +8,7 @@ import aiosqlite
 
 if TYPE_CHECKING:
     from atagia.app import AppRuntime
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 
 from atagia.api.dependencies import (
     AuthContext,
@@ -22,13 +22,22 @@ from atagia.api.dependencies import (
     get_settings,
     get_storage_backend,
 )
+from atagia.api.path_ids import TransportIdRoute
 from atagia.core.clock import Clock
+from atagia.core.admin_maintenance_repository import (
+    AdminMaintenanceRepository,
+    admin_maintenance_operation,
+)
 from atagia.core.config import Settings
 from atagia.core.ids import new_job_id
 from atagia.core import json_utils
 from atagia.core.metrics_repository import MetricsRepository
 from atagia.core.repositories import UserRepository
-from atagia.core.retrieval_event_repository import AdminAuditRepository, RetrievalEventRepository
+from atagia.core.retrieval_event_repository import (
+    AdminAuditRepository,
+    RetrievalEventRepository,
+)
+from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
 from atagia.memory.compactor import Compactor
 from atagia.memory.grounding_analyzer import GroundingAnalyzer
 from atagia.memory.inspector import MemoryInspector
@@ -48,7 +57,13 @@ from atagia.models.schemas_api import WorkerControlRequest, WorkerControlRespons
 from atagia.models.schemas_memory import MemoryCategory, MemoryStatus
 from atagia.models.schemas_jobs import WorkerControlMode
 from atagia.models.schemas_evaluation import MetricName, RetrievalSummaryStats
-from atagia.models.schemas_jobs import EVALUATION_STREAM_NAME, EvaluationJobPayload, JobEnvelope, JobType
+from atagia.models.schemas_jobs import (
+    EVALUATION_STREAM_NAME,
+    INTERNAL_SYSTEM_USER_ID,
+    EvaluationJobPayload,
+    JobEnvelope,
+    JobType,
+)
 from atagia.models.schemas_replay import (
     ConversationExport,
     ConversationExportRequest,
@@ -60,13 +75,21 @@ from atagia.models.schemas_replay import (
 )
 from atagia.services.llm_client import LLMClient, LLMRunGuardError
 from atagia.services.embeddings import EmbeddingIndex
-from atagia.services.embedding_backfill_service import EmbeddingBackfillResult, EmbeddingBackfillService
+from atagia.services.embedding_backfill_service import (
+    EmbeddingBackfillResult,
+    EmbeddingBackfillService,
+)
 from atagia.services.coverage_members_backfill_service import (
     CoverageMembersBackfillResult,
     CoverageMembersBackfillService,
 )
 from atagia.services.admin_rebuild_service import AdminRebuildService, RebuildResult
-from atagia.services.errors import DeletionConfirmationError, MemoryNotFoundError
+from atagia.services.errors import (
+    DeletionConfirmationError,
+    MemoryNotFoundError,
+    TranscriptRebuildInProgressError,
+    TranscriptRebuildRemediationRequiredError,
+)
 from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.lifecycle_service import (
@@ -83,8 +106,45 @@ from atagia.services.dataset_exporter import (
 from atagia.services.replay_service import ReplayService
 from atagia.services.retrieval_pipeline import RetrievalPipeline
 from atagia.core.storage_backend import StorageBackend
+router = APIRouter(
+    prefix="/v1/admin",
+    tags=["admin"],
+    route_class=TransportIdRoute,
+)
 
-router = APIRouter(prefix="/v1/admin", tags=["admin"])
+_MEMORY_REVIEW_FILTER_NAMES = frozenset(
+    {
+        "user_id",
+        "platform_id",
+        "user_persona_id",
+        "character_id",
+        "category",
+        "ingest_origin",
+        "limit",
+        "offset",
+    }
+)
+
+
+def _memory_review_failure_http_status(exc: Exception) -> int:
+    if isinstance(exc, HTTPException):
+        return exc.status_code
+    if isinstance(exc, TranscriptRebuildInProgressError):
+        return status.HTTP_409_CONFLICT
+    if isinstance(exc, TranscriptRebuildRemediationRequiredError):
+        return status.HTTP_503_SERVICE_UNAVAILABLE
+    return status.HTTP_500_INTERNAL_SERVER_ERROR
+
+
+async def _require_memory_scope_available(
+    connection: aiosqlite.Connection,
+    clock: Clock,
+    user_id: str | None = None,
+) -> None:
+    await TranscriptRebuildRepository(
+        connection,
+        clock,
+    ).require_scope_available(user_id)
 
 
 async def _worker_control_response(
@@ -121,6 +181,103 @@ async def _audit_admin_action(
         target_type=target_type,
         target_id=target_id,
         metadata=metadata or {},
+    )
+
+
+def _normalized_memory_review_filters(request: Request) -> dict[str, object]:
+    filters: dict[str, object] = {}
+    for key, raw_value in request.query_params.multi_items():
+        if key not in _MEMORY_REVIEW_FILTER_NAMES:
+            continue
+        value = raw_value.strip()
+        if key in {"limit", "offset"}:
+            try:
+                filters[key] = int(value)
+            except ValueError:
+                filters[key] = value[:128]
+        else:
+            filters[key] = value[:512]
+    return filters
+
+
+async def _audit_memory_review_request(
+    request: Request,
+    *,
+    actor_id: str,
+    status_label: str,
+    result_count: int,
+    error_class: str | None,
+    http_status: int,
+) -> None:
+    runtime = get_runtime(request)
+    connection = await runtime.open_connection()
+    try:
+        filters = _normalized_memory_review_filters(request)
+        await AdminAuditRepository(connection, runtime.clock).create_audit_entry(
+            admin_user_id=actor_id,
+            action="list_review_required_memories",
+            target_type="memory_review",
+            target_id=str(filters.get("user_id") or "all"),
+            metadata={
+                "filters": filters,
+                "result_count": result_count,
+                "status": status_label,
+                "error_class": error_class,
+                "http_status": http_status,
+            },
+        )
+    finally:
+        await connection.close()
+
+
+async def get_memory_review_auth_context(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> AuthContext:
+    """Authenticate the sensitive review read and audit rejected attempts."""
+
+    try:
+        return get_admin_auth_context(request, authorization)
+    except HTTPException as exc:
+        await _audit_memory_review_request(
+            request,
+            actor_id="unauthenticated_admin_request",
+            status_label="denied",
+            result_count=0,
+            error_class=exc.__class__.__name__,
+            http_status=exc.status_code,
+        )
+        raise
+
+
+async def audit_memory_review_validation_failure(
+    request: Request,
+    exc: Exception,
+) -> None:
+    """Audit a validly authenticated review request rejected by validation."""
+
+    settings = get_settings(request)
+    actor_id = "library_admin"
+    if settings.service_mode:
+        authorization_values = request.headers.getlist("authorization")
+        authorization = (
+            authorization_values[0] if len(authorization_values) == 1 else None
+        )
+        scheme, _, token = (authorization or "").partition(" ")
+        actor_id = (
+            "admin_api_key"
+            if scheme.lower() == "bearer"
+            and settings.admin_api_key is not None
+            and token == settings.admin_api_key
+            else "unauthenticated_admin_request"
+        )
+    await _audit_memory_review_request(
+        request,
+        actor_id=actor_id,
+        status_label="validation_error",
+        result_count=0,
+        error_class=exc.__class__.__name__,
+        http_status=status.HTTP_422_UNPROCESSABLE_CONTENT,
     )
 
 
@@ -279,7 +436,9 @@ async def set_worker_control(
         if not runtime.settings.workers_enabled:
             drain_completed = False
         else:
-            drain_completed = await runtime.storage_backend.drain(payload.timeout_seconds)
+            drain_completed = await runtime.storage_backend.drain(
+                payload.timeout_seconds
+            )
     await _audit_admin_action(
         connection,
         clock,
@@ -298,8 +457,10 @@ async def set_worker_control(
 
 @router.get("/memory-review", response_model=AdminReviewMemoryListResponse)
 async def list_review_required_memories(
-    auth_context: AuthContext = Depends(get_admin_auth_context),
+    request: Request,
+    auth_context: AuthContext = Depends(get_memory_review_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
+    clock: Clock = Depends(get_clock),
     user_id: str | None = Query(default=None),
     platform_id: str | None = Query(default=None),
     user_persona_id: str | None = Query(default=None),
@@ -309,17 +470,64 @@ async def list_review_required_memories(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> AdminReviewMemoryListResponse:
-    del auth_context
-    items = await _list_review_required_memories(
+    filters = {
+        "user_id": user_id,
+        "platform_id": platform_id,
+        "user_persona_id": user_persona_id,
+        "character_id": character_id,
+        "category": category.value if category is not None else None,
+        "ingest_origin": ingest_origin,
+        "limit": limit,
+        "offset": offset,
+    }
+    normalized_filters = {
+        key: value for key, value in filters.items() if value is not None
+    }
+    try:
+        await _require_memory_scope_available(connection, clock, user_id)
+        items = await _list_review_required_memories(
+            connection,
+            user_id=user_id,
+            platform_id=platform_id,
+            user_persona_id=user_persona_id,
+            character_id=character_id,
+            category=category,
+            ingest_origin=ingest_origin,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as exc:
+        http_status = _memory_review_failure_http_status(exc)
+        await _audit_admin_action(
+            connection,
+            clock,
+            auth_context,
+            action="list_review_required_memories",
+            target_type="memory_review",
+            target_id=user_id or "all",
+            metadata={
+                "filters": normalized_filters,
+                "result_count": 0,
+                "status": "failed",
+                "error_class": exc.__class__.__name__,
+                "http_status": http_status,
+            },
+        )
+        raise
+    await _audit_admin_action(
         connection,
-        user_id=user_id,
-        platform_id=platform_id,
-        user_persona_id=user_persona_id,
-        character_id=character_id,
-        category=category,
-        ingest_origin=ingest_origin,
-        limit=limit,
-        offset=offset,
+        clock,
+        auth_context,
+        action="list_review_required_memories",
+        target_type="memory_review",
+        target_id=user_id or "all",
+        metadata={
+            "filters": normalized_filters,
+            "result_count": len(items),
+            "status": "success",
+            "error_class": None,
+            "http_status": status.HTTP_200_OK,
+        },
     )
     return AdminReviewMemoryListResponse.model_validate({"items": items})
 
@@ -336,6 +544,7 @@ async def archive_review_required_memory(
     clock: Clock = Depends(get_clock),
     runtime: "AppRuntime" = Depends(get_runtime),
 ) -> AdminReviewActionResponse:
+    await _require_memory_scope_available(connection, clock, user_id)
     await _get_review_required_memory(
         connection,
         user_id=user_id,
@@ -374,6 +583,7 @@ async def delete_review_required_memory(
     clock: Clock = Depends(get_clock),
     runtime: "AppRuntime" = Depends(get_runtime),
 ) -> AdminReviewActionResponse:
+    await _require_memory_scope_available(connection, clock, user_id)
     await _get_review_required_memory(
         connection,
         user_id=user_id,
@@ -410,6 +620,7 @@ async def delete_review_required_memory(
 
 @router.post("/embeddings/backfill")
 async def backfill_embeddings(
+    request: Request,
     payload: AdminEmbeddingBackfillRequest,
     auth_context: AuthContext = Depends(get_admin_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
@@ -417,14 +628,24 @@ async def backfill_embeddings(
     embedding_index: EmbeddingIndex = Depends(get_embedding_index),
 ) -> EmbeddingBackfillResult:
     try:
-        result = await EmbeddingBackfillService(
-            connection=connection,
-            embedding_index=embedding_index,
-        ).run(
-            batch_size=payload.batch_size,
-            delay_ms=payload.delay_ms,
+        async with admin_maintenance_operation(
+            connection,
+            clock,
+            operation_kind="embedding_backfill",
             user_id=payload.user_id,
-        )
+            recovery_key=f"user:{payload.user_id or 'all'}",
+            heartbeat_connection_factory=get_runtime(request).open_connection,
+        ) as maintenance:
+            result = await EmbeddingBackfillService(
+                connection=connection,
+                embedding_index=embedding_index,
+                clock=clock,
+                maintenance_operation=maintenance,
+            ).run(
+                batch_size=payload.batch_size,
+                delay_ms=payload.delay_ms,
+                user_id=payload.user_id,
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -444,6 +665,7 @@ async def backfill_embeddings(
 
 @router.post("/memory/coverage/backfill")
 async def backfill_coverage_members(
+    request: Request,
     payload: AdminCoverageMembersBackfillRequest,
     auth_context: AuthContext = Depends(get_admin_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
@@ -452,16 +674,26 @@ async def backfill_coverage_members(
     llm_client: LLMClient[Any] = Depends(get_llm_client),
 ) -> CoverageMembersBackfillResult:
     try:
-        result = await CoverageMembersBackfillService(
-            connection=connection,
-            llm_client=llm_client,
-            settings=settings,
-        ).run(
-            batch_size=payload.batch_size,
-            delay_ms=payload.delay_ms,
+        async with admin_maintenance_operation(
+            connection,
+            clock,
+            operation_kind="coverage_members_backfill",
             user_id=payload.user_id,
-            dry_run=False,
-        )
+            recovery_key=f"user:{payload.user_id or 'all'}",
+            heartbeat_connection_factory=get_runtime(request).open_connection,
+        ) as maintenance:
+            result = await CoverageMembersBackfillService(
+                connection=connection,
+                llm_client=llm_client,
+                settings=settings,
+                clock=clock,
+                maintenance_operation=maintenance,
+            ).run(
+                batch_size=payload.batch_size,
+                delay_ms=payload.delay_ms,
+                user_id=payload.user_id,
+                dry_run=False,
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -511,6 +743,7 @@ async def reset_llm_run_guard(
 
 @router.post("/rebuild/conversation/{conversation_id}")
 async def rebuild_conversation(
+    request: Request,
     conversation_id: str,
     auth_context: AuthContext = Depends(get_admin_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
@@ -531,8 +764,9 @@ async def rebuild_conversation(
     )
     row = await cursor.fetchone()
     if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found"
+        )
     try:
         result = await AdminRebuildService(
             connection=connection,
@@ -542,6 +776,7 @@ async def rebuild_conversation(
             manifest_loader=manifest_loader,
             settings=settings,
             storage_backend=storage_backend,
+            job_connection_factory=get_runtime(request).open_connection,
         ).rebuild_conversation(
             user_id=str(row["user_id"]),
             conversation_id=str(row["id"]),
@@ -562,6 +797,7 @@ async def rebuild_conversation(
 
 @router.post("/rebuild/user/{user_id}")
 async def rebuild_user(
+    request: Request,
     user_id: str,
     auth_context: AuthContext = Depends(get_admin_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
@@ -574,7 +810,9 @@ async def rebuild_user(
 ) -> RebuildResult:
     user = await UserRepository(connection, clock).get_user(user_id)
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+        )
 
     try:
         result = await AdminRebuildService(
@@ -585,6 +823,7 @@ async def rebuild_user(
             manifest_loader=manifest_loader,
             settings=settings,
             storage_backend=storage_backend,
+            job_connection_factory=get_runtime(request).open_connection,
         ).rebuild_user(user_id)
     except LLMRunGuardError as exc:
         raise _llm_run_guard_http_exception(exc) from exc
@@ -602,6 +841,7 @@ async def rebuild_user(
 
 @router.post("/compact/conversation/{conversation_id}")
 async def compact_conversation(
+    request: Request,
     conversation_id: str,
     auth_context: AuthContext = Depends(get_admin_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
@@ -620,17 +860,27 @@ async def compact_conversation(
     )
     row = await cursor.fetchone()
     if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-
-    summary_ids = await Compactor(
-        connection=connection,
-        llm_client=llm_client,
-        clock=clock,
-        settings=settings,
-    ).generate_conversation_chunks(
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found"
+        )
+    async with admin_maintenance_operation(
+        connection,
+        clock,
+        operation_kind="compact_conversation",
         user_id=str(row["user_id"]),
-        conversation_id=str(row["id"]),
-    )
+        recovery_key=f"conversation:{row['id']}",
+        heartbeat_connection_factory=get_runtime(request).open_connection,
+    ) as maintenance:
+        summary_ids = await Compactor(
+            connection=connection,
+            llm_client=llm_client,
+            clock=clock,
+            settings=settings,
+            maintenance_operation=maintenance,
+        ).generate_conversation_chunks(
+            user_id=str(row["user_id"]),
+            conversation_id=str(row["id"]),
+        )
     await AdminAuditRepository(connection, clock).create_audit_entry(
         admin_user_id=auth_context.actor_id,
         action="compact_conversation",
@@ -643,6 +893,7 @@ async def compact_conversation(
 
 @router.post("/compact/workspace/{workspace_id}")
 async def compact_workspace(
+    request: Request,
     workspace_id: str,
     auth_context: AuthContext = Depends(get_admin_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
@@ -661,17 +912,27 @@ async def compact_workspace(
     )
     row = await cursor.fetchone()
     if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
-
-    summary_id = await Compactor(
-        connection=connection,
-        llm_client=llm_client,
-        clock=clock,
-        settings=settings,
-    ).generate_workspace_rollup(
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found"
+        )
+    async with admin_maintenance_operation(
+        connection,
+        clock,
+        operation_kind="compact_workspace",
         user_id=str(row["user_id"]),
-        workspace_id=str(row["id"]),
-    )
+        recovery_key=f"workspace:{row['id']}",
+        heartbeat_connection_factory=get_runtime(request).open_connection,
+    ) as maintenance:
+        summary_id = await Compactor(
+            connection=connection,
+            llm_client=llm_client,
+            clock=clock,
+            settings=settings,
+            maintenance_operation=maintenance,
+        ).generate_workspace_rollup(
+            user_id=str(row["user_id"]),
+            workspace_id=str(row["id"]),
+        )
     await AdminAuditRepository(connection, clock).create_audit_entry(
         admin_user_id=auth_context.actor_id,
         action="compact_workspace",
@@ -684,13 +945,39 @@ async def compact_workspace(
 
 @router.post("/reindex")
 async def reindex(
+    request: Request,
     auth_context: AuthContext = Depends(get_admin_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> dict[str, str]:
-    await connection.execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
-    await connection.execute("INSERT INTO memory_objects_fts(memory_objects_fts) VALUES ('rebuild')")
-    await connection.commit()
+    async with admin_maintenance_operation(
+        connection,
+        clock,
+        operation_kind="reindex_fts",
+        user_id=None,
+        recovery_key="global",
+        heartbeat_connection_factory=get_runtime(request).open_connection,
+    ) as maintenance:
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            await AdminMaintenanceRepository(
+                connection,
+                clock,
+            ).require_current(maintenance)
+            await AdminMaintenanceRepository(
+                connection,
+                clock,
+            ).mark_dirty(maintenance)
+            await connection.execute(
+                "INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')"
+            )
+            await connection.execute(
+                "INSERT INTO memory_objects_fts(memory_objects_fts) VALUES ('rebuild')"
+            )
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
     await AdminAuditRepository(connection, clock).create_audit_entry(
         admin_user_id=auth_context.actor_id,
         action="reindex_fts",
@@ -708,6 +995,7 @@ async def inspect_retrieval_event(
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> dict[str, object]:
+    await _require_memory_scope_available(connection, clock)
     inspector = MemoryInspector(connection, clock)
     event = await inspector.inspect_retrieval_event_by_id(
         event_id,
@@ -729,6 +1017,7 @@ async def inspect_memory_coordinates(
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> dict[str, object]:
+    await _require_memory_scope_available(connection, clock, user_id)
     inspector = MemoryInspector(connection, clock)
     inspection = await inspector.inspect_memory_coordinates(
         memory_id,
@@ -755,14 +1044,25 @@ async def correct_memory_coordinates(
 ) -> dict[str, object]:
     inspector = MemoryInspector(connection, clock)
     try:
-        inspection = await inspector.correct_memory_coordinates(
-            memory_id,
-            user_id,
-            admin_user_id=auth_context.actor_id,
-            updates=payload.coordinates,
-            reason=payload.reason,
-            invalidate_user_cache=ContextCacheService(runtime).invalidate_user_cache,
-        )
+        async with admin_maintenance_operation(
+            connection,
+            clock,
+            operation_kind="correct_memory_coordinates",
+            user_id=user_id,
+            recovery_key=f"memory:{memory_id}",
+            heartbeat_connection_factory=runtime.open_connection,
+        ) as maintenance:
+            inspection = await inspector.correct_memory_coordinates(
+                memory_id,
+                user_id,
+                admin_user_id=auth_context.actor_id,
+                updates=payload.coordinates,
+                reason=payload.reason,
+                invalidate_user_cache=ContextCacheService(
+                    runtime
+                ).invalidate_user_cache,
+                maintenance_operation=maintenance,
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -784,6 +1084,7 @@ async def inspect_memory_coordinate_corrections(
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> list[dict[str, object]]:
+    await _require_memory_scope_available(connection, clock, user_id)
     inspector = MemoryInspector(connection, clock)
     return await inspector.inspect_coordinate_correction_history(
         memory_id,
@@ -801,6 +1102,7 @@ async def inspect_retrieval_memory_decision(
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> dict[str, object]:
+    await _require_memory_scope_available(connection, clock, user_id)
     inspector = MemoryInspector(connection, clock)
     decision = await inspector.inspect_retrieval_memory_decision(
         event_id,
@@ -825,6 +1127,7 @@ async def list_consequence_chains(
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> list[dict[str, object]]:
+    await _require_memory_scope_available(connection, clock, user_id)
     inspector = MemoryInspector(connection, clock)
     return await inspector.list_consequence_chains(
         user_id,
@@ -844,6 +1147,11 @@ async def run_lifecycle(
     storage_backend: StorageBackend = Depends(get_storage_backend),
     runtime: AppRuntime = Depends(get_runtime),
 ) -> LifecycleCycleResult:
+    availability_connection = await runtime.open_connection()
+    try:
+        await _require_memory_scope_available(availability_connection, clock)
+    finally:
+        await availability_connection.close()
     try:
         result = await run_lifecycle_direct(
             database_path=runtime.database_path,
@@ -851,7 +1159,6 @@ async def run_lifecycle(
             settings=settings,
             embedding_index=embedding_index,
             storage_backend=storage_backend,
-            artifact_blob_store=runtime.artifact_blob_store,
             llm_client=runtime.llm_client,
             lifecycle_runtime=runtime,
             dry_run=dry_run,
@@ -884,6 +1191,7 @@ async def get_latest_metrics(
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> dict[str, dict[str, object]]:
+    await _require_memory_scope_available(connection, clock, user_id)
     metrics = await MetricsRepository(connection, clock).get_latest_metrics(
         user_id=user_id,
         assistant_mode_id=assistant_mode_id,
@@ -916,9 +1224,14 @@ async def get_metric_history(
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> list[dict[str, object]]:
+    await _require_memory_scope_available(connection, clock, user_id)
     normalized_from = None if from_date is None else normalize_time_bucket(from_date)
     normalized_to = None if to_date is None else normalize_time_bucket(to_date)
-    if normalized_from is not None and normalized_to is not None and normalized_from > normalized_to:
+    if (
+        normalized_from is not None
+        and normalized_to is not None
+        and normalized_from > normalized_to
+    ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="from_date must be on or before to_date",
@@ -959,6 +1272,7 @@ async def compute_metrics(
     settings: Settings = Depends(get_settings),
     storage_backend: StorageBackend = Depends(get_storage_backend),
 ) -> dict[str, object]:
+    await _require_memory_scope_available(connection, clock, payload.user_id)
     normalized_bucket = normalize_time_bucket(payload.time_bucket)
     metrics_computer = MetricsComputer(connection, clock, settings=settings)
     metrics_repository = MetricsRepository(connection, clock)
@@ -971,7 +1285,7 @@ async def compute_metrics(
             evaluation_job = JobEnvelope(
                 job_id=new_job_id(),
                 job_type=JobType.RUN_EVALUATION,
-                user_id=payload.user_id or "admin_system",
+                user_id=payload.user_id or INTERNAL_SYSTEM_USER_ID,
                 payload=EvaluationJobPayload(
                     time_bucket=normalized_bucket,
                     user_id=payload.user_id,
@@ -984,16 +1298,13 @@ async def compute_metrics(
                 connection,
                 clock,
                 workers_enabled=settings.workers_enabled,
+                settings=settings,
             )
-            await job_tracking.create_queued_job(EVALUATION_STREAM_NAME, evaluation_job)
-            try:
-                await storage_backend.stream_add(
-                    EVALUATION_STREAM_NAME,
-                    evaluation_job.model_dump(mode="json"),
-                )
-            except Exception as exc:
-                await job_tracking.mark_enqueue_failed(evaluation_job, exc)
-                raise
+            await job_tracking.enqueue_job(
+                storage_backend,
+                EVALUATION_STREAM_NAME,
+                evaluation_job,
+            )
             queued_metrics.append(MetricName.CCR.value)
             continue
 
@@ -1015,7 +1326,9 @@ async def compute_metrics(
                 time_bucket=normalized_bucket,
                 computed_at=clock.now().isoformat(),
                 user_id=None if is_system_metric else payload.user_id,
-                assistant_mode_id=None if is_system_metric else payload.assistant_mode_id,
+                assistant_mode_id=None
+                if is_system_metric
+                else payload.assistant_mode_id,
             )
             computed[stored_metric_name] = {
                 "value": result.value,
@@ -1054,6 +1367,7 @@ async def get_retrieval_summary(
     clock: Clock = Depends(get_clock),
     settings: Settings = Depends(get_settings),
 ) -> RetrievalSummaryStats:
+    await _require_memory_scope_available(connection, clock, user_id)
     normalized_from = normalize_time_bucket(from_date)
     normalized_to = normalize_time_bucket(to_date)
     if normalized_from > normalized_to:
@@ -1061,7 +1375,9 @@ async def get_retrieval_summary(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="from_date must be on or before to_date",
         )
-    summary = await MetricsComputer(connection, clock, settings=settings).summarize_retrieval_events(
+    summary = await MetricsComputer(
+        connection, clock, settings=settings
+    ).summarize_retrieval_events(
         from_date=normalized_from,
         to_date=normalized_to,
         user_id=user_id,
@@ -1093,6 +1409,7 @@ async def replay_retrieval_event(
     embedding_index: EmbeddingIndex = Depends(get_embedding_index),
     settings: Settings = Depends(get_settings),
 ) -> ReplayResult:
+    await _require_memory_scope_available(connection, clock, payload.user_id)
     replay_service = ReplayService(
         connection=connection,
         retrieval_pipeline=RetrievalPipeline(
@@ -1120,7 +1437,9 @@ async def replay_retrieval_event(
         )
         return result
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
 
 
 @router.post("/replay/conversation/{conversation_id}")
@@ -1134,6 +1453,7 @@ async def replay_conversation(
     embedding_index: EmbeddingIndex = Depends(get_embedding_index),
     settings: Settings = Depends(get_settings),
 ) -> list[ReplayResult]:
+    await _require_memory_scope_available(connection, clock, payload.user_id)
     replay_service = ReplayService(
         connection=connection,
         retrieval_pipeline=RetrievalPipeline(
@@ -1162,7 +1482,9 @@ async def replay_conversation(
         )
         return result
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
 
 
 @router.post("/grounding/{retrieval_event_id}")
@@ -1173,9 +1495,15 @@ async def analyze_grounding(
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
 ) -> GroundingReport:
-    event = await RetrievalEventRepository(connection, clock).get_event(retrieval_event_id, payload.user_id)
+    await _require_memory_scope_available(connection, clock, payload.user_id)
+    event = await RetrievalEventRepository(connection, clock).get_event(
+        retrieval_event_id, payload.user_id
+    )
     if event is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Retrieval event not found for user")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Retrieval event not found for user",
+        )
     result = await GroundingAnalyzer(connection).analyze(
         dict(event.get("context_view_json") or {}),
         payload.user_id,
@@ -1200,6 +1528,7 @@ async def export_conversation(
     llm_client: LLMClient[object] = Depends(get_llm_client),
     settings: Settings = Depends(get_settings),
 ) -> ConversationExport:
+    await _require_memory_scope_available(connection, clock, payload.user_id)
     try:
         result = await DatasetExporter(
             connection,
@@ -1226,8 +1555,14 @@ async def export_conversation(
         )
         return result
     except ConversationExportNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
     except AnonymizedExportDisabledError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from exc
     except UnsafeConversationExportRequestError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc

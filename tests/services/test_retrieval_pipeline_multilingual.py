@@ -35,8 +35,8 @@ from atagia.services.llm_client import (
 )
 from atagia.services.retrieval_pipeline import RetrievalPipeline
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 _MEMORY_ID_PATTERN = re.compile(r'memory_id="([^"]+)"')
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
@@ -423,17 +423,17 @@ async def test_pipeline_uses_language_profile_with_parallel_cards_and_literal_an
 
 @pytest.mark.asyncio
 async def test_pipeline_traces_unknown_only_language_profile_without_bridge_target() -> None:
-    message_text = "Cual es la direccion del nuevo apartamento de Ben?"
+    message_text = "Cual es la direccion del nuevo estudio de Nora?"
     provider = MultilingualPipelineProvider(
         need_response={
             "needs": [],
             "temporal_range": None,
-            "sub_queries": ["dirección del nuevo apartamento de Ben"],
+            "sub_queries": ["dirección del nuevo estudio de Nora"],
             "sparse_query_hints": [
                 {
-                    "sub_query_text": "dirección del nuevo apartamento de Ben",
-                    "fts_phrase": "Ben apartamento dirección",
-                    "must_keep_terms": ["Ben", "apartamento", "dirección"],
+                    "sub_query_text": "dirección del nuevo estudio de Nora",
+                    "fts_phrase": "Nora estudio dirección",
+                    "must_keep_terms": ["Nora", "estudio", "dirección"],
                 }
             ],
             "query_language": "es",
@@ -451,7 +451,7 @@ async def test_pipeline_traces_unknown_only_language_profile_without_bridge_targ
         await _seed_memory(
             memories,
             memory_id="mem_unknown_language",
-            canonical_text="The lease was signed for 4217 Fremont Avenue North.",
+            canonical_text="The studio lease was signed for 88 Cedar Quay, Suite 6.",
             scope=MemoryScope.CONVERSATION,
         )
         trace = RetrievalTrace(

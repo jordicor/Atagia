@@ -18,8 +18,8 @@ from atagia.memory.policy_manifest import (
 )
 from atagia.models.schemas_memory import MemoryScope, OperationalPolicyOverride
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def _copy_manifests_to(tmp_path: Path) -> Path:

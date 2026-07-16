@@ -23,6 +23,7 @@ async def resolve_active_presence_snapshot(
     owner_user_id: str,
     active_presence_id: str | None = None,
     character_id: str | None = None,
+    commit: bool = True,
 ) -> PresenceSnapshot:
     """Resolve the active Presence row without mutating a conversation."""
 
@@ -30,6 +31,7 @@ async def resolve_active_presence_snapshot(
         owner_user_id=owner_user_id,
         active_presence_id=active_presence_id,
         character_id=character_id,
+        commit=commit,
     )
     return presence_snapshot(row)
 
@@ -41,6 +43,7 @@ async def ensure_conversation_active_presence(
     conversation: dict[str, Any],
     active_presence_id: str | None = None,
     character_id: str | None = None,
+    commit: bool = True,
 ) -> tuple[dict[str, Any], PresenceSnapshot]:
     """Resolve and persist the active Presence for a conversation if missing."""
 
@@ -60,6 +63,7 @@ async def ensure_conversation_active_presence(
         owner_user_id=owner_user_id,
         active_presence_id=requested_presence_id,
         character_id=effective_character_id,
+        commit=commit,
     )
     current_presence_id = _optional_text(conversation.get("active_presence_id"))
     if current_presence_id is None:
@@ -70,6 +74,7 @@ async def ensure_conversation_active_presence(
             str(conversation["id"]),
             owner_user_id,
             snapshot.presence_id,
+            commit=commit,
         )
         if updated is not None:
             conversation = updated
@@ -85,6 +90,7 @@ async def resolve_source_presence_for_role(
     owner_user_id: str,
     role: str,
     active_presence: PresenceSnapshot,
+    commit: bool = True,
 ) -> PresenceSnapshot:
     """Resolve the source Presence for a stored message role."""
 
@@ -92,7 +98,10 @@ async def resolve_source_presence_for_role(
         row = await PresenceRepository(
             connection,
             clock,
-        ).resolve_human_owner_presence(owner_user_id=owner_user_id)
+        ).resolve_human_owner_presence(
+            owner_user_id=owner_user_id,
+            commit=commit,
+        )
         return presence_snapshot(row)
     return active_presence
 

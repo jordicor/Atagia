@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 from atagia.services.llm_client import (
     ConfigurationError,
     LLMCompletionRequest,
@@ -474,8 +474,8 @@ def test_openrouter_default_headers_and_factory_wiring(monkeypatch: pytest.Monke
 
     settings = Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         openai_api_key=None,
@@ -534,8 +534,8 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
 
     settings = Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         anthropic_api_key="anthropic-key",
@@ -596,8 +596,8 @@ def test_build_llm_client_requires_openai_for_anthropic_embeddings(
 
     settings = Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         anthropic_api_key="anthropic-key",
@@ -659,8 +659,8 @@ async def test_build_llm_client_routes_embeddings_by_provider_qualified_model(
 
     settings = Settings(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         anthropic_api_key="anthropic-key",

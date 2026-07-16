@@ -12,8 +12,8 @@ from atagia.services.embeddings import NoneBackend, create_embedding_index
 from atagia.services.llm_client import ConfigurationError, LLMClient, LLMEmbeddingRequest, LLMEmbeddingResponse, LLMEmbeddingVector, LLMProvider
 from atagia.services.sqlite_vec_backend import SQLiteVecBackend
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 class StubProvider(LLMProvider):

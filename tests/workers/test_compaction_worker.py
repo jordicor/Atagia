@@ -11,21 +11,30 @@ import pytest
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository, WorkspaceRepository
-from atagia.core.storage_backend import InProcessBackend
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+    WorkspaceRepository,
+)
 from atagia.core.summary_repository import SummaryRepository
 from atagia.memory.compactor import COMPACTION_VALIDATION_MAX_CORRECTIVE_RETRIES
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
     INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
-    WORKER_GROUP_NAME,
     CompactionJobKind,
     InitialContextPackageRefreshJobPayload,
     JobEnvelope,
     JobType,
 )
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, SummaryViewKind
+from atagia.models.schemas_memory import (
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    SummaryViewKind,
+)
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -36,9 +45,14 @@ from atagia.services.llm_client import (
     StructuredOutputError,
 )
 from atagia.workers.compaction_worker import CompactionWorker
+from tests.durable_job_support import DurableJobTestBackend
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 def _segmentation_card_outputs(
@@ -48,7 +62,9 @@ def _segmentation_card_outputs(
     # range. Card 1 stays one call per window, FIFO by purpose.
     outputs: dict[str, list[str]] = {
         "summary_chunk_segmentation_ranges_card": [
-            "\n".join(f"{start_seq}-{end_seq}" for start_seq, end_seq, _summary in window)
+            "\n".join(
+                f"{start_seq}-{end_seq}" for start_seq, end_seq, _summary in window
+            )
             for window in windows
         ],
     }
@@ -127,8 +143,10 @@ async def _build_runtime(
 ):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 3, 14, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
-    backend = InProcessBackend()
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
+    backend = DurableJobTestBackend(connection, clock, settings=_settings())
     provider = QueueProvider(outputs, failing_purposes=failing_purposes)
     llm_client = LLMClient(
         provider_name=provider.name,
@@ -143,7 +161,9 @@ async def _build_runtime(
     memories = MemoryObjectRepository(connection, clock)
     await users.create_user("usr_1")
     await workspaces.create_workspace("wrk_1", "usr_1", "Workspace")
-    await conversations.create_conversation("cnv_1", "usr_1", "wrk_1", "coding_debug", "Chat")
+    await conversations.create_conversation(
+        "cnv_1", "usr_1", "wrk_1", "coding_debug", "Chat"
+    )
     worker = CompactionWorker(
         storage_backend=backend,
         connection=connection,
@@ -155,11 +175,17 @@ async def _build_runtime(
 
 
 async def _seed_messages(messages: MessageRepository) -> None:
-    await messages.create_message("msg_1", "cnv_1", "user", 1, "We should try a patch.", 6, {})
-    await messages.create_message("msg_2", "cnv_1", "assistant", 2, "Patch the retry guard first.", 6, {})
+    await messages.create_message(
+        "msg_1", "cnv_1", "user", 1, "We should try a patch.", 6, {}
+    )
+    await messages.create_message(
+        "msg_2", "cnv_1", "assistant", 2, "Patch the retry guard first.", 6, {}
+    )
 
 
-def _compaction_job(*, job_kind: str, privacy_enforcement: str = "enforce") -> JobEnvelope:
+def _compaction_job(
+    *, job_kind: str, privacy_enforcement: str = "enforce"
+) -> JobEnvelope:
     return JobEnvelope(
         job_id="job_compact_1",
         job_type=JobType.COMPACT_SUMMARIES,
@@ -184,7 +210,10 @@ async def test_compaction_worker_processes_conversation_chunk_job() -> None:
     )
     try:
         await _seed_messages(messages)
-        await backend.stream_add(COMPACT_STREAM_NAME, _compaction_job(job_kind="conversation_chunk").model_dump(mode="json"))
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(job_kind="conversation_chunk").model_dump(mode="json"),
+        )
 
         result = await worker.run_once()
         rows = await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10)
@@ -212,17 +241,13 @@ async def test_compaction_refresh_preserves_privacy_enforcement_variant() -> Non
         )
 
         result = await worker.run_once()
-        refresh_messages = await backend.stream_read(
-            INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            "test",
-            count=1,
-            block_ms=0,
+        refresh_job = await backend.dequeue_durable_envelope(
+            INITIAL_CONTEXT_PACKAGE_STREAM_NAME
         )
 
         assert result.acked == 1
-        assert len(refresh_messages) == 1
-        refresh_envelope = JobEnvelope.model_validate(refresh_messages[0].payload)
+        assert refresh_job is not None
+        refresh_envelope = JobEnvelope.model_validate(refresh_job)
         refresh_payload = InitialContextPackageRefreshJobPayload.model_validate(
             refresh_envelope.payload
         )
@@ -234,14 +259,20 @@ async def test_compaction_refresh_preserves_privacy_enforcement_variant() -> Non
 
 @pytest.mark.asyncio
 async def test_compaction_worker_skips_temporary_conversation_chunk_job() -> None:
-    connection, backend, messages, summaries, _memories, worker = await _build_runtime({})
+    connection, backend, messages, summaries, _memories, worker = await _build_runtime(
+        {}
+    )
     try:
-        await connection.execute("UPDATE conversations SET temporary = 1 WHERE id = ?", ("cnv_1",))
+        await connection.execute(
+            "UPDATE conversations SET temporary = 1 WHERE id = ?", ("cnv_1",)
+        )
         await connection.commit()
         await _seed_messages(messages)
         await backend.stream_add(
             COMPACT_STREAM_NAME,
-            _compaction_job(job_kind=CompactionJobKind.CONVERSATION_CHUNK.value).model_dump(mode="json"),
+            _compaction_job(
+                job_kind=CompactionJobKind.CONVERSATION_CHUNK.value
+            ).model_dump(mode="json"),
         )
 
         result = await worker.run_once()
@@ -260,12 +291,16 @@ async def test_compaction_worker_runs_for_isolated_conversation_chunk_job() -> N
         _segmentation_card_outputs([(1, 2, "Isolated conversation summary.")])
     )
     try:
-        await connection.execute("UPDATE conversations SET isolated_mode = 1 WHERE id = ?", ("cnv_1",))
+        await connection.execute(
+            "UPDATE conversations SET isolated_mode = 1 WHERE id = ?", ("cnv_1",)
+        )
         await connection.commit()
         await _seed_messages(messages)
         await backend.stream_add(
             COMPACT_STREAM_NAME,
-            _compaction_job(job_kind=CompactionJobKind.CONVERSATION_CHUNK.value).model_dump(mode="json"),
+            _compaction_job(
+                job_kind=CompactionJobKind.CONVERSATION_CHUNK.value
+            ).model_dump(mode="json"),
         )
 
         result = await worker.run_once()
@@ -308,9 +343,12 @@ async def test_compaction_worker_processes_workspace_rollup_job() -> None:
                 "maya_score": 1.5,
                 "model": "classify-test-model",
                 "created_at": "2026-04-03T14:00:00+00:00",
-            }
+            },
         )
-        await backend.stream_add(COMPACT_STREAM_NAME, _compaction_job(job_kind="workspace_rollup").model_dump(mode="json"))
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(job_kind="workspace_rollup").model_dump(mode="json"),
+        )
 
         result = await worker.run_once()
         rows = await summaries.list_character_rollups("usr_1", "wrk_1", limit=10)
@@ -325,8 +363,12 @@ async def test_compaction_worker_processes_workspace_rollup_job() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compaction_worker_rechecks_current_preferences_before_broad_rollup() -> None:
-    connection, backend, _messages, summaries, _memories, worker = await _build_runtime({})
+async def test_compaction_worker_rechecks_current_preferences_before_broad_rollup() -> (
+    None
+):
+    connection, backend, _messages, summaries, _memories, worker = await _build_runtime(
+        {}
+    )
     try:
         clock = FrozenClock(datetime(2026, 4, 3, 14, 0, tzinfo=timezone.utc))
         await UserRepository(connection, clock).update_memory_preferences(
@@ -351,7 +393,9 @@ async def test_compaction_worker_rechecks_current_preferences_before_broad_rollu
         )
         await backend.stream_add(
             COMPACT_STREAM_NAME,
-            _compaction_job(job_kind=CompactionJobKind.WORKSPACE_ROLLUP.value).model_dump(mode="json"),
+            _compaction_job(
+                job_kind=CompactionJobKind.WORKSPACE_ROLLUP.value
+            ).model_dump(mode="json"),
         )
 
         result = await worker.run_once()
@@ -368,25 +412,36 @@ async def test_compaction_worker_rechecks_current_preferences_before_broad_rollu
 async def test_compaction_worker_dead_letters_after_max_failed_deliveries() -> None:
     retry_attempts_per_delivery = COMPACTION_VALIDATION_MAX_CORRECTIVE_RETRIES + 1
     connection, backend, messages, _summaries, _memories, worker = await _build_runtime(
-        {"summary_chunk_segmentation_ranges_card": ["not a range"] * (3 * retry_attempts_per_delivery)}
+        {
+            "summary_chunk_segmentation_ranges_card": ["not a range"]
+            * (3 * retry_attempts_per_delivery)
+        }
     )
     try:
         await _seed_messages(messages)
-        await backend.stream_add(COMPACT_STREAM_NAME, _compaction_job(job_kind="conversation_chunk").model_dump(mode="json"))
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(job_kind="conversation_chunk").model_dump(mode="json"),
+        )
 
         first = await worker.run_once()
+        await backend.advance_to_next_retry()
         second = await worker.run_once()
+        await backend.advance_to_next_retry()
         third = await worker.run_once()
-        dead_letter = await backend.dequeue_job(f"dead_letter:{COMPACT_STREAM_NAME}", timeout_seconds=0)
+        dead_letter = await backend.dequeue_job(
+            f"dead_letter:{COMPACT_STREAM_NAME}", timeout_seconds=0
+        )
 
         assert first.failed == 1
         assert second.failed == 1
         assert third.failed == 1
         assert third.dead_lettered == 1
         assert dead_letter is not None
-        assert dead_letter["delivery_count"] == 3
-        assert "no valid ranges" in dead_letter["error"]
-        assert dead_letter["error_details"] == []
+        assert dead_letter["attempt_count"] == 3
+        assert dead_letter["error_class"] == "ValueError"
+        assert "error" not in dead_letter
+        assert "error_details" not in dead_letter
     finally:
         await connection.close()
 
@@ -399,7 +454,10 @@ async def test_compaction_worker_handles_llm_failure_gracefully() -> None:
     )
     try:
         await _seed_messages(messages)
-        await backend.stream_add(COMPACT_STREAM_NAME, _compaction_job(job_kind="conversation_chunk").model_dump(mode="json"))
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(job_kind="conversation_chunk").model_dump(mode="json"),
+        )
 
         result = await worker.run_once()
         rows = await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10)
@@ -422,7 +480,9 @@ async def test_compaction_worker_logs_structured_job_failure_without_traceback(
             details=("$.episodes: Field required",),
         )
 
-    connection, backend, messages, _summaries, _memories, worker = await _build_runtime({})
+    connection, backend, messages, _summaries, _memories, worker = await _build_runtime(
+        {}
+    )
     try:
         await _seed_messages(messages)
         worker._compactor.generate_conversation_chunks = fail_compaction
@@ -487,7 +547,10 @@ async def test_compaction_worker_orders_chunk_episode_and_thematic_jobs() -> Non
             object_type=MemoryObjectType.BELIEF,
             scope=MemoryScope.GLOBAL_USER,
             canonical_text="User prefers patch-first debugging.",
-            payload={"claim_key": "workflow.debugging.style", "claim_value": "patch_first"},
+            payload={
+                "claim_key": "workflow.debugging.style",
+                "claim_value": "patch_first",
+            },
             source_kind=MemorySourceKind.INFERRED,
             confidence=0.9,
             privacy_level=1,
@@ -507,40 +570,56 @@ async def test_compaction_worker_orders_chunk_episode_and_thematic_jobs() -> Non
                 "maya_score": 1.5,
                 "model": "classify-test-model",
                 "created_at": "2026-04-03T14:00:00+00:00",
-            }
+            },
         )
         await backend.stream_add(
             COMPACT_STREAM_NAME,
-            _compaction_job(job_kind=CompactionJobKind.CONVERSATION_CHUNK.value).model_dump(mode="json"),
+            _compaction_job(
+                job_kind=CompactionJobKind.CONVERSATION_CHUNK.value
+            ).model_dump(mode="json"),
         )
 
         first = await worker.run_once()
         second = await worker.run_once()
         third = await worker.run_once()
 
-        episode_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE)
-        thematic_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.THEMATIC_PROFILE)
+        episode_rows = await summaries.list_summaries_by_kind(
+            "usr_1", SummaryViewKind.EPISODE
+        )
+        thematic_rows = await summaries.list_summaries_by_kind(
+            "usr_1", SummaryViewKind.THEMATIC_PROFILE
+        )
 
         assert first.acked == 1
         assert second.acked == 1
         assert third.acked == 1
         assert episode_rows
         assert thematic_rows
-        assert thematic_rows[0]["summary_kind"] == SummaryViewKind.THEMATIC_PROFILE.value
+        assert (
+            thematic_rows[0]["summary_kind"] == SummaryViewKind.THEMATIC_PROFILE.value
+        )
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_compaction_worker_acks_episode_job_after_local_corrective_retry() -> None:
+async def test_compaction_worker_acks_episode_job_after_local_corrective_retry() -> (
+    None
+):
     connection, backend, _messages, summaries, _memories, worker = await _build_runtime(
         {
             "episode_synthesis": [
                 json.dumps(
                     {
                         "episodes": [
-                            {"episode_key": "debugging", "summary_text": "Cross-session debugging episode."},
-                            {"episode_key": "unused", "summary_text": "Unused episode."},
+                            {
+                                "episode_key": "debugging",
+                                "summary_text": "Cross-session debugging episode.",
+                            },
+                            {
+                                "episode_key": "unused",
+                                "summary_text": "Unused episode.",
+                            },
                         ],
                         "chunk_episode_keys": ["debugging", "debugging"],
                     }
@@ -548,7 +627,10 @@ async def test_compaction_worker_acks_episode_job_after_local_corrective_retry()
                 json.dumps(
                     {
                         "episodes": [
-                            {"episode_key": "debugging", "summary_text": "Cross-session debugging episode."}
+                            {
+                                "episode_key": "debugging",
+                                "summary_text": "Cross-session debugging episode.",
+                            }
                         ],
                         "chunk_episode_keys": ["debugging", "debugging"],
                     }
@@ -572,15 +654,19 @@ async def test_compaction_worker_acks_episode_job_after_local_corrective_retry()
                     "maya_score": 1.5,
                     "model": "classify-test-model",
                     "created_at": f"2026-04-03T14:0{index}:00+00:00",
-                }
+                },
             )
         await backend.stream_add(
             COMPACT_STREAM_NAME,
-            _compaction_job(job_kind=CompactionJobKind.EPISODE.value).model_dump(mode="json"),
+            _compaction_job(job_kind=CompactionJobKind.EPISODE.value).model_dump(
+                mode="json"
+            ),
         )
 
         result = await worker.run_once()
-        episode_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE)
+        episode_rows = await summaries.list_summaries_by_kind(
+            "usr_1", SummaryViewKind.EPISODE
+        )
 
         assert result.acked == 1
         assert result.failed == 0

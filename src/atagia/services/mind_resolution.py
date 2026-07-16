@@ -22,6 +22,7 @@ async def resolve_active_mind_snapshot(
     active_presence: PresenceSnapshot | None = None,
     character_id: str | None = None,
     topology: MindTopology | str | None = None,
+    commit: bool = True,
 ) -> MindSnapshot:
     """Resolve the active Mind row without mutating a conversation."""
 
@@ -38,6 +39,7 @@ async def resolve_active_mind_snapshot(
         ),
         character_id=_optional_text(character_id),
         topology=resolved_topology,
+        commit=commit,
     )
     return mind_snapshot(row, resolved_topology)
 
@@ -51,6 +53,7 @@ async def ensure_conversation_active_mind(
     mind_topology: MindTopology | str | None = None,
     active_presence: PresenceSnapshot | None = None,
     character_id: str | None = None,
+    commit: bool = True,
 ) -> tuple[dict[str, Any], MindSnapshot]:
     """Resolve and persist the active Mind for a conversation if missing."""
 
@@ -75,6 +78,7 @@ async def ensure_conversation_active_mind(
         active_presence=active_presence,
         character_id=effective_character_id,
         topology=resolved_topology,
+        commit=commit,
     )
     current_mind_id = _optional_text(conversation.get("active_mind_id"))
     current_topology = MindTopology(
@@ -89,6 +93,7 @@ async def ensure_conversation_active_mind(
             owner_user_id,
             snapshot.mind_id,
             resolved_topology,
+            commit=commit,
         )
         if updated is not None:
             conversation = updated

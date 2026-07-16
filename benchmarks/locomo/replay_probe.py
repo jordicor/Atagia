@@ -29,7 +29,7 @@ from benchmarks.locomo.adapter import LoCoMoAdapter
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DATA_PATH = _PROJECT_ROOT / "benchmarks" / "data" / "locomo10.json"
-_DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
+_DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "src" / "atagia" / "resources" / "manifests"
 _QUERY_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 logger = logging.getLogger(__name__)
 
@@ -37,14 +37,21 @@ logger = logging.getLogger(__name__)
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db-path", required=True, help="Path to the frozen SQLite database")
-    parser.add_argument("--conversation-id", default="conv-26", help="LoCoMo conversation id")
+    parser.add_argument(
+        "--conversation-id",
+        required=True,
+        help="LoCoMo conversation id",
+    )
     parser.add_argument("--user-id", default="benchmark-user", help="User id stored in the frozen DB")
     parser.add_argument("--data-path", default=str(_DEFAULT_DATA_PATH), help="Path to locomo10.json")
     parser.add_argument("--manifests-dir", default=str(_DEFAULT_MANIFESTS_DIR), help="Path to manifests directory")
     parser.add_argument("--question-index", type=int, help="1-based LoCoMo question index (for example: 7)")
-    parser.add_argument("--question-id", help="Question id (for example: q7 or conv-26:q7)")
+    parser.add_argument(
+        "--question-id",
+        help="Question id (for example: q7 or <conversation-id>:q7)",
+    )
     parser.add_argument("--question-text", help="Custom question text when not using the dataset entry")
-    parser.add_argument("--output", help="Artifact path. Defaults to docs/tmp/ with a timestamped filename.")
+    parser.add_argument("--output", help="Artifact path. Defaults to the benchmark output root with a timestamped filename.")
     parser.add_argument(
         "--embedding-backend",
         default=os.getenv("ATAGIA_EMBEDDING_BACKEND", "none"),
@@ -90,6 +97,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-need-detection", action="store_true", help="Disable LLM need detection")
     parser.add_argument("--skip-applicability-scoring", action="store_true", help="Disable LLM applicability scoring")
+    parser.add_argument(
+        "--skip-fusion-dedupe",
+        action="store_true",
+        help="Disable the CS-2.3 duplicate-carrier collapse (A/B probes)",
+    )
     parser.add_argument("--summary-hit-limit", type=int, default=10, help="How many summary surface hits to log")
     args = parser.parse_args()
     if not any([args.question_index, args.question_id, args.question_text]):
@@ -393,6 +405,7 @@ async def _run(args: argparse.Namespace) -> Path:
         privacy_enforcement=args.privacy_enforcement,
         skip_need_detection=args.skip_need_detection,
         skip_applicability_scoring=args.skip_applicability_scoring,
+        skip_fusion_dedupe=args.skip_fusion_dedupe,
     )
     source_db_path = Path(args.db_path).expanduser()
     with TemporaryDirectory(prefix="atagia-locomo-replay-probe-") as temp_dir:

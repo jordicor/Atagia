@@ -7,19 +7,19 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks.atagia_bench import __main__ as atagia_bench_cli
-from benchmarks.compaction_eval import __main__ as compaction_eval_cli
 from benchmarks.locomo import __main__ as locomo_cli
-from benchmarks.third_party import __main__ as third_party_cli
+
+
+PUBLIC_CLI_MODULES = [atagia_bench_cli, locomo_cli]
+OPTIONAL_PRIVATE_CLI_MODULES = [
+    "benchmarks.compaction_eval.__main__",
+    "benchmarks.third_party.__main__",
+]
 
 
 @pytest.mark.parametrize(
     "cli_module",
-    [
-        atagia_bench_cli,
-        compaction_eval_cli,
-        locomo_cli,
-        third_party_cli,
-    ],
+    PUBLIC_CLI_MODULES,
 )
 def test_benchmark_default_judge_is_direct_kimi_k27_code(cli_module) -> None:
     args = SimpleNamespace(provider="anthropic", judge_model=None)
@@ -29,12 +29,7 @@ def test_benchmark_default_judge_is_direct_kimi_k27_code(cli_module) -> None:
 
 @pytest.mark.parametrize(
     "cli_module",
-    [
-        atagia_bench_cli,
-        compaction_eval_cli,
-        locomo_cli,
-        third_party_cli,
-    ],
+    PUBLIC_CLI_MODULES,
 )
 def test_benchmark_explicit_judge_model_overrides_default(cli_module) -> None:
     args = SimpleNamespace(provider="anthropic", judge_model="openrouter/openai/gpt-5.5")
@@ -44,14 +39,27 @@ def test_benchmark_explicit_judge_model_overrides_default(cli_module) -> None:
 
 @pytest.mark.parametrize(
     "cli_module",
-    [
-        atagia_bench_cli,
-        compaction_eval_cli,
-        locomo_cli,
-        third_party_cli,
-    ],
+    PUBLIC_CLI_MODULES,
 )
 def test_non_kimi_benchmark_default_judge_stays_direct_kimi(cli_module) -> None:
     args = SimpleNamespace(provider="openrouter", judge_model=None)
 
     assert cli_module._resolve_judge_model(args) == "kimi/kimi-k2.7-code"
+
+
+@pytest.mark.parametrize("module_name", OPTIONAL_PRIVATE_CLI_MODULES)
+def test_optional_private_benchmark_judge_defaults(module_name: str) -> None:
+    cli_module = pytest.importorskip(
+        module_name,
+        reason="private benchmark harness is not present in this checkout",
+    )
+
+    assert cli_module._resolve_judge_model(
+        SimpleNamespace(provider="anthropic", judge_model=None)
+    ) == "kimi/kimi-k2.7-code"
+    assert cli_module._resolve_judge_model(
+        SimpleNamespace(provider="anthropic", judge_model="openrouter/test-judge")
+    ) == "openrouter/test-judge"
+    assert cli_module._resolve_judge_model(
+        SimpleNamespace(provider="openrouter", judge_model=None)
+    ) == "kimi/kimi-k2.7-code"

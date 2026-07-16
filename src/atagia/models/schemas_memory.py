@@ -2053,6 +2053,12 @@ class ComposedContext(BaseModel):
     memory_block: str = ""
     state_block: str = ""
     selected_memory_ids: list[str] = Field(default_factory=list)
+    # Per-dropped-candidate composer eviction reason (memory_id -> label):
+    # one of "budget_exhausted" (token wall), "item_cap_reached", "class_cap_reached",
+    # or "diversity_demoted". Empty for candidates the composer admitted or whose
+    # drop cause is a pre-composer stage. Fed to build_candidate_custody so the
+    # engine trace distinguishes the four causes the old heuristic conflated.
+    composer_eviction_reasons: dict[str, str] = Field(default_factory=dict)
     total_tokens_estimate: int = Field(ge=0)
     budget_tokens: int = Field(ge=0)
     items_included: int = Field(ge=0)

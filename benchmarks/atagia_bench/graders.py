@@ -911,16 +911,20 @@ class LLMJudgeGrader(Grader):
         # Build a question context for the judge if available
         question_text = ""
         source_evidence: list[dict[str, Any]] = []
+        conversation_transcript: str | None = None
         if config and "question_text" in config:
             question_text = config["question_text"]
         if config and isinstance(config.get("source_evidence"), list):
             source_evidence = config["source_evidence"]
+        if config and isinstance(config.get("conversation_transcript"), str):
+            conversation_transcript = config["conversation_transcript"]
 
         score_result = await self._scorer.score(
             question=question_text or "Evaluate the prediction against the ground truth.",
             prediction=prediction,
             ground_truth=ground_truth,
             source_evidence=source_evidence,
+            conversation_transcript=conversation_transcript,
         )
 
         return GradeResult(
@@ -941,6 +945,48 @@ _DETERMINISTIC_GRADERS: dict[str, Grader] = {
 
 # Graders that require an LLM client for semantic evaluation.
 _LLM_GRADER_NAMES = {"abstention", "gated", "supersession", "llm_judge"}
+
+
+# ---- Measurement-layer classification (V24 doctrine: grade the WHAT; the HOW
+# is a separate, separately-gated layer) ----
+#
+# memory_content (the WHAT): does the answer recall the requested information,
+# correctly and correctly attributed? These graders judge memory correctness and
+# belong in the memory milestone gate.
+#
+# product_behavior (the HOW): stance/verbosity/privacy/consent behavior. These
+# graders judge whether the assistant abstained, withheld a private fact, or
+# gated a consent-protected fact — response-behavior policy that depends on the
+# answer_stance and privacy configuration, not on memory quality. They get their
+# own product-behavior suite instead of leaking into memory milestones.
+MEASUREMENT_LAYER_MEMORY_CONTENT = "memory_content"
+MEASUREMENT_LAYER_PRODUCT_BEHAVIOR = "product_behavior"
+
+_MEMORY_CONTENT_GRADERS: frozenset[str] = frozenset(
+    {"exact_match", "normalized_date", "set", "supersession", "llm_judge"}
+)
+_PRODUCT_BEHAVIOR_GRADERS: frozenset[str] = frozenset({"abstention", "gated"})
+
+MEASUREMENT_LAYERS: tuple[str, ...] = (
+    MEASUREMENT_LAYER_MEMORY_CONTENT,
+    MEASUREMENT_LAYER_PRODUCT_BEHAVIOR,
+)
+
+
+def measurement_layer_for_grader(grader_name: str) -> str:
+    """Classify a grader as a memory-content (WHAT) or product-behavior (HOW) gate.
+
+    Fails fast on an unknown grader so a newly added grader must be classified
+    deliberately rather than silently defaulting into a milestone gate.
+    """
+    if grader_name in _MEMORY_CONTENT_GRADERS:
+        return MEASUREMENT_LAYER_MEMORY_CONTENT
+    if grader_name in _PRODUCT_BEHAVIOR_GRADERS:
+        return MEASUREMENT_LAYER_PRODUCT_BEHAVIOR
+    raise ValueError(
+        f"Unclassified grader '{grader_name}': assign it to a measurement layer "
+        "(memory_content or product_behavior) before use."
+    )
 
 
 def resolve_grader(

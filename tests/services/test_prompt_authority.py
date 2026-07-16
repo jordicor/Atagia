@@ -5,6 +5,7 @@ from atagia.services.prompt_authority import (
     prompt_authority_metadata,
     render_process_metadata_block,
     render_strong_authority_block,
+    resolve_request_authority_context,
 )
 
 
@@ -82,6 +83,43 @@ def test_atagia_master_overrides_privacy_even_when_enforced() -> None:
     assert "keep this private" in block
     assert "do not tell anyone" in block
     assert "not a current blocker" in block
+
+
+def test_explicit_boundary_authority_wins_over_internal_raw_controls() -> None:
+    boundary_context = normalize_request_authority_context(
+        privacy_enforcement="enforce",
+        authenticated_user_privilege_level="standard",
+        authenticated_user_is_atagia_master=False,
+        user_id="usr_boundary",
+        authority_source="ordinary_http_boundary:service_api_key",
+    )
+
+    resolved = resolve_request_authority_context(
+        boundary_context,
+        privacy_enforcement="off",
+        authenticated_user_privilege_level="atagia_master",
+        authenticated_user_is_atagia_master=True,
+        user_id="usr_boundary",
+    )
+
+    assert resolved is boundary_context
+    assert resolved.effective_privacy_enforcement == "enforce"
+    assert resolved.normalized_privilege_level == "standard"
+    assert resolved.authenticated_user_is_atagia_master is False
+
+
+def test_internal_raw_authority_remains_available_without_boundary_context() -> None:
+    resolved = resolve_request_authority_context(
+        None,
+        privacy_enforcement="off",
+        authenticated_user_privilege_level="atagia_master",
+        authenticated_user_is_atagia_master=True,
+        user_id="usr_internal",
+    )
+
+    assert resolved.effective_privacy_enforcement == "off"
+    assert resolved.normalized_privilege_level == "atagia_master"
+    assert resolved.authenticated_user_is_atagia_master is True
 
 
 def test_conflicting_master_authority_fields_are_rejected() -> None:

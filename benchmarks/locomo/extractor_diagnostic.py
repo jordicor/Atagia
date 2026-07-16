@@ -7,6 +7,9 @@ is explicitly used.
 
 from __future__ import annotations
 
+# The diagnostic loads .env before importing modules that read provider settings.
+# ruff: noqa: E402
+
 import argparse
 import asyncio
 import json
@@ -40,7 +43,7 @@ from atagia.services.model_resolution import provider_qualified_model
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
+_DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "src" / "atagia" / "resources" / "manifests"
 _DEFAULT_OUTPUT_DIR = bench_output_root() / "locomo" / "extractor_diagnostics"
 
 
@@ -86,7 +89,9 @@ async def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
 
     component_models = {}
     if args.model:
-        extractor_model = provider_qualified_model(args.provider, args.model) or args.model
+        extractor_model = (
+            provider_qualified_model(args.provider, args.model) or args.model
+        )
         component_models["extractor"] = extractor_model
         component_models["extraction_watchdog"] = extractor_model
 
@@ -167,7 +172,9 @@ async def _run_single_extraction(
         user_id,
     )
     if conversation is None:
-        raise ValueError(f"Message conversation is missing: {message['conversation_id']}")
+        raise ValueError(
+            f"Message conversation is missing: {message['conversation_id']}"
+        )
     memory_preferences = await users.get_memory_preferences(user_id)
     prior_messages = await _prior_messages(
         connection,
@@ -209,7 +216,8 @@ async def _run_single_extraction(
         temporary=bool(conversation.get("temporary")),
         purge_on_close=bool(conversation.get("purge_on_close")),
         isolated_mode=bool(conversation.get("isolated_mode")),
-        incognito=bool(conversation.get("incognito")) or bool(conversation.get("isolated_mode")),
+        incognito=bool(conversation.get("incognito"))
+        or bool(conversation.get("isolated_mode")),
     )
 
     extractor = MemoryExtractor(
@@ -287,7 +295,10 @@ def _copy_sqlite_db_for_diagnostic(
 
 
 def _safe_path(value: str) -> str:
-    return "".join(character if character.isalnum() or character in "-_" else "_" for character in value)
+    return "".join(
+        character if character.isalnum() or character in "-_" else "_"
+        for character in value
+    )
 
 
 def _json_safe(value: Any) -> Any:

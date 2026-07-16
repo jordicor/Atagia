@@ -7,7 +7,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from atagia.api.dependencies import AuthContext, ensure_user_access, get_auth_context, get_runtime
-from atagia.api.namespace_context import require_route_namespace_context
+from atagia.api.namespace_context import (
+    RouteNamespaceContext,
+    require_current_route_namespace_snapshot,
+    require_route_namespace_context,
+)
+from atagia.api.path_ids import TransportIdRoute
+from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
 from atagia.models.schemas_api import (
     ActivitySnapshotResponse,
     ConversationActivityStats,
@@ -18,7 +24,30 @@ from atagia.models.schemas_api import (
 )
 from atagia.services.conversation_activity_service import ConversationActivityService
 
-router = APIRouter(prefix="/v1", tags=["activity"])
+router = APIRouter(prefix="/v1", tags=["activity"], route_class=TransportIdRoute)
+
+
+async def _require_current_anchor_namespace(
+    connection: Any,
+    runtime: Any,
+    namespace: RouteNamespaceContext,
+) -> None:
+    """Validate the route anchor in one final write-serialized SQLite view."""
+
+    await connection.execute("BEGIN IMMEDIATE")
+    try:
+        await TranscriptRebuildRepository(
+            connection, runtime.clock
+        ).require_user_available(namespace.user_id)
+        await require_current_route_namespace_snapshot(
+            connection,
+            runtime.clock,
+            namespace.authorization_snapshot,
+        )
+        await connection.commit()
+    except BaseException:
+        await connection.rollback()
+        raise
 
 
 def _coerce_stats(row: dict[str, Any] | None) -> ConversationActivityStats | None:
@@ -67,7 +96,7 @@ async def list_hot_conversations(
         )
         service = ConversationActivityService(runtime)
         if namespace.incognito or not namespace.remember_across_chats:
-            return ActivitySnapshotResponse(
+            response = ActivitySnapshotResponse(
                 user_id=user_id,
                 as_of=service._resolve_as_of(as_of).isoformat(),
                 filters={
@@ -84,6 +113,8 @@ async def list_hot_conversations(
                 conversations=[],
                 conversation_count=0,
             )
+            await _require_current_anchor_namespace(connection, runtime, namespace)
+            return response
         conversations = await service.list_hot_conversations(
             connection,
             user_id,
@@ -97,7 +128,7 @@ async def list_hot_conversations(
             as_of=as_of,
             refresh=refresh,
         )
-        return ActivitySnapshotResponse(
+        response = ActivitySnapshotResponse(
             user_id=user_id,
             as_of=service._resolve_as_of(as_of).isoformat(),
             filters={
@@ -114,6 +145,8 @@ async def list_hot_conversations(
             conversations=[ConversationActivityStats.model_validate(row) for row in conversations],
             conversation_count=len(conversations),
         )
+        await _require_current_anchor_namespace(connection, runtime, namespace)
+        return response
     finally:
         await connection.close()
 
@@ -160,11 +193,16 @@ async def warmup_conversation(
             incognito=namespace.incognito,
         )
         if "conversation_not_found" in result.get("warmup_errors", []):
+            await _require_current_anchor_namespace(connection, runtime, namespace)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Conversation not found for user",
             )
-        return WarmupConversationResponse.model_validate(_scrub_warmup_result(result))
+        response = WarmupConversationResponse.model_validate(
+            _scrub_warmup_result(result)
+        )
+        await _require_current_anchor_namespace(connection, runtime, namespace)
+        return response
     finally:
         await connection.close()
 
@@ -196,7 +234,7 @@ async def warmup_recommended_conversations(
                 payload.as_of,
                 lead_time_minutes=payload.lead_time_minutes,
             ).isoformat()
-            return WarmupRecommendedConversationsResponse.model_validate(
+            response = WarmupRecommendedConversationsResponse.model_validate(
                 {
                     "user_id": user_id,
                     "as_of": resolved_as_of,
@@ -215,6 +253,8 @@ async def warmup_recommended_conversations(
                     "warmed_message_count": 0,
                 }
             )
+            await _require_current_anchor_namespace(connection, runtime, namespace)
+            return response
         result = await service.warmup_recommended_conversations(
             connection,
             user_id,
@@ -230,7 +270,7 @@ async def warmup_recommended_conversations(
             total_message_budget=payload.total_message_budget,
             per_conversation_message_budget=payload.per_conversation_message_budget,
         )
-        return WarmupRecommendedConversationsResponse.model_validate(
+        response = WarmupRecommendedConversationsResponse.model_validate(
             {
                 **result,
                 "hot_conversations": [
@@ -243,5 +283,7 @@ async def warmup_recommended_conversations(
                 ],
             }
         )
+        await _require_current_anchor_namespace(connection, runtime, namespace)
+        return response
     finally:
         await connection.close()

@@ -35,6 +35,7 @@ from atagia.core.repositories import (
     UserRepository,
 )
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
+from atagia.core.user_lifecycle_repository import UserLifecycleRepository
 from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
@@ -55,8 +56,8 @@ from atagia.services.llm_client import (
 )
 from atagia.services.sidecar_service import SidecarService
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
@@ -330,25 +331,37 @@ async def _conversation_snapshot(
         await connection.close()
 
 
-def _smart_fast_cache_key(
+async def _smart_fast_cache_key(
     runtime: AppRuntime,
     cache_service: ContextCacheService,
     snapshot: dict[str, object],
 ) -> str:
-    return cache_service.build_cache_key(
-        user_id="usr_1",
-        assistant_mode_id="coding_debug",
-        conversation_id="cnv_1",
-        workspace_id=snapshot.get("workspace_id"),
-        active_presence_id=snapshot.get("active_presence_id"),
-        active_space_id=snapshot.get("active_space_id"),
-        active_mind_id=snapshot.get("active_mind_id"),
-        mind_topology=snapshot.get("mind_topology"),
-        active_embodiment_id=snapshot.get("active_embodiment_id"),
-        active_realm_id=snapshot.get("active_realm_id"),
-        operational_profile_token=_profile_token(runtime),
-        response_mode=ResponseMode.SMART_FAST,
-    )
+    connection = await runtime.open_connection()
+    try:
+        identity = await UserLifecycleRepository(
+            connection,
+            runtime.clock,
+        ).get_active_identity("usr_1")
+        assert identity is not None
+        return cache_service.build_cache_key(
+            user_id="usr_1",
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_1",
+            workspace_id=snapshot.get("workspace_id"),
+            active_presence_id=snapshot.get("active_presence_id"),
+            active_space_id=snapshot.get("active_space_id"),
+            active_mind_id=snapshot.get("active_mind_id"),
+            mind_topology=snapshot.get("mind_topology"),
+            active_embodiment_id=snapshot.get("active_embodiment_id"),
+            active_realm_id=snapshot.get("active_realm_id"),
+            operational_profile_token=_profile_token(runtime),
+            response_mode=ResponseMode.SMART_FAST,
+            lifecycle_epoch=identity.lifecycle_epoch,
+            cache_revision=identity.cache_revision,
+            derivation_revision=identity.derivation_revision,
+        )
+    finally:
+        await connection.close()
 
 
 async def _stored_event(runtime: AppRuntime, retrieval_event_id: str) -> dict[str, object]:
@@ -627,7 +640,7 @@ async def test_smart_fast_off_warm_publishes(
         await _drain_background_tasks(runtime)
 
         snapshot = await _conversation_snapshot(runtime)
-        warm_key = _smart_fast_cache_key(runtime, cache_service, snapshot)
+        warm_key = await _smart_fast_cache_key(runtime, cache_service, snapshot)
         warmed = await runtime.storage_backend.get_context_view(warm_key)
         assert warmed is not None, "flag-off warm must publish its keyspace"
 
@@ -680,7 +693,7 @@ async def test_smart_fast_on_warm_vetoed_on_world_and_next_turn_finds_nothing(
         await _drain_background_tasks(runtime)
 
         snapshot = await _conversation_snapshot(runtime)
-        warm_key = _smart_fast_cache_key(runtime, cache_service, snapshot)
+        warm_key = await _smart_fast_cache_key(runtime, cache_service, snapshot)
         # D9: the warm was gate-vetoed, so nothing was published.
         assert await runtime.storage_backend.get_context_view(warm_key) is None
 

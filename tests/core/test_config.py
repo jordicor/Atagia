@@ -32,6 +32,8 @@ def test_relative_resource_env_paths_work_from_external_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    for name in ("migrations", "manifests", "operational_profiles"):
+        (tmp_path / name).mkdir()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ATAGIA_MIGRATIONS_PATH", "./migrations")
     monkeypatch.setenv("ATAGIA_MANIFESTS_PATH", "./manifests")
@@ -39,10 +41,25 @@ def test_relative_resource_env_paths_work_from_external_cwd(
 
     settings = Settings.from_env()
 
-    assert settings.migrations_dir().exists()
-    assert settings.manifests_dir().exists()
-    assert settings.operational_profiles_dir().exists()
-    assert settings.migrations_dir() != tmp_path / "migrations"
+    assert settings.migrations_dir().resolve() == tmp_path / "migrations"
+    assert settings.manifests_dir().resolve() == tmp_path / "manifests"
+    assert (
+        settings.operational_profiles_dir().resolve()
+        == tmp_path / "operational_profiles"
+    )
+
+
+def test_explicit_missing_resource_path_is_not_replaced_by_packaged_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ATAGIA_MIGRATIONS_PATH", "challenger/migrations")
+
+    settings = Settings.from_env()
+
+    assert settings.migrations_dir() == tmp_path / "challenger" / "migrations"
+    assert not settings.migrations_dir().exists()
 
 
 def test_packaged_resources_are_present() -> None:
@@ -59,6 +76,13 @@ def test_openai_proxy_and_cors_settings_can_be_overridden(
     monkeypatch.setenv("ATAGIA_PROXY_MODEL_ID", "atagia-st")
     monkeypatch.setenv("ATAGIA_PROXY_UPSTREAM_MODEL", "openai/gpt-4.1-mini")
     monkeypatch.setenv("ATAGIA_PROXY_DEFAULT_MODE", "companion")
+    monkeypatch.setenv("ATAGIA_PROXY_MAX_OUTPUT_TOKENS", "321")
+    monkeypatch.setenv("ATAGIA_REQUEST_MAX_BODY_BYTES", "1000")
+    monkeypatch.setenv("ATAGIA_REQUEST_MAX_MESSAGE_TEXT_BYTES", "200")
+    monkeypatch.setenv("ATAGIA_REQUEST_MAX_ATTACHMENTS", "3")
+    monkeypatch.setenv("ATAGIA_REQUEST_MAX_ATTACHMENT_DECODED_BYTES", "400")
+    monkeypatch.setenv("ATAGIA_REQUEST_MAX_ATTACHMENTS_DECODED_BYTES", "800")
+    monkeypatch.setenv("ATAGIA_REQUEST_MAX_METADATA_BYTES", "100")
     monkeypatch.setenv(
         "ATAGIA_CORS_ALLOWED_ORIGINS",
         "http://127.0.0.1:8000, http://localhost:3000",
@@ -69,6 +93,13 @@ def test_openai_proxy_and_cors_settings_can_be_overridden(
     assert settings.openai_proxy_model_id == "atagia-st"
     assert settings.openai_proxy_upstream_model == "openai/gpt-4.1-mini"
     assert settings.openai_proxy_default_mode == "companion"
+    assert settings.openai_proxy_max_output_tokens == 321
+    assert settings.request_max_body_bytes == 1000
+    assert settings.request_max_message_text_bytes == 200
+    assert settings.request_max_attachments == 3
+    assert settings.request_max_attachment_decoded_bytes == 400
+    assert settings.request_max_attachments_decoded_bytes == 800
+    assert settings.request_max_metadata_bytes == 100
     assert settings.cors_allowed_origins == (
         "http://127.0.0.1:8000",
         "http://localhost:3000",
@@ -708,13 +739,13 @@ def test_recent_transcript_budget_rejects_non_positive_override(monkeypatch) -> 
         Settings.from_env()
 
 
-def test_context_envelope_defaults_to_structural_4k_budget(monkeypatch) -> None:
+def test_context_envelope_defaults_to_structural_8k_budget(monkeypatch) -> None:
     monkeypatch.delenv("ATAGIA_CONTEXT_ENVELOPE_BUDGET_TOKENS", raising=False)
     monkeypatch.delenv("ATAGIA_CONTEXT_ENVELOPE_RATIOS", raising=False)
 
     settings = Settings.from_env()
 
-    assert settings.context_envelope_budget_tokens == 4096
+    assert settings.context_envelope_budget_tokens == 8192
     assert settings.context_envelope_ratios["retrieved_context"] == 0.67
     assert settings.context_envelope_ratios["recent_transcript"] == 0.20
 
@@ -923,8 +954,8 @@ def test_operational_allowed_profiles_reject_blank_entries() -> None:
     with pytest.raises(ValueError):
         Settings(
             sqlite_path=":memory:",
-            migrations_path="./migrations",
-            manifests_path="./manifests",
+            migrations_path=default_resource_path("migrations"),
+            manifests_path=default_resource_path("manifests"),
             storage_backend="inprocess",
             redis_url="redis://localhost:6379/0",
             openai_api_key="test-openai-key",
@@ -951,7 +982,7 @@ def test_artifact_blob_storage_settings_use_defaults(monkeypatch) -> None:
     assert settings.artifact_blob_storage_path == "./data/artifact_blobs"
 
 
-def test_artifact_blob_storage_settings_can_be_overridden(monkeypatch) -> None:
+def test_legacy_artifact_blob_settings_survive_parsing_for_ordered_startup_check(monkeypatch) -> None:
     monkeypatch.setenv("ATAGIA_ARTIFACT_BLOB_STORAGE_KIND", "local_file")
     monkeypatch.setenv("ATAGIA_ARTIFACT_BLOB_STORAGE_PATH", "/tmp/atagia-artifacts")
 
@@ -979,12 +1010,25 @@ def test_llm_debug_io_settings_can_be_overridden(monkeypatch) -> None:
     assert settings.llm_debug_io_max_chars == 1234
 
 
+def test_llm_debug_io_settings_use_data_directory_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("ATAGIA_DEBUG_LLM_IO", raising=False)
+    monkeypatch.delenv("ATAGIA_DEBUG_LLM_IO_DIR", raising=False)
+    monkeypatch.delenv("ATAGIA_DEBUG_LLM_IO_PURPOSES", raising=False)
+    monkeypatch.delenv("ATAGIA_DEBUG_LLM_IO_RAW", raising=False)
+    monkeypatch.delenv("ATAGIA_DEBUG_LLM_IO_MAX_CHARS", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.llm_debug_io_enabled is False
+    assert settings.llm_debug_io_dir == "./data/llm_debug"
+
+
 def test_artifact_blob_storage_settings_reject_invalid_values() -> None:
     with pytest.raises(ValueError):
         Settings(
             sqlite_path=":memory:",
-            migrations_path="./migrations",
-            manifests_path="./manifests",
+            migrations_path=default_resource_path("migrations"),
+            manifests_path=default_resource_path("manifests"),
             storage_backend="inprocess",
             redis_url="redis://localhost:6379/0",
             openai_api_key="test-openai-key",

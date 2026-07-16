@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import logging
 from typing import Any
 
@@ -10,7 +11,15 @@ import aiosqlite
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageBuildSupersededError,
+    InitialContextPackageRepository,
+    InitialContextPackageSourceChangedError,
+)
+from atagia.core.initial_context_package_revision_repository import (
+    InitialContextPackageRevisionRepository,
+    InitialContextPackageSourceCoordinates,
+)
 from atagia.core.repositories import ConversationRepository, UserRepository
 from atagia.core.storage_backend import StorageBackend
 from atagia.memory.operational_profile import (
@@ -20,6 +29,7 @@ from atagia.memory.operational_profile import (
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.models.schemas_initial_context_package import InitialContextPackageKind
 from atagia.models.schemas_jobs import (
+    ClaimedJob,
     INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
     InitialContextPackageRefreshJobPayload,
     JobEnvelope,
@@ -37,14 +47,28 @@ from atagia.services.initial_context_package_builder import (
     InitialContextPackageBuildBudget,
     InitialContextPackageBuilder,
 )
+from atagia.services.job_execution_context import (
+    CurrentJobLockScope,
+    TransientJobLockUnavailable,
+    acquire_current_job_lock,
+    release_current_job_lock,
+    require_current_job_lock_scope,
+)
 from atagia.services.initial_context_package_curator import InitialContextPackageCurator
+from atagia.services.initial_context_package_refresh_service import (
+    InitialContextPackageRefreshEnqueuer,
+)
 from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.llm_client import LLMClient
-from atagia.services.worker_control_service import WorkerControlService, wait_if_worker_claims_paused
+from atagia.services.worker_control_service import (
+    WorkerControlService,
+    wait_if_worker_claims_paused,
+)
+from atagia.services.worker_effect_fence import WorkerEffectFence
+from atagia.services.worker_job_lease import JobLeaseLostError, WorkerJobLease
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
-STREAM_RECLAIM_IDLE_MS = 1_000
 MAX_STREAM_DELIVERIES = 3
 
 
@@ -60,6 +84,7 @@ class InitialContextPackageWorker:
         settings: Settings | None = None,
         operational_profile_loader: OperationalProfileLoader | None = None,
         llm_client: LLMClient[Any] | None = None,
+        job_connection: aiosqlite.Connection | None = None,
     ) -> None:
         self._storage_backend = storage_backend
         self._connection = connection
@@ -71,6 +96,9 @@ class InitialContextPackageWorker:
         self._package_repository = InitialContextPackageRepository(connection, clock)
         self._worker_control = WorkerControlService(connection, clock)
         resolved_settings = settings or Settings.from_env()
+        self._stream_reclaim_idle_ms = int(
+            resolved_settings.worker_stream_reclaim_idle_seconds * 1000
+        )
         self._settings = resolved_settings
         curator = (
             InitialContextPackageCurator(
@@ -107,11 +135,13 @@ class InitialContextPackageWorker:
             operational_profile_loader
             or OperationalProfileLoader(resolved_settings.operational_profiles_dir())
         )
+        self._effect_fence = WorkerEffectFence(connection, clock)
         self._job_tracking = JobTrackingService(
-            connection,
+            job_connection or connection,
             clock,
             workers_enabled=resolved_settings.workers_enabled,
             settings=resolved_settings,
+            child_job_connection=connection,
         )
 
     async def run(self, consumer_name: str = "initial-context-package-1") -> None:
@@ -125,7 +155,9 @@ class InitialContextPackageWorker:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Unexpected error in initial context package worker loop")
+                logger.exception(
+                    "Unexpected error in initial context package worker loop"
+                )
                 await asyncio.sleep(WORKER_ERROR_RETRY_SECONDS)
 
     async def run_once(
@@ -145,49 +177,147 @@ class InitialContextPackageWorker:
 
         acked = 0
         failed = 0
+        deferred = 0
         dead_lettered = 0
         for message in messages:
-            try:
-                await self._job_tracking.mark_running(message)
-                result = await self.process_job(message.payload)
-                await self._job_tracking.mark_succeeded(message, metadata=result)
+            claim = await self._job_tracking.claim_notification(
+                message,
+                owner_id=consumer_name,
+            )
+            if claim is None:
                 await self._storage_backend.stream_ack(
                     INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
                     WORKER_GROUP_NAME,
                     message.message_id,
                 )
                 acked += 1
+                continue
+            lease = WorkerJobLease(
+                self._job_tracking,
+                claim,
+                effect_fence=self._effect_fence,
+            )
+            try:
+                lock_deferred = False
+                async with lease:
+                    try:
+                        result = await self.process_job(
+                            claim.envelope.model_dump(mode="json")
+                        )
+                    except TransientJobLockUnavailable as exc:
+                        await lease.defer(
+                            exc,
+                            deferred_until=(
+                                self._clock.now()
+                                + timedelta(
+                                    seconds=self._settings.worker_transient_defer_seconds
+                                )
+                            ),
+                        )
+                        lock_deferred = True
+                    else:
+                        if result.get("status") == "source_changed":
+                            job_payload = (
+                                InitialContextPackageRefreshJobPayload.model_validate(
+                                    claim.envelope.payload
+                                )
+                            )
+                            successor_job_id = await self._enqueue_source_successor(
+                                claim=claim,
+                                job_payload=job_payload,
+                                terminal_metadata=result,
+                            )
+                            if successor_job_id is None:
+                                raise JobLeaseLostError(
+                                    "Source-changed ICP claim lost before successor creation"
+                                )
+                            result["replacement_job_id"] = successor_job_id
+                        else:
+                            if (
+                                claim.envelope.transcript_rebuild_id is not None
+                                and result.get("status") == "skipped"
+                                and not (
+                                    result.get("reason") == "refresh_disabled"
+                                    and not self._settings.initial_context_package_refresh_enabled
+                                )
+                            ):
+                                raise RuntimeError(
+                                    "Selected-transcript initial context refresh "
+                                    f"did not run: {result.get('reason') or 'unknown'}"
+                                )
+                            await lease.succeed(metadata=result)
+                await self._storage_backend.stream_ack(
+                    INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
+                if lock_deferred:
+                    deferred += 1
+                else:
+                    acked += 1
+            except JobLeaseLostError:
+                await self._storage_backend.stream_ack(
+                    INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
             except Exception as exc:
+                if lock_deferred:
+                    raise
                 failed += 1
                 logger.exception(
                     "Failed to process initial context package job %s",
                     message.message_id,
                 )
-                if await self._dead_letter_if_exhausted(message, exc):
+                if claim.attempt_count >= MAX_STREAM_DELIVERIES:
+                    finalized = await lease.dead_letter(
+                        self._storage_backend,
+                        stream_name=INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
+                        group_name=WORKER_GROUP_NAME,
+                        message=message,
+                        exc=exc,
+                    )
+                    if not finalized:
+                        continue
                     dead_lettered += 1
                 else:
-                    await self._job_tracking.mark_retrying(message, exc)
+                    await lease.retry(exc)
+                    await self._storage_backend.stream_ack(
+                        INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
+                        WORKER_GROUP_NAME,
+                        message.message_id,
+                    )
         return WorkerIterationResult(
             received=len(messages),
             acked=acked,
             failed=failed,
+            deferred=deferred,
             dead_lettered=dead_lettered,
         )
 
     async def process_job(self, payload: dict[str, object]) -> dict[str, Any]:
         envelope = JobEnvelope.model_validate(payload)
         if envelope.job_type is not JobType.REFRESH_INITIAL_CONTEXT_PACKAGE:
-            raise ValueError(f"Unsupported initial context package job type: {envelope.job_type}")
+            raise ValueError(
+                f"Unsupported initial context package job type: {envelope.job_type}"
+            )
         job_payload = InitialContextPackageRefreshJobPayload.model_validate(
             envelope.payload
         )
         if job_payload.user_id != envelope.user_id:
             raise ValueError("Refresh payload user_id must match envelope user_id")
+        lock_scope = require_current_job_lock_scope(
+            user_id=envelope.user_id,
+            job_id=envelope.job_id,
+        )
         active_user = await self._user_repository.get_active_user(envelope.user_id)
         if active_user is None:
             return {"status": "skipped", "reason": "user_not_active"}
         if not self._settings.initial_context_package_refresh_enabled:
-            stale = await self._mark_refresh_job_family_stale(job_payload)
+            stale = await self._mark_refresh_job_family_stale(
+                job_payload,
+                operational_profile=envelope.operational_profile,
+            )
             return {
                 "status": "skipped",
                 "reason": "refresh_disabled",
@@ -198,26 +328,40 @@ class InitialContextPackageWorker:
             return await self._process_conversation_refresh(
                 envelope=envelope,
                 job_payload=job_payload,
+                lock_scope=lock_scope,
             )
-        return await self._process_user_refresh(envelope, job_payload)
+        return await self._process_user_refresh(
+            envelope,
+            job_payload,
+            lock_scope=lock_scope,
+        )
 
     async def _mark_refresh_job_family_stale(
         self,
         job_payload: InitialContextPackageRefreshJobPayload,
+        *,
+        operational_profile: Any,
     ) -> int:
         stale = 0
+        operational_profile_token = self._operational_profile_token(operational_profile)
         if self._builds_conversation(job_payload.package_kind):
             stale += await self._package_repository.mark_stale_for_key_family(
                 user_id=job_payload.user_id,
                 package_kind=InitialContextPackageKind.CONVERSATION,
                 retrieval_profile_id=job_payload.retrieval_profile_id,
                 conversation_id=job_payload.conversation_id,
+                privacy_enforcement=job_payload.privacy_enforcement,
+                operational_profile_token=operational_profile_token,
+                max_refresh_generation=job_payload.refresh_generation,
             )
         if self._builds_baseline(job_payload.package_kind):
             stale += await self._package_repository.mark_stale_for_key_family(
                 user_id=job_payload.user_id,
                 package_kind=InitialContextPackageKind.BASELINE,
                 retrieval_profile_id=job_payload.retrieval_profile_id,
+                privacy_enforcement=job_payload.privacy_enforcement,
+                operational_profile_token=operational_profile_token,
+                max_refresh_generation=job_payload.refresh_generation,
             )
         return stale
 
@@ -226,6 +370,7 @@ class InitialContextPackageWorker:
         *,
         envelope: JobEnvelope,
         job_payload: InitialContextPackageRefreshJobPayload,
+        lock_scope: CurrentJobLockScope,
     ) -> dict[str, Any]:
         conversation_id = str(job_payload.conversation_id)
         lock_key = self._lock_key(
@@ -238,10 +383,27 @@ class InitialContextPackageWorker:
                 envelope.operational_profile
             ),
         )
-        lock_token = await self._storage_backend.acquire_lock(lock_key, ttl_seconds=60)
-        if lock_token is None:
-            return {"status": "skipped", "reason": "refresh_locked"}
+        lock_token = await acquire_current_job_lock(
+            self._storage_backend,
+            lock_key,
+            60,
+            scope=lock_scope,
+        )
         try:
+            source_coordinates = await self._capture_source_coordinates(
+                user_id=envelope.user_id,
+                conversation_id=conversation_id,
+            )
+            if source_coordinates is None:
+                deleted = await self._package_repository.delete_for_conversation(
+                    user_id=envelope.user_id,
+                    conversation_id=conversation_id,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "conversation_not_active",
+                    "deleted_packages": deleted,
+                }
             conversation = await self._conversation_repository.get_conversation(
                 conversation_id,
                 envelope.user_id,
@@ -259,25 +421,43 @@ class InitialContextPackageWorker:
                     "reason": "conversation_not_active",
                     "deleted_packages": deleted,
                 }
-            built, stale = await self._build_for_conversation(
-                conversation,
-                package_kind=job_payload.package_kind,
-                retrieval_profile_id=job_payload.retrieval_profile_id,
-                privacy_enforcement=job_payload.privacy_enforcement,
-                operational_profile=envelope.operational_profile,
-            )
-            return {
-                "status": "refreshed",
-                "built_packages": built,
-                "stale_packages": stale,
-            }
+            try:
+                built, stale = await self._build_for_conversation(
+                    conversation,
+                    source_coordinates=source_coordinates,
+                    refresh_generation=job_payload.refresh_generation,
+                    refresh_request_job_id=envelope.job_id,
+                    package_kind=job_payload.package_kind,
+                    retrieval_profile_id=job_payload.retrieval_profile_id,
+                    privacy_enforcement=job_payload.privacy_enforcement,
+                    operational_profile=envelope.operational_profile,
+                )
+                result: dict[str, Any] = {
+                    "status": "refreshed",
+                    "built_packages": built,
+                    "stale_packages": stale,
+                }
+            except InitialContextPackageSourceChangedError:
+                result = {
+                    "status": "source_changed",
+                    "built_packages": [],
+                    "stale_packages": 0,
+                }
         finally:
-            await self._storage_backend.release_lock(lock_key, lock_token)
+            await release_current_job_lock(
+                self._storage_backend,
+                lock_key,
+                lock_token,
+                scope=lock_scope,
+            )
+        return result
 
     async def _process_user_refresh(
         self,
         envelope: JobEnvelope,
         job_payload: InitialContextPackageRefreshJobPayload,
+        *,
+        lock_scope: CurrentJobLockScope,
     ) -> dict[str, Any]:
         lock_key = self._lock_key(
             user_id=job_payload.user_id,
@@ -289,39 +469,91 @@ class InitialContextPackageWorker:
                 envelope.operational_profile
             ),
         )
-        lock_token = await self._storage_backend.acquire_lock(lock_key, ttl_seconds=60)
-        if lock_token is None:
-            return {"status": "skipped", "reason": "refresh_locked"}
+        lock_token = await acquire_current_job_lock(
+            self._storage_backend,
+            lock_key,
+            60,
+            scope=lock_scope,
+        )
         try:
-            conversations = await self._conversation_repository.list_conversations(
-                job_payload.user_id,
-                assistant_mode_id=job_payload.retrieval_profile_id,
-                include_temporary=True,
+            discovery_coordinates = await InitialContextPackageRevisionRepository(
+                self._connection,
+                self._clock,
+            ).capture_active_coordinates(
+                user_id=job_payload.user_id,
+                conversation_id=None,
+            )
+            if discovery_coordinates is None:
+                return {"status": "skipped", "reason": "user_not_active"}
+            discovered_conversations = (
+                await self._conversation_repository.list_conversations(
+                    job_payload.user_id,
+                    assistant_mode_id=job_payload.retrieval_profile_id,
+                    include_temporary=True,
+                )
             )
             built_total: list[str] = []
             stale_total = 0
-            for conversation in conversations:
-                built, stale = await self._build_for_conversation(
-                    conversation,
-                    package_kind=job_payload.package_kind,
-                    retrieval_profile_id=job_payload.retrieval_profile_id,
-                    privacy_enforcement=job_payload.privacy_enforcement,
-                    operational_profile=envelope.operational_profile,
-                )
-                built_total.extend(built)
-                stale_total += stale
-            return {
-                "status": "refreshed",
-                "built_packages": built_total,
-                "stale_packages": stale_total,
-            }
+            try:
+                for discovered in discovered_conversations:
+                    conversation_id = str(discovered["id"])
+                    source_coordinates = await self._capture_source_coordinates(
+                        user_id=job_payload.user_id,
+                        conversation_id=conversation_id,
+                    )
+                    if source_coordinates is None:
+                        continue
+                    # Discovery rows are never package inputs. Refetch the
+                    # canonical row only after its durable source capture.
+                    conversation = await self._conversation_repository.get_conversation(
+                        conversation_id,
+                        job_payload.user_id,
+                    )
+                    if (
+                        conversation is None
+                        or str(conversation.get("status"))
+                        != ConversationStatus.ACTIVE.value
+                    ):
+                        continue
+                    built, stale = await self._build_for_conversation(
+                        conversation,
+                        source_coordinates=source_coordinates,
+                        refresh_generation=job_payload.refresh_generation,
+                        refresh_request_job_id=envelope.job_id,
+                        package_kind=job_payload.package_kind,
+                        retrieval_profile_id=job_payload.retrieval_profile_id,
+                        privacy_enforcement=job_payload.privacy_enforcement,
+                        operational_profile=envelope.operational_profile,
+                    )
+                    built_total.extend(built)
+                    stale_total += stale
+                result = {
+                    "status": "refreshed",
+                    "built_packages": built_total,
+                    "stale_packages": stale_total,
+                }
+            except InitialContextPackageSourceChangedError:
+                result = {
+                    "status": "source_changed",
+                    "built_packages": built_total,
+                    "stale_packages": stale_total,
+                }
         finally:
-            await self._storage_backend.release_lock(lock_key, lock_token)
+            await release_current_job_lock(
+                self._storage_backend,
+                lock_key,
+                lock_token,
+                scope=lock_scope,
+            )
+        return result
 
     async def _build_for_conversation(
         self,
         conversation: dict[str, Any],
         *,
+        source_coordinates: InitialContextPackageSourceCoordinates,
+        refresh_generation: int,
+        refresh_request_job_id: str,
         package_kind: str,
         retrieval_profile_id: str | None,
         privacy_enforcement: str,
@@ -329,7 +561,7 @@ class InitialContextPackageWorker:
     ) -> tuple[list[str], int]:
         user_id = str(conversation["user_id"])
         conversation_id = str(conversation["id"])
-        profile_id = retrieval_profile_id or str(conversation["assistant_mode_id"])
+        profile_id = str(conversation["assistant_mode_id"])
         operational_profile_token = self._operational_profile_token(operational_profile)
         manifest = self._manifest_loader.get(profile_id)
         resolved_operational_profile = None
@@ -338,7 +570,9 @@ class InitialContextPackageWorker:
                 resolved_operational_profile = resolve_operational_profile(
                     loader=self._operational_profile_loader,
                     settings=self._settings,
-                    operational_profile=getattr(operational_profile, "profile_id", None),
+                    operational_profile=getattr(
+                        operational_profile, "profile_id", None
+                    ),
                     operational_signals=getattr(operational_profile, "signals", None),
                 )
             except UnknownOperationalProfileError:
@@ -365,69 +599,116 @@ class InitialContextPackageWorker:
         stale = 0
         if self._builds_baseline(package_kind):
             subject = self._baseline_subject(conversation, profile_id)
-            baseline = await self._builder.build_baseline_package(
-                user_id=user_id,
-                resolved_policy=resolved_policy,
-                workspace_id=subject.get("workspace_id"),
-                assistant_mode_id=profile_id,
-                user_persona_id=subject.get("user_persona_id"),
-                platform_id=subject.get("platform_id"),
-                character_id=subject.get("character_id"),
-                active_presence_id=self._optional_text(
-                    conversation.get("active_presence_id")
-                ),
-                active_space_id=self._optional_text(
-                    conversation.get("active_space_id")
-                ),
-                active_space_boundary_mode=self._optional_text(
-                    conversation.get("active_space_boundary_mode")
-                ),
-                active_mind_id=self._optional_text(
-                    conversation.get("active_mind_id")
-                ),
-                mind_topology=self._optional_text(conversation.get("mind_topology")),
-                active_embodiment_id=self._optional_text(
-                    conversation.get("active_embodiment_id")
-                ),
-                active_realm_id=self._optional_text(
-                    conversation.get("active_realm_id")
-                ),
-                incognito=(
-                    bool(conversation.get("incognito"))
-                    or bool(conversation.get("isolated_mode"))
-                ),
-                privacy_enforcement=privacy_enforcement,
-                operational_profile=operational_profile,
+            baseline_source_coordinates = InitialContextPackageSourceCoordinates(
+                user_lifecycle_epoch=source_coordinates.user_lifecycle_epoch,
+                user_revision=source_coordinates.user_revision,
             )
-            built.append(baseline.id)
-            stale += await self._package_repository.mark_stale_for_baseline_subject(
-                user_id=user_id,
-                retrieval_profile_id=profile_id,
-                subject_json=subject,
-                privacy_enforcement=privacy_enforcement,
-                operational_profile_token=operational_profile_token,
-                exclude_package_key_hashes=[baseline.package_key_hash],
-            )
+            try:
+                baseline = await self._builder.build_baseline_package(
+                    user_id=user_id,
+                    resolved_policy=resolved_policy,
+                    workspace_id=subject.get("workspace_id"),
+                    assistant_mode_id=profile_id,
+                    user_persona_id=subject.get("user_persona_id"),
+                    platform_id=subject.get("platform_id"),
+                    character_id=subject.get("character_id"),
+                    active_presence_id=self._optional_text(
+                        conversation.get("active_presence_id")
+                    ),
+                    active_space_id=self._optional_text(
+                        conversation.get("active_space_id")
+                    ),
+                    active_space_boundary_mode=self._optional_text(
+                        conversation.get("active_space_boundary_mode")
+                    ),
+                    active_mind_id=self._optional_text(
+                        conversation.get("active_mind_id")
+                    ),
+                    mind_topology=self._optional_text(
+                        conversation.get("mind_topology")
+                    ),
+                    active_embodiment_id=self._optional_text(
+                        conversation.get("active_embodiment_id")
+                    ),
+                    active_realm_id=self._optional_text(
+                        conversation.get("active_realm_id")
+                    ),
+                    incognito=(
+                        bool(conversation.get("incognito"))
+                        or bool(conversation.get("isolated_mode"))
+                    ),
+                    privacy_enforcement=privacy_enforcement,
+                    operational_profile=operational_profile,
+                    refresh_generation=refresh_generation,
+                    refresh_request_job_id=refresh_request_job_id,
+                    source_coordinates=baseline_source_coordinates,
+                )
+            except InitialContextPackageBuildSupersededError:
+                baseline = None
+            if baseline is not None:
+                built.append(baseline.id)
         if self._builds_conversation(package_kind):
-            conversation_package = await self._builder.build_conversation_package(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                conversation=conversation,
-                resolved_policy=resolved_policy,
-                privacy_enforcement=privacy_enforcement,
-                operational_profile=operational_profile,
-            )
-            built.append(conversation_package.id)
-            stale += await self._package_repository.mark_stale_for_key_family(
-                user_id=user_id,
-                package_kind=InitialContextPackageKind.CONVERSATION,
-                retrieval_profile_id=profile_id,
-                conversation_id=conversation_id,
-                privacy_enforcement=privacy_enforcement,
-                operational_profile_token=operational_profile_token,
-                exclude_package_key_hashes=[conversation_package.package_key_hash],
-            )
+            try:
+                conversation_package = await self._builder.build_conversation_package(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    conversation=conversation,
+                    resolved_policy=resolved_policy,
+                    privacy_enforcement=privacy_enforcement,
+                    operational_profile=operational_profile,
+                    refresh_generation=refresh_generation,
+                    refresh_request_job_id=refresh_request_job_id,
+                    source_coordinates=source_coordinates,
+                )
+            except InitialContextPackageBuildSupersededError:
+                conversation_package = None
+            if conversation_package is not None:
+                built.append(conversation_package.id)
+                stale += await self._package_repository.mark_stale_for_key_family(
+                    user_id=user_id,
+                    package_kind=InitialContextPackageKind.CONVERSATION,
+                    retrieval_profile_id=profile_id,
+                    conversation_id=conversation_id,
+                    privacy_enforcement=privacy_enforcement,
+                    operational_profile_token=operational_profile_token,
+                    exclude_package_key_hashes=[conversation_package.package_key_hash],
+                    max_refresh_generation=refresh_generation,
+                )
         return built, stale
+
+    async def _capture_source_coordinates(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> InitialContextPackageSourceCoordinates | None:
+        return await InitialContextPackageRevisionRepository(
+            self._connection,
+            self._clock,
+        ).capture_active_coordinates(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+
+    async def _enqueue_source_successor(
+        self,
+        *,
+        claim: ClaimedJob,
+        job_payload: InitialContextPackageRefreshJobPayload,
+        terminal_metadata: dict[str, Any],
+    ) -> str | None:
+        """Replace one failed generation after its package lock is released."""
+
+        return await InitialContextPackageRefreshEnqueuer(
+            storage_backend=self._storage_backend,
+            clock=self._clock,
+            job_tracking_service=self._job_tracking,
+            refresh_enabled=True,
+        ).replace_source_changed_claim(
+            claim=claim,
+            job_payload=job_payload,
+            terminal_metadata=terminal_metadata,
+        )
 
     @staticmethod
     def _baseline_subject(
@@ -452,9 +733,7 @@ class InitialContextPackageWorker:
             "character_id": character_id,
             "workspace_id": workspace_id,
             "assistant_mode_id": profile_id,
-            "mode": InitialContextPackageWorker._optional_text(
-                conversation.get("mode")
-            )
+            "mode": InitialContextPackageWorker._optional_text(conversation.get("mode"))
             or profile_id,
         }
 
@@ -480,7 +759,10 @@ class InitialContextPackageWorker:
         token = getattr(operational_profile, "token", None)
         if token is not None:
             return str(token)
-        if isinstance(operational_profile, dict) and operational_profile.get("token") is not None:
+        if (
+            isinstance(operational_profile, dict)
+            and operational_profile.get("token") is not None
+        ):
             return str(operational_profile["token"])
         return None
 
@@ -516,7 +798,7 @@ class InitialContextPackageWorker:
             INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
             WORKER_GROUP_NAME,
             consumer_name,
-            min_idle_ms=0 if block_ms == 0 else STREAM_RECLAIM_IDLE_MS,
+            min_idle_ms=self._stream_reclaim_idle_ms,
             count=1,
         )
         if reclaimed:
@@ -528,28 +810,3 @@ class InitialContextPackageWorker:
             count=1,
             block_ms=block_ms,
         )
-
-    async def _dead_letter_if_exhausted(
-        self,
-        message: StreamMessage,
-        exc: Exception,
-    ) -> bool:
-        if message.delivery_count < MAX_STREAM_DELIVERIES:
-            return False
-        await self._storage_backend.enqueue_job(
-            f"dead_letter:{INITIAL_CONTEXT_PACKAGE_STREAM_NAME}",
-            {
-                "message_id": message.message_id,
-                "delivery_count": message.delivery_count,
-                "payload": message.payload,
-                "error": str(exc),
-                "error_details": [],
-            },
-        )
-        await self._storage_backend.stream_ack(
-            INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            message.message_id,
-        )
-        await self._job_tracking.mark_dead_lettered(message, exc)
-        return True

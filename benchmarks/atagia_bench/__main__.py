@@ -24,6 +24,7 @@ from benchmarks.atagia_bench.report_diff import (
 from benchmarks.atagia_bench.runner import (
     AtagiaBenchReport,
     AtagiaBenchRunner,
+    load_holdout_conversation_ids,
     load_holdout_question_ids,
 )
 from benchmarks.custody_summary import format_retrieval_custody_summary
@@ -35,6 +36,7 @@ from benchmarks.failure_taxonomy import (
 )
 from benchmarks.output_root import assert_outside_repo, bench_output_root
 from benchmarks.retained_db_paths import default_benchmark_db_dir
+from benchmarks.scorer import JudgeProtocol
 from atagia.core.config import ANSWER_STANCE_PROMPT_VARIANTS
 from atagia.models.schemas_replay import AblationConfig
 from atagia.services.model_resolution import COMPONENTS_BY_ID
@@ -42,8 +44,8 @@ from atagia.services.model_resolution import COMPONENTS_BY_ID
 load_dotenv()
 
 _DEFAULT_OUTPUT_DIR = bench_output_root() / "atagia_bench"
-_DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
-_DEFAULT_HOLDOUT_FILE = Path(__file__).resolve().parent / "data" / "holdout_v0.json"
+_DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+_DEFAULT_HOLDOUT_FILE = Path(__file__).resolve().parent / "data" / "holdout_v1.json"
 _DEFAULT_JUDGE_MODEL = "kimi/kimi-k2.7-code"
 _DEFAULT_PRIVACY_ENFORCEMENT = "off"
 
@@ -153,6 +155,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--judge-protocol",
+        choices=tuple(protocol.value for protocol in JudgeProtocol),
+        default=JudgeProtocol.MEMORY_QUALITY.value,
+        help=(
+            "Judge protocol for the llm_judge grader (V24 doctrine). "
+            "memory_quality (default, aligned rubric): all requested info "
+            "present, correct, correctly attributed; true-in-conversation "
+            "extras pass; fail on missing/false/misattributed. "
+            "source_aware_strict: the historical answer-discipline signal "
+            "(punishes true-but-out-of-scope extras). gold_only_lenient: "
+            "external comparability only. Deterministic, supersession, "
+            "abstention, and gated graders are unaffected."
+        ),
+    )
+    parser.add_argument(
         "--ingest-model",
         default=None,
         help="Model for Atagia ingest components unless overridden by --component-model.",
@@ -224,6 +241,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated question ids to run",
     )
     parser.add_argument(
+        "--measurement-layer",
+        choices=("memory_content", "product_behavior", "all"),
+        default="all",
+        help=(
+            "Filter questions by measurement layer (V24). memory_content "
+            "grades the WHAT (memory recall/correctness/attribution) and is the "
+            "memory-milestone gate; product_behavior grades the HOW "
+            "(stance/privacy/consent) and is a separate product-behavior suite. "
+            "Default: all."
+        ),
+    )
+    parser.add_argument(
         "--benchmark-split",
         choices=("all", "development", "holdout"),
         default="all",
@@ -236,6 +265,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--holdout-file",
         default=str(_DEFAULT_HOLDOUT_FILE),
         help="Frozen Atagia-bench holdout manifest JSON",
+    )
+    parser.add_argument(
+        "--allow-legacy-question-only-holdout",
+        action="store_true",
+        help=(
+            "Explicitly allow a legacy holdout manifest without conversation_ids "
+            "for a development split. This disables evidence-conversation "
+            "isolation and must not be used for the active Atagia-bench holdout."
+        ),
     )
     parser.add_argument(
         "--manifests-dir",
@@ -431,6 +469,7 @@ async def _run_async(
 ]:
     assert_outside_repo(args.output)
     holdout_ids = load_holdout_question_ids(args.holdout_file)
+    holdout_conversation_ids = load_holdout_conversation_ids(args.holdout_file)
     question_ids, exclude_question_ids = _question_filters_for_split(
         explicit_question_ids=_parse_csv_list(args.questions),
         benchmark_split=args.benchmark_split,
@@ -446,6 +485,7 @@ async def _run_async(
         llm_api_key=args.api_key,
         llm_model=args.model,
         judge_model=_resolve_judge_model(args),
+        judge_protocol=JudgeProtocol(args.judge_protocol),
         ingest_model=args.ingest_model,
         retrieval_model=args.retrieval_model,
         answer_model=args.answer_model,
@@ -464,8 +504,22 @@ async def _run_async(
         category_tags=_parse_csv_list(args.categories),
         question_ids=question_ids,
         exclude_question_ids=exclude_question_ids,
+        measurement_layers=(
+            None
+            if args.measurement_layer == "all"
+            else [args.measurement_layer]
+        ),
         benchmark_split=args.benchmark_split,
         holdout_question_ids=holdout_ids,
+        exclude_conversation_ids=(
+            holdout_conversation_ids
+            if args.benchmark_split == "development"
+            else None
+        ),
+        allow_legacy_question_only_holdout=(
+            args.benchmark_split == "development"
+            and args.allow_legacy_question_only_holdout
+        ),
         ablation=_benchmark_ablation(
             args.ablation,
             getattr(args, "privacy_enforcement", None),
@@ -566,6 +620,7 @@ def _format_report_summary(
         f"Model mode: {report.config.get('model_mode', 'forced_global')}",
         f"Answer model: {report.config.get('provider', '')} / {report.config.get('answer_model', '')}",
         f"Judge model: {report.config.get('judge_model', '')}",
+        f"Judge protocol: {report.config.get('judge_protocol', '')}",
         f"Trusted evaluation: {bool(report.config.get('trusted_evaluation', False))}",
         f"Evaluate only: {bool(report.config.get('evaluate_only', False))}",
         f"Benchmark split: {report.config.get('benchmark_split', 'all')}",

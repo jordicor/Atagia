@@ -335,6 +335,9 @@ class LLMCompletionRequest(BaseModel):
     response_schema: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     include_thinking: bool = False
+    # External answer requests own a hard caller/server ceiling. They must not
+    # inherit Atagia's structured-output minimum or technical truncation retry.
+    external_answer: bool = False
 
 
 class LLMCompletionResponse(BaseModel):
@@ -348,6 +351,7 @@ class LLMCompletionResponse(BaseModel):
     thinking: str | None = None
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     usage: dict[str, Any] = Field(default_factory=dict)
+    finish_reason: str | None = None
     raw_response: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -403,6 +407,46 @@ class LLMStreamEvent(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+def normalize_completion_finish_reason(
+    value: Any,
+    *,
+    has_tool_calls: bool = False,
+) -> str | None:
+    """Normalize provider stop labels to the OpenAI completion vocabulary."""
+
+    if value is None:
+        return "tool_calls" if has_tool_calls else None
+    label = str(getattr(value, "name", None) or value).rsplit(".", 1)[-1]
+    normalized = label.strip().lower()
+    if not normalized:
+        return "tool_calls" if has_tool_calls else None
+    if has_tool_calls and normalized in {
+        "stop",
+        "end_turn",
+        "stop_sequence",
+        "tool_use",
+        "tool_calls",
+        "function_call",
+        "finish_reason_stop",
+    }:
+        return "tool_calls"
+    if normalized in {"stop", "end_turn", "stop_sequence", "finish_reason_stop"}:
+        return "stop"
+    if normalized in {"tool_use", "tool_calls", "function_call"}:
+        return "tool_calls"
+    if normalized in {"length", "max_tokens", "model_context_window_exceeded"}:
+        return "length"
+    if normalized in {
+        "error",
+        "pause_turn",
+        "malformed_function_call",
+        "finish_reason_unspecified",
+        "unspecified",
+    }:
+        return "error"
+    return normalized
+
+
 class LLMProvider:
     """Provider adapter interface."""
 
@@ -426,7 +470,12 @@ class LLMProvider:
         if response.tool_calls:
             for tool_call in response.tool_calls:
                 yield LLMStreamEvent(type="tool_call", payload=tool_call)
-        yield LLMStreamEvent(type="done", payload={"usage": response.usage})
+        done_payload: dict[str, Any] = {}
+        if response.usage:
+            done_payload["usage"] = response.usage
+        if response.finish_reason is not None:
+            done_payload["finish_reason"] = response.finish_reason
+        yield LLMStreamEvent(type="done", payload=done_payload)
 
     def supports_native_structured_output_for(self, request: LLMCompletionRequest) -> bool:
         """Return whether this provider can enforce the schema for this request."""
@@ -544,12 +593,19 @@ class LLMClient(Generic[T]):
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         normalized_request = request.model_copy(
-            update={"max_output_tokens": apply_min_output_threshold(request.max_output_tokens)}
+            update={
+                "max_output_tokens": (
+                    request.max_output_tokens
+                    if request.external_answer
+                    else apply_min_output_threshold(request.max_output_tokens)
+                )
+            }
         )
         return await self._with_output_limit_recovery(
             normalized_request,
             self._complete_with_intimacy_routing,
             operation_name="completion",
+            allow_recovery=not normalized_request.external_answer,
         )
 
     async def _complete_with_intimacy_routing(
@@ -595,7 +651,13 @@ class LLMClient(Generic[T]):
 
     async def stream(self, request: LLMCompletionRequest) -> AsyncIterator[LLMStreamEvent]:
         normalized_request = request.model_copy(
-            update={"max_output_tokens": apply_min_output_threshold(request.max_output_tokens)}
+            update={
+                "max_output_tokens": (
+                    request.max_output_tokens
+                    if request.external_answer
+                    else apply_min_output_threshold(request.max_output_tokens)
+                )
+            }
         )
         proactive_request = self._proactive_intimacy_request(normalized_request)
         if proactive_request is not None:
@@ -708,7 +770,13 @@ class LLMClient(Generic[T]):
         observer: Any | None = None,
     ) -> LLMCompletionResponse:
         normalized_request = request.model_copy(
-            update={"max_output_tokens": apply_min_output_threshold(request.max_output_tokens)}
+            update={
+                "max_output_tokens": (
+                    request.max_output_tokens
+                    if request.external_answer
+                    else apply_min_output_threshold(request.max_output_tokens)
+                )
+            }
         )
         return await self._with_output_limit_recovery(
             normalized_request,
@@ -718,6 +786,7 @@ class LLMClient(Generic[T]):
             ),
             operation_name="streamed_completion",
             retry_observer=observer,
+            allow_recovery=not normalized_request.external_answer,
         )
 
     async def _complete_streamed_with_intimacy_routing(
@@ -753,6 +822,7 @@ class LLMClient(Generic[T]):
             thinking = ""
             tool_calls: list[dict[str, Any]] = []
             usage: dict[str, Any] = {}
+            finish_reason: str | None = None
             stream_iterator = provider.stream(provider_request)
             started_at = perf_counter()
             self._guard_before_call(provider_request, call_type="streamed_completion")
@@ -771,6 +841,9 @@ class LLMClient(Generic[T]):
                         event_usage = event.payload.get("usage")
                         if isinstance(event_usage, dict):
                             usage = event_usage
+                        event_finish_reason = event.payload.get("finish_reason")
+                        if isinstance(event_finish_reason, str):
+                            finish_reason = event_finish_reason
                 response = LLMCompletionResponse(
                     provider=provider.name,
                     model=str(provider_request.metadata.get("atagia_model_spec") or provider_request.model),
@@ -778,6 +851,7 @@ class LLMClient(Generic[T]):
                     thinking=thinking or None,
                     tool_calls=tool_calls,
                     usage=usage,
+                    finish_reason=finish_reason,
                 )
                 self._guard_record_success(
                     provider_request,

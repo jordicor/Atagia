@@ -13,10 +13,19 @@ from pydantic import BaseModel, ConfigDict
 from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
-from atagia.core.consent_repository import MemoryConsentProfileRepository, PendingMemoryConfirmationRepository
+from atagia.core.consent_repository import (
+    MemoryConsentProfileRepository,
+    PendingMemoryConfirmationRepository,
+)
 from atagia.core.contract_repository import ContractDimensionRepository
+from atagia.core.user_erasure_repository import ERASURE_PROTOCOL_VERSION
 from atagia.memory.consent_confirmation import PENDING_USER_CONFIRMATION_TTL_DAYS
-from atagia.models.schemas_memory import MemoryCategory, MemoryObjectType, MemoryScope, MemoryStatus
+from atagia.models.schemas_memory import (
+    MemoryCategory,
+    MemoryObjectType,
+    MemoryScope,
+    MemoryStatus,
+)
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
 
 logger = logging.getLogger(__name__)
@@ -59,8 +68,12 @@ class MemoryLifecycleManager:
         self._embedding_index = embedding_index or NoneBackend()
         self._settings = settings or Settings.from_env()
         self._contract_repository = ContractDimensionRepository(connection, clock)
-        self._consent_profile_repository = MemoryConsentProfileRepository(connection, clock)
-        self._pending_confirmation_repository = PendingMemoryConfirmationRepository(connection, clock)
+        self._consent_profile_repository = MemoryConsentProfileRepository(
+            connection, clock
+        )
+        self._pending_confirmation_repository = PendingMemoryConfirmationRepository(
+            connection, clock
+        )
         self._affected_user_ids: set[str] = set()
 
     @property
@@ -71,13 +84,21 @@ class MemoryLifecycleManager:
         """Run one lifecycle maintenance cycle."""
         now = self._clock.now()
         timestamp = now.isoformat()
-        decay_cutoff = (now - timedelta(days=self._settings.lifecycle_decay_days)).isoformat()
+        decay_cutoff = (
+            now - timedelta(days=self._settings.lifecycle_decay_days)
+        ).isoformat()
         ephemeral_cutoff = (
             now - timedelta(hours=self._settings.lifecycle_ephemeral_ttl_hours)
         ).isoformat()
-        review_cutoff = (now - timedelta(days=self._settings.lifecycle_review_ttl_days)).isoformat()
-        pending_cutoff = (now - timedelta(days=PENDING_USER_CONFIRMATION_TTL_DAYS)).isoformat()
-        tombstone_cutoff = (now - timedelta(days=self._settings.tombstone_retention_days)).isoformat()
+        review_cutoff = (
+            now - timedelta(days=self._settings.lifecycle_review_ttl_days)
+        ).isoformat()
+        pending_cutoff = (
+            now - timedelta(days=PENDING_USER_CONFIRMATION_TTL_DAYS)
+        ).isoformat()
+        tombstone_cutoff = (
+            now - timedelta(days=self._settings.tombstone_retention_days)
+        ).isoformat()
         result = LifecycleCycleResult()
         self._affected_user_ids = set()
 
@@ -87,10 +108,14 @@ class MemoryLifecycleManager:
             transaction_started = True
             decayed_refs = await self._decay_vitality(decay_cutoff, timestamp)
             result.decayed_count = len(decayed_refs)
-            declined_refs = await self._decline_expired_pending_confirmations(pending_cutoff, timestamp)
+            declined_refs = await self._decline_expired_pending_confirmations(
+                pending_cutoff, timestamp
+            )
             result.declined_count = len(declined_refs)
             expired_state_refs = await self._archive_expired_state_snapshots(timestamp)
-            archived_refs = expired_state_refs + await self._archive_low_value_memories(timestamp)
+            archived_refs = expired_state_refs + await self._archive_low_value_memories(
+                timestamp
+            )
             archived_ids = [ref.memory_id for ref in archived_refs]
             result.archived_count = len(archived_ids)
             result.skipped_evidence_count = await self._count_preserved_evidence()
@@ -100,14 +125,22 @@ class MemoryLifecycleManager:
             )
             ephemeral_refs = self._unique_refs(ephemeral_refs)
             ephemeral_ids = [ref.memory_id for ref in ephemeral_refs]
-            review_required_refs = await self._delete_expired_review_required(review_cutoff)
+            review_required_refs = await self._delete_expired_review_required(
+                review_cutoff
+            )
             review_required_ids = [ref.memory_id for ref in review_required_refs]
             affected_user_ids = {
                 ref.user_id
-                for ref in decayed_refs + declined_refs + archived_refs + ephemeral_refs + review_required_refs
+                for ref in decayed_refs
+                + declined_refs
+                + archived_refs
+                + ephemeral_refs
+                + review_required_refs
             }
-            projection_keys = await self._contract_repository.list_projection_keys_for_sources(
-                archived_ids + ephemeral_ids + review_required_ids
+            projection_keys = (
+                await self._contract_repository.list_projection_keys_for_sources(
+                    archived_ids + ephemeral_ids + review_required_ids
+                )
             )
             await self._delete_memory_ids(ephemeral_ids)
             await self._delete_memory_ids(review_required_ids)
@@ -115,14 +148,18 @@ class MemoryLifecycleManager:
             result.deleted_count = len(ephemeral_ids) + len(review_required_ids)
             await self._refresh_contract_dimensions(projection_keys)
             await self._cleanup_orphaned_contract_dimensions()
-            result.purged_tombstones_count = await self._purge_expired_tombstones(tombstone_cutoff)
+            result.purged_tombstones_count = await self._purge_expired_tombstones(
+                tombstone_cutoff
+            )
 
             if dry_run:
                 await self._connection.rollback()
             else:
                 await self._connection.commit()
                 await self._delete_embeddings(
-                    archived_ids + deleted_memory_ids + [ref.memory_id for ref in declined_refs]
+                    archived_ids
+                    + deleted_memory_ids
+                    + [ref.memory_id for ref in declined_refs]
                 )
                 self._affected_user_ids = affected_user_ids
             return result
@@ -132,13 +169,21 @@ class MemoryLifecycleManager:
                 await self._connection.rollback()
             raise
 
-    async def _decay_vitality(self, decay_cutoff: str, timestamp: str) -> list[_LifecycleMemoryRef]:
+    async def _decay_vitality(
+        self, decay_cutoff: str, timestamp: str
+    ) -> list[_LifecycleMemoryRef]:
         cursor = await self._connection.execute(
             """
             SELECT id, user_id, vitality
             FROM memory_objects
             WHERE status = ?
               AND updated_at < ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM conversation_transcript_selections AS selection
+                  WHERE selection.user_id = memory_objects.user_id
+                    AND selection.state IN ('rebuilding', 'remediation_required')
+              )
             """,
             (MemoryStatus.ACTIVE.value, decay_cutoff),
         )
@@ -165,7 +210,9 @@ class MemoryLifecycleManager:
             for row in rows
         ]
 
-    async def _archive_low_value_memories(self, timestamp: str) -> list[_LifecycleMemoryRef]:
+    async def _archive_low_value_memories(
+        self, timestamp: str
+    ) -> list[_LifecycleMemoryRef]:
         cursor = await self._connection.execute(
             """
             SELECT id, user_id, canonical_text, payload_json
@@ -174,6 +221,12 @@ class MemoryLifecycleManager:
               AND object_type NOT IN (?, ?, ?)
               AND vitality < ?
               AND confidence < ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM conversation_transcript_selections AS selection
+                  WHERE selection.user_id = memory_objects.user_id
+                    AND selection.state IN ('rebuilding', 'remediation_required')
+              )
             """,
             (
                 MemoryStatus.ACTIVE.value,
@@ -214,13 +267,21 @@ class MemoryLifecycleManager:
             for row in rows
         ]
 
-    async def _archive_expired_state_snapshots(self, timestamp: str) -> list[_LifecycleMemoryRef]:
+    async def _archive_expired_state_snapshots(
+        self, timestamp: str
+    ) -> list[_LifecycleMemoryRef]:
         cursor = await self._connection.execute(
             """
             SELECT id, user_id, canonical_text, payload_json, valid_from, valid_to, temporal_type
             FROM memory_objects
             WHERE status = ?
               AND object_type = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM conversation_transcript_selections AS selection
+                  WHERE selection.user_id = memory_objects.user_id
+                    AND selection.state IN ('rebuilding', 'remediation_required')
+              )
             """,
             (
                 MemoryStatus.ACTIVE.value,
@@ -262,7 +323,9 @@ class MemoryLifecycleManager:
             for row in rows
         ]
 
-    def _is_expired_state_snapshot(self, row: dict[str, Any], reference: datetime) -> bool:
+    def _is_expired_state_snapshot(
+        self, row: dict[str, Any], reference: datetime
+    ) -> bool:
         temporal_type = str(row.get("temporal_type", "unknown"))
         if temporal_type == "ephemeral":
             valid_from = self._parse_temporal_datetime(row.get("valid_from"), reference)
@@ -295,6 +358,12 @@ class MemoryLifecycleManager:
               AND object_type = ?
               AND vitality < ?
               AND confidence < ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM conversation_transcript_selections AS selection
+                  WHERE selection.user_id = memory_objects.user_id
+                    AND selection.state IN ('rebuilding', 'remediation_required')
+              )
             """,
             (
                 MemoryStatus.ACTIVE.value,
@@ -311,8 +380,51 @@ class MemoryLifecycleManager:
             """
             DELETE FROM deletion_tombstones
             WHERE deleted_at < ?
+              AND (
+                    entity_type != 'user'
+                 OR deletion_reason != 'right_to_erasure'
+                 OR (
+                        erasure_protocol_version = ?
+                    AND erasure_cleanup_state = 'verified'
+                    AND cleanup_verified_at IS NOT NULL
+                    AND cleanup_evidence_manifest_sha256 IS NOT NULL
+                    AND (
+                           erasure_lifecycle_epoch IS NOT NULL
+                        OR legacy_reconciled = 1
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM user_erasure_cleanups AS cleanup
+                        WHERE cleanup.tombstone_id = deletion_tombstones.id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM user_lifecycles AS lifecycle
+                        WHERE deletion_tombstones.erasure_lifecycle_epoch IS NOT NULL
+                          AND lifecycle.lifecycle_epoch =
+                              deletion_tombstones.erasure_lifecycle_epoch
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM worker_job_runs AS job
+                        WHERE deletion_tombstones.erasure_lifecycle_epoch IS NOT NULL
+                          AND job.lifecycle_epoch =
+                              deletion_tombstones.erasure_lifecycle_epoch
+                          AND (
+                               job.status IN (
+                                   'queued',
+                                   'awaiting_claim',
+                                   'running',
+                                   'retrying',
+                                   'deferred'
+                               )
+                               OR job.recovery_envelope_json IS NOT NULL
+                          )
+                    )
+                 )
+              )
             """,
-            (cutoff,),
+            (cutoff, ERASURE_PROTOCOL_VERSION),
         )
         return int(cursor.rowcount)
 
@@ -327,6 +439,12 @@ class MemoryLifecycleManager:
             FROM memory_objects
             WHERE status = ?
               AND created_at < ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM conversation_transcript_selections AS selection
+                  WHERE selection.user_id = memory_objects.user_id
+                    AND selection.state IN ('rebuilding', 'remediation_required')
+              )
             """,
             (
                 MemoryStatus.PENDING_USER_CONFIRMATION.value,
@@ -338,7 +456,9 @@ class MemoryLifecycleManager:
             (
                 MemoryStatus.DECLINED.value,
                 json_utils.dumps(
-                    self._declined_payload(row["payload_json"], decline_reason="ttl_expired"),
+                    self._declined_payload(
+                        row["payload_json"], decline_reason="ttl_expired"
+                    ),
                     sort_keys=True,
                 ),
                 timestamp,
@@ -370,14 +490,22 @@ class MemoryLifecycleManager:
                 )
             for (user_id, category_str), count in decline_counts.items():
                 category = MemoryCategory(category_str)
-                profile = await self._consent_profile_repository.get_profile(user_id, category)
-                current_declined = int(profile.get("declined_count", 0)) if profile else 0
+                profile = await self._consent_profile_repository.get_profile(
+                    user_id, category
+                )
+                current_declined = (
+                    int(profile.get("declined_count", 0)) if profile else 0
+                )
                 await self._consent_profile_repository.upsert_profile(
                     user_id=user_id,
                     category=category,
-                    confirmed_count=int(profile.get("confirmed_count", 0)) if profile else 0,
+                    confirmed_count=int(profile.get("confirmed_count", 0))
+                    if profile
+                    else 0,
                     declined_count=current_declined + count,
-                    last_confirmed_at=profile.get("last_confirmed_at") if profile else None,
+                    last_confirmed_at=profile.get("last_confirmed_at")
+                    if profile
+                    else None,
                     last_declined_at=timestamp,
                     commit=False,
                 )
@@ -434,7 +562,9 @@ class MemoryLifecycleManager:
             ),
         )
 
-    async def _delete_expired_review_required(self, cutoff: str) -> list[_LifecycleMemoryRef]:
+    async def _delete_expired_review_required(
+        self, cutoff: str
+    ) -> list[_LifecycleMemoryRef]:
         return await self._select_memory_refs(
             """
             SELECT id, user_id
@@ -465,21 +595,31 @@ class MemoryLifecycleManager:
         await self._connection.execute(
             """
             DELETE FROM contract_dimensions_current
-            WHERE source_memory_id IN (
-                SELECT mo.id
-                FROM memory_objects AS mo
-                WHERE mo.status IN (?, ?)
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM conversation_transcript_selections AS selection
+                WHERE selection.user_id = contract_dimensions_current.user_id
+                  AND selection.state IN ('rebuilding', 'remediation_required')
             )
-               OR NOT EXISTS (
-                    SELECT 1
-                    FROM memory_objects AS mo
-                    WHERE mo.id = contract_dimensions_current.source_memory_id
-                )
+              AND (
+                    source_memory_id IN (
+                        SELECT mo.id
+                        FROM memory_objects AS mo
+                        WHERE mo.status IN (?, ?)
+                    )
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM memory_objects AS mo
+                        WHERE mo.id = contract_dimensions_current.source_memory_id
+                    )
+              )
             """,
             (MemoryStatus.ARCHIVED.value, MemoryStatus.DELETED.value),
         )
 
-    async def _refresh_contract_dimensions(self, projection_keys: list[dict[str, Any]]) -> None:
+    async def _refresh_contract_dimensions(
+        self, projection_keys: list[dict[str, Any]]
+    ) -> None:
         seen: set[
             tuple[
                 str,
@@ -531,7 +671,19 @@ class MemoryLifecycleManager:
         query: str,
         parameters: tuple[Any, ...],
     ) -> list[_LifecycleMemoryRef]:
-        cursor = await self._connection.execute(query, parameters)
+        cursor = await self._connection.execute(
+            f"""
+            SELECT candidate.id, candidate.user_id
+            FROM ({query}) AS candidate
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM conversation_transcript_selections AS selection
+                WHERE selection.user_id = candidate.user_id
+                  AND selection.state IN ('rebuilding', 'remediation_required')
+            )
+            """,
+            parameters,
+        )
         rows = await cursor.fetchall()
         return [
             _LifecycleMemoryRef(
@@ -555,10 +707,16 @@ class MemoryLifecycleManager:
             try:
                 await self._embedding_index.delete(memory_id)
             except Exception:
-                logger.warning("Embedding cleanup failed for memory_id=%s", memory_id, exc_info=True)
+                logger.warning(
+                    "Embedding cleanup failed for memory_id=%s",
+                    memory_id,
+                    exc_info=True,
+                )
 
     @staticmethod
-    def _archived_payload(raw_payload: str | None, canonical_text: str) -> dict[str, Any]:
+    def _archived_payload(
+        raw_payload: str | None, canonical_text: str
+    ) -> dict[str, Any]:
         payload: dict[str, Any]
         if isinstance(raw_payload, str) and raw_payload:
             payload = json_utils.loads(raw_payload)
@@ -568,7 +726,9 @@ class MemoryLifecycleManager:
         return payload
 
     @staticmethod
-    def _declined_payload(raw_payload: str | None, *, decline_reason: str) -> dict[str, Any]:
+    def _declined_payload(
+        raw_payload: str | None, *, decline_reason: str
+    ) -> dict[str, Any]:
         payload: dict[str, Any]
         if isinstance(raw_payload, str) and raw_payload:
             payload = json_utils.loads(raw_payload)

@@ -18,9 +18,15 @@ from atagia.core.consent_repository import (
     PendingMemoryConfirmationRepository,
 )
 from atagia.core.memory_fact_facet_repository import MemoryFactFacetRepository
+from atagia.core.memory_extraction_suppression_repository import (
+    MemoryExtractionSuppressionRepository,
+)
 from atagia.core.memory_provenance import MemoryProvenanceWriter
 from atagia.core.repositories import MemoryObjectRepository, MessageRepository
-from atagia.core.timestamps import normalize_optional_timestamp, resolve_message_occurred_at
+from atagia.core.timestamps import (
+    normalize_optional_timestamp,
+    resolve_message_occurred_at,
+)
 from atagia.memory.chunking_config import PRIOR_CHUNK_CONTEXT_MAX_TOKENS
 from atagia.core.storage_backend import StorageBackend
 from atagia.memory.extraction_watchdog import (
@@ -41,7 +47,10 @@ from atagia.memory.extraction_mapping import (
     source_backed_fact_facet_projection,
 )
 from atagia.memory.extraction_cards import extract_lean_with_cards
-from atagia.memory.intent_classifier import are_claim_keys_equivalent, is_explicit_user_statement
+from atagia.memory.intent_classifier import (
+    are_claim_keys_equivalent,
+    is_explicit_user_statement,
+)
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.memory.namespace import MemoryNamespaceContext
 from atagia.memory.retrieval_surface_dry_run import (
@@ -106,7 +115,6 @@ COLD_START_EVIDENCE_ACTIVE_THRESHOLD = 0.3
 NORMAL_BELIEF_ACTIVE_THRESHOLD = 0.7
 COLD_START_BELIEF_ACTIVE_THRESHOLD = 0.85
 DEFAULT_ACTIVE_THRESHOLD = 0.5
-DEDUPE_TTL_SECONDS = 24 * 60 * 60
 CONSENT_CONFIRM_THRESHOLD = 2
 CONSENT_DECLINE_SUPPRESSION_THRESHOLD = 2
 HIGH_RISK_MEMORY_CATEGORIES = CONFIRMATION_REQUIRED_MEMORY_CATEGORIES
@@ -123,10 +131,10 @@ _HIGH_RISK_SECRET_CATEGORIES: frozenset[MemoryCategory] = frozenset(
 _HIGH_RISK_PRIVATE_CATEGORIES: frozenset[MemoryCategory] = frozenset(
     HIGH_RISK_MEMORY_CATEGORIES - _HIGH_RISK_SECRET_CATEGORIES
 )
-_RETRIEVAL_PACKET_AUTO_APPROVED_BY = "system:phase6_slice2_policy"
+_RETRIEVAL_PACKET_AUTO_APPROVED_BY = "system:retrieval_surface_auto_policy_v1"
 _RETRIEVAL_PACKET_AUTO_APPROVAL_NOTE = (
-    "Auto-approved because the surface matched the Phase 6 Slice 2 "
-    "public/ordinary eligibility filter."
+    "Auto-approved because the surface matched the ordinary-risk retrieval "
+    "eligibility policy."
 )
 logger = logging.getLogger(__name__)
 
@@ -154,7 +162,11 @@ class _ItemGroundingCheck:
 
     @property
     def drop_gate(self) -> str:
-        return self.source_quote.gate if self.source_quote is not None else self.canonical.gate
+        return (
+            self.source_quote.gate
+            if self.source_quote is not None
+            else self.canonical.gate
+        )
 
     @property
     def drop_overlap_ratio(self) -> float:
@@ -217,7 +229,8 @@ class MemoryExtractor:
         embedding_index: EmbeddingIndex | None = None,
         settings: Settings | None = None,
         privacy_filter_client: OpenAIPrivacyFilterClient | None = None,
-        retrieval_packet_dry_run_generator: RetrievalSurfaceDryRunGenerator | None = None,
+        retrieval_packet_dry_run_generator: RetrievalSurfaceDryRunGenerator
+        | None = None,
         enable_retrieval_packet_dry_run: bool = False,
         retrieval_packet_surface_writer: RetrievalSurfaceWriter | None = None,
         enable_retrieval_packet_surface_write: bool = False,
@@ -258,8 +271,12 @@ class MemoryExtractor:
                     self._extraction_watchdog_config.allow_different_provider
                 ),
             )
-        self._classifier_model = resolve_component_model(resolved_settings, "intent_classifier")
-        self._chunking_extraction_disabled = resolved_settings.disable_chunking_extraction
+        self._classifier_model = resolve_component_model(
+            resolved_settings, "intent_classifier"
+        )
+        self._chunking_extraction_disabled = (
+            resolved_settings.disable_chunking_extraction
+        )
         self._chunking_extraction_threshold_tokens = (
             resolved_settings.chunking_extraction_threshold_tokens
         )
@@ -276,7 +293,15 @@ class MemoryExtractor:
             memory_repository._connection,
             clock,
         )
-        self._consent_repository = MemoryConsentProfileRepository(memory_repository._connection, clock)
+        self._memory_extraction_suppression_repository = (
+            MemoryExtractionSuppressionRepository(
+                memory_repository._connection,
+                clock,
+            )
+        )
+        self._consent_repository = MemoryConsentProfileRepository(
+            memory_repository._connection, clock
+        )
         self._pending_confirmation_repository = PendingMemoryConfirmationRepository(
             memory_repository._connection,
             clock,
@@ -284,8 +309,12 @@ class MemoryExtractor:
         self._retrieval_packet_dry_run_generator = retrieval_packet_dry_run_generator
         self._retrieval_packet_dry_run_enabled = enable_retrieval_packet_dry_run
         self._retrieval_packet_surface_writer = retrieval_packet_surface_writer
-        self._retrieval_packet_surface_write_enabled = enable_retrieval_packet_surface_write
-        self._fact_facet_surfaces_enabled = resolved_settings.fact_facet_surfaces_enabled
+        self._retrieval_packet_surface_write_enabled = (
+            enable_retrieval_packet_surface_write
+        )
+        self._fact_facet_surfaces_enabled = (
+            resolved_settings.fact_facet_surfaces_enabled
+        )
 
     async def extract(
         self,
@@ -331,13 +360,22 @@ class MemoryExtractor:
     ) -> ExtractionPersistenceDetails:
         context = ExtractionConversationContext.model_validate(conversation_context)
         if context.assistant_mode_id != resolved_policy.profile_id.value:
-            raise ValueError("Conversation context assistant_mode_id must match the resolved policy")
-        source_message = await self._message_repository.get_message(context.source_message_id, context.user_id)
-        if source_message is None or source_message["conversation_id"] != context.conversation_id:
-            raise ValueError("Conversation context source_message_id must belong to the active conversation")
-        resolved_occurred_at = resolve_message_occurred_at(source_message) or normalize_optional_timestamp(
-            occurred_at
+            raise ValueError(
+                "Conversation context assistant_mode_id must match the resolved policy"
+            )
+        source_message = await self._message_repository.get_message(
+            context.source_message_id, context.user_id
         )
+        if (
+            source_message is None
+            or source_message["conversation_id"] != context.conversation_id
+        ):
+            raise ValueError(
+                "Conversation context source_message_id must belong to the active conversation"
+            )
+        resolved_occurred_at = resolve_message_occurred_at(
+            source_message
+        ) or normalize_optional_timestamp(occurred_at)
 
         cold_start = await self._is_cold_start(context, resolved_policy)
         chunk_plan = await self._plan_extraction_chunks(
@@ -582,7 +620,9 @@ class MemoryExtractor:
                 source_input_tokens=self._text_chunker.estimate_tokens(chunk.text),
             )
             chunk_extractions.append(_ChunkExtraction(chunk=chunk, result=result))
-            prior_chunk_context = self._extend_prior_chunk_context(prior_chunk_context, result)
+            prior_chunk_context = self._extend_prior_chunk_context(
+                prior_chunk_context, result
+            )
             if chunk_plan.chunked:
                 logger.info(
                     "Chunk extraction completed source_message_id=%s chunk_index=%s chunk_count=%s chunk_tokens=%s duration_ms=%.2f nothing_durable=%s strategy=%s",
@@ -717,7 +757,9 @@ class MemoryExtractor:
         return metadata
 
     @staticmethod
-    def _merge_chunk_results(chunk_extractions: list[_ChunkExtraction]) -> ExtractionResult:
+    def _merge_chunk_results(
+        chunk_extractions: list[_ChunkExtraction],
+    ) -> ExtractionResult:
         results = [chunk.result for chunk in chunk_extractions]
         if not results:
             return ExtractionResult(nothing_durable=True)
@@ -727,7 +769,9 @@ class MemoryExtractor:
         return ExtractionResult(
             evidences=[item for result in results for item in result.evidences],
             beliefs=[item for result in results for item in result.beliefs],
-            contract_signals=[item for result in results for item in result.contract_signals],
+            contract_signals=[
+                item for result in results for item in result.contract_signals
+            ],
             state_updates=[item for result in results for item in result.state_updates],
             mode_guess=mode_guess,
             nothing_durable=all(result.nothing_durable for result in results),
@@ -744,7 +788,11 @@ class MemoryExtractor:
             if not item.canonical_text.strip():
                 continue
             lines.append(rendered)
-        while lines and self._text_chunker.estimate_tokens("\n".join(lines)) > PRIOR_CHUNK_CONTEXT_MAX_TOKENS:
+        while (
+            lines
+            and self._text_chunker.estimate_tokens("\n".join(lines))
+            > PRIOR_CHUNK_CONTEXT_MAX_TOKENS
+        ):
             lines.pop(0)
         return "\n".join(lines)
 
@@ -761,7 +809,9 @@ class MemoryExtractor:
             assistant_mode_id=context.assistant_mode_id,
             user_persona_id=context.user_persona_id,
             platform_id=context.platform_id,
-            character_id=context.character_id if context.character_id is not None else context.workspace_id,
+            character_id=context.character_id
+            if context.character_id is not None
+            else context.workspace_id,
             incognito=context.incognito or context.isolated_mode,
             remember_across_chats=context.remember_across_chats,
             remember_across_devices=context.remember_across_devices,
@@ -791,7 +841,9 @@ class MemoryExtractor:
         persisted: list[dict[str, Any]] = []
         retrieval_packet_memory_ids: list[str] = []
         grounding_dropped_count = 0
-        embedding_upserts = pending_embedding_upserts if pending_embedding_upserts is not None else []
+        embedding_upserts = (
+            pending_embedding_upserts if pending_embedding_upserts is not None else []
+        )
         consent_profiles: dict[MemoryCategory, dict[str, Any] | None] = {}
         namespace_context = self._namespace_context(context)
         try:
@@ -810,8 +862,13 @@ class MemoryExtractor:
                     self._log_grounding_drop(item, grounding_check)
                     continue
 
-                privacy_filter_audit = await self._privacy_filter_pre_signal(item.canonical_text)
-                if privacy_filter_audit is not None and privacy_filter_audit["triggered"]:
+                privacy_filter_audit = await self._privacy_filter_pre_signal(
+                    item.canonical_text
+                )
+                if (
+                    privacy_filter_audit is not None
+                    and privacy_filter_audit["triggered"]
+                ):
                     item.privacy_level = max(item.privacy_level, 2)
 
                 write_policy = self._resolve_write_policy(
@@ -853,7 +910,9 @@ class MemoryExtractor:
                 consent_profile = None
                 if role == "user":
                     if item.memory_category not in consent_profiles:
-                        consent_profiles[item.memory_category] = await self._consent_repository.get_profile(
+                        consent_profiles[
+                            item.memory_category
+                        ] = await self._consent_repository.get_profile(
                             context.user_id,
                             item.memory_category,
                             user_persona_id=context.user_persona_id,
@@ -870,7 +929,10 @@ class MemoryExtractor:
                     consent_profile=consent_profile,
                     context=context,
                 )
-                if write_policy.review_required and decision.status is MemoryStatus.ACTIVE:
+                if (
+                    write_policy.review_required
+                    and decision.status is MemoryStatus.ACTIVE
+                ):
                     decision = _PersistenceDecision(status=MemoryStatus.REVIEW_REQUIRED)
                 if decision.skip_item or decision.status is None:
                     continue
@@ -885,11 +947,16 @@ class MemoryExtractor:
                     object_type.value,
                     scope_hash_seed,
                 )
-                dedupe_key = f"{context.user_id}:{extraction_hash}"
-                await self._storage_backend.remember_dedupe(dedupe_key, DEDUPE_TTL_SECONDS)
-                existing = await self._memory_repository.get_memory_object_by_extraction_hash(
-                    context.user_id,
-                    extraction_hash,
+                if await self._memory_extraction_suppression_repository.is_suppressed(
+                    user_id=context.user_id,
+                    source_message_id=context.source_message_id,
+                ):
+                    continue
+                existing = (
+                    await self._memory_repository.get_memory_object_by_extraction_hash(
+                        context.user_id,
+                        extraction_hash,
+                    )
                 )
                 alternate_extraction_hash = None
                 if existing is None and write_policy.platform_locked:
@@ -926,25 +993,30 @@ class MemoryExtractor:
                         realm_id=context.active_realm_id,
                     )
                 if existing is not None:
-                    refreshed = await self._memory_repository.refresh_memory_object_provenance(
-                        user_id=context.user_id,
-                        memory_id=str(existing["id"]),
-                        assistant_mode_id=legacy_scope_identifiers["assistant_mode_id"],
-                        workspace_id=legacy_scope_identifiers["workspace_id"],
-                        conversation_id=legacy_scope_identifiers["conversation_id"],
-                        source_message_ids=[context.source_message_id],
-                        active_presence_id=context.active_presence_id,
-                        source_presence_id=context.source_presence_id,
-                        space_id=context.active_space_id,
-                        space_boundary_mode=context.active_space_boundary_mode.value
-                        if context.active_space_id is not None
-                        else None,
-                        memory_owner_id=context.active_mind_id,
-                        source_mind_id=context.source_mind_id or context.active_mind_id,
-                        embodiment_id=context.active_embodiment_id,
-                        realm_id=context.active_realm_id,
-                        touch=True,
-                        commit=False,
+                    refreshed = (
+                        await self._memory_repository.refresh_memory_object_provenance(
+                            user_id=context.user_id,
+                            memory_id=str(existing["id"]),
+                            assistant_mode_id=legacy_scope_identifiers[
+                                "assistant_mode_id"
+                            ],
+                            workspace_id=legacy_scope_identifiers["workspace_id"],
+                            conversation_id=legacy_scope_identifiers["conversation_id"],
+                            source_message_ids=[context.source_message_id],
+                            active_presence_id=context.active_presence_id,
+                            source_presence_id=context.source_presence_id,
+                            space_id=context.active_space_id,
+                            space_boundary_mode=context.active_space_boundary_mode.value
+                            if context.active_space_id is not None
+                            else None,
+                            memory_owner_id=context.active_mind_id,
+                            source_mind_id=context.source_mind_id
+                            or context.active_mind_id,
+                            embodiment_id=context.active_embodiment_id,
+                            realm_id=context.active_realm_id,
+                            touch=True,
+                            commit=False,
+                        )
                     )
                     await self._memory_repository.add_memory_object_subjects(
                         user_id=context.user_id,
@@ -971,13 +1043,11 @@ class MemoryExtractor:
                         review_required=write_policy.review_required,
                         commit=False,
                     )
-                    persisted_row = (
-                        await self._memory_repository.fill_missing_memory_object_language_codes(
-                            user_id=context.user_id,
-                            memory_id=str(merged["id"]),
-                            language_codes=item.language_codes,
-                            commit=False,
-                        )
+                    persisted_row = await self._memory_repository.fill_missing_memory_object_language_codes(
+                        user_id=context.user_id,
+                        memory_id=str(merged["id"]),
+                        language_codes=item.language_codes,
+                        commit=False,
                     )
                     persisted.append(persisted_row)
                     evidence_packet = await self._persist_memory_evidence_packet(
@@ -1010,7 +1080,9 @@ class MemoryExtractor:
                 if write_policy.reasons:
                     payload["write_policy_reasons"] = list(write_policy.reasons)
                 payload["ingest_origin"] = context.ingest_origin.value
-                payload["presence_attribution"] = self._presence_attribution_payload(context)
+                payload["presence_attribution"] = self._presence_attribution_payload(
+                    context
+                )
                 payload["space_boundary"] = self._space_boundary_payload(context)
                 payload["mind_perspective"] = self._mind_perspective_payload(context)
                 payload["embodiment"] = self._embodiment_payload(context)
@@ -1031,12 +1103,18 @@ class MemoryExtractor:
                         privacy_level=item.privacy_level,
                     )
                 ):
-                    payload["review_reason"] = "confirmation_not_allowed_for_ingest_origin"
+                    payload["review_reason"] = (
+                        "confirmation_not_allowed_for_ingest_origin"
+                    )
                 if item.platform_lock_reason is not None:
                     payload["platform_lock_reason"] = item.platform_lock_reason
                 if chunked:
-                    payload["chunk_index"] = chunk.chunk_index if chunk is not None else 1
-                    payload["chunk_count"] = chunk.chunk_count if chunk is not None else 1
+                    payload["chunk_index"] = (
+                        chunk.chunk_index if chunk is not None else 1
+                    )
+                    payload["chunk_count"] = (
+                        chunk.chunk_count if chunk is not None else 1
+                    )
                     if chunk is not None and chunk.chunking_strategy is not None:
                         payload["chunking_strategy"] = chunk.chunking_strategy
                     if chunk is not None and chunk.level1_failure_reason is not None:
@@ -1069,7 +1147,10 @@ class MemoryExtractor:
                     valid_to=valid_to,
                 )
 
-                created, was_created = await self._memory_repository.create_memory_object_with_flag(
+                (
+                    created,
+                    was_created,
+                ) = await self._memory_repository.create_memory_object_with_flag(
                     user_id=context.user_id,
                     workspace_id=legacy_scope_identifiers["workspace_id"],
                     conversation_id=legacy_scope_identifiers["conversation_id"],
@@ -1124,25 +1205,27 @@ class MemoryExtractor:
                         created_at=str(created["created_at"]),
                         commit=False,
                     )
-                created = await self._memory_repository.refresh_memory_object_provenance(
-                    user_id=context.user_id,
-                    memory_id=str(created["id"]),
-                    assistant_mode_id=legacy_scope_identifiers["assistant_mode_id"],
-                    workspace_id=legacy_scope_identifiers["workspace_id"],
-                    conversation_id=legacy_scope_identifiers["conversation_id"],
-                    source_message_ids=[context.source_message_id],
-                    active_presence_id=context.active_presence_id,
-                    source_presence_id=context.source_presence_id,
-                    space_id=context.active_space_id,
-                    space_boundary_mode=context.active_space_boundary_mode.value
-                    if context.active_space_id is not None
-                    else None,
-                    memory_owner_id=context.active_mind_id,
-                    source_mind_id=context.source_mind_id or context.active_mind_id,
-                    embodiment_id=context.active_embodiment_id,
-                    realm_id=context.active_realm_id,
-                    touch=False,
-                    commit=False,
+                created = (
+                    await self._memory_repository.refresh_memory_object_provenance(
+                        user_id=context.user_id,
+                        memory_id=str(created["id"]),
+                        assistant_mode_id=legacy_scope_identifiers["assistant_mode_id"],
+                        workspace_id=legacy_scope_identifiers["workspace_id"],
+                        conversation_id=legacy_scope_identifiers["conversation_id"],
+                        source_message_ids=[context.source_message_id],
+                        active_presence_id=context.active_presence_id,
+                        source_presence_id=context.source_presence_id,
+                        space_id=context.active_space_id,
+                        space_boundary_mode=context.active_space_boundary_mode.value
+                        if context.active_space_id is not None
+                        else None,
+                        memory_owner_id=context.active_mind_id,
+                        source_mind_id=context.source_mind_id or context.active_mind_id,
+                        embodiment_id=context.active_embodiment_id,
+                        realm_id=context.active_realm_id,
+                        touch=False,
+                        commit=False,
+                    )
                 )
                 await self._memory_repository.add_memory_object_subjects(
                     user_id=context.user_id,
@@ -1224,7 +1307,9 @@ class MemoryExtractor:
                     canonical_text=pending["canonical_text"],
                     index_text=pending.get("index_text"),
                     privacy_level=pending["privacy_level"],
-                    intimacy_boundary=pending.get("intimacy_boundary", IntimacyBoundary.ORDINARY.value),
+                    intimacy_boundary=pending.get(
+                        "intimacy_boundary", IntimacyBoundary.ORDINARY.value
+                    ),
                     preserve_verbatim=pending["preserve_verbatim"],
                     user_id=pending["user_id"],
                     object_type=pending["object_type"],
@@ -1312,8 +1397,7 @@ class MemoryExtractor:
         support_kind = item.support_kind or MemoryEvidenceSupportKind.DIRECT
         evidence_polarity = item.evidence_polarity or MemoryEvidencePolarity.SUPPORTS
         speaker_relation = (
-            item.speaker_relation_to_subject
-            or MemoryEvidenceSpeakerRelation.UNKNOWN
+            item.speaker_relation_to_subject or MemoryEvidenceSpeakerRelation.UNKNOWN
         )
         trigger_spans = self._trigger_evidence_spans(item, context)
         if (
@@ -1460,7 +1544,9 @@ class MemoryExtractor:
         approved: list[RetrievalSurfaceApprovedWrite] = []
         approved_at = self._clock.now().isoformat()
         for surface in surfaces:
-            memory = await self._memory_repository.get_memory_object(surface.memory_id, user_id)
+            memory = await self._memory_repository.get_memory_object(
+                surface.memory_id, user_id
+            )
             if memory is None:
                 continue
             if not self._is_retrieval_packet_auto_write_memory(memory):
@@ -1505,7 +1591,9 @@ class MemoryExtractor:
                     language_codes=self._memory_language_codes(memory),
                     privacy_level=int(memory["privacy_level"]),
                     sensitivity_level=self._memory_sensitivity_level(
-                        str(memory.get("sensitivity") or MemorySensitivity.UNKNOWN.value)
+                        str(
+                            memory.get("sensitivity") or MemorySensitivity.UNKNOWN.value
+                        )
                     ),
                 )
             )
@@ -1518,7 +1606,10 @@ class MemoryExtractor:
             return False
         if str(memory.get("sensitivity") or "") != MemorySensitivity.PUBLIC.value:
             return False
-        if str(memory.get("intimacy_boundary") or "") != IntimacyBoundary.ORDINARY.value:
+        if (
+            str(memory.get("intimacy_boundary") or "")
+            != IntimacyBoundary.ORDINARY.value
+        ):
             return False
         if bool(int(memory.get("platform_locked") or 0)):
             return False
@@ -1566,7 +1657,7 @@ class MemoryExtractor:
                 ]
             ).encode("utf-8")
         ).hexdigest()[:16]
-        return f"phase6_slice2_auto:{digest}"
+        return f"retrieval_surface_auto_v1:{digest}"
 
     @staticmethod
     def _memory_language_codes(memory: dict[str, Any]) -> list[str]:
@@ -1592,10 +1683,15 @@ class MemoryExtractor:
         }.get(value.lower(), 1)
 
     @staticmethod
-    def _presence_attribution_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+    def _presence_attribution_payload(
+        context: ExtractionConversationContext,
+    ) -> dict[str, Any]:
         known_subject_presence_ids = []
         for presence_id in (context.active_presence_id, context.source_presence_id):
-            if presence_id is not None and presence_id not in known_subject_presence_ids:
+            if (
+                presence_id is not None
+                and presence_id not in known_subject_presence_ids
+            ):
                 known_subject_presence_ids.append(presence_id)
         return {
             "active": {
@@ -1612,7 +1708,9 @@ class MemoryExtractor:
         }
 
     @staticmethod
-    def _space_boundary_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+    def _space_boundary_payload(
+        context: ExtractionConversationContext,
+    ) -> dict[str, Any]:
         return {
             "active_space_id": context.active_space_id,
             "boundary_mode": context.active_space_boundary_mode.value,
@@ -1620,7 +1718,9 @@ class MemoryExtractor:
         }
 
     @staticmethod
-    def _mind_perspective_payload(context: ExtractionConversationContext) -> dict[str, Any]:
+    def _mind_perspective_payload(
+        context: ExtractionConversationContext,
+    ) -> dict[str, Any]:
         return {
             "memory_owner_id": context.active_mind_id,
             "source_mind_id": context.source_mind_id or context.active_mind_id,
@@ -1646,7 +1746,10 @@ class MemoryExtractor:
 
     @staticmethod
     def _subject_presence_ids(
-        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        item: ExtractedEvidence
+        | ExtractedBelief
+        | ExtractedContractSignal
+        | ExtractedStateUpdate,
         context: ExtractionConversationContext,
     ) -> list[str]:
         valid_ids = [
@@ -1662,12 +1765,16 @@ class MemoryExtractor:
         return resolved
 
     @staticmethod
-    def _namespace_context(context: ExtractionConversationContext) -> MemoryNamespaceContext:
+    def _namespace_context(
+        context: ExtractionConversationContext,
+    ) -> MemoryNamespaceContext:
         return MemoryNamespaceContext(
             user_id=context.user_id,
             user_persona_id=context.user_persona_id,
             platform_id=context.platform_id or "default",
-            character_id=context.character_id if context.character_id is not None else context.workspace_id,
+            character_id=context.character_id
+            if context.character_id is not None
+            else context.workspace_id,
             conversation_id=context.conversation_id,
             mode=context.mode or context.assistant_mode_id,
             incognito=context.incognito or context.isolated_mode,
@@ -1677,21 +1784,37 @@ class MemoryExtractor:
 
     @staticmethod
     def _allowed_write_scopes(context: ExtractionConversationContext) -> list[str]:
-        if context.incognito or context.isolated_mode or not context.remember_across_chats:
+        if (
+            context.incognito
+            or context.isolated_mode
+            or not context.remember_across_chats
+        ):
             return [MemoryScope.CHAT.value]
         scopes = [MemoryScope.CHAT.value]
-        if (context.character_id if context.character_id is not None else context.workspace_id) is not None:
+        if (
+            context.character_id
+            if context.character_id is not None
+            else context.workspace_id
+        ) is not None:
             scopes.append(MemoryScope.CHARACTER.value)
         scopes.append(MemoryScope.USER.value)
         return scopes
 
     @staticmethod
     def _canonical_write_scope(scope: MemoryScope) -> MemoryScope:
-        if scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION, MemoryScope.CHAT}:
+        if scope in {
+            MemoryScope.CONVERSATION,
+            MemoryScope.EPHEMERAL_SESSION,
+            MemoryScope.CHAT,
+        }:
             return MemoryScope.CHAT
         if scope in {MemoryScope.WORKSPACE, MemoryScope.CHARACTER}:
             return MemoryScope.CHARACTER
-        if scope in {MemoryScope.GLOBAL_USER, MemoryScope.ASSISTANT_MODE, MemoryScope.USER}:
+        if scope in {
+            MemoryScope.GLOBAL_USER,
+            MemoryScope.ASSISTANT_MODE,
+            MemoryScope.USER,
+        }:
             return MemoryScope.USER
         return MemoryScope.CHAT
 
@@ -1729,7 +1852,10 @@ class MemoryExtractor:
     def _resolve_write_policy(
         self,
         *,
-        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        item: ExtractedEvidence
+        | ExtractedBelief
+        | ExtractedContractSignal
+        | ExtractedStateUpdate,
         context: ExtractionConversationContext,
         privacy_filter_triggered: bool,
         force_chat: bool = False,
@@ -1739,16 +1865,25 @@ class MemoryExtractor:
         reasons: list[str] = []
         review_required = False
 
-        if is_restricted_intimacy_boundary(item.intimacy_boundary) and scope is MemoryScope.USER:
+        if (
+            is_restricted_intimacy_boundary(item.intimacy_boundary)
+            and scope is MemoryScope.USER
+        ):
             scope = MemoryScope.CHAT
             reasons.append("restricted_intimacy_forced_chat")
         if force_chat:
             scope = MemoryScope.CHAT
             if reason is not None:
                 reasons.append(reason)
-        if scope is MemoryScope.CHARACTER and (
-            context.character_id if context.character_id is not None else context.workspace_id
-        ) is None:
+        if (
+            scope is MemoryScope.CHARACTER
+            and (
+                context.character_id
+                if context.character_id is not None
+                else context.workspace_id
+            )
+            is None
+        ):
             scope = MemoryScope.CHAT
             review_required = True
             reasons.append("character_scope_missing_character_id_forced_chat")
@@ -1758,7 +1893,11 @@ class MemoryExtractor:
         if not context.remember_across_chats:
             scope = MemoryScope.CHAT
             reasons.append("remember_across_chats_disabled_forced_chat")
-        if context.temporary or context.purge_on_close or item.temporal_type == "ephemeral":
+        if (
+            context.temporary
+            or context.purge_on_close
+            or item.temporal_type == "ephemeral"
+        ):
             scope = MemoryScope.CHAT
             reasons.append("lifecycle_forced_chat")
 
@@ -1773,7 +1912,9 @@ class MemoryExtractor:
             or context.purge_on_close
             or item.temporal_type == "ephemeral"
         )
-        platform_locked = bool(item.platform_locked) or not context.remember_across_devices
+        platform_locked = (
+            bool(item.platform_locked) or not context.remember_across_devices
+        )
         platform_id_lock = context.platform_id if platform_locked else None
         if item.platform_locked:
             reasons.append("extractor_requested_platform_lock")
@@ -1794,7 +1935,10 @@ class MemoryExtractor:
     def _resolved_sensitivity(
         self,
         *,
-        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        item: ExtractedEvidence
+        | ExtractedBelief
+        | ExtractedContractSignal
+        | ExtractedStateUpdate,
         privacy_filter_triggered: bool,
     ) -> MemorySensitivity:
         sensitivity = item.sensitivity
@@ -1847,7 +1991,10 @@ class MemoryExtractor:
 
     @staticmethod
     def _resolved_themes(
-        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        item: ExtractedEvidence
+        | ExtractedBelief
+        | ExtractedContractSignal
+        | ExtractedStateUpdate,
     ) -> list[str]:
         themes = list(item.themes)
         if is_restricted_intimacy_boundary(item.intimacy_boundary):
@@ -1873,10 +2020,16 @@ class MemoryExtractor:
         valid_to: str | None,
         auto_expires: bool,
     ) -> str | None:
-        if not auto_expires or valid_to is not None or context.temporary_ttl_seconds is None:
+        if (
+            not auto_expires
+            or valid_to is not None
+            or context.temporary_ttl_seconds is None
+        ):
             return valid_to
         anchor = self._parse_temporal_datetime(occurred_at) or self._clock_now()
-        return (anchor + timedelta(seconds=int(context.temporary_ttl_seconds))).isoformat()
+        return (
+            anchor + timedelta(seconds=int(context.temporary_ttl_seconds))
+        ).isoformat()
 
     def _clock_now(self) -> datetime:
         return self._clock.now()
@@ -1893,7 +2046,9 @@ class MemoryExtractor:
             "profile_id": resolved_policy.profile_id.value,
             "user_persona_id": context.user_persona_id,
             "platform_id": context.platform_id,
-            "character_id": context.character_id if context.character_id is not None else context.workspace_id,
+            "character_id": context.character_id
+            if context.character_id is not None
+            else context.workspace_id,
             "active_mind_id": context.active_mind_id,
             "source_mind_id": context.source_mind_id or context.active_mind_id,
             "mind_topology": context.mind_topology.value,
@@ -1926,7 +2081,10 @@ class MemoryExtractor:
 
     def _resolved_temporal_fields(
         self,
-        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        item: ExtractedEvidence
+        | ExtractedBelief
+        | ExtractedContractSignal
+        | ExtractedStateUpdate,
         *,
         occurred_at: str | None,
     ) -> tuple[str | None, str | None, str]:
@@ -1935,7 +2093,11 @@ class MemoryExtractor:
         anchor = self._parse_temporal_datetime(occurred_at)
         valid_from = self._normalize_temporal_iso(item.valid_from_iso, anchor=anchor)
         valid_to = self._normalize_temporal_iso(item.valid_to_iso, anchor=anchor)
-        if item.temporal_type == "ephemeral" and valid_from is None and anchor is not None:
+        if (
+            item.temporal_type == "ephemeral"
+            and valid_from is None
+            and anchor is not None
+        ):
             valid_from = anchor.isoformat()
         return valid_from, valid_to, item.temporal_type
 
@@ -2000,7 +2162,9 @@ class MemoryExtractor:
                 },
             )
         except Exception:
-            logger.warning("Embedding upsert failed for memory_id=%s", memory_id, exc_info=True)
+            logger.warning(
+                "Embedding upsert failed for memory_id=%s", memory_id, exc_info=True
+            )
 
     async def _privacy_filter_pre_signal(self, text: str) -> dict[str, Any] | None:
         if not self._opf_enabled or self._privacy_filter_client is None:
@@ -2018,23 +2182,42 @@ class MemoryExtractor:
     def _iter_items(
         self,
         result: ExtractionResult,
-    ) -> list[tuple[MemoryObjectType, ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate]]:
+    ) -> list[
+        tuple[
+            MemoryObjectType,
+            ExtractedEvidence
+            | ExtractedBelief
+            | ExtractedContractSignal
+            | ExtractedStateUpdate,
+        ]
+    ]:
         items: list[
             tuple[
                 MemoryObjectType,
-                ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+                ExtractedEvidence
+                | ExtractedBelief
+                | ExtractedContractSignal
+                | ExtractedStateUpdate,
             ]
         ] = []
         items.extend((MemoryObjectType.EVIDENCE, item) for item in result.evidences)
         items.extend((MemoryObjectType.BELIEF, item) for item in result.beliefs)
-        items.extend((MemoryObjectType.INTERACTION_CONTRACT, item) for item in result.contract_signals)
-        items.extend((MemoryObjectType.STATE_SNAPSHOT, item) for item in result.state_updates)
+        items.extend(
+            (MemoryObjectType.INTERACTION_CONTRACT, item)
+            for item in result.contract_signals
+        )
+        items.extend(
+            (MemoryObjectType.STATE_SNAPSHOT, item) for item in result.state_updates
+        )
         return items
 
     def _resolve_status(
         self,
         *,
-        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        item: ExtractedEvidence
+        | ExtractedBelief
+        | ExtractedContractSignal
+        | ExtractedStateUpdate,
         object_type: MemoryObjectType,
         privacy_level: int,
         privacy_ceiling: int,
@@ -2061,7 +2244,10 @@ class MemoryExtractor:
     def _resolve_persistence_decision(
         self,
         *,
-        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        item: ExtractedEvidence
+        | ExtractedBelief
+        | ExtractedContractSignal
+        | ExtractedStateUpdate,
         object_type: MemoryObjectType,
         privacy_ceiling: int,
         message_text: str,
@@ -2099,19 +2285,33 @@ class MemoryExtractor:
                 )
             )
 
-        confirmed_count = int(consent_profile.get("confirmed_count", 0)) if consent_profile is not None else 0
-        declined_count = int(consent_profile.get("declined_count", 0)) if consent_profile is not None else 0
+        confirmed_count = (
+            int(consent_profile.get("confirmed_count", 0))
+            if consent_profile is not None
+            else 0
+        )
+        declined_count = (
+            int(consent_profile.get("declined_count", 0))
+            if consent_profile is not None
+            else 0
+        )
         if declined_count >= CONSENT_DECLINE_SUPPRESSION_THRESHOLD:
             return _PersistenceDecision(status=None, skip_item=True)
         # For user-role high-risk items, consent gating takes precedence over
         # the ceiling-based REVIEW_REQUIRED path. Retrieval-time privacy
         # filtering remains the actual enforcement layer, so pending
         # confirmation is the correct initial status here.
-        if requires_confirmation(
-            memory_category=item.memory_category,
-            privacy_level=item.privacy_level,
-        ) and confirmed_count < CONSENT_CONFIRM_THRESHOLD:
-            if context.confirmation_strategy is not ConfirmationStrategy.LIVE_PROMPT_ALLOWED:
+        if (
+            requires_confirmation(
+                memory_category=item.memory_category,
+                privacy_level=item.privacy_level,
+            )
+            and confirmed_count < CONSENT_CONFIRM_THRESHOLD
+        ):
+            if (
+                context.confirmation_strategy
+                is not ConfirmationStrategy.LIVE_PROMPT_ALLOWED
+            ):
                 return _PersistenceDecision(status=MemoryStatus.REVIEW_REQUIRED)
             return _PersistenceDecision(status=MemoryStatus.PENDING_USER_CONFIRMATION)
         return _PersistenceDecision(
@@ -2130,14 +2330,21 @@ class MemoryExtractor:
     def _active_threshold(
         self,
         object_type: MemoryObjectType,
-        item: ExtractedEvidence | ExtractedBelief | ExtractedContractSignal | ExtractedStateUpdate,
+        item: ExtractedEvidence
+        | ExtractedBelief
+        | ExtractedContractSignal
+        | ExtractedStateUpdate,
         message_text: str,
         role: str,
         cold_start: bool,
         explicit_user_statement: bool,
     ) -> float:
         if object_type is MemoryObjectType.EVIDENCE:
-            return COLD_START_EVIDENCE_ACTIVE_THRESHOLD if cold_start else NORMAL_EVIDENCE_ACTIVE_THRESHOLD
+            return (
+                COLD_START_EVIDENCE_ACTIVE_THRESHOLD
+                if cold_start
+                else NORMAL_EVIDENCE_ACTIVE_THRESHOLD
+            )
         if object_type is MemoryObjectType.BELIEF:
             if cold_start and role == "user" and not explicit_user_statement:
                 return COLD_START_BELIEF_ACTIVE_THRESHOLD
@@ -2193,7 +2400,10 @@ class MemoryExtractor:
     ) -> str | None:
         namespace_context = MemoryExtractor._namespace_context(context)
         canonical_scope = MemoryExtractor._canonical_write_scope(scope)
-        if canonical_scope is MemoryScope.CHARACTER and namespace_context.character_id is None:
+        if (
+            canonical_scope is MemoryScope.CHARACTER
+            and namespace_context.character_id is None
+        ):
             return None
         namespace_seed = namespace_scope_hash_seed(
             canonical_scope,
@@ -2220,13 +2430,20 @@ class MemoryExtractor:
 
     @classmethod
     def _tokenize(cls, text: str) -> list[str]:
-        return [cls._normalize_token(token) for token in _TOKEN_PATTERN.findall(text.lower())]
+        return [
+            cls._normalize_token(token)
+            for token in _TOKEN_PATTERN.findall(text.lower())
+        ]
 
     def _is_grounded(self, canonical_text: str, message_text: str) -> bool:
         return self._grounding_check(canonical_text, message_text).grounded
 
-    def _grounding_check(self, canonical_text: str, message_text: str) -> _GroundingCheck:
-        canonical_tokens = [token for token in self._tokenize(canonical_text) if len(token) >= 4]
+    def _grounding_check(
+        self, canonical_text: str, message_text: str
+    ) -> _GroundingCheck:
+        canonical_tokens = [
+            token for token in self._tokenize(canonical_text) if len(token) >= 4
+        ]
         message_tokens = set(self._tokenize(message_text))
         normalized_canonical = " ".join(self._tokenize(canonical_text))
         normalized_message = " ".join(self._tokenize(message_text))

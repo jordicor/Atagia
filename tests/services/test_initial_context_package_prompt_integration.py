@@ -10,9 +10,12 @@ import pytest
 
 from atagia.app import AppRuntime, initialize_runtime
 from atagia.core.config import Settings
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
 from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.repositories import ConversationRepository
+from atagia.core.space_repository import SpaceRepository
 from atagia.models.schemas_initial_context_package import InitialContextPackageKind
 from atagia.models.schemas_replay import AblationConfig
 from atagia.services.chat_service import ChatService
@@ -22,9 +25,14 @@ from atagia.services.chat_support import (
     resolve_policy,
 )
 from atagia.services.initial_context_package_builder import InitialContextPackageBuilder
+from atagia.services.initial_context_package_prompt import (
+    _expected_packages,
+    _read_expected_package,
+)
 from atagia.services.initial_context_package_refresh_service import (
     InitialContextPackageRefreshEnqueuer,
 )
+from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -36,10 +44,15 @@ from atagia.services.llm_client import (
 from atagia.services.sidecar_service import SidecarService
 from atagia.models.schemas_jobs import InitialContextPackageRefreshReason
 from atagia.models.schemas_jobs import WorkerControlMode
+from atagia.models.schemas_memory import SpaceBoundaryMode
 from atagia.services.worker_control_service import WorkerControlService
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
@@ -293,10 +306,36 @@ async def test_sidecar_reads_prepared_package_without_llm(
         assert provider.requests == []
         assert context.initial_context_package["rendered"] is True
         assert {
-            package["status"] for package in context.initial_context_package["packages"]
-        } == {"hit"}
+            package["package_kind"]: package["status"]
+            for package in context.initial_context_package["packages"]
+        } == {"baseline": "hit", "conversation": "stale"}
+        assert context.initial_context_package["refresh_requested"] is True
+        assert (
+            context.initial_context_package["refresh_jobs"]["conversation"] is not None
+        )
         assert "<prepared_initial_context>" in context.system_prompt
-        assert "Conversation Prepared Context" in context.system_prompt
+        assert "Baseline Prepared Context" in context.system_prompt
+        assert "Conversation Prepared Context" not in context.system_prompt
+
+        connection = await runtime.open_connection()
+        try:
+            row = await (
+                await connection.execute(
+                    """
+                    SELECT status, recovery_envelope_json
+                    FROM worker_job_runs
+                    WHERE job_id = ?
+                    """,
+                    (context.initial_context_package["refresh_jobs"]["conversation"],),
+                )
+            ).fetchone()
+            assert row is not None
+            assert row["status"] == "queued"
+            recovery_envelope = json.loads(row["recovery_envelope_json"])
+            assert recovery_envelope["payload"]["package_kind"] == "conversation"
+            assert recovery_envelope["payload"]["reason"] == "source_changed"
+        finally:
+            await connection.close()
     finally:
         await runtime.close()
 
@@ -328,6 +367,7 @@ async def test_sidecar_reports_stale_and_signature_mismatch_without_rendering(
             package["status"]
             for package in stale_context.initial_context_package["packages"]
         } == {"stale"}
+        assert stale_context.initial_context_package["refresh_requested"] is True
         assert "<prepared_initial_context>" not in stale_context.system_prompt
     finally:
         await runtime.close()
@@ -350,8 +390,153 @@ async def test_sidecar_reports_stale_and_signature_mismatch_without_rendering(
         assert {
             package["status"]
             for package in mismatch_context.initial_context_package["packages"]
-        } == {"signature_mismatch"}
+        } == {"miss"}
+        assert mismatch_context.initial_context_package["refresh_requested"] is True
         assert "<prepared_initial_context>" not in mismatch_context.system_prompt
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinate_key_miss_does_not_stale_current_baseline_variant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _warm_conversation(runtime)
+        setup_connection = await runtime.open_connection()
+        try:
+            await SpaceRepository(setup_connection, runtime.clock).resolve_space(
+                owner_user_id="usr_1",
+                space_id="space_variant",
+                boundary_mode=SpaceBoundaryMode.FOCUS,
+                display_name="Coordinate variant",
+                source_kind="explicit",
+                source_id="space_variant",
+            )
+        finally:
+            await setup_connection.close()
+        await _materialize_packages(runtime)
+        connection = await runtime.open_connection()
+        try:
+            repository = InitialContextPackageRepository(connection, runtime.clock)
+            baseline_row = await (
+                await connection.execute(
+                    """
+                    SELECT package_key_hash
+                    FROM initial_context_packages
+                    WHERE user_id = ?
+                      AND package_kind = 'baseline'
+                      AND build_status = 'active'
+                    LIMIT 1
+                    """,
+                    ("usr_1",),
+                )
+            ).fetchone()
+            assert baseline_row is not None
+            original = await repository.get_by_key_hash(
+                user_id="usr_1",
+                package_key_hash=str(baseline_row["package_key_hash"]),
+                include_inactive=True,
+            )
+            assert original is not None
+            original_bytes = original.model_dump(mode="json")
+            source_conversation = await ConversationRepository(
+                connection,
+                runtime.clock,
+            ).get_conversation("cnv_1", "usr_1")
+            assert source_conversation is not None
+            operational_profile = resolve_operational_profile(
+                loader=runtime.operational_profile_loader,
+                settings=runtime.settings,
+            )
+            canonical_policy = resolve_policy(
+                runtime.manifests,
+                "coding_debug",
+                runtime.policy_resolver,
+                operational_profile,
+            )
+            canonical_policy = apply_conversation_policy_overlay(
+                canonical_policy,
+                source_conversation,
+            )
+            stale_caller = dict(source_conversation)
+            stale_caller["incognito"] = 1
+            stale_caller["isolated_mode"] = 1
+            canonical_expected = await _expected_packages(
+                connection,
+                clock=runtime.clock,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                conversation=stale_caller,
+                resolved_policy=canonical_policy,
+                privacy_enforcement="enforce",
+                operational_profile=operational_profile.snapshot,
+            )
+            canonical_reads = [
+                await _read_expected_package(repository, request)
+                for request in canonical_expected
+            ]
+            assert len(canonical_reads) == 2
+            assert all(read.package is not None for read in canonical_reads)
+            assert {read.diagnostics["status"] for read in canonical_reads} == {"hit"}
+
+            await ConversationRepository(connection, runtime.clock).create_conversation(
+                "cnv_variant",
+                "usr_1",
+                source_conversation.get("workspace_id"),
+                "coding_debug",
+                "Coordinate variant",
+                user_persona_id=original.key_json.subject_json["user_persona_id"],
+                platform_id=original.key_json.subject_json["platform_id"],
+                character_id=original.key_json.subject_json["character_id"],
+                active_space_id="space_variant",
+            )
+            conversation = await ConversationRepository(
+                connection,
+                runtime.clock,
+            ).get_conversation("cnv_variant", "usr_1")
+            assert conversation is not None
+            resolved_policy = resolve_policy(
+                runtime.manifests,
+                "coding_debug",
+                runtime.policy_resolver,
+                operational_profile,
+            )
+            resolved_policy = apply_conversation_policy_overlay(
+                resolved_policy,
+                conversation,
+            )
+            expected = await _expected_packages(
+                connection,
+                clock=runtime.clock,
+                user_id="usr_1",
+                conversation_id="cnv_variant",
+                conversation=conversation,
+                resolved_policy=resolved_policy,
+                privacy_enforcement="enforce",
+                operational_profile=operational_profile.snapshot,
+            )
+            baseline_request = next(
+                request
+                for request in expected
+                if request.kind == InitialContextPackageKind.BASELINE
+            )
+            read = await _read_expected_package(repository, baseline_request)
+
+            assert read.package is None
+            assert read.diagnostics["status"] == "signature_mismatch"
+            assert read.refresh_required is True
+            after = await repository.get_by_key_hash(
+                user_id="usr_1",
+                package_key_hash=original.package_key_hash,
+                include_inactive=True,
+            )
+            assert after is not None
+            assert after.model_dump(mode="json") == original_bytes
+        finally:
+            await connection.close()
     finally:
         await runtime.close()
 
@@ -419,13 +604,19 @@ async def test_refresh_enqueue_marks_existing_package_stale_before_worker(
             enqueuer = InitialContextPackageRefreshEnqueuer(
                 storage_backend=runtime.storage_backend,
                 clock=runtime.clock,
+                job_tracking_service=JobTrackingService(
+                    connection,
+                    runtime.clock,
+                    workers_enabled=runtime.settings.workers_enabled,
+                    settings=runtime.settings,
+                ),
                 package_repository=repository,
             )
             await enqueuer.enqueue_refresh(
                 user_id="usr_1",
                 conversation_id="cnv_1",
                 retrieval_profile_id="coding_debug",
-                reason=InitialContextPackageRefreshReason.MESSAGE_WRITE,
+                reason=InitialContextPackageRefreshReason.COORDINATE_CHANGE,
                 source_message_ids=["warm-assistant-1"],
                 operational_profile=resolve_operational_profile(
                     loader=runtime.operational_profile_loader,
@@ -485,6 +676,65 @@ async def test_refresh_disabled_still_marks_existing_package_stale(
             )
             assert refresh_job_id is None
             assert stale.status == "stale"
+        finally:
+            await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_read_side_refresh_does_not_stale_newer_active_row_when_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _warm_conversation(runtime)
+        await _materialize_packages(runtime)
+
+        connection = await runtime.open_connection()
+        try:
+            repository = InitialContextPackageRepository(connection, runtime.clock)
+            observed = await repository.get_latest_for_conversation(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                retrieval_profile_id="coding_debug",
+            )
+            assert observed is not None
+
+            await _materialize_packages(runtime)
+            newer = await repository.get_latest_for_conversation(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                retrieval_profile_id="coding_debug",
+            )
+            assert newer is not None
+            assert newer.package_row_version > observed.package_row_version
+            newer_bytes = newer.model_dump(mode="json")
+
+            refresh_job_id = await InitialContextPackageRefreshEnqueuer(
+                storage_backend=runtime.storage_backend,
+                clock=runtime.clock,
+                package_repository=repository,
+                refresh_enabled=False,
+            ).enqueue_refresh(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                package_kind=InitialContextPackageKind.CONVERSATION,
+                retrieval_profile_id="coding_debug",
+                reason=InitialContextPackageRefreshReason.SOURCE_CHANGED,
+                mark_existing_packages_stale=False,
+            )
+
+            after = await repository.get_latest_for_conversation(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                retrieval_profile_id="coding_debug",
+                include_inactive=True,
+            )
+            assert refresh_job_id is None
+            assert after is not None
+            assert after.model_dump(mode="json") == newer_bytes
         finally:
             await connection.close()
     finally:

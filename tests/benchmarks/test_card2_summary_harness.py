@@ -17,6 +17,10 @@ from benchmarks.card2_summary.cases import (
     load_cases,
 )
 from benchmarks.card2_summary.fake_provider import FakeSummaryProvider
+from benchmarks.card2_summary.live_provider import (
+    _first_environment_value,
+    build_live_provider,
+)
 from benchmarks.card2_summary.runner import run_harness
 
 
@@ -34,9 +38,48 @@ def test_load_cases_partitions_cover_every_seq() -> None:
         assert covered == message_seqs, case.case_id
 
 
+def test_public_realistic_fixture_v2_shape_is_stable() -> None:
+    realistic = load_cases("realistic")
+
+    assert FROZEN_RANGE_FIXTURE_ID == "card2_frozen_ranges_v2"
+    assert [len(case.messages) for case in realistic] == [8, 12, 10, 15, 8]
+    assert {case.case_id for case in realistic} == {
+        "public_errand_checklist",
+        "public_maker_space_planning",
+        "public_photo_archive_workflow",
+        "public_quick_task_switches",
+        "public_digital_cleanup_reflection",
+    }
+
+
 def test_load_cases_rejects_unknown_set() -> None:
     with pytest.raises(ValueError):
         load_cases("bogus")
+
+
+def test_live_provider_key_resolution_uses_public_environment_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_OPENROUTER_API_KEY", "atagia-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "generic-key")
+
+    assert (
+        _first_environment_value(
+            "ATAGIA_OPENROUTER_API_KEY",
+            "OPENROUTER_API_KEY",
+        )
+        == "atagia-key"
+    )
+
+
+def test_live_provider_fails_fast_without_required_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ATAGIA_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    with pytest.raises(SystemExit, match="OPENROUTER_API_KEY"):
+        build_live_provider("openrouter/google/gemini-3.1-flash-lite")
 
 
 async def test_harness_full_coverage_retry_and_concurrency_cap() -> None:

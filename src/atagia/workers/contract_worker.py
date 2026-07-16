@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import hashlib
 import logging
 
@@ -11,7 +12,9 @@ import aiosqlite
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.contract_repository import ContractDimensionRepository
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
 from atagia.core.storage_backend import StorageBackend
 from atagia.core.repositories import (
     ConversationRepository,
@@ -40,14 +43,24 @@ from atagia.services.chat_support import apply_conversation_policy_overlay
 from atagia.services.initial_context_package_refresh_service import (
     InitialContextPackageRefreshEnqueuer,
 )
+from atagia.services.job_execution_context import (
+    TransientJobLockUnavailable,
+    acquire_current_job_lock,
+    current_derivation_dedupe_scope,
+    release_current_job_lock,
+    require_current_job_lock_scope,
+)
 from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.llm_client import LLMClient, StructuredOutputError
-from atagia.services.worker_control_service import WorkerControlService, wait_if_worker_claims_paused
+from atagia.services.worker_control_service import (
+    WorkerControlService,
+    wait_if_worker_claims_paused,
+)
+from atagia.services.worker_effect_fence import WorkerEffectFence
+from atagia.services.worker_job_lease import JobLeaseLostError, WorkerJobLease
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
-CONTRACT_DEDUPE_TTL_SECONDS = 60 * 60 * 24
-STREAM_RECLAIM_IDLE_MS = 1_000
 MAX_STREAM_DELIVERIES = 3
 
 
@@ -62,6 +75,7 @@ class ContractWorker:
         clock: Clock,
         manifest_loader: ManifestLoader,
         settings: Settings | None = None,
+        job_connection: aiosqlite.Connection | None = None,
     ) -> None:
         self._storage_backend = storage_backend
         self._manifest_loader = manifest_loader
@@ -70,11 +84,17 @@ class ContractWorker:
         self._clock = clock
         self._worker_control = WorkerControlService(connection, clock)
         resolved_settings = settings or Settings.from_env()
+        self._settings = resolved_settings
+        self._stream_reclaim_idle_ms = int(
+            resolved_settings.worker_stream_reclaim_idle_seconds * 1000
+        )
+        self._effect_fence = WorkerEffectFence(connection, clock)
         self._job_tracking = JobTrackingService(
-            connection,
+            job_connection or connection,
             clock,
             workers_enabled=resolved_settings.workers_enabled,
             settings=resolved_settings,
+            child_job_connection=connection,
         )
         self._initial_context_package_refresh = InitialContextPackageRefreshEnqueuer(
             storage_backend=storage_backend,
@@ -95,7 +115,9 @@ class ContractWorker:
         )
 
     async def run(self, consumer_name: str = "contract-1") -> None:
-        await self._storage_backend.stream_ensure_group(CONTRACT_STREAM_NAME, WORKER_GROUP_NAME)
+        await self._storage_backend.stream_ensure_group(
+            CONTRACT_STREAM_NAME, WORKER_GROUP_NAME
+        )
         while True:
             try:
                 await self.run_once(consumer_name=consumer_name, block_ms=5000)
@@ -122,19 +144,62 @@ class ContractWorker:
 
         acked = 0
         failed = 0
+        deferred = 0
         dead_lettered = 0
         for message in messages:
-            try:
-                await self._job_tracking.mark_running(message)
-                await self.process_job(message.payload)
-                await self._job_tracking.mark_succeeded(message)
+            claim = await self._job_tracking.claim_notification(
+                message,
+                owner_id=consumer_name,
+            )
+            if claim is None:
                 await self._storage_backend.stream_ack(
                     CONTRACT_STREAM_NAME,
                     WORKER_GROUP_NAME,
                     message.message_id,
                 )
                 acked += 1
+                continue
+            lease = WorkerJobLease(
+                self._job_tracking,
+                claim,
+                effect_fence=self._effect_fence,
+            )
+            try:
+                lock_deferred = False
+                async with lease:
+                    try:
+                        await self.process_job(claim.envelope.model_dump(mode="json"))
+                    except TransientJobLockUnavailable as exc:
+                        await lease.defer(
+                            exc,
+                            deferred_until=(
+                                self._clock.now()
+                                + timedelta(
+                                    seconds=self._settings.worker_transient_defer_seconds
+                                )
+                            ),
+                        )
+                        lock_deferred = True
+                    else:
+                        await lease.succeed()
+                await self._storage_backend.stream_ack(
+                    CONTRACT_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
+                if lock_deferred:
+                    deferred += 1
+                else:
+                    acked += 1
+            except JobLeaseLostError:
+                await self._storage_backend.stream_ack(
+                    CONTRACT_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
             except Exception as exc:
+                if lock_deferred:
+                    raise
                 failed += 1
                 if isinstance(exc, StructuredOutputError):
                     details = "; ".join(exc.details) if exc.details else str(exc)
@@ -144,15 +209,32 @@ class ContractWorker:
                         details,
                     )
                 else:
-                    logger.exception("Failed to process contract job %s", message.message_id)
-                if await self._dead_letter_if_exhausted(message, exc):
+                    logger.exception(
+                        "Failed to process contract job %s", message.message_id
+                    )
+                if claim.attempt_count >= MAX_STREAM_DELIVERIES:
+                    finalized = await lease.dead_letter(
+                        self._storage_backend,
+                        stream_name=CONTRACT_STREAM_NAME,
+                        group_name=WORKER_GROUP_NAME,
+                        message=message,
+                        exc=exc,
+                    )
+                    if not finalized:
+                        continue
                     dead_lettered += 1
                 else:
-                    await self._job_tracking.mark_retrying(message, exc)
+                    await lease.retry(exc)
+                    await self._storage_backend.stream_ack(
+                        CONTRACT_STREAM_NAME,
+                        WORKER_GROUP_NAME,
+                        message.message_id,
+                    )
         return WorkerIterationResult(
             received=len(messages),
             acked=acked,
             failed=failed,
+            deferred=deferred,
             dead_lettered=dead_lettered,
         )
 
@@ -163,17 +245,27 @@ class ContractWorker:
         if envelope.conversation_id is None:
             raise ValueError("Contract projection jobs require conversation_id")
         job_payload = MessageJobPayload.model_validate(envelope.payload)
-        dedupe_key = self._contract_dedupe_key(
+        projection_key = self._contract_projection_key(
             user_id=envelope.user_id,
             conversation_id=envelope.conversation_id,
             message_id=job_payload.message_id,
+            derivation_scope=current_derivation_dedupe_scope(
+                user_id=envelope.user_id,
+                job_id=envelope.job_id,
+            ),
         )
-        lock_token = await self._storage_backend.acquire_lock(f"{dedupe_key}:lock", ttl_seconds=60)
-        if lock_token is None:
-            return
+        lock_scope = require_current_job_lock_scope(
+            user_id=envelope.user_id,
+            job_id=envelope.job_id,
+        )
+        lock_key = f"{projection_key}:lock"
+        lock_token = await acquire_current_job_lock(
+            self._storage_backend,
+            lock_key,
+            60,
+            scope=lock_scope,
+        )
         try:
-            if await self._storage_backend.has_dedupe(dedupe_key):
-                return
             active_user = await self._user_repository.get_active_user(envelope.user_id)
             if active_user is None:
                 return
@@ -181,12 +273,17 @@ class ContractWorker:
                 envelope.conversation_id,
                 envelope.user_id,
             )
-            if conversation is None or str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
+            if (
+                conversation is None
+                or str(conversation.get("status")) != ConversationStatus.ACTIVE.value
+            ):
                 return
 
             manifest = self._manifest_loader.get(job_payload.assistant_mode_id)
             resolved_policy = self._policy_resolver.resolve(manifest, None, None)
-            resolved_policy = apply_conversation_policy_overlay(resolved_policy, conversation)
+            resolved_policy = apply_conversation_policy_overlay(
+                resolved_policy, conversation
+            )
             context = ExtractionConversationContext(
                 user_id=envelope.user_id,
                 conversation_id=envelope.conversation_id,
@@ -198,14 +295,20 @@ class ContractWorker:
                     if job_payload.user_persona_id is not None
                     else conversation.get("user_persona_id")
                 ),
-                platform_id=str(job_payload.platform_id or conversation.get("platform_id") or "default"),
+                platform_id=str(
+                    job_payload.platform_id
+                    or conversation.get("platform_id")
+                    or "default"
+                ),
                 character_id=(
                     job_payload.character_id
                     if job_payload.character_id is not None
-                    else conversation.get("character_id") or conversation.get("workspace_id")
+                    else conversation.get("character_id")
+                    or conversation.get("workspace_id")
                 ),
                 active_presence_id=(
-                    job_payload.active_presence_id or conversation.get("active_presence_id")
+                    job_payload.active_presence_id
+                    or conversation.get("active_presence_id")
                 ),
                 active_presence_kind=job_payload.active_presence_kind,
                 active_presence_display_name=job_payload.active_presence_display_name,
@@ -249,8 +352,7 @@ class ContractWorker:
                     or "direct_if_same_body"
                 ),
                 active_realm_id=(
-                    job_payload.active_realm_id
-                    or conversation.get("active_realm_id")
+                    job_payload.active_realm_id or conversation.get("active_realm_id")
                 ),
                 active_realm_display_name=job_payload.active_realm_display_name,
                 cross_realm_mode=(
@@ -258,19 +360,27 @@ class ContractWorker:
                     or conversation.get("cross_realm_mode")
                     or "none"
                 ),
-                mode=str(job_payload.mode or conversation.get("mode") or job_payload.assistant_mode_id),
+                mode=str(
+                    job_payload.mode
+                    or conversation.get("mode")
+                    or job_payload.assistant_mode_id
+                ),
                 recent_messages=[
                     ExtractionContextMessage.model_validate(item)
                     for item in job_payload.recent_messages
                 ],
-                temporary=bool(conversation.get("temporary")) or bool(job_payload.temporary),
+                temporary=bool(conversation.get("temporary"))
+                or bool(job_payload.temporary),
                 temporary_ttl_seconds=self._strictest_ttl(
                     job_payload.temporary_ttl_seconds,
                     conversation.get("temporary_ttl_seconds"),
                 ),
-                purge_on_close=bool(conversation.get("purge_on_close")) or bool(job_payload.purge_on_close),
-                isolated_mode=bool(conversation.get("isolated_mode")) or bool(job_payload.isolated_mode),
-                incognito=bool(conversation.get("incognito")) or bool(job_payload.incognito),
+                purge_on_close=bool(conversation.get("purge_on_close"))
+                or bool(job_payload.purge_on_close),
+                isolated_mode=bool(conversation.get("isolated_mode"))
+                or bool(job_payload.isolated_mode),
+                incognito=bool(conversation.get("incognito"))
+                or bool(job_payload.incognito),
                 remember_across_chats=(
                     bool(job_payload.remember_across_chats)
                     and bool(active_user["remember_across_chats"])
@@ -298,10 +408,6 @@ class ContractWorker:
                 user_id=envelope.user_id,
                 occurred_at=job_payload.message_occurred_at,
             )
-            await self._storage_backend.remember_dedupe(
-                dedupe_key,
-                CONTRACT_DEDUPE_TTL_SECONDS,
-            )
             await self._initial_context_package_refresh.enqueue_refresh(
                 user_id=envelope.user_id,
                 conversation_id=envelope.conversation_id,
@@ -310,10 +416,16 @@ class ContractWorker:
                 source_message_ids=[job_payload.message_id],
                 privacy_enforcement=job_payload.privacy_enforcement,
                 operational_profile=envelope.operational_profile,
+                parent_job_id=envelope.job_id,
                 fail_open=True,
             )
         finally:
-            await self._storage_backend.release_lock(f"{dedupe_key}:lock", lock_token)
+            await release_current_job_lock(
+                self._storage_backend,
+                lock_key,
+                lock_token,
+                scope=lock_scope,
+            )
 
     @staticmethod
     def _strictest_ttl(source_ttl: int | None, current_ttl: object) -> int | None:
@@ -327,8 +439,16 @@ class ContractWorker:
         return min(values)
 
     @staticmethod
-    def _contract_dedupe_key(*, user_id: str, conversation_id: str, message_id: str) -> str:
-        raw_key = f"{user_id}:{conversation_id}:{message_id}:contract"
+    def _contract_projection_key(
+        *,
+        user_id: str,
+        conversation_id: str,
+        message_id: str,
+        derivation_scope: str = "unclaimed",
+    ) -> str:
+        raw_key = (
+            f"{user_id}:{conversation_id}:{message_id}:{derivation_scope}:contract"
+        )
         return f"contract:{hashlib.sha256(raw_key.encode('utf-8')).hexdigest()}"
 
     async def _next_messages(
@@ -341,7 +461,7 @@ class ContractWorker:
             CONTRACT_STREAM_NAME,
             WORKER_GROUP_NAME,
             consumer_name,
-            min_idle_ms=0 if block_ms == 0 else STREAM_RECLAIM_IDLE_MS,
+            min_idle_ms=self._stream_reclaim_idle_ms,
             count=1,
         )
         if reclaimed:
@@ -353,32 +473,3 @@ class ContractWorker:
             count=1,
             block_ms=block_ms,
         )
-
-    async def _dead_letter_if_exhausted(
-        self,
-        message: StreamMessage,
-        exc: Exception,
-    ) -> bool:
-        if message.delivery_count < MAX_STREAM_DELIVERIES:
-            return False
-        await self._storage_backend.enqueue_job(
-            f"dead_letter:{CONTRACT_STREAM_NAME}",
-            {
-                "message_id": message.message_id,
-                "delivery_count": message.delivery_count,
-                "payload": message.payload,
-                "error": str(exc),
-                "error_details": (
-                    list(exc.details)
-                    if isinstance(exc, StructuredOutputError)
-                    else []
-                ),
-            },
-        )
-        await self._storage_backend.stream_ack(
-            CONTRACT_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            message.message_id,
-        )
-        await self._job_tracking.mark_dead_lettered(message, exc)
-        return True

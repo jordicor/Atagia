@@ -23,8 +23,12 @@ from atagia.core.repositories import (
 from atagia.core.summary_repository import SummaryRepository
 from atagia.core.storage_backend import InProcessBackend
 from atagia.memory.extractor import MemoryExtractor
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
-from atagia.models.schemas_jobs import JobType, REVISE_STREAM_NAME
+from atagia.memory.policy_manifest import (
+    ManifestLoader,
+    PolicyResolver,
+    sync_assistant_modes,
+)
+from atagia.models.schemas_jobs import JobEnvelope, JobType, REVISE_STREAM_NAME
 from atagia.models.schemas_memory import (
     ExtractionConversationContext,
     MemoryObjectType,
@@ -49,14 +53,19 @@ from atagia.services.llm_client import (
     StructuredOutputError,
 )
 from atagia.services.llm_run_guard import LLMRunGuardDecision
+from atagia.services.job_tracking_service import JobTrackingService
 from tests.extraction_payload_support import (
     is_memory_extraction_card_purpose,
     memory_extraction_card_output_from_payload,
     rich_extraction_payload_to_lean,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 _MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES = {
     "memory_extraction_kind_scope_card",
     "memory_extraction_evidence_card",
@@ -81,10 +90,14 @@ class NoOpProvider(LLMProvider):
     name = "admin-rebuild-service-tests"
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        raise AssertionError(f"LLM completion is not expected in this test: {request.metadata}")
+        raise AssertionError(
+            f"LLM completion is not expected in this test: {request.metadata}"
+        )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        raise AssertionError(f"Embedding is not expected in this test: {request.metadata}")
+        raise AssertionError(
+            f"Embedding is not expected in this test: {request.metadata}"
+        )
 
 
 class ExtractorProvider(LLMProvider):
@@ -122,7 +135,9 @@ class ExtractorProvider(LLMProvider):
         )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        raise AssertionError(f"Embedding is not expected in this test: {request.metadata}")
+        raise AssertionError(
+            f"Embedding is not expected in this test: {request.metadata}"
+        )
 
 
 class RebuildReplayProvider(LLMProvider):
@@ -140,9 +155,7 @@ class RebuildReplayProvider(LLMProvider):
             prompt = request.messages[1].content
             if purpose == "memory_extraction_candidate_card":
                 canonical_text = (
-                    "Assistant plan"
-                    if "Assistant plan" in prompt
-                    else "User fact"
+                    "Assistant plan" if "Assistant plan" in prompt else "User fact"
                 )
                 self._active_extraction_payload = rich_extraction_payload_to_lean(
                     {
@@ -222,9 +235,13 @@ class RebuildReplayProvider(LLMProvider):
             "summary_chunk_segmentation_summaries_card",
         }:
             prompt = request.messages[1].content
-            message_sequences = _message_sequences_from_last_conversation_messages(prompt)
+            message_sequences = _message_sequences_from_last_conversation_messages(
+                prompt
+            )
             if not message_sequences:
-                raise AssertionError("Expected message sequences in chunk segmentation prompt")
+                raise AssertionError(
+                    "Expected message sequences in chunk segmentation prompt"
+                )
             chunk_range = f"{min(message_sequences)}-{max(message_sequences)}"
             if purpose == "summary_chunk_segmentation_ranges_card":
                 output_text = chunk_range
@@ -240,7 +257,9 @@ class RebuildReplayProvider(LLMProvider):
             prompt = request.messages[1].content
             chunk_ids = re.findall(r'<conversation_chunk id="([^"]+)"', prompt)
             if not chunk_ids:
-                raise AssertionError("Expected conversation chunk IDs in episode synthesis prompt")
+                raise AssertionError(
+                    "Expected conversation chunk IDs in episode synthesis prompt"
+                )
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
@@ -279,10 +298,14 @@ class RebuildReplayProvider(LLMProvider):
                     }
                 ),
             )
-        raise AssertionError(f"Unexpected completion purpose in rebuild replay test: {purpose}")
+        raise AssertionError(
+            f"Unexpected completion purpose in rebuild replay test: {purpose}"
+        )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        raise AssertionError(f"Embedding is not expected in this test: {request.metadata}")
+        raise AssertionError(
+            f"Embedding is not expected in this test: {request.metadata}"
+        )
 
 
 class EpisodeOutputLimitReplayProvider(RebuildReplayProvider):
@@ -298,11 +321,17 @@ class EpisodeOutputLimitReplayProvider(RebuildReplayProvider):
         }:
             self.requests.append(request)
             prompt = request.messages[1].content
-            message_sequences = _message_sequences_from_last_conversation_messages(prompt)
+            message_sequences = _message_sequences_from_last_conversation_messages(
+                prompt
+            )
             if not message_sequences:
-                raise AssertionError("Expected message sequences in chunk segmentation prompt")
+                raise AssertionError(
+                    "Expected message sequences in chunk segmentation prompt"
+                )
             if purpose == "summary_chunk_segmentation_ranges_card":
-                output_text = "\n".join(f"{sequence}-{sequence}" for sequence in message_sequences)
+                output_text = "\n".join(
+                    f"{sequence}-{sequence}" for sequence in message_sequences
+                )
             else:
                 # Card 2 is per-range now: one single-message slice per call, so
                 # emit raw summary text for that range, no label.
@@ -333,7 +362,9 @@ class RecordingEmbeddingIndex(EmbeddingIndex):
     def vector_limit(self) -> int:
         return 1
 
-    async def upsert(self, memory_id: str, text: str, metadata: dict[str, object]) -> None:
+    async def upsert(
+        self, memory_id: str, text: str, metadata: dict[str, object]
+    ) -> None:
         return None
 
     async def search(self, query: str, user_id: str, top_k: int):
@@ -341,6 +372,16 @@ class RecordingEmbeddingIndex(EmbeddingIndex):
 
     async def delete(self, memory_id: str) -> None:
         return None
+
+
+class FailOnceDeleteEmbeddingIndex(RecordingEmbeddingIndex):
+    def __init__(self) -> None:
+        self.delete_attempts: list[str] = []
+
+    async def delete(self, memory_id: str) -> None:
+        self.delete_attempts.append(memory_id)
+        if len(self.delete_attempts) == 1:
+            raise RuntimeError("injected embedding delete failure")
 
 
 def _settings(**overrides: object) -> Settings:
@@ -367,10 +408,14 @@ def _settings(**overrides: object) -> Settings:
 
 
 @pytest.mark.asyncio
-async def test_conversation_rebuild_purge_keeps_shared_cross_conversation_memory() -> None:
+async def test_conversation_rebuild_purge_keeps_shared_cross_conversation_memory() -> (
+    None
+):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -379,10 +424,18 @@ async def test_conversation_rebuild_purge_keeps_shared_cross_conversation_memory
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
-        await conversations.create_conversation("cnv_2", "usr_1", "wsp_1", "coding_debug", "Two")
-        await messages.create_message("msg_1", "cnv_1", "user", 1, "First conversation fact", 4, {})
-        await messages.create_message("msg_2", "cnv_2", "user", 1, "Second conversation fact", 4, {})
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
+        await conversations.create_conversation(
+            "cnv_2", "usr_1", "wsp_1", "coding_debug", "Two"
+        )
+        await messages.create_message(
+            "msg_1", "cnv_1", "user", 1, "First conversation fact", 4, {}
+        )
+        await messages.create_message(
+            "msg_2", "cnv_2", "user", 1, "Second conversation fact", 4, {}
+        )
         await memories.create_memory_object(
             user_id="usr_1",
             workspace_id="wsp_1",
@@ -422,7 +475,9 @@ async def test_conversation_rebuild_purge_keeps_shared_cross_conversation_memory
 
         service = AdminRebuildService(
             connection=connection,
-            llm_client=LLMClient(provider_name=NoOpProvider.name, providers=[NoOpProvider()]),
+            llm_client=LLMClient(
+                provider_name=NoOpProvider.name, providers=[NoOpProvider()]
+            ),
             embedding_index=None,
             clock=clock,
             manifest_loader=ManifestLoader(MANIFESTS_DIR),
@@ -440,17 +495,116 @@ async def test_conversation_rebuild_purge_keeps_shared_cross_conversation_memory
 
 
 @pytest.mark.asyncio
+async def test_conversation_purge_retry_drains_persisted_embedding_cleanup() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
+    users = UserRepository(connection, clock)
+    conversations = ConversationRepository(connection, clock)
+    messages = MessageRepository(connection, clock)
+    memories = MemoryObjectRepository(connection, clock)
+    embedding_index = FailOnceDeleteEmbeddingIndex()
+    try:
+        await users.create_user("usr_1")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", None, "coding_debug", "One"
+        )
+        await messages.create_message(
+            "msg_1", "cnv_1", "user", 1, "Conversation fact", 4, {}
+        )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Conversation-owned evidence",
+            payload={"source_message_ids": ["msg_1"]},
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.9,
+            vitality=0.5,
+            privacy_level=0,
+            status=MemoryStatus.ACTIVE,
+            memory_id="mem_owned",
+        )
+        service = AdminRebuildService(
+            connection=connection,
+            llm_client=LLMClient(
+                provider_name=NoOpProvider.name, providers=[NoOpProvider()]
+            ),
+            embedding_index=embedding_index,
+            clock=clock,
+            manifest_loader=ManifestLoader(MANIFESTS_DIR),
+            settings=_settings(),
+        )
+
+        with pytest.raises(RuntimeError, match="injected embedding delete failure"):
+            await service._purge_conversation_state("usr_1", "cnv_1")
+
+        assert await memories.get_memory_object("mem_owned", "usr_1") is None
+        cursor = await connection.execute(
+            """
+            SELECT operation.id, operation.status, effect.status AS effect_status
+            FROM admin_maintenance_operations AS operation
+            JOIN admin_maintenance_effects AS effect
+              ON effect.operation_id = operation.id
+            WHERE operation.operation_kind = 'purge_conversation_state'
+              AND effect.target_id = 'mem_owned'
+            """
+        )
+        failed = await cursor.fetchone()
+        assert failed is not None
+        assert (failed["status"], failed["effect_status"]) == (
+            "remediation_required",
+            "pending",
+        )
+
+        await service._purge_conversation_state("usr_1", "cnv_1")
+
+        cursor = await connection.execute(
+            """
+            SELECT operation.id, operation.status, effect.status AS effect_status
+            FROM admin_maintenance_operations AS operation
+            JOIN admin_maintenance_effects AS effect
+              ON effect.operation_id = operation.id
+            WHERE operation.operation_kind = 'purge_conversation_state'
+              AND effect.target_id = 'mem_owned'
+            """
+        )
+        recovered = await cursor.fetchone()
+        assert recovered is not None
+        assert recovered["id"] == failed["id"]
+        assert (recovered["status"], recovered["effect_status"]) == (
+            "succeeded",
+            "completed",
+        )
+        assert embedding_index.delete_attempts == ["mem_owned", "mem_owned"]
+        lifecycle = await connection.execute(
+            "SELECT derivation_revision FROM user_lifecycles WHERE user_id = 'usr_1'"
+        )
+        assert int((await lifecycle.fetchone())["derivation_revision"]) == 2
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_extractor_shared_workspace_memory_survives_conversation_purge() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     messages = MessageRepository(connection, clock)
     memories = MemoryObjectRepository(connection, clock)
     manifest_loader = ManifestLoader(MANIFESTS_DIR)
-    resolved_policy = PolicyResolver().resolve(manifest_loader.load_all()["coding_debug"], None, None)
+    resolved_policy = PolicyResolver().resolve(
+        manifest_loader.load_all()["coding_debug"], None, None
+    )
     provider = ExtractorProvider(
         {
             "evidences": [
@@ -481,8 +635,12 @@ async def test_extractor_shared_workspace_memory_survives_conversation_purge() -
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
-        await conversations.create_conversation("cnv_2", "usr_1", "wsp_1", "coding_debug", "Two")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
+        await conversations.create_conversation(
+            "cnv_2", "usr_1", "wsp_1", "coding_debug", "Two"
+        )
         first = await messages.create_message(
             "msg_1",
             "cnv_1",
@@ -536,7 +694,9 @@ async def test_extractor_shared_workspace_memory_survives_conversation_purge() -
 
         service = AdminRebuildService(
             connection=connection,
-            llm_client=LLMClient(provider_name=NoOpProvider.name, providers=[NoOpProvider()]),
+            llm_client=LLMClient(
+                provider_name=NoOpProvider.name, providers=[NoOpProvider()]
+            ),
             embedding_index=None,
             clock=clock,
             manifest_loader=manifest_loader,
@@ -547,16 +707,22 @@ async def test_extractor_shared_workspace_memory_survives_conversation_purge() -
         await service._purge_conversation_state("usr_1", "cnv_1")
 
         assert purgeable_ids == []
-        assert await memories.get_memory_object(str(stored[0]["id"]), "usr_1") is not None
+        assert (
+            await memories.get_memory_object(str(stored[0]["id"]), "usr_1") is not None
+        )
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_conversation_rebuild_purge_removes_hierarchy_summaries_and_mirrors() -> None:
+async def test_conversation_rebuild_purge_removes_hierarchy_summaries_and_mirrors() -> (
+    None
+):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -564,14 +730,19 @@ async def test_conversation_rebuild_purge_removes_hierarchy_summaries_and_mirror
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
         await memories.create_memory_object(
             user_id="usr_1",
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.BELIEF,
             scope=MemoryScope.GLOBAL_USER,
             canonical_text="User prefers patch-first debugging.",
-            payload={"claim_key": "workflow.debugging.style", "claim_value": "patch_first"},
+            payload={
+                "claim_key": "workflow.debugging.style",
+                "claim_value": "patch_first",
+            },
             source_kind=MemorySourceKind.INFERRED,
             confidence=0.9,
             privacy_level=0,
@@ -593,7 +764,12 @@ async def test_conversation_rebuild_purge_removes_hierarchy_summaries_and_mirror
             object_type=MemoryObjectType.SUMMARY_VIEW,
             scope=MemoryScope.GLOBAL_USER,
             canonical_text="Episode summary",
-            payload={"summary_view_id": "sum_episode", "summary_kind": "episode", "hierarchy_level": 1, "source_object_ids": ["mem_belief"]},
+            payload={
+                "summary_view_id": "sum_episode",
+                "summary_kind": "episode",
+                "hierarchy_level": 1,
+                "source_object_ids": ["mem_belief"],
+            },
             source_kind=MemorySourceKind.SUMMARIZED,
             confidence=0.7,
             privacy_level=0,
@@ -604,7 +780,12 @@ async def test_conversation_rebuild_purge_removes_hierarchy_summaries_and_mirror
             object_type=MemoryObjectType.SUMMARY_VIEW,
             scope=MemoryScope.GLOBAL_USER,
             canonical_text="Thematic profile",
-            payload={"summary_view_id": "sum_theme", "summary_kind": "thematic_profile", "hierarchy_level": 2, "source_object_ids": ["mem_belief"]},
+            payload={
+                "summary_view_id": "sum_theme",
+                "summary_kind": "thematic_profile",
+                "hierarchy_level": 2,
+                "source_object_ids": ["mem_belief"],
+            },
             source_kind=MemorySourceKind.SUMMARIZED,
             confidence=0.7,
             privacy_level=0,
@@ -613,7 +794,9 @@ async def test_conversation_rebuild_purge_removes_hierarchy_summaries_and_mirror
 
         service = AdminRebuildService(
             connection=connection,
-            llm_client=LLMClient(provider_name=NoOpProvider.name, providers=[NoOpProvider()]),
+            llm_client=LLMClient(
+                provider_name=NoOpProvider.name, providers=[NoOpProvider()]
+            ),
             embedding_index=None,
             clock=clock,
             manifest_loader=ManifestLoader(MANIFESTS_DIR),
@@ -622,7 +805,9 @@ async def test_conversation_rebuild_purge_removes_hierarchy_summaries_and_mirror
 
         await service._purge_conversation_state("usr_1", "cnv_1")
 
-        cursor = await connection.execute("SELECT id FROM summary_views ORDER BY id ASC")
+        cursor = await connection.execute(
+            "SELECT id FROM summary_views ORDER BY id ASC"
+        )
         summary_rows = await cursor.fetchall()
         assert [row["id"] for row in summary_rows] == []
         assert await memories.get_memory_object("sum_mem_sum_episode", "usr_1") is None
@@ -635,13 +820,17 @@ async def test_conversation_rebuild_purge_removes_hierarchy_summaries_and_mirror
 async def test_rebuild_conversation_wipes_context_cache_for_user() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     cache_backend = InProcessBackend()
     try:
         await users.create_user("usr_1")
-        await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", None, "coding_debug", "One"
+        )
         await cache_backend.set_context_view(
             "ctx:1",
             {"user_id": "usr_1", "conversation_id": "cnv_1"},
@@ -660,7 +849,9 @@ async def test_rebuild_conversation_wipes_context_cache_for_user() -> None:
 
         result = await AdminRebuildService(
             connection=connection,
-            llm_client=LLMClient(provider_name=NoOpProvider.name, providers=[NoOpProvider()]),
+            llm_client=LLMClient(
+                provider_name=NoOpProvider.name, providers=[NoOpProvider()]
+            ),
             embedding_index=None,
             clock=clock,
             manifest_loader=ManifestLoader(MANIFESTS_DIR),
@@ -684,14 +875,20 @@ async def test_rebuild_conversation_wipes_context_cache_for_user() -> None:
 async def test_rebuild_user_wipes_context_cache_for_user() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     cache_backend = InProcessBackend()
     try:
         await users.create_user("usr_1")
-        await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "One")
-        await conversations.create_conversation("cnv_2", "usr_1", None, "coding_debug", "Two")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", None, "coding_debug", "One"
+        )
+        await conversations.create_conversation(
+            "cnv_2", "usr_1", None, "coding_debug", "Two"
+        )
         await cache_backend.set_context_view(
             "ctx:1",
             {"user_id": "usr_1", "conversation_id": "cnv_1"},
@@ -710,7 +907,9 @@ async def test_rebuild_user_wipes_context_cache_for_user() -> None:
 
         result = await AdminRebuildService(
             connection=connection,
-            llm_client=LLMClient(provider_name=NoOpProvider.name, providers=[NoOpProvider()]),
+            llm_client=LLMClient(
+                provider_name=NoOpProvider.name, providers=[NoOpProvider()]
+            ),
             embedding_index=None,
             clock=clock,
             manifest_loader=ManifestLoader(MANIFESTS_DIR),
@@ -734,7 +933,9 @@ async def test_rebuild_user_wipes_context_cache_for_user() -> None:
 async def test_rebuild_conversation_replays_assistant_messages_for_extraction() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -743,9 +944,22 @@ async def test_rebuild_conversation_replays_assistant_messages_for_extraction() 
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
-        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00")
-        await messages.create_message("msg_2", "cnv_1", "assistant", 2, "Assistant plan", 2, {}, "2023-05-08T14:10:00")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
+        await messages.create_message(
+            "msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00"
+        )
+        await messages.create_message(
+            "msg_2",
+            "cnv_1",
+            "assistant",
+            2,
+            "Assistant plan",
+            2,
+            {},
+            "2023-05-08T14:10:00",
+        )
         provider = RebuildReplayProvider()
 
         service = AdminRebuildService(
@@ -768,7 +982,11 @@ async def test_rebuild_conversation_replays_assistant_messages_for_extraction() 
             for row in stored
             for source_id in row["payload_json"].get("source_message_ids", [])
         }
-        extracted_rows = [row for row in stored if row["object_type"] == MemoryObjectType.EVIDENCE.value]
+        extracted_rows = [
+            row
+            for row in stored
+            if row["object_type"] == MemoryObjectType.EVIDENCE.value
+        ]
 
         assert result.processed_messages == 2
         assert result.extract_jobs_processed == 2
@@ -786,6 +1004,37 @@ async def test_rebuild_conversation_replays_assistant_messages_for_extraction() 
         )
         pending_row = await pending_cursor.fetchone()
         assert int(pending_row["count"]) == 0
+        maintenance_cursor = await connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total_jobs,
+                COUNT(maintenance_operation_id) AS owned_jobs,
+                COUNT(DISTINCT maintenance_operation_id) AS operation_count
+            FROM worker_job_runs
+            """
+        )
+        maintenance_jobs = await maintenance_cursor.fetchone()
+        assert int(maintenance_jobs["total_jobs"]) > 0
+        assert int(maintenance_jobs["owned_jobs"]) == int(
+            maintenance_jobs["total_jobs"]
+        )
+        assert int(maintenance_jobs["operation_count"]) == 1
+        operation_cursor = await connection.execute(
+            """
+            SELECT status, lifecycle_epoch, derivation_revision
+            FROM admin_maintenance_operations
+            WHERE id = (
+                SELECT maintenance_operation_id
+                FROM worker_job_runs
+                LIMIT 1
+            )
+            """
+        )
+        operation = await operation_cursor.fetchone()
+        assert operation is not None
+        assert operation["status"] == "succeeded"
+        assert operation["lifecycle_epoch"] is not None
+        assert int(operation["derivation_revision"]) >= 1
         cursor = await connection.execute(
             """
             SELECT edge.support_kind, span.span_role, span.quote_text, span.message_id
@@ -794,9 +1043,7 @@ async def test_rebuild_conversation_replays_assistant_messages_for_extraction() 
               ON span.support_edge_id = edge.id
             WHERE edge.memory_id IN ({placeholders})
             ORDER BY span.message_id ASC, span.span_role ASC
-            """.format(
-                placeholders=", ".join("?" for _ in extracted_rows)
-            ),
+            """.format(placeholders=", ".join("?" for _ in extracted_rows)),
             tuple(str(row["id"]) for row in extracted_rows),
         )
         packets = [dict(row) for row in await cursor.fetchall()]
@@ -816,9 +1063,18 @@ async def test_rebuild_conversation_replays_assistant_messages_for_extraction() 
             for request in provider.requests
             if request.metadata.get("purpose") == "contract_projection"
         ]
-        assert "<message_timestamp>2023-05-08T13:56:00</message_timestamp>" in contract_prompts[0]
-        assert any("<message_timestamp>2023-05-08T13:56:00</message_timestamp>" in prompt for prompt in extraction_prompts)
-        assert any("<message_timestamp>2023-05-08T14:10:00</message_timestamp>" in prompt for prompt in extraction_prompts)
+        assert (
+            "<message_timestamp>2023-05-08T13:56:00</message_timestamp>"
+            in contract_prompts[0]
+        )
+        assert any(
+            "<message_timestamp>2023-05-08T13:56:00</message_timestamp>" in prompt
+            for prompt in extraction_prompts
+        )
+        assert any(
+            "<message_timestamp>2023-05-08T14:10:00</message_timestamp>" in prompt
+            for prompt in extraction_prompts
+        )
     finally:
         await connection.close()
 
@@ -830,13 +1086,17 @@ async def test_rebuild_conversation_paginates_and_uses_placeholder_recent_contex
     monkeypatch.setattr(admin_rebuild_module, "REBUILD_MESSAGE_PAGE_SIZE", 2)
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     messages = MessageRepository(connection, clock)
     try:
         await users.create_user("usr_1")
-        await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", None, "coding_debug", "One"
+        )
         await messages.create_message(
             "msg_1",
             "cnv_1",
@@ -846,7 +1106,9 @@ async def test_rebuild_conversation_paginates_and_uses_placeholder_recent_contex
             None,
             {},
         )
-        await messages.create_message("msg_2", "cnv_1", "assistant", 2, "Assistant plan", 2, {})
+        await messages.create_message(
+            "msg_2", "cnv_1", "assistant", 2, "Assistant plan", 2, {}
+        )
         await messages.create_message("msg_3", "cnv_1", "user", 3, "User fact", 2, {})
         provider = RebuildReplayProvider()
         service = AdminRebuildService(
@@ -872,7 +1134,9 @@ async def test_rebuild_conversation_paginates_and_uses_placeholder_recent_contex
             for request in provider.requests
             if request.metadata.get("purpose") == "memory_extraction_candidate_card"
         ]
-        assistant_prompt = next(prompt for prompt in extraction_prompts if "Assistant plan" in prompt)
+        assistant_prompt = next(
+            prompt for prompt in extraction_prompts if "Assistant plan" in prompt
+        )
         assert result.processed_messages == 3
         assert result.extract_jobs_processed == 3
         assert "[Skipped message | id=msg_1 seq=1 role=user" in assistant_prompt
@@ -883,10 +1147,14 @@ async def test_rebuild_conversation_paginates_and_uses_placeholder_recent_contex
 
 
 @pytest.mark.asyncio
-async def test_rebuild_conversation_recreates_hierarchy_for_short_conversation() -> None:
+async def test_rebuild_conversation_recreates_hierarchy_for_short_conversation() -> (
+    None
+):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -896,8 +1164,12 @@ async def test_rebuild_conversation_recreates_hierarchy_for_short_conversation()
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
-        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
+        await messages.create_message(
+            "msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00"
+        )
         await summaries.create_summary(
             "usr_1",
             {
@@ -913,14 +1185,19 @@ async def test_rebuild_conversation_recreates_hierarchy_for_short_conversation()
                 "maya_score": 1.5,
                 "model": "score-test-model",
                 "created_at": "2026-04-10T11:00:00+00:00",
-            }
+            },
         )
         await memories.create_memory_object(
             user_id="usr_1",
             object_type=MemoryObjectType.SUMMARY_VIEW,
             scope=MemoryScope.GLOBAL_USER,
             canonical_text="Old episode.",
-            payload={"summary_view_id": "sum_old_episode", "summary_kind": "episode", "hierarchy_level": 1, "source_object_ids": []},
+            payload={
+                "summary_view_id": "sum_old_episode",
+                "summary_kind": "episode",
+                "hierarchy_level": 1,
+                "source_object_ids": [],
+            },
             source_kind=MemorySourceKind.SUMMARIZED,
             confidence=0.7,
             privacy_level=0,
@@ -941,9 +1218,15 @@ async def test_rebuild_conversation_recreates_hierarchy_for_short_conversation()
 
         result = await service.rebuild_conversation("usr_1", "cnv_1")
 
-        chunk_rows = await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10)
-        episode_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE)
-        thematic_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.THEMATIC_PROFILE)
+        chunk_rows = await summaries.list_conversation_chunks(
+            "usr_1", "cnv_1", limit=10
+        )
+        episode_rows = await summaries.list_summaries_by_kind(
+            "usr_1", SummaryViewKind.EPISODE
+        )
+        thematic_rows = await summaries.list_summaries_by_kind(
+            "usr_1", SummaryViewKind.THEMATIC_PROFILE
+        )
 
         assert result.conversation_compaction_jobs_processed == 1
         assert result.episode_compaction_jobs_processed == 1
@@ -951,9 +1234,21 @@ async def test_rebuild_conversation_recreates_hierarchy_for_short_conversation()
         assert len(chunk_rows) == 1
         assert len(episode_rows) == 1
         assert len(thematic_rows) == 1
-        assert await memories.get_memory_object("sum_mem_sum_old_episode", "usr_1") is None
-        assert await memories.get_memory_object(f"sum_mem_{episode_rows[0]['id']}", "usr_1") is not None
-        assert await memories.get_memory_object(f"sum_mem_{thematic_rows[0]['id']}", "usr_1") is not None
+        assert (
+            await memories.get_memory_object("sum_mem_sum_old_episode", "usr_1") is None
+        )
+        assert (
+            await memories.get_memory_object(
+                f"sum_mem_{episode_rows[0]['id']}", "usr_1"
+            )
+            is not None
+        )
+        assert (
+            await memories.get_memory_object(
+                f"sum_mem_{thematic_rows[0]['id']}", "usr_1"
+            )
+            is not None
+        )
     finally:
         await connection.close()
 
@@ -962,7 +1257,9 @@ async def test_rebuild_conversation_recreates_hierarchy_for_short_conversation()
 async def test_rebuild_conversation_recovers_episode_synthesis_output_limit() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -972,7 +1269,9 @@ async def test_rebuild_conversation_recovers_episode_synthesis_output_limit() ->
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
         for sequence in range(1, 5):
             await messages.create_message(
                 f"msg_{sequence}",
@@ -999,7 +1298,9 @@ async def test_rebuild_conversation_recovers_episode_synthesis_output_limit() ->
 
         result = await service.rebuild_conversation("usr_1", "cnv_1")
 
-        episode_rows = await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE)
+        episode_rows = await summaries.list_summaries_by_kind(
+            "usr_1", SummaryViewKind.EPISODE
+        )
         episode_chunk_counts = [
             request.metadata.get("chunk_count")
             for request in provider.requests
@@ -1020,7 +1321,9 @@ async def test_rebuild_conversation_recovers_episode_synthesis_output_limit() ->
 async def test_rebuild_conversation_can_skip_final_compaction() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -1030,8 +1333,12 @@ async def test_rebuild_conversation_can_skip_final_compaction() -> None:
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
-        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
+        await messages.create_message(
+            "msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00"
+        )
 
         service = AdminRebuildService(
             connection=connection,
@@ -1056,9 +1363,19 @@ async def test_rebuild_conversation_can_skip_final_compaction() -> None:
         assert result.episode_compaction_jobs_processed == 0
         assert result.thematic_profile_jobs_processed == 0
         assert result.workspace_rollup_jobs_processed == 0
-        assert await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10) == []
-        assert await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE) == []
-        assert await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.THEMATIC_PROFILE) == []
+        assert (
+            await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10) == []
+        )
+        assert (
+            await summaries.list_summaries_by_kind("usr_1", SummaryViewKind.EPISODE)
+            == []
+        )
+        assert (
+            await summaries.list_summaries_by_kind(
+                "usr_1", SummaryViewKind.THEMATIC_PROFILE
+            )
+            == []
+        )
         assert not any(
             request.metadata.get("purpose")
             in {
@@ -1075,10 +1392,14 @@ async def test_rebuild_conversation_can_skip_final_compaction() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rebuild_conversation_purges_character_rollups_when_final_compaction_is_skipped() -> None:
+async def test_rebuild_conversation_purges_character_rollups_when_final_compaction_is_skipped() -> (
+    None
+):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     messages = MessageRepository(connection, clock)
@@ -1096,7 +1417,9 @@ async def test_rebuild_conversation_purges_character_rollups_when_final_compacti
             character_id="char_debug",
             platform_id="web",
         )
-        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00")
+        await messages.create_message(
+            "msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00"
+        )
         await summaries.create_summary(
             "usr_1",
             {
@@ -1149,8 +1472,16 @@ async def test_rebuild_conversation_purges_character_rollups_when_final_compacti
         )
 
         assert result.workspace_rollup_jobs_processed == 0
-        assert await summaries.list_character_rollups("usr_1", "char_debug", limit=10) == []
-        assert await memories.get_memory_object("sum_mem_sum_old_character_rollup", "usr_1") is None
+        assert (
+            await summaries.list_character_rollups("usr_1", "char_debug", limit=10)
+            == []
+        )
+        assert (
+            await memories.get_memory_object(
+                "sum_mem_sum_old_character_rollup", "usr_1"
+            )
+            is None
+        )
     finally:
         await connection.close()
 
@@ -1159,7 +1490,9 @@ async def test_rebuild_conversation_purges_character_rollups_when_final_compacti
 async def test_rebuild_user_processes_workspace_rollups_synchronously() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -1168,8 +1501,12 @@ async def test_rebuild_user_processes_workspace_rollups_synchronously() -> None:
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
-        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
+        await messages.create_message(
+            "msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00"
+        )
 
         service = AdminRebuildService(
             connection=connection,
@@ -1184,7 +1521,9 @@ async def test_rebuild_user_processes_workspace_rollups_synchronously() -> None:
         )
 
         result = await service.rebuild_user("usr_1")
-        workspace_rollups = await summaries.list_character_rollups("usr_1", "wsp_1", limit=10)
+        workspace_rollups = await summaries.list_character_rollups(
+            "usr_1", "wsp_1", limit=10
+        )
 
         assert result.workspace_rollup_jobs_processed == 1
         assert len(workspace_rollups) == 1
@@ -1197,7 +1536,9 @@ async def test_rebuild_user_processes_workspace_rollups_synchronously() -> None:
 async def test_rebuild_user_processes_character_rollups_without_workspace() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     messages = MessageRepository(connection, clock)
@@ -1213,7 +1554,9 @@ async def test_rebuild_user_processes_character_rollups_without_workspace() -> N
             character_id="char_debug",
             platform_id="web",
         )
-        await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00")
+        await messages.create_message(
+            "msg_1", "cnv_1", "user", 1, "User fact", 2, {}, "2023-05-08T13:56:00"
+        )
 
         service = AdminRebuildService(
             connection=connection,
@@ -1228,7 +1571,9 @@ async def test_rebuild_user_processes_character_rollups_without_workspace() -> N
         )
 
         result = await service.rebuild_user("usr_1")
-        character_rollups = await summaries.list_character_rollups("usr_1", "char_debug", limit=10)
+        character_rollups = await summaries.list_character_rollups(
+            "usr_1", "char_debug", limit=10
+        )
 
         assert result.workspace_ids == []
         assert result.workspace_rollup_jobs_processed == 1
@@ -1246,7 +1591,9 @@ async def test_admin_rebuild_service_passes_embedding_index_to_revision_worker(
 ) -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     captured: dict[str, object] = {}
     embedding_index = RecordingEmbeddingIndex()
@@ -1260,7 +1607,9 @@ async def test_admin_rebuild_service_passes_embedding_index_to_revision_worker(
             async def process_job(self, payload):
                 return None
 
-        monkeypatch.setattr("atagia.services.admin_rebuild_service.RevisionWorker", FakeRevisionWorker)
+        monkeypatch.setattr(
+            "atagia.services.admin_rebuild_service.RevisionWorker", FakeRevisionWorker
+        )
 
         service = AdminRebuildService(
             connection=connection,
@@ -1287,28 +1636,47 @@ async def test_rebuild_conversation_records_claim_key_mismatch_skip_as_partial(
 ) -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     messages = MessageRepository(connection, clock)
 
     class RevisionEnqueuingIngestWorker:
-        def __init__(self, *, storage_backend, **kwargs) -> None:
+        def __init__(
+            self,
+            *,
+            storage_backend,
+            job_connection,
+            clock,
+            settings,
+            **kwargs,
+        ) -> None:
             self._storage_backend = storage_backend
+            self._job_tracking = JobTrackingService(
+                job_connection,
+                clock,
+                workers_enabled=True,
+                settings=settings,
+            )
 
         async def process_job(self, payload):
-            await self._storage_backend.stream_add(
+            parent = JobEnvelope.model_validate(payload)
+            await self._job_tracking.enqueue_job(
+                self._storage_backend,
                 REVISE_STREAM_NAME,
-                {
-                    "job_id": "job_rebuild_revise_msg_1",
-                    "job_type": JobType.REVISE_BELIEFS.value,
-                    "user_id": "usr_1",
-                    "conversation_id": "cnv_1",
-                    "message_ids": ["msg_1"],
-                    "payload": {},
-                    "created_at": None,
-                },
+                JobEnvelope(
+                    job_id="job_rebuild_revise_msg_1",
+                    job_type=JobType.REVISE_BELIEFS,
+                    user_id="usr_1",
+                    parent_job_id=parent.job_id,
+                    conversation_id="cnv_1",
+                    message_ids=["msg_1"],
+                    payload={},
+                    created_at=None,
+                ),
             )
             return {"status": "extracted"}
 
@@ -1324,13 +1692,19 @@ async def test_rebuild_conversation_records_claim_key_mismatch_skip_as_partial(
                 "payload_claim_key": "motivation.help_others",
             }
 
-    monkeypatch.setattr(admin_rebuild_module, "IngestWorker", RevisionEnqueuingIngestWorker)
-    monkeypatch.setattr(admin_rebuild_module, "RevisionWorker", ClaimKeyMismatchRevisionWorker)
+    monkeypatch.setattr(
+        admin_rebuild_module, "IngestWorker", RevisionEnqueuingIngestWorker
+    )
+    monkeypatch.setattr(
+        admin_rebuild_module, "RevisionWorker", ClaimKeyMismatchRevisionWorker
+    )
 
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
         await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
 
         service = AdminRebuildService(
@@ -1367,7 +1741,9 @@ async def test_rebuild_conversation_skips_recoverable_contract_projection_error(
 ) -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -1388,7 +1764,9 @@ async def test_rebuild_conversation_skips_recoverable_contract_projection_error(
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
         await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
 
         service = AdminRebuildService(
@@ -1425,7 +1803,9 @@ async def test_rebuild_conversation_skips_recoverable_graph_projection_error(
 ) -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -1447,7 +1827,9 @@ async def test_rebuild_conversation_skips_recoverable_graph_projection_error(
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
         await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
 
         service = AdminRebuildService(
@@ -1486,7 +1868,9 @@ async def test_rebuild_conversation_skips_recoverable_output_limit_extract_error
 ) -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -1507,7 +1891,9 @@ async def test_rebuild_conversation_skips_recoverable_output_limit_extract_error
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
         await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
 
         service = AdminRebuildService(
@@ -1543,7 +1929,9 @@ async def test_rebuild_conversation_skips_generic_llm_extract_error(
 ) -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -1561,7 +1949,9 @@ async def test_rebuild_conversation_skips_generic_llm_extract_error(
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
         await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
 
         service = AdminRebuildService(
@@ -1597,7 +1987,9 @@ async def test_rebuild_conversation_propagates_llm_run_guard_error(
 ) -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -1622,7 +2014,9 @@ async def test_rebuild_conversation_propagates_llm_run_guard_error(
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
         await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
 
         service = AdminRebuildService(
@@ -1653,7 +2047,9 @@ async def test_rebuild_conversation_propagates_non_llm_contract_errors(
 ) -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     users = UserRepository(connection, clock)
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
@@ -1671,7 +2067,9 @@ async def test_rebuild_conversation_propagates_non_llm_contract_errors(
     try:
         await users.create_user("usr_1")
         await workspaces.create_workspace("wsp_1", "usr_1", "Workspace")
-        await conversations.create_conversation("cnv_1", "usr_1", "wsp_1", "coding_debug", "One")
+        await conversations.create_conversation(
+            "cnv_1", "usr_1", "wsp_1", "coding_debug", "One"
+        )
         await messages.create_message("msg_1", "cnv_1", "user", 1, "User fact", 2, {})
 
         service = AdminRebuildService(

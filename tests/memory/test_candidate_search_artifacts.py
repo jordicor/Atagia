@@ -33,7 +33,7 @@ from atagia.models.schemas_memory import (
 from atagia.services.artifact_service import ArtifactService
 from atagia.services.embeddings import EmbeddingMatch
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
 
 class FakeEmbeddingIndex:
@@ -583,7 +583,7 @@ async def test_exact_recall_artifact_search_falls_back_to_broader_fts_queries() 
                 AttachmentInput(
                     kind="image",
                     content_text=(
-                        "Visual description of attached image: a cup with a dog face on it\n"
+                        "Visual description of attached image: a ceramic bird on a blue shelf\n"
                         "Associated message speaker: Melanie\n"
                         "Associated message text: The kids made this with clay."
                     ),
@@ -648,7 +648,7 @@ async def test_exact_recall_artifact_search_falls_back_to_broader_fts_queries() 
 
         assert any(
             candidate.get("is_artifact_chunk")
-            and "dog face" in str(candidate.get("canonical_text", "")).lower()
+            and "ceramic bird" in str(candidate.get("canonical_text", "")).lower()
             for candidate in candidates
         )
     finally:
@@ -677,12 +677,12 @@ async def test_artifact_search_includes_chunks_linked_to_retrieved_source_messag
         await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Artifact Chat")
 
         bundle = artifacts.prepare_attachments(
-            message_text="We painted something together.",
+            message_text="We assembled a model bridge.",
             attachments=[
                 AttachmentInput(
                     kind="image",
-                    content_text="Visual description of attached image: a sunset with a palm tree",
-                    title="Painting image",
+                    content_text="Visual description of attached image: a model bridge beside a ruler",
+                    title="Model bridge image",
                     preserve_verbatim=True,
                 )
             ],
@@ -752,7 +752,7 @@ async def test_artifact_search_includes_chunks_linked_to_retrieved_source_messag
 
         assert any(
             candidate.get("is_artifact_chunk")
-            and "palm tree" in str(candidate.get("canonical_text", "")).lower()
+            and "model bridge" in str(candidate.get("canonical_text", "")).lower()
             for candidate in candidates
         )
     finally:
@@ -873,15 +873,15 @@ async def test_artifact_search_tries_original_query_rewrites_after_sparse_querie
         await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Artifact Chat")
 
         bundle = artifacts.prepare_attachments(
-            message_text="We painted something together.",
+            message_text="We assembled a model bridge.",
             attachments=[
                 AttachmentInput(
                     kind="image",
                     content_text=(
-                        "Visual description of attached image: a sunset with a palm tree\n"
-                        "Associated message text: Here's our latest work from last weekend."
+                        "Visual description of attached image: a model bridge beside a ruler\n"
+                        "Associated message text: We assembled the model bridge during the workshop."
                     ),
-                    title="Painting image",
+                    title="Model bridge image",
                     preserve_verbatim=True,
                 )
             ],
@@ -930,16 +930,16 @@ async def test_artifact_search_tries_original_query_rewrites_after_sparse_querie
 
         candidates = await search.search(
             _artifact_plan(
-                fts_queries=["mel kids paint project"],
+                fts_queries=["obsolete canvas tokens"],
                 exact_recall_mode=True,
-                original_query="latest work",
+                original_query="model bridge workshop",
             ),
             "usr_a",
         )
 
         assert any(
             candidate.get("is_artifact_chunk")
-            and "palm tree" in str(candidate.get("canonical_text", "")).lower()
+            and "model bridge" in str(candidate.get("canonical_text", "")).lower()
             for candidate in candidates
         )
     finally:

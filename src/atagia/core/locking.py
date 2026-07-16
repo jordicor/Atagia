@@ -19,12 +19,19 @@ async def acquire_belief_lock(
     ttl_seconds: int = 30,
     attempts: int = 3,
     base_delay_seconds: float = 0.05,
+    lifecycle_cleanup_key: str | None = None,
+    lifecycle_epoch: str | None = None,
 ) -> str | None:
     """Acquire a Redis-style belief lock token with bounded retries."""
     delay = base_delay_seconds
     lock_key = belief_lock_key(belief_id)
     for attempt in range(1, attempts + 1):
-        token = await storage_backend.acquire_lock(lock_key, ttl_seconds=ttl_seconds)
+        token = await storage_backend.acquire_lock(
+            lock_key,
+            ttl_seconds=ttl_seconds,
+            lifecycle_cleanup_key=lifecycle_cleanup_key,
+            lifecycle_epoch=lifecycle_epoch,
+        )
         if token is not None:
             return token
         if attempt == attempts:

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from atagia.core.clock import FrozenClock
-from atagia.core.config import Settings
+from atagia.core.config import Settings, default_resource_path
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import (
     ConversationRepository,
@@ -34,15 +34,15 @@ from atagia.models.schemas_memory import (
     SummaryViewKind,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def _settings(**overrides: object) -> Settings:
     defaults: dict[str, object] = dict(
         sqlite_path=":memory:",
-        migrations_path="./migrations",
-        manifests_path="./manifests",
+        migrations_path=default_resource_path("migrations"),
+        manifests_path=default_resource_path("manifests"),
         storage_backend="inprocess",
         redis_url="redis://localhost:6379/0",
         openai_api_key=None,
@@ -256,7 +256,7 @@ async def test_verbatim_evidence_search_enabled_returns_conversation_windows() -
             messages,
             conversation_id="cnv_1",
             texts=[
-                ("user", "I was born on 14 march 1988 in Barcelona"),
+                ("user", "I was born on 22 august 1991 in Northhaven"),
                 ("assistant", "Thanks, noted your birthday."),
                 ("user", "Please remind me about passport renewal"),
                 ("assistant", "Sure."),
@@ -284,7 +284,7 @@ async def test_verbatim_evidence_search_enabled_returns_conversation_windows() -
                 conversation_id="cnv_1",
                 workspace_id="wrk_1",
                 privacy_ceiling=2,
-                fts_query="born march 1988 barcelona",
+                fts_query="born august 1991 northhaven",
             ),
             "usr_1",
         )
@@ -300,7 +300,7 @@ async def test_verbatim_evidence_search_enabled_returns_conversation_windows() -
         assert "verbatim_evidence_search" in top_window["retrieval_sources"]
         assert top_window["verbatim_evidence_window_conversation_id"] == "cnv_1"
         assert top_window["privacy_level"] == 2
-        assert "march 1988" in top_window["canonical_text"].lower()
+        assert "august 1991" in top_window["canonical_text"].lower()
         payload = top_window["payload_json"]
         assert isinstance(payload, dict)
         assert payload["source_message_window_start_occurred_at"]
@@ -405,7 +405,7 @@ async def test_verbatim_evidence_search_window_privacy_level_filters_above_plan_
             messages,
             conversation_id="cnv_1",
             texts=[
-                ("user", "The private orchid code is violet seven."),
+                ("user", "The private orchid code is amber eleven."),
                 ("assistant", "I will treat that carefully."),
             ],
         )
@@ -431,7 +431,7 @@ async def test_verbatim_evidence_search_window_privacy_level_filters_above_plan_
                 conversation_id="cnv_1",
                 workspace_id="wrk_1",
                 privacy_ceiling=2,
-                fts_query="orchid violet seven",
+                fts_query="orchid amber eleven",
             ),
             "usr_1",
         )
@@ -736,11 +736,11 @@ async def test_verbatim_evidence_exact_slot_fill_includes_follow_up_window() -> 
                 ("assistant", "Earlier filler about the week."),
                 (
                     "user",
-                    "Gina and Jon discuss the studio Jon opened yesterday.",
+                    "Sela and Varo discuss the tidal gauge Varo installed yesterday.",
                 ),
-                ("assistant", "Jon says the lighting and floors are finished."),
-                ("assistant", "Jon says the launch plan is almost ready."),
-                ("user", "Gina: The studio looks amazing."),
+                ("assistant", "Varo says the sensor housing and cabling are finished."),
+                ("assistant", "Varo says the calibration checklist is almost ready."),
+                ("user", "Sela: The calibration looks precise."),
             ],
         )
 
@@ -750,7 +750,7 @@ async def test_verbatim_evidence_exact_slot_fill_includes_follow_up_window() -> 
                 conversation_id="cnv_1",
                 workspace_id="wrk_1",
                 privacy_ceiling=2,
-                fts_query="gina jon studio opened",
+                fts_query="sela varo tidal gauge installed",
                 query_type="slot_fill",
                 exact_recall_mode=True,
                 exact_facets=[ExactFacet.OTHER_VERBATIM],
@@ -763,8 +763,8 @@ async def test_verbatim_evidence_exact_slot_fill_includes_follow_up_window() -> 
         ]
         assert evidence_windows
         top_text = str(evidence_windows[0]["canonical_text"]).lower()
-        assert "gina and jon discuss the studio jon opened" in top_text
-        assert "studio looks amazing" in top_text
+        assert "sela and varo discuss the tidal gauge varo installed" in top_text
+        assert "calibration looks precise" in top_text
         assert evidence_windows[0]["verbatim_evidence_window_variant"] == "follow_up"
     finally:
         await connection.close()
@@ -1066,7 +1066,7 @@ async def test_multi_facet_exact_recall_can_surface_cross_conversation_raw_windo
             user_id="usr_1",
             workspace_id=None,
             assistant_mode_id="general_qa",
-            title="Prior apartment search",
+            title="Prior equipment budget",
         )
         await _seed_messages(
             messages,
@@ -1074,7 +1074,7 @@ async def test_multi_facet_exact_recall_can_surface_cross_conversation_raw_windo
             texts=[
                 (
                     "user",
-                    "The apartment budget we set was exactly 2800 dollars per month.",
+                    "The equipment budget was exactly 4200 dollars.",
                 ),
                 ("assistant", "Got it."),
             ],
@@ -1085,13 +1085,13 @@ async def test_multi_facet_exact_recall_can_surface_cross_conversation_raw_windo
             user_id="usr_1",
             workspace_id=None,
             assistant_mode_id="general_qa",
-            title="Current apartment update",
+            title="Current equipment purchase",
         )
         await _seed_messages(
             messages,
             conversation_id="cnv_current",
             texts=[
-                ("user", "The apartment we chose costs $2,650 per month."),
+                ("user", "The server we chose costs $3,175."),
                 ("assistant", "Understood."),
             ],
         )
@@ -1102,7 +1102,7 @@ async def test_multi_facet_exact_recall_can_surface_cross_conversation_raw_windo
                 conversation_id="cnv_current",
                 workspace_id=None,
                 privacy_ceiling=2,
-                fts_query="apartment budget 2800",
+                fts_query="equipment budget 4200",
                 query_type="broad_list",
                 exact_recall_mode=True,
             ),
@@ -1116,7 +1116,7 @@ async def test_multi_facet_exact_recall_can_surface_cross_conversation_raw_windo
         ]
         assert any(
             window.get("verbatim_evidence_window_conversation_id") == "cnv_prior"
-            and "2800 dollars" in str(window.get("canonical_text"))
+            and "4200 dollars" in str(window.get("canonical_text"))
             and window.get("scope_canonical") == MemoryScope.USER.value
             for window in evidence_windows
         )
@@ -1136,7 +1136,7 @@ async def test_multi_facet_exact_recall_cross_raw_allows_slot_fill_multi_exact_f
             user_id="usr_1",
             workspace_id=None,
             assistant_mode_id="general_qa",
-            title="Prior apartment search",
+            title="Prior equipment budget",
         )
         await _seed_messages(
             messages,
@@ -1144,7 +1144,7 @@ async def test_multi_facet_exact_recall_cross_raw_allows_slot_fill_multi_exact_f
             texts=[
                 (
                     "user",
-                    "The apartment budget we set was exactly 2800 dollars per month.",
+                    "The equipment budget was exactly 4200 dollars.",
                 ),
             ],
         )
@@ -1154,13 +1154,13 @@ async def test_multi_facet_exact_recall_cross_raw_allows_slot_fill_multi_exact_f
             user_id="usr_1",
             workspace_id=None,
             assistant_mode_id="general_qa",
-            title="Current apartment update",
+            title="Current equipment purchase",
         )
         await _seed_messages(
             messages,
             conversation_id="cnv_current",
             texts=[
-                ("user", "The apartment we chose costs $2,650 per month."),
+                ("user", "The server we chose costs $3,175."),
             ],
         )
 
@@ -1170,7 +1170,7 @@ async def test_multi_facet_exact_recall_cross_raw_allows_slot_fill_multi_exact_f
                 conversation_id="cnv_current",
                 workspace_id=None,
                 privacy_ceiling=2,
-                fts_query="apartment budget 2800",
+                fts_query="equipment budget 4200",
                 query_type="slot_fill",
                 exact_recall_mode=True,
                 exact_facets=[ExactFacet.QUANTITY, ExactFacet.PERSON_NAME],
@@ -1180,7 +1180,7 @@ async def test_multi_facet_exact_recall_cross_raw_allows_slot_fill_multi_exact_f
 
         assert any(
             candidate.get("verbatim_evidence_window_conversation_id") == "cnv_prior"
-            and "2800 dollars" in str(candidate.get("canonical_text"))
+            and "4200 dollars" in str(candidate.get("canonical_text"))
             and candidate.get("scope_canonical") == MemoryScope.USER.value
             for candidate in candidates
             if candidate.get("is_verbatim_evidence_window")
@@ -1209,7 +1209,7 @@ async def test_single_facet_slot_fill_exact_recall_can_surface_cross_conversatio
             texts=[
                 (
                     "user",
-                    "My current pharmacy phone number is 555-0389.",
+                    "My current pharmacy phone number is 555-7142.",
                 ),
             ],
         )
@@ -1225,7 +1225,7 @@ async def test_single_facet_slot_fill_exact_recall_can_surface_cross_conversatio
             messages,
             conversation_id="cnv_current",
             texts=[
-                ("user", "My emergency contact phone number is 555-0263."),
+                ("user", "My emergency contact phone number is 555-9926."),
             ],
         )
 
@@ -1245,7 +1245,7 @@ async def test_single_facet_slot_fill_exact_recall_can_surface_cross_conversatio
 
         assert any(
             candidate.get("verbatim_evidence_window_conversation_id") == "cnv_prior"
-            and "555-0389" in str(candidate.get("canonical_text"))
+            and "555-7142" in str(candidate.get("canonical_text"))
             and candidate.get("scope_canonical") == MemoryScope.USER.value
             for candidate in candidates
             if candidate.get("is_verbatim_evidence_window")
@@ -1266,13 +1266,13 @@ async def test_multi_facet_exact_recall_cross_raw_respects_remember_gate() -> No
             user_id="usr_1",
             workspace_id=None,
             assistant_mode_id="general_qa",
-            title="Prior apartment search",
+            title="Prior equipment budget",
         )
         await _seed_messages(
             messages,
             conversation_id="cnv_prior",
             texts=[
-                ("user", "The apartment budget was exactly 2800 dollars per month."),
+                ("user", "The equipment budget was exactly 4200 dollars."),
             ],
         )
         await _create_conversation(
@@ -1281,13 +1281,13 @@ async def test_multi_facet_exact_recall_cross_raw_respects_remember_gate() -> No
             user_id="usr_1",
             workspace_id=None,
             assistant_mode_id="general_qa",
-            title="Current apartment update",
+            title="Current equipment purchase",
         )
         await _seed_messages(
             messages,
             conversation_id="cnv_current",
             texts=[
-                ("user", "The apartment we chose costs 2650 dollars per month."),
+                ("user", "The server we chose costs 3175 dollars."),
             ],
         )
 
@@ -1297,7 +1297,7 @@ async def test_multi_facet_exact_recall_cross_raw_respects_remember_gate() -> No
                 conversation_id="cnv_current",
                 workspace_id=None,
                 privacy_ceiling=2,
-                fts_query="apartment budget 2800",
+                fts_query="equipment budget 4200",
                 query_type="broad_list",
                 exact_recall_mode=True,
                 remember_across_chats=False,
@@ -1326,13 +1326,13 @@ async def test_multi_facet_exact_recall_cross_raw_filters_pending_consent_source
             user_id="usr_1",
             workspace_id=None,
             assistant_mode_id="general_qa",
-            title="Prior apartment search",
+            title="Prior equipment budget",
         )
         seeded = await _seed_messages(
             messages,
             conversation_id="cnv_prior",
             texts=[
-                ("user", "The apartment budget was exactly 2800 dollars per month."),
+                ("user", "The equipment budget was exactly 4200 dollars."),
             ],
         )
         await memories.create_memory_object(
@@ -1356,7 +1356,7 @@ async def test_multi_facet_exact_recall_cross_raw_filters_pending_consent_source
             user_id="usr_1",
             workspace_id=None,
             assistant_mode_id="general_qa",
-            title="Current apartment update",
+            title="Current equipment purchase",
         )
 
         candidates = await search.search(
@@ -1365,7 +1365,7 @@ async def test_multi_facet_exact_recall_cross_raw_filters_pending_consent_source
                 conversation_id="cnv_current",
                 workspace_id=None,
                 privacy_ceiling=2,
-                fts_query="apartment budget 2800",
+                fts_query="equipment budget 4200",
                 query_type="broad_list",
                 exact_recall_mode=True,
             ),

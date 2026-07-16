@@ -165,7 +165,13 @@ async def _run_selftest() -> int:
 
 
 async def _run_live(args: argparse.Namespace) -> int:
-    # Import here so the offline self-test never depends on provider SDKs/keys.
+    # Load the project-local environment only for an explicitly requested live
+    # run. The offline self-test never reads provider credentials.
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    # Import here so the offline self-test never depends on provider SDKs.
     from benchmarks.card2_summary.live_provider import build_live_provider
 
     if args.concurrency < 1:

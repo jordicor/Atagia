@@ -65,12 +65,12 @@ def _write_dataset(tmp_path: Path) -> Path:
                             {
                                 "speaker": "Alice",
                                 "text": "RAW SOURCE TEXT one",
-                                "dia_id": "D1:1",
+                                "dia_id": "D91:1",
                             },
                             {
                                 "speaker": "Bob",
                                 "text": "RAW SOURCE TEXT two",
-                                "dia_id": "D1:2",
+                                "dia_id": "D92:1",
                             },
                         ],
                     },
@@ -79,13 +79,13 @@ def _write_dataset(tmp_path: Path) -> Path:
                             "question": "RAW QUESTION TEXT 1",
                             "answer": "RAW GOLD 1",
                             "category": 1,
-                            "evidence": ["D1:1"],
+                            "evidence": ["D91:1"],
                         },
                         {
                             "question": "RAW QUESTION TEXT 2",
                             "answer": "RAW GOLD 2",
                             "category": 1,
-                            "evidence": ["D1:2"],
+                            "evidence": ["D92:1"],
                         },
                     ],
                 }
@@ -110,13 +110,13 @@ def _write_report(tmp_path: Path, db_path: Path) -> Path:
                         "results": [
                             _result(
                                 "conv-a:q1",
-                                ["D1:1"],
+                                ["D91:1"],
                                 ["msg_1"],
                                 retrieval_custody=[],
                             ),
                             _result(
                                 "conv-a:q2",
-                                ["D1:2"],
+                                ["D92:1"],
                                 ["msg_2"],
                                 retrieval_custody=[
                                     {

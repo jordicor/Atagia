@@ -29,6 +29,7 @@ from atagia.services.llm_client import (
     LLMStreamEvent,
     OutputLimitExceededError,
     TransientLLMError,
+    normalize_completion_finish_reason,
     retry_after_seconds_from_exception,
 )
 from atagia.services.llm_schema import strip_json_schema_nullability
@@ -104,10 +105,16 @@ def _stop_reason_label(value: Any) -> str | None:
     return label or None
 
 
-def _stop_reason_error(stop_reason: str | None) -> LLMError | None:
+def _stop_reason_error(
+    stop_reason: str | None,
+    *,
+    allow_truncation: bool = False,
+) -> LLMError | None:
     if stop_reason is None or stop_reason in _SUCCESS_STOP_REASONS:
         return None
     if stop_reason == "max_tokens":
+        if allow_truncation:
+            return None
         return OutputLimitExceededError(
             "Anthropic stopped because it reached max output tokens "
             f"(stop_reason={stop_reason})"
@@ -400,10 +407,17 @@ class AnthropicProvider(LLMProvider):
                 )
 
         stop_reason = _stop_reason_label(getattr(response, "stop_reason", None))
-        stop_error = _stop_reason_error(stop_reason)
+        stop_error = _stop_reason_error(
+            stop_reason,
+            allow_truncation=request.external_answer,
+        )
         if stop_error is not None:
             raise stop_error
-        if not output_text and not tool_calls:
+        if (
+            not output_text
+            and not tool_calls
+            and not (request.external_answer and stop_reason == "max_tokens")
+        ):
             raise _empty_content_error(stop_reason)
 
         return LLMCompletionResponse(
@@ -413,6 +427,10 @@ class AnthropicProvider(LLMProvider):
             thinking=thinking_text or None,
             tool_calls=tool_calls,
             usage=_usage_to_dict(getattr(response, "usage", None)),
+            finish_reason=normalize_completion_finish_reason(
+                stop_reason,
+                has_tool_calls=bool(tool_calls),
+            ),
             raw_response=_model_dump(response),
         )
 
@@ -448,6 +466,7 @@ class AnthropicProvider(LLMProvider):
             kwargs["thinking"] = thinking
 
         emitted_output_or_tool = False
+        emitted_tool_call = False
         pending_error: Exception | None = None
         tool_buffers: dict[int, dict[str, Any]] = {}
         try:
@@ -483,6 +502,7 @@ class AnthropicProvider(LLMProvider):
                         )
                         if payload is not None:
                             emitted_output_or_tool = True
+                            emitted_tool_call = True
                             yield LLMStreamEvent(
                                 type="tool_call",
                                 payload=payload,
@@ -491,10 +511,17 @@ class AnthropicProvider(LLMProvider):
                 stop_reason = _stop_reason_label(
                     getattr(final_message, "stop_reason", None)
                 )
-                stop_error = _stop_reason_error(stop_reason)
+                stop_error = _stop_reason_error(
+                    stop_reason,
+                    allow_truncation=request.external_answer,
+                )
                 if stop_error is not None:
                     pending_error = stop_error
-                elif stop_reason is not None and not emitted_output_or_tool:
+                elif (
+                    stop_reason is not None
+                    and not emitted_output_or_tool
+                    and not (request.external_answer and stop_reason == "max_tokens")
+                ):
                     pending_error = _empty_content_error(stop_reason)
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
             raise _transient_error(exc) from exc
@@ -503,9 +530,16 @@ class AnthropicProvider(LLMProvider):
         except APIError as exc:
             raise LLMError(str(exc)) from exc
 
-        yield LLMStreamEvent(
-            type="done",
-            payload={"usage": _usage_to_dict(getattr(final_message, "usage", None))},
+        done_payload: dict[str, Any] = {}
+        usage = _usage_to_dict(getattr(final_message, "usage", None))
+        if usage:
+            done_payload["usage"] = usage
+        normalized_finish_reason = normalize_completion_finish_reason(
+            stop_reason,
+            has_tool_calls=emitted_tool_call,
         )
+        if normalized_finish_reason is not None:
+            done_payload["finish_reason"] = normalized_finish_reason
+        yield LLMStreamEvent(type="done", payload=done_payload)
         if pending_error is not None:
             raise pending_error

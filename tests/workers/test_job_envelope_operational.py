@@ -7,7 +7,7 @@ from pathlib import Path
 from atagia.memory.operational_profile import OperationalProfileLoader
 from atagia.models.schemas_jobs import JobEnvelope, JobType
 
-PROFILES_DIR = Path(__file__).resolve().parents[2] / "operational_profiles"
+PROFILES_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "operational_profiles"
 
 
 def test_job_envelope_round_trips_operational_snapshot() -> None:

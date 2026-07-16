@@ -15,8 +15,10 @@ import aiosqlite
 from fastapi import HTTPException, status
 
 from atagia.core.clock import Clock
-from atagia.core.repositories import ConversationRepository, UserRepository
-from atagia.core.space_repository import SpaceRepository, space_snapshot
+from atagia.core.conversation_namespace import (
+    ConversationNamespaceSnapshot,
+    capture_conversation_namespace_snapshot,
+)
 from atagia.models.schemas_memory import ConversationStatus
 
 
@@ -35,13 +37,6 @@ def _clean_required(value: str | None, *, field_name: str) -> str:
             detail=f"{field_name} is required",
         )
     return stripped
-
-
-def _row_optional(row: dict[str, Any], field_name: str) -> str | None:
-    value = row.get(field_name)
-    if value is None:
-        return None
-    return str(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +60,7 @@ class RouteNamespaceContext:
     mind_topology: str
     active_embodiment_id: str | None
     active_realm_id: str | None
+    authorization_snapshot: ConversationNamespaceSnapshot
 
     def memory_kwargs(
         self,
@@ -134,61 +130,45 @@ async def require_route_namespace_context(
     expected_user_persona_id = _clean_optional(user_persona_id)
     expected_character_id = _clean_optional(character_id)
 
-    conversations = ConversationRepository(connection, clock)
-    conversation = await conversations.get_conversation(resolved_conversation_id, user_id)
-    if conversation is None:
+    snapshot = await capture_conversation_namespace_snapshot(
+        connection,
+        clock,
+        user_id=user_id,
+        conversation_id=resolved_conversation_id,
+    )
+    if snapshot is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found for user",
         )
-    if require_active and str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
+    if require_active and snapshot.status != ConversationStatus.ACTIVE.value:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found for user",
         )
 
-    actual_platform_id = _row_optional(conversation, "platform_id")
-    actual_user_persona_id = _row_optional(conversation, "user_persona_id")
-    actual_character_id = _row_optional(conversation, "character_id")
-    actual_incognito = bool(conversation.get("incognito"))
     expected_incognito = bool(incognito) if incognito is not None else False
 
-    if actual_platform_id != resolved_platform_id:
+    if snapshot.platform_id != resolved_platform_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found for namespace",
         )
-    if actual_user_persona_id != expected_user_persona_id:
+    if snapshot.user_persona_id != expected_user_persona_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found for namespace",
         )
-    if actual_character_id != expected_character_id:
+    if snapshot.character_id != expected_character_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found for namespace",
         )
-    if actual_incognito != expected_incognito:
+    if snapshot.incognito != expected_incognito:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found for namespace",
         )
-
-    preferences = await UserRepository(connection, clock).get_memory_preferences(user_id)
-    if preferences is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-    active_space_id = _row_optional(conversation, "active_space_id")
-    active_space_boundary_mode = None
-    if active_space_id is not None:
-        space_row = await SpaceRepository(connection, clock).get_space(
-            owner_user_id=user_id,
-            space_id=active_space_id,
-        )
-        if space_row is not None:
-            active_space_boundary_mode = space_snapshot(space_row).boundary_mode.value
 
     return RouteNamespaceContext(
         user_id=user_id,
@@ -196,19 +176,44 @@ async def require_route_namespace_context(
         platform_id=resolved_platform_id,
         user_persona_id=expected_user_persona_id,
         character_id=expected_character_id,
-        workspace_id=_row_optional(conversation, "workspace_id"),
-        assistant_mode_id=_row_optional(conversation, "assistant_mode_id"),
-        mode=_row_optional(conversation, "mode"),
+        workspace_id=snapshot.workspace_id,
+        assistant_mode_id=snapshot.assistant_mode_id,
+        mode=snapshot.mode,
         incognito=expected_incognito,
-        remember_across_chats=bool(preferences["remember_across_chats"]),
-        remember_across_devices=bool(preferences["remember_across_devices"]),
-        active_space_id=active_space_id,
-        active_space_boundary_mode=active_space_boundary_mode,
-        active_mind_id=_row_optional(conversation, "active_mind_id"),
-        mind_topology=_row_optional(conversation, "mind_topology") or "unimind",
-        active_embodiment_id=_row_optional(conversation, "active_embodiment_id"),
-        active_realm_id=_row_optional(conversation, "active_realm_id"),
+        remember_across_chats=snapshot.remember_across_chats,
+        remember_across_devices=snapshot.remember_across_devices,
+        active_space_id=snapshot.active_space_id,
+        active_space_boundary_mode=snapshot.active_space_boundary_mode,
+        active_mind_id=snapshot.active_mind_id,
+        mind_topology=snapshot.mind_topology,
+        active_embodiment_id=snapshot.active_embodiment_id,
+        active_realm_id=snapshot.active_realm_id,
+        authorization_snapshot=snapshot,
     )
 
 
-__all__ = ["RouteNamespaceContext", "require_route_namespace_context"]
+async def require_current_route_namespace_snapshot(
+    connection: aiosqlite.Connection,
+    clock: Clock,
+    snapshot: ConversationNamespaceSnapshot,
+) -> None:
+    """Fail closed when an authorized conversation namespace has changed."""
+
+    current = await capture_conversation_namespace_snapshot(
+        connection,
+        clock,
+        user_id=snapshot.user_id,
+        conversation_id=snapshot.conversation_id,
+    )
+    if current != snapshot:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Conversation namespace changed while the request was in progress; retry",
+        )
+
+
+__all__ = [
+    "RouteNamespaceContext",
+    "require_current_route_namespace_snapshot",
+    "require_route_namespace_context",
+]

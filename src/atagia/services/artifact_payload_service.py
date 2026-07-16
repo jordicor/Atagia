@@ -10,7 +10,6 @@ import aiosqlite
 
 from atagia.core.artifact_payload_repository import ArtifactPayloadRepository
 from atagia.core.clock import Clock
-from atagia.services.artifact_blob_store import ArtifactBlobStore
 
 
 class ArtifactPayloadService:
@@ -20,12 +19,9 @@ class ArtifactPayloadService:
         self,
         connection: aiosqlite.Connection,
         clock: Clock,
-        *,
-        blob_store: ArtifactBlobStore | None = None,
     ) -> None:
         self._connection = connection
         self._clock = clock
-        self._blob_store = blob_store
 
     async def get_or_create_payload_blob(
         self,
@@ -50,8 +46,11 @@ class ArtifactPayloadService:
         blob_bytes = blob.get("blob_bytes")
         content_sha256 = self._content_sha256(blob)
         byte_size = self._byte_size(blob, blob_bytes=blob_bytes)
-        storage_key = blob.get("storage_uri")
         payload_bytes = bytes(blob_bytes) if blob_bytes is not None else None
+        if storage_kind != "sqlite_blob":
+            raise ValueError(
+                "Content artifact payloads must use sqlite_blob; local_file is retired"
+            )
         if blob_bytes is not None:
             self._validate_content_identity(
                 payload_bytes,
@@ -66,16 +65,6 @@ class ArtifactPayloadService:
             byte_size=byte_size,
         )
         if existing is not None:
-            if (
-                storage_kind == "local_file"
-                and payload_bytes is not None
-                and existing.get("storage_kind") == "local_file"
-            ):
-                if self._blob_store is None:
-                    raise ValueError("Local artifact blob storage is not configured")
-                stored = self._blob_store.store_bytes(user_id=user_id, content_bytes=payload_bytes)
-                if stored.storage_uri != existing.get("storage_key"):
-                    raise ValueError("Artifact payload storage key mismatch")
             return existing
 
         if storage_kind == "sqlite_blob":
@@ -90,26 +79,7 @@ class ArtifactPayloadService:
                 blob_bytes=payload_bytes,
                 storage_key=None,
             )
-        if storage_kind != "local_file":
-            raise ValueError(f"Unsupported artifact payload storage kind: {storage_kind}")
-        if payload_bytes is not None:
-            if self._blob_store is None:
-                raise ValueError("Local artifact blob storage is not configured")
-            stored = self._blob_store.store_bytes(user_id=user_id, content_bytes=payload_bytes)
-            storage_key = stored.storage_uri
-            byte_size = stored.byte_size
-            content_sha256 = stored.sha256
-        if not storage_key:
-            raise ValueError("Local artifact payload is missing a storage key")
-        return await self._create_with_content_race_retry(
-            repository,
-            user_id=user_id,
-            storage_kind="local_file",
-            content_sha256=content_sha256,
-            byte_size=byte_size,
-            blob_bytes=None,
-            storage_key=str(storage_key),
-        )
+        raise ValueError(f"Unsupported artifact payload storage kind: {storage_kind}")
 
     async def _get_or_create_external_payload(
         self,

@@ -9,6 +9,8 @@ model-id prefix. We build exactly one provider -- the one the chosen model needs
 
 from __future__ import annotations
 
+import os
+
 from atagia.services.llm_client import LLMProvider
 from atagia.services.model_resolution import (
     PROVIDER_SLUG_TO_NAME,
@@ -20,7 +22,15 @@ from atagia.services.providers.minimax import MiniMaxProvider
 from atagia.services.providers.openai import OpenAIProvider
 from atagia.services.providers.openrouter import OpenRouterProvider
 
-from benchmarks.model_casting.env_loader import resolve_keys
+
+
+def _first_environment_value(*names: str) -> str | None:
+    """Return the first configured provider credential from process env."""
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
 
 
 def build_live_provider(model: str) -> LLMProvider:
@@ -31,10 +41,12 @@ def build_live_provider(model: str) -> LLMProvider:
     """
     parsed = parse_model_spec(model)
     provider_name = PROVIDER_SLUG_TO_NAME[parsed.provider_slug]
-    keys = resolve_keys()
 
     if provider_name == "openrouter":
-        api_key = keys.get("openrouter")
+        api_key = _first_environment_value(
+            "ATAGIA_OPENROUTER_API_KEY",
+            "OPENROUTER_API_KEY",
+        )
         if not api_key:
             raise SystemExit(
                 "Live run needs OPENROUTER_API_KEY (or ATAGIA_OPENROUTER_API_KEY) "
@@ -46,7 +58,11 @@ def build_live_provider(model: str) -> LLMProvider:
             app_name="Atagia card2 summary harness",
         )
     if provider_name == "gemini":
-        api_key = keys.get("google")
+        api_key = _first_environment_value(
+            "ATAGIA_GOOGLE_API_KEY",
+            "GEMINI_KEY",
+            "GOOGLE_API_KEY",
+        )
         if not api_key:
             raise SystemExit(
                 "Live run needs GOOGLE/GEMINI key (ATAGIA_GOOGLE_API_KEY or "
@@ -54,7 +70,11 @@ def build_live_provider(model: str) -> LLMProvider:
             )
         return GeminiProvider(api_key=api_key)
     if provider_name == "minimax":
-        api_key = keys.get("minimax")
+        api_key = _first_environment_value(
+            "ATAGIA_MINIMAX_API_KEY",
+            "MINIMAX_API_KEY",
+            "MINIMAX_KEY",
+        )
         if not api_key:
             raise SystemExit(
                 "Live run needs MINIMAX key (ATAGIA_MINIMAX_API_KEY or "
@@ -62,7 +82,11 @@ def build_live_provider(model: str) -> LLMProvider:
             )
         return MiniMaxProvider(api_key=api_key)
     if provider_name == "anthropic":
-        api_key = keys.get("anthropic")
+        api_key = _first_environment_value(
+            "ATAGIA_ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_KEY",
+        )
         if not api_key:
             raise SystemExit(
                 "Live run needs ANTHROPIC key for model "
@@ -70,7 +94,11 @@ def build_live_provider(model: str) -> LLMProvider:
             )
         return AnthropicProvider(api_key=api_key)
     if provider_name == "openai":
-        api_key = keys.get("openai")
+        api_key = _first_environment_value(
+            "ATAGIA_OPENAI_API_KEY",
+            "OPENAI_KEY",
+            "OPENAI_API_KEY",
+        )
         if not api_key:
             raise SystemExit(
                 "Live run needs OPENAI key for model "

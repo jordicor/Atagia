@@ -8,7 +8,11 @@ import aiosqlite
 
 from atagia.core.clock import Clock
 from atagia.core.ids import generate_prefixed_id, new_retrieval_id
-from atagia.core.repositories import BaseRepository, MemoryObjectRepository, _encode_json
+from atagia.core.repositories import (
+    BaseRepository,
+    MemoryObjectRepository,
+    _encode_json,
+)
 
 
 class MemoryFeedbackOwnershipError(ValueError):
@@ -22,7 +26,9 @@ class MemoryFeedbackMismatchError(ValueError):
 class RetrievalEventRepository(BaseRepository):
     """Persistence operations for retrieval event traces."""
 
-    async def create_event(self, event: dict[str, Any], *, commit: bool = True) -> dict[str, Any]:
+    async def create_event(
+        self, event: dict[str, Any], *, commit: bool = True
+    ) -> dict[str, Any]:
         event_id = str(event.get("id") or new_retrieval_id())
         timestamp = str(event.get("created_at") or self._timestamp())
         await self._connection.execute(
@@ -192,6 +198,7 @@ class MemoryFeedbackRepository(BaseRepository):
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
         mode: str | None = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
         selected_memory_ids: set[str] | None = None
         namespace_required = conversation_id is not None and platform_id is not None
@@ -319,7 +326,8 @@ class MemoryFeedbackRepository(BaseRepository):
                 ),
             ),
         )
-        await self._connection.commit()
+        if commit:
+            await self._connection.commit()
         created = await self._fetch_one(
             """
             SELECT *

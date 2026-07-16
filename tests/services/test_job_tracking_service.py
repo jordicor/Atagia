@@ -1,4 +1,4 @@
-"""Tests for memory-processing status summaries."""
+"""Tests for durable job tracking and memory-processing status summaries."""
 
 from __future__ import annotations
 
@@ -14,14 +14,16 @@ from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database
 from atagia.core.job_run_repository import JobRunRepository
 from atagia.core.repositories import ConversationRepository, UserRepository
+from atagia.core.storage_backend import InProcessBackend
 from atagia.models.schemas_jobs import (
-    CONTRACT_STREAM_NAME,
     EXTRACT_STREAM_NAME,
+    ClaimedJob,
     JobEnvelope,
     JobRunStatus,
     JobType,
     MessageJobPayload,
     StreamMessage,
+    WORKER_GROUP_NAME,
     WorkerControlMode,
 )
 from atagia.models.schemas_memory import (
@@ -30,24 +32,34 @@ from atagia.models.schemas_memory import (
     OperationalSignals,
 )
 from atagia.services.chat_support import enqueue_message_jobs
-from atagia.services.job_tracking_service import JobTrackingService, render_memory_processing_status_block
+from atagia.services.durable_job_dispatcher import DurableJobDispatcher
+from atagia.services.job_tracking_service import (
+    JobTrackingService,
+    render_memory_processing_status_block,
+)
 from atagia.services.llm_client import TransientLLMError
 from atagia.services.worker_control_service import WorkerControlService
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
-class RecordingBackend:
-    def __init__(self, *, fail: bool = False) -> None:
-        self.fail = fail
-        self.added: list[tuple[str, dict[str, Any]]] = []
+class FailOncePublishBackend(InProcessBackend):
+    """Inject one notification-delivery failure without losing durable work."""
 
-    async def stream_add(self, stream_name: str, payload: dict[str, Any]) -> str:
-        if self.fail:
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    async def publish_job_notification(self, *args: Any, **kwargs: Any) -> str | None:
+        if not self.failed:
+            self.failed = True
             raise RuntimeError("stream unavailable")
-        self.added.append((stream_name, payload))
-        return f"stm_{len(self.added)}"
+        return await super().publish_job_notification(*args, **kwargs)
 
 
 async def _connection_and_clock() -> tuple[aiosqlite.Connection, FrozenClock]:
@@ -56,27 +68,27 @@ async def _connection_and_clock() -> tuple[aiosqlite.Connection, FrozenClock]:
     return connection, clock
 
 
-async def _insert_assistant_mode(connection: aiosqlite.Connection, mode_id: str = "coding_debug") -> None:
+async def _seed_scope(
+    connection: aiosqlite.Connection,
+    clock: FrozenClock,
+) -> None:
+    await UserRepository(connection, clock).create_user("usr_1")
     await connection.execute(
         """
-        INSERT INTO assistant_modes(id, display_name, prompt_hash, memory_policy_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO assistant_modes(
+            id, display_name, prompt_hash, memory_policy_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
-            mode_id,
+            "coding_debug",
             "Coding Debug",
             "hash_1",
             "{}",
-            "2026-05-02T12:00:00+00:00",
-            "2026-05-02T12:00:00+00:00",
+            clock.now().isoformat(),
+            clock.now().isoformat(),
         ),
     )
     await connection.commit()
-
-
-async def _seed_scope(connection: aiosqlite.Connection, clock: FrozenClock) -> None:
-    await UserRepository(connection, clock).create_user("usr_1")
-    await _insert_assistant_mode(connection)
     await ConversationRepository(connection, clock).create_conversation(
         "cnv_1",
         "usr_1",
@@ -148,39 +160,60 @@ def _settings(**overrides: Any) -> Settings:
     return Settings(**values)
 
 
-def _stream_message(envelope: JobEnvelope, *, delivery_count: int = 1) -> StreamMessage:
-    return StreamMessage(
-        message_id=f"stm_{envelope.job_id}",
-        payload=envelope.model_dump(mode="json"),
-        delivery_count=delivery_count,
+async def _enqueue_and_claim(
+    service: JobTrackingService,
+    backend: InProcessBackend,
+    envelope: JobEnvelope,
+    *,
+    owner_id: str,
+) -> tuple[StreamMessage, ClaimedJob]:
+    await service.enqueue_job(backend, EXTRACT_STREAM_NAME, envelope)
+    messages = await backend.stream_read(
+        EXTRACT_STREAM_NAME,
+        WORKER_GROUP_NAME,
+        owner_id,
+        count=1,
+        block_ms=0,
     )
+    assert len(messages) == 1
+    claim = await service.claim_notification(messages[0], owner_id=owner_id)
+    assert claim is not None
+    return messages[0], claim
+
+
+async def _ack(
+    backend: InProcessBackend,
+    message: StreamMessage,
+) -> None:
+    await backend.stream_ack(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME, message.message_id)
 
 
 @pytest.mark.asyncio
 async def test_job_tracking_service_summarizes_pending_work_and_estimate() -> None:
     connection, clock = await _connection_and_clock()
+    backend = InProcessBackend()
     try:
         await _seed_scope(connection, clock)
-        repository = JobRunRepository(connection, clock)
         service = JobTrackingService(connection, clock, workers_enabled=True)
 
         for index in range(3):
-            job_id = f"job_completed_{index}"
-            await repository.create_queued_job(
-                job_id=job_id,
-                stream_name=EXTRACT_STREAM_NAME,
-                job_type=JobType.EXTRACT_MEMORY_CANDIDATES.value,
-                user_id="usr_1",
-                conversation_id="cnv_1",
-                source_message_ids=[f"msg_completed_{index}"],
-                source_token_estimate=128,
-                size_bucket="small",
+            message, claim = await _enqueue_and_claim(
+                service,
+                backend,
+                _message_job(
+                    f"job_completed_{index}",
+                    f"msg_completed_{index}",
+                    "Completed source.",
+                    created_at=clock.now(),
+                ),
+                owner_id=f"worker-completed-{index}",
             )
-            await repository.mark_running(job_id, attempt_count=1)
             clock.advance(seconds=4)
-            await repository.mark_succeeded(job_id)
+            assert await service.finish_claim_succeeded(claim)
+            await _ack(backend, message)
 
-        await service.create_queued_job(
+        await service.enqueue_job(
+            backend,
             EXTRACT_STREAM_NAME,
             _message_job(
                 "job_pending",
@@ -191,7 +224,6 @@ async def test_job_tracking_service_summarizes_pending_work_and_estimate() -> No
         )
 
         status = await service.get_status(user_id="usr_1", conversation_id="cnv_1")
-
         assert status.processing is True
         assert status.status == "queued"
         assert status.pending_jobs == 1
@@ -213,47 +245,69 @@ async def test_job_tracking_service_summarizes_pending_work_and_estimate() -> No
         assert "Pending work: extract_memory_candidates=1" in prompt_block
         assert "Rough remaining time" in prompt_block
     finally:
+        await backend.close()
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_enqueue_message_jobs_records_success_and_enqueue_failure() -> None:
+async def test_enqueue_failure_preserves_job_until_continuous_dispatch_recovers() -> (
+    None
+):
     connection, clock = await _connection_and_clock()
+    backend = FailOncePublishBackend()
     try:
         await _seed_scope(connection, clock)
         service = JobTrackingService(connection, clock, workers_enabled=True)
         repository = JobRunRepository(connection, clock)
+        envelope = _message_job("job_recover", "msg_recover", "hello")
 
-        success_backend = RecordingBackend()
         await enqueue_message_jobs(
-            storage_backend=success_backend,
-            jobs=[(EXTRACT_STREAM_NAME, _message_job("job_success", "msg_success", "hello"))],
+            storage_backend=backend,
+            jobs=[(EXTRACT_STREAM_NAME, envelope)],
             job_tracking_service=service,
+            initial_context_package_refresh_enabled=False,
         )
-        assert success_backend.added[0][0] == EXTRACT_STREAM_NAME
-        success = await repository.get_job("job_success")
-        assert success is not None
-        assert success["status"] == JobRunStatus.QUEUED.value
+        stored = await repository.get_job(envelope.job_id)
+        assert stored is not None
+        assert stored["status"] == JobRunStatus.AWAITING_CLAIM.value
+        assert stored["error_class"] is None
 
-        with pytest.raises(RuntimeError, match="stream unavailable"):
-            await enqueue_message_jobs(
-                storage_backend=RecordingBackend(fail=True),
-                jobs=[(CONTRACT_STREAM_NAME, _message_job("job_failed", "msg_failed", "hello"))],
-                job_tracking_service=service,
-            )
-
-        failed = await repository.get_job("job_failed")
-        assert failed is not None
-        assert failed["status"] == JobRunStatus.FAILED.value
-        assert failed["error_class"] == "RuntimeError"
-        assert failed["error_message"] == "stream unavailable"
+        clock.advance(seconds=31)
+        dispatcher = DurableJobDispatcher(
+            connection,
+            clock,
+            storage_backend=backend,
+            target_backend="inprocess",
+            visibility_seconds=30,
+            sweep_interval_seconds=1,
+            batch_size=10,
+        )
+        result = await dispatcher.dispatch_once()
+        assert result.published == 1
+        messages = await backend.stream_read(
+            EXTRACT_STREAM_NAME,
+            WORKER_GROUP_NAME,
+            "worker-recovered",
+            count=1,
+            block_ms=0,
+        )
+        assert len(messages) == 1
+        assert set(messages[0].payload) == {
+            "job_id",
+            "dispatch_token",
+            "lifecycle_epoch",
+            "lifecycle_cleanup_key",
+        }
+        assert "message_text" not in str(messages[0].payload)
     finally:
+        await backend.close()
         await connection.close()
 
 
 @pytest.mark.asyncio
 async def test_job_tracking_stores_full_operational_profile_snapshot() -> None:
     connection, clock = await _connection_and_clock()
+    backend = InProcessBackend()
     try:
         await _seed_scope(connection, clock)
         service = JobTrackingService(connection, clock, workers_enabled=True)
@@ -263,21 +317,22 @@ async def test_job_tracking_stores_full_operational_profile_snapshot() -> None:
             update={"operational_profile": _operational_snapshot("custom-token")}
         )
 
-        await service.create_queued_job(EXTRACT_STREAM_NAME, envelope)
-
-        stored = await repository.get_job("job_operational")
+        await service.enqueue_job(backend, EXTRACT_STREAM_NAME, envelope)
+        stored = await repository.get_job(envelope.job_id)
         assert stored is not None
         assert stored["metadata_json"]["operational_profile"] == "normal"
         assert stored["metadata_json"]["operational_profile_snapshot"]["token"] == (
             "custom-token"
         )
     finally:
+        await backend.close()
         await connection.close()
 
 
 @pytest.mark.asyncio
 async def test_enqueue_message_jobs_skips_source_work_when_paused() -> None:
     connection, clock = await _connection_and_clock()
+    backend = InProcessBackend()
     try:
         await _seed_scope(connection, clock)
         service = JobTrackingService(connection, clock, workers_enabled=True)
@@ -285,24 +340,35 @@ async def test_enqueue_message_jobs_skips_source_work_when_paused() -> None:
         worker_control = WorkerControlService(connection, clock)
         await worker_control.set_mode(WorkerControlMode.PAUSE_NEW_JOBS, reason="backup")
 
-        backend = RecordingBackend()
         job_ids = await enqueue_message_jobs(
             storage_backend=backend,
-            jobs=[(EXTRACT_STREAM_NAME, _message_job("job_paused", "msg_paused", "hello"))],
+            jobs=[
+                (EXTRACT_STREAM_NAME, _message_job("job_paused", "msg_paused", "hello"))
+            ],
             job_tracking_service=service,
             worker_control_service=worker_control,
         )
-
         assert job_ids == []
-        assert backend.added == []
         assert await repository.get_job("job_paused") is None
+        assert (
+            await backend.stream_read(
+                EXTRACT_STREAM_NAME,
+                WORKER_GROUP_NAME,
+                "worker-paused",
+                count=1,
+                block_ms=0,
+            )
+            == []
+        )
     finally:
+        await backend.close()
         await connection.close()
 
 
 @pytest.mark.asyncio
 async def test_job_tracking_auto_hard_pauses_after_failure_storm() -> None:
     connection, clock = await _connection_and_clock()
+    backend = InProcessBackend()
     try:
         await _seed_scope(connection, clock)
         settings = _settings(
@@ -319,33 +385,37 @@ async def test_job_tracking_auto_hard_pauses_after_failure_storm() -> None:
         worker_control = WorkerControlService(connection, clock)
 
         for index in range(3):
-            envelope = _message_job(
-                f"job_failure_{index}",
-                f"msg_failure_{index}",
-                "provider call failed",
+            message, claim = await _enqueue_and_claim(
+                service,
+                backend,
+                _message_job(
+                    f"job_failure_{index}",
+                    f"msg_failure_{index}",
+                    "provider call failed",
+                ),
+                owner_id=f"worker-failure-{index}",
             )
-            await service.create_queued_job(EXTRACT_STREAM_NAME, envelope)
-            message = _stream_message(envelope, delivery_count=1)
-            await service.mark_running(message)
-            await service.mark_retrying(
-                message,
+            assert await service.finish_claim_failed(
+                claim,
                 TransientLLMError("provider unavailable"),
             )
+            await _ack(backend, message)
 
         state = await worker_control.get_state()
-
         assert state.mode is WorkerControlMode.HARD_PAUSE
         assert state.updated_by == "worker_circuit_breaker"
         assert state.reason is not None
         assert "Auto hard pause" in state.reason
         assert "TransientLLMError=3" in state.reason
     finally:
+        await backend.close()
         await connection.close()
 
 
 @pytest.mark.asyncio
 async def test_job_tracking_circuit_breaker_respects_failure_ratio() -> None:
     connection, clock = await _connection_and_clock()
+    backend = InProcessBackend()
     try:
         await _seed_scope(connection, clock)
         settings = _settings(
@@ -362,47 +432,51 @@ async def test_job_tracking_circuit_breaker_respects_failure_ratio() -> None:
         worker_control = WorkerControlService(connection, clock)
 
         for index in range(3):
-            envelope = _message_job(
-                f"job_success_{index}",
-                f"msg_success_{index}",
-                "healthy job",
+            message, claim = await _enqueue_and_claim(
+                service,
+                backend,
+                _message_job(f"job_success_{index}", f"msg_success_{index}", "healthy"),
+                owner_id=f"worker-success-{index}",
             )
-            await service.create_queued_job(EXTRACT_STREAM_NAME, envelope)
-            message = _stream_message(envelope, delivery_count=1)
-            await service.mark_running(message)
-            await service.mark_succeeded(message)
+            assert await service.finish_claim_succeeded(claim)
+            await _ack(backend, message)
 
         for index in range(3):
-            envelope = _message_job(
-                f"job_mixed_failure_{index}",
-                f"msg_mixed_failure_{index}",
-                "provider call failed",
+            message, claim = await _enqueue_and_claim(
+                service,
+                backend,
+                _message_job(
+                    f"job_mixed_failure_{index}",
+                    f"msg_mixed_failure_{index}",
+                    "provider call failed",
+                ),
+                owner_id=f"worker-mixed-{index}",
             )
-            await service.create_queued_job(EXTRACT_STREAM_NAME, envelope)
-            message = _stream_message(envelope, delivery_count=1)
-            await service.mark_running(message)
-            await service.mark_retrying(
-                message,
+            assert await service.finish_claim_failed(
+                claim,
                 TransientLLMError("provider unavailable"),
             )
+            await _ack(backend, message)
 
         state = await worker_control.get_state()
-
         assert state.mode is WorkerControlMode.ACTIVE
         assert state.reason is None
     finally:
+        await backend.close()
         await connection.close()
 
 
 @pytest.mark.asyncio
 async def test_job_tracking_filters_non_admin_user_status_by_namespace() -> None:
     connection, clock = await _connection_and_clock()
+    backend = InProcessBackend()
     try:
         await _seed_scope(connection, clock)
         service = JobTrackingService(connection, clock, workers_enabled=True)
         repository = JobRunRepository(connection, clock)
 
-        await service.create_queued_job(
+        await service.enqueue_job(
+            backend,
             EXTRACT_STREAM_NAME,
             _message_job(
                 "job_persona_a",
@@ -413,7 +487,8 @@ async def test_job_tracking_filters_non_admin_user_status_by_namespace() -> None
                 character_id="char_a",
             ),
         )
-        await service.create_queued_job(
+        await service.enqueue_job(
+            backend,
             EXTRACT_STREAM_NAME,
             _message_job(
                 "job_persona_b",
@@ -447,11 +522,11 @@ async def test_job_tracking_filters_non_admin_user_status_by_namespace() -> None
             platform_id="web",
             character_id="char_a",
         )
-
         assert status.pending_jobs == 1
         assert status.pending_jobs_by_type == {
             JobType.EXTRACT_MEMORY_CANDIDATES.value: 1,
         }
         assert status.global_pending_jobs == 1
     finally:
+        await backend.close()
         await connection.close()

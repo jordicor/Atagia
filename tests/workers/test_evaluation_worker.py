@@ -11,10 +11,18 @@ import pytest
 from atagia.core.clock import FrozenClock
 from atagia.core.config import Settings
 from atagia.core.db_sqlite import initialize_database
+from atagia.core.job_run_repository import JobRunRepository
 from atagia.core.metrics_repository import MetricsRepository
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
-from atagia.core.retrieval_event_repository import MemoryFeedbackRepository, RetrievalEventRepository
-from atagia.core.storage_backend import InProcessBackend
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+)
+from atagia.core.retrieval_event_repository import (
+    MemoryFeedbackRepository,
+    RetrievalEventRepository,
+)
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_jobs import EVALUATION_STREAM_NAME, JobEnvelope, JobType
 from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
@@ -28,9 +36,14 @@ from atagia.services.llm_client import (
     StructuredOutputError,
 )
 from atagia.workers.evaluation_worker import EvaluationWorker
+from tests.durable_job_support import DurableJobTestBackend
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 class QueueProvider(LLMProvider):
@@ -80,8 +93,10 @@ def _settings() -> Settings:
 async def _build_runtime():
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 3, 31, 9, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
-    backend = InProcessBackend()
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
+    backend = DurableJobTestBackend(connection, clock, settings=_settings())
     provider = QueueProvider()
     llm_client = LLMClient(provider_name=provider.name, providers=[provider])
     users = UserRepository(connection, clock)
@@ -92,7 +107,9 @@ async def _build_runtime():
     feedback = MemoryFeedbackRepository(connection, clock)
     metrics = MetricsRepository(connection, clock)
     await users.create_user("usr_1")
-    await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "Chat")
+    await conversations.create_conversation(
+        "cnv_1", "usr_1", None, "coding_debug", "Chat"
+    )
     await messages.create_message("msg_1", "cnv_1", "user", 1, "Need help", 2, {})
     await messages.create_message("msg_2", "cnv_1", "assistant", 2, "Try this", 2, {})
     await memories.create_memory_object(
@@ -117,7 +134,11 @@ async def _build_runtime():
             "assistant_mode_id": "coding_debug",
             "retrieval_plan_json": {"fts_queries": ["retry"]},
             "selected_memory_ids_json": ["mem_1"],
-            "context_view_json": {"selected_memory_ids": ["mem_1"], "items_included": 1, "items_dropped": 0},
+            "context_view_json": {
+                "selected_memory_ids": ["mem_1"],
+                "items_included": 1,
+                "items_dropped": 0,
+            },
             "outcome_json": {},
             "created_at": "2026-03-31T09:05:00+00:00",
         }
@@ -140,7 +161,9 @@ async def _build_runtime():
     return connection, backend, metrics, worker
 
 
-def _job(metrics: list[str], *, job_type: JobType = JobType.RUN_EVALUATION) -> JobEnvelope:
+def _job(
+    metrics: list[str], *, job_type: JobType = JobType.RUN_EVALUATION
+) -> JobEnvelope:
     return JobEnvelope(
         job_id="job_eval_1",
         job_type=job_type,
@@ -159,7 +182,9 @@ def _job(metrics: list[str], *, job_type: JobType = JobType.RUN_EVALUATION) -> J
 async def test_evaluation_worker_processes_job_and_stores_metrics() -> None:
     connection, backend, metrics, worker = await _build_runtime()
     try:
-        await backend.stream_add(EVALUATION_STREAM_NAME, _job(["mur"]).model_dump(mode="json"))
+        await backend.stream_add(
+            EVALUATION_STREAM_NAME, _job(["mur"]).model_dump(mode="json")
+        )
 
         result = await worker.run_once()
         stored = await metrics.get_metric(
@@ -194,21 +219,79 @@ async def test_evaluation_worker_dead_letters_after_max_retries() -> None:
     try:
         await backend.stream_add(
             EVALUATION_STREAM_NAME,
-            _job(["mur"], job_type=JobType.EXTRACT_MEMORY_CANDIDATES).model_dump(mode="json"),
+            _job(["mur"], job_type=JobType.EXTRACT_MEMORY_CANDIDATES).model_dump(
+                mode="json"
+            ),
         )
 
         first = await worker.run_once()
+        await backend.advance_to_next_retry()
         second = await worker.run_once()
+        await backend.advance_to_next_retry()
         third = await worker.run_once()
-        dead_letter = await backend.dequeue_job(f"dead_letter:{EVALUATION_STREAM_NAME}", timeout_seconds=0)
+        dead_letter = await backend.dequeue_job(
+            f"dead_letter:{EVALUATION_STREAM_NAME}", timeout_seconds=0
+        )
 
         assert first.failed == 1
         assert second.failed == 1
         assert third.failed == 1
         assert third.dead_lettered == 1
         assert dead_letter is not None
-        assert dead_letter["delivery_count"] == 3
-        assert dead_letter["error_details"] == []
+        assert dead_letter["attempt_count"] == 3
+        assert dead_letter["error_class"] == "ValueError"
+        assert "error" not in dead_letter
+        assert "error_details" not in dead_letter
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_and_terminal_diagnostics_exclude_private_error_text() -> (
+    None
+):
+    private_sentinel = "PRIVATE_PROVIDER_PAYLOAD_DO_NOT_PERSIST_7f31"
+
+    async def fail_with_private_text(_payload):
+        raise RuntimeError(private_sentinel)
+
+    connection, backend, _metrics, worker = await _build_runtime()
+    try:
+        worker.process_job = fail_with_private_text
+        job = _job(["mur"])
+        await backend.stream_add(
+            EVALUATION_STREAM_NAME,
+            job.model_dump(mode="json"),
+        )
+
+        await worker.run_once()
+        await backend.advance_to_next_retry()
+        await worker.run_once()
+        await backend.advance_to_next_retry()
+        result = await worker.run_once()
+
+        queue_name = f"dead_letter:{EVALUATION_STREAM_NAME}"
+        dead_letter = await backend.dequeue_job(queue_name, timeout_seconds=0)
+        stored_job = await JobRunRepository(connection, worker._clock).get_job(
+            job.job_id
+        )
+        serialized_diagnostics = json.dumps(
+            {"dead_letter": dead_letter, "stored_job": stored_job},
+            sort_keys=True,
+            default=str,
+        )
+
+        assert result.dead_lettered == 1
+        assert dead_letter is not None
+        assert dead_letter["error_class"] == "RuntimeError"
+        assert stored_job is not None
+        assert stored_job["error_message"] is None
+        assert stored_job["recovery_envelope_json"] is None
+        assert private_sentinel not in serialized_diagnostics
+
+        await backend.enqueue_job(queue_name, dead_letter)
+        assert await backend.purge_user_jobs("usr_1") == 1
+        assert await backend.dequeue_job(queue_name, timeout_seconds=0) is None
     finally:
         await connection.close()
 
@@ -227,7 +310,9 @@ async def test_evaluation_worker_logs_structured_job_failure_without_traceback(
     connection, backend, _metrics, worker = await _build_runtime()
     try:
         worker._metrics_computer.compute_named_metric = fail_metric
-        await backend.stream_add(EVALUATION_STREAM_NAME, _job(["ccr"]).model_dump(mode="json"))
+        await backend.stream_add(
+            EVALUATION_STREAM_NAME, _job(["ccr"]).model_dump(mode="json")
+        )
 
         with caplog.at_level("WARNING", logger="atagia.workers.evaluation_worker"):
             result = await worker.run_once()

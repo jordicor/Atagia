@@ -24,6 +24,7 @@ async def resolve_active_realm_snapshot(
     realm_id: str | None = None,
     cross_realm_mode: CrossRealmMode | str | None = None,
     display_name: str | None = None,
+    commit: bool = True,
 ) -> RealmSnapshot | None:
     """Resolve the active Realm row without mutating a conversation."""
 
@@ -32,6 +33,7 @@ async def resolve_active_realm_snapshot(
         realm_id=_optional_text(realm_id),
         cross_realm_mode=cross_realm_mode,
         display_name=display_name,
+        commit=commit,
     )
     if row is None:
         return None
@@ -46,6 +48,7 @@ async def ensure_conversation_active_realm(
     realm_id: str | None = None,
     cross_realm_mode: CrossRealmMode | str | None = None,
     display_name: str | None = None,
+    commit: bool = True,
 ) -> tuple[dict[str, Any], RealmSnapshot | None]:
     """Resolve and persist the active Realm for a conversation if present."""
 
@@ -60,6 +63,7 @@ async def ensure_conversation_active_realm(
         realm_id=requested_realm_id,
         cross_realm_mode=cross_realm_mode,
         display_name=display_name,
+        commit=commit,
     )
     if snapshot is None:
         return conversation, None
@@ -79,6 +83,7 @@ async def ensure_conversation_active_realm(
             str(conversation["id"]),
             owner_user_id,
             snapshot.realm_id,
+            commit=commit,
         )
         if updated is not None:
             conversation = {

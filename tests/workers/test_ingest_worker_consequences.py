@@ -18,7 +18,6 @@ from atagia.core.repositories import (
     UserRepository,
     WorkspaceRepository,
 )
-from atagia.core.storage_backend import InProcessBackend
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_jobs import EXTRACT_STREAM_NAME, JobEnvelope
 from atagia.models.schemas_memory import MemoryObjectType
@@ -35,9 +34,10 @@ from tests.extraction_payload_support import (
     is_memory_extraction_card_purpose,
     memory_extraction_card_output_from_payload,
 )
+from tests.durable_job_support import DurableJobTestBackend
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 class QueueProvider(LLMProvider):
@@ -183,7 +183,8 @@ async def _build_runtime(
         10,
         {},
     )
-    backend = InProcessBackend()
+    resolved_settings = _settings()
+    backend = DurableJobTestBackend(connection, clock, settings=resolved_settings)
     provider = QueueProvider(
         extraction_output=extraction_output,
         consequence_outputs=consequence_outputs,
@@ -196,7 +197,7 @@ async def _build_runtime(
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         clock=clock,
         manifest_loader=manifest_loader,
-        settings=_settings(),
+        settings=resolved_settings,
     )
     return connection, backend, memories, worker, current
 

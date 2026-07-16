@@ -2,21 +2,67 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from shutil import copy2
 
 import aiosqlite
 import pytest
 
-from atagia.core.db_sqlite import SQLITE_BUSY_TIMEOUT_MS, MigrationManager, initialize_database
+from atagia.core.db_sqlite import (
+    SQLITE_BUSY_TIMEOUT_MS,
+    MigrationManager,
+    close_connection,
+    initialize_database,
+    is_in_memory_database,
+    open_connection,
+    resolve_runtime_database_path,
+)
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
 
 
 async def _fetch_one_value(connection: aiosqlite.Connection, query: str) -> object:
     cursor = await connection.execute(query)
     row = await cursor.fetchone()
     return row[0]
+
+
+@pytest.mark.asyncio
+async def test_runtime_memory_database_waits_for_concurrent_writer() -> None:
+    database_path = resolve_runtime_database_path(":memory:")
+    assert database_path.startswith("file:/atagia-")
+    assert database_path.endswith("?vfs=memdb")
+    assert is_in_memory_database(database_path)
+
+    first = await open_connection(database_path)
+    second = await open_connection(database_path)
+    try:
+        await first.execute("CREATE TABLE writer_probe (value INTEGER NOT NULL)")
+        await first.commit()
+        await first.execute("BEGIN IMMEDIATE")
+        await first.execute("INSERT INTO writer_probe(value) VALUES (?)", (1,))
+
+        async def write_from_second_connection() -> None:
+            await second.execute("BEGIN IMMEDIATE")
+            await second.execute("INSERT INTO writer_probe(value) VALUES (?)", (2,))
+            await second.commit()
+
+        pending_write = asyncio.create_task(write_from_second_connection())
+        await asyncio.sleep(0.05)
+        assert not pending_write.done()
+
+        await first.commit()
+        await asyncio.wait_for(pending_write, timeout=1.0)
+        cursor = await first.execute(
+            "SELECT value FROM writer_probe ORDER BY value ASC"
+        )
+        assert [row["value"] for row in await cursor.fetchall()] == [1, 2]
+    finally:
+        await close_connection(second)
+        await close_connection(first)
 
 
 @pytest.mark.asyncio
@@ -76,6 +122,7 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "overseer_grants",
             "deletion_tombstones",
             "pending_file_deletions",
+            "artifact_blob_cleanup_intents",
             "pending_memory_confirmations",
             "presences",
             "realm_bridges",
@@ -92,7 +139,10 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
         }.issubset(names)
         assert await _fetch_one_value(connection, "PRAGMA foreign_keys;") == 1
         assert await _fetch_one_value(connection, "PRAGMA journal_mode;") != "wal"
-        assert await _fetch_one_value(connection, "PRAGMA busy_timeout;") == SQLITE_BUSY_TIMEOUT_MS
+        assert (
+            await _fetch_one_value(connection, "PRAGMA busy_timeout;")
+            == SQLITE_BUSY_TIMEOUT_MS
+        )
         assert await _fetch_one_value(
             connection,
             "SELECT COUNT(*) FROM schema_migrations;",
@@ -104,11 +154,19 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             row["name"] for row in await assistant_modes_columns_cursor.fetchall()
         }
         assert "privacy_ceiling" in assistant_modes_columns
-        feedback_columns_cursor = await connection.execute("PRAGMA table_info(memory_feedback_events);")
-        feedback_columns = {row["name"] for row in await feedback_columns_cursor.fetchall()}
+        feedback_columns_cursor = await connection.execute(
+            "PRAGMA table_info(memory_feedback_events);"
+        )
+        feedback_columns = {
+            row["name"] for row in await feedback_columns_cursor.fetchall()
+        }
         assert "user_id" in feedback_columns
-        message_columns_cursor = await connection.execute("PRAGMA table_info(messages);")
-        message_columns = {row["name"] for row in await message_columns_cursor.fetchall()}
+        message_columns_cursor = await connection.execute(
+            "PRAGMA table_info(messages);"
+        )
+        message_columns = {
+            row["name"] for row in await message_columns_cursor.fetchall()
+        }
         assert {
             "occurred_at",
             "content_kind",
@@ -128,7 +186,9 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "active_embodiment_id",
             "active_realm_id",
         }.issubset(message_columns)
-        memory_columns_cursor = await connection.execute("PRAGMA table_info(memory_objects);")
+        memory_columns_cursor = await connection.execute(
+            "PRAGMA table_info(memory_objects);"
+        )
         memory_columns = {row["name"] for row in await memory_columns_cursor.fetchall()}
         assert "extraction_hash" in memory_columns
         assert "index_text" in memory_columns
@@ -150,7 +210,9 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
         surface_columns_cursor = await connection.execute(
             "PRAGMA table_info(memory_retrieval_surfaces);"
         )
-        surface_columns = {row["name"] for row in await surface_columns_cursor.fetchall()}
+        surface_columns = {
+            row["name"] for row in await surface_columns_cursor.fetchall()
+        }
         assert {
             "_rowid",
             "id",
@@ -210,8 +272,12 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "schema_version",
             "created_at",
         }.issubset(fact_facet_columns)
-        conversation_columns_cursor = await connection.execute("PRAGMA table_info(conversations);")
-        conversation_columns = {row["name"] for row in await conversation_columns_cursor.fetchall()}
+        conversation_columns_cursor = await connection.execute(
+            "PRAGMA table_info(conversations);"
+        )
+        conversation_columns = {
+            row["name"] for row in await conversation_columns_cursor.fetchall()
+        }
         assert {
             "temporary",
             "temporary_ttl_seconds",
@@ -262,8 +328,12 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             )
             """
         )
-        worker_job_columns_cursor = await connection.execute("PRAGMA table_info(worker_job_runs);")
-        worker_job_columns = {row["name"] for row in await worker_job_columns_cursor.fetchall()}
+        worker_job_columns_cursor = await connection.execute(
+            "PRAGMA table_info(worker_job_runs);"
+        )
+        worker_job_columns = {
+            row["name"] for row in await worker_job_columns_cursor.fetchall()
+        }
         assert {
             "job_id",
             "stream_name",
@@ -288,13 +358,21 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "error_message",
             "metadata_json",
         }.issubset(worker_job_columns)
-        consent_columns_cursor = await connection.execute("PRAGMA table_info(memory_consent_profile);")
-        consent_columns = {row["name"] for row in await consent_columns_cursor.fetchall()}
-        assert {"user_id", "category", "confirmed_count", "declined_count"}.issubset(consent_columns)
+        consent_columns_cursor = await connection.execute(
+            "PRAGMA table_info(memory_consent_profile);"
+        )
+        consent_columns = {
+            row["name"] for row in await consent_columns_cursor.fetchall()
+        }
+        assert {"user_id", "category", "confirmed_count", "declined_count"}.issubset(
+            consent_columns
+        )
         confirmation_columns_cursor = await connection.execute(
             "PRAGMA table_info(pending_memory_confirmations);"
         )
-        confirmation_columns = {row["name"] for row in await confirmation_columns_cursor.fetchall()}
+        confirmation_columns = {
+            row["name"] for row in await confirmation_columns_cursor.fetchall()
+        }
         assert {
             "user_id",
             "conversation_id",
@@ -303,21 +381,31 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "asked_at",
             "confirmation_asked_once",
         }.issubset(confirmation_columns)
-        memory_fts_columns_cursor = await connection.execute("PRAGMA table_info(memory_objects_fts);")
-        memory_fts_columns = {row["name"] for row in await memory_fts_columns_cursor.fetchall()}
+        memory_fts_columns_cursor = await connection.execute(
+            "PRAGMA table_info(memory_objects_fts);"
+        )
+        memory_fts_columns = {
+            row["name"] for row in await memory_fts_columns_cursor.fetchall()
+        }
         assert "canonical_text" in memory_fts_columns
         assert "index_text" in memory_fts_columns
-        graph_mentions_columns_cursor = await connection.execute("PRAGMA table_info(graph_entity_mentions);")
+        graph_mentions_columns_cursor = await connection.execute(
+            "PRAGMA table_info(graph_entity_mentions);"
+        )
         graph_mentions_columns = {
             row["name"] for row in await graph_mentions_columns_cursor.fetchall()
         }
         assert "source_occurrence_key" in graph_mentions_columns
-        graph_source_columns_cursor = await connection.execute("PRAGMA table_info(graph_relationship_sources);")
+        graph_source_columns_cursor = await connection.execute(
+            "PRAGMA table_info(graph_relationship_sources);"
+        )
         graph_source_columns = {
             row["name"] for row in await graph_source_columns_cursor.fetchall()
         }
         assert "source_occurrence_key" in graph_source_columns
-        pin_columns_cursor = await connection.execute("PRAGMA table_info(verbatim_pins);")
+        pin_columns_cursor = await connection.execute(
+            "PRAGMA table_info(verbatim_pins);"
+        )
         pin_columns = {row["name"] for row in await pin_columns_cursor.fetchall()}
         assert {
             "user_id",
@@ -344,11 +432,19 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "embodiment_id",
             "realm_id",
         }.issubset(pin_columns)
-        pin_fts_columns_cursor = await connection.execute("PRAGMA table_info(verbatim_pins_fts);")
-        pin_fts_columns = {row["name"] for row in await pin_fts_columns_cursor.fetchall()}
+        pin_fts_columns_cursor = await connection.execute(
+            "PRAGMA table_info(verbatim_pins_fts);"
+        )
+        pin_fts_columns = {
+            row["name"] for row in await pin_fts_columns_cursor.fetchall()
+        }
         assert "index_text" in pin_fts_columns
-        artifact_columns_cursor = await connection.execute("PRAGMA table_info(artifacts);")
-        artifact_columns = {row["name"] for row in await artifact_columns_cursor.fetchall()}
+        artifact_columns_cursor = await connection.execute(
+            "PRAGMA table_info(artifacts);"
+        )
+        artifact_columns = {
+            row["name"] for row in await artifact_columns_cursor.fetchall()
+        }
         assert {
             "user_id",
             "workspace_id",
@@ -382,8 +478,12 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "embodiment_id",
             "realm_id",
         }.issubset(artifact_columns)
-        artifact_payload_columns_cursor = await connection.execute("PRAGMA table_info(artifact_payload_blobs);")
-        artifact_payload_columns = {row["name"] for row in await artifact_payload_columns_cursor.fetchall()}
+        artifact_payload_columns_cursor = await connection.execute(
+            "PRAGMA table_info(artifact_payload_blobs);"
+        )
+        artifact_payload_columns = {
+            row["name"] for row in await artifact_payload_columns_cursor.fetchall()
+        }
         assert {
             "id",
             "user_id",
@@ -398,8 +498,12 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "created_at",
             "updated_at",
         }.issubset(artifact_payload_columns)
-        artifact_chunks_columns_cursor = await connection.execute("PRAGMA table_info(artifact_chunks);")
-        artifact_chunks_columns = {row["name"] for row in await artifact_chunks_columns_cursor.fetchall()}
+        artifact_chunks_columns_cursor = await connection.execute(
+            "PRAGMA table_info(artifact_chunks);"
+        )
+        artifact_chunks_columns = {
+            row["name"] for row in await artifact_chunks_columns_cursor.fetchall()
+        }
         assert {
             "artifact_id",
             "user_id",
@@ -414,8 +518,12 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "created_at",
             "updated_at",
         }.issubset(artifact_chunks_columns)
-        artifact_links_columns_cursor = await connection.execute("PRAGMA table_info(artifact_links);")
-        artifact_links_columns = {row["name"] for row in await artifact_links_columns_cursor.fetchall()}
+        artifact_links_columns_cursor = await connection.execute(
+            "PRAGMA table_info(artifact_links);"
+        )
+        artifact_links_columns = {
+            row["name"] for row in await artifact_links_columns_cursor.fetchall()
+        }
         assert {
             "user_id",
             "message_id",
@@ -424,15 +532,21 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "ordinal",
             "created_at",
         }.issubset(artifact_links_columns)
-        summary_columns_cursor = await connection.execute("PRAGMA table_info(summary_views);")
-        summary_columns = {row["name"] for row in await summary_columns_cursor.fetchall()}
+        summary_columns_cursor = await connection.execute(
+            "PRAGMA table_info(summary_views);"
+        )
+        summary_columns = {
+            row["name"] for row in await summary_columns_cursor.fetchall()
+        }
         assert "model" in summary_columns
         assert "user_id" in summary_columns
         assert "hierarchy_level" in summary_columns
         activity_columns_cursor = await connection.execute(
             "PRAGMA table_info(conversation_activity_stats);"
         )
-        activity_columns = {row["name"] for row in await activity_columns_cursor.fetchall()}
+        activity_columns = {
+            row["name"] for row in await activity_columns_cursor.fetchall()
+        }
         assert {
             "user_id",
             "conversation_id",
@@ -445,8 +559,12 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "likely_soon_score",
             "schedule_pattern_kind",
         }.issubset(activity_columns)
-        graph_entity_columns_cursor = await connection.execute("PRAGMA table_info(graph_entities);")
-        graph_entity_columns = {row["name"] for row in await graph_entity_columns_cursor.fetchall()}
+        graph_entity_columns_cursor = await connection.execute(
+            "PRAGMA table_info(graph_entities);"
+        )
+        graph_entity_columns = {
+            row["name"] for row in await graph_entity_columns_cursor.fetchall()
+        }
         assert {
             "_rowid",
             "id",
@@ -460,7 +578,9 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "created_at",
             "updated_at",
         }.issubset(graph_entity_columns)
-        graph_relationship_columns_cursor = await connection.execute("PRAGMA table_info(graph_relationships);")
+        graph_relationship_columns_cursor = await connection.execute(
+            "PRAGMA table_info(graph_relationships);"
+        )
         graph_relationship_columns = {
             row["name"] for row in await graph_relationship_columns_cursor.fetchall()
         }
@@ -480,7 +600,8 @@ async def test_initialize_database_applies_schema_and_pragmas() -> None:
             "PRAGMA table_info(initial_context_packages);"
         )
         initial_context_package_columns = {
-            row["name"] for row in await initial_context_package_columns_cursor.fetchall()
+            row["name"]
+            for row in await initial_context_package_columns_cursor.fetchall()
         }
         assert {
             "_rowid",
@@ -616,7 +737,9 @@ async def test_memory_retrieval_surfaces_fts_owner_guard_and_cascade() -> None:
 
         await connection.execute("DELETE FROM memory_objects WHERE id = 'mem_1'")
         await connection.commit()
-        cursor = await connection.execute("SELECT COUNT(*) AS count FROM memory_retrieval_surfaces")
+        cursor = await connection.execute(
+            "SELECT COUNT(*) AS count FROM memory_retrieval_surfaces"
+        )
         row = await cursor.fetchone()
         assert row["count"] == 0
         cursor = await connection.execute(
@@ -653,7 +776,9 @@ async def test_memory_retrieval_surfaces_fts_owner_guard_and_cascade() -> None:
         await connection.commit()
         await connection.execute("DELETE FROM memory_objects WHERE user_id = 'usr_1'")
         await connection.commit()
-        cursor = await connection.execute("SELECT COUNT(*) AS count FROM memory_retrieval_surfaces")
+        cursor = await connection.execute(
+            "SELECT COUNT(*) AS count FROM memory_retrieval_surfaces"
+        )
         row = await cursor.fetchone()
         assert row["count"] == 0
         cursor = await connection.execute(
@@ -836,8 +961,12 @@ async def test_rowid_fts_and_review_required_status_work() -> None:
         )
         await connection.commit()
 
-        message_rowid = await _fetch_one_value(connection, "SELECT _rowid FROM messages WHERE id = 'msg_1';")
-        memory_rowid = await _fetch_one_value(connection, "SELECT _rowid FROM memory_objects WHERE id = 'mem_1';")
+        message_rowid = await _fetch_one_value(
+            connection, "SELECT _rowid FROM messages WHERE id = 'msg_1';"
+        )
+        memory_rowid = await _fetch_one_value(
+            connection, "SELECT _rowid FROM memory_objects WHERE id = 'mem_1';"
+        )
         assert message_rowid == 1
         assert memory_rowid == 1
 
@@ -865,10 +994,13 @@ async def test_rowid_fts_and_review_required_status_work() -> None:
         )
         assert (await removed_cursor.fetchone())[0] == 0
         assert (await updated_cursor.fetchone())[0] == 1
-        assert await _fetch_one_value(
-            connection,
-            "SELECT status FROM memory_objects WHERE id = 'mem_1';",
-        ) == "review_required"
+        assert (
+            await _fetch_one_value(
+                connection,
+                "SELECT status FROM memory_objects WHERE id = 'mem_1';",
+            )
+            == "review_required"
+        )
     finally:
         await connection.close()
 
@@ -924,7 +1056,10 @@ async def test_memory_objects_accept_pending_and_declined_statuses() -> None:
         rows = await cursor.fetchall()
 
         assert [row["id"] for row in rows] == ["mem_declined", "mem_pending"]
-        assert [row["status"] for row in rows] == ["declined", "pending_user_confirmation"]
+        assert [row["status"] for row in rows] == [
+            "declined",
+            "pending_user_confirmation",
+        ]
         assert all(row["memory_category"] == "pin_or_password" for row in rows)
         assert all(row["preserve_verbatim"] == 1 for row in rows)
     finally:
@@ -959,7 +1094,9 @@ async def test_verbatim_pins_fts_uses_safe_index_text_and_honors_rowid() -> None
         )
         await connection.commit()
 
-        rowid = await _fetch_one_value(connection, "SELECT _rowid FROM verbatim_pins WHERE id = 'vbp_1';")
+        rowid = await _fetch_one_value(
+            connection, "SELECT _rowid FROM verbatim_pins WHERE id = 'vbp_1';"
+        )
         assert rowid == 1
 
         safe_match = await _fetch_one_value(
@@ -978,7 +1115,9 @@ async def test_verbatim_pins_fts_uses_safe_index_text_and_honors_rowid() -> None
 
 
 @pytest.mark.asyncio
-async def test_artifact_chunks_fts_uses_safe_text_and_excludes_base64_payloads() -> None:
+async def test_artifact_chunks_fts_uses_safe_text_and_excludes_base64_payloads() -> (
+    None
+):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     try:
         await connection.execute(
@@ -1049,7 +1188,9 @@ async def test_artifact_chunks_fts_uses_safe_text_and_excludes_base64_payloads()
         )
         await connection.commit()
 
-        rowid = await _fetch_one_value(connection, "SELECT _rowid FROM artifact_chunks WHERE id = 'arc_1';")
+        rowid = await _fetch_one_value(
+            connection, "SELECT _rowid FROM artifact_chunks WHERE id = 'arc_1';"
+        )
         assert rowid == 1
 
         safe_match = await _fetch_one_value(
@@ -1226,7 +1367,9 @@ async def test_memory_extraction_hash_is_unique_per_user() -> None:
 
 
 @pytest.mark.asyncio
-async def test_migration_0012_backfills_summary_view_user_ids_and_drops_orphans(tmp_path: Path) -> None:
+async def test_migration_0012_backfills_summary_view_user_ids_and_drops_orphans(
+    tmp_path: Path,
+) -> None:
     legacy_dir = tmp_path / "legacy-migrations"
     legacy_dir.mkdir()
     manager = MigrationManager(MIGRATIONS_DIR)
@@ -1302,7 +1445,9 @@ async def test_migration_0012_backfills_summary_view_user_ids_and_drops_orphans(
 
 
 @pytest.mark.asyncio
-async def test_migration_0032_converts_workspace_rollups_to_character_rollups(tmp_path: Path) -> None:
+async def test_migration_0032_converts_workspace_rollups_to_character_rollups(
+    tmp_path: Path,
+) -> None:
     db_path = tmp_path / "phase8.sqlite"
     bootstrap_migrations = tmp_path / "bootstrap_migrations_0032"
     bootstrap_migrations.mkdir()
@@ -1385,7 +1530,9 @@ async def test_migration_0032_converts_workspace_rollups_to_character_rollups(tm
 
 
 @pytest.mark.asyncio
-async def test_migration_0033_upgrades_existing_secondary_surfaces(tmp_path: Path) -> None:
+async def test_migration_0033_upgrades_existing_secondary_surfaces(
+    tmp_path: Path,
+) -> None:
     db_path = tmp_path / "phase10.sqlite"
     bootstrap_migrations = tmp_path / "bootstrap_migrations_0033"
     bootstrap_migrations.mkdir()
@@ -1460,7 +1607,9 @@ async def test_migration_0033_upgrades_existing_secondary_surfaces(tmp_path: Pat
 
     upgraded = await initialize_database(str(db_path), MIGRATIONS_DIR)
     try:
-        cursor = await upgraded.execute("PRAGMA table_xinfo(contract_dimensions_current)")
+        cursor = await upgraded.execute(
+            "PRAGMA table_xinfo(contract_dimensions_current)"
+        )
         contract_columns = {row["name"] for row in await cursor.fetchall()}
         assert "scope_canonical_key" in contract_columns
 
@@ -1629,6 +1778,7 @@ async def test_migration_0034_finalizes_canonical_scope_schema(tmp_path: Path) -
 
     upgraded = await initialize_database(str(db_path), MIGRATIONS_DIR)
     try:
+
         async def create_sql(table: str) -> str:
             cursor = await upgraded.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -1658,7 +1808,9 @@ async def test_migration_0034_finalizes_canonical_scope_schema(tmp_path: Path) -
                 """
             )
 
-        cursor = await upgraded.execute("SELECT id, scope, scope_canonical FROM memory_objects ORDER BY id")
+        cursor = await upgraded.execute(
+            "SELECT id, scope, scope_canonical FROM memory_objects ORDER BY id"
+        )
         memories = {row["id"]: dict(row) for row in await cursor.fetchall()}
         assert memories == {
             "mem_chat": {"id": "mem_chat", "scope": "chat", "scope_canonical": "chat"},
@@ -1683,7 +1835,9 @@ async def test_migration_0034_finalizes_canonical_scope_schema(tmp_path: Path) -
         fts_memory_count = await cursor.fetchone()
         assert fts_memory_count["count"] == len(memories)
 
-        cursor = await upgraded.execute("SELECT scope, scope_canonical FROM verbatim_pins WHERE id = 'pin_1'")
+        cursor = await upgraded.execute(
+            "SELECT scope, scope_canonical FROM verbatim_pins WHERE id = 'pin_1'"
+        )
         pin = await cursor.fetchone()
         assert dict(pin) == {"scope": "chat", "scope_canonical": "chat"}
 
@@ -1697,11 +1851,15 @@ async def test_migration_0034_finalizes_canonical_scope_schema(tmp_path: Path) -
         fts_pin_count = await cursor.fetchone()
         assert fts_pin_count["count"] == 1
 
-        cursor = await upgraded.execute("SELECT scope, scope_canonical FROM contract_dimensions_current")
+        cursor = await upgraded.execute(
+            "SELECT scope, scope_canonical FROM contract_dimensions_current"
+        )
         contract = await cursor.fetchone()
         assert dict(contract) == {"scope": "chat", "scope_canonical": "chat"}
 
-        cursor = await upgraded.execute("SELECT id, relation_type FROM memory_links ORDER BY id")
+        cursor = await upgraded.execute(
+            "SELECT id, relation_type FROM memory_links ORDER BY id"
+        )
         links = [dict(row) for row in await cursor.fetchall()]
         assert links == [{"id": "lnk_keep", "relation_type": "supports"}]
 
@@ -1732,6 +1890,7 @@ async def test_migration_0034_finalizes_canonical_scope_schema(tmp_path: Path) -
 async def test_migration_0031_adds_redesign_identity_columns() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     try:
+
         async def column_names(table: str) -> set[str]:
             # `table_xinfo` is the variant that surfaces VIRTUAL generated
             # columns alongside ordinary columns; `table_info` hides them.

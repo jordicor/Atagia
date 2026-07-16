@@ -72,6 +72,7 @@ class SpaceRepository:
         workspace_id: str | None,
         boundary_mode: SpaceBoundaryMode = SpaceBoundaryMode.FOCUS,
         display_name: str | None = None,
+        commit: bool = True,
     ) -> dict[str, Any] | None:
         if space_id is not None:
             return await self.resolve_space(
@@ -81,6 +82,7 @@ class SpaceRepository:
                 display_name=display_name or space_id,
                 source_kind="explicit",
                 source_id=space_id,
+                commit=commit,
             )
         if workspace_id is not None:
             return await self.resolve_space(
@@ -90,6 +92,7 @@ class SpaceRepository:
                 display_name=display_name or workspace_id,
                 source_kind="workspace_id",
                 source_id=workspace_id,
+                commit=commit,
             )
         return None
 
@@ -111,6 +114,15 @@ class SpaceRepository:
         )
         timestamp = self._timestamp()
         if existing is not None:
+            normalized_display = _normalize_optional_text(display_name)
+            if (
+                str(existing.get("boundary_mode")) == boundary_mode.value
+                and (
+                    normalized_display is None
+                    or existing.get("display_name") == normalized_display
+                )
+            ):
+                return existing
             await self._connection.execute(
                 """
                 UPDATE spaces
@@ -122,7 +134,7 @@ class SpaceRepository:
                 """,
                 (
                     boundary_mode.value,
-                    _normalize_optional_text(display_name),
+                    normalized_display,
                     timestamp,
                     owner_user_id,
                     space_id,

@@ -31,8 +31,6 @@ def test_copyable_python_platform_scaffolds_import() -> None:
         "atagia_memory_filter": ROOT / "integrations/open-webui/atagia_memory_filter.py",
         "atagia_adapter": ROOT / "integrations/openclaw/atagia_adapter.py",
         "atagia_provider": ROOT / "integrations/hermes/atagia_provider.py",
-        "hermes_atagia_plugin": ROOT
-        / "integrations/hermes/plugins/memory/atagia/provider.py",
         "atagia_importers": ROOT / "integrations/importers/atagia_importers.py",
     }
 
@@ -42,7 +40,6 @@ def test_copyable_python_platform_scaffolds_import() -> None:
     assert hasattr(loaded["atagia_memory_filter"], "Filter")
     assert hasattr(loaded["atagia_adapter"], "AtagiaOpenClawAdapter")
     assert hasattr(loaded["atagia_provider"], "AtagiaHermesProvider")
-    assert hasattr(loaded["hermes_atagia_plugin"], "AtagiaMemoryProvider")
     assert hasattr(loaded["atagia_importers"], "import_sillytavern_jsonl")
 
 

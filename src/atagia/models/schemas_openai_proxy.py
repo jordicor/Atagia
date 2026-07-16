@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 from atagia.models.schemas_memory import ResponseMode
 
@@ -37,6 +37,8 @@ class OpenAIChatCompletionRequest(BaseModel):
     stream_options: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
     user: str | None = None
+    incognito: SkipValidation[bool | None] = None
+    cross_chat_memory: SkipValidation[bool | None] = None
     # Atagia extension: optional per-request latency/quality mode. Kept
     # OpenAI-schema-tolerant (the model already allows extra fields); an
     # explicit field gives enum validation when callers set it directly.

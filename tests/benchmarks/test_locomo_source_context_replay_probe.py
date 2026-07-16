@@ -25,7 +25,7 @@ def test_build_source_context_cases_from_retained_db(tmp_path: Path) -> None:
     assert report["summary"]["case_count"] == 1
     case = report["cases"][0]
     assert case["question_id"] == "conv-test:q1"
-    assert case["probe_bucket"] == "single-hop:non_summary_available_not_raw"
+    assert case["probe_bucket"] == "multi-hop:non_summary_available_not_raw"
     assert "Selected summary about volunteering." in case["contexts"]["selected_current"]
     assert "Direct source memory: David helped at the shelter." in case["contexts"]["source_memory_all"]
     assert "Direct source memory: David helped at the shelter." in case["contexts"]["source_memory_non_summary"]
@@ -44,12 +44,12 @@ def _write_dataset(path: Path) -> None:
                             {
                                 "speaker": "Alex",
                                 "text": "I met David while volunteering at the shelter.",
-                                "dia_id": "D1:1",
+                                "dia_id": "D91:1",
                             },
                             {
                                 "speaker": "Blair",
                                 "text": "That sounds meaningful.",
-                                "dia_id": "D1:2",
+                                "dia_id": "D92:1",
                             },
                         ],
                     },
@@ -58,7 +58,7 @@ def _write_dataset(path: Path) -> None:
                             "question": "Who did Alex meet while volunteering?",
                             "answer": "David",
                             "category": 1,
-                            "evidence": ["D1:1"],
+                            "evidence": ["D91:1"],
                         }
                     ],
                 }
@@ -177,7 +177,7 @@ def _write_report(path: Path, db_path: Path) -> None:
                                     "question_text": "Who did Alex meet while volunteering?",
                                     "ground_truth": "David",
                                     "category": 1,
-                                    "evidence_turn_ids": ["D1:1"],
+                                    "evidence_turn_ids": ["D91:1"],
                                 },
                                 "prediction": "I do not know.",
                                 "score_result": {
@@ -190,7 +190,7 @@ def _write_report(path: Path, db_path: Path) -> None:
                                 "trace": {
                                     "benchmark_privacy_enforcement": "off",
                                     "evidence_message_ids": ["msg-1"],
-                                    "evidence_turn_ids": ["D1:1"],
+                                    "evidence_turn_ids": ["D91:1"],
                                     "missing_evidence_turn_ids": [],
                                     "retrieval_trace": {"user_id": "benchmark-user"},
                                     "selected_memory_ids": ["sum-1"],

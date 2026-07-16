@@ -39,7 +39,6 @@ class _LifecycleRuntimeView:
     settings: Settings
     embedding_index: EmbeddingIndex
     storage_backend: StorageBackend
-    artifact_blob_store: Any | None = None
     llm_client: Any | None = None
 
 
@@ -70,11 +69,6 @@ def _runtime_prefix(database_path: str) -> str:
     return hashlib.sha256(database_path.encode()).hexdigest()[:12]
 
 
-def cache_generation_key(database_path: str, user_id: str) -> str:
-    """Build a namespaced cache generation key for a user."""
-    return f"{_runtime_prefix(database_path)}:{user_id}"
-
-
 def _is_sqlite_busy_error(exc: BaseException) -> bool:
     """Return True for SQLite writer contention that lazy lifecycle can skip."""
     if not isinstance(exc, sqlite3.OperationalError):
@@ -102,7 +96,6 @@ async def try_run_lifecycle(
     settings: Settings,
     embedding_index: EmbeddingIndex,
     storage_backend: StorageBackend,
-    artifact_blob_store: Any | None = None,
     llm_client: Any | None = None,
     lifecycle_runtime: AppRuntime | None = None,
 ) -> bool:
@@ -148,7 +141,6 @@ async def try_run_lifecycle(
                 settings=settings,
                 embedding_index=embedding_index,
                 storage_backend=storage_backend,
-                artifact_blob_store=artifact_blob_store,
                 llm_client=llm_client,
                 lifecycle_runtime=lifecycle_runtime,
                 dry_run=False,
@@ -160,7 +152,6 @@ async def try_run_lifecycle(
                 settings=settings,
                 embedding_index=embedding_index,
                 storage_backend=storage_backend,
-                artifact_blob_store=artifact_blob_store,
                 llm_client=llm_client,
                 lifecycle_runtime=lifecycle_runtime,
                 dry_run=False,
@@ -172,7 +163,6 @@ async def try_run_lifecycle(
                 settings=settings,
                 embedding_index=embedding_index,
                 storage_backend=storage_backend,
-                artifact_blob_store=artifact_blob_store,
                 llm_client=llm_client,
                 lifecycle_runtime=lifecycle_runtime,
                 dry_run=False,
@@ -193,9 +183,6 @@ async def try_run_lifecycle(
 
         for user_id in manager.affected_user_ids:
             await storage_backend.delete_context_views_for_user(user_id)
-            await storage_backend.increment_cache_generation(
-                cache_generation_key(database_path, user_id)
-            )
         await storage_backend.force_dedupe(
             cooldown_key,
             settings.lifecycle_min_interval_seconds,
@@ -220,7 +207,6 @@ async def run_lifecycle_direct(
     settings: Settings,
     embedding_index: EmbeddingIndex,
     storage_backend: StorageBackend,
-    artifact_blob_store: Any | None = None,
     llm_client: Any | None = None,
     lifecycle_runtime: AppRuntime | None = None,
     dry_run: bool = False,
@@ -256,7 +242,6 @@ async def run_lifecycle_direct(
             settings=settings,
             embedding_index=embedding_index,
             storage_backend=storage_backend,
-            artifact_blob_store=artifact_blob_store,
             llm_client=llm_client,
             lifecycle_runtime=lifecycle_runtime,
             dry_run=dry_run,
@@ -268,7 +253,6 @@ async def run_lifecycle_direct(
             settings=settings,
             embedding_index=embedding_index,
             storage_backend=storage_backend,
-            artifact_blob_store=artifact_blob_store,
             llm_client=llm_client,
             lifecycle_runtime=lifecycle_runtime,
             dry_run=dry_run,
@@ -280,7 +264,6 @@ async def run_lifecycle_direct(
             settings=settings,
             embedding_index=embedding_index,
             storage_backend=storage_backend,
-            artifact_blob_store=artifact_blob_store,
             llm_client=llm_client,
             lifecycle_runtime=lifecycle_runtime,
             dry_run=dry_run,
@@ -291,9 +274,6 @@ async def run_lifecycle_direct(
             )
             for user_id in manager.affected_user_ids:
                 await storage_backend.delete_context_views_for_user(user_id)
-                await storage_backend.increment_cache_generation(
-                    cache_generation_key(database_path, user_id)
-                )
         return result
     finally:
         for connection in connections:
@@ -309,7 +289,6 @@ async def _expire_idle_temporary_conversations(
     settings: Settings,
     embedding_index: EmbeddingIndex,
     storage_backend: StorageBackend,
-    artifact_blob_store: Any | None,
     llm_client: Any | None,
     lifecycle_runtime: AppRuntime | None,
     dry_run: bool,
@@ -322,7 +301,6 @@ async def _expire_idle_temporary_conversations(
         settings=settings,
         embedding_index=embedding_index,
         storage_backend=storage_backend,
-        artifact_blob_store=artifact_blob_store,
         llm_client=llm_client,
     )
     return await ConversationLifecycleService(runtime).expire_idle_temporary_conversations(
@@ -339,7 +317,6 @@ async def _process_pending_file_deletions(
     settings: Settings,
     embedding_index: EmbeddingIndex,
     storage_backend: StorageBackend,
-    artifact_blob_store: Any | None,
     llm_client: Any | None,
     lifecycle_runtime: AppRuntime | None,
     dry_run: bool,
@@ -352,7 +329,6 @@ async def _process_pending_file_deletions(
         settings=settings,
         embedding_index=embedding_index,
         storage_backend=storage_backend,
-        artifact_blob_store=artifact_blob_store,
         llm_client=llm_client,
     )
     return await ConversationLifecycleService(runtime).process_pending_file_deletions(
@@ -369,7 +345,6 @@ async def _purge_pending_deleted_conversations(
     settings: Settings,
     embedding_index: EmbeddingIndex,
     storage_backend: StorageBackend,
-    artifact_blob_store: Any | None,
     llm_client: Any | None,
     lifecycle_runtime: AppRuntime | None,
     dry_run: bool,
@@ -382,7 +357,6 @@ async def _purge_pending_deleted_conversations(
         settings=settings,
         embedding_index=embedding_index,
         storage_backend=storage_backend,
-        artifact_blob_store=artifact_blob_store,
         llm_client=llm_client,
     )
     return await ConversationLifecycleService(runtime).purge_pending_deleted_conversations(
@@ -401,7 +375,6 @@ async def piggyback_lifecycle(runtime: AppRuntime, *, reason: str | None = None)
             settings=runtime.settings,
             embedding_index=runtime.embedding_index,
             storage_backend=runtime.storage_backend,
-            artifact_blob_store=runtime.artifact_blob_store,
             llm_client=runtime.llm_client,
             lifecycle_runtime=runtime,
         )

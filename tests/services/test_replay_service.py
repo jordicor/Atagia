@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
 import re
 from pathlib import Path
 
@@ -34,8 +33,8 @@ from atagia.services.llm_client import (
 from atagia.services.replay_service import ReplayService
 from atagia.services.retrieval_pipeline import RetrievalPipeline
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
     r'<candidate[^>]*memory_id="([^"]+)"[^>]*score_key="([^"]+)"'
 )
@@ -299,6 +298,7 @@ async def test_replay_event_with_ablation_changes_result() -> None:
             "privacy_enforcement": "enforce",
             "skip_need_detection": False,
             "skip_applicability_scoring": True,
+            "skip_fusion_dedupe": False,
             "skip_contract_memory": False,
             "skip_workspace_rollup": False,
             "force_all_scopes": False,

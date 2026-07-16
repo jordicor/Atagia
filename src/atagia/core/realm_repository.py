@@ -71,6 +71,7 @@ class RealmRepository:
         realm_id: str | None,
         cross_realm_mode: CrossRealmMode | str | None = None,
         display_name: str | None = None,
+        commit: bool = True,
     ) -> dict[str, Any] | None:
         resolved_id = _normalize_optional_text(realm_id)
         if resolved_id is None:
@@ -84,6 +85,7 @@ class RealmRepository:
             display_name=display_name or resolved_id,
             source_kind="explicit",
             source_id=resolved_id,
+            commit=commit,
         )
 
     async def resolve_realm(
@@ -104,6 +106,15 @@ class RealmRepository:
         )
         timestamp = self._timestamp()
         if existing is not None:
+            normalized_display = _normalize_optional_text(display_name)
+            if (
+                str(existing.get("cross_realm_mode")) == cross_realm_mode.value
+                and (
+                    normalized_display is None
+                    or existing.get("display_name") == normalized_display
+                )
+            ):
+                return existing
             await self._connection.execute(
                 """
                 UPDATE realms
@@ -115,7 +126,7 @@ class RealmRepository:
                 """,
                 (
                     cross_realm_mode.value,
-                    _normalize_optional_text(display_name),
+                    normalized_display,
                     timestamp,
                     owner_user_id,
                     realm_id,

@@ -7,6 +7,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import pytest
@@ -27,15 +28,22 @@ from atagia.core.repositories import (
     WorkspaceRepository,
 )
 from atagia.core.storage_backend import InProcessBackend
+from atagia.core.user_lifecycle_repository import UserLifecycleRepository
 from atagia.memory.candidate_search import CandidateSearch
 from atagia.memory.context_composer import ContextComposer
 from atagia.memory.extractor import ExtractionPersistenceDetails
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
+from atagia.memory.policy_manifest import (
+    ManifestLoader,
+    PolicyResolver,
+    sync_assistant_modes,
+)
 from atagia.memory.text_chunker import ChunkingPlan, TextChunk
 from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
     CONTRACT_STREAM_NAME,
     EXTRACT_STREAM_NAME,
+    InitialContextPackageRefreshJobPayload,
+    InitialContextPackageRefreshReason,
     JobEnvelope,
     JobType,
     MessageJobPayload,
@@ -50,11 +58,16 @@ from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
     MemorySensitivity,
+    MemorySourceKind,
     MemoryStatus,
     PlannedSubQuery,
     RetrievalPlan,
     ScoredCandidate,
 )
+from atagia.services.durable_job_dispatcher import DurableJobDispatcher
+from atagia.services.chat_support import build_message_jobs
+from atagia.services.job_execution_context import StaleParentJobFenceError
+from atagia.services.lifecycle_service import ConversationLifecycleService
 from atagia.services.llm_client import (
     LLMError,
     LLMClient,
@@ -73,9 +86,14 @@ from tests.extraction_payload_support import (
     is_memory_extraction_card_purpose,
     memory_extraction_card_output_from_payload,
 )
+from tests.durable_job_support import DurableJobTestBackend, bound_test_job_claim
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 def _is_need_detection_card_purpose(purpose: object) -> bool:
@@ -444,7 +462,6 @@ async def _build_runtime(
     clock = FrozenClock(datetime(2026, 3, 31, 4, 0, tzinfo=timezone.utc))
     manifest_loader = ManifestLoader(MANIFESTS_DIR)
     await sync_assistant_modes(connection, manifest_loader.load_all(), clock)
-    backend = InProcessBackend()
     provider = QueueProvider(outputs)
     client = LLMClient(
         provider_name=provider.name,
@@ -459,7 +476,9 @@ async def _build_runtime(
     await users.create_user("usr_1")
     if workspace_id is not None:
         await workspaces.create_workspace(workspace_id, "usr_1", "Workspace")
-    await conversations.create_conversation("cnv_1", "usr_1", workspace_id, "coding_debug", "Chat")
+    await conversations.create_conversation(
+        "cnv_1", "usr_1", workspace_id, "coding_debug", "Chat"
+    )
     message = await messages.create_message(
         "msg_1",
         "cnv_1",
@@ -482,6 +501,7 @@ async def _build_runtime(
             {},
         )
     resolved_settings = settings or _settings()
+    backend = DurableJobTestBackend(connection, clock, settings=resolved_settings)
     ingest_worker = IngestWorker(
         storage_backend=backend,
         connection=connection,
@@ -534,7 +554,9 @@ def _extract_job(
     )
 
 
-def _test_chunk_plan(text: str = "I prefer concise debugging answers for retry issues.") -> ChunkingPlan:
+def _test_chunk_plan(
+    text: str = "I prefer concise debugging answers for retry issues.",
+) -> ChunkingPlan:
     return ChunkingPlan(
         chunks=[TextChunk(text=text)],
         chunked=False,
@@ -561,7 +583,9 @@ def _contract_job(message_id: str) -> JobEnvelope:
     )
 
 
-def test_retrieval_packet_settings_default_off_and_parse_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retrieval_packet_settings_default_off_and_parse_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("ATAGIA_RETRIEVAL_PACKETS_DRY_RUN_ENABLED", raising=False)
     monkeypatch.delenv("ATAGIA_RETRIEVAL_PACKETS_WRITE_ENABLED", raising=False)
 
@@ -608,7 +632,7 @@ async def test_ingest_worker_retrieval_packet_constructor_wiring(
     (
         connection,
         _clock,
-        _backend,
+        backend,
         _provider,
         memories,
         ingest_worker,
@@ -619,7 +643,9 @@ async def test_ingest_worker_retrieval_packet_constructor_wiring(
         extractor = ingest_worker._extractor
 
         assert extractor._retrieval_packet_dry_run_enabled is expect_dry_run
-        assert (extractor._retrieval_packet_dry_run_generator is not None) is expect_dry_run
+        assert (
+            extractor._retrieval_packet_dry_run_generator is not None
+        ) is expect_dry_run
         assert extractor._retrieval_packet_surface_write_enabled is expect_writer
         assert (extractor._retrieval_packet_surface_writer is not None) is expect_writer
     finally:
@@ -703,7 +729,9 @@ async def test_ingest_worker_updates_user_language_profile_after_ingest() -> Non
         message,
     ) = await _build_runtime([_public_extraction_payload(), language_profile_update])
     try:
-        await ingest_worker.process_job(_extract_job(str(message["id"])).model_dump(mode="json"))
+        await ingest_worker.process_job(
+            _extract_job(str(message["id"])).model_dump(mode="json")
+        )
 
         repository = CommunicationProfileRepository(connection, clock)
         profile = await repository.get_user_language_profile_for_context(
@@ -719,7 +747,10 @@ async def test_ingest_worker_updates_user_language_profile_after_ingest() -> Non
         )
         assert profile is not None
         assert [row.language_code for row in profile.observed_user_languages] == ["es"]
-        assert profile.explicit_language_preferences[0].preference_kind == "default_answer_language"
+        assert (
+            profile.explicit_language_preferences[0].preference_kind
+            == "default_answer_language"
+        )
         assert any(
             request.metadata.get("purpose") in _LANGUAGE_PROFILE_CARD_PURPOSES
             for request in provider.requests
@@ -729,7 +760,9 @@ async def test_ingest_worker_updates_user_language_profile_after_ingest() -> Non
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_retrieval_packet_surface_recovers_and_composes_base_memory() -> None:
+async def test_ingest_worker_retrieval_packet_surface_recovers_and_composes_base_memory() -> (
+    None
+):
     (
         connection,
         clock,
@@ -812,14 +845,19 @@ async def test_ingest_worker_retrieval_packet_surface_recovers_and_composes_base
         )
 
         assert composed.selected_memory_ids == [memory_id]
-        assert "I prefer concise debugging answers for retry issues" in composed.memory_block
+        assert (
+            "I prefer concise debugging answers for retry issues"
+            in composed.memory_block
+        )
         assert "respuestas depuracion concisas" not in composed.memory_block.lower()
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_lean_extraction_persists_formerly_high_risk_as_active() -> None:
+async def test_ingest_worker_lean_extraction_persists_formerly_high_risk_as_active() -> (
+    None
+):
     # Privacy enrichment is deferred (F1.2): the lean contract carries no
     # privacy_level/sensitivity/memory_category, so content that previously
     # registered as high-risk now persists active and public. The retrieval
@@ -846,7 +884,9 @@ async def test_ingest_worker_lean_extraction_persists_formerly_high_risk_as_acti
         message_text = "The retry issue recovery PIN is stored elsewhere"
         await backend.stream_add(
             EXTRACT_STREAM_NAME,
-            _extract_job(str(message["id"]), message_text=message_text).model_dump(mode="json"),
+            _extract_job(str(message["id"]), message_text=message_text).model_dump(
+                mode="json"
+            ),
         )
 
         result = await ingest_worker.run_once()
@@ -919,9 +959,16 @@ async def test_ingest_worker_processes_stream_job_and_acks() -> None:
             "nothing_durable": False,
         }
     )
-    connection, _clock, backend, _provider, memories, ingest_worker, _contract_worker, message = await _build_runtime(
-        [payload]
-    )
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime([payload])
     try:
         await backend.stream_add(
             EXTRACT_STREAM_NAME,
@@ -943,10 +990,413 @@ async def test_ingest_worker_processes_stream_job_and_acks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_does_not_ack_failed_job() -> None:
-    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
-        ["__llm_error__"]
+async def test_ingest_worker_cancels_frozen_payload_after_source_revision_bump() -> (
+    None
+):
+    old_text = "The old canonical preference must not return."
+    payload = json.dumps(
+        {
+            "evidences": [
+                {
+                    "canonical_text": old_text,
+                    "scope": "assistant_mode",
+                    "confidence": 0.92,
+                    "source_kind": "extracted",
+                    "privacy_level": 1,
+                    "payload": {"kind": "preference"},
+                }
+            ],
+            "beliefs": [],
+            "contract_signals": [],
+            "state_updates": [],
+            "mode_guess": None,
+            "nothing_durable": False,
+        }
     )
+    (
+        connection,
+        clock,
+        backend,
+        provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime([payload])
+    try:
+        envelope = _extract_job(str(message["id"]), message_text=old_text)
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            envelope.model_dump(mode="json"),
+        )
+        queued = await JobRunRepository(connection, clock).get_job(envelope.job_id)
+        assert queued is not None
+        assert queued["derivation_revision"] == 0
+        assert queued["status"] == "awaiting_claim"
+
+        lifecycle_repository = UserLifecycleRepository(connection, clock)
+        lifecycle = await lifecycle_repository.get_active_identity("usr_1")
+        assert lifecycle is not None
+        await connection.execute("BEGIN IMMEDIATE")
+        await connection.execute(
+            "UPDATE messages SET text = ? WHERE id = ?",
+            ("The corrected canonical preference.", str(message["id"])),
+        )
+        bumped = await lifecycle_repository.bump_derivation_revision(
+            "usr_1",
+            expected_lifecycle_epoch=lifecycle.lifecycle_epoch,
+            commit=False,
+        )
+        await connection.commit()
+        assert bumped == 1
+
+        result = await ingest_worker.run_once()
+
+        stored_job = await JobRunRepository(connection, clock).get_job(envelope.job_id)
+        assert result.received == 1
+        assert result.acked == 1
+        assert result.failed == 0
+        assert provider.requests == []
+        assert await memories.list_for_user("usr_1") == []
+        assert stored_job is not None
+        assert stored_job["status"] == "cancelled"
+        assert stored_job["derivation_revision"] == 0
+        assert stored_job["recovery_envelope_json"] is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_archive_service_preserves_validated_root_from_unaffected_chat() -> None:
+    unaffected_text = "The unrelated chat still prefers structured explanations."
+    extraction_output = json.dumps(
+        {
+            "evidences": [
+                {
+                    "canonical_text": unaffected_text,
+                    "scope": "assistant_mode",
+                    "confidence": 0.92,
+                    "source_kind": "extracted",
+                    "privacy_level": 1,
+                    "payload": {"kind": "preference"},
+                }
+            ],
+            "beliefs": [],
+            "contract_signals": [],
+            "state_updates": [],
+            "mode_guess": None,
+            "nothing_durable": False,
+        }
+    )
+    (
+        connection,
+        clock,
+        backend,
+        _provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        affected_message,
+    ) = await _build_runtime([extraction_output])
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        preferences = await users.get_memory_preferences("usr_1")
+        affected_conversation = await conversations.get_conversation("cnv_1", "usr_1")
+        unaffected_conversation = await conversations.create_conversation(
+            "cnv_2", "usr_1", None, "coding_debug", "Unaffected chat"
+        )
+        unaffected_message = await messages.create_message(
+            "msg_2",
+            "cnv_2",
+            "user",
+            1,
+            unaffected_text,
+            8,
+            {},
+        )
+        assert preferences is not None
+        assert affected_conversation is not None
+        affected_envelope = build_message_jobs(
+            clock=clock,
+            conversation=affected_conversation,
+            message_id=str(affected_message["id"]),
+            prior_messages=[],
+            message_text=str(affected_message["text"]),
+            occurred_at=affected_message.get("occurred_at"),
+            role="user",
+            include_contract_projection=False,
+            memory_preferences=preferences,
+        )[0][1]
+        unaffected_envelope = build_message_jobs(
+            clock=clock,
+            conversation=unaffected_conversation,
+            message_id=str(unaffected_message["id"]),
+            prior_messages=[],
+            message_text=str(unaffected_message["text"]),
+            occurred_at=unaffected_message.get("occurred_at"),
+            role="user",
+            include_contract_projection=False,
+            memory_preferences=preferences,
+        )[0][1]
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            affected_envelope.model_dump(mode="json"),
+        )
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            unaffected_envelope.model_dump(mode="json"),
+        )
+
+        lifecycle_repository = UserLifecycleRepository(connection, clock)
+        lifecycle_before = await lifecycle_repository.get_active_identity("usr_1")
+        assert lifecycle_before is not None
+        archived = await ConversationLifecycleService(
+            SimpleNamespace(
+                clock=clock,
+                settings=_settings(),
+                llm_client=None,
+                storage_backend=backend,
+            )
+        ).archive_conversation(
+            connection,
+            user_id="usr_1",
+            conversation_id="cnv_1",
+        )
+        lifecycle_after = await lifecycle_repository.get_active_identity("usr_1")
+        assert lifecycle_after is not None
+        new_revision = lifecycle_after.derivation_revision
+
+        affected_job = await JobRunRepository(connection, clock).get_job(
+            affected_envelope.job_id
+        )
+        unaffected_job = await JobRunRepository(connection, clock).get_job(
+            unaffected_envelope.job_id
+        )
+        assert archived["status"] == "archived"
+        assert new_revision == lifecycle_before.derivation_revision + 1
+        assert affected_job is not None
+        assert affected_job["status"] == "cancelled"
+        assert (
+            affected_job["derivation_revision"] == lifecycle_before.derivation_revision
+        )
+        assert affected_job["recovery_envelope_json"] is None
+        assert unaffected_job is not None
+        assert unaffected_job["status"] == "queued"
+        assert unaffected_job["derivation_revision"] == new_revision
+        assert unaffected_job["recovery_envelope_json"] is not None
+
+        first = await ingest_worker.run_once()
+        second = await ingest_worker.run_once()
+        third = await ingest_worker.run_once()
+
+        completed_unaffected_job = await JobRunRepository(connection, clock).get_job(
+            unaffected_envelope.job_id
+        )
+        stored = await memories.list_for_user("usr_1")
+        assert first.acked == 1
+        assert second.acked == 1
+        assert third.acked == 1
+        assert completed_unaffected_job is not None
+        assert completed_unaffected_job["status"] == "succeeded"
+        assert completed_unaffected_job["derivation_revision"] == new_revision
+        assert len(stored) == 1
+        assert stored[0]["canonical_text"] == unaffected_text
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_edit_regenerates_other_chat_icp_after_root_succeeded() -> None:
+    extraction_output = json.dumps(
+        {
+            "evidences": [],
+            "beliefs": [],
+            "contract_signals": [],
+            "state_updates": [],
+            "mode_guess": None,
+            "nothing_durable": True,
+        }
+    )
+    (
+        connection,
+        clock,
+        backend,
+        _provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        _affected_message,
+    ) = await _build_runtime([extraction_output])
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        preferences = await users.get_memory_preferences("usr_1")
+        unaffected_conversation = await conversations.create_conversation(
+            "cnv_2",
+            "usr_1",
+            None,
+            "coding_debug",
+            "Unaffected completed root",
+        )
+        unaffected_message = await messages.create_message(
+            "msg_2",
+            "cnv_2",
+            "user",
+            1,
+            "The other chat still needs its current context package.",
+            10,
+            {},
+        )
+        assert preferences is not None
+        root = build_message_jobs(
+            clock=clock,
+            conversation=unaffected_conversation,
+            message_id=str(unaffected_message["id"]),
+            prior_messages=[],
+            message_text=str(unaffected_message["text"]),
+            occurred_at=unaffected_message.get("occurred_at"),
+            role="user",
+            include_contract_projection=False,
+            memory_preferences=preferences,
+        )[0][1]
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            root.model_dump(mode="json"),
+        )
+        result = await ingest_worker.run_once()
+        root_row = await JobRunRepository(connection, clock).get_job(root.job_id)
+        child_rows = await JobRunRepository(connection, clock)._fetch_all(
+            """
+            SELECT *
+            FROM worker_job_runs
+            WHERE parent_job_id = ?
+              AND job_type = ?
+            ORDER BY job_id ASC
+            """,
+            (root.job_id, JobType.REFRESH_INITIAL_CONTEXT_PACKAGE.value),
+        )
+
+        assert result.acked == 1
+        assert root_row is not None
+        assert root_row["status"] == "succeeded"
+        assert len(child_rows) == 1
+        stale_child = child_rows[0]
+        assert stale_child["status"] == "queued"
+        stale_payload = InitialContextPackageRefreshJobPayload.model_validate(
+            stale_child["recovery_envelope_json"]["payload"]
+        )
+
+        await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="A manually curated preference.",
+            source_kind=MemorySourceKind.VERBATIM,
+            confidence=1.0,
+            privacy_level=0,
+            memory_id="mem_manual_edit_target",
+            payload={"writer_kind": "manual"},
+        )
+        lifecycle_before = await UserLifecycleRepository(
+            connection,
+            clock,
+        ).get_active_identity("usr_1")
+        assert lifecycle_before is not None
+        await ConversationLifecycleService(
+            SimpleNamespace(
+                clock=clock,
+                settings=_settings(),
+                llm_client=None,
+                storage_backend=backend,
+            )
+        ).edit_memory(
+            connection,
+            user_id="usr_1",
+            memory_id="mem_manual_edit_target",
+            new_text="The current manually curated preference.",
+            conversation_id="cnv_1",
+        )
+
+        lifecycle_after = await UserLifecycleRepository(
+            connection,
+            clock,
+        ).get_active_identity("usr_1")
+        assert lifecycle_after is not None
+        stale_after = await JobRunRepository(connection, clock).get_job(
+            str(stale_child["job_id"])
+        )
+        replacements = await JobRunRepository(connection, clock)._fetch_all(
+            """
+            SELECT *
+            FROM worker_job_runs
+            WHERE job_type = ?
+              AND json_extract(
+                    metadata_json,
+                    '$.regenerated_from_job_id'
+                  ) = ?
+            ORDER BY job_id ASC
+            """,
+            (
+                JobType.REFRESH_INITIAL_CONTEXT_PACKAGE.value,
+                str(stale_child["job_id"]),
+            ),
+        )
+
+        assert lifecycle_after.derivation_revision == (
+            lifecycle_before.derivation_revision + 1
+        )
+        assert stale_after is not None
+        assert stale_after["status"] == "cancelled"
+        assert stale_after["recovery_envelope_json"] is None
+        assert len(replacements) == 1
+        replacement = replacements[0]
+        replacement_envelope = JobEnvelope.model_validate(
+            replacement["recovery_envelope_json"]
+        )
+        replacement_payload = InitialContextPackageRefreshJobPayload.model_validate(
+            replacement_envelope.payload
+        )
+        assert replacement["status"] == "queued"
+        assert replacement["derivation_revision"] == (
+            lifecycle_after.derivation_revision
+        )
+        assert replacement_envelope.parent_job_id is None
+        assert replacement_envelope.transcript_rebuild_id is None
+        assert (
+            replacement_payload.reason
+            is InitialContextPackageRefreshReason.SOURCE_CHANGED
+        )
+        assert replacement_payload.refresh_generation > (
+            stale_payload.refresh_generation
+        )
+
+        await backend.dispatch_durable_jobs()
+        dispatched = await JobRunRepository(connection, clock).get_job(
+            replacement_envelope.job_id
+        )
+        assert dispatched is not None
+        assert dispatched["status"] == "awaiting_claim"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_worker_releases_failed_job_for_durable_retry() -> None:
+    (
+        connection,
+        clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(["__llm_error__"])
     try:
         await backend.stream_add(
             EXTRACT_STREAM_NAME,
@@ -958,11 +1408,14 @@ async def test_ingest_worker_does_not_ack_failed_job() -> None:
 
         result = await ingest_worker.run_once()
         pending = backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)]
+        stored_job = await JobRunRepository(connection, clock).get_job("job_extract_1")
 
         assert result.received == 1
         assert result.acked == 0
         assert result.failed == 1
-        assert len(pending) == 1
+        assert pending == {}
+        assert stored_job is not None
+        assert stored_job["status"] == "retrying"
     finally:
         await connection.close()
 
@@ -993,16 +1446,6 @@ async def test_ingest_worker_defers_transient_provider_failures_without_dead_let
     )
     try:
         job = _extract_job(str(message["id"]))
-        await JobRunRepository(connection, clock).create_queued_job(
-            job_id=job.job_id,
-            stream_name=EXTRACT_STREAM_NAME,
-            job_type=JobType.EXTRACT_MEMORY_CANDIDATES.value,
-            user_id=job.user_id,
-            conversation_id=job.conversation_id,
-            source_message_ids=job.message_ids,
-            source_token_estimate=12,
-            size_bucket="small",
-        )
         await backend.stream_add(EXTRACT_STREAM_NAME, job.model_dump(mode="json"))
 
         result = await ingest_worker.run_once()
@@ -1019,11 +1462,10 @@ async def test_ingest_worker_defers_transient_provider_failures_without_dead_let
         assert result.failed == 0
         assert result.dead_lettered == 0
         assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
-        assert len(backend._stream_deferred[EXTRACT_STREAM_NAME]) == 1
         assert immediate == []
         assert await memories.list_for_user("usr_1") == []
         assert deferred_job is not None
-        assert deferred_job["status"] == "retrying"
+        assert deferred_job["status"] == "deferred"
         assert deferred_job["attempt_count"] == 1
         assert deferred_job["deferred_until"] == "2026-03-31T04:01:30+00:00"
         assert deferred_job["transient_defer_count"] == 1
@@ -1062,22 +1504,12 @@ async def test_ingest_worker_dead_letters_after_transient_defer_budget_exhaustio
     try:
         job = _extract_job(str(message["id"]))
         repository = JobRunRepository(connection, clock)
-        await repository.create_queued_job(
-            job_id=job.job_id,
-            stream_name=EXTRACT_STREAM_NAME,
-            job_type=JobType.EXTRACT_MEMORY_CANDIDATES.value,
-            user_id=job.user_id,
-            conversation_id=job.conversation_id,
-            source_message_ids=job.message_ids,
-            source_token_estimate=12,
-            size_bucket="small",
-        )
         await backend.stream_add(EXTRACT_STREAM_NAME, job.model_dump(mode="json"))
 
         first = await ingest_worker.run_once()
-        backend._stream_deferred[EXTRACT_STREAM_NAME][0]["due_at"] = 0.0
+        clock.advance(seconds=90)
         second = await ingest_worker.run_once()
-        backend._stream_deferred[EXTRACT_STREAM_NAME][0]["due_at"] = 0.0
+        clock.advance(seconds=90)
         third = await ingest_worker.run_once()
         dead_letter = await backend.dequeue_job(
             f"dead_letter:{EXTRACT_STREAM_NAME}",
@@ -1091,13 +1523,14 @@ async def test_ingest_worker_dead_letters_after_transient_defer_budget_exhaustio
         assert third.failed == 1
         assert third.dead_lettered == 1
         assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
-        assert backend._stream_deferred.get(EXTRACT_STREAM_NAME) is None
         assert dead_letter is not None
-        assert dead_letter["delivery_count"] == 1
-        assert "transient defer budget exhausted" in dead_letter["error"]
+        assert dead_letter["attempt_count"] == 3
+        assert dead_letter["error_class"] == "TransientDeferBudgetExceededError"
+        assert "error" not in dead_letter
+        assert "error_details" not in dead_letter
         assert stored_job is not None
         assert stored_job["status"] == "dead_lettered"
-        assert stored_job["transient_defer_count"] == 3
+        assert stored_job["transient_defer_count"] == 2
         assert stored_job["deferred_until"] is None
         assert stored_job["error_class"] == "TransientDeferBudgetExceededError"
     finally:
@@ -1133,21 +1566,10 @@ async def test_ingest_worker_dead_letters_after_transient_defer_age_exhaustion(
     try:
         job = _extract_job(str(message["id"]))
         repository = JobRunRepository(connection, clock)
-        await repository.create_queued_job(
-            job_id=job.job_id,
-            stream_name=EXTRACT_STREAM_NAME,
-            job_type=JobType.EXTRACT_MEMORY_CANDIDATES.value,
-            user_id=job.user_id,
-            conversation_id=job.conversation_id,
-            source_message_ids=job.message_ids,
-            source_token_estimate=12,
-            size_bucket="small",
-        )
         await backend.stream_add(EXTRACT_STREAM_NAME, job.model_dump(mode="json"))
 
         first = await ingest_worker.run_once()
-        clock.advance(seconds=31)
-        backend._stream_deferred[EXTRACT_STREAM_NAME][0]["due_at"] = 0.0
+        clock.advance(seconds=90)
         second = await ingest_worker.run_once()
         dead_letter = await backend.dequeue_job(
             f"dead_letter:{EXTRACT_STREAM_NAME}",
@@ -1159,21 +1581,35 @@ async def test_ingest_worker_dead_letters_after_transient_defer_age_exhaustion(
         assert second.failed == 1
         assert second.dead_lettered == 1
         assert dead_letter is not None
-        assert "transient defer budget exhausted" in dead_letter["error"]
+        assert dead_letter["error_class"] == "TransientDeferBudgetExceededError"
+        assert "error" not in dead_letter
+        assert "error_details" not in dead_letter
         assert stored_job is not None
-        assert stored_job["transient_defer_count"] == 2
+        assert stored_job["transient_defer_count"] == 1
         assert stored_job["status"] == "dead_lettered"
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_tolerates_malformed_card_output_as_no_durable_memory() -> None:
-    connection, _clock, backend, _provider, memories, ingest_worker, _contract_worker, message = await _build_runtime(
-        ["not-json"]
-    )
+async def test_ingest_worker_tolerates_malformed_card_output_as_no_durable_memory() -> (
+    None
+):
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(["not-json"])
     try:
-        await backend.stream_add(EXTRACT_STREAM_NAME, _extract_job(str(message["id"])).model_dump(mode="json"))
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"])).model_dump(mode="json"),
+        )
 
         result = await ingest_worker.run_once()
 
@@ -1189,16 +1625,30 @@ async def test_ingest_worker_tolerates_malformed_card_output_as_no_durable_memor
 
 @pytest.mark.asyncio
 async def test_ingest_worker_dead_letters_after_max_failed_deliveries() -> None:
-    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
-        ["__llm_error__"]
-    )
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(["__llm_error__"])
     try:
-        await backend.stream_add(EXTRACT_STREAM_NAME, _extract_job(str(message["id"])).model_dump(mode="json"))
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"])).model_dump(mode="json"),
+        )
 
         first = await ingest_worker.run_once()
+        await backend.advance_to_next_retry()
         second = await ingest_worker.run_once()
+        await backend.advance_to_next_retry()
         third = await ingest_worker.run_once()
-        dead_letter = await backend.dequeue_job(f"dead_letter:{EXTRACT_STREAM_NAME}", timeout_seconds=0)
+        dead_letter = await backend.dequeue_job(
+            f"dead_letter:{EXTRACT_STREAM_NAME}", timeout_seconds=0
+        )
 
         assert first.failed == 1
         assert second.failed == 1
@@ -1206,7 +1656,7 @@ async def test_ingest_worker_dead_letters_after_max_failed_deliveries() -> None:
         assert third.dead_lettered == 1
         assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
         assert dead_letter is not None
-        assert dead_letter["delivery_count"] == 3
+        assert dead_letter["attempt_count"] == 3
     finally:
         await connection.close()
 
@@ -1236,7 +1686,16 @@ async def test_ingest_worker_card_assembly_drops_invalid_temporal_bounds() -> No
             "nothing_durable": False,
         }
     )
-    connection, _clock, backend, _provider, memories, ingest_worker, _contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
         [invalid_payload],
     )
     try:
@@ -1249,7 +1708,9 @@ async def test_ingest_worker_card_assembly_drops_invalid_temporal_bounds() -> No
         )
 
         result = await ingest_worker.run_once()
-        dead_letter = await backend.dequeue_job(f"dead_letter:{EXTRACT_STREAM_NAME}", timeout_seconds=0)
+        dead_letter = await backend.dequeue_job(
+            f"dead_letter:{EXTRACT_STREAM_NAME}", timeout_seconds=0
+        )
         stored = await memories.list_for_user("usr_1")
 
         assert result.acked == 1
@@ -1271,7 +1732,16 @@ async def test_ingest_worker_logs_structured_job_failure_without_traceback(
         del args, kwargs
         raise StructuredOutputError("Provider returned invalid structured output")
 
-    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
         [],
     )
     try:
@@ -1297,7 +1767,9 @@ async def test_ingest_worker_logs_structured_job_failure_without_traceback(
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_enqueues_compaction_job_for_workspace_after_threshold() -> None:
+async def test_ingest_worker_enqueues_compaction_job_for_workspace_after_threshold() -> (
+    None
+):
     payload = json.dumps(
         {
             "evidences": [],
@@ -1308,7 +1780,16 @@ async def test_ingest_worker_enqueues_compaction_job_for_workspace_after_thresho
             "nothing_durable": True,
         }
     )
-    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
         [payload],
         workspace_id="wrk_1",
         extra_messages=9,
@@ -1316,15 +1797,17 @@ async def test_ingest_worker_enqueues_compaction_job_for_workspace_after_thresho
     try:
         await backend.stream_add(
             EXTRACT_STREAM_NAME,
-            _extract_job(str(message["id"]), workspace_id="wrk_1").model_dump(mode="json"),
+            _extract_job(str(message["id"]), workspace_id="wrk_1").model_dump(
+                mode="json"
+            ),
         )
 
         result = await ingest_worker.run_once()
-        compact_job = await backend.dequeue_job(f"stream:{COMPACT_STREAM_NAME}", timeout_seconds=0)
+        compact_job = await backend.dequeue_durable_envelope(COMPACT_STREAM_NAME)
 
         assert result.acked == 1
         assert compact_job is not None
-        envelope = JobEnvelope.model_validate(compact_job["payload"])
+        envelope = JobEnvelope.model_validate(compact_job)
         assert envelope.job_type is JobType.COMPACT_SUMMARIES
         assert envelope.payload["job_kind"] == "conversation_chunk"
         assert envelope.payload["workspace_id"] == "wrk_1"
@@ -1333,7 +1816,9 @@ async def test_ingest_worker_enqueues_compaction_job_for_workspace_after_thresho
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_enqueues_compaction_job_without_workspace_after_threshold() -> None:
+async def test_ingest_worker_enqueues_compaction_job_without_workspace_after_threshold() -> (
+    None
+):
     payload = json.dumps(
         {
             "evidences": [],
@@ -1344,7 +1829,16 @@ async def test_ingest_worker_enqueues_compaction_job_without_workspace_after_thr
             "nothing_durable": True,
         }
     )
-    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
         [payload],
         workspace_id=None,
         extra_messages=9,
@@ -1356,11 +1850,11 @@ async def test_ingest_worker_enqueues_compaction_job_without_workspace_after_thr
         )
 
         result = await ingest_worker.run_once()
-        compact_job = await backend.dequeue_job(f"stream:{COMPACT_STREAM_NAME}", timeout_seconds=0)
+        compact_job = await backend.dequeue_durable_envelope(COMPACT_STREAM_NAME)
 
         assert result.acked == 1
         assert compact_job is not None
-        envelope = JobEnvelope.model_validate(compact_job["payload"])
+        envelope = JobEnvelope.model_validate(compact_job)
         assert envelope.job_type is JobType.COMPACT_SUMMARIES
         assert envelope.payload["job_kind"] == "conversation_chunk"
         assert envelope.payload["workspace_id"] is None
@@ -1370,7 +1864,9 @@ async def test_ingest_worker_enqueues_compaction_job_without_workspace_after_thr
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_dedupes_pending_compaction_for_same_conversation_window() -> None:
+async def test_ingest_worker_dedupes_pending_compaction_for_same_conversation_window() -> (
+    None
+):
     payload = json.dumps(
         {
             "evidences": [],
@@ -1381,7 +1877,16 @@ async def test_ingest_worker_dedupes_pending_compaction_for_same_conversation_wi
             "nothing_durable": True,
         }
     )
-    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
         [payload, payload],
         workspace_id=None,
         extra_messages=9,
@@ -1398,11 +1903,11 @@ async def test_ingest_worker_dedupes_pending_compaction_for_same_conversation_wi
 
         first = await ingest_worker.run_once()
         second = await ingest_worker.run_once()
-        first_compact_job = await backend.dequeue_job(f"stream:{COMPACT_STREAM_NAME}", timeout_seconds=0)
-        second_compact_job = await backend.dequeue_job(f"stream:{COMPACT_STREAM_NAME}", timeout_seconds=0)
+        first_compact_job = await backend.dequeue_durable_envelope(COMPACT_STREAM_NAME)
+        second_compact_job = await backend.dequeue_durable_envelope(COMPACT_STREAM_NAME)
 
         assert first.acked == 1
-        assert second.acked == 1
+        assert second.received == 0
         assert first_compact_job is not None
         assert second_compact_job is None
     finally:
@@ -1423,7 +1928,16 @@ async def test_ingest_worker_rolls_back_failed_topic_refresh(
             "nothing_durable": True,
         }
     )
-    connection, _clock, _backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        _backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
         [payload],
         settings=_settings(topic_working_set_enabled=True),
     )
@@ -1504,7 +2018,16 @@ async def test_ingest_skips_revision_when_disabled() -> None:
     async def skip_side_effects(*args, **kwargs) -> None:
         del args, kwargs
 
-    control_connection, _clock, control_backend, _provider, _memories, control_worker, _contract_worker, control_message = await _build_runtime(
+    (
+        control_connection,
+        _clock,
+        control_backend,
+        _provider,
+        _memories,
+        control_worker,
+        _contract_worker,
+        control_message,
+    ) = await _build_runtime(
         [],
     )
     try:
@@ -1517,9 +2040,8 @@ async def test_ingest_skips_revision_when_disabled() -> None:
         )
 
         control_result = await control_worker.run_once()
-        control_revision_job = await control_backend.dequeue_job(
-            f"stream:{REVISE_STREAM_NAME}",
-            timeout_seconds=0,
+        control_revision_job = await control_backend.dequeue_durable_envelope(
+            REVISE_STREAM_NAME
         )
 
         assert control_result.acked == 1
@@ -1527,7 +2049,16 @@ async def test_ingest_skips_revision_when_disabled() -> None:
     finally:
         await control_connection.close()
 
-    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
         [],
         settings=_settings(skip_belief_revision=True),
     )
@@ -1541,7 +2072,7 @@ async def test_ingest_skips_revision_when_disabled() -> None:
         )
 
         result = await ingest_worker.run_once()
-        revision_job = await backend.dequeue_job(f"stream:{REVISE_STREAM_NAME}", timeout_seconds=0)
+        revision_job = await backend.dequeue_durable_envelope(REVISE_STREAM_NAME)
 
         assert result.acked == 1
         assert revision_job is None
@@ -1592,7 +2123,16 @@ async def test_ingest_marks_belief_revision_claim_key_validated_by_match(
         del args, kwargs
         return existing_belief_id
 
-    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
         [],
     )
     try:
@@ -1606,15 +2146,12 @@ async def test_ingest_marks_belief_revision_claim_key_validated_by_match(
         )
 
         result = await ingest_worker.run_once()
-        revision_job = await backend.dequeue_job(
-            f"stream:{REVISE_STREAM_NAME}",
-            timeout_seconds=0,
-        )
+        revision_job = await backend.dequeue_durable_envelope(REVISE_STREAM_NAME)
 
         assert result.acked == 1
         assert revision_job is not None
 
-        payload = RevisionJobPayload.model_validate(revision_job["payload"]["payload"])
+        payload = RevisionJobPayload.model_validate(revision_job["payload"])
         assert payload.claim_key == "response_style.debugging"
         assert payload.claim_key_already_validated is expected_validated
         assert payload.belief_id == expected_belief_id
@@ -1637,7 +2174,16 @@ async def test_ingest_treats_non_json_after_schema_fallback_as_noop(
     async def skip_side_effects(*args, **kwargs) -> None:
         del args, kwargs
 
-    connection, _clock, backend, _provider, memories, ingest_worker, _contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
         [],
     )
     try:
@@ -1680,7 +2226,16 @@ async def test_ingest_skips_compaction_when_disabled() -> None:
             "nothing_durable": True,
         }
     )
-    connection, _clock, backend, _provider, _memories, ingest_worker, _contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime(
         [payload],
         workspace_id="wrk_1",
         extra_messages=9,
@@ -1689,11 +2244,13 @@ async def test_ingest_skips_compaction_when_disabled() -> None:
     try:
         await backend.stream_add(
             EXTRACT_STREAM_NAME,
-            _extract_job(str(message["id"]), workspace_id="wrk_1").model_dump(mode="json"),
+            _extract_job(str(message["id"]), workspace_id="wrk_1").model_dump(
+                mode="json"
+            ),
         )
 
         result = await ingest_worker.run_once()
-        compact_job = await backend.dequeue_job(f"stream:{COMPACT_STREAM_NAME}", timeout_seconds=0)
+        compact_job = await backend.dequeue_durable_envelope(COMPACT_STREAM_NAME)
 
         assert result.acked == 1
         assert compact_job is None
@@ -1722,9 +2279,16 @@ async def test_ingest_worker_is_idempotent_for_duplicate_jobs() -> None:
             "nothing_durable": False,
         }
     )
-    connection, _clock, backend, _provider, memories, ingest_worker, _contract_worker, message = await _build_runtime(
-        [payload, payload]
-    )
+    (
+        connection,
+        _clock,
+        backend,
+        _provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime([payload, payload])
     try:
         job = _extract_job(str(message["id"])).model_dump(mode="json")
         await backend.stream_add(EXTRACT_STREAM_NAME, job)
@@ -1734,7 +2298,7 @@ async def test_ingest_worker_is_idempotent_for_duplicate_jobs() -> None:
         second = await ingest_worker.run_once()
 
         assert first.acked == 1
-        assert second.acked == 1
+        assert second.received == 0
         stored = await memories.list_for_user("usr_1")
         assert len(stored) == 1
     finally:
@@ -1743,9 +2307,16 @@ async def test_ingest_worker_is_idempotent_for_duplicate_jobs() -> None:
 
 @pytest.mark.asyncio
 async def test_ingest_worker_handles_empty_stream_gracefully() -> None:
-    connection, _clock, _backend, _provider, _memories, ingest_worker, _contract_worker, _message = await _build_runtime(
-        []
-    )
+    (
+        connection,
+        _clock,
+        _backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        _message,
+    ) = await _build_runtime([])
     try:
         result = await ingest_worker.run_once(block_ms=10)
         assert result.received == 0
@@ -1761,7 +2332,12 @@ async def test_belief_lock_utility_handles_acquire_release_and_contention() -> N
 
     first_lock = await acquire_belief_lock(backend, "blf_1", attempts=1)
     assert first_lock is not None
-    assert await acquire_belief_lock(backend, "blf_1", attempts=2, base_delay_seconds=0.001) is None
+    assert (
+        await acquire_belief_lock(
+            backend, "blf_1", attempts=2, base_delay_seconds=0.001
+        )
+        is None
+    )
     await backend.release_lock("belief:blf_1", "wrong-token")
     assert await acquire_belief_lock(backend, "blf_1", attempts=1) is None
     await backend.release_lock("belief:blf_1", first_lock)
@@ -1769,14 +2345,25 @@ async def test_belief_lock_utility_handles_acquire_release_and_contention() -> N
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_run_recovers_from_unexpected_loop_errors(monkeypatch) -> None:
-    connection, _clock, _backend, _provider, _memories, ingest_worker, _contract_worker, _message = await _build_runtime(
-        []
-    )
+async def test_ingest_worker_run_recovers_from_unexpected_loop_errors(
+    monkeypatch,
+) -> None:
+    (
+        connection,
+        _clock,
+        _backend,
+        _provider,
+        _memories,
+        ingest_worker,
+        _contract_worker,
+        _message,
+    ) = await _build_runtime([])
     calls = 0
     sleeps: list[float] = []
 
-    async def fake_run_once(*, consumer_name: str = "ingest-1", block_ms: int | None = 0):
+    async def fake_run_once(
+        *, consumer_name: str = "ingest-1", block_ms: int | None = 0
+    ):
         del consumer_name, block_ms
         nonlocal calls
         calls += 1
@@ -1799,14 +2386,25 @@ async def test_ingest_worker_run_recovers_from_unexpected_loop_errors(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_contract_worker_run_recovers_from_unexpected_loop_errors(monkeypatch) -> None:
-    connection, _clock, _backend, _provider, _memories, _ingest_worker, contract_worker, _message = await _build_runtime(
-        []
-    )
+async def test_contract_worker_run_recovers_from_unexpected_loop_errors(
+    monkeypatch,
+) -> None:
+    (
+        connection,
+        _clock,
+        _backend,
+        _provider,
+        _memories,
+        _ingest_worker,
+        contract_worker,
+        _message,
+    ) = await _build_runtime([])
     calls = 0
     sleeps: list[float] = []
 
-    async def fake_run_once(*, consumer_name: str = "contract-1", block_ms: int | None = 0):
+    async def fake_run_once(
+        *, consumer_name: str = "contract-1", block_ms: int | None = 0
+    ):
         del consumer_name, block_ms
         nonlocal calls
         calls += 1
@@ -1846,9 +2444,16 @@ async def test_contract_worker_is_idempotent_for_duplicate_jobs() -> None:
             "nothing_durable": False,
         }
     )
-    connection, _clock, backend, provider, memories, _ingest_worker, contract_worker, message = await _build_runtime(
-        [payload, payload]
-    )
+    (
+        connection,
+        _clock,
+        backend,
+        provider,
+        memories,
+        _ingest_worker,
+        contract_worker,
+        message,
+    ) = await _build_runtime([payload, payload])
     try:
         job = _contract_job(str(message["id"])).model_dump(mode="json")
         await backend.stream_add(CONTRACT_STREAM_NAME, job)
@@ -1863,7 +2468,7 @@ async def test_contract_worker_is_idempotent_for_duplicate_jobs() -> None:
             if row["object_type"] == MemoryObjectType.INTERACTION_CONTRACT.value
         ]
         assert first.acked == 1
-        assert second.acked == 1
+        assert second.received == 0
         assert len(contract_memories) == 1
         assert len(provider.requests) == 1
     finally:
@@ -1871,7 +2476,271 @@ async def test_contract_worker_is_idempotent_for_duplicate_jobs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_contract_worker_projects_even_when_ingest_already_persisted_contract_memory() -> None:
+async def test_contract_process_job_rejects_unclaimed_and_mismatched_invocations() -> (
+    None
+):
+    (
+        connection,
+        clock,
+        backend,
+        provider,
+        _memories,
+        _ingest_worker,
+        contract_worker,
+        message,
+    ) = await _build_runtime([])
+    try:
+        target = _contract_job(str(message["id"]))
+        target_payload = target.model_dump(mode="json")
+
+        with pytest.raises(StaleParentJobFenceError):
+            await contract_worker.process_job(target_payload)
+
+        other = target.model_copy(update={"job_id": "job_other_contract_claim"})
+        async with bound_test_job_claim(
+            connection,
+            backend,
+            clock,
+            other,
+        ):
+            with pytest.raises(StaleParentJobFenceError):
+                await contract_worker.process_job(target_payload)
+
+        assert backend._lifecycle_locks == {}
+        assert provider.requests == []
+        assert (
+            await ContractDimensionRepository(connection, clock).list_for_context(
+                "usr_1",
+                "coding_debug",
+                None,
+                "cnv_1",
+            )
+            == []
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_contract_worker_defers_when_lifecycle_mirror_disappears_after_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_payload = json.dumps(
+        {
+            "signals": [
+                {
+                    "canonical_text": "I prefer concise debugging answers",
+                    "dimension_name": "directness",
+                    "value_json": {"label": "concise", "score": 0.9},
+                    "confidence": 0.9,
+                    "scope": "assistant_mode",
+                    "source_kind": "inferred",
+                    "privacy_level": 1,
+                }
+            ],
+            "nothing_durable": False,
+        }
+    )
+    (
+        connection,
+        clock,
+        backend,
+        provider,
+        _memories,
+        _ingest_worker,
+        contract_worker,
+        message,
+    ) = await _build_runtime([project_payload])
+    try:
+        envelope = _contract_job(str(message["id"]))
+        await backend.stream_add(
+            CONTRACT_STREAM_NAME,
+            envelope.model_dump(mode="json"),
+        )
+        original_claim = contract_worker._job_tracking.claim_notification
+
+        async def claim_then_drop_mirror(
+            stream_message: object,
+            *,
+            owner_id: str,
+        ):
+            claim = await original_claim(stream_message, owner_id=owner_id)  # type: ignore[arg-type]
+            if claim is not None:
+                backend._lifecycle_mirrors.pop(claim.lifecycle_cleanup_key, None)
+            return claim
+
+        monkeypatch.setattr(
+            contract_worker._job_tracking,
+            "claim_notification",
+            claim_then_drop_mirror,
+        )
+
+        result = await contract_worker.run_once()
+        stored = await backend.job_tracking_service.get_job_run(envelope.job_id)
+
+        assert result.deferred == 1
+        assert result.failed == 0
+        assert stored is not None
+        assert stored["status"] == "deferred"
+        assert stored["recovery_envelope_json"] is not None
+        assert provider.requests == []
+        assert (
+            await ContractDimensionRepository(connection, clock).list_for_context(
+                "usr_1",
+                "coding_debug",
+                None,
+                "cnv_1",
+            )
+            == []
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_contract_worker_defers_when_lock_backend_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        connection,
+        _clock,
+        backend,
+        provider,
+        _memories,
+        _ingest_worker,
+        contract_worker,
+        message,
+    ) = await _build_runtime([])
+    try:
+        envelope = _contract_job(str(message["id"]))
+        await backend.stream_add(
+            CONTRACT_STREAM_NAME,
+            envelope.model_dump(mode="json"),
+        )
+
+        async def unavailable_lock(*_args: object, **_kwargs: object) -> str | None:
+            raise ConnectionError("simulated transient lock backend outage")
+
+        monkeypatch.setattr(backend, "acquire_lock", unavailable_lock)
+
+        result = await contract_worker.run_once()
+        stored = await backend.job_tracking_service.get_job_run(envelope.job_id)
+
+        assert result.deferred == 1
+        assert result.failed == 0
+        assert stored is not None
+        assert stored["status"] == "deferred"
+        assert provider.requests == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_contract_worker_ack_failure_after_lock_defer_does_not_retry_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        connection,
+        _clock,
+        backend,
+        provider,
+        _memories,
+        _ingest_worker,
+        contract_worker,
+        message,
+    ) = await _build_runtime([])
+    try:
+        envelope = _contract_job(str(message["id"]))
+        await backend.stream_add(
+            CONTRACT_STREAM_NAME,
+            envelope.model_dump(mode="json"),
+        )
+
+        async def unavailable_lock(*_args: object, **_kwargs: object) -> str | None:
+            raise ConnectionError("simulated transient lock backend outage")
+
+        async def unavailable_ack(*_args: object, **_kwargs: object) -> None:
+            raise ConnectionError("simulated stream acknowledgement outage")
+
+        monkeypatch.setattr(backend, "acquire_lock", unavailable_lock)
+        monkeypatch.setattr(backend, "stream_ack", unavailable_ack)
+
+        with pytest.raises(ConnectionError, match="acknowledgement outage"):
+            await contract_worker.run_once()
+
+        stored = await backend.job_tracking_service.get_job_run(envelope.job_id)
+        assert stored is not None
+        assert stored["status"] == "deferred"
+        assert stored["attempt_count"] == 1
+        assert stored["error_class"] == "TransientJobLockUnavailable"
+        assert provider.requests == []
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_contract_worker_release_failure_does_not_overwrite_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_payload = json.dumps(
+        {
+            "signals": [
+                {
+                    "canonical_text": "I prefer concise debugging answers",
+                    "dimension_name": "directness",
+                    "value_json": {"label": "concise", "score": 0.9},
+                    "confidence": 0.9,
+                    "scope": "assistant_mode",
+                    "source_kind": "inferred",
+                    "privacy_level": 1,
+                }
+            ],
+            "nothing_durable": False,
+        }
+    )
+    (
+        connection,
+        clock,
+        backend,
+        provider,
+        _memories,
+        _ingest_worker,
+        contract_worker,
+        message,
+    ) = await _build_runtime([project_payload])
+    try:
+        envelope = _contract_job(str(message["id"]))
+        await backend.stream_add(
+            CONTRACT_STREAM_NAME,
+            envelope.model_dump(mode="json"),
+        )
+
+        async def unavailable_release(*_args: object, **_kwargs: object) -> None:
+            raise ConnectionError("simulated transient release outage")
+
+        monkeypatch.setattr(backend, "release_lock", unavailable_release)
+
+        result = await contract_worker.run_once()
+        stored = await backend.job_tracking_service.get_job_run(envelope.job_id)
+        projected = await ContractDimensionRepository(
+            connection,
+            clock,
+        ).list_for_context("usr_1", "coding_debug", None, "cnv_1")
+
+        assert result.acked == 1
+        assert result.failed == 0
+        assert stored is not None
+        assert stored["status"] == "succeeded"
+        assert len(projected) == 1
+        assert len(provider.requests) == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_contract_worker_projects_even_when_ingest_already_persisted_contract_memory() -> (
+    None
+):
     extract_payload = json.dumps(
         {
             "evidences": [],
@@ -1910,23 +2779,43 @@ async def test_contract_worker_projects_even_when_ingest_already_persisted_contr
             "nothing_durable": False,
         }
     )
-    connection, clock, _backend, _provider, memories, ingest_worker, contract_worker, message = await _build_runtime(
-        [extract_payload, project_payload]
-    )
+    (
+        connection,
+        clock,
+        backend,
+        _provider,
+        memories,
+        ingest_worker,
+        contract_worker,
+        message,
+    ) = await _build_runtime([extract_payload, project_payload])
     contracts = ContractDimensionRepository(connection, clock)
     try:
-        await ingest_worker.process_job(_extract_job(str(message["id"])).model_dump(mode="json"))
+        await ingest_worker.process_job(
+            _extract_job(str(message["id"])).model_dump(mode="json")
+        )
 
         raw_contracts = [
             row
             for row in await memories.list_for_user("usr_1")
             if row["object_type"] == MemoryObjectType.INTERACTION_CONTRACT.value
         ]
-        before_projection = await contracts.list_for_context("usr_1", "coding_debug", None, "cnv_1")
+        before_projection = await contracts.list_for_context(
+            "usr_1", "coding_debug", None, "cnv_1"
+        )
 
-        await contract_worker.process_job(_contract_job(str(message["id"])).model_dump(mode="json"))
+        contract_envelope = _contract_job(str(message["id"])).model_dump(mode="json")
+        async with bound_test_job_claim(
+            connection,
+            backend,
+            clock,
+            contract_envelope,
+        ):
+            await contract_worker.process_job(contract_envelope)
 
-        after_projection = await contracts.list_for_context("usr_1", "coding_debug", None, "cnv_1")
+        after_projection = await contracts.list_for_context(
+            "usr_1", "coding_debug", None, "cnv_1"
+        )
 
         assert len(raw_contracts) == 1
         assert before_projection == []
@@ -1956,15 +2845,28 @@ async def test_contract_worker_reclaims_failed_pending_job_and_retries_successfu
             "nothing_durable": False,
         }
     )
-    connection, _clock, backend, provider, memories, _ingest_worker, contract_worker, message = await _build_runtime(
+    (
+        connection,
+        _clock,
+        backend,
+        provider,
+        memories,
+        _ingest_worker,
+        contract_worker,
+        message,
+    ) = await _build_runtime(
         ["not-json", "still-not-json", payload],
         structured_output_retry_attempts=0,
     )
     try:
-        await backend.stream_add(CONTRACT_STREAM_NAME, _contract_job(str(message["id"])).model_dump(mode="json"))
+        await backend.stream_add(
+            CONTRACT_STREAM_NAME,
+            _contract_job(str(message["id"])).model_dump(mode="json"),
+        )
 
         with caplog.at_level("WARNING", logger="atagia.workers.contract_worker"):
             first = await contract_worker.run_once()
+            await backend.advance_to_next_retry()
             second = await contract_worker.run_once()
 
         contract_memories = [
@@ -1987,7 +2889,9 @@ async def test_contract_worker_reclaims_failed_pending_job_and_retries_successfu
         await connection.close()
 
 
-def test_chat_reply_enqueues_stream_jobs_and_worker_processes_extraction(tmp_path: Path) -> None:
+def test_chat_reply_enqueues_stream_jobs_and_worker_processes_extraction(
+    tmp_path: Path,
+) -> None:
     settings = Settings(
         sqlite_path=str(tmp_path / "atagia-step12.db"),
         migrations_path=str(MIGRATIONS_DIR),
@@ -2047,8 +2951,12 @@ def test_chat_reply_enqueues_stream_jobs_and_worker_processes_extraction(tmp_pat
         runtime = client.app.state.runtime
         connection = client.portal.call(runtime.open_connection)
         try:
-            runtime.clock = FrozenClock(datetime(2026, 3, 31, 4, 30, tzinfo=timezone.utc))
-            runtime.llm_client = LLMClient(provider_name=provider.name, providers=[provider])
+            runtime.clock = FrozenClock(
+                datetime(2026, 3, 31, 4, 30, tzinfo=timezone.utc)
+            )
+            runtime.llm_client = LLMClient(
+                provider_name=provider.name, providers=[provider]
+            )
 
             conversation = client.post(
                 "/v1/conversations",
@@ -2094,6 +3002,17 @@ def test_chat_reply_enqueues_stream_jobs_and_worker_processes_extraction(tmp_pat
             )
             memories = MemoryObjectRepository(connection, runtime.clock)
             assert client.portal.call(memories.list_for_user, "usr_1") == []
+
+            dispatcher = DurableJobDispatcher(
+                connection,
+                runtime.clock,
+                storage_backend=runtime.storage_backend,
+                target_backend=runtime.settings.storage_backend,
+                visibility_seconds=runtime.settings.worker_dispatch_visibility_seconds,
+                sweep_interval_seconds=runtime.settings.worker_dispatch_sweep_interval_seconds,
+                batch_size=runtime.settings.worker_dispatch_batch_size,
+            )
+            client.portal.call(dispatcher.dispatch_once)
 
             ingest_result = client.portal.call(ingest_worker.run_once)
             contract_result = client.portal.call(contract_worker.run_once)

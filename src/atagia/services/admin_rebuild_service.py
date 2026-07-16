@@ -4,23 +4,41 @@ from __future__ import annotations
 
 from dataclasses import replace
 import logging
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field
 
 from atagia.core.clock import Clock
+from atagia.core.admin_maintenance_repository import (
+    EMBEDDING_DELETE_EFFECT,
+    AdminMaintenanceOperation,
+    AdminMaintenanceRepository,
+    admin_maintenance_operation,
+)
 from atagia.core.config import Settings
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
-from atagia.core.repositories import ConversationRepository, MessageRepository, UserRepository, summary_mirror_id
+from atagia.core.ids import new_job_id
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
+from atagia.core.job_run_repository import JobRunRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MessageRepository,
+    UserRepository,
+    summary_mirror_id,
+)
 from atagia.core.storage_backend import InProcessBackend, StorageBackend
 from atagia.core.timestamps import resolve_message_occurred_at
+from atagia.core.user_lifecycle_repository import UserLifecycleRepository
 from atagia.memory.policy_manifest import ManifestLoader
 from atagia.services.chat_support import recent_context
 from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
+    CONTRACT_STREAM_NAME,
     CompactionJobKind,
     CompactionJobPayload,
+    EXTRACT_STREAM_NAME,
     GRAPH_STREAM_NAME,
     INITIAL_CONTEXT_PACKAGE_STREAM_NAME,
     JobEnvelope,
@@ -48,6 +66,8 @@ from atagia.services.llm_run_guard import (
     LLMRunGuardRun,
     bulk_ingest_llm_run_guard_config,
 )
+from atagia.services.worker_effect_fence import WorkerEffectFence
+from atagia.services.worker_job_lease import JobLeaseLostError, WorkerJobLease
 from atagia.workers.compaction_worker import CompactionWorker
 from atagia.workers.contract_worker import ContractWorker
 from atagia.workers.graph_sync_worker import GraphSyncWorker
@@ -105,6 +125,8 @@ class AdminRebuildService:
         manifest_loader: ManifestLoader,
         settings: Settings | None = None,
         storage_backend: StorageBackend | None = None,
+        job_connection_factory: Callable[[], Awaitable[aiosqlite.Connection]]
+        | None = None,
     ) -> None:
         self._connection = connection
         self._clock = clock
@@ -113,14 +135,10 @@ class AdminRebuildService:
         self._manifest_loader = manifest_loader
         self._settings = settings or Settings.from_env()
         self._cache_storage_backend = storage_backend
+        self._job_connection_factory = job_connection_factory
         self._conversation_repository = ConversationRepository(connection, clock)
         self._message_repository = MessageRepository(connection, clock)
-        self._job_tracking = JobTrackingService(
-            connection,
-            clock,
-            workers_enabled=self._settings.workers_enabled,
-            settings=self._settings,
-        )
+        self._maintenance_operation: AdminMaintenanceOperation | None = None
 
     async def rebuild_conversation(
         self,
@@ -130,11 +148,45 @@ class AdminRebuildService:
         skip_final_compaction: bool = False,
         llm_health_check: Callable[[str], None] | None = None,
     ) -> RebuildResult:
-        conversation = await self._conversation_repository.get_conversation(conversation_id, user_id)
+        async with admin_maintenance_operation(
+            self._connection,
+            self._clock,
+            operation_kind="rebuild_conversation",
+            user_id=user_id,
+            recovery_key=f"conversation:{conversation_id}",
+            heartbeat_connection_factory=self._job_connection_factory,
+        ) as operation:
+            self._maintenance_operation = operation
+            try:
+                return await self._rebuild_conversation_owned(
+                    user_id,
+                    conversation_id,
+                    skip_final_compaction=skip_final_compaction,
+                    llm_health_check=llm_health_check,
+                )
+            finally:
+                self._maintenance_operation = None
+
+    async def _rebuild_conversation_owned(
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        skip_final_compaction: bool = False,
+        llm_health_check: Callable[[str], None] | None = None,
+    ) -> RebuildResult:
+        await self._require_maintenance_current()
+        conversation = await self._conversation_repository.get_conversation(
+            conversation_id, user_id
+        )
         if conversation is None:
             raise ValueError(f"Unknown conversation_id: {conversation_id}")
 
-        workspace_id = str(conversation["workspace_id"]) if conversation.get("workspace_id") else None
+        workspace_id = (
+            str(conversation["workspace_id"])
+            if conversation.get("workspace_id")
+            else None
+        )
         await self._invalidate_user_cache(user_id)
         guard_config = bulk_ingest_llm_run_guard_config(self._settings)
         with self._llm_client.llm_run_guard_scope(
@@ -167,6 +219,30 @@ class AdminRebuildService:
         *,
         llm_health_check: Callable[[str], None] | None = None,
     ) -> RebuildResult:
+        async with admin_maintenance_operation(
+            self._connection,
+            self._clock,
+            operation_kind="rebuild_user",
+            user_id=user_id,
+            recovery_key=f"user:{user_id}",
+            heartbeat_connection_factory=self._job_connection_factory,
+        ) as operation:
+            self._maintenance_operation = operation
+            try:
+                return await self._rebuild_user_owned(
+                    user_id,
+                    llm_health_check=llm_health_check,
+                )
+            finally:
+                self._maintenance_operation = None
+
+    async def _rebuild_user_owned(
+        self,
+        user_id: str,
+        *,
+        llm_health_check: Callable[[str], None] | None = None,
+    ) -> RebuildResult:
+        await self._require_maintenance_current()
         conversations = await self._list_user_conversations(user_id)
         workspace_ids = await self._list_user_workspaces(user_id)
         await self._invalidate_user_cache(user_id)
@@ -212,8 +288,26 @@ class AdminRebuildService:
         llm_health_check: Callable[[str], None] | None,
     ) -> None:
         rebuild_backend = InProcessBackend()
+        rebuild_job_connection = self._connection
+        owns_job_connection = False
         try:
-            rebuild_settings = replace(self._settings, skip_compaction=True)
+            if self._job_connection_factory is not None:
+                rebuild_job_connection = await self._job_connection_factory()
+                owns_job_connection = True
+            rebuild_settings = replace(
+                self._settings,
+                skip_compaction=True,
+                storage_backend="inprocess",
+                service_process_count=1,
+                workers_enabled=True,
+            )
+            rebuild_job_tracking = JobTrackingService(
+                rebuild_job_connection,
+                self._clock,
+                workers_enabled=True,
+                settings=rebuild_settings,
+            )
+            rebuild_effect_fence = WorkerEffectFence(self._connection, self._clock)
             ingest_worker = IngestWorker(
                 storage_backend=rebuild_backend,
                 connection=self._connection,
@@ -222,6 +316,7 @@ class AdminRebuildService:
                 manifest_loader=self._manifest_loader,
                 embedding_index=self._embedding_index,
                 settings=rebuild_settings,
+                job_connection=rebuild_job_connection,
             )
             contract_worker = ContractWorker(
                 storage_backend=rebuild_backend,
@@ -229,7 +324,8 @@ class AdminRebuildService:
                 llm_client=self._llm_client,
                 clock=self._clock,
                 manifest_loader=self._manifest_loader,
-                settings=self._settings,
+                settings=rebuild_settings,
+                job_connection=rebuild_job_connection,
             )
             graph_worker = (
                 GraphSyncWorker(
@@ -238,7 +334,8 @@ class AdminRebuildService:
                     llm_client=self._llm_client,
                     clock=self._clock,
                     manifest_loader=self._manifest_loader,
-                    settings=self._settings,
+                    settings=rebuild_settings,
+                    job_connection=rebuild_job_connection,
                 )
                 if self._settings.graph_projection_enabled
                 else None
@@ -249,7 +346,8 @@ class AdminRebuildService:
                 llm_client=self._llm_client,
                 clock=self._clock,
                 embedding_index=self._embedding_index,
-                settings=self._settings,
+                settings=rebuild_settings,
+                job_connection=rebuild_job_connection,
             )
             compaction_worker = (
                 None
@@ -260,7 +358,8 @@ class AdminRebuildService:
                     llm_client=self._llm_client,
                     clock=self._clock,
                     embedding_index=self._embedding_index,
-                    settings=self._settings,
+                    settings=rebuild_settings,
+                    job_connection=rebuild_job_connection,
                 )
             )
             initial_context_package_worker = InitialContextPackageWorker(
@@ -268,14 +367,17 @@ class AdminRebuildService:
                 connection=self._connection,
                 clock=self._clock,
                 manifest_loader=self._manifest_loader,
-                settings=self._settings,
+                settings=rebuild_settings,
                 llm_client=self._llm_client,
+                job_connection=rebuild_job_connection,
             )
             conversations_with_messages: list[dict[str, Any]] = []
             users = UserRepository(self._connection, self._clock)
 
             for conversation in conversations:
-                memory_preferences = await users.get_memory_preferences(str(conversation["user_id"]))
+                memory_preferences = await users.get_memory_preferences(
+                    str(conversation["user_id"])
+                )
                 conversation_had_messages = False
                 recent_message_window: list[dict[str, Any]] = []
                 offset = 0
@@ -305,7 +407,9 @@ class AdminRebuildService:
                                 else None
                             ),
                             user_persona_id=conversation.get("user_persona_id"),
-                            platform_id=str(conversation.get("platform_id") or "default"),
+                            platform_id=str(
+                                conversation.get("platform_id") or "default"
+                            ),
                             character_id=(
                                 str(conversation["character_id"])
                                 if conversation.get("character_id") is not None
@@ -331,7 +435,8 @@ class AdminRebuildService:
                                 else conversation.get("active_space_id")
                             ),
                             active_space_boundary_mode=(
-                                conversation.get("active_space_boundary_mode") or "focus"
+                                conversation.get("active_space_boundary_mode")
+                                or "focus"
                             ),
                             active_space_display_name=conversation.get(
                                 "active_space_display_name"
@@ -350,7 +455,8 @@ class AdminRebuildService:
                                     else conversation.get("active_mind_id")
                                 )
                             ),
-                            mind_topology=conversation.get("mind_topology") or "unimind",
+                            mind_topology=conversation.get("mind_topology")
+                            or "unimind",
                             active_embodiment_id=(
                                 str(message["active_embodiment_id"])
                                 if message.get("active_embodiment_id") is not None
@@ -366,57 +472,80 @@ class AdminRebuildService:
                                 else conversation.get("active_realm_id")
                             ),
                             cross_realm_mode=(
-                                conversation.get("cross_realm_mode")
-                                or "none"
+                                conversation.get("cross_realm_mode") or "none"
                             ),
-                            mode=str(conversation.get("mode") or conversation["assistant_mode_id"]),
-                            incognito=bool(conversation.get("incognito")) or bool(conversation.get("isolated_mode")),
-                            remember_across_chats=bool(memory_preferences["remember_across_chats"]),
-                            remember_across_devices=bool(memory_preferences["remember_across_devices"]),
-                            memory_privacy_mode=memory_preferences["memory_privacy_mode"],
+                            mode=str(
+                                conversation.get("mode")
+                                or conversation["assistant_mode_id"]
+                            ),
+                            incognito=bool(conversation.get("incognito"))
+                            or bool(conversation.get("isolated_mode")),
+                            remember_across_chats=bool(
+                                memory_preferences["remember_across_chats"]
+                            ),
+                            remember_across_devices=bool(
+                                memory_preferences["remember_across_devices"]
+                            ),
+                            memory_privacy_mode=memory_preferences[
+                                "memory_privacy_mode"
+                            ],
                             recent_messages=[
                                 item.model_dump(mode="json")
                                 for item in recent_context(recent_message_window)
                             ],
                             temporary=bool(conversation.get("temporary")),
-                            temporary_ttl_seconds=conversation.get("temporary_ttl_seconds"),
+                            temporary_ttl_seconds=conversation.get(
+                                "temporary_ttl_seconds"
+                            ),
                             purge_on_close=bool(conversation.get("purge_on_close")),
                             isolated_mode=bool(conversation.get("isolated_mode")),
                             ingest_origin=IngestOrigin.ADMIN_IMPORT,
                             confirmation_strategy=ConfirmationStrategy.ADMIN_REVIEW_ONLY,
                         )
-                        extract_processed, _ = await self._process_rebuild_job(
-                            result=result,
-                            stage="extract",
+                        extract_results = await self._enqueue_and_drain_rebuild_job(
+                            storage_backend=rebuild_backend,
+                            job_tracking=rebuild_job_tracking,
+                            effect_fence=rebuild_effect_fence,
+                            stream_name=EXTRACT_STREAM_NAME,
                             handler=ingest_worker.process_job,
-                            payload=self._message_job(
+                            envelope=self._message_job(
                                 user_id=str(conversation["user_id"]),
                                 conversation_id=str(conversation["id"]),
                                 payload=payload,
                                 job_type=JobType.EXTRACT_MEMORY_CANDIDATES,
                             ),
+                            result=result,
+                            stage="extract",
                             llm_health_check=llm_health_check,
                         )
                         result.processed_messages += 1
-                        if extract_processed:
+                        if extract_results:
                             result.extract_jobs_processed += 1
                         if message_role == "user":
-                            contract_processed, _ = await self._process_rebuild_job(
-                                result=result,
-                                stage="contract",
-                                handler=contract_worker.process_job,
-                                payload=self._message_job(
-                                    user_id=str(conversation["user_id"]),
-                                    conversation_id=str(conversation["id"]),
-                                    payload=payload,
-                                    job_type=JobType.PROJECT_CONTRACT,
-                                ),
-                                llm_health_check=llm_health_check,
+                            contract_results = (
+                                await self._enqueue_and_drain_rebuild_job(
+                                    storage_backend=rebuild_backend,
+                                    job_tracking=rebuild_job_tracking,
+                                    effect_fence=rebuild_effect_fence,
+                                    stream_name=CONTRACT_STREAM_NAME,
+                                    handler=contract_worker.process_job,
+                                    envelope=self._message_job(
+                                        user_id=str(conversation["user_id"]),
+                                        conversation_id=str(conversation["id"]),
+                                        payload=payload,
+                                        job_type=JobType.PROJECT_CONTRACT,
+                                    ),
+                                    result=result,
+                                    stage="contract",
+                                    llm_health_check=llm_health_check,
+                                )
                             )
-                            if contract_processed:
+                            if contract_results:
                                 result.contract_jobs_processed += 1
                         recent_message_window.append(message)
-                        recent_message_window = recent_message_window[-RECENT_CONTEXT_MESSAGES:]
+                        recent_message_window = recent_message_window[
+                            -RECENT_CONTEXT_MESSAGES:
+                        ]
                     offset += len(messages)
 
             revision_results = await self._drain_stream(
@@ -426,6 +555,8 @@ class AdminRebuildService:
                 result=result,
                 stage="revision",
                 llm_health_check=llm_health_check,
+                job_tracking=rebuild_job_tracking,
+                effect_fence=rebuild_effect_fence,
             )
             result.revision_jobs_processed += len(revision_results)
 
@@ -437,48 +568,49 @@ class AdminRebuildService:
                     result=result,
                     stage="graph",
                     llm_health_check=llm_health_check,
+                    job_tracking=rebuild_job_tracking,
+                    effect_fence=rebuild_effect_fence,
                 )
                 result.graph_jobs_processed += len(graph_results)
 
             if compaction_worker is not None:
                 for conversation in conversations_with_messages:
-                    compaction_processed, compaction_result = await self._process_rebuild_job(
-                        result=result,
-                        stage="compaction",
+                    compaction_results = await self._enqueue_and_drain_rebuild_job(
+                        storage_backend=rebuild_backend,
+                        job_tracking=rebuild_job_tracking,
+                        effect_fence=rebuild_effect_fence,
+                        stream_name=COMPACT_STREAM_NAME,
                         handler=compaction_worker.process_job,
-                        payload=self._conversation_chunk_job(
+                        envelope=self._conversation_chunk_job(
                             conversation=conversation,
                             memory_preferences=memory_preferences,
                         ),
-                        llm_health_check=llm_health_check,
-                    )
-                    if compaction_processed:
-                        self._record_compaction_result(result, compaction_result)
-
-                compaction_results = await self._drain_stream(
-                    rebuild_backend,
-                    COMPACT_STREAM_NAME,
-                    compaction_worker.process_job,
-                    result=result,
-                    stage="compaction",
-                    llm_health_check=llm_health_check,
-                )
-                for item in compaction_results:
-                    self._record_compaction_result(result, item)
-
-                for target in self._character_rollup_targets(conversations, result.workspace_ids):
-                    rollup_processed, _ = await self._process_rebuild_job(
                         result=result,
                         stage="compaction",
+                        llm_health_check=llm_health_check,
+                    )
+                    for item in compaction_results:
+                        self._record_compaction_result(result, item)
+
+                for target in self._character_rollup_targets(
+                    conversations, result.workspace_ids
+                ):
+                    rollup_results = await self._enqueue_and_drain_rebuild_job(
+                        storage_backend=rebuild_backend,
+                        job_tracking=rebuild_job_tracking,
+                        effect_fence=rebuild_effect_fence,
+                        stream_name=COMPACT_STREAM_NAME,
                         handler=compaction_worker.process_job,
-                        payload=self._character_rollup_job(
+                        envelope=self._character_rollup_job(
                             user_id=result.user_id,
                             character_id=target["character_id"],
                             workspace_id=target["workspace_id"],
                         ),
+                        result=result,
+                        stage="compaction",
                         llm_health_check=llm_health_check,
                     )
-                    if rollup_processed:
+                    if rollup_results:
                         result.workspace_rollup_jobs_processed += 1
 
             initial_context_results = await self._drain_stream(
@@ -488,17 +620,30 @@ class AdminRebuildService:
                 result=result,
                 stage="initial_context_package",
                 llm_health_check=None,
+                job_tracking=rebuild_job_tracking,
+                effect_fence=rebuild_effect_fence,
             )
             result.initial_context_package_refresh_jobs_processed += len(
                 initial_context_results
             )
         finally:
             await rebuild_backend.close()
+            if owns_job_connection:
+                await rebuild_job_connection.close()
 
     async def _invalidate_user_cache(self, user_id: str) -> None:
         if self._cache_storage_backend is None:
             return
         await self._cache_storage_backend.delete_context_views_for_user(user_id)
+
+    async def _require_maintenance_current(self) -> None:
+        operation = self._maintenance_operation
+        if operation is None:
+            raise RuntimeError("Admin rebuild has no maintenance ownership fence")
+        await AdminMaintenanceRepository(
+            self._connection,
+            self._clock,
+        ).require_current(operation)
 
     @staticmethod
     def _message_job(
@@ -509,7 +654,7 @@ class AdminRebuildService:
         job_type: JobType,
     ) -> dict[str, Any]:
         return JobEnvelope(
-            job_id=f"job_rebuild_{job_type.value}_{payload.message_id}",
+            job_id=new_job_id(),
             job_type=job_type,
             user_id=user_id,
             conversation_id=conversation_id,
@@ -533,9 +678,8 @@ class AdminRebuildService:
         character_id: str,
         workspace_id: str | None = None,
     ) -> dict[str, Any]:
-        suffix = f"{workspace_id}_{character_id}" if workspace_id is not None else character_id
         return JobEnvelope(
-            job_id=f"job_rebuild_character_{suffix}",
+            job_id=new_job_id(),
             job_type=JobType.COMPACT_SUMMARIES,
             user_id=user_id,
             payload=CompactionJobPayload(
@@ -595,7 +739,7 @@ class AdminRebuildService:
             else workspace_id
         )
         return JobEnvelope(
-            job_id=f"job_rebuild_chunk_{conversation['id']}",
+            job_id=new_job_id(),
             job_type=JobType.COMPACT_SUMMARIES,
             user_id=str(conversation["user_id"]),
             conversation_id=str(conversation["id"]),
@@ -607,9 +751,12 @@ class AdminRebuildService:
                 platform_id=str(conversation.get("platform_id") or "default"),
                 character_id=character_id,
                 mode=str(conversation.get("mode") or conversation["assistant_mode_id"]),
-                incognito=bool(conversation.get("incognito")) or bool(conversation.get("isolated_mode")),
+                incognito=bool(conversation.get("incognito"))
+                or bool(conversation.get("isolated_mode")),
                 remember_across_chats=bool(memory_preferences["remember_across_chats"]),
-                remember_across_devices=bool(memory_preferences["remember_across_devices"]),
+                remember_across_devices=bool(
+                    memory_preferences["remember_across_devices"]
+                ),
                 temporary=bool(conversation.get("temporary")),
                 temporary_ttl_seconds=conversation.get("temporary_ttl_seconds"),
                 purge_on_close=bool(conversation.get("purge_on_close")),
@@ -646,7 +793,12 @@ class AdminRebuildService:
             job_result = await handler(payload)
         except LLMRunGuardError:
             raise
-        except (LLMError, StructuredOutputError, TransientLLMError, OutputLimitExceededError) as exc:
+        except (
+            LLMError,
+            StructuredOutputError,
+            TransientLLMError,
+            OutputLimitExceededError,
+        ) as exc:
             self._record_recoverable_job_failure(result, stage)
             logger.warning(
                 "Skipping recoverable %s rebuild job",
@@ -703,6 +855,8 @@ class AdminRebuildService:
         result: RebuildResult,
         stage: str,
         llm_health_check: Callable[[str], None] | None = None,
+        job_tracking: JobTrackingService,
+        effect_fence: WorkerEffectFence,
     ) -> list[dict[str, Any] | None]:
         await storage_backend.stream_ensure_group(stream_name, WORKER_GROUP_NAME)
         results: list[dict[str, Any] | None] = []
@@ -717,42 +871,155 @@ class AdminRebuildService:
             if not messages:
                 return results
             for message in messages:
-                await self._job_tracking.mark_running(message)
-                try:
-                    processed, job_result = await self._process_rebuild_job(
-                        result=result,
-                        stage=stage,
-                        handler=handler,
-                        payload=message.payload,
-                        llm_health_check=llm_health_check,
+                claim = await job_tracking.claim_notification(
+                    message,
+                    owner_id="admin-rebuild",
+                )
+                if claim is None:
+                    await storage_backend.stream_ack(
+                        stream_name,
+                        WORKER_GROUP_NAME,
+                        message.message_id,
                     )
+                    continue
+                lease = WorkerJobLease(
+                    job_tracking,
+                    claim,
+                    effect_fence=effect_fence,
+                )
+                try:
+                    async with lease:
+                        processed, job_result = await self._process_rebuild_job(
+                            result=result,
+                            stage=stage,
+                            handler=handler,
+                            payload=claim.envelope.model_dump(mode="json"),
+                            llm_health_check=llm_health_check,
+                        )
+                        if processed:
+                            self._record_claim_key_mismatch_skip(result, job_result)
+                            await lease.succeed(
+                                metadata=(
+                                    job_result if isinstance(job_result, dict) else None
+                                ),
+                            )
+                        else:
+                            await lease.skip(
+                                reason=f"admin_rebuild_{stage}_recoverable_failure",
+                            )
+                except JobLeaseLostError:
+                    await storage_backend.stream_ack(
+                        stream_name,
+                        WORKER_GROUP_NAME,
+                        message.message_id,
+                    )
+                    raise
                 except Exception as exc:
-                    await self._job_tracking.mark_failed(message, exc)
+                    await lease.fail(exc)
+                    await storage_backend.stream_ack(
+                        stream_name,
+                        WORKER_GROUP_NAME,
+                        message.message_id,
+                    )
                     raise
                 if processed:
-                    self._record_claim_key_mismatch_skip(result, job_result)
-                    await self._job_tracking.mark_succeeded(
-                        message,
-                        metadata=job_result if isinstance(job_result, dict) else None,
-                    )
                     results.append(job_result)
-                else:
-                    await self._job_tracking.mark_skipped(
-                        message,
-                        reason=f"admin_rebuild_{stage}_recoverable_failure",
-                    )
                 await storage_backend.stream_ack(
                     stream_name,
                     WORKER_GROUP_NAME,
                     message.message_id,
                 )
 
-    async def _purge_conversation_state(self, user_id: str, conversation_id: str) -> None:
-        memory_ids = await self._memory_ids_for_conversation(user_id, conversation_id)
-        summary_ids = await self._summary_ids_for_conversation_purge(user_id, conversation_id)
-        mirror_ids = [summary_mirror_id(summary_id) for summary_id in summary_ids]
+    async def _enqueue_and_drain_rebuild_job(
+        self,
+        *,
+        storage_backend: InProcessBackend,
+        job_tracking: JobTrackingService,
+        effect_fence: WorkerEffectFence,
+        stream_name: str,
+        handler: Callable[[dict[str, object]], Awaitable[dict[str, Any] | None]],
+        envelope: dict[str, Any],
+        result: RebuildResult,
+        stage: str,
+        llm_health_check: Callable[[str], None] | None,
+    ) -> list[dict[str, Any] | None]:
+        validated_envelope = JobEnvelope.model_validate(envelope)
+        operation = self._maintenance_operation
+        if operation is None:
+            raise RuntimeError("Admin rebuild job has no maintenance ownership fence")
+        validated_envelope = validated_envelope.model_copy(
+            update={"maintenance_operation_id": operation.operation_id}
+        )
+        await job_tracking.enqueue_job(
+            storage_backend,
+            stream_name,
+            validated_envelope,
+        )
+        return await self._drain_stream(
+            storage_backend,
+            stream_name,
+            handler,
+            result=result,
+            stage=stage,
+            llm_health_check=llm_health_check,
+            job_tracking=job_tracking,
+            effect_fence=effect_fence,
+        )
+
+    async def _purge_conversation_state(
+        self, user_id: str, conversation_id: str
+    ) -> None:
+        if self._maintenance_operation is None:
+            async with admin_maintenance_operation(
+                self._connection,
+                self._clock,
+                operation_kind="purge_conversation_state",
+                user_id=user_id,
+                recovery_key=f"conversation:{conversation_id}",
+                heartbeat_connection_factory=self._job_connection_factory,
+            ) as operation:
+                self._maintenance_operation = operation
+                try:
+                    await self._purge_conversation_state(user_id, conversation_id)
+                    return
+                finally:
+                    self._maintenance_operation = None
         try:
-            await self._connection.execute("BEGIN")
+            await self._connection.execute("BEGIN IMMEDIATE")
+            await self._require_maintenance_current()
+            assert self._maintenance_operation is not None
+            await AdminMaintenanceRepository(
+                self._connection,
+                self._clock,
+            ).mark_dirty(self._maintenance_operation)
+            source_message_ids = await self._message_ids_for_conversation(
+                user_id,
+                conversation_id,
+            )
+            await self._bump_derivation_revision(
+                user_id,
+                excluded_source_message_ids=source_message_ids,
+                excluded_conversation_ids=[conversation_id],
+            )
+            memory_ids = await self._memory_ids_for_conversation(
+                user_id,
+                conversation_id,
+            )
+            summary_ids = await self._summary_ids_for_conversation_purge(
+                user_id,
+                conversation_id,
+            )
+            mirror_ids = [summary_mirror_id(summary_id) for summary_id in summary_ids]
+            cleanup_ids = self._stable_ids([*memory_ids, *mirror_ids])
+            if self._embedding_index.vector_limit > 0:
+                await AdminMaintenanceRepository(
+                    self._connection,
+                    self._clock,
+                ).enqueue_effects(
+                    self._maintenance_operation,
+                    effect_kind=EMBEDDING_DELETE_EFFECT,
+                    target_ids=cleanup_ids,
+                )
             await self._connection.execute(
                 """
                 DELETE FROM consequence_chains
@@ -808,17 +1075,51 @@ class AdminRebuildService:
                 self._connection,
                 self._clock,
             ).mark_stale_for_user(user_id, commit=False)
-            await self._delete_memory_ids(user_id, self._stable_ids([*memory_ids, *mirror_ids]))
+            await self._delete_memory_ids(user_id, cleanup_ids)
             await self._connection.commit()
         except Exception:
             await self._connection.rollback()
             raise
-        await self._delete_embeddings(self._stable_ids([*memory_ids, *mirror_ids]))
+        await self._drain_pending_embedding_deletes()
 
     async def _purge_user_state(self, user_id: str) -> None:
-        memory_ids = await self._memory_ids_for_user(user_id)
+        if self._maintenance_operation is None:
+            async with admin_maintenance_operation(
+                self._connection,
+                self._clock,
+                operation_kind="purge_user_state",
+                user_id=user_id,
+                recovery_key=f"user:{user_id}",
+                heartbeat_connection_factory=self._job_connection_factory,
+            ) as operation:
+                self._maintenance_operation = operation
+                try:
+                    await self._purge_user_state(user_id)
+                    return
+                finally:
+                    self._maintenance_operation = None
         try:
-            await self._connection.execute("BEGIN")
+            await self._connection.execute("BEGIN IMMEDIATE")
+            await self._require_maintenance_current()
+            assert self._maintenance_operation is not None
+            await AdminMaintenanceRepository(
+                self._connection,
+                self._clock,
+            ).mark_dirty(self._maintenance_operation)
+            await self._bump_derivation_revision(
+                user_id,
+                allow_validated_requeue=False,
+            )
+            memory_ids = await self._memory_ids_for_user(user_id)
+            if self._embedding_index.vector_limit > 0:
+                await AdminMaintenanceRepository(
+                    self._connection,
+                    self._clock,
+                ).enqueue_effects(
+                    self._maintenance_operation,
+                    effect_kind=EMBEDDING_DELETE_EFFECT,
+                    target_ids=memory_ids,
+                )
             await self._connection.execute(
                 """
                 DELETE FROM consequence_chains
@@ -848,7 +1149,67 @@ class AdminRebuildService:
         except Exception:
             await self._connection.rollback()
             raise
-        await self._delete_embeddings(memory_ids)
+        await self._drain_pending_embedding_deletes()
+
+    async def _bump_derivation_revision(
+        self,
+        user_id: str,
+        *,
+        excluded_source_message_ids: Iterable[str] = (),
+        excluded_conversation_ids: Iterable[str] = (),
+        allow_validated_requeue: bool = True,
+    ) -> int:
+        """Fence prior worker effects inside an admin purge transaction."""
+
+        operation = self._maintenance_operation
+        if operation is None or operation.user_id != user_id:
+            raise RuntimeError("Admin rebuild maintenance identity is unavailable")
+        snapshot = operation.availability_snapshot
+        repository = UserLifecycleRepository(self._connection, self._clock)
+        revision = await repository.bump_derivation_revision(
+            user_id,
+            expected_lifecycle_epoch=snapshot.lifecycle_epoch,
+            commit=False,
+        )
+        if revision is None or revision != snapshot.derivation_revision + 1:
+            raise RuntimeError(
+                f"User lifecycle changed before rebuild purge: {user_id}"
+            )
+        await JobRunRepository(
+            self._connection,
+            self._clock,
+        ).reconcile_stale_root_jobs_after_revision_bump(
+            user_id,
+            snapshot.derivation_revision,
+            revision,
+            excluded_source_message_ids=excluded_source_message_ids,
+            excluded_conversation_ids=excluded_conversation_ids,
+            allow_validated_requeue=allow_validated_requeue,
+        )
+        await AdminMaintenanceRepository(
+            self._connection,
+            self._clock,
+        ).advance_derivation_revision(operation, new_revision=revision)
+        return revision
+
+    async def _message_ids_for_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> list[str]:
+        cursor = await self._connection.execute(
+            """
+            SELECT message.id
+            FROM messages AS message
+            JOIN conversations AS conversation
+              ON conversation.id = message.conversation_id
+            WHERE conversation.user_id = ?
+              AND message.conversation_id = ?
+            ORDER BY message.seq ASC, message.id ASC
+            """,
+            (user_id, conversation_id),
+        )
+        return [str(row["id"]) for row in await cursor.fetchall()]
 
     async def _delete_memory_ids(self, user_id: str, memory_ids: list[str]) -> None:
         if not memory_ids:
@@ -865,12 +1226,26 @@ class AdminRebuildService:
                 (user_id, *chunk),
             )
 
-    async def _delete_embeddings(self, memory_ids: list[str]) -> None:
-        for memory_id in memory_ids:
-            try:
-                await self._embedding_index.delete(memory_id)
-            except Exception:
-                logger.warning("Embedding cleanup failed for memory_id=%s", memory_id, exc_info=True)
+    async def _drain_pending_embedding_deletes(self) -> None:
+        operation = self._maintenance_operation
+        if operation is None:
+            raise RuntimeError("Admin rebuild maintenance identity is unavailable")
+        repository = AdminMaintenanceRepository(self._connection, self._clock)
+        pending_ids = await repository.list_pending_effect_targets(
+            operation,
+            effect_kind=EMBEDDING_DELETE_EFFECT,
+        )
+        if pending_ids and self._embedding_index.vector_limit == 0:
+            raise RuntimeError(
+                "Pending embedding cleanup requires the original embedding backend"
+            )
+        for memory_id in pending_ids:
+            await self._embedding_index.delete(memory_id)
+            await repository.complete_effect(
+                operation,
+                effect_kind=EMBEDDING_DELETE_EFFECT,
+                target_id=memory_id,
+            )
 
     async def _delete_orphan_graph_rows(self, user_id: str) -> None:
         await self._connection.execute(
@@ -909,7 +1284,9 @@ class AdminRebuildService:
             (user_id,),
         )
 
-    async def _memory_ids_for_conversation(self, user_id: str, conversation_id: str) -> list[str]:
+    async def _memory_ids_for_conversation(
+        self, user_id: str, conversation_id: str
+    ) -> list[str]:
         cursor = await self._connection.execute(
             """
             SELECT DISTINCT mo.id
@@ -936,12 +1313,21 @@ class AdminRebuildService:
               )
             ORDER BY mo.id ASC
             """,
-            (user_id, conversation_id, conversation_id, user_id, user_id, conversation_id),
+            (
+                user_id,
+                conversation_id,
+                conversation_id,
+                user_id,
+                user_id,
+                conversation_id,
+            ),
         )
         rows = await cursor.fetchall()
         return [str(row["id"]) for row in rows]
 
-    async def _summary_ids_for_conversation_purge(self, user_id: str, conversation_id: str) -> list[str]:
+    async def _summary_ids_for_conversation_purge(
+        self, user_id: str, conversation_id: str
+    ) -> list[str]:
         cursor = await self._connection.execute(
             """
             SELECT sv.id

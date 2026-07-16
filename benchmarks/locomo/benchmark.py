@@ -48,7 +48,8 @@ from benchmarks.llm_run_guard import LLMRunGuardConfig
 from benchmarks.migration_metadata import benchmark_migration_metadata
 from benchmarks.output_root import assert_outside_repo, bench_output_root
 from benchmarks.retained_db_paths import validate_retained_benchmark_db_dir
-from benchmarks.scorer import LLMJudgeScorer
+from benchmarks.locomo.night_run_artifacts import render_conversation_transcript
+from benchmarks.scorer import JudgeProtocol, LLMJudgeScorer
 from benchmarks.source_evidence import (
     normalize_evidence_turn_ids,
     source_evidence_from_turns,
@@ -87,7 +88,7 @@ from atagia.services.run_counters import (
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "manifests"
+_DEFAULT_MANIFESTS_DIR = _PROJECT_ROOT / "src" / "atagia" / "resources" / "manifests"
 _DEFAULT_RETRIEVAL_PROFILE_ID = "general_qa"
 _BENCHMARK_USER_ID = "benchmark-user"
 _BENCHMARK_PLATFORM_ID = "locomo"
@@ -205,7 +206,9 @@ class LoCoMoBenchmark(BenchmarkRunner):
         corrections_path: str | Path | None = None,
         community_corrections_path: str | Path | None = None,
         answer_postcondition_guard_enabled: bool = False,
+        judge_protocol: JudgeProtocol = JudgeProtocol.SOURCE_AWARE_STRICT,
     ) -> None:
+        self._judge_protocol = judge_protocol
         self._data_path = Path(data_path).expanduser()
         self._llm_provider = llm_provider
         self._llm_api_key = llm_api_key
@@ -247,6 +250,9 @@ class LoCoMoBenchmark(BenchmarkRunner):
         self._embedding_model = embedding_model
         self._answer_postcondition_guard_enabled = answer_postcondition_guard_enabled
         self._adapter = LoCoMoAdapter(self._data_path)
+        # memory_quality judging needs the full conversation transcript; render
+        # it once per conversation instead of once per question (12-26k tokens).
+        self._transcript_cache: dict[str, str] = {}
         self._corrections: dict[str, Any] = {}
         if community_corrections_path is not None:
             from benchmarks.locomo.corrections import load_community_corrections
@@ -1887,11 +1893,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
         try:
             messages_repo = MessageRepository(connection, runtime.clock)
             conversations_repo = ConversationRepository(connection, runtime.clock)
-            artifacts = ArtifactService(
-                connection,
-                runtime.clock,
-                blob_store=runtime.artifact_blob_store,
-            )
+            artifacts = ArtifactService(connection, runtime.clock)
             conversation_row = await conversations_repo.get_conversation(
                 conversation.conversation_id,
                 user_id,
@@ -2481,6 +2483,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 judge = LLMJudgeScorer(
                     runtime.llm_client,
                     self._judge_model or chat_model(runtime.settings),
+                    self._judge_protocol,
                 )
                 return await self._score_question(
                     question_engine,
@@ -2601,11 +2604,17 @@ class LoCoMoBenchmark(BenchmarkRunner):
                     conversation,
                     question,
                 )
+                conversation_transcript = (
+                    self._conversation_transcript(conversation)
+                    if self._judge_protocol is JudgeProtocol.MEMORY_QUALITY
+                    else None
+                )
                 score_result = await judge.score(
                     question=question.question_text,
                     prediction=prediction,
                     ground_truth=question.ground_truth,
                     source_evidence=source_evidence,
+                    conversation_transcript=conversation_transcript,
                 )
             except _JUDGE_TECHNICAL_ERRORS as exc:
                 trace_payload = await self._build_question_trace_from_chat_result(
@@ -2671,8 +2680,8 @@ class LoCoMoBenchmark(BenchmarkRunner):
             trace=trace_payload,
         )
 
-    @staticmethod
     def _technical_failure_result(
+        self,
         *,
         question: BenchmarkQuestion,
         stage: str,
@@ -2722,6 +2731,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 score=0,
                 reasoning=f"{reason_prefix}: {exc_class}: {truncated}",
                 judge_model=judge_model,
+                protocol=self._judge_protocol.value,
             ),
             memories_used=memories_used,
             retrieval_time_ms=retrieval_time_ms,
@@ -2878,6 +2888,14 @@ class LoCoMoBenchmark(BenchmarkRunner):
             turns=conversation.turns,
             conversation_id=conversation.conversation_id,
         )
+
+    def _conversation_transcript(self, conversation: BenchmarkConversation) -> str:
+        """Return the memoized full transcript for one conversation."""
+        transcript = self._transcript_cache.get(conversation.conversation_id)
+        if transcript is None:
+            transcript = render_conversation_transcript(conversation)
+            self._transcript_cache[conversation.conversation_id] = transcript
+        return transcript
 
     @staticmethod
     def _grade_context_for_question(
@@ -3204,7 +3222,14 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 scored_count += 1
             if selected:
                 selected_count += 1
-            survival_stage = cls._critical_evidence_survival_stage(record)
+            deduped_into, deduped_into_selected = cls._critical_evidence_dedupe(
+                record,
+                records_by_id,
+            )
+            survival_stage = cls._critical_evidence_survival_stage(
+                record,
+                deduped_into_selected=deduped_into_selected,
+            )
             stage_counts[survival_stage] += 1
             source_message_ids = cls._payload_id_list(
                 row,
@@ -3247,6 +3272,10 @@ class LoCoMoBenchmark(BenchmarkRunner):
                         "selection_rank": record.get("selection_rank"),
                         "drop_stage": record.get("drop_stage"),
                         "drop_reason": record.get("drop_reason"),
+                        # CS-2.2 precise composer eviction cause (budget_exhausted
+                        # token wall / item_cap_reached / class_cap_reached /
+                        # diversity_demoted). None on pre-CS-2.2 traces.
+                        "eviction_reason": record.get("eviction_reason"),
                         "composer_decision": record.get("composer_decision"),
                         "matched_subquery_indexes": [
                             int(index)
@@ -3255,6 +3284,9 @@ class LoCoMoBenchmark(BenchmarkRunner):
                         ],
                     }
                 )
+                if deduped_into is not None:
+                    item["deduped_into"] = deduped_into
+                    item["deduped_into_selected"] = deduped_into_selected
             items.append(item)
 
         return {
@@ -3270,12 +3302,41 @@ class LoCoMoBenchmark(BenchmarkRunner):
         }
 
     @staticmethod
-    def _critical_evidence_survival_stage(record: dict[str, Any] | None) -> str:
+    def _critical_evidence_dedupe(
+        record: dict[str, Any] | None,
+        records_by_id: dict[str, dict[str, Any]],
+    ) -> tuple[str | None, bool]:
+        """Resolve the CS-2.3 fusion-dedupe custody of one evidence record.
+
+        Returns ``(representative_id, representative_selected)``. Evidence
+        collapsed into a SELECTED duplicate carrier reached the answer model
+        content-wise even though its own id never got selected; the funnel
+        must not read that as a plain retrieval death.
+        """
+        if record is None:
+            return None, False
+        deduped_into = str(record.get("deduped_into") or "").strip()
+        if not deduped_into:
+            return None, False
+        representative = records_by_id.get(deduped_into)
+        representative_selected = (
+            representative is not None and representative.get("selected") is True
+        )
+        return deduped_into, representative_selected
+
+    @staticmethod
+    def _critical_evidence_survival_stage(
+        record: dict[str, Any] | None,
+        *,
+        deduped_into_selected: bool = False,
+    ) -> str:
         if record is None:
             return "absent_from_raw_candidates"
         if record.get("selected") is True:
             return "selected"
         drop_stage = str(record.get("drop_stage") or "").strip()
+        if drop_stage == "fusion_dedupe" and deduped_into_selected:
+            return "fusion_dedupe_into_selected"
         if drop_stage:
             return drop_stage
         if record.get("scored") is True:
@@ -3334,6 +3395,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
             "provider": self._llm_provider,
             "answer_model": effective_answer_model,
             "judge_model": self._judge_model or effective_answer_model,
+            "judge_protocol": self._judge_protocol.value,
             "forced_global_model": self._forced_global_model,
             "ingest_model": self._ingest_model,
             "retrieval_model": self._retrieval_model,

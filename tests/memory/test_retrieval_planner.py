@@ -49,8 +49,8 @@ from atagia.models.schemas_memory import (
     TemporalQueryRange,
 )
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def _resolved_policy(mode_id: str = "coding_debug"):
@@ -182,7 +182,7 @@ async def test_plan_accepts_non_latin_sub_queries() -> None:
 async def test_plan_uses_sparse_query_hints_for_content_bearing_rewrites() -> None:
     planner = RetrievalPlanner()
     policy = _resolved_policy()
-    original_query = "When did Caroline go to the LGBTQ support group?"
+    original_query = "When did Dr Sato calibrate the lunar spectrometer?"
 
     plan = planner.build_plan(
         original_query=original_query,
@@ -194,9 +194,9 @@ async def test_plan_uses_sparse_query_hints_for_content_bearing_rewrites() -> No
             sparse_query_hints=[
                 SparseQueryHint(
                     sub_query_text=original_query,
-                    fts_phrase="Caroline LGBTQ support group",
-                    quoted_phrases=["LGBTQ support group"],
-                    must_keep_terms=["Caroline"],
+                    fts_phrase="Dr Sato lunar spectrometer",
+                    quoted_phrases=["lunar spectrometer"],
+                    must_keep_terms=["Sato"],
                 )
             ],
             query_type="temporal",
@@ -209,13 +209,13 @@ async def test_plan_uses_sparse_query_hints_for_content_bearing_rewrites() -> No
 
     assert plan.original_query == original_query
     assert plan.sub_query_plans[0].text == original_query
-    assert plan.sub_query_plans[0].sparse_phrase == "Caroline LGBTQ support group"
-    assert plan.sub_query_plans[0].quoted_phrases == ["LGBTQ support group"]
-    assert plan.sub_query_plans[0].must_keep_terms == ["Caroline"]
+    assert plan.sub_query_plans[0].sparse_phrase == "Dr Sato lunar spectrometer"
+    assert plan.sub_query_plans[0].quoted_phrases == ["lunar spectrometer"]
+    assert plan.sub_query_plans[0].must_keep_terms == ["Sato"]
     assert plan.sub_query_plans[0].fts_queries == [
-        '"lgbtq support group"',
-        "caroline lgbtq support group",
-        "caroline OR lgbtq OR support OR group",
+        '"lunar spectrometer"',
+        "dr sato lunar spectrometer",
+        "dr OR sato OR lunar OR spectrometer",
     ]
     assert plan.fts_queries == plan.sub_query_plans[0].fts_queries
 
@@ -285,7 +285,7 @@ async def test_plan_materializes_runtime_anchor_aliases_as_fts_variants() -> Non
 async def test_plan_adds_person_anchor_backoff_prefix_for_exact_recall() -> None:
     planner = RetrievalPlanner()
     policy = _resolved_policy()
-    sub_query = "What did Caroline research?"
+    sub_query = "What did Ilya inspect?"
 
     plan = planner.build_plan(
         original_query=sub_query,
@@ -296,15 +296,15 @@ async def test_plan_adds_person_anchor_backoff_prefix_for_exact_recall() -> None
             sparse_query_hints=[
                 SparseQueryHint(
                     sub_query_text=sub_query,
-                    fts_phrase="Caroline research",
-                    must_keep_terms=["Caroline", "research"],
+                    fts_phrase="Ilya inspect",
+                    must_keep_terms=["Ilya", "inspect"],
                 )
             ],
             anchors=[
                 RuntimeAnchor(
                     sub_query_text=sub_query,
                     anchor_type="person",
-                    original_surface="Caroline",
+                    original_surface="Ilya",
                     preserve_verbatim=True,
                 )
             ],
@@ -320,9 +320,9 @@ async def test_plan_adds_person_anchor_backoff_prefix_for_exact_recall() -> None
 
     sub_query_plan = plan.sub_query_plans[0]
     assert sub_query_plan.fts_queries == [
-        "caroline research",
-        "research*",
-        "resear*",
+        "ilya inspect",
+        "inspect*",
+        "inspe*",
     ]
     assert sub_query_plan.fts_query_kinds == [
         "anchor_first_and",
@@ -335,7 +335,7 @@ async def test_plan_adds_person_anchor_backoff_prefix_for_exact_recall() -> None
 async def test_plan_adds_short_prefix_backoff_for_inflected_person_anchor_terms() -> None:
     planner = RetrievalPlanner()
     policy = _resolved_policy()
-    sub_query = "Which cities has Jon visited?"
+    sub_query = "Which devices has Rhea tested?"
 
     plan = planner.build_plan(
         original_query=sub_query,
@@ -346,15 +346,15 @@ async def test_plan_adds_short_prefix_backoff_for_inflected_person_anchor_terms(
             sparse_query_hints=[
                 SparseQueryHint(
                     sub_query_text=sub_query,
-                    fts_phrase="Jon visited cities",
-                    must_keep_terms=["Jon", "visited", "cities"],
+                    fts_phrase="Rhea tested devices",
+                    must_keep_terms=["Rhea", "tested", "devices"],
                 )
             ],
             anchors=[
                 RuntimeAnchor(
                     sub_query_text=sub_query,
                     anchor_type="person",
-                    original_surface="Jon",
+                    original_surface="Rhea",
                     preserve_verbatim=True,
                 )
             ],
@@ -371,11 +371,11 @@ async def test_plan_adds_short_prefix_backoff_for_inflected_person_anchor_terms(
     assert plan.max_candidates >= 30
     sub_query_plan = plan.sub_query_plans[0]
     assert sub_query_plan.fts_queries == [
-        "jon visited cities",
-        "visited cities",
-        "visited* cities*",
-        "visit* OR citi*",
-        "jon OR visited OR cities",
+        "rhea tested devices",
+        "tested devices",
+        "tested* devices*",
+        "test* OR devic*",
+        "rhea OR tested OR devices",
     ]
     assert sub_query_plan.fts_query_kinds == [
         "anchor_first_and",
@@ -390,7 +390,7 @@ async def test_plan_adds_short_prefix_backoff_for_inflected_person_anchor_terms(
 async def test_plan_adds_person_anchor_backoff_for_broad_list_without_exact_recall() -> None:
     planner = RetrievalPlanner()
     policy = _resolved_policy()
-    sub_query = "Which cities has Jon visited?"
+    sub_query = "Which devices has Rhea tested?"
 
     plan = planner.build_plan(
         original_query=sub_query,
@@ -401,15 +401,15 @@ async def test_plan_adds_person_anchor_backoff_for_broad_list_without_exact_reca
             sparse_query_hints=[
                 SparseQueryHint(
                     sub_query_text=sub_query,
-                    fts_phrase="Jon visited cities",
-                    must_keep_terms=["Jon", "visited", "cities"],
+                    fts_phrase="Rhea tested devices",
+                    must_keep_terms=["Rhea", "tested", "devices"],
                 )
             ],
             anchors=[
                 RuntimeAnchor(
                     sub_query_text=sub_query,
                     anchor_type="person",
-                    original_surface="Jon",
+                    original_surface="Rhea",
                     preserve_verbatim=True,
                 )
             ],
@@ -425,10 +425,10 @@ async def test_plan_adds_person_anchor_backoff_for_broad_list_without_exact_reca
 
     sub_query_plan = plan.sub_query_plans[0]
     assert sub_query_plan.fts_queries == [
-        "jon visited cities",
-        "visited* cities*",
-        "visit* OR citi*",
-        "jon OR visited OR cities",
+        "rhea tested devices",
+        "tested* devices*",
+        "test* OR devic*",
+        "rhea OR tested OR devices",
     ]
     assert sub_query_plan.fts_query_kinds == [
         "anchor_first_and",
@@ -442,7 +442,7 @@ async def test_plan_adds_person_anchor_backoff_for_broad_list_without_exact_reca
 async def test_plan_adds_must_keep_tail_backoff_for_exact_anchor_phrase() -> None:
     planner = RetrievalPlanner()
     policy = _resolved_policy()
-    sub_query = "What country is Caroline's grandma from?"
+    sub_query = "Which country did the mentor of Dr Imani grow up in?"
 
     plan = planner.build_plan(
         original_query=sub_query,
@@ -453,8 +453,8 @@ async def test_plan_adds_must_keep_tail_backoff_for_exact_anchor_phrase() -> Non
             sparse_query_hints=[
                 SparseQueryHint(
                     sub_query_text=sub_query,
-                    fts_phrase="Caroline grandma country",
-                    must_keep_terms=["Caroline", "grandma", "country"],
+                    fts_phrase="Imani mentor country",
+                    must_keep_terms=["Imani","mentor","country"],
                 )
             ],
             query_type="slot_fill",
@@ -469,9 +469,9 @@ async def test_plan_adds_must_keep_tail_backoff_for_exact_anchor_phrase() -> Non
 
     sub_query_plan = plan.sub_query_plans[0]
     assert sub_query_plan.fts_queries == [
-        "caroline grandma country",
-        "grandma country",
-        "caroline OR grandma OR country",
+        "imani mentor country",
+        "mentor country",
+        "imani OR mentor OR country",
     ]
     assert sub_query_plan.fts_query_kinds == [
         "anchor_first_and",
@@ -521,7 +521,7 @@ async def test_plan_derives_sparse_phrase_from_partial_hint_without_question_sha
 async def test_plan_slot_fill_promotes_fts_phrase_to_precision_anchor() -> None:
     planner = RetrievalPlanner()
     policy = _resolved_policy()
-    original_query = "Where did Caroline move from after the four-year period?"
+    original_query = "Which port did Vela transfer from after three service cycles?"
 
     plan = planner.build_plan(
         original_query=original_query,
@@ -532,7 +532,7 @@ async def test_plan_slot_fill_promotes_fts_phrase_to_precision_anchor() -> None:
             sparse_query_hints=[
                 SparseQueryHint(
                     sub_query_text=original_query,
-                    fts_phrase="Caroline move from home country four years",
+                    fts_phrase="Vela transfer from origin port three cycles",
                 )
             ],
             query_type="slot_fill",
@@ -544,11 +544,13 @@ async def test_plan_slot_fill_promotes_fts_phrase_to_precision_anchor() -> None:
     )
 
     assert plan.query_type == "slot_fill"
-    assert plan.sub_query_plans[0].quoted_phrases == ["Caroline move from home country four years"]
+    assert plan.sub_query_plans[0].quoted_phrases == [
+        "Vela transfer from origin port three cycles"
+    ]
     assert plan.sub_query_plans[0].fts_queries == [
-        '"caroline move from home country four years"',
-        "caroline move from home country four",
-        "caroline OR move OR from OR home OR country OR four OR years",
+        '"vela transfer from origin port three cycles"',
+        "vela transfer from origin port three",
+        "vela OR transfer OR from OR origin OR port OR three OR cycles",
     ]
 
 
@@ -1061,14 +1063,14 @@ async def test_person_anchor_backoff_prefix_recovers_first_person_memory_without
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
             canonical_text=(
-                "Researching adoption agencies has been a long-term family goal."
+                "Inspecting turbine housings has been a long-term maintenance routine."
             ),
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
-            memory_id="mem_adoption_research",
+            memory_id="mem_turbine_inspection",
         )
-        sub_query = "What did Caroline research?"
+        sub_query = "What did Ilya inspect?"
         plan = RetrievalPlanner().build_plan(
             original_query=sub_query,
             query_intelligence=QueryIntelligenceResult(
@@ -1078,15 +1080,15 @@ async def test_person_anchor_backoff_prefix_recovers_first_person_memory_without
                 sparse_query_hints=[
                     SparseQueryHint(
                         sub_query_text=sub_query,
-                        fts_phrase="Caroline research",
-                        must_keep_terms=["Caroline", "research"],
+                        fts_phrase="Ilya inspect",
+                        must_keep_terms=["Ilya", "inspect"],
                     )
                 ],
                 anchors=[
                     RuntimeAnchor(
                         sub_query_text=sub_query,
                         anchor_type="person",
-                        original_surface="Caroline",
+                        original_surface="Ilya",
                         preserve_verbatim=True,
                     )
                 ],
@@ -1108,11 +1110,11 @@ async def test_person_anchor_backoff_prefix_recovers_first_person_memory_without
         )
 
         assert [candidate["id"] for candidate in candidates] == [
-            "mem_adoption_research"
+            "mem_turbine_inspection"
         ]
         assert any(
             entry["kind"] == "non_evidential_person_anchor_backoff_prefix"
-            and entry["query"] == "research*"
+            and entry["query"] == "inspect*"
             and entry["raw_rows"] == 1
             for entry in fts_query_audit
         )
@@ -1129,15 +1131,13 @@ async def test_must_keep_tail_backoff_recovers_first_person_relation_memory() ->
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text=(
-                "This necklace is a gift from my grandma in my home country, Sweden."
-            ),
+                canonical_text="My mentor grew up in the country of Lydora.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
-            memory_id="mem_grandma_country",
+            memory_id="mem_mentor_country",
         )
-        sub_query = "What country is Caroline's grandma from?"
+        sub_query = "Which country did the mentor of Dr Imani grow up in?"
         plan = RetrievalPlanner().build_plan(
             original_query=sub_query,
             query_intelligence=QueryIntelligenceResult(
@@ -1147,8 +1147,8 @@ async def test_must_keep_tail_backoff_recovers_first_person_relation_memory() ->
                 sparse_query_hints=[
                     SparseQueryHint(
                         sub_query_text=sub_query,
-                        fts_phrase="Caroline grandma country",
-                        must_keep_terms=["Caroline", "grandma", "country"],
+                        fts_phrase="Imani mentor country",
+                        must_keep_terms=["Imani","mentor","country"],
                     )
                 ],
                 query_type="slot_fill",
@@ -1169,11 +1169,11 @@ async def test_must_keep_tail_backoff_recovers_first_person_relation_memory() ->
         )
 
         assert [candidate["id"] for candidate in candidates] == [
-            "mem_grandma_country"
+            "mem_mentor_country"
         ]
         assert any(
             entry["kind"] == "must_keep_tail_and"
-            and entry["query"] == "grandma country"
+            and entry["query"] == "mentor country"
             and entry["raw_rows"] == 1
             for entry in fts_query_audit
         )
@@ -3183,20 +3183,20 @@ async def test_candidate_search_returns_empty_list_when_skip_retrieval_is_true()
 
 
 def test_retrieval_fts_queries_generate_multiple_mechanical_rewrites() -> None:
-    queries = build_retrieval_fts_queries("Jon lost banker job last year")
+    queries = build_retrieval_fts_queries("Nia replaced observatory badge last winter")
     assert len(queries) == 3
-    assert queries[0] == "jon lost banker job"
-    assert queries[1] == "jon lost banker"
-    assert queries[2] == "jon OR lost OR banker OR job OR last OR year"
+    assert queries[0] == "nia replaced observatory badge"
+    assert queries[1] == "nia replaced observatory"
+    assert queries[2] == "nia OR replaced OR observatory OR badge OR last OR winter"
 
 
 def test_retrieval_fts_queries_preserve_distinct_content_terms_after_operator_cleanup() -> None:
-    queries = build_retrieval_fts_queries("Jon and Gina share photography project")
+    queries = build_retrieval_fts_queries("Rhea and Niko share mosaic design notes")
     all_terms: set[str] = set()
     for query in queries:
         for part in query.replace(" OR ", " ").split():
             all_terms.add(part)
-    expected = {"jon", "gina", "share", "photography", "project"}
+    expected = {"rhea", "niko", "share", "mosaic", "design", "notes"}
     assert expected.issubset(all_terms)
     assert "and" not in all_terms
 

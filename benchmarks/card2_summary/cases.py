@@ -2,10 +2,10 @@
 
 Two families:
 
-- ``realistic``: the 5 conversational cases from
-  ``benchmarks/model_casting/inputs/compactor.json``. Each carries a
-  hand-authored, contiguous, non-overlapping partition of its seqs (these stand
-  in for card-1 output, frozen so card 2 is measured in isolation).
+- ``realistic``: 5 public synthetic conversational cases stored alongside this
+  harness. Each carries a hand-authored, contiguous, non-overlapping partition
+  of its seqs (these stand in for card-1 output, frozen so card 2 is measured in
+  isolation).
 - ``stress``: 2 synthetic stress cases with realistic fictional dialogue (no
   benchmark entities): one that saturates concurrency with ~20 single-message
   ranges, and one long single range (~30 messages) to confirm a big slice still
@@ -24,11 +24,10 @@ from typing import Any
 
 # Bump this when the hand-authored partitions below change, so report
 # artifacts can be matched against the exact fixture that produced them.
-FROZEN_RANGE_FIXTURE_ID = "card2_frozen_ranges_v1"
+FROZEN_RANGE_FIXTURE_ID = "card2_frozen_ranges_v2"
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 _COMPACTOR_INPUTS = (
-    _REPO_ROOT / "benchmarks" / "model_casting" / "inputs" / "compactor.json"
+    Path(__file__).resolve().parent / "fixtures" / "compactor_cases.json"
 )
 
 
@@ -50,20 +49,28 @@ class Card2Case:
 
 
 # ---------------------------------------------------------------------------
-# Realistic cases: frozen partitions (card-1 stand-in) for compactor.json.
+# Realistic cases: frozen partitions (card-1 stand-in) for the public fixture.
 # Authored from the message topics; every seq is covered exactly once.
 # ---------------------------------------------------------------------------
 _REALISTIC_RANGES: dict[str, list[tuple[int, int]]] = {
-    # greeting -> work/weather -> walks/lake -> plan to meet
-    "cmp_short_single_thread": [(1, 2), (3, 4), (5, 6), (7, 8)],
-    # support group -> pottery/piano -> sister's baby
-    "cmp_multi_topic_medium": [(1, 3), (4, 7), (8, 12)],
-    # one deep thread about mentoring a teen
-    "cmp_single_topic_deep": [(1, 6), (7, 10)],
-    # plumber -> wedding -> journaling -> dog -> promotion -> recipe -> goodbye
-    "cmp_rapid_topic_shifts": [(1, 2), (3, 4), (5, 6), (7, 7), (8, 10), (11, 12), (13, 15)],
-    # venting about work -> coffee plan
-    "cmp_monologue_and_reactions": [(1, 5), (6, 8)],
+    # battery sorting -> cable sorting -> planter drainage -> receipt scanning
+    "public_errand_checklist": [(1, 2), (3, 4), (5, 6), (7, 8)],
+    # workshop supplies -> storage shelves -> observation session
+    "public_maker_space_planning": [(1, 3), (4, 7), (8, 12)],
+    # photo catalog workflow -> independent backup verification
+    "public_photo_archive_workflow": [(1, 6), (7, 10)],
+    # lamp -> transit -> freezer -> storage -> game -> sensor -> language routine
+    "public_quick_task_switches": [
+        (1, 2),
+        (3, 4),
+        (5, 6),
+        (7, 7),
+        (8, 10),
+        (11, 12),
+        (13, 15),
+    ],
+    # reversible digital cleanup -> scheduled review
+    "public_digital_cleanup_reflection": [(1, 5), (6, 8)],
 }
 
 

@@ -1,0 +1,5 @@
+# Direct dependencies for the private Atagia Journal build/publication artifact.
+markdown-it-py>=3,<5
+nh3>=0.2.21,<1
+pydantic>=2,<3
+PyYAML>=6.0.2,<7

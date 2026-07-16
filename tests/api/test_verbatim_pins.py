@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from typing import Any
 
 from fastapi.testclient import TestClient
 import pytest
@@ -20,19 +22,28 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
+from atagia.services.verbatim_pin_service import VerbatimPinService
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 
 
 class NoopProvider(LLMProvider):
     name = "noop-verbatim-pin-api-tests"
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-        raise AssertionError(f"LLM should not be called in verbatim pin API tests: {request.metadata}")
+        raise AssertionError(
+            f"LLM should not be called in verbatim pin API tests: {request.metadata}"
+        )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        raise AssertionError(f"Embeddings should not be called in verbatim pin API tests: {request.model}")
+        raise AssertionError(
+            f"Embeddings should not be called in verbatim pin API tests: {request.model}"
+        )
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -164,7 +175,11 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
 
         listing = client.get(
             "/v1/verbatim-pins",
-            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
+            params={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+            },
             headers=headers,
         )
         assert listing.status_code == 200
@@ -172,28 +187,44 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
 
         wrong_user_listing = client.get(
             "/v1/verbatim-pins",
-            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
+            params={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+            },
             headers=wrong_headers,
         )
         assert wrong_user_listing.status_code == 403
 
         wrong_namespace_listing = client.get(
             "/v1/verbatim-pins",
-            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "mobile"},
+            params={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_1",
+                "platform_id": "mobile",
+            },
             headers=headers,
         )
         assert wrong_namespace_listing.status_code == 404
 
         private_fetched = client.get(
             f"/v1/verbatim-pins/{private_pin_id}",
-            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
+            params={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+            },
             headers=headers,
         )
         assert private_fetched.status_code == 404
 
         fetched = client.get(
             f"/v1/verbatim-pins/{pin_id}",
-            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
+            params={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+            },
             headers=headers,
         )
         assert fetched.status_code == 200
@@ -201,7 +232,11 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
 
         updated = client.patch(
             f"/v1/verbatim-pins/{pin_id}",
-            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
+            params={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+            },
             json={"status": "archived", "reason": "done"},
             headers=headers,
         )
@@ -211,7 +246,11 @@ def test_verbatim_pin_routes_enforce_user_claims_and_crud(
 
         deleted = client.delete(
             f"/v1/verbatim-pins/{pin_id}",
-            params={"user_id": "usr_1", "conversation_id": "cnv_1", "platform_id": "web"},
+            params={
+                "user_id": "usr_1",
+                "conversation_id": "cnv_1",
+                "platform_id": "web",
+            },
             headers=headers,
         )
         assert deleted.status_code == 200
@@ -385,3 +424,127 @@ def test_verbatim_pin_routes_enforce_space_boundaries_for_crud(
         )
         assert inside_delete.status_code == 200
         assert inside_delete.json()["status"] == "deleted"
+
+
+def test_verbatim_pin_read_rejects_stale_row_after_completed_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = NoopProvider()
+    monkeypatch.setattr(
+        "atagia.app.build_llm_client",
+        lambda _settings: LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        ),
+    )
+    app = create_app(_settings(tmp_path))
+    headers = {
+        "Authorization": "Bearer service-key",
+        "X-Atagia-User-Id": "usr_pin_race",
+    }
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime
+        setup = client.portal.call(runtime.open_connection)
+        try:
+            client.portal.call(
+                UserRepository(setup, runtime.clock).create_user,
+                "usr_pin_race",
+            )
+            client.portal.call(
+                lambda: ConversationRepository(
+                    setup,
+                    runtime.clock,
+                ).create_conversation(
+                    "cnv_pin_race",
+                    "usr_pin_race",
+                    None,
+                    "general_qa",
+                    "Pin race",
+                    platform_id="web",
+                )
+            )
+        finally:
+            client.portal.call(setup.close)
+
+        created = client.post(
+            "/v1/verbatim-pins",
+            json={
+                "user_id": "usr_pin_race",
+                "scope": "conversation",
+                "target_kind": "text_span",
+                "target_id": "host:pin-race",
+                "conversation_id": "cnv_pin_race",
+                "platform_id": "web",
+                "canonical_text": "Selected branch quote",
+                "index_text": "selected branch quote",
+                "privacy_level": 0,
+                "reason": "race test",
+                "created_by": "usr_pin_race",
+            },
+            headers=headers,
+        )
+        assert created.status_code == 200
+        pin_id = created.json()["id"]
+        original_get = VerbatimPinService.get_verbatim_pin
+        raced = False
+
+        async def get_while_replacement_completes(
+            service: VerbatimPinService,
+            connection: Any,
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any] | None:
+            nonlocal raced
+            row = await original_get(service, connection, *args, **kwargs)
+            if raced:
+                return row
+            raced = True
+            read_completed = asyncio.Event()
+            replacement_completed = asyncio.Event()
+
+            async def complete_replacement() -> None:
+                await read_completed.wait()
+                writer = await runtime.open_connection()
+                try:
+                    await writer.execute("BEGIN IMMEDIATE")
+                    await writer.execute(
+                        "DELETE FROM verbatim_pins WHERE id = ? AND user_id = ?",
+                        (pin_id, "usr_pin_race"),
+                    )
+                    await writer.execute(
+                        """
+                        UPDATE user_lifecycles
+                        SET derivation_revision = derivation_revision + 1
+                        WHERE user_id = ?
+                        """,
+                        ("usr_pin_race",),
+                    )
+                    await writer.commit()
+                finally:
+                    await writer.close()
+                    replacement_completed.set()
+
+            replacement_task = asyncio.create_task(complete_replacement())
+            read_completed.set()
+            await asyncio.wait_for(replacement_completed.wait(), timeout=2.0)
+            await replacement_task
+            return row
+
+        monkeypatch.setattr(
+            VerbatimPinService,
+            "get_verbatim_pin",
+            get_while_replacement_completes,
+        )
+        response = client.get(
+            f"/v1/verbatim-pins/{pin_id}",
+            params={
+                "user_id": "usr_pin_race",
+                "conversation_id": "cnv_pin_race",
+                "platform_id": "web",
+            },
+            headers=headers,
+        )
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "selected_transcript_rebuild_in_progress"

@@ -71,6 +71,7 @@ class EmbodimentRepository:
         embodiment_id: str | None,
         cross_embodiment_mode: EmbodimentBoundaryMode | str | None = None,
         display_name: str | None = None,
+        commit: bool = True,
     ) -> dict[str, Any] | None:
         resolved_id = _normalize_optional_text(embodiment_id)
         if resolved_id is None:
@@ -85,6 +86,7 @@ class EmbodimentRepository:
             display_name=display_name or resolved_id,
             source_kind="explicit",
             source_id=resolved_id,
+            commit=commit,
         )
 
     async def resolve_embodiment(
@@ -105,6 +107,16 @@ class EmbodimentRepository:
         )
         timestamp = self._timestamp()
         if existing is not None:
+            normalized_display = _normalize_optional_text(display_name)
+            if (
+                str(existing.get("cross_embodiment_mode"))
+                == cross_embodiment_mode.value
+                and (
+                    normalized_display is None
+                    or existing.get("display_name") == normalized_display
+                )
+            ):
+                return existing
             await self._connection.execute(
                 """
                 UPDATE embodiments
@@ -116,7 +128,7 @@ class EmbodimentRepository:
                 """,
                 (
                     cross_embodiment_mode.value,
-                    _normalize_optional_text(display_name),
+                    normalized_display,
                     timestamp,
                     owner_user_id,
                     embodiment_id,

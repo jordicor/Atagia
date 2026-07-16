@@ -31,6 +31,7 @@ from atagia.services.llm_client import (
     LLMStreamEvent,
     OutputLimitExceededError,
     TransientLLMError,
+    normalize_completion_finish_reason,
     retry_after_seconds_from_exception,
 )
 from atagia.services.llm_schema import (
@@ -168,10 +169,13 @@ def _finish_reason_error(
     max_output_tokens: int | None = None,
     partial_output_text: str | None = None,
     partial_output_chars: int | None = None,
+    allow_truncation: bool = False,
 ) -> LLMError | None:
     if finish_reason is None or finish_reason in _SUCCESS_FINISH_REASONS:
         return None
     if finish_reason in _TRUNCATION_FINISH_REASONS:
+        if allow_truncation:
+            return None
         excerpt = _output_tail_excerpt(partial_output_text)
         char_count = (
             partial_output_chars
@@ -473,10 +477,18 @@ class OpenAICompatibleProvider(LLMProvider):
             choice=first_choice,
             max_output_tokens=request.max_output_tokens,
             partial_output_text=output_text,
+            allow_truncation=request.external_answer,
         )
         if finish_error is not None:
             raise finish_error
-        if not output_text and not tool_calls:
+        if (
+            not output_text
+            and not tool_calls
+            and not (
+                request.external_answer
+                and finish_reason in _TRUNCATION_FINISH_REASONS
+            )
+        ):
             raise _empty_content_error(self.name, finish_reason)
 
         return LLMCompletionResponse(
@@ -487,6 +499,10 @@ class OpenAICompatibleProvider(LLMProvider):
             or _getattr_or_key(message, "reasoning_content", None),
             tool_calls=tool_calls,
             usage=_usage_to_dict(_getattr_or_key(response, "usage")),
+            finish_reason=normalize_completion_finish_reason(
+                finish_reason,
+                has_tool_calls=bool(tool_calls),
+            ),
             raw_response=_model_dump(response),
         )
 
@@ -561,6 +577,7 @@ class OpenAICompatibleProvider(LLMProvider):
         usage: dict[str, Any] = {}
         tool_buffers: dict[int, dict[str, Any]] = {}
         emitted_output_or_tool = False
+        emitted_tool_call = False
         pending_error: Exception | None = None
         last_finish_reason: str | None = None
         output_tail = ""
@@ -615,6 +632,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     if finish_reason == "tool_calls":
                         for index in sorted(tool_buffers):
                             emitted_output_or_tool = True
+                            emitted_tool_call = True
                             yield LLMStreamEvent(type="tool_call", payload=tool_buffers[index])
                         tool_buffers.clear()
                     finish_error = _finish_reason_error(
@@ -624,6 +642,7 @@ class OpenAICompatibleProvider(LLMProvider):
                         max_output_tokens=request.max_output_tokens,
                         partial_output_text=output_tail,
                         partial_output_chars=output_char_count,
+                        allow_truncation=request.external_answer,
                     )
                     if finish_error is not None:
                         pending_error = finish_error
@@ -646,10 +665,27 @@ class OpenAICompatibleProvider(LLMProvider):
         if pending_error is None:
             for index in sorted(tool_buffers):
                 emitted_output_or_tool = True
+                emitted_tool_call = True
                 yield LLMStreamEvent(type="tool_call", payload=tool_buffers[index])
-        if pending_error is None and not emitted_output_or_tool:
+        if (
+            pending_error is None
+            and not emitted_output_or_tool
+            and not (
+                request.external_answer
+                and last_finish_reason in _TRUNCATION_FINISH_REASONS
+            )
+        ):
             pending_error = _empty_content_error(self.name, last_finish_reason)
-        yield LLMStreamEvent(type="done", payload={"usage": usage})
+        done_payload: dict[str, Any] = {}
+        if usage:
+            done_payload["usage"] = usage
+        normalized_finish_reason = normalize_completion_finish_reason(
+            last_finish_reason,
+            has_tool_calls=emitted_tool_call,
+        )
+        if normalized_finish_reason is not None:
+            done_payload["finish_reason"] = normalized_finish_reason
+        yield LLMStreamEvent(type="done", payload=done_payload)
         if pending_error is not None:
             raise pending_error
 

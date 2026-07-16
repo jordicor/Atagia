@@ -8,7 +8,7 @@ from atagia.core.db_sqlite import MigrationManager
 from benchmarks.artifact_hash import sha256_directory
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_DEFAULT_MIGRATIONS_DIR = _PROJECT_ROOT / "migrations"
+_DEFAULT_MIGRATIONS_DIR = _PROJECT_ROOT / "src" / "atagia" / "resources" / "migrations"
 
 
 def benchmark_migration_metadata(

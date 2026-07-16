@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
+import sqlite3
+from time import monotonic
 from typing import Any
 
 from atagia.app import AppRuntime, initialize_runtime
 from atagia.core.config import Settings, configured_resource_path
 from atagia.core import json_utils
+from atagia.core.job_run_repository import JobRunRepository
 from atagia.core.repositories import MemoryObjectRepository, WorkspaceRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
+from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
 from atagia.models.schemas_api import (
     ChatResult,
     ContextResult,
@@ -44,7 +49,6 @@ from atagia.models.schemas_memory import (
 )
 from atagia.services.chat_service import ChatService
 from atagia.services.confirmation_service import PendingConfirmationService
-from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.conversation_activity_service import ConversationActivityService
 from atagia.services.lifecycle_service import (
     HARD_DELETE_MEMORY_CONFIRMATION,
@@ -89,6 +93,17 @@ def _models_after_phase_overrides(
         models[component_id] = model
     models.update(explicit_models)
     return models
+
+
+def _is_sqlite_busy_or_locked(exc: sqlite3.OperationalError) -> bool:
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(error_code, int) and (error_code & 0xFF) in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }:
+        return True
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 class Atagia:
@@ -244,6 +259,7 @@ class Atagia:
     ) -> ContextResult:
         """Run retrieval, persist the user message, and return a ready system prompt."""
         runtime = await self._require_runtime()
+        await self._require_user_memory_available(runtime, user_id)
         return await SidecarService(runtime).get_context(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -290,12 +306,104 @@ class Atagia:
         runtime = await self._require_runtime()
         if not runtime.settings.workers_enabled:
             return False
-        return await runtime.storage_backend.drain(
-            timeout_seconds,
+        return await self._drain_runtime(
+            runtime,
+            timeout_seconds=timeout_seconds,
             idle_timeout_seconds=idle_timeout_seconds,
             progress_interval_seconds=progress_interval_seconds,
             progress_callback=progress_callback,
         )
+
+    async def _drain_runtime(
+        self,
+        runtime: AppRuntime,
+        *,
+        timeout_seconds: float,
+        idle_timeout_seconds: float | None = None,
+        progress_interval_seconds: float = 0.0,
+        progress_callback: Any | None = None,
+    ) -> bool:
+        """Drain durable SQLite work first, then its transient deliveries."""
+
+        timeout = max(0.0, timeout_seconds)
+        idle_timeout = (
+            None if idle_timeout_seconds is None else max(0.0, idle_timeout_seconds)
+        )
+        started_at = monotonic()
+        deadline = started_at + timeout
+        last_progress_at = started_at
+        previous_nonterminal: int | None = None
+        try:
+            connection = await runtime.open_connection(
+                busy_timeout_ms=max(1, int(timeout * 1000))
+            )
+        except sqlite3.OperationalError as exc:
+            if _is_sqlite_busy_or_locked(exc):
+                return False
+            raise
+        jobs = JobRunRepository(connection, runtime.clock)
+        try:
+            while True:
+                now = monotonic()
+                remaining = max(0.0, deadline - now)
+                await connection.execute(
+                    f"PRAGMA busy_timeout = {max(1, min(50, int(remaining * 1000)))}"
+                )
+                try:
+                    nonterminal = await jobs.nonterminal_count()
+                except sqlite3.OperationalError as exc:
+                    if not _is_sqlite_busy_or_locked(exc):
+                        raise
+                    if connection.in_transaction:
+                        await connection.rollback()
+                    now = monotonic()
+                    if (
+                        idle_timeout is not None
+                        and now - last_progress_at >= idle_timeout
+                    ):
+                        return False
+                    if now >= deadline:
+                        return False
+                    await asyncio.sleep(min(0.05, max(0.0, deadline - now)))
+                    continue
+                if (
+                    previous_nonterminal is not None
+                    and nonterminal != previous_nonterminal
+                ):
+                    last_progress_at = now
+                previous_nonterminal = nonterminal
+                if nonterminal == 0:
+                    remaining = max(0.0, deadline - now)
+                    backend_idle = await runtime.storage_backend.drain(
+                        remaining,
+                        idle_timeout_seconds=(
+                            None
+                            if idle_timeout is None
+                            else max(
+                                0.0,
+                                min(
+                                    remaining,
+                                    idle_timeout - (now - last_progress_at),
+                                ),
+                            )
+                        ),
+                        progress_interval_seconds=progress_interval_seconds,
+                        progress_callback=progress_callback,
+                    )
+                    if not backend_idle:
+                        return False
+                    if await jobs.nonterminal_count() == 0:
+                        return True
+                    last_progress_at = monotonic()
+                    previous_nonterminal = None
+                    continue
+                if idle_timeout is not None and now - last_progress_at >= idle_timeout:
+                    return False
+                if now >= deadline:
+                    return False
+                await asyncio.sleep(min(0.05, max(0.0, deadline - now)))
+        finally:
+            await connection.close()
 
     async def get_worker_control(self) -> WorkerControlResponse:
         """Return the current background-processing stop-switch state."""
@@ -328,7 +436,10 @@ class Atagia:
             drain_completed: bool | None = None
             if resolved_mode is WorkerControlMode.DRAIN_AND_PAUSE:
                 drain_completed = (
-                    await runtime.storage_backend.drain(timeout_seconds)
+                    await self._drain_runtime(
+                        runtime,
+                        timeout_seconds=timeout_seconds,
+                    )
                     if runtime.settings.workers_enabled
                     else False
                 )
@@ -355,6 +466,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             return await JobTrackingService(
                 connection,
                 runtime.clock,
@@ -382,6 +498,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             items = await PendingConfirmationService(
                 connection,
                 runtime.clock,
@@ -415,6 +536,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             memory = await PendingConfirmationService(
                 connection,
                 runtime.clock,
@@ -437,6 +563,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             memory = await PendingConfirmationService(
                 connection,
                 runtime.clock,
@@ -457,6 +588,12 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            if filters.get("user_id") is not None:
+                await self._require_user_memory_available(
+                    runtime,
+                    str(filters["user_id"]),
+                    connection=connection,
+                )
             items = await self._list_review_required_rows(
                 connection,
                 user_id=filters.get("user_id"),
@@ -482,6 +619,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             memory = await MemoryObjectRepository(
                 connection,
                 runtime.clock,
@@ -513,6 +655,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             memory = await MemoryObjectRepository(
                 connection,
                 runtime.clock,
@@ -571,6 +718,7 @@ class Atagia:
     ) -> None:
         """Store a message and enqueue extraction without running retrieval."""
         runtime = await self._require_runtime()
+        await self._require_user_memory_available(runtime, user_id)
         await SidecarService(runtime).ingest_message(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -634,6 +782,7 @@ class Atagia:
     ) -> None:
         """Persist an assistant response in the conversation history."""
         runtime = await self._require_runtime()
+        await self._require_user_memory_available(runtime, user_id)
         await SidecarService(runtime).add_response(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -699,6 +848,11 @@ class Atagia:
         await wait_for_in_memory_worker_quiescence(runtime)
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             await sidecar.ensure_user_exists(connection, user_id)
             await sidecar.ensure_conversation(
                 connection,
@@ -755,6 +909,7 @@ class Atagia:
     async def get_memory_preferences(self, user_id: str) -> MemoryPreferencesResponse:
         """Return user-level memory sharing preferences."""
         runtime = await self._require_runtime()
+        await self._require_user_memory_available(runtime, user_id)
         preferences = await SidecarService(runtime).get_memory_preferences(user_id)
         return MemoryPreferencesResponse.model_validate(preferences)
 
@@ -768,6 +923,7 @@ class Atagia:
     ) -> MemoryPreferencesResponse:
         """Update user-level memory sharing preferences."""
         runtime = await self._require_runtime()
+        await self._require_user_memory_available(runtime, user_id)
         preferences = await SidecarService(runtime).set_memory_preferences(
             user_id,
             remember_across_chats=remember_across_chats,
@@ -784,6 +940,7 @@ class Atagia:
     ) -> dict[str, Any]:
         """Set the reversible per-conversation incognito flag."""
         runtime = await self._require_runtime()
+        await self._require_user_memory_available(runtime, user_id)
         return await SidecarService(runtime).set_conversation_incognito(
             user_id,
             conversation_id,
@@ -795,6 +952,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             await SidecarService(runtime).ensure_user_exists(connection, user_id)
         finally:
             await connection.close()
@@ -807,6 +969,11 @@ class Atagia:
         sidecar = SidecarService(runtime)
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             await sidecar.ensure_user_exists(connection, user_id)
             workspaces = WorkspaceRepository(connection, runtime.clock)
             if await workspaces.get_workspace(workspace_id, user_id) is None:
@@ -844,6 +1011,11 @@ class Atagia:
         sidecar = SidecarService(runtime)
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             await sidecar.ensure_user_exists(connection, user_id)
             conversation = await sidecar.ensure_conversation(
                 connection,
@@ -883,6 +1055,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             return await ConversationLifecycleService(runtime).close_conversation(
                 connection,
                 user_id=user_id,
@@ -900,6 +1077,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             return await ConversationLifecycleService(runtime).archive_conversation(
                 connection,
                 user_id=user_id,
@@ -917,18 +1099,21 @@ class Atagia:
     ) -> DeletionReport:
         """Hard-delete a conversation cascade after explicit confirmation."""
         runtime = await self._require_runtime()
-        cache_service = ContextCacheService(runtime)
-        async with cache_service.user_cache_guard(user_id):
-            connection = await runtime.open_connection()
-            try:
-                return await ConversationLifecycleService(runtime).delete_conversation(
-                    connection,
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    confirmation=confirmation,
-                )
-            finally:
-                await connection.close()
+        connection = await runtime.open_connection()
+        try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
+            return await ConversationLifecycleService(runtime).delete_conversation(
+                connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                confirmation=confirmation,
+            )
+        finally:
+            await connection.close()
 
     async def edit_memory(
         self,
@@ -943,6 +1128,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             return await ConversationLifecycleService(runtime).edit_memory(
                 connection,
                 user_id=user_id,
@@ -964,19 +1154,22 @@ class Atagia:
     ) -> DeletionReport:
         """Archive or hard-delete a memory object."""
         runtime = await self._require_runtime()
-        cache_service = ContextCacheService(runtime)
-        async with cache_service.user_cache_guard(user_id):
-            connection = await runtime.open_connection()
-            try:
-                return await ConversationLifecycleService(runtime).delete_memory(
-                    connection,
-                    user_id=user_id,
-                    memory_id=memory_id,
-                    hard=hard,
-                    confirmation=confirmation,
-                )
-            finally:
-                await connection.close()
+        connection = await runtime.open_connection()
+        try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
+            return await ConversationLifecycleService(runtime).delete_memory(
+                connection,
+                user_id=user_id,
+                memory_id=memory_id,
+                hard=hard,
+                confirmation=confirmation,
+            )
+        finally:
+            await connection.close()
 
     async def erase_user_data(
         self, user_id: str, *, confirmation: str
@@ -985,6 +1178,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             return await ConversationLifecycleService(runtime).erase_user_data(
                 connection,
                 user_id=user_id,
@@ -1019,6 +1217,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             await SidecarService(runtime).ensure_user_exists(connection, user_id)
             created = await VerbatimPinService(runtime).create_verbatim_pin(
                 connection,
@@ -1054,6 +1257,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             row = await VerbatimPinService(runtime).get_verbatim_pin(
                 connection,
                 user_id=user_id,
@@ -1081,6 +1289,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             rows = await VerbatimPinService(runtime).list_verbatim_pins(
                 connection,
                 user_id=user_id,
@@ -1119,6 +1332,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             updated = await VerbatimPinService(runtime).update_verbatim_pin(
                 connection,
                 user_id=user_id,
@@ -1150,6 +1368,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             deleted = await VerbatimPinService(runtime).delete_verbatim_pin(
                 connection,
                 user_id=user_id,
@@ -1174,6 +1397,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             service = ConversationActivityService(runtime)
             snapshot = await service.get_activity_snapshot(
                 connection,
@@ -1209,6 +1437,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             service = ConversationActivityService(runtime)
             rows = await service.list_hot_conversations(
                 connection,
@@ -1234,6 +1467,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             service = ConversationActivityService(runtime)
             result = await service.warmup_conversation(
                 connection,
@@ -1262,6 +1500,11 @@ class Atagia:
         runtime = await self._require_runtime()
         connection = await runtime.open_connection()
         try:
+            await self._require_user_memory_available(
+                runtime,
+                user_id,
+                connection=connection,
+            )
             service = ConversationActivityService(runtime)
             result = await service.warmup_recommended_conversations(
                 connection,
@@ -1637,6 +1880,30 @@ class Atagia:
             verbatim_evidence_window_size=env_settings.verbatim_evidence_window_size,
             verbatim_evidence_window_overlap=env_settings.verbatim_evidence_window_overlap,
         )
+
+    @staticmethod
+    async def _require_user_memory_available(
+        runtime: AppRuntime,
+        user_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> None:
+        """Reject user-scoped memory access during transcript replacement."""
+        if connection is not None:
+            await TranscriptRebuildRepository(
+                connection,
+                runtime.clock,
+            ).require_user_available(user_id)
+            return
+
+        guard_connection = await runtime.open_connection()
+        try:
+            await TranscriptRebuildRepository(
+                guard_connection,
+                runtime.clock,
+            ).require_user_available(user_id)
+        finally:
+            await guard_connection.close()
 
     async def _require_runtime(self) -> AppRuntime:
         if self._runtime is None:

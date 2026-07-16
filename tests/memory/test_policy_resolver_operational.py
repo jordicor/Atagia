@@ -21,7 +21,7 @@ from atagia.models.schemas_memory import (
     OperationalRetrievalParamsOverride,
 )
 
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
 
 def test_operational_overlay_restricts_without_mutating_prompt_hash() -> None:

@@ -1,0 +1,7 @@
+{
+  "capability_contract": "hermes.memory-selection.v1",
+  "hermes_commit": "e4ea0a0ed7fc24761b2b425146893561a73216e1",
+  "hermes_version": "0.18.2",
+  "patch_file": "hermes-memory-selection-v1.patch",
+  "source_mirror": "memory_selection.py"
+}

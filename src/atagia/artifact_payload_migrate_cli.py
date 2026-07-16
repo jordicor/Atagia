@@ -14,7 +14,6 @@ import aiosqlite
 from atagia.core.config import Settings
 from atagia.core.db_sqlite import close_connection, initialize_database
 from atagia.core.clock import SystemClock
-from atagia.services.artifact_blob_store import ArtifactBlobStore
 from atagia.services.artifact_payload_service import ArtifactPayloadService
 
 
@@ -39,14 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sqlite-path", default=None)
     parser.add_argument("--migrations-path", default=None)
-    parser.add_argument("--artifact-blob-storage-path", default=None)
     subparsers = parser.add_subparsers(dest="mode", required=True)
     subparsers.add_parser("audit")
     migrate = subparsers.add_parser("migrate")
     migrate.add_argument("--batch-size", type=int, default=500)
     migrate.add_argument(
         "--target-storage-kind",
-        choices=("sqlite_blob", "local_file"),
+        choices=("sqlite_blob",),
         default=None,
     )
     subparsers.add_parser("verify")
@@ -58,7 +56,6 @@ async def main_async(argv: Sequence[str] | None = None) -> int:
     settings = Settings.from_env()
     sqlite_path = str(args.sqlite_path or settings.sqlite_path)
     migrations_path = Path(args.migrations_path or settings.migrations_dir())
-    storage_path = Path(args.artifact_blob_storage_path or settings.artifact_blobs_dir())
     connection = await initialize_database(sqlite_path, migrations_path)
     try:
         if args.mode == "audit":
@@ -66,12 +63,11 @@ async def main_async(argv: Sequence[str] | None = None) -> int:
         elif args.mode == "migrate":
             result = await _migrate(
                 connection,
-                storage_path=storage_path,
                 target_storage_kind=args.target_storage_kind or settings.artifact_blob_storage_kind,
                 batch_size=args.batch_size,
             )
         else:
-            result = await _verify(connection, storage_path=storage_path)
+            result = await _verify(connection)
     finally:
         await close_connection(connection)
     print(json.dumps(asdict(result), sort_keys=True))
@@ -93,14 +89,12 @@ async def _audit(connection: aiosqlite.Connection) -> MigrationCliResult:
 async def _migrate(
     connection: aiosqlite.Connection,
     *,
-    storage_path: Path,
     target_storage_kind: str,
     batch_size: int,
 ) -> MigrationCliResult:
     if batch_size <= 0:
         raise ValueError("batch-size must be positive")
-    blob_store = ArtifactBlobStore(storage_path)
-    payload_service = ArtifactPayloadService(connection, SystemClock(), blob_store=blob_store)
+    payload_service = ArtifactPayloadService(connection, SystemClock())
     cursor = await connection.execute(
         """
         SELECT
@@ -130,7 +124,6 @@ async def _migrate(
             try:
                 blob = _migration_blob_for_row(
                     row,
-                    blob_store=blob_store,
                     target_storage_kind=target_storage_kind,
                 )
                 payload = await payload_service.get_or_create_payload_blob(blob, user_id=str(row["user_id"]))
@@ -170,43 +163,30 @@ async def _migrate(
     )
 
 
-async def _verify(connection: aiosqlite.Connection, *, storage_path: Path) -> MigrationCliResult:
-    blob_store = ArtifactBlobStore(storage_path)
-    missing = 0
-    mismatches = 0
+async def _verify(connection: aiosqlite.Connection) -> MigrationCliResult:
     cursor = await connection.execute(
         """
-        SELECT storage_key, content_sha256
+        SELECT COUNT(*) AS count
         FROM artifact_payload_blobs
         WHERE storage_kind = 'local_file'
-          AND storage_key IS NOT NULL
-          AND status IN ('pending', 'ready', 'gc_pending')
-        ORDER BY id ASC
         """
     )
-    for row in await cursor.fetchall():
-        try:
-            content = blob_store.read_bytes(str(row["storage_key"]))
-        except FileNotFoundError:
-            missing += 1
-            continue
-        if _sha256(content) != str(row["content_sha256"]):
-            mismatches += 1
+    row = await cursor.fetchone()
     return MigrationCliResult(
         mode="verify",
         legacy_active_artifacts_without_payload=await _count_legacy_active_artifacts_without_payload(connection),
         payload_blob_count=await _payload_blob_count(connection),
-        missing_local_files=missing,
-        hash_mismatches=mismatches,
+        error_count=int(row["count"]),
     )
 
 
 def _migration_blob_for_row(
     row: aiosqlite.Row,
     *,
-    blob_store: ArtifactBlobStore,
     target_storage_kind: str,
 ) -> dict[str, Any]:
+    if target_storage_kind != "sqlite_blob":
+        raise ValueError("Artifact payload migration only supports sqlite_blob")
     storage_kind = str(row["storage_kind"])
     if storage_kind == "external_ref":
         return {
@@ -219,14 +199,6 @@ def _migration_blob_for_row(
         blob_bytes = row["blob_bytes"]
         if blob_bytes is None:
             raise ValueError("Legacy SQLite artifact blob is missing bytes")
-        if target_storage_kind == "local_file":
-            return {
-                "storage_kind": "local_file",
-                "blob_bytes": bytes(blob_bytes),
-                "storage_uri": None,
-                "byte_size": int(row["byte_size"]),
-                "sha256": row["sha256"],
-            }
         return {
             "storage_kind": "sqlite_blob",
             "blob_bytes": bytes(blob_bytes),
@@ -236,22 +208,9 @@ def _migration_blob_for_row(
         }
     if storage_kind != "local_file":
         raise ValueError(f"Unsupported legacy artifact blob storage kind: {storage_kind}")
-    content = blob_store.read_bytes(str(row["storage_uri"]))
-    if target_storage_kind == "sqlite_blob":
-        return {
-            "storage_kind": "sqlite_blob",
-            "blob_bytes": content,
-            "storage_uri": None,
-            "byte_size": len(content),
-            "sha256": row["sha256"],
-        }
-    return {
-        "storage_kind": "local_file",
-        "blob_bytes": content,
-        "storage_uri": None,
-        "byte_size": len(content),
-        "sha256": row["sha256"],
-    }
+    raise ValueError(
+        "Legacy local_file rows must first be migrated with atagia-artifact-blob-migrate"
+    )
 
 
 async def _count_legacy_active_artifacts_without_payload(connection: aiosqlite.Connection) -> int:
@@ -272,12 +231,6 @@ async def _payload_blob_count(connection: aiosqlite.Connection) -> int:
     cursor = await connection.execute("SELECT COUNT(*) AS count FROM artifact_payload_blobs")
     row = await cursor.fetchone()
     return int(row["count"])
-
-
-def _sha256(content: bytes) -> str:
-    import hashlib
-
-    return hashlib.sha256(content).hexdigest()
 
 
 def main() -> None:

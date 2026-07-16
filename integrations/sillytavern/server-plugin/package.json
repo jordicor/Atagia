@@ -1,0 +1,10 @@
+{
+  "name": "sillytavern-atagia-memory-server",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Same-origin SillyTavern server boundary for Atagia memory.",
+  "main": "index.cjs",
+  "scripts": {
+    "test": "node --test test.cjs"
+  }
+}

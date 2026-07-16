@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import logging
 from typing import Any
 
@@ -12,11 +13,23 @@ from atagia.core import json_utils
 from atagia.core.belief_repository import BeliefRepository
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
-from atagia.core.locking import acquire_belief_lock, belief_lock_key
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, MessageRepository, UserRepository
+from atagia.core.locking import belief_lock_key
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+)
 from atagia.core.storage_backend import StorageBackend
-from atagia.memory.belief_reviser import BeliefReviser, ClaimKeyMismatchError, RevisionContext
-from atagia.memory.intent_classifier import are_claim_keys_equivalent, is_explicit_user_statement
+from atagia.memory.belief_reviser import (
+    BeliefReviser,
+    ClaimKeyMismatchError,
+    RevisionContext,
+)
+from atagia.memory.intent_classifier import (
+    are_claim_keys_equivalent,
+    is_explicit_user_statement,
+)
 from atagia.memory.scope_utils import resolve_scope_identifiers
 from atagia.models.schemas_jobs import (
     JobEnvelope,
@@ -36,14 +49,24 @@ from atagia.models.schemas_memory import (
     ConversationStatus,
 )
 from atagia.services.embeddings import EmbeddingIndex, NoneBackend
+from atagia.services.job_execution_context import (
+    TransientJobLockUnavailable,
+    acquire_current_job_lock,
+    release_current_job_lock,
+    require_current_job_lock_scope,
+)
 from atagia.services.job_tracking_service import JobTrackingService
 from atagia.services.llm_client import LLMClient, StructuredOutputError
 from atagia.services.model_resolution import resolve_component_model
-from atagia.services.worker_control_service import WorkerControlService, wait_if_worker_claims_paused
+from atagia.services.worker_control_service import (
+    WorkerControlService,
+    wait_if_worker_claims_paused,
+)
+from atagia.services.worker_effect_fence import WorkerEffectFence
+from atagia.services.worker_job_lease import JobLeaseLostError, WorkerJobLease
 
 logger = logging.getLogger(__name__)
 WORKER_ERROR_RETRY_SECONDS = 1.0
-STREAM_RECLAIM_IDLE_MS = 1_000
 MAX_STREAM_DELIVERIES = 3
 
 
@@ -58,16 +81,22 @@ class RevisionWorker:
         clock: Clock,
         embedding_index: EmbeddingIndex | None = None,
         settings: Settings | None = None,
+        job_connection: aiosqlite.Connection | None = None,
     ) -> None:
         self._storage_backend = storage_backend
         self._settings = settings or Settings.from_env()
+        self._stream_reclaim_idle_ms = int(
+            self._settings.worker_stream_reclaim_idle_seconds * 1000
+        )
         self._clock = clock
         self._worker_control = WorkerControlService(connection, clock)
+        self._effect_fence = WorkerEffectFence(connection, clock)
         self._job_tracking = JobTrackingService(
-            connection,
+            job_connection or connection,
             clock,
             workers_enabled=self._settings.workers_enabled,
             settings=self._settings,
+            child_job_connection=connection,
         )
         self._llm_client = llm_client
         self._embedding_index = embedding_index or NoneBackend()
@@ -89,7 +118,9 @@ class RevisionWorker:
         )
 
     async def run(self, consumer_name: str = "revise-1") -> None:
-        await self._storage_backend.stream_ensure_group(REVISE_STREAM_NAME, WORKER_GROUP_NAME)
+        await self._storage_backend.stream_ensure_group(
+            REVISE_STREAM_NAME, WORKER_GROUP_NAME
+        )
         while True:
             try:
                 await self.run_once(consumer_name=consumer_name, block_ms=5000)
@@ -116,19 +147,62 @@ class RevisionWorker:
 
         acked = 0
         failed = 0
+        deferred = 0
         dead_lettered = 0
         for message in messages:
-            try:
-                await self._job_tracking.mark_running(message)
-                await self.process_job(message.payload)
-                await self._job_tracking.mark_succeeded(message)
+            claim = await self._job_tracking.claim_notification(
+                message,
+                owner_id=consumer_name,
+            )
+            if claim is None:
                 await self._storage_backend.stream_ack(
                     REVISE_STREAM_NAME,
                     WORKER_GROUP_NAME,
                     message.message_id,
                 )
                 acked += 1
+                continue
+            lease = WorkerJobLease(
+                self._job_tracking,
+                claim,
+                effect_fence=self._effect_fence,
+            )
+            try:
+                lock_deferred = False
+                async with lease:
+                    try:
+                        await self.process_job(claim.envelope.model_dump(mode="json"))
+                    except TransientJobLockUnavailable as exc:
+                        await lease.defer(
+                            exc,
+                            deferred_until=(
+                                self._clock.now()
+                                + timedelta(
+                                    seconds=self._settings.worker_transient_defer_seconds
+                                )
+                            ),
+                        )
+                        lock_deferred = True
+                    else:
+                        await lease.succeed()
+                await self._storage_backend.stream_ack(
+                    REVISE_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
+                if lock_deferred:
+                    deferred += 1
+                else:
+                    acked += 1
+            except JobLeaseLostError:
+                await self._storage_backend.stream_ack(
+                    REVISE_STREAM_NAME,
+                    WORKER_GROUP_NAME,
+                    message.message_id,
+                )
             except Exception as exc:
+                if lock_deferred:
+                    raise
                 failed += 1
                 if isinstance(exc, StructuredOutputError):
                     details = "; ".join(exc.details) if exc.details else str(exc)
@@ -138,15 +212,32 @@ class RevisionWorker:
                         details,
                     )
                 else:
-                    logger.exception("Failed to process revision job %s", message.message_id)
-                if await self._dead_letter_if_exhausted(message, exc):
+                    logger.exception(
+                        "Failed to process revision job %s", message.message_id
+                    )
+                if claim.attempt_count >= MAX_STREAM_DELIVERIES:
+                    finalized = await lease.dead_letter(
+                        self._storage_backend,
+                        stream_name=REVISE_STREAM_NAME,
+                        group_name=WORKER_GROUP_NAME,
+                        message=message,
+                        exc=exc,
+                    )
+                    if not finalized:
+                        continue
                     dead_lettered += 1
                 else:
-                    await self._job_tracking.mark_retrying(message, exc)
+                    await lease.retry(exc)
+                    await self._storage_backend.stream_ack(
+                        REVISE_STREAM_NAME,
+                        WORKER_GROUP_NAME,
+                        message.message_id,
+                    )
         return WorkerIterationResult(
             received=len(messages),
             acked=acked,
             failed=failed,
+            deferred=deferred,
             dead_lettered=dead_lettered,
         )
 
@@ -156,7 +247,9 @@ class RevisionWorker:
             raise ValueError(f"Unsupported revision job type: {envelope.job_type}")
         raw_claim_key = str(envelope.payload.get("claim_key", "")).strip()
         if not raw_claim_key:
-            logger.warning("Skipping revision job %s with empty claim_key", envelope.job_id)
+            logger.warning(
+                "Skipping revision job %s with empty claim_key", envelope.job_id
+            )
             return {"status": "invalid_claim_key"}
         job_payload = RevisionJobPayload.model_validate(envelope.payload)
         job_payload = await self._strictest_payload(job_payload)
@@ -164,9 +257,17 @@ class RevisionWorker:
             return {"status": "skipped_inactive_source", "claim_key": raw_claim_key}
 
         lock_subject = job_payload.belief_id or job_payload.claim_key
-        lock_token = await acquire_belief_lock(self._storage_backend, lock_subject)
-        if lock_token is None:
-            raise RuntimeError(f"Could not acquire belief lock for {lock_subject}")
+        lock_scope = require_current_job_lock_scope(
+            user_id=envelope.user_id,
+            job_id=envelope.job_id,
+        )
+        lock_key = belief_lock_key(lock_subject)
+        lock_token = await acquire_current_job_lock(
+            self._storage_backend,
+            lock_key,
+            30,
+            scope=lock_scope,
+        )
 
         try:
             if job_payload.belief_id:
@@ -175,23 +276,36 @@ class RevisionWorker:
                     job_payload.user_id,
                 )
                 if belief is None or belief["status"] != MemoryStatus.ACTIVE.value:
-                    return {"status": "skipped_inactive", "belief_id": job_payload.belief_id}
+                    return {
+                        "status": "skipped_inactive",
+                        "belief_id": job_payload.belief_id,
+                    }
                 if job_payload.isolated_mode and (
                     belief.get("conversation_id") != job_payload.conversation_id
                     or belief.get("scope") != MemoryScope.CONVERSATION.value
                 ):
-                    return {"status": "skipped_isolated_scope", "belief_id": job_payload.belief_id}
+                    return {
+                        "status": "skipped_isolated_scope",
+                        "belief_id": job_payload.belief_id,
+                    }
                 if not self._belief_matches_payload_namespace(belief, job_payload):
-                    return {"status": "skipped_namespace_mismatch", "belief_id": job_payload.belief_id}
+                    return {
+                        "status": "skipped_namespace_mismatch",
+                        "belief_id": job_payload.belief_id,
+                    }
                 return await self._revise_existing_belief(job_payload)
             return await self._process_promotion(job_payload)
         finally:
-            await self._storage_backend.release_lock(
-                belief_lock_key(lock_subject),
+            await release_current_job_lock(
+                self._storage_backend,
+                lock_key,
                 lock_token,
+                scope=lock_scope,
             )
 
-    async def _strictest_payload(self, payload: RevisionJobPayload) -> RevisionJobPayload | None:
+    async def _strictest_payload(
+        self, payload: RevisionJobPayload
+    ) -> RevisionJobPayload | None:
         active_user = await self._user_repository.get_active_user(payload.user_id)
         if active_user is None:
             return None
@@ -210,18 +324,25 @@ class RevisionWorker:
                 payload.conversation_id,
                 payload.user_id,
             )
-            if conversation is None or str(conversation.get("status")) != ConversationStatus.ACTIVE.value:
+            if (
+                conversation is None
+                or str(conversation.get("status")) != ConversationStatus.ACTIVE.value
+            ):
                 return None
             updates.update(
                 {
-                    "temporary": bool(payload.temporary) or bool(conversation.get("temporary")),
+                    "temporary": bool(payload.temporary)
+                    or bool(conversation.get("temporary")),
                     "temporary_ttl_seconds": self._strictest_ttl(
                         payload.temporary_ttl_seconds,
                         conversation.get("temporary_ttl_seconds"),
                     ),
-                    "purge_on_close": bool(payload.purge_on_close) or bool(conversation.get("purge_on_close")),
-                    "isolated_mode": bool(payload.isolated_mode) or bool(conversation.get("isolated_mode")),
-                    "incognito": bool(payload.incognito) or bool(conversation.get("incognito")),
+                    "purge_on_close": bool(payload.purge_on_close)
+                    or bool(conversation.get("purge_on_close")),
+                    "isolated_mode": bool(payload.isolated_mode)
+                    or bool(conversation.get("isolated_mode")),
+                    "incognito": bool(payload.incognito)
+                    or bool(conversation.get("incognito")),
                     "active_embodiment_id": (
                         payload.active_embodiment_id
                         or conversation.get("active_embodiment_id")
@@ -232,8 +353,7 @@ class RevisionWorker:
                         or "direct_if_same_body"
                     ),
                     "active_realm_id": (
-                        payload.active_realm_id
-                        or conversation.get("active_realm_id")
+                        payload.active_realm_id or conversation.get("active_realm_id")
                     ),
                     "cross_realm_mode": (
                         payload.cross_realm_mode
@@ -268,12 +388,17 @@ class RevisionWorker:
             return False
         if belief.get("user_persona_id") != payload.user_persona_id:
             return False
-        if str(belief.get("sensitivity") or "unknown") != str(payload.sensitivity or "unknown"):
+        if str(belief.get("sensitivity") or "unknown") != str(
+            payload.sensitivity or "unknown"
+        ):
             return False
         if bool(belief.get("platform_locked")):
             if belief.get("platform_id_lock") != payload.platform_id:
                 return False
-        elif not payload.remember_across_devices and belief.get("platform_id") != payload.platform_id:
+        elif (
+            not payload.remember_across_devices
+            and belief.get("platform_id") != payload.platform_id
+        ):
             return False
         scope = str(belief.get("scope_canonical") or belief.get("scope") or "")
         if scope in {
@@ -282,9 +407,17 @@ class RevisionWorker:
             MemoryScope.EPHEMERAL_SESSION.value,
         }:
             return belief.get("conversation_id") == payload.conversation_id
-        if payload.incognito or payload.isolated_mode or not payload.remember_across_chats:
+        if (
+            payload.incognito
+            or payload.isolated_mode
+            or not payload.remember_across_chats
+        ):
             return False
-        if scope in {MemoryScope.WORKSPACE.value, MemoryScope.CHARACTER.value, "legacy_workspace"}:
+        if scope in {
+            MemoryScope.WORKSPACE.value,
+            MemoryScope.CHARACTER.value,
+            "legacy_workspace",
+        }:
             return belief.get("character_id") == payload.character_id
         if scope in {
             MemoryScope.GLOBAL_USER.value,
@@ -314,7 +447,9 @@ class RevisionWorker:
         payload: RevisionJobPayload,
     ) -> bool:
         belief_embodiment = belief.get("embodiment_id")
-        belief_embodiment_id = None if belief_embodiment is None else str(belief_embodiment)
+        belief_embodiment_id = (
+            None if belief_embodiment is None else str(belief_embodiment)
+        )
         if payload.active_embodiment_id is None:
             return belief_embodiment_id is None
         return (
@@ -366,23 +501,33 @@ class RevisionWorker:
                     "tension_score": tension_score,
                     "threshold": self._settings.belief_tension_threshold,
                 }
-            accumulated_evidence_ids = await self._belief_repository.get_tension_evidence_ids(
-                payload.belief_id,
-                user_id=payload.user_id,
+            accumulated_evidence_ids = (
+                await self._belief_repository.get_tension_evidence_ids(
+                    payload.belief_id,
+                    user_id=payload.user_id,
+                )
             )
-            threshold_payload = payload.model_copy(update={"evidence_memory_ids": accumulated_evidence_ids})
+            threshold_payload = payload.model_copy(
+                update={"evidence_memory_ids": accumulated_evidence_ids}
+            )
             try:
-                threshold_preview = await self._preview_belief_revision(threshold_payload)
+                threshold_preview = await self._preview_belief_revision(
+                    threshold_payload
+                )
             except ClaimKeyMismatchError as exc:
                 return self._claim_key_mismatch_skip(exc)
             try:
-                popped_evidence_ids = await self._belief_repository.pop_tension_evidence_ids(
-                    payload.belief_id,
-                    user_id=payload.user_id,
-                    commit=False,
+                popped_evidence_ids = (
+                    await self._belief_repository.pop_tension_evidence_ids(
+                        payload.belief_id,
+                        user_id=payload.user_id,
+                        commit=False,
+                    )
                 )
                 if popped_evidence_ids != accumulated_evidence_ids:
-                    raise RuntimeError("Tension evidence buffer changed during threshold revision")
+                    raise RuntimeError(
+                        "Tension evidence buffer changed during threshold revision"
+                    )
                 await self._belief_repository.reset_tension(
                     payload.belief_id,
                     user_id=payload.user_id,
@@ -427,23 +572,33 @@ class RevisionWorker:
                     "tension_score": tension_score,
                     "threshold": self._settings.belief_tension_threshold,
                 }
-            accumulated_evidence_ids = await self._belief_repository.get_tension_evidence_ids(
-                payload.belief_id,
-                user_id=payload.user_id,
+            accumulated_evidence_ids = (
+                await self._belief_repository.get_tension_evidence_ids(
+                    payload.belief_id,
+                    user_id=payload.user_id,
+                )
             )
-            threshold_payload = payload.model_copy(update={"evidence_memory_ids": accumulated_evidence_ids})
+            threshold_payload = payload.model_copy(
+                update={"evidence_memory_ids": accumulated_evidence_ids}
+            )
             try:
-                threshold_preview = await self._preview_belief_revision(threshold_payload)
+                threshold_preview = await self._preview_belief_revision(
+                    threshold_payload
+                )
             except ClaimKeyMismatchError as exc:
                 return self._claim_key_mismatch_skip(exc)
             try:
-                popped_evidence_ids = await self._belief_repository.pop_tension_evidence_ids(
-                    payload.belief_id,
-                    user_id=payload.user_id,
-                    commit=False,
+                popped_evidence_ids = (
+                    await self._belief_repository.pop_tension_evidence_ids(
+                        payload.belief_id,
+                        user_id=payload.user_id,
+                        commit=False,
+                    )
                 )
                 if popped_evidence_ids != accumulated_evidence_ids:
-                    raise RuntimeError("Tension evidence buffer changed during threshold revision")
+                    raise RuntimeError(
+                        "Tension evidence buffer changed during threshold revision"
+                    )
                 await self._belief_repository.reset_tension(
                     payload.belief_id,
                     user_id=payload.user_id,
@@ -461,7 +616,9 @@ class RevisionWorker:
             result["tension_score"] = 0.0
             return result
 
-        result = await self._execute_belief_revision(payload, preview_action=preview_decision)
+        result = await self._execute_belief_revision(
+            payload, preview_action=preview_decision
+        )
         tension_score = await self._post_revision_tension_update(payload, result)
         result["signal_type"] = signal_type
         result["tension_score"] = tension_score
@@ -535,8 +692,12 @@ class RevisionWorker:
         )
         if current_version is None:
             return "unknown"
-        current_value = self._normalize_claim_value(current_version.get("claim_value_json"))
-        next_value = self._normalize_claim_value(self._parse_claim_value(payload.claim_value))
+        current_value = self._normalize_claim_value(
+            current_version.get("claim_value_json")
+        )
+        next_value = self._normalize_claim_value(
+            self._parse_claim_value(payload.claim_value)
+        )
         if current_value != next_value:
             return "contradictory"
         return "ambiguous"
@@ -582,9 +743,14 @@ class RevisionWorker:
             )
         return tension_score
 
-    async def _process_promotion(self, payload: RevisionJobPayload) -> dict[str, Any] | None:
+    async def _process_promotion(
+        self, payload: RevisionJobPayload
+    ) -> dict[str, Any] | None:
         if self._promotion_blocked_by_policy(payload):
-            return {"status": "blocked_by_source_policy", "claim_key": payload.claim_key}
+            return {
+                "status": "blocked_by_source_policy",
+                "claim_key": payload.claim_key,
+            }
         active_beliefs = await self._matching_beliefs_for_claim_key(payload)
         explicit_user_statement = await self._is_explicit_user_statement(payload)
         same_message_beliefs = [
@@ -622,15 +788,25 @@ class RevisionWorker:
         )
         target_scope = self._promotion_target_scope(payload, active_beliefs, stats)
         if target_scope is None:
-            if explicit_user_statement and payload.evidence_memory_ids and not same_message_beliefs:
+            if (
+                explicit_user_statement
+                and payload.evidence_memory_ids
+                and not same_message_beliefs
+            ):
                 target_scope = self._explicit_statement_target_scope(payload)
                 if target_scope is None:
                     return {"status": "below_threshold", "claim_key": payload.claim_key}
             else:
                 return {"status": "below_threshold", "claim_key": payload.claim_key}
 
-        if any(belief.get("scope") == target_scope.value for belief in same_message_beliefs):
-            return {"status": "already_present", "claim_key": payload.claim_key, "scope": target_scope.value}
+        if any(
+            belief.get("scope") == target_scope.value for belief in same_message_beliefs
+        ):
+            return {
+                "status": "already_present",
+                "claim_key": payload.claim_key,
+                "scope": target_scope.value,
+            }
 
         promoted = await self._create_promoted_belief(
             payload=payload,
@@ -648,16 +824,18 @@ class RevisionWorker:
         self,
         payload: RevisionJobPayload,
     ) -> list[dict[str, Any]]:
-        candidates = await self._belief_repository.find_active_belief_candidates_by_claim_key(
-            payload.user_id,
-            payload.claim_key,
-            user_persona_id=payload.user_persona_id,
-            platform_id=payload.platform_id,
-            character_id=payload.character_id,
-            conversation_id=payload.conversation_id,
-            incognito=payload.incognito or payload.isolated_mode,
-            remember_across_chats=payload.remember_across_chats,
-            remember_across_devices=payload.remember_across_devices,
+        candidates = (
+            await self._belief_repository.find_active_belief_candidates_by_claim_key(
+                payload.user_id,
+                payload.claim_key,
+                user_persona_id=payload.user_persona_id,
+                platform_id=payload.platform_id,
+                character_id=payload.character_id,
+                conversation_id=payload.conversation_id,
+                incognito=payload.incognito or payload.isolated_mode,
+                remember_across_chats=payload.remember_across_chats,
+                remember_across_devices=payload.remember_across_devices,
+            )
         )
         matches: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -682,14 +860,20 @@ class RevisionWorker:
             return None
         current_scope = MemoryScope(payload.scope)
         if current_scope is MemoryScope.CONVERSATION:
-            if stats["distinct_conversations"] >= self._settings.promotion_conv_to_ws_min_conversations:
+            if (
+                stats["distinct_conversations"]
+                >= self._settings.promotion_conv_to_ws_min_conversations
+            ):
                 if payload.workspace_id is not None:
                     return MemoryScope.WORKSPACE
                 return MemoryScope.ASSISTANT_MODE
             return None
 
         if current_scope in {MemoryScope.WORKSPACE, MemoryScope.ASSISTANT_MODE}:
-            if stats["distinct_sessions"] < self._settings.promotion_ws_to_global_min_sessions:
+            if (
+                stats["distinct_sessions"]
+                < self._settings.promotion_ws_to_global_min_sessions
+            ):
                 return None
             if self._settings.promotion_require_mode_consistency:
                 distinct_modes = {
@@ -715,7 +899,9 @@ class RevisionWorker:
         )
 
     @staticmethod
-    def _explicit_statement_target_scope(payload: RevisionJobPayload) -> MemoryScope | None:
+    def _explicit_statement_target_scope(
+        payload: RevisionJobPayload,
+    ) -> MemoryScope | None:
         if payload.isolated_mode:
             return None
         current_scope = MemoryScope(payload.scope)
@@ -747,7 +933,9 @@ class RevisionWorker:
             conversation_id=payload.conversation_id,
         )
         if scope_identifiers is None:
-            raise ValueError(f"Cannot resolve identifiers for promoted belief scope {target_scope.value}")
+            raise ValueError(
+                f"Cannot resolve identifiers for promoted belief scope {target_scope.value}"
+            )
         try:
             created = await self._memory_repository.create_memory_object(
                 user_id=payload.user_id,
@@ -764,7 +952,8 @@ class RevisionWorker:
                     "promotion_stats": stats,
                     "mind_perspective": {
                         "memory_owner_id": payload.active_mind_id,
-                        "source_mind_id": payload.source_mind_id or payload.active_mind_id,
+                        "source_mind_id": payload.source_mind_id
+                        or payload.active_mind_id,
                         "mind_topology": payload.mind_topology,
                     },
                     "embodiment": {
@@ -778,11 +967,21 @@ class RevisionWorker:
                 },
                 extraction_hash=None,
                 source_kind=MemorySourceKind.INFERRED,
-                confidence=float(seed_belief["confidence"]) if seed_belief is not None else 0.8,
-                stability=float(seed_belief["stability"]) if seed_belief is not None else 0.65,
-                vitality=float(seed_belief["vitality"]) if seed_belief is not None else 0.25,
-                maya_score=float(seed_belief["maya_score"]) if seed_belief is not None else 1.0,
-                privacy_level=int(seed_belief["privacy_level"]) if seed_belief is not None else 1,
+                confidence=float(seed_belief["confidence"])
+                if seed_belief is not None
+                else 0.8,
+                stability=float(seed_belief["stability"])
+                if seed_belief is not None
+                else 0.65,
+                vitality=float(seed_belief["vitality"])
+                if seed_belief is not None
+                else 0.25,
+                maya_score=float(seed_belief["maya_score"])
+                if seed_belief is not None
+                else 1.0,
+                privacy_level=int(seed_belief["privacy_level"])
+                if seed_belief is not None
+                else 1,
                 status=MemoryStatus.ACTIVE,
                 language_codes=(
                     [
@@ -798,11 +997,18 @@ class RevisionWorker:
                 ),
                 user_persona_id=payload.user_persona_id,
                 platform_id=payload.platform_id,
-                character_id=payload.character_id if target_scope is MemoryScope.WORKSPACE else None,
+                character_id=payload.character_id
+                if target_scope is MemoryScope.WORKSPACE
+                else None,
                 sensitivity=MemorySensitivity(str(payload.sensitivity or "unknown")),
-                platform_locked=bool(payload.platform_locked) or not payload.remember_across_devices,
-                platform_id_lock=payload.platform_id_lock or (
-                    payload.platform_id if bool(payload.platform_locked) or not payload.remember_across_devices else None
+                platform_locked=bool(payload.platform_locked)
+                or not payload.remember_across_devices,
+                platform_id_lock=payload.platform_id_lock
+                or (
+                    payload.platform_id
+                    if bool(payload.platform_locked)
+                    or not payload.remember_across_devices
+                    else None
                 ),
                 scope_canonical=self._canonical_scope_for_storage(target_scope).value,
                 memory_owner_id=payload.active_mind_id,
@@ -820,7 +1026,9 @@ class RevisionWorker:
                 commit=False,
             )
             for evidence_id in payload.evidence_memory_ids:
-                evidence = await self._memory_repository.get_memory_object(evidence_id, payload.user_id)
+                evidence = await self._memory_repository.get_memory_object(
+                    evidence_id, payload.user_id
+                )
                 if evidence is None:
                     continue
                 await self._belief_repository.create_memory_link(
@@ -838,7 +1046,11 @@ class RevisionWorker:
 
     @staticmethod
     def _canonical_scope_for_storage(scope: MemoryScope) -> MemoryScope:
-        if scope in {MemoryScope.CONVERSATION, MemoryScope.EPHEMERAL_SESSION, MemoryScope.CHAT}:
+        if scope in {
+            MemoryScope.CONVERSATION,
+            MemoryScope.EPHEMERAL_SESSION,
+            MemoryScope.CHAT,
+        }:
             return MemoryScope.CHAT
         if scope in {MemoryScope.WORKSPACE, MemoryScope.CHARACTER}:
             return MemoryScope.CHARACTER
@@ -850,7 +1062,9 @@ class RevisionWorker:
     ) -> list[dict[str, Any]]:
         evidence_rows: list[dict[str, Any]] = []
         for evidence_id in payload.evidence_memory_ids:
-            row = await self._memory_repository.get_memory_object(evidence_id, payload.user_id)
+            row = await self._memory_repository.get_memory_object(
+                evidence_id, payload.user_id
+            )
             if row is None or row["object_type"] != MemoryObjectType.EVIDENCE.value:
                 continue
             if not self._belief_matches_payload_namespace(row, payload):
@@ -873,9 +1087,15 @@ class RevisionWorker:
             score = 0
             if belief.get("scope") == payload.scope:
                 score += 4
-            if payload.conversation_id is not None and belief.get("conversation_id") == payload.conversation_id:
+            if (
+                payload.conversation_id is not None
+                and belief.get("conversation_id") == payload.conversation_id
+            ):
                 score += 3
-            if payload.workspace_id is not None and belief.get("workspace_id") == payload.workspace_id:
+            if (
+                payload.workspace_id is not None
+                and belief.get("workspace_id") == payload.workspace_id
+            ):
                 score += 2
             if belief.get("assistant_mode_id") == payload.assistant_mode_id:
                 score += 1
@@ -895,7 +1115,7 @@ class RevisionWorker:
             REVISE_STREAM_NAME,
             WORKER_GROUP_NAME,
             consumer_name,
-            min_idle_ms=0 if block_ms == 0 else STREAM_RECLAIM_IDLE_MS,
+            min_idle_ms=self._stream_reclaim_idle_ms,
             count=1,
         )
         if reclaimed:
@@ -908,37 +1128,10 @@ class RevisionWorker:
             block_ms=block_ms,
         )
 
-    async def _dead_letter_if_exhausted(
-        self,
-        message: StreamMessage,
-        exc: Exception,
-    ) -> bool:
-        if message.delivery_count < MAX_STREAM_DELIVERIES:
-            return False
-        await self._storage_backend.enqueue_job(
-            f"dead_letter:{REVISE_STREAM_NAME}",
-            {
-                "message_id": message.message_id,
-                "delivery_count": message.delivery_count,
-                "payload": message.payload,
-                "error": str(exc),
-                "error_details": (
-                    list(exc.details)
-                    if isinstance(exc, StructuredOutputError)
-                    else []
-                ),
-            },
-        )
-        await self._storage_backend.stream_ack(
-            REVISE_STREAM_NAME,
-            WORKER_GROUP_NAME,
-            message.message_id,
-        )
-        await self._job_tracking.mark_dead_lettered(message, exc)
-        return True
-
     async def _message_text(self, payload: RevisionJobPayload) -> str:
-        message = await self._message_repository.get_message(payload.source_message_id, payload.user_id)
+        message = await self._message_repository.get_message(
+            payload.source_message_id, payload.user_id
+        )
         if message is None:
             return ""
         return str(message["text"])
@@ -982,7 +1175,11 @@ class RevisionWorker:
     ) -> str:
         if seed_belief is not None:
             return str(seed_belief["canonical_text"])
-        rendered_value = claim_value if isinstance(claim_value, str) else json_utils.dumps(claim_value, sort_keys=True)
+        rendered_value = (
+            claim_value
+            if isinstance(claim_value, str)
+            else json_utils.dumps(claim_value, sort_keys=True)
+        )
         return f"{payload.claim_key}: {rendered_value}"
 
     def _timestamp(self) -> str:

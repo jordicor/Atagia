@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from atagia.core.clock import FrozenClock
-from atagia.core.db_sqlite import initialize_database
+from atagia.core.db_sqlite import close_connection, initialize_database, open_connection
 from atagia.core.embodiment_repository import EmbodimentRepository
-from atagia.core.initial_context_package_repository import InitialContextPackageRepository
+from atagia.core.initial_context_package_repository import (
+    InitialContextPackageRepository,
+)
 from atagia.core.mind_repository import MindRepository
 from atagia.core.overseer_grant_repository import OverseerGrantRepository
 from atagia.core.presence_repository import PresenceRepository
@@ -18,13 +21,17 @@ from atagia.core.realm_repository import RealmRepository
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
+    MessageRepository,
     UserRepository,
     WorkspaceRepository,
 )
 from atagia.core.space_repository import SpaceRepository
-from atagia.core.storage_backend import InProcessBackend
-from atagia.memory.lifecycle_runner import cache_generation_key
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
+from atagia.core.storage_backend import InProcessBackend, build_recent_window_key
+from atagia.memory.policy_manifest import (
+    ManifestLoader,
+    PolicyResolver,
+    sync_assistant_modes,
+)
 from atagia.models.schemas_initial_context_package import (
     InitialContextPackageBlocks,
     InitialContextPackageKey,
@@ -49,17 +56,24 @@ from atagia.services.initial_context_package_signatures import (
     build_initial_context_package_source_fingerprint,
     invalidate_initial_context_package_dependency,
 )
+from atagia.services.initial_context_package_builder import InitialContextPackageBuilder
 from atagia.services.prompt_authority import normalize_request_authority_context
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "manifests"
+MIGRATIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
+)
+MANIFESTS_DIR = (
+    Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+)
 DATABASE_ID = "/tmp/atagia-initial-context-package-test.db"
 
 
-async def _seed_connection():
-    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+async def _seed_connection(database_path: str = ":memory:"):
+    connection = await initialize_database(database_path, MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 6, 8, 9, 0, tzinfo=timezone.utc))
-    await sync_assistant_modes(connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock)
+    await sync_assistant_modes(
+        connection, ManifestLoader(MANIFESTS_DIR).load_all(), clock
+    )
     await UserRepository(connection, clock).create_user("usr_1")
     await UserRepository(connection, clock).create_user("usr_2")
     await WorkspaceRepository(connection, clock).create_workspace(
@@ -201,7 +215,10 @@ async def test_coordinate_signature_changes_on_coordinate_and_grant_updates() ->
         assert before.complete is True
         assert before.markers_json["space"]["boundary_mode"] == "focus"
         assert before.markers_json["ojocentauri"]["grants"][0]["expired"] is False
-        assert before.markers_json["realm"]["bridges"][0]["cross_realm_mode"] == "attributed"
+        assert (
+            before.markers_json["realm"]["bridges"][0]["cross_realm_mode"]
+            == "attributed"
+        )
 
         clock.advance(seconds=7200)
         expired = await build_initial_context_package_coordinate_signature(
@@ -229,7 +246,9 @@ async def test_coordinate_signature_changes_on_coordinate_and_grant_updates() ->
             conversation_id="cnv_1",
             now=clock.now(),
         )
-        assert space_changed.coordinate_signature_hash != expired.coordinate_signature_hash
+        assert (
+            space_changed.coordinate_signature_hash != expired.coordinate_signature_hash
+        )
         assert space_changed.markers_json["space"]["boundary_mode"] == "privacy_vault"
 
         await RealmRepository(connection, clock).upsert_realm_bridge(
@@ -245,8 +264,14 @@ async def test_coordinate_signature_changes_on_coordinate_and_grant_updates() ->
             conversation_id="cnv_1",
             now=clock.now(),
         )
-        assert bridge_changed.coordinate_signature_hash != space_changed.coordinate_signature_hash
-        assert bridge_changed.markers_json["realm"]["bridges"][0]["cross_realm_mode"] == "applicable"
+        assert (
+            bridge_changed.coordinate_signature_hash
+            != space_changed.coordinate_signature_hash
+        )
+        assert (
+            bridge_changed.markers_json["realm"]["bridges"][0]["cross_realm_mode"]
+            == "applicable"
+        )
 
         await OverseerGrantRepository(connection, clock).revoke_grant(
             owner_user_id="usr_1",
@@ -262,7 +287,10 @@ async def test_coordinate_signature_changes_on_coordinate_and_grant_updates() ->
             conversation_id="cnv_1",
             now=clock.now(),
         )
-        assert revoked.coordinate_signature_hash != bridge_changed.coordinate_signature_hash
+        assert (
+            revoked.coordinate_signature_hash
+            != bridge_changed.coordinate_signature_hash
+        )
         assert revoked.markers_json["ojocentauri"]["grants"][0]["revoked"] is True
     finally:
         await connection.close()
@@ -333,7 +361,9 @@ async def test_source_fingerprint_changes_for_user_scoped_source_updates() -> No
             user_id="usr_1",
             conversation_id="cnv_1",
         )
-        assert other_user_change.source_fingerprint_hash == before.source_fingerprint_hash
+        assert (
+            other_user_change.source_fingerprint_hash == before.source_fingerprint_hash
+        )
 
         await connection.execute(
             """
@@ -352,9 +382,9 @@ async def test_source_fingerprint_changes_for_user_scoped_source_updates() -> No
         )
 
         assert after.source_fingerprint_hash != before.source_fingerprint_hash
-        assert after.source_markers_json["sources"]["memory_objects"]["max_updated_at"] == (
-            "2026-06-08T10:30:00+00:00"
-        )
+        assert after.source_markers_json["sources"]["memory_objects"][
+            "max_updated_at"
+        ] == ("2026-06-08T10:30:00+00:00")
 
         baseline_before = await build_initial_context_package_source_fingerprint(
             connection,
@@ -374,10 +404,16 @@ async def test_source_fingerprint_changes_for_user_scoped_source_updates() -> No
             connection,
             user_id="usr_1",
         )
-        assert baseline_after.source_fingerprint_hash != baseline_before.source_fingerprint_hash
-        assert baseline_after.source_markers_json["sources"]["memory_objects"][
-            "max_tension_updated_at"
-        ] == "2026-06-08T10:45:00+00:00"
+        assert (
+            baseline_after.source_fingerprint_hash
+            != baseline_before.source_fingerprint_hash
+        )
+        assert (
+            baseline_after.source_markers_json["sources"]["memory_objects"][
+                "max_tension_updated_at"
+            ]
+            == "2026-06-08T10:45:00+00:00"
+        )
     finally:
         await connection.close()
 
@@ -494,13 +530,22 @@ async def test_source_fingerprint_tracks_message_raw_policy_markers() -> None:
         )
 
         assert after.source_fingerprint_hash != before.source_fingerprint_hash
-        assert after.source_markers_json["sources"]["messages"][
-            "requires_explicit_request_count"
-        ] == 0
-        assert after.source_markers_json["sources"]["messages"][
-            "policy_reason_marker_count"
-        ] == 2
-        assert len(after.source_markers_json["sources"]["messages"]["raw_policy_buckets"]) == 2
+        assert (
+            after.source_markers_json["sources"]["messages"][
+                "requires_explicit_request_count"
+            ]
+            == 0
+        )
+        assert (
+            after.source_markers_json["sources"]["messages"][
+                "policy_reason_marker_count"
+            ]
+            == 2
+        )
+        assert (
+            len(after.source_markers_json["sources"]["messages"]["raw_policy_buckets"])
+            == 2
+        )
     finally:
         await connection.close()
 
@@ -648,13 +693,41 @@ async def test_package_invalidation_marks_stale_and_clears_dependent_cache() -> 
             {"user_id": "usr_2", "conversation_id": "cnv_2"},
             ttl_seconds=3600,
         )
-        await backend.set_recent_window("usr_1:cnv_1", [{"id": "msg_1"}])
+        recent_window_key = build_recent_window_key("usr_1", "cnv_1")
+        await backend.prepare_lifecycle_mirror(
+            "cleanup_initial_context",
+            "epoch_initial_context",
+            "nonce_initial_context",
+        )
+        assert await backend.activate_lifecycle_mirror(
+            "cleanup_initial_context",
+            "epoch_initial_context",
+            "nonce_initial_context",
+        )
+        assert await backend.set_recent_window_for_lifecycle(
+            recent_window_key,
+            [{"id": "msg_1"}],
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            lifecycle_cleanup_key="cleanup_initial_context",
+            lifecycle_epoch="epoch_initial_context",
+            cache_revision=0,
+            derivation_revision=0,
+            conversation_lifecycle_epoch="conversation_epoch_initial_context",
+            conversation_source_revision=0,
+        )
+        await MessageRepository(connection, clock).create_message(
+            "msg_source_change",
+            "cnv_1",
+            "user",
+            1,
+            "Canonical source changed before invalidation.",
+        )
 
         result = await invalidate_initial_context_package_dependency(
             connection,
             clock=clock,
             storage_backend=backend,
-            database_path=DATABASE_ID,
             user_id="usr_1",
             conversation_id="cnv_1",
         )
@@ -667,12 +740,101 @@ async def test_package_invalidation_marks_stale_and_clears_dependent_cache() -> 
         assert result.stale_package_count == 1
         assert result.deleted_context_views == 1
         assert result.deleted_recent_windows == 1
-        assert result.cache_generation == 1
         assert await backend.get_context_view("ctx-usr-1") is None
         assert await backend.get_context_view("ctx-usr-2") is not None
-        assert await backend.get_recent_window("usr_1:cnv_1") is None
-        assert await backend.get_cache_generation(
-            cache_generation_key(DATABASE_ID, "usr_1")
-        ) == 1
+        assert await backend.get_recent_window(recent_window_key) is None
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_delayed_dependency_invalidator_preserves_fresh_current_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "icp-delayed-invalidator.db")
+    connection, clock = await _seed_connection(database_path)
+    writer = await open_connection(database_path)
+    invalidation_release = asyncio.Event()
+    try:
+        await ConversationRepository(connection, clock).create_conversation(
+            "cnv_1",
+            "usr_1",
+            "wrk_1",
+            "coding_debug",
+            "Invalidation race",
+        )
+        manifests = ManifestLoader(MANIFESTS_DIR).load_all()
+        resolved_policy = PolicyResolver().resolve(
+            manifests["coding_debug"],
+            None,
+            None,
+        )
+        await InitialContextPackageBuilder(
+            connection,
+            clock,
+        ).build_conversation_package(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            resolved_policy=resolved_policy,
+        )
+        await connection.execute(
+            "UPDATE users SET remember_across_chats = 0 WHERE id = ?",
+            ("usr_1",),
+        )
+        await connection.commit()
+
+        invalidation_entered = asyncio.Event()
+        original_mark = InitialContextPackageRepository.mark_stale_for_changed_sources
+
+        async def delayed_mark(
+            repository: InitialContextPackageRepository,
+            **kwargs: object,
+        ) -> int:
+            invalidation_entered.set()
+            await invalidation_release.wait()
+            return await original_mark(repository, **kwargs)
+
+        monkeypatch.setattr(
+            InitialContextPackageRepository,
+            "mark_stale_for_changed_sources",
+            delayed_mark,
+        )
+        backend = InProcessBackend()
+        invalidation_task = asyncio.create_task(
+            invalidate_initial_context_package_dependency(
+                connection,
+                clock=clock,
+                storage_backend=backend,
+                user_id="usr_1",
+            )
+        )
+        await asyncio.wait_for(invalidation_entered.wait(), timeout=2)
+
+        fresh = await InitialContextPackageBuilder(
+            writer,
+            clock,
+        ).build_conversation_package(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            resolved_policy=resolved_policy,
+        )
+        fresh_bytes = fresh.model_dump(mode="json")
+        invalidation_release.set()
+        result = await invalidation_task
+
+        after = await InitialContextPackageRepository(
+            writer,
+            clock,
+        ).get_by_key_hash(
+            user_id="usr_1",
+            package_key_hash=fresh.package_key_hash,
+            include_inactive=True,
+        )
+        assert after is not None
+        assert after.model_dump(mode="json") == fresh_bytes
+        assert result.stale_package_count == 1
+    finally:
+        invalidation_release.set()
+        await close_connection(writer)
+        await close_connection(connection)

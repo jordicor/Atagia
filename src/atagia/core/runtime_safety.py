@@ -23,6 +23,12 @@ async def wait_for_in_memory_worker_quiescence(
         return
     if not is_in_memory_database(runtime.database_path):
         return
+    # The runtime's default memdb VFS uses normal SQLite locking and does not
+    # need this legacy shared-cache workaround. Keep it only for an explicitly
+    # configured cache=shared URI, whose SQLITE_LOCKED_SHAREDCACHE errors do not
+    # honor busy_timeout.
+    if "cache=shared" not in runtime.database_path:
+        return
     drained = await runtime.storage_backend.drain(timeout_seconds)
     if not drained:
         raise RuntimeError(

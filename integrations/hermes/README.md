@@ -1,44 +1,26 @@
 # Hermes Integration
 
-Status: implemented, mock-verified, live smoke pending.
+Status: the native provider is contract-tested for straight-line turns and
+suffix mutations against Hermes Agent `0.18.2`, commit
+`e4ea0a0ed7fc24761b2b425146893561a73216e1`, with Atagia's versioned downstream
+host patch. Vanilla Hermes 0.18.2 is explicitly unsupported and rejected.
 
-Hermes-style stacks often expose a memory-provider abstraction. Atagia now ships
-a copyable provider bundle at `plugins/memory/atagia/`, plus the older
-`atagia_provider.py` facade over `SidecarBridge` for direct Python integration.
+The native plugin is in `plugins/memory/atagia/`. The required host patch and
+its machine-readable pin are in `patches/0.18.2-e4ea0a0/`. See the plugin
+[README](plugins/memory/atagia/README.md) for exact apply commands, mandatory
+identity settings, mutation ordering, failure behavior, and verification.
 
-## Provider Bundle
+The patch adds the `hermes.memory-selection.v1` capability. It uses stable
+SessionDB row IDs and supplies the selected transcript/cutoff before context
+prefetch, so retry, undo, and regeneration can replace the abandoned Atagia
+suffix before any context is read from the new branch. The provider accepts
+only a strict retained prefix and never infers mutation state from message text.
 
-`plugins/memory/atagia/` implements a minimal `MemoryProvider`:
+`atagia_provider.py` remains a direct Python-library facade for callers that
+own their host adapter. It is not the Hermes native plugin and is not part of
+the pinned loader contract.
 
-- `is_available`
-- `initialize`
-- `get_config_schema`
-- `save_config`
-- `prefetch`
-- `sync_turn`
-- `on_session_end`
-- `on_memory_write` no-op
-- `shutdown`
-
-`sync_turn` and `on_session_end` enqueue work on a daemon thread, so Hermes
-generation does not block on Atagia persistence.
-
-`on_memory_write` intentionally does nothing for now. Curated Hermes memory
-records should not be converted into fake chat turns until there is a clear
-semantic mapping.
-
-## Importer
-
-Use `integrations/importers/atagia_importers.py` for Hermes exports shaped as
-`messages`, `transcript`, or `memories` with text fields.
-
-## Smoke Checklist
-
-- Provider imports against a real Hermes install and sees
-  `agent.memory_provider.MemoryProvider`.
-- `initialize(config)` returns available with the local Atagia URL.
-- `prefetch()` returns a `system_prompt` and stores the user message.
-- `sync_turn()` queues assistant persistence without blocking generation.
-- `on_session_end()` can backfill session transcript messages rerunnably.
-- `on_memory_write()` remains a documented no-op.
-- Atagia down/API error fails open.
+Hermes exports can be backfilled with
+`integrations/importers/atagia_importers.py`; only explicit transcript
+`user`/`assistant` rows are eligible. Curated `memories` are reported and
+skipped rather than fabricated as assistant turns.

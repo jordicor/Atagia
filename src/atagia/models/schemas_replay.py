@@ -52,6 +52,9 @@ class AblationConfig(BaseModel):
     privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
     skip_need_detection: bool = False
     skip_applicability_scoring: bool = False
+    # Fusion dedupe is ON by default; this switch exists for A/B
+    # probes and ablation studies only.
+    skip_fusion_dedupe: bool = False
     applicability_gate_mode: Literal["off", "shadow", "enforced"] | None = None
     skip_contract_memory: bool = False
     skip_workspace_rollup: bool = False

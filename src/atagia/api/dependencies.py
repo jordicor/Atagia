@@ -15,6 +15,10 @@ from atagia.core.storage_backend import StorageBackend
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.llm_client import LLMClient
+from atagia.services.prompt_authority import (
+    PromptAuthorityContext,
+    normalize_request_authority_context,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +30,24 @@ class AuthContext:
     actor_id: str
     api_key: str | None = None
     claimed_user_id: str | None = None
+
+
+def ordinary_http_authority_context(
+    auth_context: AuthContext,
+    *,
+    user_id: str | None,
+    purpose: str,
+) -> PromptAuthorityContext:
+    """Build non-privileged prompt authority for an ordinary HTTP request."""
+
+    return normalize_request_authority_context(
+        privacy_enforcement="enforce",
+        authenticated_user_privilege_level="standard",
+        authenticated_user_is_atagia_master=False,
+        user_id=user_id,
+        purpose=purpose,
+        authority_source=f"ordinary_http_boundary:{auth_context.actor_id}",
+    )
 
 
 def get_runtime(request: Request) -> Any:
@@ -100,12 +122,40 @@ def _bearer_token(authorization: str | None) -> str:
     return token.strip()
 
 
+def reject_duplicate_singleton_headers(
+    request: Request,
+    header_names: tuple[str, ...],
+) -> None:
+    """Reject ambiguous repeated headers before any value is trusted."""
+
+    for header_name in header_names:
+        if len(request.headers.getlist(header_name)) > 1:
+            raise ValueError(f"Duplicate {header_name} header is not allowed")
+
+
+def _reject_duplicate_auth_headers(
+    request: Request,
+    header_names: tuple[str, ...],
+) -> None:
+    try:
+        reject_duplicate_singleton_headers(request, header_names)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
 def get_auth_context(
     request: Request,
     authorization: str | None = Header(default=None),
     x_atagia_user_id: str | None = Header(default=None, alias="X-Atagia-User-Id"),
 ) -> AuthContext:
     """Authenticate normal user routes."""
+    _reject_duplicate_auth_headers(
+        request,
+        ("Authorization", "X-Atagia-User-Id"),
+    )
     settings = get_settings(request)
     if not settings.service_mode:
         return AuthContext(service_mode=False, is_admin=False, actor_id="library_mode")
@@ -142,6 +192,7 @@ def get_admin_auth_context(
     authorization: str | None = Header(default=None),
 ) -> AuthContext:
     """Authenticate admin-only routes."""
+    _reject_duplicate_auth_headers(request, ("Authorization",))
     settings = get_settings(request)
     if not settings.service_mode:
         return AuthContext(service_mode=False, is_admin=True, actor_id="library_admin")
@@ -158,7 +209,9 @@ def get_admin_auth_context(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid admin API key",
         )
-    return AuthContext(service_mode=True, is_admin=True, actor_id="admin_api_key", api_key=token)
+    return AuthContext(
+        service_mode=True, is_admin=True, actor_id="admin_api_key", api_key=token
+    )
 
 
 def ensure_user_access(user_id: str, auth_context: AuthContext) -> None:

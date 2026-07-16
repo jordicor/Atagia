@@ -1,5 +1,4 @@
 -- atagia:foreign_keys_off
-BEGIN;
 
 DROP TRIGGER IF EXISTS memory_objects_fts_ai;
 DROP TRIGGER IF EXISTS memory_objects_fts_ad;
@@ -235,5 +234,3 @@ CREATE TABLE memory_consent_profile (
 
 CREATE INDEX idx_mcp_user_category
     ON memory_consent_profile(user_id, category);
-
-COMMIT;
