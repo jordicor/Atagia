@@ -14,7 +14,7 @@ certifi==2026.6.17
 cffi==2.1.0
 charset-normalizer==3.4.9
 click==8.4.2
-cryptography==49.0.0
+cryptography==50.0.1
 cyclonedx-python-lib==11.11.0
 defusedxml==0.7.1
 distro==1.9.0
@@ -44,7 +44,7 @@ packaging==26.2
 pip-api==0.0.34
 pip-audit==2.10.1
 pip-requirements-parser==32.0.1
-pip-tools==7.5.3
+pip-tools==7.6.1
 platformdirs==4.10.0
 pluggy==1.6.0
 py-serializable==2.1.0
@@ -87,5 +87,5 @@ websockets==16.1
 wheel==0.47.0
 
 # The following packages are considered to be unsafe in a requirements file:
-pip==26.1.2
+pip==26.2.1
 setuptools==83.0.0
