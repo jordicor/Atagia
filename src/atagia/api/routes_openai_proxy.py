@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from fastapi import APIRouter, Header, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from atagia.core.mind_repository import MindNotFoundError
 from atagia.api.dependencies import (
@@ -43,6 +44,38 @@ from atagia.services.request_budgets import (
     RequestBudgetExceededError,
     RequestPayloadStructureError,
 )
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """A streaming response that closes the iterator it consumed.
+
+    Starlette never closes ``body_iterator``. When a client disconnects it
+    simply stops iterating and drops the response, which leaves the whole proxy
+    generator chain -- and the upstream provider stream underneath it --
+    suspended at their yields until the async generator finalizer happens to
+    reach them. Until then the turn keeps an unfinished provider round-trip
+    open, its terminal record is unwritten, and the abandoned call is recorded
+    in a task that no longer belongs to the turn.
+
+    Closing here is what triggers the teardown in ``OpenAIProxyService``, inside
+    the request that owns it: the `aclosing` chain when the body is suspended,
+    plus -- always, not only when the body never ran -- an explicit close of the
+    provider round-trip and a fenced resolution of the turn's claim. Always,
+    because a body cancelled inside ``__anext__`` is TERMINATED rather than
+    suspended, so it can neither finish its own teardown nor be revived to; see
+    ``_ProxyStreamBody``. On a completed stream both steps match nothing and this
+    is a no-op.
+
+    This `finally` is the one place in the request where that can run: it
+    executes after Starlette's disconnect task group has exited, so it is outside
+    the cancel scope that tore the body down and its awaits are not re-cancelled.
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self.body_iterator.aclose()
 
 
 router = APIRouter(prefix="/v1", tags=["openai-compatible"])
@@ -388,7 +421,7 @@ async def create_openai_proxy_chat_completion(
                 adaptive_retrieval_header=x_atagia_adaptive_retrieval,
                 prompt_authority_context=authority_context,
             )
-            return StreamingResponse(
+            return _ClosingStreamingResponse(
                 stream,
                 media_type="text/event-stream",
                 headers={

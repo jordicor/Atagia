@@ -37,6 +37,7 @@ from atagia.models.schemas_memory import (
 )
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.embeddings import EmbeddingIndex, EmbeddingMatch
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -178,7 +179,11 @@ async def test_candidate_search_filters_by_active_realm_and_explicit_bridge() ->
             realm_id=None,
         )
 
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
         real_ids = {
             row["id"]
             for row in await search.search(
@@ -248,6 +253,7 @@ async def test_embedding_candidates_require_explicit_realm_bridge() -> None:
                     )
                 ]
             ),
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
         )
 
         no_bridge_rows = await search.search(plan, "usr_1")
@@ -772,7 +778,11 @@ async def test_verbatim_pins_filter_by_active_realm_in_crud_search_and_candidate
         )
         assert {row["id"] for row in search_rows} == {"pin_real"}
 
-        candidate_rows = await CandidateSearch(connection, clock).search(
+        candidate_rows = await CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        ).search(
             _plan(
                 active_realm_id="realm_real",
                 raw_context_access_mode="verbatim",
@@ -788,7 +798,11 @@ async def test_verbatim_pins_filter_by_active_realm_in_crud_search_and_candidate
             target_realm_id="realm_aincrad",
             cross_realm_mode=CrossRealmMode.ATTRIBUTED,
         )
-        bridged_candidate_rows = await CandidateSearch(connection, clock).search(
+        bridged_candidate_rows = await CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        ).search(
             _plan(
                 active_realm_id="realm_real",
                 raw_context_access_mode="verbatim",
@@ -916,7 +930,11 @@ async def test_artifact_chunks_and_verbatim_evidence_carry_realm() -> None:
         ).model_copy(update={"scope_filter": [MemoryScope.CONVERSATION]})
         bridged_artifact_rows = [
             row
-            for row in await CandidateSearch(connection, clock).search(
+            for row in await CandidateSearch(
+                connection,
+                clock,
+                token_document_frequency_cache=TokenDocumentFrequencyCache(),
+            ).search(
                 artifact_plan,
                 "usr_1",
             )
@@ -936,7 +954,11 @@ async def test_artifact_chunks_and_verbatim_evidence_carry_realm() -> None:
             raw_context_access_mode="verbatim",
         ).model_copy(update={"scope_filter": [MemoryScope.CHAT]})
         evidence_rows = [
-            row for row in await CandidateSearch(connection, clock).search(plan, "usr_1")
+            row for row in await CandidateSearch(
+                connection,
+                clock,
+                token_document_frequency_cache=TokenDocumentFrequencyCache(),
+            ).search(plan, "usr_1")
             if row.get("is_verbatim_evidence_window")
         ]
         assert evidence_rows

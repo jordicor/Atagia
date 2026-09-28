@@ -67,11 +67,18 @@ MANIFESTS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 )
 _MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES = {
-    "memory_extraction_kind_scope_card",
-    "memory_extraction_evidence_card",
+    "memory_extraction_kind_card",
+    "memory_extraction_scope_card",
+    "memory_extraction_confidence_card",
+    "memory_extraction_evidence_support_card",
+    "memory_extraction_preserve_verbatim_card",
+    "memory_extraction_candidate_language_card",
+    "memory_extraction_source_reference_card",
     "memory_extraction_index_card",
-    "memory_extraction_temporal_card",
-    "memory_extraction_belief_card",
+    "memory_extraction_belief_key_card",
+    "memory_extraction_belief_value_card",
+    "memory_extraction_temporal_type_card",
+    "memory_extraction_temporal_interval_card",
     "memory_extraction_coverage_members_card",
 }
 
@@ -126,6 +133,7 @@ class ExtractorProvider(LLMProvider):
                 output_text=memory_extraction_card_output_from_payload(
                     self.payload,
                     request.metadata.get("purpose"),
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         return LLMCompletionResponse(
@@ -182,11 +190,13 @@ class RebuildReplayProvider(LLMProvider):
                 output_text = memory_extraction_card_output_from_payload(
                     self._active_extraction_payload,
                     purpose,
+                    prompt="\n".join(message.content for message in request.messages),
                 )
             else:
                 output_text = memory_extraction_card_output_from_payload(
                     self._active_extraction_payload or {"candidates": []},
                     purpose,
+                    prompt="\n".join(message.content for message in request.messages),
                 )
                 self._active_extraction_consumed.add(str(purpose))
                 if (

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import logging
 import math
 import re
 from typing import Any
@@ -48,10 +49,15 @@ from atagia.memory.realm_policy import (
 from atagia.memory.retrieval_planner import (
     RetrievalFtsQuerySpec,
     build_retrieval_fts_queries,
+    filter_fts_query_tokens,
 )
 from atagia.memory.space_policy import (
     candidate_allows_space_boundary,
     space_visibility_sql_clause,
+)
+from atagia.memory.token_document_frequency import (
+    TOKEN_DOC_RATIO_MAX_RATIO,
+    TokenDocumentFrequencyCache,
 )
 from atagia.models.schemas_memory import (
     MemoryCategory,
@@ -146,12 +152,17 @@ _RUNTIME_ALIAS_FTS_KIND = "runtime_alias_or"
 _RUNTIME_ALIAS_FTS_SOURCE = "alias_anchor"
 _PERSISTED_SURFACE_FTS_SOURCE = "persisted_surface"
 _PERSISTED_SURFACE_FTS_KIND_PREFIX = "persisted_surface_"
+# RRF weight applied to the fts channel when a candidate's only FTS evidence
+# comes from a broad OR fallback query instead of a precise AND/phrase query.
+_BROAD_OR_FTS_RRF_WEIGHT = 0.5
 _SENSITIVITY_RANK = {
     "unknown": 0,
     "public": 1,
     "private": 2,
     "secret": 3,
 }
+
+logger = logging.getLogger(__name__)
 
 
 def _canonical_scope_value(scope_value: str) -> str:
@@ -252,11 +263,16 @@ class CandidateSearch:
         self,
         connection: aiosqlite.Connection,
         clock: Clock,
+        *,
+        token_document_frequency_cache: TokenDocumentFrequencyCache,
         embedding_index: EmbeddingIndex | None = None,
         settings: Settings | None = None,
     ) -> None:
         self._connection = connection
         self._clock = clock
+        # Required, never defaulted: a cache allocated alongside this
+        # short-lived object would be indistinguishable from no cache.
+        self._token_document_frequency_cache = token_document_frequency_cache
         self._settings = settings or Settings.from_env()
         self._embedding_index = embedding_index or NoneBackend()
         self._rrf_k = self._settings.rrf_k
@@ -325,7 +341,7 @@ class CandidateSearch:
               AND mo.archived_by_conversation_id IS NULL
               AND {visibility_clause}
               AND memory_objects_fts MATCH ?
-            ORDER BY {temporal_order_case}{scope_order_case}, rank ASC, mo.updated_at DESC
+            ORDER BY rank ASC, {temporal_order_case}{scope_order_case}, mo.updated_at DESC
             LIMIT ?
         """.format(
             visibility_clauses=" AND ".join(visibility_clauses),
@@ -414,11 +430,27 @@ class CandidateSearch:
             persisted_surface_search_enabled = (
                 plan.exact_recall_mode or plan.query_type == "slot_fill"
             )
-            for fts_query_index, fts_query in enumerate(sub_query.fts_queries):
+            filtered_fts_queries = [
+                await self._corpus_filtered_fts_query(
+                    str(planned_fts_query),
+                    user_id=user_id,
+                )
+                for planned_fts_query in sub_query.fts_queries
+            ]
+            if not any(filtered_fts_queries):
+                # The corpus cannot discriminate any token of this sub-query
+                # (e.g. a topically uniform corpus): keep the planned queries
+                # and let bm25 rank on its own.
+                filtered_fts_queries = [
+                    str(planned_fts_query) for planned_fts_query in sub_query.fts_queries
+                ]
+            for fts_query_index, fts_query in enumerate(filtered_fts_queries):
                 fts_query_kind = self._fts_query_kind_at(
                     sub_query,
                     fts_query_index,
                 )
+                if not fts_query or fts_query in executed_fts_queries:
+                    continue
                 fts_candidates, raw_rows = await self._search_memory_fts_query(
                     query,
                     user_id=user_id,
@@ -428,13 +460,13 @@ class CandidateSearch:
                     retrieval_level_parameters=retrieval_level_parameters,
                     plan=plan,
                     sub_query_text=str(sub_query.text),
-                    fts_query=str(fts_query),
+                    fts_query=fts_query,
                     fts_query_kind=fts_query_kind,
                     fts_limit=fts_limit,
                     fts_query_audit=fts_query_audit,
                 )
                 sub_query_memory_fts_raw_rows += raw_rows
-                executed_fts_queries.add(str(fts_query))
+                executed_fts_queries.add(fts_query)
                 if persisted_surface_search_enabled:
                     surface_candidates, surface_raw_rows = await self._search_persisted_surface_fts_query(
                         surface_candidate_query,
@@ -445,7 +477,7 @@ class CandidateSearch:
                         retrieval_level_parameters=retrieval_level_parameters,
                         plan=plan,
                         sub_query_text=str(sub_query.text),
-                        fts_query=str(fts_query),
+                        fts_query=fts_query,
                         fts_query_kind=fts_query_kind,
                         fts_limit=fts_limit,
                         fts_query_audit=fts_query_audit,
@@ -467,7 +499,7 @@ class CandidateSearch:
                         retrieval_level_parameters=retrieval_level_parameters,
                         plan=plan,
                         sub_query_text=str(sub_query.text),
-                        fts_query=str(fts_query),
+                        fts_query=fts_query,
                         fts_query_kind=fts_query_kind,
                         fts_limit=fts_limit,
                         fts_query_audit=fts_query_audit,
@@ -535,6 +567,8 @@ class CandidateSearch:
                         fts_query_kind=spec.kind,
                         fts_limit=fts_limit,
                         fts_query_audit=fts_query_audit,
+                        fts_query_source="corpus_near",
+                        non_evidential=True,
                     )
                     executed_fts_queries.add(spec.query)
                     self._merge_channel_candidates(
@@ -579,10 +613,14 @@ class CandidateSearch:
                 plan=plan,
             )
             if self._needs_consequence_chain_search(plan):
+                consequence_fts_query = await self._corpus_filtered_fts_query(
+                    str(sub_query.fts_queries[0]),
+                    user_id=user_id,
+                )
                 consequence_candidates = await self._search_consequence_chains(
                     plan=plan,
                     user_id=user_id,
-                    fts_query=sub_query.fts_queries[0],
+                    fts_query=consequence_fts_query or str(sub_query.fts_queries[0]),
                 )
                 self._merge_channel_candidates(
                     sub_query_aggregated,
@@ -708,6 +746,7 @@ class CandidateSearch:
             fts_query=fts_query,
             fts_query_kind=fts_query_kind,
             raw_rows=raw_rows,
+            raw_row_ids=[str(row["id"]) for row in rows],
             source=fts_query_source,
             non_evidential=non_evidential,
         )
@@ -775,6 +814,9 @@ class CandidateSearch:
             fts_query=fts_query,
             fts_query_kind=persisted_kind,
             raw_rows=raw_rows,
+            # ``surface_candidate_query`` selects ``mo.*``, so ``id`` is the
+            # memory ID; several surface rows can back the same memory.
+            raw_row_ids=[str(row["id"]) for row in rows],
             source=_PERSISTED_SURFACE_FTS_SOURCE,
             non_evidential=True,
         )
@@ -835,14 +877,15 @@ class CandidateSearch:
         cursor = await self._connection.execute(query, parameters)
         rows = await cursor.fetchall()
         raw_rows = len(rows)
-        if raw_rows <= 0:
-            return
         self._record_fts_query_audit(
             fts_query_audit,
             sub_query_text=sub_query_text,
             fts_query=fts_query,
             fts_query_kind=f"{_PERSISTED_SURFACE_FTS_KIND_PREFIX}{fts_query_kind}",
             raw_rows=raw_rows,
+            # ``surface_diagnostic_query`` projects the memory ID under
+            # ``memory_id``, not ``id``.
+            raw_row_ids=[str(row["memory_id"]) for row in rows],
             source=_PERSISTED_SURFACE_FTS_SOURCE,
             non_evidential=True,
         )
@@ -2347,8 +2390,8 @@ class CandidateSearch:
               AND ({chain_relevance_clauses})
               AND memory_objects_fts MATCH ?
             ORDER BY
-                {temporal_order_case}{scope_order_case},
                 rank ASC,
+                {temporal_order_case}{scope_order_case},
                 cc.confidence DESC,
                 COALESCE(tendency.updated_at, outcome.updated_at) DESC
             LIMIT ?
@@ -4098,6 +4141,7 @@ class CandidateSearch:
         fts_query: str,
         fts_query_kind: str,
         raw_rows: int,
+        raw_row_ids: list[str],
         source: str = "planned",
         non_evidential: bool = True,
     ) -> None:
@@ -4109,6 +4153,10 @@ class CandidateSearch:
             "kind": fts_query_kind,
             "match_mode": CandidateSearch._fts_query_match_mode(fts_query),
             "raw_rows": max(0, int(raw_rows)),
+            # ``fts_query`` is the string actually executed (already rewritten by
+            # ``_corpus_filtered_fts_query``), so the IDs and the query text
+            # always describe the same execution.
+            "raw_row_ids": list(dict.fromkeys(raw_row_ids)),
         }
         if source not in {"planned", "dynamic"}:
             entry["source"] = source
@@ -4133,6 +4181,35 @@ class CandidateSearch:
             return "explicit_or"
         return "implicit_and"
 
+    async def _corpus_filtered_fts_query(self, fts_query: str, *, user_id: str) -> str:
+        ratios = await self._token_document_frequency_cache.ubiquitous_token_ratios(
+            self._connection,
+            self._clock,
+            user_id,
+        )
+        return filter_fts_query_tokens(
+            fts_query,
+            token_doc_ratios=ratios,
+            max_doc_ratio=TOKEN_DOC_RATIO_MAX_RATIO,
+        )
+
+    @staticmethod
+    def _fts_match_weight(candidate: dict[str, Any]) -> float:
+        """Down-weight candidates whose only FTS evidence is a broad OR query."""
+        matches = candidate.get("fts_query_matches")
+        if not isinstance(matches, list) or not matches:
+            return 1.0
+        match_modes = {
+            str(match.get("match_mode") or "")
+            for match in matches
+            if isinstance(match, dict)
+        }
+        if match_modes & {"implicit_and", "quoted_phrase"}:
+            return 1.0
+        if "explicit_or" in match_modes:
+            return _BROAD_OR_FTS_RRF_WEIGHT
+        return 1.0
+
     def _merge_channel_candidates(
         self,
         aggregated: dict[str, dict[str, Any]],
@@ -4141,10 +4218,16 @@ class CandidateSearch:
         channel: str,
         plan: RetrievalPlan,
     ) -> None:
-        for candidate in candidates:
+        for enumeration_index, candidate in enumerate(candidates, start=1):
             position_rank = candidate.get("position_rank")
             if position_rank is None:
-                raise ValueError(f"Candidate {candidate.get('id')} missing position_rank for channel {channel}")
+                logger.warning(
+                    "Candidate %s missing position_rank for channel %s; "
+                    "falling back to enumeration order",
+                    candidate.get("id"),
+                    channel,
+                )
+                position_rank = enumeration_index
 
             memory_id = str(candidate["id"])
             current = aggregated.get(memory_id)
@@ -4186,6 +4269,7 @@ class CandidateSearch:
                 query_type=plan.query_type,
                 exact_recall_mode=plan.exact_recall_mode,
                 raw_context_access_mode=plan.raw_context_access_mode,
+                fts_match_weight=self._fts_match_weight(current),
             )
             current["rrf_score_raw"] = raw_rrf_score
             current["rrf_score"] = normalized_rrf_score
@@ -4269,9 +4353,18 @@ class CandidateSearch:
                 exact_recall_mode=plan.exact_recall_mode,
                 raw_context_access_mode=plan.raw_context_access_mode,
                 channel_ranks=current.get("channel_ranks"),
+                fts_match_weight=self._fts_match_weight(current),
             )
             current["rrf_score_raw"] = raw_rrf_score
             current["rrf_score"] = normalized_rrf_score
+            if (
+                plan.query_type == "broad_list"
+                and self._settings.broad_list_comparable_rrf_enabled
+                and total_sub_queries > 0
+            ):
+                current["rrf_subquery_coverage"] = (
+                    len(current["matched_sub_queries"]) / total_sub_queries
+                )
 
     def _initialize_channel_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
         channel_candidate = dict(candidate)
@@ -4328,17 +4421,21 @@ class CandidateSearch:
         query_type: str = "default",
         exact_recall_mode: bool = False,
         raw_context_access_mode: str = "normal",
+        fts_match_weight: float = 1.0,
     ) -> tuple[float, float]:
         raw_score = 0.0
         for channel, rank in channel_ranks.items():
             if rank is None:
                 continue
-            raw_score += self._channel_weight(
+            channel_weight = self._channel_weight(
                 channel,
                 query_type=query_type,
                 exact_recall_mode=exact_recall_mode,
                 raw_context_access_mode=raw_context_access_mode,
-            ) * (1.0 / (self._rrf_k + int(rank)))
+            )
+            if channel == "fts":
+                channel_weight *= fts_match_weight
+            raw_score += channel_weight * (1.0 / (self._rrf_k + int(rank)))
         normalized_score = raw_score / self._max_rrf_score(
             query_type=query_type,
             exact_recall_mode=exact_recall_mode,
@@ -4406,6 +4503,7 @@ class CandidateSearch:
         exact_recall_mode: bool = False,
         raw_context_access_mode: str = "normal",
         channel_ranks: dict[str, int | None] | None = None,
+        fts_match_weight: float = 1.0,
     ) -> tuple[float, float]:
         rank_values = [int(rank) for rank in ranks if rank is not None]
         if not rank_values:
@@ -4423,13 +4521,19 @@ class CandidateSearch:
             query_type=query_type,
             exact_recall_mode=exact_recall_mode,
             raw_context_access_mode=raw_context_access_mode,
+            fts_match_weight=fts_match_weight,
         )
         raw_score *= candidate_channel_weight
-        if query_type == "broad_list":
+        if (
+            query_type == "broad_list"
+            and not self._settings.broad_list_comparable_rrf_enabled
+        ):
+            # Champion behavior: coverage is implicit in the denominator.
             score_list_count = max_lists
         else:
-            # Outside broad-list queries, preserve the strength of the best matched
-            # sub-query instead of heavily rewarding generic coverage across facets.
+            # Comparable-score challenger and every non-broad query normalize
+            # by lists actually matched. Broad-list coverage remains explicit
+            # in ``rrf_subquery_coverage`` instead of changing the score scale.
             score_list_count = len(rank_values)
         if score_list_count <= 0:
             return 0.0, 0.0
@@ -4444,6 +4548,7 @@ class CandidateSearch:
         query_type: str = "default",
         exact_recall_mode: bool = False,
         raw_context_access_mode: str = "normal",
+        fts_match_weight: float = 1.0,
     ) -> float:
         """Return the effective channel weight for a merged candidate.
 
@@ -4456,16 +4561,19 @@ class CandidateSearch:
         """
         if not channel_ranks:
             return 1.0
-        contributing_weights = [
-            self._channel_weight(
+        contributing_weights = []
+        for channel, rank in channel_ranks.items():
+            if rank is None:
+                continue
+            channel_weight = self._channel_weight(
                 channel,
                 query_type=query_type,
                 exact_recall_mode=exact_recall_mode,
                 raw_context_access_mode=raw_context_access_mode,
             )
-            for channel, rank in channel_ranks.items()
-            if rank is not None
-        ]
+            if channel == "fts":
+                channel_weight *= fts_match_weight
+            contributing_weights.append(channel_weight)
         if not contributing_weights:
             return 1.0
         return max(contributing_weights)
@@ -4475,17 +4583,53 @@ class CandidateSearch:
         candidates: Any,
         plan: RetrievalPlan,
     ) -> list[dict[str, Any]]:
+        # Freshness guards first: a stale ephemeral or, in callback-bias
+        # plans, the callback-originated candidate keeps its designed lead.
+        # Both keys are constant in default plans, so rrf_score is the
+        # effective primary key: lexical/semantic strength decides the pool
+        # and the truncation cut, and the level/scope buckets only break
+        # ties inside equal-score groups.
         return sorted(
             candidates,
             key=lambda candidate: (
                 self._temporal_priority(candidate, plan),
                 self._callback_priority(candidate, plan),
+                -float(candidate.get("rrf_score", 0.0)),
+                -float(candidate.get("rrf_subquery_coverage", 0.0)),
                 self._retrieval_level_priority(candidate, plan),
                 self._scope_priority(candidate["scope"], plan.scope_filter),
-                -float(candidate.get("rrf_score", 0.0)),
                 -self._updated_at_sort_key(candidate["updated_at"]),
                 str(candidate["id"]),
             ),
+        )
+
+    async def order_candidates_with_guards(
+        self,
+        candidates: Any,
+        plan: RetrievalPlan,
+        *,
+        user_id: str,
+    ) -> list[dict[str, Any]]:
+        """Reapply search guards after cross-lane fusion.
+
+        Coverage candidates enter after ``search`` and therefore have no
+        callback-origin flag yet. Populate it before sorting so callback bias
+        remains a real guard instead of demoting every late coverage row.
+        """
+        prepared = list(candidates)
+        if plan.callback_bias and prepared:
+            await self._populate_callback_source_flags(prepared, user_id=user_id)
+        return self._sort_candidates(prepared, plan)
+
+    def candidate_guard_priority(
+        self,
+        candidate: dict[str, Any],
+        plan: RetrievalPlan,
+    ) -> tuple[int, int]:
+        """Return the guard bucket that must survive downstream diversity."""
+        return (
+            self._temporal_priority(candidate, plan),
+            self._callback_priority(candidate, plan),
         )
 
     @classmethod
@@ -4554,10 +4698,20 @@ class CandidateSearch:
             f"""
             SELECT
                 mo.id AS memory_id,
-                MAX(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) AS assistant_source_match
+                MAX(
+                    CASE
+                        WHEN source_conversation.id IS NOT NULL
+                         AND m.role = 'assistant'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS assistant_source_match
             FROM memory_objects AS mo
             LEFT JOIN json_each(mo.payload_json, '$.source_message_ids') AS source_ids ON 1 = 1
             LEFT JOIN messages AS m ON m.id = source_ids.value
+            LEFT JOIN conversations AS source_conversation
+              ON source_conversation.id = m.conversation_id
+             AND source_conversation.user_id = mo.user_id
             WHERE mo.user_id = ?
               AND mo.id IN ({placeholders})
             GROUP BY mo.id

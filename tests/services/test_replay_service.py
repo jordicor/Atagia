@@ -31,7 +31,9 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.replay_service import ReplayService
+from tests.turn_telemetry_support import sample_turn_telemetry
 from atagia.services.retrieval_pipeline import RetrievalPipeline
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -71,7 +73,8 @@ class ReplayProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -216,7 +219,8 @@ async def _build_runtime():
                 ]
             },
             "created_at": "2026-04-05T15:00:00+00:00",
-        }
+        },
+        telemetry=sample_turn_telemetry(),
     )
     await events.create_event(
         {
@@ -243,7 +247,8 @@ async def _build_runtime():
                 ]
             },
             "created_at": "2026-04-05T15:10:00+00:00",
-        }
+        },
+        telemetry=sample_turn_telemetry(),
     )
     provider = ReplayProvider({"mem_1": 0.3, "mem_2": 0.95})
     pipeline = RetrievalPipeline(
@@ -252,6 +257,7 @@ async def _build_runtime():
         embedding_index=NoneBackend(),
         clock=clock,
         settings=_settings(),
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
     )
     replay_service = ReplayService(
         connection=connection,

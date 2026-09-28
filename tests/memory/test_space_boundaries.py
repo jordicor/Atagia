@@ -24,6 +24,7 @@ from atagia.models.schemas_memory import (
     SpaceBoundaryMode,
     VerbatimPinTargetKind,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
@@ -98,7 +99,11 @@ async def test_candidate_search_applies_space_boundary_modes() -> None:
             memory_id="mem_global",
         )
 
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         outside_ids = {
             row["id"]
@@ -196,7 +201,11 @@ async def test_candidate_search_applies_space_boundaries_to_verbatim_pins() -> N
                 space_boundary_mode=mode,
             )
 
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
         verbatim_plan = _plan(
             active_space_id=None,
             active_space_boundary_mode=None,

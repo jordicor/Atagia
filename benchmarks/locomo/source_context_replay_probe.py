@@ -48,7 +48,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DATA_PATH = _PROJECT_ROOT / "benchmarks" / "data" / "locomo10.json"
 _DEFAULT_OUTPUT_DIR = bench_output_root() / "locomo"
 _DEFAULT_ANSWER_MODEL = "openrouter/openai/gpt-chat-latest"
-_DEFAULT_JUDGE_MODEL = "kimi/kimi-k2.7-code"
+_DEFAULT_JUDGE_MODEL = "openrouter/openai/gpt-5.6-luna,medium"
 _DEFAULT_VARIANTS = (
     "selected_current",
     "selected_plus_source_non_summary",

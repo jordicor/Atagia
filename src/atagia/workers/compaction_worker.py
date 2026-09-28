@@ -232,13 +232,14 @@ class CompactionWorker:
                 conversation_id=job_payload.conversation_id,
                 force=job_payload.force_rebuild,
             )
-            await self._enqueue_initial_context_package_refresh(
-                user_id=job_payload.user_id,
-                conversation_id=job_payload.conversation_id,
-                retrieval_profile_id=None,
-                parent=envelope,
-                privacy_enforcement=job_payload.privacy_enforcement,
-            )
+            if summary_ids:
+                await self._enqueue_initial_context_package_refresh(
+                    user_id=job_payload.user_id,
+                    conversation_id=job_payload.conversation_id,
+                    retrieval_profile_id=None,
+                    parent=envelope,
+                    privacy_enforcement=job_payload.privacy_enforcement,
+                )
             if not await self._broad_hierarchy_blocked(
                 job_payload
             ) and await self._conversation_allows_hierarchy(
@@ -264,13 +265,14 @@ class CompactionWorker:
                 character_id=character_id,
                 workspace_id=job_payload.workspace_id,
             )
-            await self._enqueue_initial_context_package_refresh(
-                user_id=job_payload.user_id,
-                conversation_id=None,
-                retrieval_profile_id=None,
-                parent=envelope,
-                privacy_enforcement=job_payload.privacy_enforcement,
-            )
+            if summary_id is not None:
+                await self._enqueue_initial_context_package_refresh(
+                    user_id=job_payload.user_id,
+                    conversation_id=None,
+                    retrieval_profile_id=None,
+                    parent=envelope,
+                    privacy_enforcement=job_payload.privacy_enforcement,
+                )
             return {"job_kind": job_payload.job_kind.value, "summary_id": summary_id}
         if job_payload.job_kind is CompactionJobKind.EPISODE:
             if await self._broad_hierarchy_blocked(job_payload):

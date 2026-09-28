@@ -235,7 +235,7 @@ cannot be persisted.
 | `GET` | `/v1/admin/metrics/latest` | Return the latest stored value for every metric, optionally filtered by user and assistant mode. |
 | `GET` | `/v1/admin/metrics/{metric_name}/history` | Return the time-bucketed history of a named metric. |
 | `POST` | `/v1/admin/metrics/compute` | Recompute a list of metrics for a given time bucket; `ccr` is queued as a worker job, the rest run inline. |
-| `GET` | `/v1/admin/metrics/retrieval-summary` | Return retrieval-event aggregate statistics between two time buckets for a user or globally. |
+| `GET` | `/v1/admin/metrics/retrieval-summary` | Return retrieval-event aggregate statistics between two time buckets for a user or globally, split per turn surface and optionally filtered to one via `turn_surface`. Latency comes back as three separate series, each with its own sample count: `avg_retrieval_stage_latency_ms` (the measured retrieval stage, over turns whose retrieval produced memory context), `avg_failed_retrieval_stage_latency_ms` (the same measured stage over turns whose retrieval failed open, kept apart so a failed attempt never describes what a working retrieval costs) and `avg_request_to_event_wall_ms` (the request-message-to-event wall gap, which also contains reply generation, available only for events written before the turn-telemetry migration). |
 
 ### Retrieval events and memory decisions
 

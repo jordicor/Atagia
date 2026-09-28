@@ -29,6 +29,7 @@ from atagia.memory.inspector import (
     _retrieval_plan_from_event,
 )
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
+from tests.turn_telemetry_support import sample_turn_telemetry
 from atagia.models.schemas_memory import (
     CrossRealmMode,
     EmbodimentBoundaryMode,
@@ -194,7 +195,8 @@ async def _build_runtime():
                 "items_dropped": 1,
             },
             "outcome_json": {"zero_candidates": False},
-        }
+        },
+        telemetry=sample_turn_telemetry(),
     )
     return connection, inspector, audits, event
 
@@ -449,6 +451,61 @@ async def test_inspect_memory_coordinates_returns_joined_coordinate_truth() -> N
         assert audit_rows[-2]["action"] == "inspect_memory_coordinates"
         assert audit_rows[-2]["metadata_json"]["found"] is True
         assert audit_rows[-1]["metadata_json"]["found"] is False
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_inspection_exposes_both_ingest_stamps_not_just_created_at() -> None:
+    """An operator must be able to see WHEN a memory became retrievable.
+
+    `created_at` is when the row appeared, which for a confirmation-gated memory
+    is not when it became queryable -- it sits in the FTS index but invisible to
+    retrieval until it turns active, if it ever does. Exposing `created_at`
+    alone left the inspector showing the one number that looks like a freshness
+    stamp and is not.
+    """
+    connection, inspector, _audits, _event = await _build_runtime()
+    try:
+        clock = _clock()
+        memories = MemoryObjectRepository(connection, clock)
+        born_active = await inspector.inspect_memory_coordinates(
+            "mem_evidence", "usr_1", admin_user_id="adm_1"
+        )
+        assert born_active is not None
+        memory = born_active["memory"]
+        # The keys exist at all -- a projection that silently omits them would
+        # make the column invisible however correctly it is written.
+        assert "queryable_at" in memory
+        assert "source_message_created_at" in memory
+        # Born active: it was queryable the instant it appeared.
+        assert memory["queryable_at"] == memory["created_at"]
+
+        gated = await inspector.inspect_memory_coordinates(
+            "mem_pending", "usr_1", admin_user_id="adm_1"
+        )
+        assert gated is not None
+        # Never confirmed: NULL is the true statement, and it is visible.
+        assert gated["memory"]["queryable_at"] is None
+        pending_created_at = gated["memory"]["created_at"]
+
+        # ...and once the user confirms it an hour later, the inspector shows an
+        # interval instead of the zero `created_at` alone implied.
+        clock.advance(seconds=3600)
+        await memories.update_memory_object_status(
+            memory_id="mem_pending",
+            user_id="usr_1",
+            status=MemoryStatus.ACTIVE,
+        )
+
+        confirmed = await inspector.inspect_memory_coordinates(
+            "mem_pending", "usr_1", admin_user_id="adm_1"
+        )
+        assert confirmed is not None
+        confirmed_memory = confirmed["memory"]
+        assert confirmed_memory["created_at"] == pending_created_at
+        assert confirmed_memory["queryable_at"] is not None
+        assert confirmed_memory["queryable_at"] > confirmed_memory["created_at"]
     finally:
         await connection.close()
 

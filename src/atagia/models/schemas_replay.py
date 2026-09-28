@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from atagia.models.schemas_memory import (
     AdaptiveGateStatus,
@@ -18,6 +20,74 @@ from atagia.models.schemas_memory import (
     RetrievalTrace,
     ScoredCandidate,
 )
+
+# Upper bound on the LLM coverage-expansion sub-query knob, and the pipeline's
+# default when the knob is not overridden. It lives beside the knob's validated
+# range rather than at the use site so the bound that rejects a requested value
+# and the bound the engine enforces are the same object.
+LLM_COVERAGE_MAX_SUBQUERIES: Final[int] = 3
+
+# Inclusive integer bounds for every override_retrieval_params key whose value
+# is a bounded number; ``None`` as the upper bound means unbounded above. Four
+# of them (fts_limit, vector_limit, rerank_top_k, final_context_items) mirror
+# RetrievalParams fields and repeat that model's own Field bounds, and
+# privacy_ceiling repeats RetrievalPlan's -- rejecting the value here is what
+# stops an override from building a model that violates its own constraints.
+# tests/models/test_override_retrieval_params_validation.py re-derives those
+# bounds from the models and fails on drift.
+_OVERRIDE_RETRIEVAL_PARAM_BOUNDS: dict[str, tuple[int, int | None]] = {
+    "fts_limit": (0, None),
+    "vector_limit": (0, None),
+    "rerank_top_k": (1, None),
+    "final_context_items": (1, None),
+    "max_candidates": (0, None),
+    "max_context_items": (1, None),
+    "privacy_ceiling": (0, 3),
+    "context_budget_tokens": (1, None),
+    "transcript_budget_tokens": (1, None),
+    "llm_coverage_candidate_limit": (1, None),
+    "llm_coverage_max_subqueries": (1, LLM_COVERAGE_MAX_SUBQUERIES),
+}
+
+# The one recognized override that is a flag rather than a bounded integer.
+_OVERRIDE_RETRIEVAL_PARAM_BOOL_KEYS: frozenset[str] = frozenset(
+    {"allow_private_sensitivity"}
+)
+
+# Single source of truth for the override_retrieval_params keys the retrieval
+# pipeline actually reads. Four of them mirror RetrievalParams fields (applied
+# in RetrievalPipeline._override_policy, which loops over
+# RetrievalParams.model_fields); the rest are consumed explicitly by the
+# pipeline (_build_plan, _override_policy, _cap_explicit_final_context_items,
+# _llm_coverage_candidate_limit, _llm_coverage_max_subqueries). Deriving the set
+# from the two domain tables above makes "key the engine reads" and "values the
+# engine can honor" the same declaration, so a key can never be accepted without
+# a validated domain. The boundary validator on AblationConfig, and the no-drift
+# test that re-derives the set from the pipeline consumption sites, both use it.
+RECOGNIZED_OVERRIDE_RETRIEVAL_PARAM_KEYS: frozenset[str] = (
+    frozenset(_OVERRIDE_RETRIEVAL_PARAM_BOUNDS) | _OVERRIDE_RETRIEVAL_PARAM_BOOL_KEYS
+)
+
+
+def _bounds_text(bounds: tuple[int, int | None]) -> str:
+    minimum, maximum = bounds
+    return f">= {minimum}" if maximum is None else f"{minimum}..{maximum}"
+
+
+def _override_value_rejection(key: str, value: Any) -> str | None:
+    """Describe why the engine cannot honor ``value`` for ``key``, else None."""
+    if key in _OVERRIDE_RETRIEVAL_PARAM_BOOL_KEYS:
+        if isinstance(value, bool):
+            return None
+        return f"{key}={value!r} (valid values: true, false)"
+    bounds = _OVERRIDE_RETRIEVAL_PARAM_BOUNDS[key]
+    # bool is an int subclass, so a flag would otherwise pass as 0 or 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"{key}={value!r} (valid values: integers {_bounds_text(bounds)})"
+    minimum, maximum = bounds
+    if value < minimum or (maximum is not None and value > maximum):
+        return f"{key}={value} (valid range: {_bounds_text(bounds)})"
+    return None
 
 
 class GroundingLevel(str, Enum):
@@ -47,7 +117,14 @@ class ConversationExportKind(str, Enum):
 class AblationConfig(BaseModel):
     """Optional switches that modify replay-time retrieval behavior."""
 
-    model_config = ConfigDict(extra="forbid")
+    # Frozen because this is THE validated boundary for retrieval overrides: a
+    # config whose fields could be reassigned after construction would let a
+    # caller install a value the validator below never saw, which is the defect
+    # this class exists to prevent. It also matches every neighboring schema
+    # (RetrievalParams, RetrievalProfileManifest, ResolvedRetrievalPolicy).
+    # model_copy(update=...) still works, which is how the trusted-evaluation
+    # merge and the benchmark presets derive variants.
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
     skip_need_detection: bool = False
@@ -67,9 +144,70 @@ class AblationConfig(BaseModel):
     enable_evidence_packets: bool = True
     enable_final_answer_evidence_pack: bool = False
     composer_strategy: Literal["score_first", "budgeted_marginal"] | None = None
-    override_retrieval_params: dict[str, Any] | None = None
+    # Read-only by construction. ``frozen=True`` stops the FIELD from being
+    # reassigned, but a plain dict behind it could still be mutated in place
+    # after validation -- and the retrieval trace copies this exact object into
+    # ``applied_override_retrieval_params``, so an injected key would have been
+    # recorded as applied while no consumer ever read it. Storing an immutable
+    # view of a private copy is what makes "applied == requested" structural
+    # instead of a comment asserting it. The field serializer below dumps it
+    # back as a plain dict, so every model_dump/model_dump_json round trip is
+    # unchanged.
+    override_retrieval_params: Mapping[str, Any] | None = None
     context_envelope_budget_tokens: int | None = Field(default=None, gt=0)
     context_envelope_ratios: dict[str, float] | None = None
+
+    @field_serializer("override_retrieval_params")
+    def _serialize_override_retrieval_params(
+        self, value: Mapping[str, Any] | None
+    ) -> dict[str, Any] | None:
+        return None if value is None else dict(value)
+
+    @field_validator("override_retrieval_params")
+    @classmethod
+    def _validate_override_retrieval_params(
+        cls, value: Mapping[str, Any] | None
+    ) -> Mapping[str, Any] | None:
+        """Reject keys the pipeline never reads and values it cannot honor.
+
+        Unknown or typo'd keys were silently ignored, so a run could vary a knob
+        the engine did not consume. Reject them at the earliest boundary and name
+        the offenders alongside the recognized set.
+
+        Values get the same treatment, and for the same reason: an unusable
+        value used to be silently clamped (a requested privacy_ceiling of 99 ran
+        as 3), which is the value-level version of the defect the key check
+        exists to stop. Rejecting instead of clamping makes the recorded
+        override structurally equal to the requested one -- there is no longer a
+        normalization step that could diverge from what the engine applies -- and
+        it matches ContextBudgetAboveEnvelopeError, which already raises on an
+        above-envelope context_budget_tokens rather than capping it.
+
+        The validated mapping is returned as an immutable view of a private
+        copy: the caller's dict cannot leak later writes into it, and nothing
+        downstream can add a key this validator never saw. An empty mapping is
+        wrapped too -- ``{}`` is exactly the case where a post-construction
+        insert would have been invisible.
+        """
+        if value is None:
+            return None
+        unknown = sorted(set(value) - RECOGNIZED_OVERRIDE_RETRIEVAL_PARAM_KEYS)
+        if unknown:
+            recognized = ", ".join(sorted(RECOGNIZED_OVERRIDE_RETRIEVAL_PARAM_KEYS))
+            raise ValueError(
+                "Unknown override_retrieval_params key(s): "
+                f"{', '.join(unknown)}. Recognized keys: {recognized}"
+            )
+        rejected = [
+            rejection
+            for key in sorted(value)
+            if (rejection := _override_value_rejection(key, value[key])) is not None
+        ]
+        if rejected:
+            raise ValueError(
+                "Unusable override_retrieval_params value(s): " + "; ".join(rejected)
+            )
+        return MappingProxyType(dict(value))
 
 
 class PipelineResult(BaseModel):

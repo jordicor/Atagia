@@ -33,6 +33,7 @@ from atagia.services.lifecycle_mirror_reconciler import (
     reconcile_active_lifecycle_mirror,
 )
 from tests.redis_real_support import RealRedisServer, running_redis_server
+from tests.recent_window_support import stored_recent_window
 
 
 MIGRATIONS_DIR = (
@@ -617,7 +618,7 @@ async def test_real_redis_lifecycle_mirror_reset_and_revocation_are_fail_closed(
             conversation_lifecycle_epoch="conversation_epoch_1",
             conversation_source_revision=1,
         )
-        assert await backend.get_recent_window(REAL_RECENT_KEY) == [
+        assert await stored_recent_window(backend, REAL_RECENT_KEY) == [
             {"role": "user", "text": "new conversation source"}
         ]
         assert await backend.set_context_view_if_newer_for_lifecycle(
@@ -646,7 +647,7 @@ async def test_real_redis_lifecycle_mirror_reset_and_revocation_are_fail_closed(
         )
         assert purged == 1
         assert real_redis_server.client.xlen(stream_name) == 0
-        assert await backend.get_recent_window(REAL_RECENT_KEY) is None
+        assert await stored_recent_window(backend, REAL_RECENT_KEY) is None
         assert await backend.get_context_view("ctx_1") is None
         assert (
             await backend.publish_job_notification(
@@ -868,7 +869,7 @@ async def test_real_redis_recent_window_takeover_survives_old_lifecycle_revoke(
             old_lifecycle_epoch,
             group_name="atagia-workers",
         )
-        assert await backend.get_recent_window(logical_key) == [
+        assert await stored_recent_window(backend, logical_key) == [
             {"role": "assistant", "text": "new owner"}
         ]
         assert json_utils.loads(real_redis_server.client.get(identity_key)) == (
@@ -907,7 +908,7 @@ async def test_real_redis_recent_window_takeover_survives_old_lifecycle_revoke(
             conversation_lifecycle_epoch="conversation_epoch_new",
             conversation_source_revision=2,
         )
-        assert await backend.get_recent_window(malformed_key) == [
+        assert await stored_recent_window(backend, malformed_key) == [
             {"role": "user", "text": "preserve on malformed identity"}
         ]
 
@@ -916,7 +917,7 @@ async def test_real_redis_recent_window_takeover_survives_old_lifecycle_revoke(
             new_lifecycle_epoch,
             group_name="atagia-workers",
         )
-        assert await backend.get_recent_window(logical_key) is None
+        assert await stored_recent_window(backend, logical_key) is None
         assert not real_redis_server.client.exists(user_index_key)
     finally:
         await backend.close()
@@ -972,7 +973,7 @@ async def test_recent_window_identity_validation_has_inprocess_redis_parity(
                     [{"role": "user", "text": "invalid write"}],
                     **invalid_identity,
                 )
-                assert await backend.get_recent_window(logical_key) is None
+                assert await stored_recent_window(backend, logical_key) is None
 
                 expected_window = [{"role": "assistant", "text": "valid owner remains"}]
                 assert await backend.set_recent_window_for_lifecycle(
@@ -984,7 +985,31 @@ async def test_recent_window_identity_validation_has_inprocess_redis_parity(
                     logical_key,
                     **invalid_identity,
                 )
-                assert await backend.get_recent_window(logical_key) == expected_window
+                assert await stored_recent_window(backend, logical_key) == expected_window
+                # The read is fenced on the same coordinates as the write and
+                # the conditional delete, on both backends: an identity that
+                # cannot publish cannot read either.
+                assert (
+                    await backend.get_recent_window_for_cache_identity(
+                        logical_key,
+                        **invalid_identity,
+                    )
+                    is None
+                )
+                assert (
+                    await backend.get_recent_window_for_cache_identity(
+                        logical_key,
+                        **{**valid_identity, "cache_revision": 3},
+                    )
+                    is None
+                )
+                assert (
+                    await backend.get_recent_window_for_cache_identity(
+                        logical_key,
+                        **valid_identity,
+                    )
+                    == expected_window
+                )
     finally:
         await redis_backend.close()
         await inprocess_backend.close()
@@ -1071,11 +1096,11 @@ async def test_recent_window_colon_ids_have_exact_backend_parity(
                 conversation_id=f"{backend_name}:thread",
                 **first_identity,
             )
-            assert await backend.get_recent_window(first_key) == [{"text": "first"}]
+            assert await stored_recent_window(backend, first_key) == [{"text": "first"}]
 
             assert await backend.delete_recent_windows_for_user("account") == 1
-            assert await backend.get_recent_window(second_key) is None
-            assert await backend.get_recent_window(first_key) == [{"text": "first"}]
+            assert await stored_recent_window(backend, second_key) is None
+            assert await stored_recent_window(backend, first_key) == [{"text": "first"}]
             assert (
                 await backend.delete_recent_window_for_conversation(
                     first_owner["user_id"],
@@ -1083,7 +1108,7 @@ async def test_recent_window_colon_ids_have_exact_backend_parity(
                 )
                 == 1
             )
-            assert await backend.get_recent_window(first_key) is None
+            assert await stored_recent_window(backend, first_key) is None
     finally:
         await redis_backend.close()
         await inprocess_backend.close()
@@ -1738,10 +1763,10 @@ async def test_real_redis_legacy_transient_purge_is_exact_and_idempotent(
         assert client.exists(f"cachegen:cccccccccccc:{other_user}")
         assert not client.exists(f"cachegen:not-hex-value:{target_user}")
         assert all(not client.exists(key) for key in legacy_recent_keys)
-        assert await backend.get_recent_window(current_recent_key) == [
+        assert await stored_recent_window(backend, current_recent_key) == [
             {"role": "user", "text": "current"}
         ]
-        assert await backend.get_recent_window(stale_recent_key) is None
+        assert await stored_recent_window(backend, stale_recent_key) is None
         assert not client.exists(f"recent_window_cache_identity:{missing_recent_key}")
         assert not client.sismember(
             "lifecycle_recent_entries:cleanup_missing_recent",

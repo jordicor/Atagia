@@ -16,6 +16,11 @@ from atagia.core.config import Settings
 from atagia.core.mind_repository import MindRepository
 from atagia.core.repositories import UserRepository
 from atagia.models.schemas_memory import MindKind
+from atagia.services.errors import (
+    TranscriptRebuildInProgressError,
+    TranscriptRebuildRemediationRequiredError,
+)
+from atagia.models.schemas_openai_proxy import OpenAIChatCompletionRequest
 from atagia.services.llm_client import (
     LLMError,
     LLMClient,
@@ -27,6 +32,7 @@ from atagia.services.llm_client import (
     LLMStreamEvent,
     TransientLLMError,
 )
+from atagia.services.llm_run_guard import LLMRunGuard, LLMRunGuardConfig
 from atagia.services.openai_proxy_service import OpenAIProxyService
 
 MIGRATIONS_DIR = (
@@ -60,7 +66,8 @@ class ProxyProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -220,6 +227,41 @@ async def _ensure_capture_namespace(service, identity):
         await connection.close()
 
 
+async def _precreate_proxy_conversations(
+    client: httpx.AsyncClient,
+    *,
+    user_id: str,
+    conversation_ids: tuple[str, ...],
+) -> None:
+    """Create each conversation with its own sequential first turn.
+
+    Creating a conversation is a user-scoped source mutation: it bumps the
+    user's ``derivation_revision``, which invalidates the source snapshot every
+    other in-flight turn for that user captured. Concurrent FIRST turns in two
+    brand-new conversations therefore race, and the loser is refused with the
+    documented retry -- see
+    ``test_concurrent_first_turns_in_new_conversations_use_the_retry_contract``,
+    which is where that behavior belongs. A test about something else must not
+    inherit the race, so it creates the conversations through the same proxy
+    endpoint first, one at a time.
+    """
+    for conversation_id in conversation_ids:
+        response = await client.post(
+            "/v1/chat/completions",
+            headers={
+                "Authorization": "Bearer service-key",
+                "X-Atagia-User-Id": user_id,
+                "X-Atagia-Platform-Id": "proxy_desktop",
+                "X-Atagia-Conversation-Id": conversation_id,
+            },
+            json={
+                "model": "atagia-memory-proxy",
+                "messages": [{"role": "user", "content": "Open the conversation."}],
+            },
+        )
+        assert response.status_code == 200, (conversation_id, response.text)
+
+
 @pytest.mark.asyncio
 async def test_openai_proxy_models_and_non_streaming_completion(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
@@ -276,7 +318,8 @@ async def test_openai_proxy_models_and_non_streaming_completion(tmp_path: Path) 
     assert chat_requests[-1].metadata["character_id"] == "char_proxy"
     assert chat_requests[-1].metadata["mode"] == "general_qa"
     assert chat_requests[-1].metadata["incognito"] is False
-    assert "[ATAGIA MEMORY CONTEXT - INTERNAL]" in chat_requests[-1].messages[0].content
+    assert "[ATAGIA MEMORY CONTEXT" not in chat_requests[-1].messages[0].content
+    assert "You are the Atagia assistant" not in chat_requests[-1].messages[0].content
     assert chat_requests[-1].messages[-1].content == "Remember the proxy path."
 
 
@@ -1197,6 +1240,16 @@ async def test_concurrent_burst_streams_renew_by_time_not_per_event(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """800 streamed events across two live streams must renew on TIME, not per
+    event.
+
+    Both conversations are created before the burst: the subject here is
+    renewal cadence, and concurrent conversation CREATION is a separate,
+    separately-tested behavior that would otherwise decide this test's outcome
+    (it did -- the burst ran on only one stream most runs, which is exactly when
+    ``renew_calls == 0`` proves the least).
+    """
+
     class BurstProvider(ProxyProvider):
         async def stream(self, request: LLMCompletionRequest):
             self.requests.append(request)
@@ -1251,6 +1304,11 @@ async def test_concurrent_burst_streams_renew_by_time_not_per_event(
                     },
                 )
 
+            await _precreate_proxy_conversations(
+                client,
+                user_id="usr_proxy",
+                conversation_ids=("cnv_proxy_burst_a", "cnv_proxy_burst_b"),
+            )
             responses = await asyncio.gather(
                 run_stream("cnv_proxy_burst_a"),
                 run_stream("cnv_proxy_burst_b"),
@@ -1258,7 +1316,83 @@ async def test_concurrent_burst_streams_renew_by_time_not_per_event(
 
     assert all(response.status_code == 200 for response in responses)
     assert all("data: [DONE]" in response.text for response in responses)
+    # Counted across the setup turns too: no elapsed time, so no renewal is due
+    # anywhere in the test, and the 800 burst events cannot have triggered one.
     assert renew_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_turns_in_new_conversations_use_the_retry_contract(
+    tmp_path: Path,
+) -> None:
+    """A turn is either fully served or refused with the documented retry.
+
+    Creating a conversation bumps the user's ``derivation_revision``
+    (``SidecarService.ensure_conversation``), and every turn revalidates the
+    source snapshot it captured before returning. Two FIRST turns for one user
+    therefore race: whichever creates its conversation second invalidates the
+    other's snapshot, and that turn fails CLOSED rather than answering from
+    sources that moved underneath it.
+
+    The engine does not serialize turns across a user's conversations -- once
+    both exist, concurrent streams all succeed, which
+    ``test_concurrent_burst_streams_renew_by_time_not_per_event`` exercises. So
+    this covers exactly the creation window, and what must hold is the SHAPE of
+    the outcome: a served turn streams to completion, and a refused one is a 409
+    carrying ``Retry-After`` and the documented code -- never a 500 the client
+    cannot act on.
+
+    Whether a refusal happens is timing-dependent (measured 6 refusals in 20
+    runs), so the refusal branch is not guaranteed to execute on every run. The
+    invariant asserted here holds either way, and
+    ``test_openai_proxy_rebuild_context_error_keeps_its_own_contract`` pins the
+    409/503 payload deterministically. What only this test can catch is the
+    outcome of a REAL race: any third outcome -- a 500, a hang, or two refusals
+    with nothing served -- fails it.
+    """
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(provider.name, [provider])
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+
+            async def first_turn(conversation_id: str) -> httpx.Response:
+                return await client.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer service-key",
+                        "X-Atagia-User-Id": "usr_proxy",
+                        "X-Atagia-Platform-Id": "proxy_desktop",
+                        "X-Atagia-Conversation-Id": conversation_id,
+                    },
+                    json={
+                        "model": "atagia-memory-proxy",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "First turn."}],
+                    },
+                )
+
+            responses = await asyncio.gather(
+                first_turn("cnv_proxy_first_a"),
+                first_turn("cnv_proxy_first_b"),
+            )
+
+    served = [response for response in responses if response.status_code == 200]
+    assert served, [
+        (response.status_code, response.text[:200]) for response in responses
+    ]
+    assert all("data: [DONE]" in response.text for response in served)
+    for response in responses:
+        if response.status_code == 200:
+            continue
+        assert response.status_code == 409, response.text
+        assert response.headers["Retry-After"] == "1"
+        error = response.json()["error"]
+        assert error["type"] == "conflict_error"
+        assert error["code"] == "selected_transcript_rebuild_in_progress"
 
 
 @pytest.mark.asyncio
@@ -1645,6 +1779,488 @@ async def test_streaming_openai_proxy_emits_sse_error_after_partial_failure(
     assert "data: [DONE]" not in text
 
 
+# ---------------------------------------------------------------------------
+# A client that goes away must not leave the round-trip it paid for suspended.
+#
+# Starlette never closes a response body it abandons; `_ClosingStreamingResponse`
+# does, and that close is the ONLY teardown the proxy gets. These two tests take
+# the two moments a disconnect can land before the SSE loop begins: before the
+# body generator has started at all, and while it is parked on the synthetic
+# assistant-role chunk it emits first. Both used to leave the provider stream
+# suspended until the event loop's async-generator finalizer collected it, in a
+# task outside the request and after the turn's accounting had closed.
+# ---------------------------------------------------------------------------
+
+
+class _TeardownTrackingProvider(ProxyProvider):
+    """Records the moment the provider round-trip is really torn down."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+
+    async def stream(self, request: LLMCompletionRequest):
+        try:
+            async for event in super().stream(request):
+                yield event
+        finally:
+            self.events.append("provider_stream_closed")
+
+
+class _TeardownTrackingProxyService(OpenAIProxyService):
+    """Records claim resolution, so its order against the close is observable."""
+
+    def __init__(self, runtime: Any, events: list[str]) -> None:
+        super().__init__(runtime)
+        self.events = events
+
+    async def _mark_ambiguous_best_effort(
+        self,
+        claim: Any,
+        exc: BaseException,
+    ) -> None:
+        await super()._mark_ambiguous_best_effort(claim, exc)
+        self.events.append("claim_marked_ambiguous")
+
+
+async def _abandon_proxy_stream(
+    app: Any,
+    *,
+    events: list[str],
+    conversation_id: str,
+    chunks_before_disconnect: int,
+) -> None:
+    """Start a streamed proxy turn and drop it the way a disconnect does."""
+    service = _TeardownTrackingProxyService(app.state.runtime, events)
+    body = await service.stream(
+        OpenAIChatCompletionRequest.model_validate(
+            {
+                "model": "atagia-memory-proxy",
+                "stream": True,
+                "messages": [{"role": "user", "content": "Stream with memory."}],
+            }
+        ),
+        claimed_user_id="usr_proxy",
+        conversation_id_header=conversation_id,
+        platform_id_header="proxy_desktop",
+    )
+    pulled = 0
+    try:
+        while pulled < chunks_before_disconnect:
+            await body.__anext__()
+            pulled += 1
+    finally:
+        # Exactly what `_ClosingStreamingResponse.__call__` does in its finally.
+        await body.aclose()
+
+
+async def _proxy_turn_states(app: Any, conversation_id: str) -> list[str]:
+    connection = await app.state.runtime.open_connection()
+    try:
+        cursor = await connection.execute(
+            "SELECT state FROM proxy_turn_runs WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        rows = await cursor.fetchall()
+    finally:
+        await connection.close()
+    return [str(row[0]) for row in rows]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunks_before_disconnect", [0, 1])
+async def test_an_abandoned_proxy_stream_closes_its_round_trip_inside_the_request(
+    tmp_path: Path,
+    chunks_before_disconnect: int,
+) -> None:
+    """Whether or not the body ever ran, the teardown happens in one pass here.
+
+    ``chunks_before_disconnect=0`` is the wider window: an async generator that
+    was never iterated runs no code when it is closed, so nothing inside it can
+    own anything. ``1`` is the narrow one: the body is parked on the role chunk,
+    which is the first byte written after ``http.response.start`` and therefore
+    exactly where a client that is already gone lands.
+    """
+    conversation_id = f"cnv_proxy_abandon_{chunks_before_disconnect}"
+    app = create_app(_settings(tmp_path))
+    events: list[str] = []
+    provider = _TeardownTrackingProvider(events)
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+            llm_run_guard=LLMRunGuard(LLMRunGuardConfig()),
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            await _precreate_proxy_conversations(
+                client,
+                user_id="usr_proxy",
+                conversation_ids=(conversation_id,),
+            )
+        # The turn that created the conversation is non-streaming, so the only
+        # provider stream in this test is the one abandoned below.
+        assert events == []
+
+        await _abandon_proxy_stream(
+            app,
+            events=events,
+            conversation_id=conversation_id,
+            chunks_before_disconnect=chunks_before_disconnect,
+        )
+
+        # The round-trip is closed FIRST and the claim resolved after, both
+        # before `aclose()` returns -- not deferred to a finalizer.
+        #
+        # The provider close appears EXACTLY ONCE either way. The claim
+        # resolution appears twice when the body had started, because the body
+        # resolves the claim on its way out and `_ProxyStreamBody.aclose` then
+        # runs the abandon path unconditionally -- it cannot tell a body that
+        # finished its teardown from one that was cancelled mid-teardown, so it
+        # always tries, and the second attempt is a fenced no-op. See
+        # `_ProxyStreamBody` for why that question has no answer from out there.
+        assert events == (
+            ["provider_stream_closed", "claim_marked_ambiguous"]
+            if chunks_before_disconnect == 0
+            else [
+                "provider_stream_closed",
+                "claim_marked_ambiguous",
+                "claim_marked_ambiguous",
+            ]
+        )
+        snapshot = app.state.runtime.llm_client.llm_run_guard_snapshot()
+        assert snapshot is not None
+        assert snapshot["cancelled_calls"] == 1
+        assert await _proxy_turn_states(app, conversation_id) == [
+            "completed",
+            "ambiguous_exposed",
+        ]
+
+
+class _CloseRaisingProvider(_TeardownTrackingProvider):
+    """A provider whose stream raises while the abandon path is closing it."""
+
+    async def stream(self, request: LLMCompletionRequest):
+        try:
+            async for event in ProxyProvider.stream(self, request):
+                yield event
+        finally:
+            self.events.append("provider_stream_closed")
+            raise RuntimeError("provider close exploded")
+
+
+@pytest.mark.asyncio
+async def test_a_provider_that_raises_on_close_does_not_escape_the_abandon_path(
+    tmp_path: Path,
+) -> None:
+    """A noisy provider teardown must not cost the turn its claim resolution.
+
+    ``chunks_before_disconnect=0`` is the shape where the abandon path itself
+    closes the provider round-trip, so a close that raises lands squarely between
+    the two steps. Unhandled, it propagated out of
+    ``_ClosingStreamingResponse.__call__``'s ``finally`` into the ASGI task error
+    log AND took the claim resolution queued behind it -- the claim being the
+    part that is durable and the log line the part that is not.
+    """
+    conversation_id = "cnv_proxy_close_raises"
+    app = create_app(_settings(tmp_path))
+    events: list[str] = []
+    provider = _CloseRaisingProvider(events)
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+            llm_run_guard=LLMRunGuard(LLMRunGuardConfig()),
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            await _precreate_proxy_conversations(
+                client,
+                user_id="usr_proxy",
+                conversation_ids=(conversation_id,),
+            )
+        assert events == []
+
+        # No `pytest.raises`: nothing may reach the caller of `aclose`.
+        await _abandon_proxy_stream(
+            app,
+            events=events,
+            conversation_id=conversation_id,
+            chunks_before_disconnect=0,
+        )
+
+        # The resolution runs AFTER the raising close, which is the point.
+        assert events == ["provider_stream_closed", "claim_marked_ambiguous"]
+        snapshot = app.state.runtime.llm_client.llm_run_guard_snapshot()
+        assert snapshot is not None
+        assert snapshot["cancelled_calls"] == 1
+        assert await _proxy_turn_states(app, conversation_id) == [
+            "completed",
+            "ambiguous_exposed",
+        ]
+
+
+class _GatedStreamProvider(ProxyProvider):
+    """A provider whose stream parks between events, so a disconnect can be aimed.
+
+    The park is what makes the two cancellation SHAPES reachable on demand. The
+    first event is consumed by the setup coroutine's preflight, so the body sees
+    it via the prepending wrapper; parking before the second one leaves the body
+    suspended inside ``__anext__`` awaiting the provider, which is where a real
+    streamed turn spends nearly all of its wall time.
+    """
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+        self.parked = asyncio.Event()
+        self.resume = asyncio.Event()
+
+    async def stream(self, request: LLMCompletionRequest):
+        self.requests.append(request)
+        try:
+            yield LLMStreamEvent(type="text", content="Proxy ")
+            self.parked.set()
+            await self.resume.wait()
+            yield LLMStreamEvent(type="text", content="stream.")
+            yield LLMStreamEvent(type="done", payload={})
+        finally:
+            self.events.append("provider_stream_closed")
+
+
+async def _disconnect_mid_stream(
+    app: Any,
+    *,
+    conversation_id: str,
+    provider: _GatedStreamProvider,
+    park_in_send_at: int | None,
+) -> int:
+    """Run a streamed turn over raw ASGI and cut it off with ``http.disconnect``.
+
+    Deliberately NOT ``body.aclose()``. A manual close is a cooperative teardown
+    of a suspended generator and exercises none of this: real cancellation is
+    delivered by Starlette, which -- for any scope advertising an ASGI
+    ``spec_version`` below 2.4, which is what uvicorn sends -- races
+    ``stream_response`` against ``listen_for_disconnect`` in a task group and
+    cancels the former when the latter returns. Where the response task happens
+    to be parked at that moment decides whether the body ends up SUSPENDED or
+    TERMINATED, and those two lead to opposite durable outcomes.
+
+    ``park_in_send_at`` holds the ASGI ``send`` on the given body message, which
+    parks the body at a ``yield``. Leaving it ``None`` lets the body run on until
+    it parks inside ``__anext__`` awaiting ``provider``. Returns the number of
+    body messages the response got out before the cut.
+    """
+    payload = json.dumps(
+        {
+            "model": "atagia-memory-proxy",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Stream with memory."}],
+        }
+    ).encode()
+    scope = {
+        "type": "http",
+        # Below 2.4 on purpose: this is the branch uvicorn drives, and the only
+        # one that cancels the response task on disconnect.
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "client": ("127.0.0.1", 54321),
+        "server": ("testserver", 80),
+        "headers": [
+            (b"host", b"testserver"),
+            (b"authorization", b"Bearer service-key"),
+            (b"x-atagia-user-id", b"usr_proxy"),
+            (b"x-atagia-platform-id", b"proxy_desktop"),
+            (b"x-atagia-conversation-id", conversation_id.encode()),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+        ],
+    }
+
+    disconnected = asyncio.Event()
+    parked_in_send = asyncio.Event()
+    request_delivered = False
+    body_messages = 0
+
+    async def receive() -> dict[str, Any]:
+        nonlocal request_delivered
+        if not request_delivered:
+            request_delivered = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        nonlocal body_messages
+        if message["type"] != "http.response.body":
+            return
+        body_messages += 1
+        if park_in_send_at is not None and body_messages == park_in_send_at:
+            parked_in_send.set()
+            # Never returns. The cancellation arrives here, which leaves the
+            # body suspended at the yield that produced this chunk.
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(app(scope, receive, send))
+    waiter = parked_in_send if park_in_send_at is not None else provider.parked
+    await asyncio.wait_for(waiter.wait(), timeout=10)
+    disconnected.set()
+    await asyncio.wait_for(task, timeout=10)
+    return body_messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "park_in_send_at", "expected_body_messages"),
+    [
+        ("cancel_at_yield", 1, 1),
+        ("cancel_inside_anext", None, 2),
+    ],
+)
+async def test_a_disconnected_proxy_stream_resolves_its_claim_in_both_cancel_shapes(
+    tmp_path: Path,
+    case: str,
+    park_in_send_at: int | None,
+    expected_body_messages: int,
+) -> None:
+    """Neither cancellation shape may leave the turn claiming to be emitting.
+
+    ``cancel_at_yield`` is the survivable one: the body is parked at a ``yield``
+    when the cancel lands, so it stays SUSPENDED and the route's later close can
+    revive it to run its own teardown.
+
+    ``cancel_inside_anext`` is the one that used to escape. The cancel lands
+    while the body's frame is running, which TERMINATES it -- and the teardown it
+    attempts on the way out runs inside the cancelled scope, where every await is
+    re-cancelled, so the provider close and the claim resolution are both entered
+    and interrupted. From the route's ``finally`` the wreckage is
+    indistinguishable from an exhausted generator, which is why the abandon path
+    can no longer be conditional on it. This is also the WIDE case: it needs
+    nothing but a disconnect during an inter-token gap.
+
+    Both must end ``ambiguous_exposed``: emission was marked started before the
+    body existed, so the turn cannot prove nothing reached the client. Leaving
+    the row at ``emission_started`` is permanent -- the 30s lease expires but
+    nothing reaps it -- and it makes a host using the same-message-ID
+    idempotency contract retry into ``request_in_progress`` instead of
+    ``stream_retry_requires_new_ids``.
+    """
+    conversation_id = f"cnv_proxy_disconnect_{case}"
+    app = create_app(_settings(tmp_path))
+    events: list[str] = []
+    provider = _GatedStreamProvider(events)
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+            llm_run_guard=LLMRunGuard(LLMRunGuardConfig()),
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            await _precreate_proxy_conversations(
+                client,
+                user_id="usr_proxy",
+                conversation_ids=(conversation_id,),
+            )
+        # The conversation-opening turn is non-streaming, so the only provider
+        # stream in this test is the one cut off below.
+        assert events == []
+
+        body_messages = await _disconnect_mid_stream(
+            app,
+            conversation_id=conversation_id,
+            provider=provider,
+            park_in_send_at=park_in_send_at,
+        )
+
+        assert body_messages == expected_body_messages
+        # Torn down inside the request, not left to a finalizer in another task.
+        assert events.count("provider_stream_closed") == 1
+        snapshot = app.state.runtime.llm_client.llm_run_guard_snapshot()
+        assert snapshot is not None
+        assert snapshot["cancelled_calls"] == 1
+        assert await _proxy_turn_states(app, conversation_id) == [
+            "completed",
+            "ambiguous_exposed",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_a_completed_proxy_stream_is_unaffected_by_the_abandon_path(
+    tmp_path: Path,
+) -> None:
+    """The unconditional abandon must be invisible on the success path.
+
+    It runs on every streamed turn, after the last byte, so it has to match
+    nothing here: the provider stream is exhausted and the claim reached
+    ``completed``, which the fenced ``emission_started`` update cannot touch.
+    """
+    conversation_id = "cnv_proxy_stream_completed"
+    app = create_app(_settings(tmp_path))
+    events: list[str] = []
+    provider = _TeardownTrackingProvider(events)
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+            llm_run_guard=LLMRunGuard(LLMRunGuardConfig()),
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            await _precreate_proxy_conversations(
+                client,
+                user_id="usr_proxy",
+                conversation_ids=(conversation_id,),
+            )
+            async with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": conversation_id,
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Stream with memory."}],
+                },
+            ) as response:
+                text = (await response.aread()).decode("utf-8")
+
+        assert response.status_code == 200
+        # Natural exhaustion, in order, before the terminal commit's [DONE].
+        assert 0 < text.index("Proxy ") < text.index("stream.")
+        assert text.rstrip().endswith("data: [DONE]")
+        assert events == ["provider_stream_closed"]
+        snapshot = app.state.runtime.llm_client.llm_run_guard_snapshot()
+        assert snapshot is not None
+        assert snapshot["cancelled_calls"] == 0
+        assert await _proxy_turn_states(app, conversation_id) == [
+            "completed",
+            "completed",
+        ]
+
+
 @pytest.mark.asyncio
 async def test_openai_proxy_terminal_persistence_failure_is_not_fail_open(
     tmp_path: Path,
@@ -1752,6 +2368,80 @@ async def test_openai_proxy_conversation_id_collision_returns_404(
     assert first.status_code == 200
     assert second.status_code == 404
     assert second.json()["error"]["message"] == "Conversation not found for user"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code"),
+    [
+        (
+            TranscriptRebuildInProgressError("Memory sources changed"),
+            409,
+            "selected_transcript_rebuild_in_progress",
+        ),
+        (
+            TranscriptRebuildRemediationRequiredError("Rebuild needs remediation"),
+            503,
+            "selected_transcript_remediation_required",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_openai_proxy_rebuild_context_error_keeps_its_own_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    """A fail-closed source error keeps its contract wherever it is raised.
+
+    Both errors already produce these responses when raised while preparing the
+    turn. Raised from ``get_context`` they used to fall through to the generic
+    branch and surface as a 500 ``memory_context_internal_error`` instead, so
+    the same condition reported a retryable conflict or a server fault depending
+    only on which stage noticed it.
+    """
+
+    async def fail_context(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        "atagia.services.openai_proxy_service.SidecarService.get_context",
+        fail_context,
+    )
+    app = create_app(_settings(tmp_path))
+    provider = ProxyProvider()
+    async with app.router.lifespan_context(app):
+        app.state.runtime.llm_client = LLMClient(
+            provider_name=provider.name,
+            providers=[provider],
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer service-key",
+                    "X-Atagia-User-Id": "usr_proxy",
+                    "X-Atagia-Platform-Id": "proxy_desktop",
+                    "X-Atagia-Conversation-Id": "cnv_proxy_rebuild_contract",
+                },
+                json={
+                    "model": "atagia-memory-proxy",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+
+    assert response.status_code == expected_status
+    assert response.json()["error"]["code"] == expected_code
+    # The turn is refused, not answered without memory.
+    assert not [
+        request
+        for request in provider.requests
+        if request.metadata.get("purpose") == "chat_reply"
+    ]
 
 
 @pytest.mark.asyncio

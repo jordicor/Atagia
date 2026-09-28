@@ -175,10 +175,16 @@ def test_actual_cost_uses_cached_price() -> None:
     ]
     config = RejudgeConfig(report_specs=[], protocol=JudgeProtocol.MEMORY_QUALITY)
     cost = _actual_cost(records, config)
-    # 100k non-cached @0.95 + 900k cached @0.19 + 100k output @4.00 (per 1M)
-    expected = 0.1 * 0.95 + 0.9 * 0.19 + 0.1 * 4.00
+    # 100k non-cached at the input rate + 900k at the cached rate + 100k output.
+    expected = (
+        0.1 * config.input_price
+        + 0.9 * config.cached_input_price
+        + 0.1 * config.output_price
+    )
     assert cost["cost_usd"] == round(expected, 4)
     assert cost["cached_input_tokens"] == 900_000
+    # The cached rate must actually be cheaper for the split to matter.
+    assert config.cached_input_price < config.input_price
 
 
 def test_resolve_report_paths_prefers_recovery(tmp_path: Path) -> None:

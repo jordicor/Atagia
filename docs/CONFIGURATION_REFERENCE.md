@@ -50,7 +50,8 @@ forced-global model. The defaults route ingest and compaction intelligence to
 `openrouter/google/gemini-3.1-flash-lite`, cheap ordinary-answer generation to
 `openrouter/deepseek/deepseek-v4-flash`, and privacy/consent/export-sensitive
 components to `anthropic/claude-sonnet-4-6`. For local experiments, point an
-OpenAI-compatible base URL at an Ollama route such as `openai/qwen3-coder:30b`.
+explicit local endpoint catalog at an OpenAI-compatible server and use a model
+spec such as `local/desktop/qwen3-coder:30b`.
 Use the stable `openrouter/google/gemini-3.1-flash-lite` slug, not the
 deprecated `-preview` endpoint, for retrieval overrides.
 
@@ -60,8 +61,8 @@ deprecated `-preview` endpoint, for retrieval overrides.
 
 | Variable | Default | Required | Description |
 |---|---|---|---|
-| `ATAGIA_SQLITE_PATH` | `./data/atagia.db` | Optional | Path to the SQLite database used as the single source of truth. |
-| `ATAGIA_DB_PATH` | `atagia.db` (MCP) | Optional | SQLite path used by the MCP server and the client SDK; falls back to `ATAGIA_SQLITE_PATH` in the client. |
+| `ATAGIA_SQLITE_PATH` | `./data/atagia.db` | Optional | Path to the SQLite database used as the single source of truth. Applies to library mode, service mode, the MCP server, and the client SDK alike. |
+| `ATAGIA_DB_PATH` | `ATAGIA_SQLITE_PATH` | Optional | SQLite path override for the MCP server and the client SDK. Unset, both fall through to `ATAGIA_SQLITE_PATH` and its default. |
 | `ATAGIA_STORAGE_BACKEND` | `inprocess` | Optional | Storage backend selector. `inprocess` keeps streams in memory; `redis` uses Redis Streams. |
 | `ATAGIA_REDIS_URL` | `redis://localhost:6379/0` | Optional | Redis connection URL when `ATAGIA_STORAGE_BACKEND=redis`. |
 | `ATAGIA_MIGRATIONS_PATH` | Packaged resources | Optional | Explicit custom directory containing numbered SQL migration files. |
@@ -130,6 +131,7 @@ more than one service or worker process participates.
 | `ATAGIA_KIMI_API_KEY` | _(unset)_ | Conditional | API key for direct Kimi/Moonshot API access. Required when any component or benchmark judge uses a `kimi/...` model such as `kimi/kimi-k2.7-code`. |
 | `ATAGIA_MINIMAX_API_KEY` | _(unset)_ | Conditional | API key or subscription key for direct MiniMax API access. Required when any component uses a `minimax/...` model such as `minimax/MiniMax-M3`. |
 | `ATAGIA_OPENROUTER_API_KEY` | _(unset)_ | Conditional | API key for OpenRouter. Required when any component uses an `openrouter/...` model. |
+| `ATAGIA_TYPESAFE_API_KEY` | _(unset)_ | Conditional | TypeSafe API key for native finite-choice decisions. Required when an eligible component uses `typesafe/jev-latest`. |
 | `ATAGIA_ANTHROPIC_BASE_URL` | _(unset)_ | Optional | Override Anthropic API base URL. |
 | `ATAGIA_OPENAI_BASE_URL` | _(unset)_ | Optional | Override OpenAI API base URL. |
 | `ATAGIA_OPENAI_EMBEDDING_BASE_URL` | _(unset)_ | Optional | Override only the OpenAI-compatible embeddings base URL. When unset, embeddings use `ATAGIA_OPENAI_BASE_URL`. |
@@ -139,12 +141,128 @@ more than one service or worker process participates.
 | `ATAGIA_OPENROUTER_SITE_URL` | `http://localhost` | Optional | `HTTP-Referer` header sent to OpenRouter for attribution. |
 | `ATAGIA_OPENROUTER_APP_NAME` | `Atagia` | Optional | `X-Title` header sent to OpenRouter for attribution. |
 
+### Inference access modes
+
+Atagia defaults to `unrestricted`. Two opt-in modes constrain every
+Atagia-owned completion, streaming, and embedding route before its transport
+is built or called:
+
+| Variable | Default | Required | Description |
+|---|---|---|---|
+| `ATAGIA_INFERENCE_ACCESS_MODE` | `unrestricted` | Optional | `unrestricted`, `local_only`, or `zero_cost`. |
+| `ATAGIA_LOCAL_LLM_ENDPOINTS_FILE` | _(unset)_ | Required for `local_only`; optional for `zero_cost` | Absolute path to an immutable version-one JSON catalog of local OpenAI-compatible endpoints and their served models. |
+| `ATAGIA_ZERO_COST_OPENROUTER_PROFILE` | _(unset)_ | Conditional | Must be `dedicated_free_tier_no_byok` before `zero_cost` can admit an external OpenRouter-free route. It is unnecessary for an all-local `zero_cost` configuration. |
+
+Local model specs have the form
+`local/<endpoint_id>/<served_model_id>[,thinking_level]`. The endpoint ID keeps
+two machines serving the same model unambiguous, while the served model ID may
+itself contain `/`. Credentials are named with `api_key_env` and read from that
+environment variable; never put a secret in the catalog.
+
+A single local endpoint catalog can be as small as:
+
+```json
+{
+  "version": 1,
+  "endpoints": [
+    {
+      "id": "desktop",
+      "adapter": "openai_compatible",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "chat_models": ["qwen3:8b", "qwen3-coder:30b"],
+      "embedding_models": ["qwen3-embedding:4b"]
+    }
+  ]
+}
+```
+
+Several LAN machines use the same schema. These addresses are examples; local
+catalog hosts must be literal loopback, RFC1918 IPv4, or IPv6 ULA addresses and
+must include a port:
+
+```json
+{
+  "version": 1,
+  "endpoints": [
+    {
+      "id": "generation_gpu",
+      "adapter": "openai_compatible",
+      "base_url": "http://10.0.0.20:8000/v1",
+      "api_key_env": "GENERATION_GPU_API_KEY",
+      "chat_models": ["acme/assistant-32b", "acme/assistant-70b"],
+      "embedding_models": []
+    },
+    {
+      "id": "embedding_node",
+      "adapter": "openai_compatible",
+      "base_url": "http://10.0.0.21:8080/v1",
+      "chat_models": [],
+      "embedding_models": ["acme/embed-4b"]
+    }
+  ]
+}
+```
+
+For an entirely local runtime, route every enabled surface to catalog-backed
+specs. Embeddings need their own local spec only when enabled:
+
+```env
+ATAGIA_INFERENCE_ACCESS_MODE=local_only
+ATAGIA_LOCAL_LLM_ENDPOINTS_FILE=/srv/atagia/local_llm_endpoints.json
+ATAGIA_LLM_FORCED_GLOBAL_MODEL=local/generation_gpu/acme/assistant-32b
+ATAGIA_EMBEDDING_BACKEND=sqlite_vec
+ATAGIA_EMBEDDING_MODEL=local/embedding_node/acme/embed-4b
+ATAGIA_EMBEDDING_DIMENSION=1536
+```
+
+`zero_cost` always admits the same catalog-backed local routes. With no
+OpenRouter profile it remains all-local. To add an external completion route,
+use only an exact OpenRouter `:free` variant or `openrouter/free`, an OpenRouter
+free-tier key, the official canonical origin, and the dedicated profile:
+
+```env
+ATAGIA_INFERENCE_ACCESS_MODE=zero_cost
+ATAGIA_LOCAL_LLM_ENDPOINTS_FILE=/srv/atagia/local_llm_endpoints.json
+ATAGIA_LLM_INGEST_MODEL=local/generation_gpu/acme/assistant-32b
+ATAGIA_LLM_RETRIEVAL_MODEL=local/generation_gpu/acme/assistant-32b
+ATAGIA_LLM_CHAT_MODEL=openrouter/openrouter/free
+ATAGIA_OPENROUTER_API_KEY=replace-with-a-dedicated-free-tier-key
+ATAGIA_ZERO_COST_OPENROUTER_PROFILE=dedicated_free_tier_no_byok
+```
+
+Startup checks OpenRouter's `GET /api/v1/key` result for
+`data.is_free_tier=true`; custom OpenRouter base URLs fail closed. Admitted
+requests receive policy-owned zero maximum prices and disabled provider
+fallback. The named profile is also an operator declaration that the dedicated
+OpenRouter account or workspace has no BYOK providers: Atagia cannot inspect
+that account invariant atomically. External embeddings and all other external
+providers remain denied.
+
+When OPF privacy filtering is enabled in either restricted mode, its primary
+and fallback URLs must both be literal local URLs. Version one has no external
+zero-cost OPF route.
+
+Atagia-bench and LoCoMo accept the same
+`--inference-access-mode`, `--local-llm-endpoints-file`, and
+`--zero-cost-openrouter-profile` options. Their default judge is not an
+admissible restricted route, so select an admitted judge explicitly, for
+example `--judge-model local/generation_gpu/acme/assistant-32b`. Judge and
+engine routes are audited together before provider construction.
+
+These modes govern provider HTTP performed by the Atagia runtime and its
+associated provider charges. They do not govern a host application's own
+answer-model call, an HTTP client's remote Atagia sidecar, local electricity or
+hardware costs, or competitor systems called outside Atagia. Use network
+firewall or process-level egress controls when the whole machine must be unable
+to reach external services.
+
 ## 4. LLM model selection
 
 Model specs are provider-qualified: `provider/model[,thinking_level]`, e.g.
 `anthropic/claude-sonnet-4-6`, `kimi/kimi-k2.7-code`,
 `minimax/MiniMax-M3`, or `openrouter/minimax/minimax-m3`.
-Resolution order per component: forced-global -> component override ->
+Resolution order per component: forced-global -> component override -> enabled
+finite-decision route (supported components only) -> inherited component ->
 category override -> built-in default.
 
 | Variable | Default | Required | Description |
@@ -153,13 +271,16 @@ category override -> built-in default.
 | `ATAGIA_LLM_INGEST_MODEL` | _(unset)_ | Optional | Category override for all ingest-side components. |
 | `ATAGIA_LLM_RETRIEVAL_MODEL` | _(unset)_ | Optional | Category override for all retrieval-side components. |
 | `ATAGIA_LLM_CHAT_MODEL` | _(unset)_ | Optional | Category override for the chat component. |
+| `ATAGIA_LLM_FINITE_DECISIONS_ENABLED` | `false` | Optional | Explicitly opt supported finite-choice components into the common decision route. When enabled without an ordinary decision model, the route is `typesafe/jev-latest`. |
+| `ATAGIA_LLM_FINITE_DECISION_MODEL` | _(unset)_ | Optional | Ordinary provider-qualified LLM used by all supported finite-choice components when the opt-in switch is enabled. TypeSafe specs are rejected here; leave it unset for Jev. |
 | `ATAGIA_LLM_MODEL__<COMPONENT_ID>` | _(unset)_ | Optional | Per-component override. `<COMPONENT_ID>` is one of the IDs listed below, uppercased. |
 
 ### Component IDs (for `ATAGIA_LLM_MODEL__<COMPONENT_ID>`)
 
-Ingest: `EXTRACTOR`, `TEXT_CHUNKER`, `COMPACTOR`, `SUMMARY_PRIVACY_JUDGE`,
+Ingest: `EXTRACTOR`, `DATE_RESOLUTION`, `TEXT_CHUNKER`, `COMPACTOR`, `SUMMARY_PRIVACY_JUDGE`,
 `SUMMARY_PRIVACY_REFINER`, `BELIEF_REVISER`, `CONTRACT_PROJECTION`,
 `GRAPH_PROJECTION`, `CONSEQUENCE_BUILDER`, `CONSEQUENCE_DETECTOR`,
+`CONSEQUENCE_GATE`, `CONSEQUENCE_SENTIMENT`, `CONSEQUENCE_LINK`,
 `TOPIC_WORKING_SET`, `CONSENT_CONFIRMATION`, `INTENT_CLASSIFIER`,
 `EXTRACTION_WATCHDOG`, `INITIAL_CONTEXT_PACKAGE_CURATION`, `EXPORT_ANONYMIZER`.
 
@@ -167,10 +288,223 @@ Retrieval: `NEED_DETECTOR_NEEDS`, `NEED_DETECTOR_LANGUAGE`,
 `NEED_DETECTOR_MEMORY`, `NEED_DETECTOR_EXACT`, `NEED_DETECTOR_SHAPE`,
 `NEED_DETECTOR_FACETS`, `NEED_DETECTOR_CALLBACK`,
 `NEED_DETECTOR_SEARCH_WORDS`, `NEED_DETECTOR_SEARCH_WORDS_OTHER_LANGUAGE`,
-`COVERAGE_EXPANDER`, `APPLICABILITY_SCORER`, `CONTEXT_STALENESS`,
+`COVERAGE_EXPANDER`, `APPLICABILITY_SCORER`, `APPLICABILITY_RELEVANCE`, `CONTEXT_STALENESS`,
 `METRICS_COMPUTER`.
 
 Chat: `ANSWER_POSTCONDITION`, `CHAT`.
+
+### Calendar date resolution
+
+`DATE_RESOLUTION` defaults to `openrouter/openai/gpt-6-luna,low`. Override it with
+`ATAGIA_LLM_MODEL__DATE_RESOLUTION`; the usual forced-global, component, category,
+intimacy, and inference-access rules still apply. This setting does not change
+reasoning for other extraction or retrieval calls. OpenRouter date requests
+explicitly disable provider fallback. The ordinary completion-token floor stays
+in force: the card asks for 1024 tokens and the client currently sends 8192.
+
+The date card extracts one operation from text and the source message's calendar
+date. Python applies calendar months and years, clamps the end of the month,
+estimates a remaining fractional month at 30 days, and rounds fractional days
+to the nearest day with ties away from zero. `ref` always refers to the source
+message date. Temporal classification remains a separate finite decision.
+
+The memory payload stores a versioned `date_resolution`, the source reference,
+and a text hash. Completed `exact`, `uncertain`, and `unknown` results are reused
+on retrieval. Uncertainty describes the wording, not a numeric confidence or a
+prediction that an event will occur. `analyze` is `pending_analysis`; missing
+annotations are unprocessed and mismatched text/anchors are stale. Retrieval
+never turns those states into completed unknowns or makes another date call.
+
+Intervals retain separate boundary, clock, UTC-offset, and calendar-period
+interpretation. Each normalized endpoint is attributed through an exact
+`source_quote` from an original message; timing wording may inherit explicitly
+written shared calendar fields. Rewritten candidates and prior-chunk summaries
+are not literal source evidence. Quotes may match the original text or its exact
+HTML-escaped prompt representation; a unique match is stored as the original
+substring. Literal entity text is preserved, and decoding is never repeated.
+Ambiguous source attribution remains pending, including when raw and escaped
+representations identify different sources or original substrings.
+For an explicitly written whole month or year, typed `calendar_period` fields
+let Python construct the first and last instants without inventing a point date.
+Relative timing still uses the independent date resolver and source message date.
+
+Python builds timestamps only when a supported bound and offset are available.
+Approximate representative dates do not become exact expiration timestamps.
+Context evidence prefers the actual validity interval, retaining open bounds,
+offsets and uncertainty. A range's last day is not the date of the whole state;
+the separate point annotation remains available for audit. Stale or inconsistent
+interval metadata does not silently fall back to that point.
+
+There is no automatic real-data backfill. Existing memories, stale annotations,
+or pending analysis can be handled with the existing admin conversation rebuild
+(`POST /v1/admin/rebuild/conversation/{conversation_id}`) under normal admin
+and user partition controls. It clears managed derived state and replays stored
+messages through ingestion, so first back up and select a bounded conversation.
+Re-inserting a duplicate message is not a date backfill. If the source remains
+incomplete, a rebuild may leave analysis pending again; it does not invent a
+missing anchor or retry indefinitely.
+
+### TypeSafe finite-choice decisions (opt-in)
+
+```dotenv
+ATAGIA_TYPESAFE_API_KEY=your-typesafe-key
+ATAGIA_LLM_FINITE_DECISIONS_ENABLED=true
+```
+
+To use the same finite-decision components without TypeSafe access, select any
+ordinary provider-qualified model instead:
+
+```dotenv
+ATAGIA_LLM_FINITE_DECISIONS_ENABLED=true
+ATAGIA_LLM_FINITE_DECISION_MODEL=local/desktop/decision-model
+```
+
+The switch is authoritative. When it is false, a TypeSafe per-component
+override fails configuration validation instead of remaining silently active.
+Setting `ATAGIA_LLM_FINITE_DECISION_MODEL` while the switch is false also fails.
+The shared decision-model setting accepts ordinary LLMs only; leave it unset to
+select Jev. Forced-global and explicit component overrides retain their higher
+precedence. The finite-decision route outranks category models, while unrelated
+components continue to use their category or built-in models. A supported
+component can therefore opt out of the shared route with its own ordinary model
+override, or explicitly select Jev while the switch is enabled.
+
+The narrow extraction decisions have independent component overrides.
+`EXTRACTION_TEMPORAL_TYPE` uses the common finite-decision route when enabled;
+the other extraction subcards below inherit `EXTRACTOR` unless overridden.
+Candidate generation, belief keys and values, member names, and interval-shape
+extraction use the extractor model, whose built-in default is GPT-6-Luna.
+Calendar date operations use the separate `DATE_RESOLUTION` component. Claim-key
+equivalence retains the existing `INTENT_CLASSIFIER` finite-decision route.
+
+| Component suffix | Decision | Remaining generative work |
+|---|---|---|
+| `EXTRACTION_KIND` | One memory kind | Candidate text |
+| `EXTRACTION_SCOPE` | One allowed scope; a single allowed scope needs no call | None |
+| `EXTRACTION_CONFIDENCE` | Source-support score in [0,1] | None |
+| `EXTRACTION_EVIDENCE_SUPPORT` | Direct, contextual, inferred, weak, or absent support | None |
+| `EXTRACTION_PRESERVE_VERBATIM` | Whether exact wording must be retained | Candidate language list |
+| `EXTRACTION_TEMPORAL_TYPE` | Permanent, bounded, event-triggered, ephemeral, unknown, or absent | Intervals when required |
+| `EXTRACTION_MEMBER_IDENTITY` | One canonical identity per member; native choices use the extracted-name catalog | Member list; LLM identity generation; native identities absent from the catalog |
+
+`EXTRACTION_CONFIDENCE` asks an ordinary LLM for one continuous source-support
+number using the existing simple extraction prompt. Jev receives a five-anchor
+rubric and returns a weighted Score on [0,4], divided by four. TypeSafe's
+certainty about its answer is separate from this memory confidence. Existing
+memory activation thresholds do not change.
+
+`EXTRACTION_MEMBER_IDENTITY` keeps one simple canonical-name generation request
+per member on LLM routes. Native TypeSafe choices compare each member against
+the names already extracted for that candidate. A valid `not_listed` choice
+requests a canonical name from the extractor model; it does not substitute a
+model after an error. The full source context remains available to both routes.
+
+`EXTRACTION_EVIDENCE` selects original source references and defaults to
+`openrouter/openai/gpt-6-luna`, independently of an `EXTRACTOR` override.
+Forced-global, explicit component and ingest-category settings retain their
+normal precedence. GPT-6-Luna defaults to reasoning effort `none`; an explicit
+thinking suffix can select another supported effort. Support, literal
+preservation and the candidate language list remain separate cards.
+
+An explicit `typesafe/jev-latest` override with finite decisions enabled selects
+source boundaries through native choices. The selector reuses the support
+assessment and candidate text; it does not extract or classify them again. Both
+routes receive the source and relevant conversation context. Code copies the
+quotation from source coordinates after validating the catalog and source hash;
+the model does not reproduce quote text or count characters. Long sources use
+block and anchor stages. Native transport splits ready questions when necessary,
+but does not truncate source context; an input beyond its safe context limit
+fails before dispatch. All effective requests count toward cost and concurrency.
+Invalid decisions fail explicitly without silent model fallback.
+
+Query and answer language decisions can be overridden independently through
+`NEED_DETECTOR_QUERY_LANGUAGE` and `NEED_DETECTOR_ANSWER_LANGUAGE`. They inherit
+`NEED_DETECTOR_LANGUAGE` otherwise. Answer language still receives the query
+language result and the existing profile/preference context.
+
+`ATAGIA_TOPIC_WORKING_SET_UPDATE_MODE=direct|selective` controls existing-topic
+content updates and defaults to `selective`. Selective mode offers one independent
+keep/clear/regenerate decision per field; a required title cannot be cleared.
+Its component suffixes are `TOPIC_TITLE_DECISION`, `TOPIC_SUMMARY_DECISION`,
+`TOPIC_GOAL_DECISION`, `TOPIC_QUESTIONS_DECISION` and `TOPIC_DECISIONS_DECISION`.
+With finite decisions enabled they use the common decision route (Jev unless an
+ordinary decision model is selected). With the switch off they inherit
+`TOPIC_WORKING_SET`; explicit component overrides take precedence in both cases.
+New topics bypass these filters. `TOPIC_WORKING_SET` defaults to
+`openrouter/openai/gpt-6-luna`. A regenerated field uses that topic model with the
+full context. Keeping or clearing avoids that generation, but filtering a field that
+needs regeneration adds a decision. Choose this mode based on the complete
+workflow's cost, latency and quality, rather than its filter alone. Setting the
+update mode to `direct` explicitly skips these field decisions.
+
+`CONTEXT_STALENESS` follows the same route: with finite decisions enabled and no
+component override, it uses Jev's native `reuse`/`refresh` choice after cache
+identity, policy, revision, age, and deterministic checks. An explicit
+`ATAGIA_LLM_MODEL__CONTEXT_STALENESS=openrouter/google/gemini-3.1-flash-lite`
+keeps the conventional LLM signal detector for that component. The switch
+remains off by default, so installations that have not enabled finite decisions
+retain their existing context-cache model. Missing provider keys and invalid
+native responses fail explicitly; there is no automatic fallback model.
+
+`APPLICABILITY_RELEVANCE` inherits `APPLICABILITY_SCORER` when neither a component
+override nor the enabled common decision route applies. The forced-global
+setting still takes precedence, so leave it
+unset to use different models for relevance and dates. Few-shot examples
+continue to use the existing `APPLICABILITY_SCORER` examples setting.
+
+TypeSafe uses the native [System One API](https://docs.typesafe.ai/api), not an
+OpenAI-compatible chat endpoint. Each candidate receives one independent choice
+among Atagia's existing relevance labels. Candidate retrieval, numeric label
+weights, and ranking retain their existing roles. Retrieval consumes persisted
+date annotations without dispatching a date card; extraction and answer
+generation keep their own models.
+
+The seven supported need-detection cards use closed choices:
+
+| Component suffix | Native decisions |
+|---|---|
+| `MEMORY`, `EXACT`, `SHAPE` | Memory dependence, exact recall, and answer shape, separately. |
+| `LANGUAGE` | Two separate requests: query language and answer language. Each selects from the existing complete ISO 639-1 catalog plus `unknown`, mapped to absent guidance. Codes identify languages (`en`, `it`), not countries (`US`, `IT`). A current answer-language request outranks a stored preference. |
+| `NEEDS` | Independent yes/no membership questions for the policy's enabled need types. Multiple matches and no matches are valid. An empty enabled set needs no provider call. |
+| `FACETS` | Independent yes/no membership questions for the ten exact-detail categories. Several categories may apply; this is not a single-label choice. |
+| `CALLBACK` | Whether the user refers to an earlier assistant answer or recommendation. |
+
+`INTENT_CLASSIFIER` also supports separate yes/no decisions for explicit durable
+user statements and claim-key equivalence. These decisions do not generate
+reasoning text. Identical claim keys still return true mechanically without I/O.
+
+The common finite route covers applicability relevance; the seven closed-choice
+need cards; the two intent-classifier decisions; consequence gate, sentiment,
+and link; and the separate context-reuse decision. No unrelated semantic tasks
+share a multi-task inference. Independent
+membership questions within one card family may use one API batch. Consequence
+action, outcome, and language stay on `CONSEQUENCE_DETECTOR`. Search words and
+cross-language aliases, free-text extraction, language-profile synthesis, date
+resolution, and answer generation remain on generative models.
+
+In a frozen synthetic comparison of 12 semantic context-reuse cases repeated ten
+times, `jev-1.13.0` matched the expected decision 110/120 times versus 90/120
+for the conventional Luna route. All ten Jev errors were one ambiguous-reference
+case that asked for "the other one" after two possible referents. That weakness
+concerns ambiguity, not necessarily an old cache entry. This small result does
+not establish general production accuracy. In that case Jev reused context
+when the expected action was refresh. The per-component override above remains
+available while this limitation is tracked.
+
+Enabling a route sends that card's required message/context/profile excerpts
+to TypeSafe. Use synthetic or explicitly authorized data during evaluation;
+enabling local configuration is not a deployment or a memory-quality guarantee.
+
+TypeSafe is not accepted as a global, category-wide, chat, JSON-rescue, or
+intimacy-fallback model. Typed requests have no text parsing, JSON repair, or
+automatic chat-model fallback. Authentication and malformed responses fail
+immediately; transient transport errors use the existing shared retry policy.
+The common decision override and TypeSafe are off by default; the same decision
+tasks still run through their ordinary component models. Store credentials in
+the environment or your ignored local `.env`, never in tracked files.
+TypeSafe is an external, metered provider: both `local_only` and `zero_cost`
+reject its routes at startup and before calls. Free output tokens do not make
+the input-token charges eligible for `zero_cost`.
 
 ### Card prompt examples (few-shot demonstrations)
 
@@ -215,6 +549,12 @@ reports aggregate calls under
 | `ATAGIA_LLM_STRUCTURED_OUTPUT_RETRY_ATTEMPTS` | `1` | Optional | Same-model corrective retries after cleanroom/schema validation fails. |
 | `ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_ENABLED` | `false` | Optional | Enable final escalation to the configured rescue model after same-model retries fail. |
 | `ATAGIA_LLM_STRUCTURED_OUTPUT_RESCUE_MODEL` | `anthropic/claude-opus-4-7` | Optional | Provider-qualified rescue model, for example `anthropic/claude-opus-4-7` or `openai/gpt-5.5`. Required provider key only matters when rescue is enabled. |
+
+### Provider dispatch
+
+| Variable | Default | Required | Description |
+|---|---|---|---|
+| `ATAGIA_LLM_MAX_CONCURRENT_REQUESTS_PER_PROVIDER` | `4` | Optional | Maximum in-flight requests to each provider across tasks using one engine's LLM client. Completions, embeddings, and streams share this limit; separate processes or engine clients have independent limits. |
 
 ### Answer context envelope
 
@@ -364,12 +704,38 @@ with optional raw request/response bodies.
 | `ATAGIA_DEBUG_LLM_IO_RAW` | `false` | Optional | Also persist raw provider request/response payloads alongside the structured artifact. |
 | `ATAGIA_DEBUG_LLM_IO_MAX_CHARS` | `50000` | Optional | Maximum characters per recorded field before truncation. |
 
+Diagnostic capture is a separate, opt-in local recorder. It stores rendered
+model inputs, typed options and schemas, resolved provider attempts, responses,
+stream fragments, source snapshots, and selected operation effects. This can
+include conversation content. It does not upload captures or make extra model
+calls. Keep the directory private and remove capture directories manually when
+they are no longer needed. The directory must already exist and be writable
+when capture is enabled; startup fails if it is unavailable. Each session has
+`manifest.json`, `events.jsonl`, and SHA-256 addressed `blobs/`. A complete
+manifest is required for replay. If a size or write limit is hit, the manifest
+is marked failed and the provider result is still returned normally.
+
+| Variable | Default | Status | Purpose |
+|---|---|---|---|
+| `ATAGIA_DIAGNOSTIC_CAPTURE_ENABLED` | `false` | Optional | Enable local diagnostic capture for this process. |
+| `ATAGIA_DIAGNOSTIC_CAPTURE_DIR` | `./data/diagnostic_captures` | Optional | Existing private parent directory for per-session captures. |
+| `ATAGIA_DIAGNOSTIC_CAPTURE_MAX_BLOB_BYTES` | `1048576` | Optional | Maximum bytes for one exact content block; excess marks capture failed. |
+| `ATAGIA_DIAGNOSTIC_CAPTURE_MAX_SESSION_BYTES` | `104857600` | Optional | Maximum bytes for one session; excess marks capture failed. |
+
 ---
 
 ## 12. Service mode
 
 Service mode runs Atagia as a FastAPI HTTP service. The library mode trusts
 the caller's `user_id`; the service mode requires an API key.
+
+`ATAGIA_SERVICE_MODE`, `ATAGIA_SERVICE_API_KEY`, `ATAGIA_ADMIN_API_KEY`,
+`ATAGIA_ALLOW_INSECURE_HTTP` and `ATAGIA_WORKERS_ENABLED` configure the HTTP
+service only. The library-mode engine (`Atagia(...)`) pins all five on its own
+authority and ignores them: it is not a service, it runs its own workers, and it
+talks over loopback. Every other variable in this reference reaches the runtime
+in both modes. The effective-settings report tags these five `engine_override`
+in library mode so a run never claims to have honored them.
 
 | Variable | Default | Required | Description |
 |---|---|---|---|
@@ -486,19 +852,18 @@ ATAGIA_LLM_INTIMACY_MODEL__EXTRACTOR=openrouter/z-ai/glm-4.6
 ATAGIA_LLM_INTIMACY_MODEL__COMPACTOR=openrouter/z-ai/glm-4.6
 ```
 
-### 15.3. Local Ollama runtime benchmark env
+### 15.3. Local OpenAI-compatible runtime benchmark env
 
-Ollama's OpenAI-compatible endpoint can be used through the `openai/...`
-provider namespace. This is a convenient starting point for local
-retrieval/answer experiments without a paid API.
+After declaring an Ollama or other OpenAI-compatible server in the local
+endpoint catalog above, select it through its explicit endpoint identity. This
+keeps the same configuration valid when another LAN machine is added later.
 
 ```env
-ATAGIA_OPENAI_API_KEY=ollama
-ATAGIA_OPENAI_BASE_URL=http://localhost:11434/v1
-ATAGIA_OPENAI_EMBEDDING_BASE_URL=http://localhost:11434/v1
-ATAGIA_LLM_FORCED_GLOBAL_MODEL=openai/qwen3-coder:30b
+ATAGIA_INFERENCE_ACCESS_MODE=local_only
+ATAGIA_LOCAL_LLM_ENDPOINTS_FILE=/srv/atagia/local_llm_endpoints.json
+ATAGIA_LLM_FORCED_GLOBAL_MODEL=local/desktop/qwen3-coder:30b
 ATAGIA_EMBEDDING_BACKEND=sqlite_vec
-ATAGIA_EMBEDDING_MODEL=openai/qwen3-embedding:4b
+ATAGIA_EMBEDDING_MODEL=local/desktop/qwen3-embedding:4b
 ATAGIA_EMBEDDING_DIMENSION=1536
 ```
 

@@ -58,6 +58,7 @@ from atagia.services.initial_context_package_signatures import (
 )
 from atagia.services.initial_context_package_builder import InitialContextPackageBuilder
 from atagia.services.prompt_authority import normalize_request_authority_context
+from tests.recent_window_support import stored_recent_window
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -742,7 +743,7 @@ async def test_package_invalidation_marks_stale_and_clears_dependent_cache() -> 
         assert result.deleted_recent_windows == 1
         assert await backend.get_context_view("ctx-usr-1") is None
         assert await backend.get_context_view("ctx-usr-2") is not None
-        assert await backend.get_recent_window(recent_window_key) is None
+        assert await stored_recent_window(backend, recent_window_key) is None
     finally:
         await connection.close()
 

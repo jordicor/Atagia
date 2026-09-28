@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import aiosqlite
-
 from atagia.core.ids import generate_prefixed_id
 from atagia.core.repositories import BaseRepository, _encode_json
 from atagia.models.schemas_memory import (
@@ -300,6 +298,8 @@ class MemoryEvidenceRepository(BaseRepository):
         quote_text = self._normalize_required_text(span.get("quote_text"))
         message_id = self._normalize_optional_text(span.get("message_id"))
         conversation_id = self._normalize_optional_text(span.get("conversation_id"))
+        char_start = self._optional_int(span.get("char_start"))
+        char_end = self._optional_int(span.get("char_end"))
         seq = self._optional_int(span.get("seq"))
         occurred_at = self._normalize_optional_text(span.get("occurred_at"))
         metadata = dict(span.get("metadata") or {})
@@ -332,9 +332,11 @@ class MemoryEvidenceRepository(BaseRepository):
               AND span_role = ?
               AND COALESCE(message_id, '') = COALESCE(?, '')
               AND quote_text = ?
+              AND char_start IS ?
+              AND char_end IS ?
             LIMIT 1
             """,
-            (user_id, support_edge_id, span_role.value, message_id, quote_text),
+            (user_id, support_edge_id, span_role.value, message_id, quote_text, char_start, char_end),
         )
         if existing is not None:
             return
@@ -369,8 +371,8 @@ class MemoryEvidenceRepository(BaseRepository):
                 message_id,
                 span_role.value,
                 quote_text,
-                self._optional_int(span.get("char_start")),
-                self._optional_int(span.get("char_end")),
+                char_start,
+                char_end,
                 seq,
                 occurred_at,
                 _encode_json(metadata),

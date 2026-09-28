@@ -17,8 +17,12 @@ from atagia.services.llm_client import (
     LLMCompletionResponse,
     LLMStreamEvent,
 )
-from atagia.services.openai_proxy_service import OpenAIProxyService
+from atagia.services.openai_proxy_service import (
+    OpenAIProxyService,
+    ProxyContextAttempt,
+)
 from tests.api.test_openai_proxy import _settings as proxy_settings
+from tests.turn_telemetry_support import TurnCallMeterMixin
 
 
 _REJECTED_STORE_TABLES = (
@@ -33,7 +37,7 @@ _REJECTED_STORE_TABLES = (
 )
 
 
-class _CaptureLLMClient:
+class _CaptureLLMClient(TurnCallMeterMixin):
     def __init__(
         self,
         *,
@@ -74,8 +78,9 @@ class _CaptureLLMClient:
 def _avoid_unrelated_retrieval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def no_context(*_args: Any, **_kwargs: Any) -> None:
-        return None
+    async def no_context(*_args: Any, **_kwargs: Any) -> ProxyContextAttempt:
+        # These tests never exercise retrieval, so the attempt cost nothing.
+        return ProxyContextAttempt(context=None, elapsed_ms=0.0)
 
     monkeypatch.setattr(
         OpenAIProxyService,

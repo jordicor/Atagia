@@ -131,11 +131,11 @@ async def test_topic_refresh_creates_topic_and_records_processed_seq_bounds() ->
     outputs = [
         "none",
         "track msg_1 msg_4",
-        (
-            "title: Trip planning\n"
-            "summary: Keep the current travel-planning thread oriented.\n"
-            "goal: Decide the next booking step."
-        ),
+        "Trip planning",
+        "Keep the current travel-planning thread oriented.",
+        "Decide the next booking step.",
+        "none",
+        "none",
         "tmp1 ordinary 0 0.82",
     ]
     connection, service, provider, messages = await _runtime(outputs, message_count=4)
@@ -156,7 +156,11 @@ async def test_topic_refresh_creates_topic_and_records_processed_seq_bounds() ->
         ] == [
             "topic_working_set_route_card",
             "topic_working_set_route_card",
-            "topic_working_set_content_card",
+            "topic_working_set_title_card",
+            "topic_working_set_summary_card",
+            "topic_working_set_goal_card",
+            "topic_working_set_questions_card",
+            "topic_working_set_decisions_card",
             "topic_working_set_boundary_card",
         ]
         assert snapshot["active_topics"][0]["title"] == "Trip planning"

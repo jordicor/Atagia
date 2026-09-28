@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+import logging
 from typing import Any
 from uuid import uuid4
 
@@ -53,6 +54,7 @@ from atagia.memory.policy_manifest import (
     PolicyResolver,
     load_and_sync_assistant_modes,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 from atagia.models.schemas_jobs import (
     COMPACT_STREAM_NAME,
     CONTRACT_STREAM_NAME,
@@ -76,6 +78,12 @@ from atagia.services.errors import (
     TranscriptRebuildRemediationRequiredError,
 )
 from atagia.services.model_resolution import log_resolution
+from atagia.services.inference_runtime import (
+    PreparedInferenceAccess,
+    format_inference_access_diagnostics,
+    prepare_inference_access,
+)
+from atagia.services.inference_routes import InferenceAccessMode
 from atagia.services.providers import build_llm_client
 from atagia.services.user_erasure_cleanup_service import (
     recover_pending_user_erasures,
@@ -91,6 +99,9 @@ from atagia.workers.revision_worker import RevisionWorker
 from atagia.workers.transcript_rebuild_worker import TranscriptRebuildWorker
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass(slots=True)
 class AppRuntime:
     """Shared runtime dependencies stored in app.state."""
@@ -104,6 +115,7 @@ class AppRuntime:
     operational_profiles: dict[str, Any]
     policy_resolver: PolicyResolver
     llm_client: LLMClient[Any]
+    inference_access: PreparedInferenceAccess
     embedding_index: EmbeddingIndex
     storage_backend: StorageBackend
     ingest_worker: IngestWorker | None
@@ -120,6 +132,11 @@ class AppRuntime:
     bootstrap_connection: aiosqlite.Connection
     embedding_connection: aiosqlite.Connection | None
     worker_connections: list[aiosqlite.Connection]
+    # Corpus statistics outlive the per-request pipeline that reads them, so
+    # they are owned here: one cache per database, for the process lifetime.
+    token_document_frequency_cache: TokenDocumentFrequencyCache = field(
+        default_factory=TokenDocumentFrequencyCache
+    )
     _background_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     closed: bool = False
 
@@ -156,6 +173,7 @@ class AppRuntime:
             task.cancel()
         if bg_tasks:
             await asyncio.gather(*bg_tasks, return_exceptions=True)
+        await self.llm_client.aclose()
         await self.storage_backend.close()
         for worker_connection in self.worker_connections:
             await close_connection(worker_connection)
@@ -193,12 +211,26 @@ def _validate_settings(settings: Settings) -> None:
         )
 
 
-async def initialize_runtime(settings: Settings) -> AppRuntime:
+async def initialize_runtime(
+    settings: Settings,
+    *,
+    additional_inference_completion_models: dict[str, str] | None = None,
+) -> AppRuntime:
     """Build the shared runtime used by both FastAPI and library mode."""
+    inference_access = await prepare_inference_access(
+        settings,
+        additional_completion_models=additional_inference_completion_models,
+    )
+    if (
+        inference_access.policy.restricted
+        or inference_access.local_catalog is not None
+    ):
+        logger.info("%s", format_inference_access_diagnostics(inference_access))
     worker_tasks: list[asyncio.Task[None]] = []
     worker_connections: list[aiosqlite.Connection] = []
     embedding_connection: aiosqlite.Connection | None = None
     storage_backend: StorageBackend | None = None
+    llm_client: LLMClient[Any] | None = None
     database_path = resolve_runtime_database_path(settings.sqlite_path)
     clock = SystemClock()
     bootstrap_connection = await initialize_database(
@@ -230,7 +262,16 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
         )
         operational_profiles = operational_profile_loader.load_all()
         log_resolution(settings)
-        llm_client = build_llm_client(settings)
+        if (
+            inference_access.policy.mode is InferenceAccessMode.UNRESTRICTED
+            and inference_access.local_catalog is None
+        ):
+            llm_client = build_llm_client(settings)
+        else:
+            llm_client = build_llm_client(
+                settings,
+                prepared_inference_access=inference_access,
+            )
         if settings.embedding_backend != "none":
             embedding_connection = await open_connection(database_path)
         embedding_index = await create_embedding_index(
@@ -457,6 +498,7 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             operational_profiles=operational_profiles,
             policy_resolver=PolicyResolver(),
             llm_client=llm_client,
+            inference_access=inference_access,
             embedding_index=embedding_index,
             storage_backend=storage_backend,
             ingest_worker=ingest_worker,
@@ -481,6 +523,8 @@ async def initialize_runtime(settings: Settings) -> AppRuntime:
             await asyncio.gather(*worker_tasks, return_exceptions=True)
         if storage_backend is not None:
             await storage_backend.close()
+        if llm_client is not None:
+            await llm_client.aclose()
         for worker_connection in worker_connections:
             await close_connection(worker_connection)
         if embedding_connection is not None:

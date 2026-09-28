@@ -25,6 +25,7 @@ from atagia.models.schemas_memory import (
     ResponseMode,
 )
 from atagia.services.chat_service import ChatService
+from atagia.services.llm_run_guard import LLMCallMeter
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.llm_client import (
     LLMClient,
@@ -45,7 +46,8 @@ _CANDIDATE_SCORE_KEY_PATTERN = re.compile(
 _RETRIEVAL_PIPELINE_PURPOSES = frozenset(
     {
         "need_detection_needs_card",
-        "need_detection_language_card",
+        "need_detection_query_language_card",
+        "need_detection_answer_language_card",
         "need_detection_memory_card",
         "need_detection_exact_card",
         "need_detection_shape_card",
@@ -74,7 +76,8 @@ class RecordingProvider(LLMProvider):
         if purpose.startswith("need_detection_") and purpose.endswith("_card"):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -686,3 +689,75 @@ def _profile_token(runtime: AppRuntime) -> str:
         loader=runtime.operational_profile_loader,
         settings=runtime.settings,
     ).token
+
+
+@pytest.mark.asyncio
+async def test_smart_fast_warm_gets_its_own_meter_not_the_finished_turn_s(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The warm's provider calls must not be charged to a row already written.
+
+    ``asyncio.create_task`` copies the current context, so a turn meter still
+    bound when the warm is scheduled follows it and keeps accumulating after the
+    turn's telemetry row is persisted -- calls that then appear in no persisted
+    telemetry at all. The chat surface now unbinds first (the sidecar already
+    did), and the warm binds its own meter so its cost is recorded somewhere.
+    """
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime)
+        await _seed_user_memory(
+            runtime,
+            memory_id="mem_budget",
+            canonical_text="The apartment budget is 2800 dollars.",
+        )
+
+        created_meters: list[LLMCallMeter] = []
+        original_begin_turn = runtime.llm_client.begin_turn_call_meter
+        original_begin_isolated = runtime.llm_client.begin_isolated_call_meter
+
+        def _capture_begin_turn() -> LLMCallMeter:
+            meter = original_begin_turn()
+            created_meters.append(meter)
+            return meter
+
+        def _capture_begin_isolated() -> LLMCallMeter:
+            meter = original_begin_isolated()
+            created_meters.append(meter)
+            return meter
+
+        monkeypatch.setattr(
+            runtime.llm_client, "begin_turn_call_meter", _capture_begin_turn
+        )
+        monkeypatch.setattr(
+            runtime.llm_client, "begin_isolated_call_meter", _capture_begin_isolated
+        )
+
+        result = await ChatService(runtime).chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="What is the apartment budget?",
+            assistant_mode_id="coding_debug",
+            response_mode="smart_fast",
+            debug=True,
+        )
+        assert result.debug is not None
+        turn_calls_at_write = result.debug["llm_call_metrics"]["total_calls"]
+        turn_meter = created_meters[0]
+        # Snapshot BEFORE the warm runs, then let it run.
+        turn_calls_before_warm = turn_meter.total_calls
+        await _drain_background_tasks(runtime)
+
+        # The warm ran on its own ISOLATED meter -- isolated because this task
+        # holds a copy of the turn's context, so a merely-pushed meter would
+        # still have charged the turn.
+        assert len(created_meters) >= 2, "the warm must begin its own meter"
+        warm_meter = created_meters[1]
+        assert warm_meter is not turn_meter
+        assert warm_meter.total_calls >= 1
+        # ...and left the finished turn's meter untouched.
+        assert turn_meter.total_calls == turn_calls_before_warm
+        assert turn_meter.total_calls == turn_calls_at_write
+    finally:
+        await runtime.close()

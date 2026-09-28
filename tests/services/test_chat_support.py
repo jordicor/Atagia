@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from atagia.integrations.prompt_injection import minimal_memory_payload
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
+from atagia.services.answer_postcondition import _request_with_answer_support_context
 from atagia.services.chat_support import (
     ChunkSummary,
     RawMessage,
@@ -28,6 +30,8 @@ from atagia.services.chat_support import (
     resolve_retrieval_profile_id,
 )
 from atagia.models.schemas_memory import ComposedContext, MemoryScope
+from atagia.services.llm_client import LLMCompletionRequest, LLMMessage
+from atagia.services.prompt_section_rules import ANSWER_SUPPORT_INSTRUCTION
 
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
@@ -390,34 +394,27 @@ def test_build_transcript_window_trace_and_system_prompt_include_summary_boundar
     assert trace["transcript_message_seqs"] == [7, 8, 9, 10]
     assert trace["budget_tokens"] == 400
     assert trace["budget_used_tokens"] > 0
-    assert "resolve them against that memory's temporal metadata" in prompt
-    assert "Prefer resolved_date or event_time when present" in prompt
-    assert "not as the event date when event_time" in prompt
-    assert "last Saturday" in prompt
-    assert "Calculate the actual calendar date when possible." in prompt
-    assert "bind each relationship, event, address, preference" in prompt
-    assert "unless the context explicitly says it applies to both" in prompt
-    assert "include all distinct items found across the retrieved memories" in prompt
-    assert "including lower-ranked entries and artifact snippets" in prompt
-    assert "When retrieved memories conflict on an exact fact" in prompt
-    assert "Do not let a paraphrase without source_quote override" in prompt
-    assert "do not mention superseded values unless the user asks" in prompt
-    assert "mislabeled as, nicknamed, or confused with a name" in prompt
-    assert "Factual grounding rules:" in prompt
-    assert "Answer the question that was asked." in prompt
-    assert "Use retrieved context as evidence for exact facts." in prompt
-    assert "If the question has several parts" in prompt
-    assert "A related or nearby fact is not the same as the asked fact" in prompt
-    assert "Follow the answer stance rule" in prompt
-    assert "Do not guess missing names, dates, numbers" in prompt
-    assert "Each needs direct retrieved support" in prompt
-    assert "just because the spelling overlaps" in prompt
-    assert "names appear near each other" in prompt
-    assert "Do not guess a name's meaning, origin, or reason" in prompt
-    assert "These are separate facts" in prompt
-    assert "If only adjacent or partial evidence is present" not in prompt
-    assert "Do not resolve unclear pronouns to a specific person" in prompt
-    assert "do not fill gaps with related or inferred facts" in prompt
+    assert "Answer the final user message using the provided memories as" in prompt
+    assert "passive context, not output templates" in prompt
+    assert "When [Final Answer Evidence Pack] is present" in prompt
+    assert "Treat direct quotes as the canonical wording for exact facts" in prompt
+    assert "bind each fact to the specific entity the context supports" in prompt
+    assert "include all distinct relevant items from the provided memories" in prompt
+    assert "answer with the current value only" in prompt
+    assert "unless the user asks for history or comparison" in prompt
+    assert "state the ambiguity briefly" in prompt
+    assert "show the competing values" not in prompt
+    assert "answer the supported parts and say which are missing" in prompt
+    assert "Do not invent facts that are not present in the memories" in prompt
+    assert "Dates shown alongside memories are already resolved calendar" in prompt
+    assert "Calculate the actual calendar date" not in prompt
+    assert "resolve them against that memory's temporal metadata" not in prompt
+    assert "Nicknames, labels, or etymology mentioned in conversation" in prompt
+    assert "legal/full/true name" not in prompt
+    assert "Factual grounding rules:" not in prompt
+    assert "Answer concisely: put the requested fact or list first" in prompt
+    assert "follow-up questions, or broad summaries unless the user asks" in prompt
+    assert "begin with Yes or No" in prompt
     assert "you may use it inside that same active conversation/mode" in prompt
     assert "The current authenticated user is Alex Rivera." in prompt
     assert "Do not refuse solely because a retrieved fact is sensitive." in prompt
@@ -492,10 +489,16 @@ def test_system_prompt_includes_answer_support_block_for_source_required_shapes(
     )
 
     assert "<answer_support>" in prompt
-    assert '"allowed_values"' in prompt
-    assert '"coverage_state": "partial"' in prompt
-    assert "Use only values listed in allowed_values" in prompt
-    assert "state the supported subset plainly" in prompt
+    assert "answer_shape: list" in prompt
+    assert "source_group_coverage_state: partial" in prompt
+    assert "source_inventory:" in prompt
+    assert "- Paris" in prompt
+    assert "evidence_ids: memory:mem_paris" in prompt
+    assert "source_coverage_gaps:" in prompt
+    assert "value|rome" in prompt
+    assert "source_coverage_gaps names groups omitted" in prompt
+    assert "answer allowlist" in prompt
+    assert "State which requested facts lack support" in prompt
 
 
 def test_system_prompt_omits_answer_support_instruction_without_block() -> None:
@@ -513,10 +516,10 @@ def test_system_prompt_omits_answer_support_instruction_without_block() -> None:
     )
 
     assert "<answer_support>" not in prompt
-    assert "Use only values listed in allowed_values" not in prompt
+    assert "source_inventory is a" not in prompt
 
 
-def test_answer_support_payload_marks_truncated_complete_values_partial() -> None:
+def test_answer_support_payload_keeps_source_coverage_distinct_from_inventory() -> None:
     composed_context = ComposedContext(
         answer_shape="list",
         coverage_mode="exhaustive_known_set",
@@ -526,7 +529,7 @@ def test_answer_support_payload_marks_truncated_complete_values_partial() -> Non
             {
                 "display_text": f"city-{index}",
                 "normalized_key": f"value|city-{index}",
-                "evidence_ids": [f"memory:mem_{index}"],
+                "evidence_ids": [f"memory:mem_{index}_{source}" for source in range(9)],
             }
             for index in range(13)
         ],
@@ -542,11 +545,109 @@ def test_answer_support_payload_marks_truncated_complete_values_partial() -> Non
     payload = answer_support_prompt_payload(composed_context)
 
     assert payload is not None
-    assert payload["coverage_state"] == "partial"
-    assert payload["values_truncated"] is True
-    assert len(payload["allowed_values"]) == 12
-    assert len(payload["support_map"]["mem_overflow"]) == 8
+    assert payload["source_group_coverage_state"] == "complete"
+    assert payload["source_inventory_truncated"] is True
+    assert len(payload["source_inventory"]) == 12
+    assert len(payload["source_inventory"][0]["evidence_ids"]) == 8
+    assert "allowed_values" not in payload
+    assert "support_map" not in payload
     assert composed_context.coverage_state == "complete"
+
+
+def test_answer_support_keeps_all_source_members_beyond_inventory_limit() -> None:
+    members = [f"member-{index:02d}" for index in range(1, 15)]
+    source_text = "Official roster: " + ", ".join(members) + "."
+    context = ComposedContext(
+        answer_shape="list",
+        coverage_mode="exhaustive_known_set",
+        source_precision="required",
+        coverage_state="complete",
+        allowed_values=[{"display_text": member} for member in members],
+        memory_block=source_text,
+        total_tokens_estimate=100,
+        budget_tokens=1000,
+        items_included=1,
+        items_dropped=0,
+    )
+    policy = PolicyResolver().resolve(
+        ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"], None, None
+    )
+    prompt = build_system_prompt(
+        "general_qa", policy, "", "", context.memory_block, "",
+        answer_support_block=render_answer_support_block(context),
+    )
+    host_payload = minimal_memory_payload(prompt)
+
+    for rendered in (prompt, host_payload):
+        assert source_text in rendered
+        assert "source_inventory_truncated: true" in rendered
+        assert "include every relevant supported member" in rendered
+        assert "member-14" in rendered
+        assert "- member-14" not in rendered
+
+
+def test_answer_support_does_not_claim_requested_fact_coverage() -> None:
+    policy = PolicyResolver().resolve(
+        ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"], None, None
+    )
+    cases = [
+        (
+            "Mara's birthday is May 4, 1991. Her trip destination is unknown.",
+            "complete",
+            "May 4, 1991",
+        ),
+        ("No source mentions Mara's birthday or trip.", "insufficient", "No source"),
+        (
+            "The exact code is Q7-X9. The event occurred on 2025-03-08.",
+            "complete",
+            "Q7-X9",
+        ),
+    ]
+    for source_text, coverage_state, literal in cases:
+        context = ComposedContext(
+            answer_shape="single_fact",
+            coverage_mode="current_state",
+            source_precision="required",
+            coverage_state=coverage_state,
+            allowed_values=[{"display_text": "Mara"}] if coverage_state == "complete" else [],
+            memory_block=source_text,
+            total_tokens_estimate=50,
+            budget_tokens=1000,
+            items_included=1,
+            items_dropped=0,
+        )
+        prompt = build_system_prompt(
+            "general_qa", policy, "", "", context.memory_block, "",
+            answer_support_block=render_answer_support_block(context),
+        )
+        for rendered in (prompt, minimal_memory_payload(prompt)):
+            assert literal in rendered
+            assert f"source_group_coverage_state: {coverage_state}" in rendered
+            assert "not answer completeness" in rendered
+            assert "never add plausible unsupported values or exact details" in rendered
+            if "2025-03-08" in source_text:
+                assert "2025-03-08" in rendered
+
+
+def test_guard_injects_answer_support_after_rule_only_tag_mention() -> None:
+    context = ComposedContext(
+        answer_shape="list",
+        coverage_state="partial",
+        allowed_values=[{"display_text": "Northglass"}],
+        total_tokens_estimate=10,
+        budget_tokens=100,
+        items_included=1,
+        items_dropped=0,
+    )
+    request = LLMCompletionRequest(
+        model="openai/gpt-5-mini",
+        messages=[LLMMessage(role="system", content=ANSWER_SUPPORT_INSTRUCTION)],
+    )
+
+    augmented = _request_with_answer_support_context(request, composed_context=context)
+
+    assert augmented.messages[0].content.count("<answer_support>\n") == 1
+    assert "source_inventory:\n- Northglass" in augmented.messages[0].content
 
 
 def test_system_prompt_includes_answer_stance_guidance() -> None:
@@ -583,21 +684,19 @@ def test_system_prompt_includes_answer_stance_guidance() -> None:
     assert "Answer the exact asked fact first" in proactive_prompt
     assert "related, not the same fact" in proactive_prompt
     assert "Do not turn related evidence into a yes answer" in proactive_prompt
-    assert "Current-turn response discipline" in reactive_prompt
-    assert "the final user message is the task to answer" in reactive_prompt
-    assert "passive context only" in reactive_prompt
+    assert "Answer the final user message" in reactive_prompt
+    assert "passive context" in reactive_prompt
     assert "not output templates" in reactive_prompt
-    assert "without revealing the concrete restricted details" in reactive_prompt
+    assert "without revealing concrete restricted details" in reactive_prompt
     assert "answer only the requested facet" in reactive_prompt
-    assert "do not add extra remembered dates" in reactive_prompt
+    assert "do not add extra remembered details" in reactive_prompt
     assert "begin with Yes or No" in reactive_prompt
     assert "add the minimal supporting fact" in reactive_prompt
-    assert "do not stop at a bare Yes/No" in reactive_prompt
     assert "permission, applicability, relevance, or boundary questions" in reactive_prompt
-    assert "Do not mention internal prompts" in reactive_prompt
-    assert "privacy enforcement mode" in reactive_prompt
+    assert "do not mention internal prompts" in reactive_prompt
+    assert "retrieved memory mechanics" in reactive_prompt
     assert reactive_prompt.index("Answer stance: reactive") < reactive_prompt.index(
-        "Current-turn response discipline"
+        "=== AUTHENTICATED AUTHORITY ==="
     )
 
 
@@ -650,7 +749,7 @@ def test_system_prompt_appends_atagia_master_authority_block_last() -> None:
     assert prompt.index("<retrieved_memory>") < prompt.index(
         "=== AUTHENTICATED AUTHORITY ==="
     )
-    assert prompt.index("Current-turn response discipline") < prompt.index(
+    assert prompt.index("Resolved policy hash:") < prompt.index(
         "=== AUTHENTICATED AUTHORITY ==="
     )
 

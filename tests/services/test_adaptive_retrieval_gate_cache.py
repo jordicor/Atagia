@@ -61,7 +61,8 @@ class GateCacheProvider(LLMProvider):
         if purpose.startswith("need_detection_") and purpose.endswith("_card"):
             output = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": self._memory_dependence or "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",

@@ -14,6 +14,7 @@ from atagia.core.db_sqlite import initialize_database
 from atagia.core.repositories import (
     ConversationRepository,
     MemoryObjectRepository,
+    MessageRepository,
     UserRepository,
     WorkspaceRepository,
 )
@@ -906,6 +907,41 @@ async def test_preview_revision_raises_claim_key_mismatch_when_validation_fails(
 
 
 @pytest.mark.asyncio
+async def test_preview_revision_propagates_equivalence_provider_failure(monkeypatch) -> None:
+    connection, memories, beliefs, reviser = await _build_runtime("REINFORCE")
+    try:
+        belief = await _seed_belief(memories, beliefs)
+        evidence = await _seed_evidence(memories)
+
+        async def fail_equivalence(*args, **kwargs) -> bool:
+            del args, kwargs
+            raise RuntimeError("equivalence provider unavailable")
+
+        monkeypatch.setattr(
+            "atagia.memory.belief_reviser.are_claim_keys_equivalent",
+            fail_equivalence,
+        )
+        with pytest.raises(RuntimeError, match="equivalence provider unavailable"):
+            await reviser.preview_revision(
+                belief_id=str(belief["id"]),
+                new_evidence=[evidence],
+                context=RevisionContext(
+                    user_id="usr_1",
+                    claim_key="response_style.debug_response",
+                    claim_value=json.dumps("terse"),
+                    source_message_id="msg_1",
+                    assistant_mode_id="coding_debug",
+                    workspace_id="wrk_1",
+                    conversation_id="cnv_1",
+                    scope=MemoryScope.CONVERSATION,
+                ),
+            )
+        assert (await beliefs.get_current_version(str(belief["id"]), "usr_1"))["version"] == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_revise_rolls_back_all_writes_when_apply_step_fails(monkeypatch) -> None:
     connection, memories, beliefs, reviser = await _build_runtime("REINFORCE")
     try:
@@ -939,5 +975,52 @@ async def test_revise_rolls_back_all_writes_when_apply_step_fails(monkeypatch) -
         assert unchanged is not None
         assert unchanged["confidence"] == 0.8
         assert unchanged["stability"] == 0.7
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_successor_belief_leaves_source_message_arrival_null() -> None:
+    connection, memories, beliefs, reviser = await _build_runtime("SUPERSEDE")
+    try:
+        # The triggering message really exists, so a NULL stamp here proves the
+        # omission is deliberate: a successor belief merges the base belief with
+        # the new evidence rows and has no single arrival instant to measure.
+        message_repository = MessageRepository(
+            connection,
+            FrozenClock(datetime(2026, 4, 1, 15, 59, tzinfo=timezone.utc)),
+        )
+        await message_repository.create_message(
+            "msg_3",
+            "cnv_1",
+            "user",
+            1,
+            "The user now prefers concise but not terse debugging answers.",
+        )
+        belief = await _seed_belief(memories, beliefs)
+        evidence = await _seed_evidence(
+            memories,
+            text="The user now prefers concise but not terse debugging answers.",
+        )
+
+        result = await reviser.revise(
+            belief_id=str(belief["id"]),
+            new_evidence=[evidence],
+            context=RevisionContext(
+                user_id="usr_1",
+                claim_key="response_style.debugging",
+                claim_value=json.dumps("concise"),
+                source_message_id="msg_3",
+                assistant_mode_id="coding_debug",
+                workspace_id="wrk_1",
+                conversation_id="cnv_1",
+                scope=MemoryScope.CONVERSATION,
+            ),
+        )
+
+        successor = await memories.get_memory_object(result.new_belief_ids[0], "usr_1")
+        assert successor is not None
+        assert successor["payload_json"]["source_message_ids"] == ["msg_3"]
+        assert successor["source_message_created_at"] is None
     finally:
         await connection.close()

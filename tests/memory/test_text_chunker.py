@@ -19,6 +19,15 @@ from atagia.services.llm_client import (
 )
 
 
+def _assert_literal_spans(text: str, plan) -> None:
+    previous_end = 0
+    for chunk in plan.chunks:
+        assert chunk.char_end is not None
+        assert previous_end <= chunk.char_start < chunk.char_end <= len(text)
+        assert text[chunk.char_start:chunk.char_end] == chunk.text
+        previous_end = chunk.char_end
+
+
 class ChunkerProvider(LLMProvider):
     name = "chunker-tests"
 
@@ -96,6 +105,14 @@ def test_split_by_natural_separators_merges_small_segments() -> None:
     assert "short" in segments[0]
     assert "small" in segments[0]
     assert "large" in segments[0]
+    assert segments == [text.strip()]
+
+
+def test_split_by_natural_separators_merges_literal_crlf_across_rules() -> None:
+    chunker, _provider = _chunker(lambda _request: json.dumps({"cut_markers": []}))
+    text = "  First\r\n---\r\n\r\nSecond  "
+
+    assert chunker.split_by_natural_separators(text) == [text.strip()]
 
 
 @pytest.mark.asyncio
@@ -115,6 +132,33 @@ async def test_plan_chunks_marks_level0_segments_when_threshold_exceeded() -> No
     assert [chunk.chunking_strategy for chunk in plan.chunks] == ["level0", "level0"]
     assert [chunk.chunk_index for chunk in plan.chunks] == [1, 2]
     assert all(chunk.chunk_count == 2 for chunk in plan.chunks)
+    _assert_literal_spans(text, plan)
+
+
+@pytest.mark.asyncio
+async def test_plan_chunks_tracks_second_identical_segment_with_crlf_and_whitespace() -> None:
+    chunker, provider = _chunker(lambda _request: json.dumps({"cut_markers": []}))
+    repeated = "Speaker: " + ("same words " * 100).strip()
+    text = f"  \r\n{repeated}\r\n\r\n{repeated}\r\n  "
+
+    plan = await chunker.plan_chunks(text, threshold_tokens=20)
+
+    assert [chunk.text for chunk in plan.chunks] == [repeated, repeated]
+    assert [chunk.char_start for chunk in plan.chunks] == [4, text.index(repeated, 5)]
+    assert provider.requests == []
+    _assert_literal_spans(text, plan)
+
+
+@pytest.mark.asyncio
+async def test_plan_chunks_preserves_short_literal_text_and_original_offsets() -> None:
+    chunker, _provider = _chunker(lambda _request: json.dumps({"cut_markers": []}))
+    text = " \r\n  First line\r\nSecond line  \r\n"
+
+    plan = await chunker.plan_chunks(text)
+
+    assert plan.chunked is False
+    assert [chunk.text for chunk in plan.chunks] == ["First line\r\nSecond line"]
+    _assert_literal_spans(text, plan)
 
 
 @pytest.mark.asyncio
@@ -159,6 +203,31 @@ async def test_chunk_with_ai_level1_merges_soft_min_chunk_instead_of_rejecting()
 
 
 @pytest.mark.asyncio
+async def test_plan_chunks_preserves_literal_text_through_ai_cut_and_merge() -> None:
+    def responder(request: LLMCompletionRequest) -> str:
+        marked_text = request.messages[1].content.split("<marked_text>\n", 1)[1].split(
+            "\n</marked_text>", 1
+        )[0]
+        markers = re.findall(r"<<<BM_[A-Z0-9]{8}_\d+>>>", marked_text)
+        return json.dumps({"cut_markers": [markers[2], markers[10]] if len(markers) > 10 else []})
+
+    chunker, provider = _chunker(responder)
+    text = " \r\n" + (
+        ("topic alpha\r\n" * 2500)
+        + ("topic beta\r\n" * 2500)
+        + ("topic gamma\r\n" * 2500)
+    )
+
+    plan = await chunker.plan_chunks(text, threshold_tokens=20)
+
+    assert plan.fallback_count == 0
+    assert len(plan.chunks) == 2
+    assert all(chunk.chunking_strategy == "level1" for chunk in plan.chunks)
+    assert provider.requests
+    _assert_literal_spans(text, plan)
+
+
+@pytest.mark.asyncio
 async def test_plan_chunks_falls_back_to_deterministic_splits_when_level1_fails(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -176,6 +245,20 @@ async def test_plan_chunks_falls_back_to_deterministic_splits_when_level1_fails(
     assert all(chunker.estimate_tokens(chunk.text) <= LEVEL1_MAX_CHUNK_TOKENS for chunk in plan.chunks)
     assert "Level 1 chunking fallback activated" in caplog.text
     assert "segment_index=1" in caplog.text
+    _assert_literal_spans(text, plan)
+
+
+@pytest.mark.asyncio
+async def test_plan_chunks_preserves_crlf_in_deterministic_tail_merge() -> None:
+    chunker, _provider = _chunker(lambda _request: "not-json")
+    text = " \r\n" + ("narrative\r\n" * (LEVEL1_MAX_CHUNK_TOKENS // 2 + 1000))
+
+    plan = await chunker.plan_chunks(text)
+
+    assert plan.fallback_count == 1
+    assert len(plan.chunks) >= 2
+    assert all(chunk.chunking_strategy == "deterministic_fallback" for chunk in plan.chunks)
+    _assert_literal_spans(text, plan)
 
 
 @pytest.mark.asyncio

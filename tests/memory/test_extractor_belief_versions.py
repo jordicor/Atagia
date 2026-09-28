@@ -60,6 +60,7 @@ class CannedProvider(LLMProvider):
                 output_text=memory_extraction_card_output_from_payload(
                     self.payload,
                     request.metadata.get("purpose"),
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         return LLMCompletionResponse(
@@ -88,14 +89,14 @@ async def test_extracting_a_belief_also_creates_belief_version_row() -> None:
             "evidences": [],
             "beliefs": [
                 {
-                    "canonical_text": "terse debugging answers",
+                    "canonical_text": "No quiero cambios automáticos para Café Sol.",
                     "scope": "assistant_mode",
                     "confidence": 0.78,
                     "source_kind": "inferred",
                     "privacy_level": 1,
                     "payload": {},
-                    "claim_key": "response_style.debugging",
-                    "claim_value": "terse",
+                    "claim_key": "workflow.edits.no_automatic_edits",
+                    "claim_value": "No quiero cambios automáticos para Café Sol",
                 }
             ],
             "contract_signals": [],
@@ -122,7 +123,7 @@ async def test_extracting_a_belief_also_creates_belief_version_row() -> None:
             "cnv_1",
             "user",
             1,
-            "I prefer terse debugging answers.",
+            "No quiero cambios automáticos para Café Sol.",
             8,
             {},
         )
@@ -154,8 +155,24 @@ async def test_extracting_a_belief_also_creates_belief_version_row() -> None:
 
         assert len(rows) == 1
         assert rows[0]["version"] == 1
-        assert rows[0]["claim_key"] == "response_style.debugging"
-        assert json.loads(rows[0]["claim_value_json"]) == "terse"
+        assert rows[0]["claim_key"] == "workflow.edits.no_automatic_edits"
+        assert json.loads(rows[0]["claim_value_json"]) == "No quiero cambios automáticos para Café Sol"
         assert rows[0]["is_current"] == 1
+        belief_requests = [
+            request for request in provider.requests
+            if request.metadata.get("purpose") in {
+                "memory_extraction_belief_key_card",
+                "memory_extraction_belief_value_card",
+            }
+        ]
+        assert [request.metadata["purpose"] for request in belief_requests] == [
+            "memory_extraction_belief_key_card",
+            "memory_extraction_belief_value_card",
+        ]
+        assert all("cand_001" not in request.messages[-1].content for request in belief_requests)
+        assert (
+            "<claim_key>\nworkflow.edits.no_automatic_edits\n</claim_key>"
+            in belief_requests[1].messages[-1].content
+        )
     finally:
         await connection.close()

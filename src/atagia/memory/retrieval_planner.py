@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import re
 
@@ -18,7 +19,11 @@ from atagia.models.schemas_memory import (
     SparseQueryHint,
 )
 
-_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
+# The tokenization that defines what counts as a token for FTS purposes.
+# Corpus document-frequency keys are built with this same pattern, and the
+# DF filter silently becomes a no-op if the two ever disagree.
+FTS_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
+_FILTERABLE_FTS_TERM_PATTERN = re.compile(r"\w+\Z", re.UNICODE)
 _FTS5_OPERATORS = frozenset({"and", "or", "not", "near"})
 _MAX_RETRIEVAL_QUERIES = 3
 _MAX_EXACT_RECALL_RETRIEVAL_QUERIES = 5
@@ -283,6 +288,71 @@ def build_safe_fts_queries(message_text: str) -> list[str]:
     return [" ".join(content_tokens[:8])]
 
 
+def filter_fts_query_tokens(
+    fts_query: str,
+    *,
+    token_doc_ratios: Mapping[str, float],
+    max_doc_ratio: float,
+) -> str:
+    """Drop corpus-ubiquitous tokens from a flat FTS5 query string.
+
+    Mechanical cleanup only: ``token_doc_ratios`` carries per-token document
+    frequency ratios computed from the corpus itself, so no language-specific
+    word lists are involved. A term absent from the mapping is treated as
+    informative. Returns ``""`` when every token is ubiquitous, in which case
+    the query variant carries no lexical signal and the caller should skip it.
+    Queries with phrase, prefix, or mixed-operator structure are returned
+    unchanged.
+
+    ``max_doc_ratio`` has no default on purpose: the threshold belongs to
+    whoever computed the ratios, and a second copy of it here would be free to
+    drift away from the value the statistics were built for.
+    """
+    split = _split_flat_fts_query(fts_query)
+    if split is None:
+        return fts_query
+    terms, is_or = split
+    if len(terms) <= 1:
+        return fts_query
+    if is_or:
+        # Dropping tokens from a flat OR is pure recall loss: each OR term is
+        # an independent match path (often the protagonist's name), and the
+        # noisy-OR cost is already handled downstream by the RRF down-weight.
+        return fts_query
+    informative_terms = [
+        term
+        for term in terms
+        if token_doc_ratios.get(term, 0.0) < max_doc_ratio
+    ]
+    if not informative_terms:
+        return ""
+    if len(informative_terms) == len(terms):
+        return fts_query
+    # Flat OR queries returned above, so what reaches here is always an AND.
+    return " ".join(informative_terms)
+
+
+def _split_flat_fts_query(fts_query: str) -> tuple[list[str], bool] | None:
+    """Split a flat AND/OR query into terms; ``None`` for other shapes."""
+    query = fts_query.strip()
+    if not query or query.startswith('"'):
+        return None
+    parts = query.split()
+    is_or = "OR" in parts
+    if is_or:
+        # Only flat "a OR b OR c" shapes are filterable.
+        if any(part == "OR" for part in parts[0::2]) or any(
+            part != "OR" for part in parts[1::2]
+        ):
+            return None
+        terms = parts[0::2]
+    else:
+        terms = parts
+    if any(_FILTERABLE_FTS_TERM_PATTERN.fullmatch(term) is None for term in terms):
+        return None
+    return terms, is_or
+
+
 def _collect_content_tokens(message_text: str) -> list[str]:
     return _collect_tokens_from_values([message_text])
 
@@ -291,7 +361,7 @@ def _collect_tokens_from_values(values: list[str]) -> list[str]:
     content_tokens: list[str] = []
     seen: set[str] = set()
     for value in values:
-        for token in _TOKEN_PATTERN.findall(value.lower()):
+        for token in FTS_TOKEN_PATTERN.findall(value.lower()):
             clean = _sanitize_fts_token(token)
             if clean is None or clean in seen:
                 continue

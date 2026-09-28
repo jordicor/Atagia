@@ -11,6 +11,7 @@ from atagia.core.proxy_turn_repository import (
     ProxyTurnClaim,
     ProxyTurnRepository,
     ProxyTurnResponseMessage,
+    ProxyTurnTelemetry,
 )
 from atagia.core.repositories import (
     ConversationRepository,
@@ -224,6 +225,7 @@ async def finalize_proxy_turn(
     claim: ProxyTurnClaim,
     response: ProxyTurnResponseMessage,
     job_plan: ProxyTerminalJobPlan,
+    turn_telemetry: ProxyTurnTelemetry,
     failpoint: Any | None = None,
 ) -> list[ProxyDurableJobInsert]:
     connection = await runtime.open_connection()
@@ -251,6 +253,7 @@ async def finalize_proxy_turn(
             claim,
             response=response,
             durable_job_builder=build_jobs,
+            turn_telemetry=turn_telemetry,
             failpoint=failpoint,
         )
         return built_jobs

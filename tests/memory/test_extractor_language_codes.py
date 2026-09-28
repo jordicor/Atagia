@@ -97,16 +97,21 @@ async def test_extraction_normalizes_card_language_codes() -> None:
             resolved_policy=resolved_policy,
         )
 
-        assert len(sequenced_provider.requests) == 7
-        assert [request.metadata.get("purpose") for request in sequenced_provider.requests] == [
-            "memory_extraction_candidate_card",
-            "memory_extraction_kind_scope_card",
-            "memory_extraction_evidence_card",
+        assert len(sequenced_provider.requests) == 11
+        purposes = [request.metadata.get("purpose") for request in sequenced_provider.requests]
+        assert purposes[0] == "memory_extraction_candidate_card"
+        assert set(purposes[1:]) == {
+            "memory_extraction_kind_card",
+            "memory_extraction_scope_card",
+            "memory_extraction_confidence_card",
+            "memory_extraction_evidence_support_card",
+            "memory_extraction_preserve_verbatim_card",
+            "memory_extraction_candidate_language_card",
+            "memory_extraction_source_reference_card",
             "memory_extraction_index_card",
-            "memory_extraction_temporal_card",
-            "memory_extraction_belief_card",
+            "memory_extraction_temporal_type_card",
             "memory_extraction_coverage_members_card",
-        ]
+        }
         assert result.evidences[0].language_codes == ["es"]
     finally:
         await connection.close()

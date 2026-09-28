@@ -399,6 +399,13 @@ redis.call("sadd", KEYS[5], ARGV[3])
 return 1
 """
 
+GET_RECENT_WINDOW_IF_CACHE_IDENTITY_SCRIPT = """
+if redis.call("get", KEYS[2]) ~= ARGV[1] then
+    return nil
+end
+return redis.call("get", KEYS[1])
+"""
+
 DELETE_RECENT_WINDOW_IF_CACHE_IDENTITY_SCRIPT = """
 if redis.call("get", KEYS[2]) ~= ARGV[1] then
     return 0
@@ -1396,8 +1403,43 @@ class RedisBackend(StorageBackend):
         self._stream_claim_counts: dict[str, int] = {}
         self._stream_ack_counts: dict[str, int] = {}
 
-    async def get_recent_window(self, key: str) -> list[dict[str, Any]] | None:
-        raw = await self._client.get(f"recent_window:{key}")
+    async def get_recent_window_for_cache_identity(
+        self,
+        key: str,
+        *,
+        user_id: str,
+        conversation_id: str,
+        lifecycle_cleanup_key: str,
+        lifecycle_epoch: str,
+        cache_revision: int,
+        derivation_revision: int,
+        conversation_lifecycle_epoch: str,
+        conversation_source_revision: int,
+    ) -> list[dict[str, Any]] | None:
+        identity = RecentWindowIdentity(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            lifecycle_cleanup_key=lifecycle_cleanup_key,
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
+            conversation_lifecycle_epoch=conversation_lifecycle_epoch,
+            conversation_source_revision=conversation_source_revision,
+        )
+        if not _recent_window_identity_is_valid(
+            identity
+        ) or key != build_recent_window_key(user_id, conversation_id):
+            return None
+        # One script, so the identity cannot change between the check and the
+        # read: two round-trips could pass the fence against one publication and
+        # return the payload of the next.
+        raw = await self._client.eval(
+            GET_RECENT_WINDOW_IF_CACHE_IDENTITY_SCRIPT,
+            2,
+            f"recent_window:{key}",
+            self._recent_window_cache_identity_key(key),
+            self._recent_window_cache_identity(identity),
+        )
         if raw is None:
             return None
         return json_utils.loads(raw)

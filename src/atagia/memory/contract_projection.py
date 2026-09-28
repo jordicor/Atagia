@@ -179,6 +179,11 @@ class ContractProjector:
         resolved_occurred_at = resolve_message_occurred_at(source_message) or normalize_optional_timestamp(
             occurred_at
         )
+        # Ingest freshness starts when the message row was written, not at its
+        # occurred_at: callers may backdate occurred_at to any historical
+        # instant (transcript imports do), which would make the interval to the
+        # memory's created_at meaningless.
+        source_message_created_at = str(source_message["created_at"])
 
         cold_start = await self._is_cold_start(context)
         prompt = self._build_prompt(
@@ -284,6 +289,7 @@ class ContractProjector:
                 source_mind_id=context.source_mind_id or context.active_mind_id,
                 embodiment_id=context.active_embodiment_id,
                 realm_id=context.active_realm_id,
+                source_message_created_at=source_message_created_at,
             )
             if memory_object is None:
                 raise RuntimeError("Failed to create interaction_contract memory object")
@@ -305,7 +311,6 @@ class ContractProjector:
                 confidence=signal.confidence,
                 confidence_details={"dimension_name": signal.dimension_name},
                 rationale="Interaction contract signal is grounded in the source message.",
-                source_quote_by_message_id={context.source_message_id: message_text},
             )
 
             if (

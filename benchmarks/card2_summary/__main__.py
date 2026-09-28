@@ -171,6 +171,14 @@ async def _run_live(args: argparse.Namespace) -> int:
 
     load_dotenv()
 
+    from atagia.core.config import Settings
+    from atagia.services.inference_runtime import require_unrestricted_inference
+
+    require_unrestricted_inference(
+        Settings.from_env(),
+        entry_point="benchmarks.card2_summary live mode",
+    )
+
     # Import here so the offline self-test never depends on provider SDKs.
     from benchmarks.card2_summary.live_provider import build_live_provider
 

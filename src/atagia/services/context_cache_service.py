@@ -101,6 +101,14 @@ _CACHE_BACKEND_BYPASS: ContextVar[bool] = ContextVar(
     "atagia_cache_backend_bypass",
     default=False,
 )
+# The only ``override_retrieval_params`` key a fast/smart_fast turn actually
+# applies. It is consumed by the calling surface (chat and sidecar size the
+# recent-transcript window with it), not by this service; every other key is
+# read exclusively inside the retrieval pipeline, which the fast path never
+# enters.
+FAST_MODE_HONORABLE_OVERRIDE_KEYS: frozenset[str] = frozenset(
+    {"transcript_budget_tokens"}
+)
 DISCARDABLE_CACHE_SIGNALS = frozenset(
     {
         "assistant_mode_id_mismatch",
@@ -115,6 +123,16 @@ DISCARDABLE_CACHE_SIGNALS = frozenset(
         "workspace_id_mismatch",
     }
 )
+
+
+class FastModeAblationUnsupportedError(ValueError):
+    """A fast/smart_fast turn asked for retrieval work that path never runs.
+
+    A ``ValueError`` so the request surfaces map it the way they already map
+    ``resolve_fast_with_connection``'s other misuse error: the caller asked for
+    a combination the requested mode cannot serve, which is a bad request, not
+    an engine failure.
+    """
 
 
 @dataclass(slots=True)
@@ -139,10 +157,21 @@ class AdaptiveContextResolution:
     source_retrieval_plan: dict[str, Any]
     scored_candidates: list[dict[str, Any]]
     candidate_custody: list[dict[str, Any]]
-    retrieval_custody_v2_status: Literal["fresh", "cache_hit_no_candidate_custody"]
+    # Why this turn carries no custody / no sufficiency diagnostics. The
+    # fast-mode value exists because a fast turn that read no cache at all was
+    # still reporting "cache_hit_...", which is the same class of lie as a warm
+    # serve reporting from_cache=False: the reason a row is empty has to be the
+    # real one.
+    retrieval_custody_v2_status: Literal[
+        "fresh",
+        "cache_hit_no_candidate_custody",
+        "fast_mode_no_candidate_custody",
+    ]
     retrieval_sufficiency: dict[str, Any] | None
     sufficiency_diagnostics_v1_status: Literal[
-        "fresh", "cache_hit_no_sufficiency_diagnostics"
+        "fresh",
+        "cache_hit_no_sufficiency_diagnostics",
+        "fast_mode_no_sufficiency_diagnostics",
     ]
     candidate_search_summary: dict[str, Any]
     retrieval_diagnostics_for_guard: dict[str, Any]
@@ -331,12 +360,10 @@ class ContextCacheService:
         )
         current_message_seq = self._next_message_seq(current_messages)
         cache_lookup_started = perf_counter()
-        cache_allowed = (
-            self._cache_enabled(ablation)
-            and cache_identity is not None
-            and not _CACHE_BACKEND_BYPASS.get()
-            and str(active_conversation.get("mind_topology") or "unimind")
-            != "ojocentauri"
+        cache_allowed = self._cache_read_allowed(
+            ablation=ablation,
+            cache_identity=cache_identity,
+            conversation=active_conversation,
         )
         raw_entry: dict[str, Any] | None = None
         if cache_allowed:
@@ -375,7 +402,9 @@ class ContextCacheService:
                 # publishing the freshly recomputed replacement.
                 if not captured_identity_is_current:
                     cache_allowed = False
-        cache_lookup_elapsed = perf_counter() - cache_lookup_started
+        # Milliseconds: this dict is surfaced and persisted as stage_timings_ms
+        # alongside the retrieval pipeline's own millisecond stage timings.
+        cache_lookup_elapsed_ms = (perf_counter() - cache_lookup_started) * 1000.0
 
         cache_score: ContextStalenessScore | None = None
         cache_age_seconds: float | None = None
@@ -399,7 +428,7 @@ class ContextCacheService:
                 ),
                 resolved_policy,
             )
-            staleness_elapsed = perf_counter() - staleness_started
+            staleness_elapsed_ms = (perf_counter() - staleness_started) * 1000.0
             cache_age_seconds = self._cache_age_seconds(raw_entry)
             if self._should_discard_cache_entry(cache_score):
                 await self._best_effort_delete_context_view(cache_key)
@@ -414,6 +443,19 @@ class ContextCacheService:
                 cache_allowed = False
             if raw_entry is not None and not cache_score.should_refresh:
                 entry = ContextCacheEntry.model_validate(raw_entry)
+                recorder = getattr(self.runtime.llm_client, "_diagnostic_recorder", None)
+                if recorder is not None:
+                    recorder.no_call(
+                        "context_cache_reuse",
+                        component="context_cache",
+                        user_id=user_id,
+                        data={
+                            "conversation_id": conversation_id,
+                            "cache_key": cache_key,
+                            "context": recorder.blob(entry.composed_context),
+                            "need_detection_skipped": True,
+                        },
+                    )
                 return AdaptiveContextResolution(
                     conversation=active_conversation,
                     resolved_policy=resolved_policy,
@@ -423,8 +465,8 @@ class ContextCacheService:
                     memory_summaries=entry.memory_summaries,
                     detected_needs=[],
                     stage_timings={
-                        "context_cache_lookup": cache_lookup_elapsed,
-                        "context_cache_staleness": staleness_elapsed,
+                        "context_cache_lookup": cache_lookup_elapsed_ms,
+                        "context_cache_staleness": staleness_elapsed_ms,
                     },
                     from_cache=True,
                     staleness=cache_score.staleness,
@@ -452,7 +494,7 @@ class ContextCacheService:
                     source_derivation_revision=(cache_identity.derivation_revision),
                 )
         else:
-            staleness_elapsed = 0.0
+            staleness_elapsed_ms = 0.0
 
         retrieval_trace = RetrievalTrace(
             query_text=message_text,
@@ -539,8 +581,8 @@ class ContextCacheService:
             cache_ttl_seconds = self._cache_ttl_seconds(resolved_policy)
 
         stage_timings = dict(pipeline_result.stage_timings)
-        stage_timings["context_cache_lookup"] = cache_lookup_elapsed
-        stage_timings["context_cache_staleness"] = staleness_elapsed
+        stage_timings["context_cache_lookup"] = cache_lookup_elapsed_ms
+        stage_timings["context_cache_staleness"] = staleness_elapsed_ms
         retrieval_trace_payload = self._retrieval_trace_payload(
             pipeline_result,
             stage_timings=stage_timings,
@@ -633,6 +675,7 @@ class ContextCacheService:
         """
         if response_mode is ResponseMode.NORMAL:
             raise ValueError("resolve_fast_with_connection requires a non-normal mode")
+        self._require_fast_mode_honorable_ablation(ablation)
         await TranscriptRebuildRepository(
             connection,
             self.runtime.clock,
@@ -726,19 +769,31 @@ class ContextCacheService:
             authority_context=authority_context,
             ablation=ablation,
         )
-        stage_timings["contract_lookup"] = perf_counter() - contract_started
+        stage_timings["contract_lookup"] = (perf_counter() - contract_started) * 1000.0
         contract_block = ContextComposer.render_contract_block(
             current_contract,
             resolved_policy,
         )
+        applied_override_params: dict[str, Any] = (
+            dict(ablation.override_retrieval_params or {})
+            if ablation is not None
+            else {}
+        )
         warmed_entry: ContextCacheEntry | None = None
         warmed_memory_summaries: list[MemorySummary] = []
         warmed_composed: ComposedContext | None = None
-        if (
-            response_mode is ResponseMode.SMART_FAST
-            and cache_identity is not None
-            and not _CACHE_BACKEND_BYPASS.get()
-        ):
+        warmed_cache_age_seconds: float | None = None
+        # The SAME predicate the normal path applies, not a second copy of it:
+        # this path used to carry its own weaker version, which is how a turn
+        # that had explicitly disabled the cache was still handed a warm entry.
+        warm_read_allowed = response_mode is ResponseMode.SMART_FAST and (
+            self._cache_read_allowed(
+                ablation=ablation,
+                cache_identity=cache_identity,
+                conversation=active_conversation,
+            )
+        )
+        if warm_read_allowed:
             warm_started = perf_counter()
             try:
                 raw_warm = await self.runtime.storage_backend.get_context_view(
@@ -751,27 +806,48 @@ class ContextCacheService:
                     exc_info=True,
                 )
                 raw_warm = None
-            stage_timings["smart_fast_warm_lookup"] = perf_counter() - warm_started
-            if raw_warm is not None and await self._entry_has_current_identity(
-                user_id=user_id,
-                raw_entry=raw_warm,
-                captured_identity=cache_identity,
-            ):
-                try:
-                    warmed_entry = ContextCacheEntry.model_validate(raw_warm)
-                except Exception:
-                    logger.warning(
-                        "Discarding malformed smart_fast warm entry for "
-                        "user_id=%s conversation_id=%s",
-                        user_id,
-                        conversation_id,
-                    )
-                    warmed_entry = None
-            elif raw_warm is not None:
-                await self._best_effort_delete_context_view(cache_key)
+            stage_timings["smart_fast_warm_lookup"] = (
+                perf_counter() - warm_started
+            ) * 1000.0
+            if raw_warm is not None:
+                # TWO questions, and this path used to ask only one of them. The
+                # identity triple answers "does this entry belong to the current
+                # user lifecycle"; the policy hashes answer "was it composed
+                # under the policy this turn just resolved". A manifest edit --
+                # or any policy change that bumps no lifecycle revision -- moves
+                # the second without moving the first, and the cache key carries
+                # neither hash, so without this check smart_fast keeps serving
+                # context composed under the OLD policy until the TTL expires.
+                # The normal path reaches the same verdict through the staleness
+                # scorer's `policy_prompt_hash_mismatch` and
+                # `effective_policy_hash_mismatch` discard signals; this path
+                # makes no staleness call at all, which is why it has to compare
+                # the hashes the entry already carries itself.
+                entry_is_servable = self._entry_matches_policy(
+                    raw_warm,
+                    resolved_policy,
+                ) and await self._entry_has_current_identity(
+                    user_id=user_id,
+                    raw_entry=raw_warm,
+                    captured_identity=cache_identity,
+                )
+                if entry_is_servable:
+                    try:
+                        warmed_entry = ContextCacheEntry.model_validate(raw_warm)
+                    except Exception:
+                        logger.warning(
+                            "Discarding malformed smart_fast warm entry for "
+                            "user_id=%s conversation_id=%s",
+                            user_id,
+                            conversation_id,
+                        )
+                        warmed_entry = None
+                else:
+                    await self._best_effort_delete_context_view(cache_key)
             if warmed_entry is not None:
                 warmed_composed = warmed_entry.composed_context
                 warmed_memory_summaries = list(warmed_entry.memory_summaries)
+                warmed_cache_age_seconds = self._cache_age_seconds(raw_warm)
         if warmed_composed is not None:
             composed_context = warmed_composed.model_copy(
                 update={"contract_block": contract_block}
@@ -797,6 +873,9 @@ class ContextCacheService:
             "raw_context_access_mode": "normal",
             "response_mode": response_mode.value,
             "fast_mode": True,
+            # Both are needed to read a row: "not present" alone cannot tell a
+            # genuine miss from a read this turn's ablation refused to make.
+            "smart_fast_warm_read_allowed": warm_read_allowed,
             "smart_fast_warm_entry_present": warm_present,
             "adaptive_gate": fast_adaptive_gate,
         }
@@ -809,11 +888,17 @@ class ContextCacheService:
             response_mode=response_mode.value,
             timestamp_iso=self.runtime.clock.now().isoformat(),
             privacy_enforcement=authority_context.effective_privacy_enforcement,
+            # Every key the caller requested is applied on this path or the turn
+            # was refused above, so the requested set IS the applied set.
+            applied_override_retrieval_params=applied_override_params,
         )
-        stage_timings["context_fast_assembly"] = perf_counter() - fast_started
+        stage_timings["context_fast_assembly"] = (
+            perf_counter() - fast_started
+        ) * 1000.0
         retrieval_diagnostics_for_guard = {
             "response_mode": response_mode.value,
             "fast_mode": True,
+            "smart_fast_warm_read_allowed": warm_read_allowed,
             "smart_fast_warm_entry_present": warm_present,
             "selected_memory_ids": list(composed_context.selected_memory_ids),
             "selected_memory_count": len(composed_context.selected_memory_ids),
@@ -828,19 +913,35 @@ class ContextCacheService:
             memory_summaries=warmed_memory_summaries,
             detected_needs=[],
             stage_timings=stage_timings,
-            from_cache=False,
+            # A served warm entry IS a cache hit of the smart_fast key space:
+            # the composed context and every memory summary below come from the
+            # stored entry, only the contract block was re-read live. Reporting
+            # from_cache=False here made a warm serve indistinguishable from a
+            # recomputed turn in persisted telemetry and in the latency probe.
+            # ``staleness`` stays at the conservative maximum because this path
+            # deliberately makes no staleness call: 1.0 means "never scored",
+            # never "scored as fresh".
+            from_cache=warm_present,
             staleness=1.0,
-            next_refresh_strategy="sync",
-            cache_age_seconds=None,
-            cache_source=None,
+            next_refresh_strategy="cache" if warm_present else "sync",
+            cache_age_seconds=warmed_cache_age_seconds,
+            cache_source="cache_hit" if warm_present else None,
             need_detection_skipped=True,
             cache_key=cache_key,
             source_retrieval_plan=source_retrieval_plan,
             scored_candidates=[],
             candidate_custody=[],
-            retrieval_custody_v2_status="cache_hit_no_candidate_custody",
+            retrieval_custody_v2_status=(
+                "cache_hit_no_candidate_custody"
+                if warm_present
+                else "fast_mode_no_candidate_custody"
+            ),
             retrieval_sufficiency=None,
-            sufficiency_diagnostics_v1_status="cache_hit_no_sufficiency_diagnostics",
+            sufficiency_diagnostics_v1_status=(
+                "cache_hit_no_sufficiency_diagnostics"
+                if warm_present
+                else "fast_mode_no_sufficiency_diagnostics"
+            ),
             candidate_search_summary={},
             retrieval_diagnostics_for_guard=retrieval_diagnostics_for_guard,
             retrieval_trace=retrieval_trace.model_dump(mode="json"),
@@ -863,6 +964,85 @@ class ContextCacheService:
                 else None
             ),
         )
+
+    def _cache_read_allowed(
+        self,
+        *,
+        ablation: AblationConfig | None,
+        cache_identity: UserLifecycleIdentity | None,
+        conversation: dict[str, Any],
+    ) -> bool:
+        """Decide whether a stored context view may be read for this turn.
+
+        One definition for both resolve paths. The fast path used to carry its
+        own, weaker copy, so an ablation that switched the cache off was
+        honored on one path and ignored on the other; sharing the predicate is
+        what keeps a knob added to ``_cache_enabled`` binding on both.
+        """
+
+        return (
+            self._cache_enabled(ablation)
+            and cache_identity is not None
+            and not _CACHE_BACKEND_BYPASS.get()
+            and str(conversation.get("mind_topology") or "unimind") != "ojocentauri"
+        )
+
+    @staticmethod
+    def _require_fast_mode_honorable_ablation(ablation: AblationConfig | None) -> None:
+        """Refuse a fast-mode turn that asks for work this path never performs.
+
+        The fast path runs no retrieval pipeline, so every knob that configures
+        planning, candidate search, scoring or composition is unreachable from
+        here. Ignoring one silently is exactly how a run could record an
+        override as requested, apply nothing, and still report a normal turn:
+        with no pipeline to apply it to, the alternatives are failing fast or
+        lying, so this fails fast and names the offenders.
+
+        Accepted, because the fast path really does honor them:
+        ``privacy_enforcement`` (folded into the authority context and the
+        contract lookup's sensitivity gating), ``skip_contract_memory``,
+        ``disable_context_cache`` (and every other knob ``_cache_enabled``
+        reads, which now refuse the warm read here too), and the context
+        envelope, which the calling surface applies to the transcript and
+        prepared-context sections it builds itself.
+
+        Also accepted: every knob that asks a stage NOT to run. ``skip_*`` and
+        ``applicability_gate_mode="off"`` are satisfied by construction on a
+        path that runs none of those stages, so refusing them would reject
+        requests the mode already fulfills.
+        """
+        if ablation is None:
+            return
+        unsupported: list[str] = []
+        dropped_override_keys = sorted(
+            set(ablation.override_retrieval_params or {})
+            - FAST_MODE_HONORABLE_OVERRIDE_KEYS
+        )
+        if dropped_override_keys:
+            honorable = ", ".join(sorted(FAST_MODE_HONORABLE_OVERRIDE_KEYS))
+            unsupported.append(
+                "override_retrieval_params "
+                f"{', '.join(dropped_override_keys)} (the retrieval pipeline is "
+                f"the only consumer; {honorable} is applied by the caller)"
+            )
+        if ablation.composer_strategy not in {None, "score_first"}:
+            unsupported.append(f"composer_strategy={ablation.composer_strategy!r}")
+        if ablation.applicability_gate_mode in {"shadow", "enforced"}:
+            unsupported.append(
+                f"applicability_gate_mode={ablation.applicability_gate_mode!r}"
+            )
+        if ablation.force_all_scopes:
+            unsupported.append("force_all_scopes=True")
+        if ablation.enable_llm_coverage_expansion:
+            unsupported.append("enable_llm_coverage_expansion=True")
+        if ablation.enable_final_answer_evidence_pack:
+            unsupported.append("enable_final_answer_evidence_pack=True")
+        if unsupported:
+            raise FastModeAblationUnsupportedError(
+                "fast/smart_fast turns cannot honor: "
+                + "; ".join(unsupported)
+                + ". Run this ablation in normal response mode."
+            )
 
     async def _fast_contract_lookup(
         self,
@@ -997,6 +1177,16 @@ class ContextCacheService:
         to SQLite -- runs outside the guard on its own connection, so it cannot
         starve a foreground same-user turn waiting on the same guard.
         """
+        # The warm runs after its turn's row is written, so its provider calls
+        # belong to no persisted turn. It gets its own ISOLATED meter: this task
+        # holds a copy of the spawning turn's context, so merely pushing a meter
+        # would still charge every round-trip to a row nobody updates again --
+        # and the proxy surface spawns this from inside its own turn meter, so
+        # the scheduler unbinding first is not enough on its own. The totals are
+        # logged below, which is the only honest home they have until a
+        # background-work telemetry surface exists.
+        warm_call_meter = self.runtime.llm_client.begin_isolated_call_meter()
+        warm_started_at = perf_counter()
         try:
             connection = await open_connection(self.runtime.database_path)
             try:
@@ -1030,7 +1220,8 @@ class ContextCacheService:
             logger.info(
                 "smart_fast warm completed user_id=%s conversation_id=%s "
                 "cache_key=%s published=%s selected_memory_ids=%d from_cache=%s "
-                "adaptive_gate_status=%s",
+                "adaptive_gate_status=%s llm_calls=%d llm_failed_calls=%d "
+                "llm_latency_ms=%.1f wall_ms=%.1f llm_by_purpose=%s",
                 user_id,
                 conversation_id,
                 resolution.cache_key,
@@ -1038,14 +1229,27 @@ class ContextCacheService:
                 len(resolution.composed_context.selected_memory_ids),
                 resolution.from_cache,
                 gate_status.get("status") if isinstance(gate_status, dict) else None,
+                warm_call_meter.total_calls,
+                warm_call_meter.failed_calls,
+                warm_call_meter.total_latency_ms,
+                (perf_counter() - warm_started_at) * 1000.0,
+                {
+                    purpose: (usage.calls, round(usage.latency_ms, 1))
+                    for purpose, usage in sorted(warm_call_meter.by_purpose.items())
+                },
             )
         except Exception:
             logger.warning(
-                "smart_fast warm failed for user_id=%s conversation_id=%s",
+                "smart_fast warm failed for user_id=%s conversation_id=%s after "
+                "llm_calls=%d llm_latency_ms=%.1f",
                 user_id,
                 conversation_id,
+                warm_call_meter.total_calls,
+                warm_call_meter.total_latency_ms,
                 exc_info=True,
             )
+        finally:
+            self.runtime.llm_client.end_turn_call_meter(warm_call_meter)
 
     async def publish_pending_cache_entry(
         self,
@@ -1224,6 +1428,26 @@ class ContextCacheService:
             derivation_revision=derivation_revision,
             conversation_lifecycle_epoch=conversation_lifecycle_epoch,
             conversation_source_revision=conversation_source_revision,
+        )
+
+    async def drop_recent_window(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> int:
+        """Delete whatever recent window a conversation still has published.
+
+        Used when a caller knows the published value is superseded but does not
+        hold the identity it was published under, so the identity-scoped
+        ``discard_recent_window_publication`` cannot reach it. The key is
+        derived from ``(user_id, conversation_id)``, so this can only ever
+        remove that conversation's own entry.
+        """
+
+        return await self.runtime.storage_backend.delete_recent_window_for_conversation(
+            user_id,
+            conversation_id,
         )
 
     async def invalidate_conversation_cache(
@@ -1569,6 +1793,27 @@ class ContextCacheService:
             )
         finally:
             await close_connection(connection)
+
+    @staticmethod
+    def _entry_matches_policy(
+        raw_entry: dict[str, Any],
+        resolved_policy: ResolvedRetrievalPolicy,
+    ) -> bool:
+        """Whether a stored entry was composed under the policy in force now.
+
+        Both hashes, because they answer different questions: the prompt hash
+        covers the manifest's own content, and the effective hash covers the
+        fully resolved runtime policy after workspace, conversation and
+        operational overlays. Either can move without the other.
+
+        The effective hash is computed here rather than by the caller so a turn
+        that finds no entry never pays for it.
+        """
+        return (
+            raw_entry.get("policy_prompt_hash") == resolved_policy.prompt_hash
+            and raw_entry.get("effective_policy_hash")
+            == compute_effective_policy_hash(resolved_policy)
+        )
 
     @staticmethod
     def _entry_matches_identity(

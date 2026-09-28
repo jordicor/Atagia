@@ -16,6 +16,8 @@ from atagia.memory.coverage_keys import (
     resolve_member_keys,
 )
 from atagia.memory.high_risk_policy import HighRiskDisclosureAction, disclosure_action
+from atagia.memory.date_resolution import read_persisted_date_resolution
+from atagia.memory.extraction_temporal import TemporalIntervalResolution, resolved_endpoint_timestamp
 from atagia.memory.intimacy_boundary_policy import candidate_allows_intimacy_boundary
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.models.schemas_memory import (
@@ -868,6 +870,58 @@ class ContextComposer:
         )
 
     @classmethod
+    def _complete_rendered_packet_spans(
+        cls,
+        candidate: ScoredCandidate,
+        entry: str,
+        *,
+        query_text: str | None,
+    ) -> tuple[str, set[str]]:
+        """Complete only packet spans already visible in a selected entry."""
+        memory_object = candidate.memory_object
+        bounded_lines = cls._evidence_packet_lines(memory_object)
+        complete_lines = cls._evidence_packet_lines(
+            memory_object, complete_spans=True
+        )
+        lines = entry.split("\n")
+        completed_keys: set[str] = set()
+        for bounded, complete in zip(bounded_lines, complete_lines):
+            if bounded == complete or not bounded.lstrip().startswith(
+                ("source_quote:", "trigger_quote:")
+            ):
+                continue
+            try:
+                index = lines.index(bounded)
+            except ValueError:
+                continue
+            lines[index] = complete
+            key = cls._normalize_quote_for_compare(
+                complete.split(":", 1)[1].strip()
+            )
+            if len(key) >= cls.RENDERED_SOURCE_QUOTE_DEDUPE_MIN_CHARS:
+                completed_keys.add(key)
+
+        if cls._is_fact_facet_memory_object(memory_object):
+            bounded_span, _ = cls._best_evidence_packet_quote_with_role_for_query(
+                memory_object, query_text=query_text
+            )
+            complete_span, _ = cls._best_evidence_packet_quote_with_role_for_query(
+                memory_object, query_text=query_text, complete=True
+            )
+            bounded_line = f"   source_span: {bounded_span}"
+            if bounded_span and complete_span != bounded_span:
+                try:
+                    index = lines.index(bounded_line)
+                except ValueError:
+                    pass
+                else:
+                    lines[index] = f"   source_span: {complete_span}"
+                    key = cls._normalize_quote_for_compare(complete_span)
+                    if len(key) >= cls.RENDERED_SOURCE_QUOTE_DEDUPE_MIN_CHARS:
+                        completed_keys.add(key)
+        return "\n".join(lines), completed_keys
+
+    @classmethod
     def _upgrade_entries_with_source_quotes(
         cls,
         selection: _MemorySelection,
@@ -879,20 +933,41 @@ class ContextComposer:
         redact_high_risk_secret_literals: bool,
         fact_facet_span_coadmission_enabled: bool,
     ) -> None:
-        """Attach source quotes to already-selected entries, in place.
+        """Complete selected packet spans before funding optional source quotes.
 
-        Walks the selected entries in rank order and, for ranks within the
-        per-composition ``max_entries`` cap, upgrades each entry's rendered
-        text to a quote-bearing form (full quote -> compact quote -> keep
-        bare) funded only by the budget left over after every bare admission.
-        Selection membership and order never change; only the rendered text of
-        an entry and the running leftover budget are mutated. The cross-entry
-        source-quote dedup chain is replayed here so a quote rendered on an
-        earlier entry still suppresses its duplicate on a later one.
+        All bare entries have already been admitted. Each expansion is paid
+        from the leftover budget, so it cannot change selection membership or
+        displace a later memory. If a complete entry does not fit, its bounded
+        rendering remains unchanged.
         """
-        if not source_quote_options.enabled or not selection.selected:
+        if not selection.selected:
             return
         leftover_budget = selection.remaining_budget
+        completed_entries = [False] * len(selection.selected)
+        completed_keys_by_entry: list[set[str]] = []
+        bounded_keys_by_entry: list[set[str]] = []
+        for index, candidate in enumerate(selection.selected):
+            current_block = selection.memory_lines[index]
+            bounded_keys_by_entry.append(
+                cls._source_quote_keys_from_rendered_memory_entry(current_block)
+            )
+            complete_block, completed_keys = cls._complete_rendered_packet_spans(
+                candidate, current_block, query_text=query_text
+            )
+            token_delta = (
+                cls.estimate_tokens(complete_block)
+                - cls.estimate_tokens(current_block)
+            )
+            if complete_block != current_block and token_delta <= leftover_budget:
+                selection.memory_lines[index] = complete_block
+                leftover_budget -= token_delta
+                completed_entries[index] = True
+                completed_keys_by_entry.append(completed_keys)
+            else:
+                completed_keys_by_entry.append(set())
+
+        if not source_quote_options.enabled:
+            return
         rendered_source_quote_keys: set[str] = set()
         for index, candidate in enumerate(selection.selected):
             rank = index + 1
@@ -919,12 +994,18 @@ class ContextComposer:
                     suppressed_source_quote_keys=frozenset(
                         rendered_source_quote_keys
                     ),
+                    completed_packet_spans=completed_entries[index],
+                    completed_packet_quote_keys=frozenset(
+                        completed_keys_by_entry[index]
+                    ),
                 )
                 if upgraded_block is not None:
                     upgraded_tokens = cls.estimate_tokens(upgraded_block)
                     leftover_budget -= upgraded_tokens - current_tokens
                     selection.memory_lines[index] = upgraded_block
                     current_block = upgraded_block
+            rendered_source_quote_keys.update(bounded_keys_by_entry[index])
+            rendered_source_quote_keys.update(completed_keys_by_entry[index])
             rendered_source_quote_keys.update(
                 cls._source_quote_keys_from_rendered_memory_entry(current_block)
             )
@@ -944,6 +1025,8 @@ class ContextComposer:
         redact_high_risk_secret_literals: bool,
         fact_facet_span_coadmission_enabled: bool,
         suppressed_source_quote_keys: frozenset[str],
+        completed_packet_spans: bool,
+        completed_packet_quote_keys: frozenset[str],
     ) -> str | None:
         """Return the richest quote-bearing block that fits leftover budget.
 
@@ -962,7 +1045,12 @@ class ContextComposer:
             redact_high_risk_secret_literals=redact_high_risk_secret_literals,
             fact_facet_span_coadmission_enabled=fact_facet_span_coadmission_enabled,
             suppressed_source_quote_keys=suppressed_source_quote_keys,
+            completed_packet_quote_keys=completed_packet_quote_keys,
         )
+        if completed_packet_spans:
+            full_block, _ = cls._complete_rendered_packet_spans(
+                candidate, full_block, query_text=query_text
+            )
         full_tokens = cls.estimate_tokens(full_block)
         if full_tokens <= bare_tokens:
             # No quote was added (or it shrank the entry); nothing to upgrade.
@@ -984,7 +1072,12 @@ class ContextComposer:
             redact_high_risk_secret_literals=redact_high_risk_secret_literals,
             fact_facet_span_coadmission_enabled=fact_facet_span_coadmission_enabled,
             suppressed_source_quote_keys=suppressed_source_quote_keys,
+            completed_packet_quote_keys=completed_packet_quote_keys,
         )
+        if completed_packet_spans:
+            compact_block, _ = cls._complete_rendered_packet_spans(
+                candidate, compact_block, query_text=query_text
+            )
         compact_tokens = cls.estimate_tokens(compact_block)
         if compact_tokens <= bare_tokens:
             return None
@@ -2324,6 +2417,9 @@ class ContextComposer:
             "supporting_quote": cls._truncate_inline(source_quote, 300),
             "quote_source": quote_source,
             "date": date,
+            "date_certainty": normalization.get("date_certainty"),
+            "date_resolution_status": normalization["date_resolution_status"],
+            "date_kind": normalization.get("date_kind"),
             "speaker": speaker,
             "source": source,
             "support_kind": support_kind,
@@ -2348,7 +2444,16 @@ class ContextComposer:
             lines.append(f"- claim: {item['claim']}")
             quote = str(item.get("supporting_quote") or "").strip()
             lines.append(f"- supporting_quote: {quote or 'not available'}")
-            lines.append(f"- date: {item.get('date') or 'unknown'}")
+            status = str(item.get("date_resolution_status") or "unprocessed")
+            date_label = item.get("date") or (
+                "unknown" if status == "completed" else status.replace("_", " ")
+            )
+            lines.append(f"- date: {date_label}")
+            if item.get("date_kind"):
+                lines.append(f"- date_kind: {item['date_kind']}")
+            lines.append(f"- date_resolution_status: {status}")
+            if item.get("date_certainty"):
+                lines.append(f"- date_certainty: {item['date_certainty']}")
             lines.append(f"- speaker: {item.get('speaker') or 'unknown'}")
             lines.append(f"- source: {item.get('source') or item.get('memory_id')}")
             support_kind = str(item.get("support_kind") or "").strip()
@@ -2377,19 +2482,26 @@ class ContextComposer:
         memory_object: dict[str, Any],
         *,
         query_text: str | None,
+        complete: bool = False,
     ) -> tuple[str, str]:
         candidates = cls._evidence_packet_quote_candidates(memory_object)
         if not candidates:
             return ("", "")
         if not query_text:
-            return candidates[0]
-        return max(
-            candidates,
-            key=lambda candidate: (
-                cls._quote_query_relevance(candidate[0], query_text),
-                1 if candidate[1] == "source" else 0,
-            ),
-        )
+            selected_index = 0
+        else:
+            selected_index = max(
+                range(len(candidates)),
+                key=lambda index: (
+                    cls._quote_query_relevance(candidates[index][0], query_text),
+                    1 if candidates[index][1] == "source" else 0,
+                ),
+            )
+        if complete:
+            return cls._evidence_packet_quote_candidates(
+                memory_object, complete=True
+            )[selected_index]
+        return candidates[selected_index]
 
     @classmethod
     def _best_evidence_packet_quote_with_role(
@@ -2403,6 +2515,8 @@ class ContextComposer:
     def _evidence_packet_quote_candidates(
         cls,
         memory_object: dict[str, Any],
+        *,
+        complete: bool = False,
     ) -> list[tuple[str, str]]:
         packets = memory_object.get("evidence_packets")
         if not isinstance(packets, list):
@@ -2418,8 +2532,8 @@ class ContextComposer:
                 for span in spans:
                     if not isinstance(span, dict) or span.get("span_role") != span_role:
                         continue
-                    quote = str(span.get("quote_text") or "").strip()
-                    if not quote:
+                    quote = str(span.get("quote_text") or "")
+                    if not quote.strip():
                         continue
                     prefix_parts: list[str] = []
                     metadata = span.get("metadata_json") or {}
@@ -2434,9 +2548,12 @@ class ContextComposer:
                     if seq is not None:
                         prefix_parts.append(f"seq {seq}")
                     prefix = f"{' '.join(prefix_parts)}: " if prefix_parts else ""
-                    candidates.append(
-                        (cls._truncate_inline(f"{prefix}{quote}", 300), span_role)
+                    rendered = (
+                        f"{prefix}{quote}"
+                        if complete
+                        else cls._truncate_inline(f"{prefix}{quote.strip()}", 300)
                     )
+                    candidates.append((rendered, span_role))
         return candidates
 
     @classmethod
@@ -2492,18 +2609,109 @@ class ContextComposer:
                 return value
         return ""
 
+    @staticmethod
+    def _validated_date_interval(memory_object: dict[str, Any]) -> TemporalIntervalResolution | None:
+        """Verify typed bounds against their persisted inputs before rendering them."""
+        payload = memory_object.get("payload_json") or {}
+        canonical_text = str(memory_object.get("canonical_text") or "")
+        if not isinstance(payload, dict) or read_persisted_date_resolution(
+            payload, canonical_text, payload.get("source_occurred_at"),
+        ) is None:
+            return None
+        try:
+            interval = TemporalIntervalResolution.model_validate(payload.get("date_interval"))
+            for endpoint, field, is_end in (
+                (interval.start, "valid_from", False), (interval.end, "valid_to", True),
+            ):
+                if endpoint is not None and endpoint.date_resolution is not None:
+                    if read_persisted_date_resolution(
+                        {"date_resolution": endpoint.date_resolution.model_dump()},
+                        (endpoint.endpoint.source_quote or canonical_text)
+                        if endpoint.endpoint.calendar_period is not None
+                        else (endpoint.endpoint.text or canonical_text),
+                        endpoint.source_occurred_at,
+                    ) is None:
+                        return None
+                actual = resolved_endpoint_timestamp(endpoint, is_end=is_end)
+                if actual != (memory_object.get(field) or None):
+                    return None
+            if memory_object.get("valid_from") and memory_object.get("valid_to"):
+                if datetime.fromisoformat(memory_object["valid_from"]) > datetime.fromisoformat(memory_object["valid_to"]):
+                    return None
+            return interval
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _format_validity_interval(memory_object: dict[str, Any]) -> str:
+        start = str(memory_object.get("valid_from") or "").strip()
+        end = str(memory_object.get("valid_to") or "").strip()
+        if start and end:
+            return f"from {start} through {end}"
+        if start:
+            return f"from {start}"
+        if end:
+            return f"through {end}"
+        return ""
+
+    @staticmethod
+    def _interval_uses_point_date(
+        candidate: ScoredCandidate,
+        memory_object: dict[str, Any],
+        interval: TemporalIntervalResolution,
+    ) -> bool:
+        """An event may retain its calendar day when only its timezone is unknown."""
+        return (
+            memory_object.get("temporal_type") == "event_triggered"
+            and candidate.resolved_date is not None
+            and not (memory_object.get("valid_from") or memory_object.get("valid_to"))
+            and all(
+                endpoint is None or (
+                    endpoint.endpoint.text is None
+                    and endpoint.endpoint.period == "day"
+                    and endpoint.date_resolution is not None
+                    and endpoint.date_resolution.resolved_date == candidate.resolved_date
+                )
+                for endpoint in (interval.start, interval.end)
+            )
+        )
+
     @classmethod
     def _answer_evidence_date(
         cls,
         candidate: ScoredCandidate,
         memory_object: dict[str, Any],
     ) -> str:
+        payload = memory_object.get("payload_json") or {}
+        if isinstance(payload, dict) and "date_interval" in payload:
+            interval = cls._validated_date_interval(memory_object)
+            if interval is None:
+                return ""
+            rendered = cls._format_validity_interval(memory_object)
+            if rendered:
+                if interval.start is not None and not memory_object.get("valid_from"):
+                    rendered = f"start not resolved; {rendered}"
+                if interval.end is not None and not memory_object.get("valid_to"):
+                    rendered = f"{rendered}; end not resolved"
+                return rendered
+            if not cls._interval_uses_point_date(candidate, memory_object, interval):
+                # A representative point cannot describe an unresolved state interval.
+                return ""
+        elif candidate.date_resolution_status == "unprocessed":
+            # Preserve known legacy intervals while they await date reprocessing.
+            rendered = cls._format_validity_interval(memory_object)
+            if rendered:
+                return rendered
         if candidate.resolved_date:
+            if candidate.date_certainty == "uncertain":
+                return f"approximately {candidate.resolved_date} (representative date)"
             return candidate.resolved_date
-        for key in ("valid_from", "valid_to", "occurred_at", "created_at"):
-            value = str(memory_object.get(key) or "").strip()
-            if value:
-                return value
+        if candidate.date_resolution_status in {"completed", "pending_analysis", "stale"}:
+            # A source timestamp is not a replacement for unresolved event timing.
+            return ""
+        occurred_at = str(memory_object.get("occurred_at") or "").strip()
+        if occurred_at:
+            return f"source timestamp: {occurred_at}"
         packets = memory_object.get("evidence_packets")
         if isinstance(packets, list):
             for packet in packets:
@@ -2517,11 +2725,13 @@ class ContextComposer:
                         continue
                     occurred_at = str(span.get("occurred_at") or "").strip()
                     if occurred_at:
-                        return occurred_at
+                        return f"source timestamp: {occurred_at}"
         source_window = cls._candidate_source_window(candidate)
         if source_window is not None:
             start, end = source_window
-            return start if start == end or not end else f"{start} to {end}"
+            if start == end or not end:
+                return f"source timestamp: {start}"
+            return f"source window: {start} to {end}"
         return ""
 
     @classmethod
@@ -2782,7 +2992,10 @@ class ContextComposer:
             payload_json = {}
         normalized: dict[str, Any] = {
             "quote_source": quote_source,
+            "date_resolution_status": candidate.date_resolution_status,
         }
+        if candidate.date_certainty is not None:
+            normalized["date_certainty"] = candidate.date_certainty
         source_message_ids = cls._candidate_source_message_ids(candidate)
         if source_message_ids:
             normalized["source_message_ids"] = source_message_ids
@@ -2798,7 +3011,47 @@ class ContextComposer:
             value = str(memory_object.get(key) or "").strip()
             if value:
                 normalized[key] = value
-        if candidate.resolved_date:
+        if "date_interval" in payload_json:
+            normalized["date_kind"] = "interval"
+            interval = cls._validated_date_interval(memory_object)
+            if interval is not None:
+                normalized["date_interval"] = interval.model_dump(mode="json")
+                normalized["point_date_resolution"] = payload_json.get("date_resolution")
+                unresolved = [
+                    endpoint for endpoint, field in (
+                        (interval.start, "valid_from"), (interval.end, "valid_to"),
+                    ) if endpoint is not None and not memory_object.get(field)
+                ]
+                pending = any(
+                    endpoint.date_resolution is not None
+                    and endpoint.date_resolution.status == "pending_analysis"
+                    for endpoint in unresolved
+                )
+                uncertain = any(
+                    endpoint.date_resolution is not None
+                    and endpoint.date_resolution.certainty == "uncertain"
+                    for endpoint in unresolved
+                )
+                if cls._interval_uses_point_date(candidate, memory_object, interval):
+                    normalized["date_kind"] = "point"
+                    normalized["resolved_date"] = candidate.resolved_date
+                else:
+                    normalized["date_resolution_status"] = "pending_analysis" if pending else "completed"
+                    if pending:
+                        certainty = None
+                    elif uncertain:
+                        certainty = "uncertain"
+                    elif unresolved or not (memory_object.get("valid_from") or memory_object.get("valid_to")):
+                        certainty = "unknown"
+                    else:
+                        certainty = "exact"
+                    normalized["date_certainty"] = certainty
+            else:
+                normalized["date_resolution_status"] = "stale"
+                normalized.pop("date_certainty", None)
+                normalized.pop("valid_from", None)
+                normalized.pop("valid_to", None)
+        elif candidate.resolved_date:
             normalized["resolved_date"] = candidate.resolved_date
         occurred_at = cls._first_evidence_packet_occurred_at(memory_object)
         if occurred_at:
@@ -3844,41 +4097,26 @@ class ContextComposer:
         redact_high_risk_secret_literals: bool = True,
         fact_facet_span_coadmission_enabled: bool = False,
         suppressed_source_quote_keys: frozenset[str] = frozenset(),
+        completed_packet_quote_keys: frozenset[str] = frozenset(),
     ) -> str:
         memory_object = candidate.memory_object
-        confidence = float(memory_object.get("confidence", 0.0))
         payload_json = memory_object.get("payload_json") or {}
         is_conversation_chunk = (
             memory_object.get("object_type") == "summary_view"
             and isinstance(payload_json, dict)
             and payload_json.get("summary_kind") == "conversation_chunk"
         )
-        metadata_parts = [
-            f"{memory_object.get('object_type')}",
-            f"confidence: {confidence:.2f}",
-            f"scope: {memory_object.get('scope')}",
-        ]
-        privacy_level = memory_object.get("privacy_level")
-        if privacy_level is not None:
-            if redact_high_risk_secret_literals:
-                metadata_parts.append(f"privacy_level: {privacy_level}")
-            else:
-                metadata_parts.append(
-                    f"privacy_classification_non_blocking: level_{privacy_level}"
-                )
-        memory_category = str(memory_object.get("memory_category") or "").strip()
-        if memory_category:
-            if redact_high_risk_secret_literals:
-                metadata_parts.append(f"memory_category: {memory_category}")
-            else:
-                metadata_parts.append(
-                    f"memory_category_non_blocking: {memory_category}"
-                )
-        intimacy_boundary = str(memory_object.get("intimacy_boundary") or "").strip()
-        if intimacy_boundary and intimacy_boundary != "ordinary":
-            metadata_parts.append(f"intimacy_boundary: {intimacy_boundary}")
-        if bool(memory_object.get("preserve_verbatim")):
-            metadata_parts.append("preserve_verbatim: true")
+        # Visible per-entry metadata is intentionally minimal: a kind tag and
+        # a resolved date or validity interval. Scoring, privacy, and source bookkeeping stays
+        # in the data model but out of the prompt. The date follows the same
+        # precedence as the answer-evidence pack and is only rendered when a
+        # usable value exists, so unresolved placeholders never reach the
+        # prompt. Cross-boundary attribution notes stay visible because the
+        # responder needs them to avoid misattributing the fact.
+        metadata_parts = [f"{memory_object.get('object_type')}"]
+        entry_date = ContextComposer._answer_evidence_date(candidate, memory_object)
+        if entry_date:
+            metadata_parts.append(f"date: {entry_date}")
         presence_note = ContextComposer._presence_attribution_note(memory_object)
         if presence_note:
             metadata_parts.append(f"presence: {presence_note}")
@@ -3894,37 +4132,11 @@ class ContextComposer:
         )
         if realm_note:
             metadata_parts.append(f"realm: {realm_note}")
-        temporal_type = str(memory_object.get("temporal_type") or "unknown")
-        valid_from = memory_object.get("valid_from")
-        valid_to = memory_object.get("valid_to")
-        if valid_from or valid_to:
-            if temporal_type == "event_triggered":
-                metadata_parts.append(
-                    f"event_time: {valid_from or '?'} to {valid_to or '?'}"
-                )
-            else:
-                metadata_parts.append(
-                    f"valid_window: {valid_from or '?'} to {valid_to or '?'}"
-                )
-        source_window = ContextComposer._candidate_source_window(candidate)
-        if source_window is not None:
-            source_window_start, source_window_end = source_window
-            metadata_parts.append(
-                f"source_window: {source_window_start or '?'} to {source_window_end or '?'}"
-            )
-        if candidate.resolved_date:
-            metadata_parts.append(f"resolved_date: {candidate.resolved_date}")
         disclosure = ContextComposer._disclosure_action(memory_object)
         withhold_literal = (
             redact_high_risk_secret_literals
             and disclosure is HighRiskDisclosureAction.WITHHOLD_SECRET_LITERAL
         )
-        if withhold_literal:
-            metadata_parts.append(f"disclosure_action: {disclosure.value}")
-        elif disclosure is HighRiskDisclosureAction.WITHHOLD_SECRET_LITERAL:
-            metadata_parts.append(
-                "privacy_restrictions_inactive: high_risk_secret_literal_unredacted"
-            )
         memory_text = (
             "Protected high-risk memory present; raw value withheld. "
             "Use a host-managed secure reveal or verification flow."
@@ -3951,7 +4163,6 @@ class ContextComposer:
                 )
             ):
                 coadmitted_source_span = candidate_source_span
-                metadata_parts.append("fact_facet_span_coadmitted: true")
                 memory_text = f"source_span: {coadmitted_source_span}"
         lines = [f"{index}. ({', '.join(metadata_parts)})\n   {memory_text}"]
         if not withhold_literal:
@@ -3987,6 +4198,7 @@ class ContextComposer:
                     options=source_quote_options or _SourceQuoteOptions(enabled=False),
                     redact_high_risk_secret_literals=redact_high_risk_secret_literals,
                     query_text=query_text,
+                    completed_packet_quote_keys=completed_packet_quote_keys,
                 )
                 if (
                     source_quote
@@ -4008,6 +4220,7 @@ class ContextComposer:
                     options=source_quote_options or _SourceQuoteOptions(enabled=False),
                     redact_high_risk_secret_literals=redact_high_risk_secret_literals,
                     query_text=query_text,
+                    completed_packet_quote_keys=completed_packet_quote_keys,
                 )
                 if source_quote and not ContextComposer._source_quote_is_suppressed(
                     source_quote,
@@ -4081,7 +4294,11 @@ class ContextComposer:
         )
 
     @staticmethod
-    def _evidence_packet_lines(memory_object: dict[str, Any]) -> list[str]:
+    def _evidence_packet_lines(
+        memory_object: dict[str, Any],
+        *,
+        complete_spans: bool = False,
+    ) -> list[str]:
         packets = memory_object.get("evidence_packets")
         if not isinstance(packets, list) or not packets:
             return []
@@ -4114,6 +4331,7 @@ class ContextComposer:
                         span_role="source",
                         label="source_quote",
                         max_spans=2,
+                        complete_spans=complete_spans,
                     )
                 )
                 lines.extend(
@@ -4122,6 +4340,7 @@ class ContextComposer:
                         span_role="trigger",
                         label="trigger_quote",
                         max_spans=2,
+                        complete_spans=complete_spans,
                     )
                 )
             rationale = str(packet.get("rationale") or "").strip()
@@ -4139,6 +4358,7 @@ class ContextComposer:
         span_role: str,
         label: str,
         max_spans: int,
+        complete_spans: bool = False,
     ) -> list[str]:
         lines: list[str] = []
         for span in spans:
@@ -4146,8 +4366,8 @@ class ContextComposer:
                 break
             if not isinstance(span, dict) or span.get("span_role") != span_role:
                 continue
-            quote = str(span.get("quote_text") or "").strip()
-            if not quote:
+            quote = str(span.get("quote_text") or "")
+            if not quote.strip():
                 continue
             prefix_parts: list[str] = []
             metadata = span.get("metadata_json") or {}
@@ -4162,10 +4382,14 @@ class ContextComposer:
             if seq is not None:
                 prefix_parts.append(f"seq {seq}")
             prefix = f"{' '.join(prefix_parts)}: " if prefix_parts else ""
-            lines.append(
-                f"   {label}: "
-                + ContextComposer._truncate_inline(f"{prefix}{quote}", 260)
+            rendered = (
+                f"{prefix}{quote}"
+                if complete_spans
+                else ContextComposer._truncate_inline(
+                    f"{prefix}{quote.strip()}", 260
+                )
             )
+            lines.append(f"   {label}: {rendered}")
         return lines
 
     @staticmethod
@@ -4692,6 +4916,7 @@ class ContextComposer:
         options: _SourceQuoteOptions,
         redact_high_risk_secret_literals: bool,
         query_text: str | None = None,
+        completed_packet_quote_keys: frozenset[str] = frozenset(),
     ) -> str:
         if not options.enabled:
             return ""
@@ -4711,7 +4936,7 @@ class ContextComposer:
         if not source_message_ids:
             return ""
 
-        message_candidates: list[tuple[int, float, dict[str, Any], str]] = []
+        message_candidates: list[tuple[int, float, str, str]] = []
         for index, source_message_id in enumerate(source_message_ids):
             message = source_messages_by_id.get(source_message_id)
             if message is None or not cls._message_allows_source_quote(message):
@@ -4719,11 +4944,23 @@ class ContextComposer:
             text = str(message.get("text", "")).strip()
             if not text:
                 continue
+            prefix_parts = [str(message.get("role") or "unknown").strip() or "unknown"]
+            occurred_at = str(message.get("occurred_at") or "").strip()
+            if occurred_at:
+                prefix_parts.append(f"@ {occurred_at}")
+            seq = message.get("seq")
+            if seq is not None:
+                prefix_parts.append(f"seq {seq}")
+            prefix = " ".join(prefix_parts)
+            if cls._source_quote_is_suppressed(
+                f"{prefix}: {text}", completed_packet_quote_keys
+            ):
+                continue
             message_candidates.append(
                 (
                     index,
                     cls._quote_query_relevance(text, query_text),
-                    message,
+                    prefix,
                     text,
                 )
             )
@@ -4741,7 +4978,7 @@ class ContextComposer:
 
         rendered: list[str] = []
         total_chars = 0
-        for _, _, message, text in message_candidates:
+        for _, _, prefix, text in message_candidates:
             if len(rendered) >= options.max_messages:
                 break
             text = cls._source_quote_snippet(
@@ -4749,14 +4986,7 @@ class ContextComposer:
                 max_chars=options.max_message_chars,
                 query_text=query_text,
             )
-            prefix_parts = [str(message.get("role") or "unknown").strip() or "unknown"]
-            occurred_at = str(message.get("occurred_at") or "").strip()
-            if occurred_at:
-                prefix_parts.append(f"@ {occurred_at}")
-            seq = message.get("seq")
-            if seq is not None:
-                prefix_parts.append(f"seq {seq}")
-            segment = f"{' '.join(prefix_parts)}: {text}"
+            segment = f"{prefix}: {text}"
             segment = cls._truncate_inline(
                 segment, max(1, options.max_chars - total_chars)
             )

@@ -21,6 +21,7 @@ from benchmarks.custody_report import (
     build_failed_question_custody_report,
     save_failed_question_custody_report,
 )
+from benchmarks.invocation_args import redact_invocation_args
 from benchmarks.json_artifacts import write_json_atomic
 from benchmarks.report_aggregate import (
     build_combined_report,
@@ -121,6 +122,23 @@ def _string_list(value: object) -> list[str]:
     return []
 
 
+def redacted_command(command: list[str]) -> list[str]:
+    """A shard command with credentials removed, for persistence only.
+
+    The shard subprocess still receives the real command; the manifest gets this
+    one. Shards run ``benchmarks.locomo``, so that CLI's parser is the authority
+    on which flags carry credentials -- the config's ``base_args`` are written by
+    hand and go straight to it, abbreviations included.
+
+    The CLI module is imported here rather than at module scope because importing
+    it runs ``load_dotenv()``, which must not happen merely because something
+    imported this runner.
+    """
+    from benchmarks.locomo.__main__ import _build_parser as _build_locomo_parser
+
+    return redact_invocation_args(command, _build_locomo_parser())
+
+
 def build_locomo_command(
     job: RetainedLoCoMoJob,
     *,
@@ -163,7 +181,7 @@ async def run_jobs(
         if dry_run:
             return {
                 "name": job.name,
-                "command": command,
+                "command": redacted_command(command),
                 "returncode": None,
                 "report_path": None,
                 "log_path": None,
@@ -187,7 +205,7 @@ async def run_jobs(
         report_path = latest_report_path(job.output)
         return {
             "name": job.name,
-            "command": command,
+            "command": redacted_command(command),
             "returncode": process.returncode,
             "started_at": started_at.isoformat(),
             "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -291,7 +309,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         "config_path": str(Path(args.config).expanduser()),
         "max_workers": args.max_workers,
         "dry_run": bool(args.dry_run),
-        "base_args": config.base_args,
+        "base_args": redacted_command(config.base_args),
         "shards": shard_results,
         "aggregate": aggregate_result,
     }

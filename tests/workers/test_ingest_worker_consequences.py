@@ -67,6 +67,7 @@ class QueueProvider(LLMProvider):
             output_text = memory_extraction_card_output_from_payload(
                 self._active_extraction_output or self.extraction_output,
                 purpose,
+                prompt="\n".join(message.content for message in request.messages),
             )
             return LLMCompletionResponse(
                 provider=self.name,

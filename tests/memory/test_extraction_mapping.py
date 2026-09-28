@@ -145,8 +145,8 @@ def test_mapper_applies_server_side_defaults() -> None:
     assert evidence.trigger_quote is None
     assert evidence.support_rationale is None
     assert evidence.confidence_details == {}
-    # source_span maps to source_quote (whitespace-normalized by the rich model).
-    assert evidence.source_quote == "exact source"
+    # Source quotes preserve the original message's whitespace.
+    assert evidence.source_quote == "  exact  source  "
     assert evidence.scope is MemoryScope.USER
 
 
@@ -283,7 +283,7 @@ def test_mapped_zero_temporal_confidence_drops_bounds_in_persistence_gate() -> N
 # --------------------------------------------------------------------------- #
 def test_lean_schema_is_small() -> None:
     serialized = json.dumps(TypeAdapter(LeanExtractionResult).json_schema())
-    assert len(serialized) < 4000
+    assert len(serialized) < 4600
 
 
 def test_lean_schema_is_far_smaller_than_rich_extraction_result() -> None:
@@ -298,5 +298,6 @@ def test_lean_schema_has_no_nullable_anyof_explosion() -> None:
     schema = TypeAdapter(LeanExtractionResult).json_schema()
     defs = schema.get("$defs", {})
     # Far fewer $defs than the 12 the rich ExtractionResult carries.
-    assert len(defs) <= 4
+    assert len(defs) <= 5
+    assert "SourceReference" in defs
     assert "LeanExtractionCandidate" in defs

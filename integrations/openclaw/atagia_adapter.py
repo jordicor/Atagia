@@ -10,7 +10,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from atagia.integrations import SidecarBridge, build_injection_decision
+from atagia.integrations import (
+    SidecarBridge,
+    build_injection_decision,
+    extract_context_message_id,
+    extract_context_system_prompt,
+    minimal_memory_payload,
+)
+
+
+def _minimal_context(context: Any | None) -> dict[str, Any] | None:
+    """Return the context with its system prompt reduced to memory sections,
+    so the injection decision wraps only host-facing memory content."""
+    if context is None:
+        return None
+    return {
+        "system_prompt": minimal_memory_payload(
+            extract_context_system_prompt(context)
+        ),
+        "request_message_id": extract_context_message_id(context),
+    }
 
 
 @dataclass(slots=True)
@@ -61,7 +80,7 @@ class AtagiaOpenClawAdapter:
             confirmation_strategy="live_prompt_allowed",
             memory_privacy_mode=memory_privacy_mode,
         )
-        decision = build_injection_decision(system_prompt, context)
+        decision = build_injection_decision(system_prompt, _minimal_context(context))
         return OpenClawPromptResult(
             system_prompt=decision.full_prompt,
             atagia_active=decision.active,

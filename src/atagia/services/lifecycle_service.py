@@ -858,7 +858,16 @@ class ConversationLifecycleService:
         if confirmation != ERASE_ALL_DATA_CONFIRMATION:
             raise DeletionConfirmationError("Missing ERASE_ALL_DATA confirmation")
         async with ContextCacheService(self.runtime).user_cache_guard(user_id):
-            return await self._erase_user_data(connection, user_id=user_id)
+            try:
+                return await self._erase_user_data(connection, user_id=user_id)
+            finally:
+                # Canonical deletion commits before transient cleanup. If that
+                # cleanup fails, _erase_user_data raises even though the source
+                # rows are already gone; eviction must therefore live in the
+                # finally path. The guard serializes the current runtime; the
+                # DF cache's post-scan SQLite identity check rejects a
+                # cross-runtime scan that overlaps this erasure.
+                self.runtime.token_document_frequency_cache.forget(user_id)
 
     async def _delete_conversation(
         self,

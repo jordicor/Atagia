@@ -235,7 +235,8 @@ class MCPProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -278,6 +279,7 @@ class MCPProvider(LLMProvider):
                 output_text=memory_extraction_card_output_from_payload(
                     {"candidates": [], "nothing_durable": True},
                     purpose,
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         if purpose == "contract_projection":
@@ -512,7 +514,7 @@ async def test_mcp_get_context(
                 _is_need_detection_card_purpose(request.metadata.get("purpose"))
                 for request in provider.requests
             )
-            == 8
+            == 9
         )
         (
             lifecycle_epoch,

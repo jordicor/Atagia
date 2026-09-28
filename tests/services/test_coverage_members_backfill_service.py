@@ -19,6 +19,8 @@ from atagia.core.repositories import (
 )
 from atagia.coverage_members_backfill_cli import build_parser
 from atagia.memory.extraction_cards import _CARD_SYSTEM_PROMPTS
+from atagia.memory.coverage_members_card import IDENTITY_PURPOSE, IDENTITY_SYSTEM_PROMPT
+from atagia.models.schemas_decisions import ChoiceAnswer
 from atagia.models.schemas_memory import (
     MemoryObjectType,
     MemoryScope,
@@ -36,6 +38,7 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
+from atagia.services.model_resolution import resolve_component_model
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -47,6 +50,7 @@ class SequencedCoverageProvider(LLMProvider):
     """LLM provider returning canned coverage-card lines in order."""
 
     name = "coverage-members-backfill-tests"
+    supports_choices = True
 
     def __init__(self, outputs: list[Any]) -> None:
         self.outputs = list(outputs)
@@ -59,6 +63,21 @@ class SequencedCoverageProvider(LLMProvider):
         output = self.outputs.pop(0)
         if isinstance(output, Exception):
             raise output
+        if request.choice_questions:
+            assert isinstance(output, dict)
+            return LLMCompletionResponse(
+                provider=self.name,
+                model=request.model,
+                choice_answers={
+                    question_id: ChoiceAnswer(
+                        type="choice",
+                        choice=choice,
+                        probabilities={choice: 1.0},
+                        confidence=1.0,
+                    )
+                    for question_id, choice in output.items()
+                },
+            )
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
@@ -69,7 +88,7 @@ class SequencedCoverageProvider(LLMProvider):
         raise AssertionError("Embeddings are not used by coverage members backfill")
 
 
-def _settings() -> Settings:
+def _settings(*, identity_model: str | None = None) -> Settings:
     return Settings(
         sqlite_path=":memory:",
         migrations_path=str(MIGRATIONS_DIR),
@@ -86,6 +105,10 @@ def _settings() -> Settings:
         admin_api_key=None,
         workers_enabled=False,
         debug=False,
+        llm_finite_decisions_enabled=identity_model is not None,
+        llm_component_models=(
+            {"extraction_member_identity": identity_model} if identity_model else {}
+        ),
     )
 
 
@@ -160,11 +183,16 @@ async def _payload(connection, clock: FrozenClock, memory_id: str, user_id: str)
     return row["payload_json"]
 
 
-def _service(connection, provider: SequencedCoverageProvider) -> CoverageMembersBackfillService:
+def _service(
+    connection,
+    provider: SequencedCoverageProvider,
+    *,
+    settings: Settings | None = None,
+) -> CoverageMembersBackfillService:
     return CoverageMembersBackfillService(
         connection=connection,
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
-        settings=_settings(),
+        settings=settings or _settings(),
     )
 
 
@@ -182,7 +210,7 @@ async def test_scan_selects_only_key_absent_rows() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc))
     provider = SequencedCoverageProvider(
-        ['cand_001 | [{"member_key": "dr. a", "display_text": "Dr. A"}]']
+        ['"Dr. A"', 'Dr. A']
     )
     try:
         await _create_memory(
@@ -220,8 +248,11 @@ async def test_scan_selects_only_key_absent_rows() -> None:
         assert result.examined == 1
         assert result.processed == 1
         assert result.updated == 1
-        # Exactly one LLM call: only the key-absent row was scanned.
-        assert len(provider.requests) == 1
+        # Only the key-absent row was scanned: membership, then identity.
+        assert [request.metadata["purpose"] for request in provider.requests] == [
+            "memory_extraction_coverage_members_card",
+            IDENTITY_PURPOSE,
+        ]
         assert (await _payload(connection, clock, "mem_absent", "usr_1"))[
             "coverage_members"
         ] == [{"member_key": "dr. a", "display_text": "Dr. A"}]
@@ -239,9 +270,10 @@ async def test_real_run_writes_key_and_increments_counters() -> None:
     clock = FrozenClock(datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc))
     provider = SequencedCoverageProvider(
         [
-            'cand_001 | [{"member_key": "dr. navarro", "display_text": "Dr. Navarro"},'
-            ' {"member_key": "dr. okafor", "display_text": "Dr. Okafor"}]',
-            "cand_001 | []",
+            '"Dr. Navarro"\n"Dr. Okafor"',
+            "Dr. Navarro",
+            "Dr. Okafor",
+            "none",
         ]
     )
     try:
@@ -283,14 +315,56 @@ async def test_real_run_writes_key_and_increments_counters() -> None:
             "coverage_members"
         ] == []
         # The card purpose is wired correctly on each request.
-        assert all(
-            req.metadata["purpose"] == "memory_extraction_coverage_members_card"
-            for req in provider.requests
+        assert [req.metadata["purpose"] for req in provider.requests] == [
+            "memory_extraction_coverage_members_card",
+            IDENTITY_PURPOSE,
+            IDENTITY_PURPOSE,
+            "memory_extraction_coverage_members_card",
+        ]
+        assert provider.requests[0].messages[0].content == _CARD_SYSTEM_PROMPTS["coverage_members"]
+        assert provider.requests[1].messages[0].content == IDENTITY_SYSTEM_PROMPT
+        assert provider.requests[2].messages[0].content == IDENTITY_SYSTEM_PROMPT
+        assert not provider.requests[1].finite_choice
+        assert not provider.requests[2].finite_choice
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_uses_native_identity_catalog_on_test_sqlite() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc))
+    provider = SequencedCoverageProvider([
+        '"Dr. Ruiz"\n"Lucía Ruiz"',
+        {"member_002": "self", "member_001": "member_002"},
+    ])
+    try:
+        await _create_memory(
+            connection,
+            clock,
+            memory_id="mem_aliases",
+            user_id="usr_1",
+            canonical_text="Mira sees Dr. Ruiz, also named Lucía Ruiz.",
         )
-        assert all(
-            req.messages[0].content == _CARD_SYSTEM_PROMPTS["coverage_members"]
-            for req in provider.requests
+        settings = _settings(identity_model="typesafe/jev-1.13.0")
+        result = await _service(connection, provider, settings=settings).run(
+            batch_size=10,
+            delay_ms=0,
+            user_id="usr_1",
+            dry_run=False,
         )
+
+        assert (result.examined, result.processed, result.updated, result.failed) == (
+            1, 1, 1, 0
+        )
+        assert (await _payload(connection, clock, "mem_aliases", "usr_1"))[
+            "coverage_members"
+        ] == [{"member_key": "lucía ruiz", "display_text": "Dr. Ruiz"}]
+        assert [request.model for request in provider.requests] == [
+            resolve_component_model(settings, "extractor"),
+            "typesafe/jev-1.13.0",
+        ]
+        assert provider.requests[1].choice_questions is not None
     finally:
         await connection.close()
 
@@ -300,7 +374,7 @@ async def test_dry_run_writes_nothing() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc))
     provider = SequencedCoverageProvider(
-        ['cand_001 | [{"member_key": "dr. a", "display_text": "Dr. A"}]']
+        ['"Dr. A"', 'Dr. A']
     )
     try:
         await _create_memory(
@@ -335,7 +409,8 @@ async def test_per_row_failure_counted_and_leaves_row_rerunnable() -> None:
     provider = SequencedCoverageProvider(
         [
             RuntimeError("provider blew up on this row"),
-            'cand_001 | [{"member_key": "dr. b", "display_text": "Dr. B"}]',
+            '"Dr. B"',
+            'Dr. B',
         ]
     )
     try:
@@ -379,8 +454,8 @@ async def test_per_row_failure_counted_and_leaves_row_rerunnable() -> None:
 @pytest.mark.parametrize(
     "card_output",
     [
-        "cand_001 | [{]",
-        'cand_001 | [{"member_key": "dr. a", "display_text": "Dr. A"}, 7]',
+        "[",
+        '"Dr. A"\n7',
     ],
 )
 async def test_malformed_card_output_fails_and_leaves_row_rerunnable(
@@ -417,11 +492,44 @@ async def test_malformed_card_output_fails_and_leaves_row_rerunnable(
 
 
 @pytest.mark.asyncio
+async def test_unvalidated_identity_leaves_backfill_row_rerunnable() -> None:
+    connection = await initialize_database(":memory:", MIGRATIONS_DIR)
+    clock = FrozenClock(datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc))
+    provider = SequencedCoverageProvider(['"Dr. A"', "Dr. Unknown"])
+    try:
+        await _create_memory(
+            connection,
+            clock,
+            memory_id="mem_bad_identity",
+            user_id="usr_1",
+            canonical_text="Mira sees Dr. A.",
+        )
+
+        result = await _service(connection, provider).run(
+            batch_size=10,
+            delay_ms=0,
+            dry_run=False,
+        )
+
+        assert result.failed == 1
+        assert result.processed == 0
+        assert [request.metadata["purpose"] for request in provider.requests] == [
+            "memory_extraction_coverage_members_card",
+            IDENTITY_PURPOSE,
+        ]
+        assert "coverage_members" not in (
+            await _payload(connection, clock, "mem_bad_identity", "usr_1")
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_user_id_scoping_does_not_touch_other_users() -> None:
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
     clock = FrozenClock(datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc))
     provider = SequencedCoverageProvider(
-        ['cand_001 | [{"member_key": "dr. a", "display_text": "Dr. A"}]']
+        ['"Dr. A"', 'Dr. A']
     )
     try:
         await _create_memory(
@@ -449,7 +557,7 @@ async def test_user_id_scoping_does_not_touch_other_users() -> None:
         assert result.examined == 1
         assert result.updated == 1
         assert result.user_id == "usr_1"
-        assert len(provider.requests) == 1
+        assert len(provider.requests) == 2
         assert (await _payload(connection, clock, "mem_usr_1", "usr_1"))[
             "coverage_members"
         ] == [{"member_key": "dr. a", "display_text": "Dr. A"}]

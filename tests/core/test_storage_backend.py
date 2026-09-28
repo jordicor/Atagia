@@ -12,9 +12,19 @@ from atagia.models.schemas_jobs import (
     EXTRACT_STREAM_NAME,
 )
 
+from tests.recent_window_support import stored_recent_window
+
 
 RECENT_WINDOW_OWNER = {"user_id": "usr_1", "conversation_id": "cnv_1"}
 RECENT_WINDOW_KEY = build_recent_window_key(**RECENT_WINDOW_OWNER)
+PUBLISHED_RECENT_WINDOW_IDENTITY: dict[str, object] = {
+    "lifecycle_cleanup_key": "cleanup_1",
+    "lifecycle_epoch": "epoch_1",
+    "cache_revision": 0,
+    "derivation_revision": 0,
+    "conversation_lifecycle_epoch": "conversation_epoch_1",
+    "conversation_source_revision": 0,
+}
 
 
 def test_legacy_extractor_dedupe_owner_match_uses_full_user_prefix() -> None:
@@ -85,19 +95,106 @@ async def test_recent_window_round_trip_uses_copies() -> None:
         RECENT_WINDOW_KEY,
         messages,
         **RECENT_WINDOW_OWNER,
-        lifecycle_cleanup_key="cleanup_1",
-        lifecycle_epoch="epoch_1",
-        cache_revision=0,
-        derivation_revision=0,
-        conversation_lifecycle_epoch="conversation_epoch_1",
-        conversation_source_revision=0,
+        **PUBLISHED_RECENT_WINDOW_IDENTITY,
     )
-    fetched = await backend.get_recent_window(RECENT_WINDOW_KEY)
+    fetched = await backend.get_recent_window_for_cache_identity(
+        RECENT_WINDOW_KEY,
+        **RECENT_WINDOW_OWNER,
+        **PUBLISHED_RECENT_WINDOW_IDENTITY,
+    )
 
     assert fetched == messages
     assert fetched is not messages
     fetched[0]["text"] = "changed"
-    assert (await backend.get_recent_window(RECENT_WINDOW_KEY)) == messages
+    assert (
+        await backend.get_recent_window_for_cache_identity(
+            RECENT_WINDOW_KEY,
+            **RECENT_WINDOW_OWNER,
+            **PUBLISHED_RECENT_WINDOW_IDENTITY,
+        )
+    ) == messages
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        {"lifecycle_epoch": "epoch_2"},
+        {"lifecycle_cleanup_key": "cleanup_2"},
+        {"cache_revision": 1},
+        {"derivation_revision": 1},
+        {"conversation_lifecycle_epoch": "conversation_epoch_2"},
+        {"conversation_source_revision": 1},
+    ],
+)
+@pytest.mark.asyncio
+async def test_recent_window_read_refuses_a_foreign_cache_identity(
+    mismatch: dict[str, object],
+) -> None:
+    """The read enforces the identity contract the write does.
+
+    A key-only read cannot tell a window that describes the reader's canonical
+    state from one an older turn or an older lifecycle published, so every
+    coordinate the writer fenced on has to fence the read too. A mismatch is an
+    honest miss, which sends the reader to SQLite instead of serving a
+    transcript that is not the one it asked for.
+    """
+
+    backend = InProcessBackend()
+    await backend.prepare_lifecycle_mirror("cleanup_1", "epoch_1", "nonce_1")
+    assert await backend.activate_lifecycle_mirror("cleanup_1", "epoch_1", "nonce_1")
+    assert await backend.set_recent_window_for_lifecycle(
+        RECENT_WINDOW_KEY,
+        [{"id": "msg_1", "text": "hello"}],
+        **RECENT_WINDOW_OWNER,
+        **PUBLISHED_RECENT_WINDOW_IDENTITY,
+    )
+
+    assert (
+        await backend.get_recent_window_for_cache_identity(
+            RECENT_WINDOW_KEY,
+            **RECENT_WINDOW_OWNER,
+            **{**PUBLISHED_RECENT_WINDOW_IDENTITY, **mismatch},
+        )
+        is None
+    )
+    # The refusal is a read fence, not a delete: the entry the identity's real
+    # owner is entitled to survives the foreign read.
+    assert await stored_recent_window(backend, RECENT_WINDOW_KEY) == [
+        {"id": "msg_1", "text": "hello"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recent_window_read_refuses_another_conversations_key() -> None:
+    """A key that does not derive from the requested pair is never served."""
+
+    backend = InProcessBackend()
+    await backend.prepare_lifecycle_mirror("cleanup_1", "epoch_1", "nonce_1")
+    assert await backend.activate_lifecycle_mirror("cleanup_1", "epoch_1", "nonce_1")
+    assert await backend.set_recent_window_for_lifecycle(
+        RECENT_WINDOW_KEY,
+        [{"id": "msg_1", "text": "hello"}],
+        **RECENT_WINDOW_OWNER,
+        **PUBLISHED_RECENT_WINDOW_IDENTITY,
+    )
+
+    assert (
+        await backend.get_recent_window_for_cache_identity(
+            RECENT_WINDOW_KEY,
+            user_id="usr_2",
+            conversation_id="cnv_1",
+            **PUBLISHED_RECENT_WINDOW_IDENTITY,
+        )
+        is None
+    )
+    assert (
+        await backend.get_recent_window_for_cache_identity(
+            RECENT_WINDOW_KEY,
+            **RECENT_WINDOW_OWNER,
+            **{**PUBLISHED_RECENT_WINDOW_IDENTITY, "cache_revision": -1},
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -465,7 +562,7 @@ async def test_legacy_transient_purge_preserves_current_inprocess_state() -> Non
     assert result.clean
     assert await backend.get_context_view("legacy-target") is None
     assert backend._recent_windows.keys() == {current_recent_key}
-    assert await backend.get_recent_window(current_recent_key) == [{"text": "current"}]
+    assert await stored_recent_window(backend, current_recent_key) == [{"text": "current"}]
     assert await backend.get_context_view("legacy-other") == {
         "user_id": "usr_other",
         "value": "other",
@@ -1021,7 +1118,7 @@ async def test_lifecycle_gated_cache_writes_are_purged_and_cannot_resume() -> No
         "epoch_1",
         group_name="workers",
     )
-    assert await backend.get_recent_window(RECENT_WINDOW_KEY) is None
+    assert await stored_recent_window(backend, RECENT_WINDOW_KEY) is None
     assert await backend.get_context_view("ctx:old") is None
     assert not await backend.set_recent_window_for_lifecycle(
         RECENT_WINDOW_KEY,
@@ -1086,7 +1183,7 @@ async def test_recent_window_conditional_cleanup_includes_derivation_revision() 
         conversation_lifecycle_epoch="conversation_epoch_1",
         conversation_source_revision=4,
     )
-    assert await backend.get_recent_window(RECENT_WINDOW_KEY) == [
+    assert await stored_recent_window(backend, RECENT_WINDOW_KEY) == [
         {"text": "new selected transcript"}
     ]
     assert await backend.delete_recent_window_if_cache_identity(
@@ -1142,7 +1239,7 @@ async def test_recent_window_source_revision_blocks_old_overwrite_and_cleanup() 
         **common_identity,
         conversation_source_revision=4,
     )
-    assert await backend.get_recent_window(RECENT_WINDOW_KEY) == [
+    assert await stored_recent_window(backend, RECENT_WINDOW_KEY) == [
         {"text": "new conversation source"}
     ]
 
@@ -1200,7 +1297,7 @@ async def test_recent_window_new_conversation_epoch_takes_monotonic_ownership() 
         conversation_lifecycle_epoch="conversation_epoch_old",
         conversation_source_revision=9,
     )
-    assert await backend.get_recent_window(RECENT_WINDOW_KEY) == [
+    assert await stored_recent_window(backend, RECENT_WINDOW_KEY) == [
         {"text": "new conversation epoch"}
     ]
 
@@ -1250,8 +1347,8 @@ async def test_recent_window_keys_and_user_cleanup_are_exact_for_colon_ids() -> 
     )
 
     assert await backend.delete_recent_windows_for_user("account") == 1
-    assert await backend.get_recent_window(second_key) is None
-    assert await backend.get_recent_window(first_key) == [{"text": "first"}]
+    assert await stored_recent_window(backend, second_key) is None
+    assert await stored_recent_window(backend, first_key) == [{"text": "first"}]
     assert (
         await backend.delete_recent_window_for_conversation(
             first_owner["user_id"],
@@ -1259,7 +1356,7 @@ async def test_recent_window_keys_and_user_cleanup_are_exact_for_colon_ids() -> 
         )
         == 1
     )
-    assert await backend.get_recent_window(first_key) is None
+    assert await stored_recent_window(backend, first_key) is None
 
 
 @pytest.mark.asyncio
@@ -1288,7 +1385,7 @@ async def test_recent_window_key_identity_mismatch_is_non_mutating() -> None:
         conversation_id="one:conversation:one",
         **identity,
     )
-    assert await backend.get_recent_window(key) is None
+    assert await stored_recent_window(backend, key) is None
 
     assert await backend.set_recent_window_for_lifecycle(
         key,
@@ -1302,7 +1399,7 @@ async def test_recent_window_key_identity_mismatch_is_non_mutating() -> None:
         conversation_id="one:conversation:one",
         **identity,
     )
-    assert await backend.get_recent_window(key) == [{"text": "owned"}]
+    assert await stored_recent_window(backend, key) == [{"text": "owned"}]
 
 
 @pytest.mark.asyncio

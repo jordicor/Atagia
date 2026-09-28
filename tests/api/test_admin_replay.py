@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -30,6 +32,8 @@ from atagia.services.llm_client import (
     LLMEmbeddingResponse,
     LLMProvider,
 )
+
+from tests.turn_telemetry_support import sample_turn_telemetry
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -67,7 +71,8 @@ class ReplayAdminProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -256,7 +261,7 @@ def test_admin_replay_grounding_and_export_routes_work(tmp_path: Path) -> None:
                 )
             )
             client.portal.call(
-                events.create_event,
+                partial(events.create_event, telemetry=sample_turn_telemetry()),
                 {
                     "id": "ret_1",
                     "user_id": "usr_1",
@@ -284,7 +289,7 @@ def test_admin_replay_grounding_and_export_routes_work(tmp_path: Path) -> None:
                 },
             )
             client.portal.call(
-                events.create_event,
+                partial(events.create_event, telemetry=sample_turn_telemetry()),
                 {
                     "id": "ret_2",
                     "user_id": "usr_1",

@@ -34,6 +34,7 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.retrieval_pipeline import RetrievalPipeline
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -68,12 +69,12 @@ class MultilingualPipelineProvider(LLMProvider):
         self.need_response = need_response or {
             "needs": [],
             "temporal_range": None,
-            "sub_queries": ["¿Cuál es la dosis actual de amlodipino de Rosa?"],
+            "sub_queries": ["¿Cuál es la dosis actual de fexofenadina de Leonie?"],
             "sparse_query_hints": [
                 {
-                    "sub_query_text": "¿Cuál es la dosis actual de amlodipino de Rosa?",
-                    "fts_phrase": "amlodipino",
-                    "must_keep_terms": ["Rosa", "amlodipino"],
+                    "sub_query_text": "¿Cuál es la dosis actual de fexofenadina de Leonie?",
+                    "fts_phrase": "fexofenadina",
+                    "must_keep_terms": ["Leonie", "fexofenadina"],
                 },
             ],
             "query_language": "es",
@@ -129,13 +130,10 @@ class MultilingualPipelineProvider(LLMProvider):
                 if isinstance(item, dict) and item.get("need_type")
             ]
             return "\n".join(labels) if labels else "none"
-        if purpose == "need_detection_language_card":
-            return "\n".join(
-                [
-                    str(self.need_response.get("query_language") or "en"),
-                    str(self.need_response.get("answer_language") or "en"),
-                ]
-            )
+        if purpose == "need_detection_query_language_card":
+            return str(self.need_response.get("query_language") or "en")
+        if purpose == "need_detection_answer_language_card":
+            return str(self.need_response.get("answer_language") or "en")
         if purpose == "need_detection_memory_card":
             return str(self.need_response.get("memory_dependence") or "mixed")
         if purpose == "need_detection_exact_card":
@@ -228,6 +226,7 @@ async def _build_runtime(
         embedding_index=NoneBackend(),
         clock=clock,
         settings=resolved_settings,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
     )
     manifest = ManifestLoader(MANIFESTS_DIR).load_all()[mode_id]
     resolved_policy = PolicyResolver().resolve(manifest, None, None)
@@ -297,7 +296,7 @@ def _language_card_prompt(provider: MultilingualPipelineProvider) -> str:
     return next(
         request.messages[1].content
         for request in provider.requests
-        if str(request.metadata.get("purpose")) == "need_detection_language_card"
+        if str(request.metadata.get("purpose")) == "need_detection_answer_language_card"
     )
 
 
@@ -310,7 +309,7 @@ def _saved_language_profile_block(prompt: str) -> str:
 
 @pytest.mark.asyncio
 async def test_pipeline_uses_language_profile_with_parallel_cards_and_literal_anchors() -> None:
-    message_text = "¿Cuál es la dosis actual de amlodipino de Rosa?"
+    message_text = "¿Cuál es la dosis actual de fexofenadina de Leonie?"
     provider = MultilingualPipelineProvider(
         score_map={"mem_english": 0.94},
     )
@@ -321,14 +320,14 @@ async def test_pipeline_uses_language_profile_with_parallel_cards_and_literal_an
         await _seed_memory(
             memories,
             memory_id="mem_english",
-            canonical_text="Rosa toma amlodipino 10 mg los martes.",
+            canonical_text="Leonie toma fexofenadina 60 mg los domingos.",
             scope=MemoryScope.CONVERSATION,
             language_codes=["en"],
         )
         await _seed_memory(
             memories,
             memory_id="mem_pending_fr",
-            canonical_text="dose actuelle d'amlodipine",
+            canonical_text="dose actuelle de fexofenadine",
             scope=MemoryScope.CONVERSATION,
             status=MemoryStatus.PENDING_USER_CONFIRMATION,
             language_codes=["fr"],
@@ -336,7 +335,7 @@ async def test_pipeline_uses_language_profile_with_parallel_cards_and_literal_an
         await _seed_memory(
             memories,
             memory_id="mem_private_de",
-            canonical_text="aktuelle amlodipin dosis",
+            canonical_text="aktuelle fexofenadin dosis",
             scope=MemoryScope.CONVERSATION,
             privacy_level=3,
             language_codes=["de"],
@@ -373,11 +372,11 @@ async def test_pipeline_uses_language_profile_with_parallel_cards_and_literal_an
         )
         assert "fr:" not in profile_block
         assert "de:" not in profile_block
-        assert "amlodipine" not in profile_block
+        assert "fexofenadine" not in profile_block
         assert [plan.text for plan in result.retrieval_plan.sub_query_plans] == [
-            "¿Cuál es la dosis actual de amlodipino de Rosa?",
+            "¿Cuál es la dosis actual de fexofenadina de Leonie?",
         ]
-        assert "amlodipino" in " ".join(result.retrieval_plan.fts_queries)
+        assert "fexofenadina" in " ".join(result.retrieval_plan.fts_queries)
         assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_english"]
         assert [candidate.memory_id for candidate in result.scored_candidates] == ["mem_english"]
         assert result.composed_context.selected_memory_ids == ["mem_english"]
@@ -406,8 +405,8 @@ async def test_pipeline_uses_language_profile_with_parallel_cards_and_literal_an
         ]
         assert trace.need_detection.anchors[0].preserve_verbatim is True
         assert [anchor.original_surface for anchor in trace.need_detection.anchors] == [
-            "Rosa",
-            "amlodipino",
+            "Leonie",
+            "fexofenadina",
         ]
         assert trace.need_detection.alias_groups == []
         assert trace.candidate_search is not None
@@ -571,7 +570,7 @@ async def test_phase8_need_detection_trace_language_profile_is_content_free_and_
 
 @pytest.mark.asyncio
 async def test_pipeline_literal_anchor_lane_recovers_without_alias_evidence() -> None:
-    message_text = "¿Cuál es la dosis actual de amlodipino?"
+    message_text = "¿Cuál es la dosis actual de fexofenadina?"
     provider = MultilingualPipelineProvider(
         need_response={
             "needs": [],
@@ -580,8 +579,8 @@ async def test_pipeline_literal_anchor_lane_recovers_without_alias_evidence() ->
             "sparse_query_hints": [
                 {
                     "sub_query_text": message_text,
-                    "fts_phrase": "dosis amlodipino",
-                    "must_keep_terms": ["dosis", "amlodipino"],
+                    "fts_phrase": "dosis fexofenadina",
+                    "must_keep_terms": ["dosis", "fexofenadina"],
                 }
             ],
             "query_language": "es",
@@ -600,7 +599,7 @@ async def test_pipeline_literal_anchor_lane_recovers_without_alias_evidence() ->
         await _seed_memory(
             memories,
             memory_id="mem_english",
-            canonical_text="Rosa toma amlodipino 10 mg los martes.",
+            canonical_text="Leonie toma fexofenadina 60 mg los domingos.",
             scope=MemoryScope.CONVERSATION,
             language_codes=["en"],
         )
@@ -622,7 +621,7 @@ async def test_pipeline_literal_anchor_lane_recovers_without_alias_evidence() ->
 
         assert [candidate["id"] for candidate in result.raw_candidates] == ["mem_english"]
         assert result.composed_context.selected_memory_ids == ["mem_english"]
-        assert "Rosa toma amlodipino 10 mg los martes." in result.composed_context.memory_block
+        assert "Leonie toma fexofenadina 60 mg los domingos." in result.composed_context.memory_block
         assert "alias_anchor" not in result.composed_context.memory_block
         assert "runtime_alias_or" not in result.composed_context.memory_block
         assert trace.candidate_search is not None

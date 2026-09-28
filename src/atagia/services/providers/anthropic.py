@@ -352,6 +352,7 @@ class AnthropicProvider(LLMProvider):
         )
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        from atagia.diagnostics.recorder import capture_raw_response, capture_sent_payload
         system_blocks, messages = _split_messages(request)
         max_tokens = max(1, request.max_output_tokens or ANTHROPIC_FALLBACK_MAX_OUTPUT_TOKENS)
         kwargs: dict[str, Any] = {
@@ -378,6 +379,7 @@ class AnthropicProvider(LLMProvider):
         thinking = _thinking_config(request, max_tokens)
         if thinking is not None:
             kwargs["thinking"] = thinking
+        capture_sent_payload(kwargs)
         try:
             response = await self._client.messages.create(**kwargs)
         except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
@@ -386,6 +388,8 @@ class AnthropicProvider(LLMProvider):
             raise _anthropic_status_error(exc) from exc
         except APIError as exc:
             raise LLMError(str(exc)) from exc
+
+        capture_raw_response(response)
 
         output_text = ""
         thinking_text = ""
@@ -438,6 +442,7 @@ class AnthropicProvider(LLMProvider):
         raise LLMError("Anthropic does not currently expose embeddings through this adapter")
 
     async def stream(self, request: LLMCompletionRequest) -> AsyncIterator[LLMStreamEvent]:
+        from atagia.diagnostics.recorder import capture_raw_response, capture_sent_payload
         system_blocks, messages = _split_messages(request)
         max_tokens = max(1, request.max_output_tokens or ANTHROPIC_FALLBACK_MAX_OUTPUT_TOKENS)
         kwargs: dict[str, Any] = {
@@ -464,6 +469,7 @@ class AnthropicProvider(LLMProvider):
         thinking = _thinking_config(request, max_tokens)
         if thinking is not None:
             kwargs["thinking"] = thinking
+        capture_sent_payload(kwargs)
 
         emitted_output_or_tool = False
         emitted_tool_call = False
@@ -472,6 +478,7 @@ class AnthropicProvider(LLMProvider):
         try:
             async with self._client.messages.stream(**kwargs) as stream:
                 async for event in stream:
+                    capture_raw_response(event)
                     if event.type == "text":
                         emitted_output_or_tool = True
                         yield LLMStreamEvent(type="text", content=event.text)

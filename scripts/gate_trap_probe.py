@@ -27,6 +27,7 @@ from atagia.models.schemas_memory import (
     MemoryDependence,
 )
 from atagia.services.llm_client import LLMClient, RetryPolicy
+from atagia.services.inference_runtime import require_unrestricted_inference
 from atagia.services.providers.openrouter import OpenRouterProvider
 
 MANIFESTS_DIR = Path(__file__).resolve().parents[1] / "src" / "atagia" / "resources" / "manifests"
@@ -77,6 +78,7 @@ CASES: list[tuple[str, str, str, list[ExtractionContextMessage], bool]] = [
 
 async def main() -> int:
     settings = Settings.from_env()
+    require_unrestricted_inference(settings, entry_point="scripts/gate_trap_probe.py")
     if not settings.openrouter_api_key:
         print("ERROR: ATAGIA_OPENROUTER_API_KEY not set")
         return 1

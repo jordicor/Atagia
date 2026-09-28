@@ -35,6 +35,7 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.sqlite_vec_backend import SQLiteVecBackend
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -211,7 +212,12 @@ async def _build_runtime(tmp_path: Path, vectors_by_text: dict[str, list[float]]
         _settings(database_path),
     )
     await backend.initialize()
-    search = CandidateSearch(search_connection, clock, embedding_index=backend)
+    search = CandidateSearch(
+        search_connection,
+        clock,
+        embedding_index=backend,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
     return search_connection, embedding_connection, memories, search, backend
 
 

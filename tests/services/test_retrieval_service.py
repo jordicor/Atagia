@@ -236,3 +236,84 @@ async def test_retrieve_rejects_result_if_completed_replacement_changes_source_s
             await retrieval_task
     finally:
         await runtime.close()
+
+
+class _CaptureSentinel(Exception):
+    """Ends the retrieval early once the pipeline has been inspected."""
+
+
+@pytest.mark.asyncio
+async def test_retrieve_reuses_the_runtime_cache_across_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every turn's pipeline must read the one cache the runtime owns.
+
+    This is the production wire the corpus-statistics cache depends on: the
+    pipeline and its ``CandidateSearch`` are rebuilt per turn, so sourcing the
+    cache anywhere but the runtime silently restores the per-request lifetime
+    that made its TTL unreachable.
+    """
+    runtime = await initialize_runtime(
+        Settings(
+            sqlite_path=str(tmp_path / "retrieval-cache-identity.db"),
+            migrations_path=str(MIGRATIONS_DIR),
+            manifests_path=str(MANIFESTS_DIR),
+            storage_backend="inprocess",
+            redis_url="redis://localhost:6379/0",
+            openai_api_key="test-openai-key",
+            openrouter_api_key=None,
+            openrouter_site_url="http://localhost",
+            openrouter_app_name="Atagia",
+            llm_chat_model="openai/test-model",
+            llm_ingest_model="openai/test-model",
+            llm_retrieval_model="openai/test-model",
+            service_mode=False,
+            service_api_key=None,
+            admin_api_key=None,
+            workers_enabled=False,
+            debug=False,
+            allow_insecure_http=True,
+        )
+    )
+    try:
+        setup = await runtime.open_connection()
+        try:
+            await UserRepository(setup, runtime.clock).create_user("usr_cache")
+            await ConversationRepository(setup, runtime.clock).create_conversation(
+                "cnv_cache",
+                "usr_cache",
+                None,
+                "general_qa",
+                "Cache identity",
+                platform_id="web",
+            )
+        finally:
+            await setup.close()
+
+        observed: list[object] = []
+
+        async def capturing_execute(
+            _pipeline: RetrievalPipeline,
+            **_kwargs: object,
+        ) -> object:
+            observed.append(
+                _pipeline._candidate_search._token_document_frequency_cache  # noqa: SLF001
+            )
+            raise _CaptureSentinel
+
+        monkeypatch.setattr(RetrievalPipeline, "execute", capturing_execute)
+
+        for _turn in range(2):
+            with pytest.raises(_CaptureSentinel):
+                await RetrievalService(runtime).retrieve(
+                    user_id="usr_cache",
+                    conversation_id="cnv_cache",
+                    message_text="What do you remember?",
+                )
+
+        assert len(observed) == 2
+        assert observed[0] is runtime.token_document_frequency_cache
+        assert observed[1] is runtime.token_document_frequency_cache
+    finally:
+        await runtime.close()

@@ -211,6 +211,9 @@ class AtagiaBenchRunner:
         answer_stance: str = "reactive",
         answer_stance_prompt_variant: str = "baseline",
         llm_call_delay_ms: int = 0,
+        inference_access_mode: str | None = None,
+        local_llm_endpoints_file: str | Path | None = None,
+        zero_cost_openrouter_profile: str | None = None,
     ) -> None:
         self._llm_provider = llm_provider
         self._llm_api_key = llm_api_key
@@ -277,6 +280,19 @@ class AtagiaBenchRunner:
         self._answer_stance_prompt_variant = answer_stance_prompt_variant
         self._judge_protocol = judge_protocol
         self._llm_call_delay_ms = max(0, int(llm_call_delay_ms))
+        self._inference_access_mode = inference_access_mode
+        self._local_llm_endpoints_file = local_llm_endpoints_file
+        self._zero_cost_openrouter_profile = zero_cost_openrouter_profile
+        # Effective-settings snapshot captured from the first live engine of a
+        # run (every engine in a run shares identical settings) and threaded into
+        # the report and run manifest so a run can prove its effective
+        # configuration.
+        self._effective_settings_report: dict[str, Any] | None = None
+
+    def _capture_effective_settings(self, engine: Atagia) -> None:
+        """Record the engine's effective-settings report once per run."""
+        if self._effective_settings_report is None:
+            self._effective_settings_report = engine.effective_settings_report()
 
     async def run(
         self,
@@ -301,6 +317,9 @@ class AtagiaBenchRunner:
         invocation_args: list[str] | None = None,
     ) -> AtagiaBenchReport:
         """Run the benchmark and return a structured report."""
+        # Each run captures its own effective-settings snapshot; a stale one from
+        # a prior run on a reused instance must never leak forward.
+        self._effective_settings_report = None
         if parallel_personas < 1:
             raise ValueError("parallel_personas must be at least 1")
         if benchmark_split == "development" and not holdout_question_ids:
@@ -645,6 +664,7 @@ class AtagiaBenchRunner:
             **provider_api_key_kwargs(self._llm_provider, self._llm_api_key),
             embedding_backend=self._embedding_backend,
             embedding_model=self._embedding_model,
+            **self._inference_access_kwargs(),
             skip_belief_revision=ablation.skip_belief_revision if ablation else False,
             skip_compaction=ablation.skip_compaction if ablation else False,
             answer_postcondition_guard_enabled=self._answer_postcondition_guard_enabled,
@@ -654,6 +674,7 @@ class AtagiaBenchRunner:
             runtime = engine.runtime
             if runtime is None:
                 raise RuntimeError("Atagia runtime unavailable")
+            self._capture_effective_settings(engine)
             install_llm_call_recorder(runtime.llm_client, llm_recorder)
             install_llm_call_delay(
                 runtime.llm_client,
@@ -790,6 +811,7 @@ class AtagiaBenchRunner:
                     **provider_api_key_kwargs(self._llm_provider, self._llm_api_key),
                     embedding_backend=self._embedding_backend,
                     embedding_model=self._embedding_model,
+                    **self._inference_access_kwargs(),
                     skip_belief_revision=ablation.skip_belief_revision
                     if ablation
                     else False,
@@ -837,6 +859,18 @@ class AtagiaBenchRunner:
             "llm_chat_model": self._answer_model,
             "llm_component_models": dict(self._component_models),
         }
+
+    def _inference_access_kwargs(self) -> dict[str, Any]:
+        values: dict[str, Any] = {
+            "inference_access_mode": self._inference_access_mode,
+            "local_llm_endpoints_file": self._local_llm_endpoints_file,
+            "zero_cost_openrouter_profile": self._zero_cost_openrouter_profile,
+        }
+        if self._judge_model is not None:
+            values["_inference_startup_completion_models"] = {
+                "atagia_bench.judge": self._judge_model
+            }
+        return values
 
     async def _load_turn_message_ids(
         self,
@@ -1180,7 +1214,11 @@ class AtagiaBenchRunner:
                 conversation_id=conversation_id,
                 message=question.question_text,
                 mode=assistant_mode_id,
+                ablation=ablation,
                 debug=True,
+                # The AblationConfig is the single source of truth for privacy:
+                # these arguments are projections of `ablation.privacy_enforcement`
+                # onto the engine's separate request-authority parameters.
                 privacy_enforcement=self._benchmark_privacy_enforcement(ablation),
                 authenticated_user_privilege_level=(
                     "atagia_master"
@@ -2303,6 +2341,7 @@ class AtagiaBenchRunner:
                 ),
                 "llm_call_summary": llm_call_summary or {},
                 "run_counters": normalize_run_counters(run_counters),
+                "effective_settings": self._effective_settings_report or {},
             },
             personas_used=persona_ids,
             total_questions=total,
@@ -2382,6 +2421,7 @@ class AtagiaBenchRunner:
             "git": _git_state(),
             "activation_flags": self._activation_flags(),
             "config": report.config,
+            "effective_settings": report.config.get("effective_settings", {}),
             "run_counters": normalize_run_counters(
                 report.config.get("run_counters")
             ),

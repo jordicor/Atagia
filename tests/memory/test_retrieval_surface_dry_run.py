@@ -45,6 +45,7 @@ from atagia.services.llm_client import (
     LLMProvider,
     StructuredOutputError,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -624,7 +625,11 @@ async def test_synthetic_e2e_dry_run_writer_retrieval_and_composition() -> None:
             approved_by="synthetic-review",
         )
         writer = RetrievalSurfaceWriter(surfaces, CLOCK)
-        search = CandidateSearch(connection, CLOCK)
+        search = CandidateSearch(
+            connection,
+            CLOCK,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
         plan = _persisted_surface_plan("direccion apartamento nuevo")
 
         disabled_report = await writer.write_approved([approved])
@@ -738,7 +743,11 @@ async def test_synthetic_e2e_high_risk_surface_does_not_recover_active_candidate
         write_report = await writer.write_approved([approved], enable_write=True)
         assert write_report.written_surface_count == 1
 
-        candidates = await CandidateSearch(connection, CLOCK).search(
+        candidates = await CandidateSearch(
+            connection,
+            CLOCK,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        ).search(
             _persisted_surface_plan("SA42"),
             user_id="usr_1",
             fts_query_audit=[],

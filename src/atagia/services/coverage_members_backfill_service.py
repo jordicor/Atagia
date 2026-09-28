@@ -30,22 +30,15 @@ from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.memory.extraction_cards import (
     CandidateDraft,
-    build_enrichment_prompt,
-    parse_coverage_members_card_output,
-    _CARD_MAX_OUTPUT_TOKENS,
-    _CARD_SYSTEM_PROMPTS,
+    run_coverage_members_card,
 )
-from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.models.schemas_memory import (
     CoverageMember,
     ExtractionConversationContext,
     MemoryStatus,
-    RetrievalProfileId,
 )
 from atagia.services.llm_client import (
     LLMClient,
-    LLMCompletionRequest,
-    LLMMessage,
     StructuredOutputError,
 )
 from atagia.services.model_resolution import resolve_component_model
@@ -54,11 +47,6 @@ from atagia.services.model_resolution import resolve_component_model
 logger = logging.getLogger(__name__)
 
 _COVERAGE_MEMBERS_PAYLOAD_KEY = "coverage_members"
-# Resolved policy is unused by the coverage-members card builder (it calls
-# ``del resolved_policy`` immediately), so the profile choice is immaterial to
-# the card output. A single fixed default keeps the backfill from depending on
-# every stored row's ``assistant_mode_id`` being a valid retrieval profile.
-_DEFAULT_PROFILE_ID = RetrievalProfileId.GENERAL_QA
 _CANDIDATE_ID = "cand_001"
 
 _BACKFILL_STATUSES = frozenset(
@@ -109,12 +97,8 @@ class CoverageMembersBackfillService:
         self._clock = clock
         self._maintenance_operation = maintenance_operation
         self._card_model = resolve_component_model(self._settings, "extractor")
-        self._resolved_policy = PolicyResolver().resolve(
-            ManifestLoader(self._settings.manifests_dir()).get(
-                _DEFAULT_PROFILE_ID.value
-            ),
-            None,
-            None,
+        self._identity_model = resolve_component_model(
+            self._settings, "extraction_member_identity"
         )
         self._progress_callback = progress_callback
         self._sleep = sleep or asyncio.sleep
@@ -223,41 +207,19 @@ class CoverageMembersBackfillService:
             source_message_id=str(row["id"]),
             assistant_mode_id=str(row["assistant_mode_id"]),
         )
-        prompt = build_enrichment_prompt(
-            "coverage_members",
+        result = await run_coverage_members_card(
+            self._llm_client,
+            model=self._card_model,
+            identity_model=self._identity_model,
             message_text=str(row["canonical_text"]),
             role="user",
             context=context,
-            resolved_policy=self._resolved_policy,
-            allowed_write_scopes=("user",),
             occurred_at=None,
             prior_chunk_context=None,
             candidates=(candidate,),
+            metadata={"memory_id": str(row["id"])},
         )
-        request = LLMCompletionRequest(
-            model=self._card_model,
-            messages=[
-                LLMMessage(
-                    role="system",
-                    content=_CARD_SYSTEM_PROMPTS["coverage_members"],
-                ),
-                LLMMessage(role="user", content=prompt),
-            ],
-            max_output_tokens=_CARD_MAX_OUTPUT_TOKENS["coverage_members"],
-            metadata={
-                "user_id": str(row["user_id"]),
-                "memory_id": str(row["id"]),
-                "purpose": "memory_extraction_coverage_members_card",
-            },
-        )
-        response = await self._llm_client.complete(request)
-        parsed, malformed = parse_coverage_members_card_output(response.output_text)
-        if malformed:
-            entry_word = "entry" if malformed == 1 else "entries"
-            raise ValueError(
-                f"coverage-members card returned {malformed} malformed {entry_word}"
-            )
-        return list(parsed.get(_CANDIDATE_ID) or ())
+        return result.parsed[_CANDIDATE_ID]
 
     async def _write_members(
         self,

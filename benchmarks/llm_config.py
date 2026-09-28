@@ -12,6 +12,11 @@ def provider_api_key_kwargs(provider: str | None, api_key: str | None) -> dict[s
     provider_slug = PROVIDER_NAME_TO_SLUG.get((provider or "").strip().lower())
     if provider_slug is None:
         raise ValueError("A valid --provider is required when --api-key is set")
+    if provider_slug == "local":
+        raise ValueError(
+            "Local endpoint credentials must be configured through "
+            "api_key_env in the local endpoint catalog"
+        )
     key_names = {
         "anthropic": "anthropic_api_key",
         "openai": "openai_api_key",

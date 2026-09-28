@@ -33,9 +33,20 @@ from atagia.core.storage_backend import InProcessBackend
 from atagia.memory.candidate_search import CandidateSearch
 from atagia.memory.extraction_cards import (
     CandidateDraft,
+    build_belief_key_prompt,
+    build_belief_value_prompt,
+    _source_context_block,
     build_candidate_prompt,
+    build_classification_choice_question,
+    build_memory_confidence_score_question,
     build_enrichment_prompt,
 )
+from atagia.memory.extraction_temporal import (
+    TemporalIntervalResolution,
+    build_temporal_interval_prompt,
+    build_temporal_type_question,
+)
+from atagia.memory.date_resolution import read_persisted_date_resolution
 from atagia.memory.extractor import MemoryExtractor
 from atagia.memory.policy_manifest import (
     ManifestLoader,
@@ -66,13 +77,13 @@ from atagia.services.llm_client import (
     LLMCompletionResponse,
     LLMEmbeddingRequest,
     LLMEmbeddingResponse,
+    LLMError,
     LLMProvider,
     LLMStreamEvent,
     OutputLimitExceededError,
 )
 from atagia.services.embeddings import NoneBackend
 from atagia.services.lifecycle_service import ConversationLifecycleService
-from atagia.services.model_resolution import MINIMAX_M3_MODEL
 from atagia.services.privacy_filter_client import (
     PrivacyFilterDetection,
     PrivacyFilterSpan,
@@ -81,7 +92,13 @@ from atagia.services.run_counters import (
     RunCounterAccumulator,
     use_run_counter_accumulator,
 )
-from tests.extraction_payload_support import rich_extraction_payload_to_lean
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
+from tests.extraction_payload_support import (
+    _candidates_shown_in_prompt,
+    coverage_card_output_from_lean_candidates,
+    memory_extraction_card_output_from_payload,
+    rich_extraction_payload_to_lean,
+)
 from tests.memory.card_leak_guard import assert_prompt_has_no_benchmark_leak
 
 MIGRATIONS_DIR = (
@@ -103,12 +120,21 @@ def _with_default_language_codes(payload: dict[str, object]) -> dict[str, object
 
 _MEMORY_EXTRACTION_CARD_PURPOSES = {
     "memory_extraction_candidate_card",
-    "memory_extraction_kind_scope_card",
-    "memory_extraction_evidence_card",
+    "memory_extraction_kind_card",
+    "memory_extraction_scope_card",
+    "memory_extraction_confidence_card",
+    "memory_extraction_evidence_support_card",
+    "memory_extraction_preserve_verbatim_card",
+    "memory_extraction_candidate_language_card",
+    "memory_extraction_source_reference_card",
     "memory_extraction_index_card",
-    "memory_extraction_temporal_card",
-    "memory_extraction_belief_card",
+    "memory_extraction_belief_key_card",
+    "memory_extraction_belief_value_card",
+    "memory_extraction_temporal_type_card",
+    "memory_extraction_temporal_interval_card",
+    "memory_date_resolution",
     "memory_extraction_coverage_members_card",
+    "memory_extraction_coverage_member_identity_card",
 }
 
 
@@ -117,16 +143,18 @@ def _is_memory_extraction_card_purpose(purpose: object) -> bool:
 
 
 def _card_output_from_lean_payload(
-    payload: dict[str, object] | str, purpose: object
+    payload: dict[str, object] | str, purpose: object, *, prompt: str
 ) -> str:
     if isinstance(payload, str):
         return payload
     candidates = payload.get("candidates")
     if not isinstance(candidates, list) or payload.get("nothing_durable"):
         return "none"
-    candidate_ids = [f"cand_{index + 1:03d}" for index in range(len(candidates))]
     purpose_text = str(purpose or "")
+    if purpose_text == "memory_date_resolution":
+        return memory_extraction_card_output_from_payload(payload, purpose, prompt=prompt)
     if purpose_text == "memory_extraction_candidate_card":
+        candidate_ids = [f"cand_{index + 1:03d}" for index in range(len(candidates))]
         return (
             "\n".join(
                 f"{candidate_id} | {candidate.get('canonical_text') or ''}"
@@ -137,38 +165,32 @@ def _card_output_from_lean_payload(
             )
             or "none"
         )
-    if purpose_text == "memory_extraction_kind_scope_card":
-        return (
-            "\n".join(
-                (
-                    f"{candidate_id} "
-                    f"{candidate.get('kind') or 'evidence'} "
-                    f"{candidate.get('subject_scope') or 'user'} "
-                    f"{candidate.get('confidence', 0.75)}"
-                )
-                for candidate_id, candidate in zip(
-                    candidate_ids, candidates, strict=True
-                )
-                if isinstance(candidate, dict)
-            )
-            or "none"
+    if purpose_text in {
+        "memory_extraction_belief_key_card",
+        "memory_extraction_belief_value_card",
+        "memory_extraction_kind_card",
+        "memory_extraction_scope_card",
+        "memory_extraction_confidence_card",
+    }:
+        return memory_extraction_card_output_from_payload(
+            payload, purpose, prompt=prompt
         )
-    if purpose_text == "memory_extraction_evidence_card":
-        lines = []
-        for candidate_id, candidate in zip(candidate_ids, candidates, strict=True):
-            if not isinstance(candidate, dict):
-                continue
-            languages = ",".join(candidate.get("language_codes") or ["en"])
-            source_span = candidate.get("source_span") or "none"
-            lines.append(
-                (
-                    f"{candidate_id} "
-                    f"{candidate.get('support_kind') or 'direct'} "
-                    f"{str(bool(candidate.get('preserve_verbatim'))).lower()} "
-                    f"{languages} | {source_span}"
-                )
-            )
-        return "\n".join(lines) or "none"
+    if purpose_text in {
+        "memory_extraction_coverage_members_card",
+        "memory_extraction_coverage_member_identity_card",
+    }:
+        return coverage_card_output_from_lean_candidates(candidates, purpose_text, prompt)
+    if purpose_text in {
+        "memory_extraction_evidence_support_card",
+        "memory_extraction_preserve_verbatim_card",
+        "memory_extraction_candidate_language_card",
+        "memory_extraction_source_reference_card",
+    }:
+        return memory_extraction_card_output_from_payload(
+            payload, purpose, prompt=prompt
+        )
+    candidates = _candidates_shown_in_prompt(candidates, prompt)
+    candidate_ids = [str(candidate["_fixture_candidate_id"]) for candidate in candidates]
     if purpose_text == "memory_extraction_index_card":
         return (
             "\n".join(
@@ -180,49 +202,11 @@ def _card_output_from_lean_payload(
             )
             or "none"
         )
-    if purpose_text == "memory_extraction_temporal_card":
-        lines = []
-        for candidate_id, candidate in zip(candidate_ids, candidates, strict=True):
-            if not isinstance(candidate, dict):
-                continue
-            temporal = candidate.get("temporal_status")
-            if not isinstance(temporal, dict):
-                lines.append(f"{candidate_id} none none")
-                continue
-            lines.append(
-                (
-                    f"{candidate_id} "
-                    f"{temporal.get('type') or 'unknown'} "
-                    f"{temporal.get('valid_from_iso') or 'none'} "
-                    f"{temporal.get('valid_to_iso') or 'none'}"
-                )
-            )
-        return "\n".join(lines) or "none"
-    if purpose_text == "memory_extraction_belief_card":
-        lines = []
-        for candidate_id, candidate in zip(candidate_ids, candidates, strict=True):
-            if not isinstance(candidate, dict) or candidate.get("kind") != "belief":
-                lines.append(f"{candidate_id} none none")
-                continue
-            lines.append(
-                (
-                    f"{candidate_id} "
-                    f"{candidate.get('claim_key') or 'memory.claim'} "
-                    f"{candidate.get('claim_value') or 'true'}"
-                )
-            )
-        return "\n".join(lines) or "none"
-    if purpose_text == "memory_extraction_coverage_members_card":
-        lines = []
-        for candidate_id, candidate in zip(candidate_ids, candidates, strict=True):
-            members = (
-                candidate.get("coverage_members")
-                if isinstance(candidate, dict)
-                else None
-            )
-            members_json = json.dumps(members) if isinstance(members, list) else "[]"
-            lines.append(f"{candidate_id} | {members_json}")
-        return "\n".join(lines) or "none"
+    if purpose_text in {
+        "memory_extraction_temporal_type_card",
+        "memory_extraction_temporal_interval_card",
+    }:
+        return memory_extraction_card_output_from_payload(payload, purpose, prompt=prompt)
     return "none"
 
 
@@ -260,7 +244,7 @@ class CannedExtractionProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps({"equivalent": True}),
+                output_text="yes",
             )
         if _is_memory_extraction_card_purpose(request.metadata.get("purpose")):
             return LLMCompletionResponse(
@@ -269,6 +253,7 @@ class CannedExtractionProvider(LLMProvider):
                 output_text=_card_output_from_lean_payload(
                     self.payload,
                     request.metadata.get("purpose"),
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         return LLMCompletionResponse(
@@ -529,7 +514,7 @@ class SequencedExtractionProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps({"equivalent": True}),
+                output_text="yes",
             )
         if _is_memory_extraction_card_purpose(request.metadata.get("purpose")):
             if request.metadata.get("purpose") == "memory_extraction_candidate_card":
@@ -546,6 +531,7 @@ class SequencedExtractionProvider(LLMProvider):
                 output_text=_card_output_from_lean_payload(
                     self._active_payload,
                     request.metadata.get("purpose"),
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         if not self._payloads:
@@ -594,6 +580,7 @@ class OutputLimitThenBoundedProvider(LLMProvider):
                 output_text=_card_output_from_lean_payload(
                     self.bounded_payload,
                     request.metadata.get("purpose"),
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         return LLMCompletionResponse(
@@ -639,6 +626,7 @@ class WatchdogAbortProvider(LLMProvider):
                 output_text=_card_output_from_lean_payload(
                     self.bounded_payload,
                     request.metadata.get("purpose"),
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         return LLMCompletionResponse(
@@ -700,7 +688,7 @@ class VerboseStreamingExtractionProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps({"equivalent": True}),
+                output_text="yes",
             )
         if _is_memory_extraction_card_purpose(request.metadata.get("purpose")):
             return LLMCompletionResponse(
@@ -709,6 +697,7 @@ class VerboseStreamingExtractionProvider(LLMProvider):
                 output_text=_card_output_from_lean_payload(
                     self.payload,
                     request.metadata.get("purpose"),
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         return LLMCompletionResponse(
@@ -931,7 +920,7 @@ async def test_normal_extraction_persists_grounded_items() -> None:
         ],
         "beliefs": [
             {
-                "canonical_text": "concise actionable debugging advice",
+                "canonical_text": "The user values concise actionable debugging advice",
                 "scope": "assistant_mode",
                 "confidence": 0.78,
                 "source_kind": "inferred",
@@ -943,7 +932,7 @@ async def test_normal_extraction_persists_grounded_items() -> None:
         ],
         "contract_signals": [
             {
-                "canonical_text": "concise actionable debugging advice",
+                "canonical_text": "The assistant should provide concise actionable debugging advice",
                 "scope": "assistant_mode",
                 "confidence": 0.72,
                 "source_kind": "inferred",
@@ -995,8 +984,8 @@ async def test_normal_extraction_persists_grounded_items() -> None:
         assert result.nothing_durable is False
         assert details.grounding_dropped_count == 0
         assert run_counters.snapshot() == {"counts": {}, "labeled_counts": {}}
-        assert len(persisted) == 3
-        assert provider.requests[0].model == MINIMAX_M3_MODEL
+        assert len(persisted) == 4
+        assert provider.requests[0].model == "openrouter/openai/gpt-6-luna"
         assert (
             provider.requests[0].metadata["purpose"]
             == "memory_extraction_candidate_card"
@@ -1795,7 +1784,11 @@ async def test_retrieval_packet_writer_auto_writes_active_public_ordinary_surfac
             in derivation["approval"]["approval_note"]
         )
 
-        candidates = await CandidateSearch(connection, clock).search(
+        candidates = await CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        ).search(
             _persisted_surface_plan("retrieval packet public alias"),
             user_id="usr_1",
             fts_query_audit=[],
@@ -2152,15 +2145,20 @@ async def test_extractor_mechanical_watchdog_abort_retries_bounded_and_closes_st
             )
 
         purposes = [request.metadata.get("purpose") for request in provider.requests]
-        assert purposes == [
-            "memory_extraction_candidate_card",
-            "memory_extraction_kind_scope_card",
-            "memory_extraction_evidence_card",
+        assert purposes[0] == "memory_extraction_candidate_card"
+        assert len(purposes) == 11
+        assert set(purposes[1:]) == {
+            "memory_extraction_kind_card",
+            "memory_extraction_scope_card",
+            "memory_extraction_confidence_card",
+            "memory_extraction_evidence_support_card",
+            "memory_extraction_preserve_verbatim_card",
+            "memory_extraction_candidate_language_card",
+            "memory_extraction_source_reference_card",
             "memory_extraction_index_card",
-            "memory_extraction_temporal_card",
-            "memory_extraction_belief_card",
+            "memory_extraction_temporal_type_card",
             "memory_extraction_coverage_members_card",
-        ]
+        }
         assert all(
             request.metadata.get("extraction_retry_mode") != "bounded_output"
             for request in provider.requests
@@ -2281,7 +2279,7 @@ async def test_bounded_retry_item_cap_prevents_persisting_excess_items() -> None
         persisted = await memories.list_for_user("usr_1")
         assert result.nothing_durable is False
         assert len(persisted) == 1
-        assert len(provider.requests) == 8
+        assert len(provider.requests) == 12
         assert (
             provider.requests[1].metadata["extraction_retry_mode"] == "bounded_output"
         )
@@ -2455,8 +2453,8 @@ async def test_temporal_fields_are_persisted_when_temporal_confidence_is_high() 
                 "privacy_level": 0,
                 "payload": {},
                 "temporal_type": "bounded",
-                "valid_from_iso": "2023-05-15T00:00:00",
-                "valid_to_iso": "2023-05-21T23:59:59.999999",
+                "valid_from_iso": "2023-05-15T00:00:00+00:00",
+                "valid_to_iso": "2023-05-21T23:59:59.999999+00:00",
                 "temporal_confidence": 0.82,
             }
         ],
@@ -2524,6 +2522,9 @@ async def test_extraction_prompt_requires_event_dates_for_relative_one_time_even
                 "source_kind": "extracted",
                 "privacy_level": 0,
                 "payload": {},
+                "temporal_type": "event_triggered",
+                "valid_from_iso": "2023-08-13T00:00:00+00:00",
+                "valid_to_iso": "2023-08-13T23:59:59+00:00",
             }
         ],
         "beliefs": [],
@@ -2560,13 +2561,13 @@ async def test_extraction_prompt_requires_event_dates_for_relative_one_time_even
         temporal_request = next(
             request
             for request in provider.requests
-            if request.metadata.get("purpose") == "memory_extraction_temporal_card"
+            if request.metadata.get("purpose") == "memory_extraction_temporal_interval_card"
         )
         prompt = temporal_request.messages[-1].content
         assert "last night" in prompt
         assert "event_triggered" in prompt
-        assert "valid_from_iso" in prompt
-        assert "Use <message_timestamp> to resolve" in prompt
+        assert "the first describes the start, the second describes the end" in prompt
+        assert "Never calculate a date" in prompt
     finally:
         await connection.close()
 
@@ -2633,15 +2634,21 @@ async def test_extractor_requests_plain_text_cards_without_json_schema() -> None
             for request in provider.requests
             if str(request.metadata.get("purpose", "")).startswith("memory_extraction_")
         ]
-        assert [request.metadata.get("purpose") for request in extraction_requests] == [
-            "memory_extraction_candidate_card",
-            "memory_extraction_kind_scope_card",
-            "memory_extraction_evidence_card",
+        purposes = [request.metadata.get("purpose") for request in extraction_requests]
+        assert purposes[0] == "memory_extraction_candidate_card"
+        assert len(purposes) == 11
+        assert set(purposes[1:]) == {
+            "memory_extraction_kind_card",
+            "memory_extraction_scope_card",
+            "memory_extraction_confidence_card",
+            "memory_extraction_evidence_support_card",
+            "memory_extraction_preserve_verbatim_card",
+            "memory_extraction_candidate_language_card",
+            "memory_extraction_source_reference_card",
             "memory_extraction_index_card",
-            "memory_extraction_temporal_card",
-            "memory_extraction_belief_card",
+            "memory_extraction_temporal_type_card",
             "memory_extraction_coverage_members_card",
-        ]
+        }
         assert all(request.response_schema is None for request in extraction_requests)
         assert "No JSON" in extraction_requests[0].messages[0].content
     finally:
@@ -2696,6 +2703,198 @@ async def test_temporal_type_accepts_ephemeral() -> None:
         persisted = await memories.list_for_user("usr_1")
         assert len(persisted) == 1
         assert persisted[0]["temporal_type"] == "ephemeral"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_temporal_type_component_override_does_not_reroute_interval() -> None:
+    payload = {
+        "evidences": [{
+            "canonical_text": "The user visited Jo yesterday.",
+            "scope": "conversation",
+            "confidence": 0.9,
+            "source_kind": "extracted",
+            "privacy_level": 0,
+            "payload": {},
+            "temporal_type": "event_triggered",
+            "valid_from_iso": "2026-09-25T00:00:00-04:00",
+            "valid_to_iso": "2026-09-25T23:59:59-04:00",
+        }],
+        "beliefs": [],
+        "contract_signals": [],
+        "state_updates": [],
+        "mode_guess": None,
+        "nothing_durable": False,
+    }
+    settings = _settings(llm_component_models={
+        "extractor": "openai/extractor-test",
+        "extraction_temporal_type": "openai/temporal-test",
+    })
+    (
+        connection, _clock, messages, _memories, extractor, provider, resolved_policy
+    ) = await _build_runtime(payload, settings=settings)
+    try:
+        source_message = await _create_source_message(
+            messages,
+            text="Yesterday I visited Jo.",
+            occurred_at="2026-09-26T12:00:00-04:00",
+        )
+        result = await extractor.extract(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(source_message["id"]),
+            resolved_policy=resolved_policy,
+        )
+        assert result.evidences[0].temporal_type == "event_triggered"
+        type_requests = [request for request in provider.requests if
+                         request.metadata.get("purpose") == "memory_extraction_temporal_type_card"]
+        interval_requests = [request for request in provider.requests if
+                             request.metadata.get("purpose") == "memory_extraction_temporal_interval_card"]
+        assert len(type_requests) == len(interval_requests) == 1
+        assert type_requests[0].model == "openai/temporal-test"
+        assert interval_requests[0].model == "openai/extractor-test"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output,status,certainty,day", [
+    ("exact|ref|days|-1", "completed", "exact", "2026-09-25"),
+    ("uncertain|ref|days|-1", "completed", "uncertain", "2026-09-25"),
+    ("unknown", "completed", "unknown", None),
+    ("analyze", "pending_analysis", None, None),
+])
+async def test_date_annotation_roundtrips_source_anchor_and_completion(
+    output, status, certainty, day,
+) -> None:
+    # Reuse the temporal-component scenario above to exercise persistence,
+    # including provider outputs that must not become exact expiry bounds.
+    text = "The user visited Jo yesterday."
+    payload = {"evidences": [{
+        "canonical_text": text, "scope": "conversation", "confidence": 0.9,
+        "source_kind": "extracted", "privacy_level": 0,
+        "temporal_type": "event_triggered",
+        "valid_from_iso": "2026-09-25T00:00:00-04:00",
+        "valid_to_iso": "2026-09-25T23:59:59-04:00",
+        "date_resolution_output": output,
+    }]}
+    connection, clock, messages, memories, extractor, provider, policy = await _build_runtime(payload)
+    try:
+        source = await _create_source_message(
+            messages, text="Yesterday I visited Jo.", occurred_at="2026-09-26T12:00:00-04:00",
+        )
+        await extractor.extract(
+            message_text=source["text"], role="user",
+            conversation_context=_context(source["id"]), resolved_policy=policy,
+        )
+        rows = await memories.list_for_user("usr_1")
+        assert len(rows) == 1
+        row = await memories.get_memory_object(user_id="usr_1", memory_id=rows[0]["id"])
+        assert row is not None
+        assert row["payload_json"]["source_occurred_at"] == "2026-09-26T12:00:00-04:00"
+        before = len(provider.requests)
+        annotation = read_persisted_date_resolution(
+            row["payload_json"], row["canonical_text"], row["payload_json"]["source_occurred_at"],
+        )
+        assert annotation is not None
+        assert (annotation.status, annotation.certainty, annotation.resolved_date) == (status, certainty, day)
+        assert annotation.reference_date == "2026-09-26"
+        assert len(provider.requests) == before
+        if certainty != "exact":
+            assert row["valid_from"] is None and row["valid_to"] is None
+        requests = [request for request in provider.requests if request.metadata.get("purpose") == "memory_date_resolution"]
+        assert len(requests) == 1
+        assert requests[0].metadata["source_message_id"] == source["id"]
+        assert "Reference date: 2026-09-26" in requests[0].messages[0].content
+        assert len(requests[0].messages) == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,anchor,point_answer,texts,calendar,answers,expected", [
+    pytest.param(
+        "The user is away from June 10 through June 12, 2026, inclusive.",
+        "2026-06-01T12:00:00+02:00", "exact|2026-06-12|days|0",
+        ("June 10, 2026", "June 12, 2026"), None,
+        {"June 10, 2026": "exact|2026-06-10|days|0", "June 12, 2026": "exact|2026-06-12|days|0"},
+        ("2026-06-10T00:00:00+02:00", "2026-06-12T23:59:59+02:00"),
+        id="original_three_day_range",
+    ),
+    pytest.param(
+        "The user is on leave for the whole of November 2026, from the month's first instant through its last instant, UTC+00:00.",
+        "2026-09-27T12:00:00+00:00", "analyze", (None, None),
+        {"year": 2026, "month": 11}, {},
+        ("2026-11-01T00:00:00+00:00", "2026-11-30T23:59:59+00:00"),
+        id="original_whole_month",
+    ),
+])
+async def test_original_written_intervals_persist_source_attribution(
+    source, anchor, point_answer, texts, calendar, answers, expected,
+) -> None:
+    # These are the unchanged original interval fixtures, not additions to the
+    # frozen benchmark corpus. Canned semantic outputs isolate integration.
+    descriptors = [
+        {"text": text, "source_quote": source, "time": None,
+         "offset": anchor[-6:], "period": "month" if calendar else "day",
+         "calendar_period": calendar}
+        for text in texts
+    ]
+    payload = {"evidences": [{
+        "canonical_text": source, "scope": "conversation", "confidence": 0.9,
+        "source_kind": "extracted", "privacy_level": 0, "temporal_type": "bounded",
+        "date_resolution_output": point_answer, "date_resolution_outputs": answers,
+        "temporal_interval_output": "\n".join(json.dumps(endpoint) for endpoint in descriptors),
+    }]}
+    connection, _clock, messages, memories, extractor, provider, policy = await _build_runtime(payload)
+    try:
+        message = await _create_source_message(messages, text=source, occurred_at=anchor)
+        await extractor.extract(
+            message_text=message["text"], role="user",
+            conversation_context=_context(message["id"]), resolved_policy=policy,
+        )
+        rows = await memories.list_for_user("usr_1")
+        assert len(rows) == 1
+        row = await memories.get_memory_object(user_id="usr_1", memory_id=rows[0]["id"])
+        assert (row["valid_from"], row["valid_to"]) == expected
+        interval = TemporalIntervalResolution.model_validate(row["payload_json"]["date_interval"])
+        for endpoint in (interval.start, interval.end):
+            assert endpoint.endpoint.source_quote == source
+            assert endpoint.source_message_id == message["id"]
+            assert endpoint.source_occurred_at == anchor
+        if calendar:
+            assert row["payload_json"]["date_resolution"]["status"] == "pending_analysis"
+            assert interval.start.date_resolution is None
+            assert interval.end.date_resolution is None
+            assert interval.start.endpoint.calendar_period.model_dump() == calendar
+        else:
+            assert interval.start.date_resolution.resolved_date == "2026-06-10"
+            assert interval.end.date_resolution.resolved_date == "2026-06-12"
+        requests = [request for request in provider.requests if request.metadata.get("purpose") == "memory_date_resolution"]
+        assert len(requests) == 1 + len(answers)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_date_response_remains_failure_without_persistence() -> None:
+    payload = {"evidences": [{
+        "canonical_text": "The user visited Jo yesterday.", "scope": "conversation",
+        "confidence": 0.9, "source_kind": "extracted", "privacy_level": 0,
+        "temporal_type": "event_triggered", "date_resolution_output": "exact|ref|days|broken",
+    }]}
+    connection, _clock, messages, memories, extractor, _provider, policy = await _build_runtime(payload)
+    try:
+        source = await _create_source_message(
+            messages, text="Yesterday I visited Jo.", occurred_at="2026-09-26T12:00:00-04:00",
+        )
+        with pytest.raises(ValueError, match="numeric"):
+            await extractor.extract(
+                message_text=source["text"], role="user",
+                conversation_context=_context(source["id"]), resolved_policy=policy,
+            )
+        assert await memories.list_for_user("usr_1") == []
     finally:
         await connection.close()
 
@@ -2933,14 +3132,14 @@ async def test_extraction_persists_active_space_boundary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_isolated_extraction_forces_cross_chat_items_to_conversation_scope() -> (
+async def test_isolated_extraction_stores_only_allowed_chat_scope() -> (
     None
 ):
     payload = {
         "evidences": [
             {
                 "canonical_text": "I prefer concise debugging advice",
-                "scope": "global_user",
+                "scope": "chat",
                 "confidence": 0.91,
                 "source_kind": "extracted",
                 "privacy_level": 1,
@@ -3071,7 +3270,7 @@ async def test_phase6_incognito_preferences_and_temporary_force_chat_lock_and_ex
         "evidences": [
             {
                 "canonical_text": "I prefer client local temporary memory",
-                "scope": "user",
+                "scope": "chat",
                 "confidence": 0.91,
                 "source_kind": "extracted",
                 "privacy_level": 1,
@@ -3162,28 +3361,21 @@ async def test_phase6_character_scope_without_character_id_never_becomes_user() 
             text="I prefer character scoped notes.",
         )
 
-        await extractor.extract(
-            message_text=str(source_message["text"]),
-            role="user",
-            conversation_context=_context(str(source_message["id"]), character_id=None),
-            resolved_policy=resolved_policy,
-        )
+        with pytest.raises(ValueError, match="Memory scope is outside the allowed write scopes"):
+            await extractor.extract(
+                message_text=str(source_message["text"]),
+                role="user",
+                conversation_context=_context(str(source_message["id"]), character_id=None),
+                resolved_policy=resolved_policy,
+            )
 
-        rows = await memories.list_for_user("usr_1", statuses=None)
-        assert len(rows) == 1
-        assert rows[0]["scope"] == MemoryScope.CHAT.value
-        assert rows[0]["scope_canonical"] == MemoryScope.CHAT.value
-        assert rows[0]["status"] == MemoryStatus.REVIEW_REQUIRED.value
-        assert (
-            "character_scope_missing_character_id_forced_chat"
-            in rows[0]["payload_json"]["write_policy_reasons"]
-        )
+        assert await memories.list_for_user("usr_1", statuses=None) == []
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_temporal_type_unexpected_string_is_dropped_by_card_assembly() -> None:
+async def test_temporal_type_unexpected_string_fails_extraction() -> None:
     payload = {
         "evidences": [
             {
@@ -3219,16 +3411,16 @@ async def test_temporal_type_unexpected_string_is_dropped_by_card_assembly() -> 
             occurred_at="2023-05-08T13:56:00+00:00",
         )
 
-        await extractor.extract(
-            message_text=source_message["text"],
-            role="user",
-            conversation_context=_context(source_message["id"]),
-            resolved_policy=resolved_policy,
-        )
+        with pytest.raises(LLMError, match="unknown option"):
+            await extractor.extract(
+                message_text=source_message["text"],
+                role="user",
+                conversation_context=_context(source_message["id"]),
+                resolved_policy=resolved_policy,
+            )
 
         persisted = await memories.list_for_user("usr_1")
-        assert len(persisted) == 1
-        assert persisted[0]["temporal_type"] == "unknown"
+        assert persisted == []
     finally:
         await connection.close()
 
@@ -3237,25 +3429,6 @@ async def test_temporal_type_unexpected_string_is_dropped_by_card_assembly() -> 
 async def test_extraction_cards_do_not_use_json_validation_retry_messages() -> None:
     provider = SequencedExtractionProvider(
         [
-            {
-                "evidences": [],
-                "beliefs": [],
-                "contract_signals": [],
-                "state_updates": [
-                    {
-                        "canonical_text": "I am at the airport.",
-                        "scope": "conversation",
-                        "confidence": 0.9,
-                        "source_kind": "extracted",
-                        "privacy_level": 0,
-                        "payload": {"location": "airport"},
-                        "temporal_type": "temporary",
-                        "temporal_confidence": 0.82,
-                    }
-                ],
-                "mode_guess": None,
-                "nothing_durable": False,
-            },
             {
                 "evidences": [],
                 "beliefs": [],
@@ -3300,7 +3473,7 @@ async def test_extraction_cards_do_not_use_json_validation_retry_messages() -> N
             resolved_policy=resolved_policy,
         )
 
-        assert len(sequenced_provider.requests) == 7
+        assert len(sequenced_provider.requests) == 13
         assert all(
             request.response_schema is None for request in sequenced_provider.requests
         )
@@ -3316,25 +3489,6 @@ async def test_extraction_cards_do_not_use_json_validation_retry_messages() -> N
 async def test_extraction_persists_ephemeral_from_cards_without_json_retry() -> None:
     provider = SequencedExtractionProvider(
         [
-            {
-                "evidences": [],
-                "beliefs": [],
-                "contract_signals": [],
-                "state_updates": [
-                    {
-                        "canonical_text": "I have a headache today.",
-                        "scope": "conversation",
-                        "confidence": 0.9,
-                        "source_kind": "extracted",
-                        "privacy_level": 0,
-                        "payload": {"symptom": "headache"},
-                        "temporal_type": "temporary",
-                        "temporal_confidence": 0.82,
-                    }
-                ],
-                "mode_guess": None,
-                "nothing_durable": False,
-            },
             {
                 "evidences": [],
                 "beliefs": [],
@@ -3380,16 +3534,16 @@ async def test_extraction_persists_ephemeral_from_cards_without_json_retry() -> 
         )
 
         persisted = await memories.list_for_user("usr_1")
-        assert len(sequenced_provider.requests) == 7
+        assert len(sequenced_provider.requests) == 13
         assert len(persisted) == 1
-        assert persisted[0]["temporal_type"] == "unknown"
+        assert persisted[0]["temporal_type"] == "ephemeral"
         assert persisted[0]["valid_from"] is None
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_extraction_drops_invalid_temporal_bounds_without_json_retry() -> None:
+async def test_extraction_rejects_inverted_temporal_bounds() -> None:
     provider = SequencedExtractionProvider(
         [
             {
@@ -3405,48 +3559,12 @@ async def test_extraction_drops_invalid_temporal_bounds_without_json_retry() -> 
                         "privacy_level": 0,
                         "payload": {"focus": "vacation"},
                         "temporal_type": "bounded",
+                        "temporal_interval_output": (
+                            '{"text":null,"time":"23:59:59","offset":"+00:00","period":"day"}\n'
+                            '{"text":null,"time":"00:00:00","offset":"+00:00","period":"day"}'
+                        ),
                         "valid_from_iso": "2023-05-12T00:00:00+00:00",
                         "valid_to_iso": "2023-05-08T00:00:00+00:00",
-                        "temporal_confidence": 0.82,
-                    }
-                ],
-                "mode_guess": None,
-                "nothing_durable": False,
-            },
-            {
-                "evidences": [],
-                "beliefs": [],
-                "contract_signals": [],
-                "state_updates": [
-                    {
-                        "canonical_text": "I am on vacation this week.",
-                        "scope": "conversation",
-                        "confidence": 0.9,
-                        "source_kind": "extracted",
-                        "privacy_level": 0,
-                        "payload": {"focus": "vacation"},
-                        "temporal_type": "temporary",
-                        "temporal_confidence": 0.82,
-                    }
-                ],
-                "mode_guess": None,
-                "nothing_durable": False,
-            },
-            {
-                "evidences": [],
-                "beliefs": [],
-                "contract_signals": [],
-                "state_updates": [
-                    {
-                        "canonical_text": "I am on vacation this week.",
-                        "scope": "conversation",
-                        "confidence": 0.9,
-                        "source_kind": "extracted",
-                        "privacy_level": 0,
-                        "payload": {"focus": "vacation"},
-                        "temporal_type": "bounded",
-                        "valid_from_iso": "2023-05-08T00:00:00+00:00",
-                        "valid_to_iso": "2023-05-12T00:00:00+00:00",
                         "temporal_confidence": 0.82,
                     }
                 ],
@@ -3471,67 +3589,24 @@ async def test_extraction_drops_invalid_temporal_bounds_without_json_retry() -> 
             occurred_at="2023-05-08T13:56:00+00:00",
         )
 
-        await extractor.extract(
-            message_text=source_message["text"],
-            role="user",
-            conversation_context=_context(source_message["id"]),
-            resolved_policy=resolved_policy,
-        )
+        with pytest.raises(ValueError, match="Temporal interval starts after it ends"):
+            await extractor.extract(
+                message_text=source_message["text"],
+                role="user",
+                conversation_context=_context(source_message["id"]),
+                resolved_policy=resolved_policy,
+            )
 
         persisted = await memories.list_for_user("usr_1")
-        assert len(sequenced_provider.requests) == 7
-        assert len(persisted) == 1
-        assert persisted[0]["temporal_type"] == "unknown"
-        assert persisted[0]["valid_from"] is None
-        assert persisted[0]["valid_to"] is None
+        assert persisted == []
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_extraction_invalid_temporal_repair_does_not_raise_or_retry_json() -> (
-    None
-):
+async def test_extraction_rejects_invalid_temporal_type_without_retry() -> None:
     provider = SequencedExtractionProvider(
         [
-            {
-                "evidences": [],
-                "beliefs": [],
-                "contract_signals": [],
-                "state_updates": [
-                    {
-                        "canonical_text": "I am at the airport.",
-                        "scope": "conversation",
-                        "confidence": 0.9,
-                        "source_kind": "extracted",
-                        "privacy_level": 0,
-                        "payload": {"location": "airport"},
-                        "temporal_type": "temporary",
-                        "temporal_confidence": 0.82,
-                    }
-                ],
-                "mode_guess": None,
-                "nothing_durable": False,
-            },
-            {
-                "evidences": [],
-                "beliefs": [],
-                "contract_signals": [],
-                "state_updates": [
-                    {
-                        "canonical_text": "I am at the airport.",
-                        "scope": "conversation",
-                        "confidence": 0.9,
-                        "source_kind": "extracted",
-                        "privacy_level": 0,
-                        "payload": {"location": "airport"},
-                        "temporal_type": "temporary",
-                        "temporal_confidence": 0.82,
-                    }
-                ],
-                "mode_guess": None,
-                "nothing_durable": False,
-            },
             {
                 "evidences": [],
                 "beliefs": [],
@@ -3569,46 +3644,54 @@ async def test_extraction_invalid_temporal_repair_does_not_raise_or_retry_json()
             occurred_at="2023-05-08T13:56:00+00:00",
         )
 
-        await extractor.extract(
-            message_text=source_message["text"],
-            role="user",
-            conversation_context=_context(source_message["id"]),
-            resolved_policy=resolved_policy,
-        )
+        with pytest.raises(LLMError, match="unknown option"):
+            await extractor.extract(
+                message_text=source_message["text"],
+                role="user",
+                conversation_context=_context(source_message["id"]),
+                resolved_policy=resolved_policy,
+            )
 
-        assert len(sequenced_provider.requests) == 7
+        assert sum(
+            request.metadata.get("purpose") == "memory_extraction_temporal_type_card"
+            for request in sequenced_provider.requests
+        ) == 1
+        assert not any(
+            request.metadata.get("purpose") == "memory_extraction_temporal_interval_card"
+            for request in sequenced_provider.requests
+        )
         persisted = await memories.list_for_user("usr_1")
-        assert len(persisted) == 1
-        assert persisted[0]["temporal_type"] == "unknown"
+        assert persisted == []
     finally:
         await connection.close()
 
 
-def test_extraction_temporal_card_instructs_event_dates() -> None:
-    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["coding_debug"]
-    resolved_policy = PolicyResolver().resolve(manifest, None, None)
-    prompt = build_enrichment_prompt(
-        "temporal",
-        message_text="Last night we celebrated my daughter's birthday with a concert.",
+def test_extraction_temporal_cards_separate_type_and_event_interval() -> None:
+    source_context = _source_context_block(
+        message_text="Last night I completed a lino-printing workshop.",
         role="user",
         context=_context("msg_1"),
-        resolved_policy=resolved_policy,
-        allowed_write_scopes=("chat", "character", "user"),
-        occurred_at="2023-08-14T14:24:00+00:00",
+        occurred_at="2025-02-09T09:15:00+00:00",
         prior_chunk_context=None,
-        candidates=(
-            CandidateDraft(
-                candidate_id="cand_001",
-                canonical_text="The user celebrated their daughter's birthday with a concert last night.",
-            ),
-        ),
+    )
+    candidate_text = "The user completed a lino-printing workshop last night."
+    type_question = build_temporal_type_question(
+        candidate_id="cand_001", candidate_text=candidate_text
+    )
+    interval_prompt = build_temporal_interval_prompt(
+        candidate_id="cand_001",
+        candidate_text=candidate_text,
+        temporal_type="event_triggered",
+        source_context=source_context,
     )
 
-    assert "event_triggered" in prompt
-    assert "valid_from_iso" in prompt
-    assert "valid_to_iso" in prompt
-    assert "Use <message_timestamp> to resolve yesterday, last night" in prompt
-    assert "Use none for missing timestamps." in prompt
+    assert "event_triggered" in type_question.criteria
+    assert "ISO timestamp" not in type_question.instructions
+    assert "Classify an occurrence as an event" in type_question.instructions
+    assert "<message_timestamp>2025-02-09T09:15:00+00:00" in interval_prompt
+    assert "Never calculate a date" in interval_prompt
+    assert "For an event" in interval_prompt
+    assert "the first describes the start, the second describes the end" in interval_prompt
 
 
 def test_extraction_cards_preserve_structured_fact_granularity() -> None:
@@ -3628,72 +3711,46 @@ def test_extraction_cards_preserve_structured_fact_granularity() -> None:
         occurred_at="2023-05-08T13:56:00+00:00",
         prior_chunk_context=None,
     )
-    kind_prompt = build_enrichment_prompt(
-        "kind_scope",
-        message_text="My backup code is BLUE-27 for vendor calls only.",
-        role="user",
-        context=context,
-        resolved_policy=resolved_policy,
+    kind_prompt = build_classification_choice_question(
+        "memory_kind",
         allowed_write_scopes=("chat", "character", "user"),
-        occurred_at="2023-05-08T13:56:00+00:00",
-        prior_chunk_context=None,
-        candidates=(candidate,),
-    )
-    evidence_prompt = build_enrichment_prompt(
-        "evidence",
-        message_text="My backup code is BLUE-27 for vendor calls only.",
-        role="user",
-        context=context,
-        resolved_policy=resolved_policy,
-        allowed_write_scopes=("chat", "character", "user"),
-        occurred_at="2023-05-08T13:56:00+00:00",
-        prior_chunk_context=None,
-        candidates=(candidate,),
-    )
-
+        candidate=candidate,
+    ).instructions
     assert "Do not classify factual details as contract_signal" in kind_prompt
     assert "Split independent facts into separate lines." in candidate_prompt
     assert "keep that condition attached to the candidate text" in candidate_prompt
     assert "do not rewrite it as the person's true name" in candidate_prompt
     assert "Use evidence for appointments, past events, scheduled events" in kind_prompt
-    assert "source_span is the exact quote from the source message" in evidence_prompt
 
 
-def test_coverage_members_card_parses_json_with_collision_prone_labels() -> None:
+def test_coverage_members_card_parses_one_name_per_line_with_collision_prone_labels() -> None:
     from atagia.memory.extraction_cards import parse_coverage_members_card_output
 
     text = (
-        "cand_001 | [{\"member_key\": \"quartz-otter\", "
-        "\"display_text\": \"Quartz-otter token in the lunar gallery\"}, "
-        "{\"member_key\": \"quartz otter\", "
-        "\"display_text\": \"Quartz otter token in the river gallery\"}]\n"
-        "cand_002 | []"
+        '"Quartz-otter token in the lunar gallery"\n'
+        '"Quartz otter token in the river gallery"'
     )
     parsed, malformed = parse_coverage_members_card_output(text)
 
     assert malformed == 0
-    assert list(parsed.keys()) == ["cand_001", "cand_002"]
-    members = parsed["cand_001"]
-    assert [member.member_key for member in members] == [
-        "quartz-otter",
-        "quartz otter",
+    assert parsed == [
+        "Quartz-otter token in the lunar gallery",
+        "Quartz otter token in the river gallery",
     ]
-    assert members[0].display_text == "Quartz-otter token in the lunar gallery"
-    assert parsed["cand_002"] == []
+    assert parse_coverage_members_card_output("none") == ([], 0)
+    assert parse_coverage_members_card_output('"none"') == (["none"], 0)
 
 
 def test_coverage_members_card_truncates_display_text_and_dedupes_keys() -> None:
+    from atagia.memory.coverage_members_card import build_members
     from atagia.memory.extraction_cards import parse_coverage_members_card_output
 
     long_label = "X" * 200
-    text = (
-        f'cand_001 | [{{"member_key": "alpha", "display_text": "{long_label}"}}, '
-        '{"member_key": "alpha", "display_text": "Alpha duplicate"}]'
-    )
+    text = f'"{long_label}"\n"Alpha duplicate"'
     parsed, malformed = parse_coverage_members_card_output(text)
 
     assert malformed == 0
-    members = parsed["cand_001"]
+    members = build_members(parsed, ["alpha", "alpha"])
     # Duplicate member_key collapses to one entry; display_text is bounded to 160.
     assert [member.member_key for member in members] == ["alpha"]
     assert len(members[0].display_text) == 160
@@ -3767,12 +3824,20 @@ def _all_extraction_card_prompts(include_examples: bool = True) -> str:
             include_examples=include_examples,
         )
     ]
+    prompts.extend(
+        build_classification_choice_question(
+            card,
+            candidate=candidate,
+            allowed_write_scopes=("chat", "character", "user"),
+            include_examples=include_examples,
+        ).instructions
+        for card in ("memory_kind", "memory_scope")
+    )
+    confidence_question = build_memory_confidence_score_question(candidate)
+    prompts.append(confidence_question.instructions)
+    prompts.extend(confidence_question.criteria)
     for card in (
-        "kind_scope",
-        "evidence",
         "index",
-        "temporal",
-        "belief",
         "coverage_members",
     ):
         prompts.append(
@@ -3789,6 +3854,42 @@ def _all_extraction_card_prompts(include_examples: bool = True) -> str:
                 include_examples=include_examples,
             )
         )
+    source_context = _source_context_block(
+        message_text="placeholder message",
+        role="user",
+        context=context,
+        occurred_at=None,
+        prior_chunk_context=None,
+    )
+    prompts.extend(
+        (
+            build_temporal_type_question(
+                candidate_id=candidate.candidate_id,
+                candidate_text=candidate.canonical_text,
+            ).instructions,
+            build_temporal_interval_prompt(
+                candidate_id=candidate.candidate_id,
+                candidate_text=candidate.canonical_text,
+                temporal_type="event_triggered",
+                source_context=source_context,
+            ),
+        )
+    )
+    prompts.extend(
+        [
+            build_belief_key_prompt(
+                candidate,
+                source_context=source_context,
+                include_examples=include_examples,
+            ),
+            build_belief_value_prompt(
+                candidate,
+                claim_key="workflow.preference",
+                source_context=source_context,
+                include_examples=include_examples,
+            ),
+        ]
+    )
     return "\n".join(prompts)
 
 
@@ -3824,9 +3925,6 @@ def test_extraction_cards_examples_toggle_omits_demonstrations() -> None:
     assert "MAPLE-72-GOLD" not in without_examples
     # The toggle only drops demonstrations; the output format spec stays.
     assert "Output format: cand_001 | concise canonical memory text" in without_examples
-    assert (
-        "Format: cand_001 support preserve_verbatim language_codes" in without_examples
-    )
 
 
 @pytest.mark.asyncio
@@ -3885,7 +3983,7 @@ async def test_ephemeral_state_update_is_persisted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ephemeral_persistence_derives_valid_from_from_occurred_at() -> None:
+async def test_ephemeral_persistence_preserves_absent_interval_start() -> None:
     payload = {
         "evidences": [],
         "beliefs": [],
@@ -3930,7 +4028,7 @@ async def test_ephemeral_persistence_derives_valid_from_from_occurred_at() -> No
 
         persisted = await memories.list_for_user("usr_1")
         assert persisted[0]["temporal_type"] == "ephemeral"
-        assert persisted[0]["valid_from"] == "2023-05-08T13:56:00+00:00"
+        assert persisted[0]["valid_from"] is None
         assert persisted[0]["valid_to"] is None
     finally:
         await connection.close()
@@ -4139,7 +4237,7 @@ async def test_dedupe_hit_fills_missing_language_codes_from_validated_extraction
             {
                 "evidences": [
                     {
-                        "canonical_text": "Rosa toma amlodipino los martes",
+                        "canonical_text": "Leonie toma fexofenadina los domingos",
                         "scope": "conversation",
                         "confidence": 0.9,
                         "source_kind": "extracted",
@@ -4172,7 +4270,7 @@ async def test_dedupe_hit_fills_missing_language_codes_from_validated_extraction
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.CONVERSATION,
-            canonical_text="Rosa toma amlodipino los martes",
+            canonical_text="Leonie toma fexofenadina los domingos",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
@@ -4181,7 +4279,7 @@ async def test_dedupe_hit_fills_missing_language_codes_from_validated_extraction
         )
         source_message = await _create_source_message(
             messages,
-            text="Rosa toma amlodipino los martes.",
+            text="Leonie toma fexofenadina los domingos.",
         )
 
         await extractor.extract(
@@ -5284,13 +5382,12 @@ async def test_assistant_messages_do_not_enter_pending_confirmation_branch() -> 
 
 
 @pytest.mark.asyncio
-async def test_anti_hallucination_rejects_ungrounded_items(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+async def test_evidence_card_omits_item_without_source_reference() -> None:
     payload = {
         "evidences": [
             {
                 "canonical_text": "The user loves Rust",
+                "source_quote": None,
                 "scope": "assistant_mode",
                 "confidence": 0.95,
                 "source_kind": "extracted",
@@ -5310,7 +5407,7 @@ async def test_anti_hallucination_rejects_ungrounded_items(
         messages,
         memories,
         extractor,
-        _provider,
+        provider,
         resolved_policy,
     ) = await _build_runtime(payload)
     try:
@@ -5320,7 +5417,6 @@ async def test_anti_hallucination_rejects_ungrounded_items(
         )
 
         run_counters = RunCounterAccumulator()
-        caplog.set_level(logging.INFO, logger="atagia.memory.extractor")
         with use_run_counter_accumulator(run_counters):
             details = await extractor.extract_with_persistence_and_chunk_plan(
                 message_text=source_message["text"],
@@ -5329,17 +5425,21 @@ async def test_anti_hallucination_rejects_ungrounded_items(
                 resolved_policy=resolved_policy,
             )
 
-        assert details.grounding_dropped_count == 1
-        assert run_counters.snapshot() == {
-            "counts": {"grounding_dropped_count": 1},
-            "labeled_counts": {},
-        }
-        assert any(
-            "extraction_grounding_dropped" in record.message
-            and "The user loves Rust" in record.message
-            and "gate=minimum_overlap" in record.message
-            for record in caplog.records
-        )
+        assert details.result.nothing_durable is True
+        assert details.grounding_dropped_count == 0
+        assert run_counters.snapshot() == {"counts": {}, "labeled_counts": {}}
+        evidence_requests = [
+            request for request in provider.requests
+            if request.metadata.get("purpose") == "memory_extraction_evidence_support_card"
+        ]
+        assert len(evidence_requests) == 1
+        assert _card_output_from_lean_payload(
+            provider.payload,
+            "memory_extraction_evidence_support_card",
+            prompt="\n".join(
+                message.content for message in evidence_requests[0].messages
+            ),
+        ) == "none"
         assert await memories.list_for_user("usr_1") == []
     finally:
         await connection.close()
@@ -5541,6 +5641,7 @@ async def test_chunked_extraction_grounds_against_each_local_chunk() -> None:
                 "evidences": [
                     {
                         "canonical_text": "I prefer concise debugging advice for retry issues",
+                        "source_quote": None,
                         "scope": "assistant_mode",
                         "confidence": 0.9,
                         "source_kind": "extracted",
@@ -5584,7 +5685,7 @@ async def test_chunked_extraction_grounds_against_each_local_chunk() -> None:
 
         rows = await memories.list_for_user("usr_1")
         assert result.nothing_durable is False
-        assert len(result.evidences) == 2
+        assert len(result.evidences) == 1
         assert len(persisted) == 1
         assert len(rows) == 1
         assert rows[0]["payload_json"]["chunk_index"] == 1
@@ -5677,12 +5778,17 @@ async def test_chunked_extraction_dedupes_semantically_equivalent_beliefs_across
             if request.metadata.get("purpose")
             == "intent_classifier_claim_key_equivalence"
         ]
+        purposes = [request.metadata.get("purpose") for request in sequenced_provider.requests]
         assert len(result.beliefs) == 1
         assert len(persisted) == 1
         assert len(rows) == 1
         assert rows[0]["object_type"] == "belief"
         assert rows[0]["payload_json"]["claim_value"] == "concise_actionable"
+        assert purposes.count("memory_extraction_belief_key_card") == 2
+        assert purposes.count("memory_extraction_belief_value_card") == 2
+        assert purposes.count("memory_extraction_belief_key_selection_card") == 0
         assert len(equivalence_requests) == 1
+        assert equivalence_requests[0].metadata["stage"] == "equivalent"
     finally:
         await connection.close()
 

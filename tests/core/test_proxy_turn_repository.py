@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 from shutil import copy2
+from time import perf_counter
 from typing import Any, Coroutine
 
 import aiosqlite
@@ -27,6 +28,7 @@ from atagia.core.proxy_turn_repository import (
     ProxyTurnRepository,
     ProxyTurnRequestMessage,
     ProxyTurnResponseMessage,
+    ProxyTurnTelemetry,
     proxy_turn_pair_id,
 )
 from atagia.core.presence_repository import PresenceRepository
@@ -37,7 +39,11 @@ from atagia.core.repositories import (
 )
 from atagia.core.space_repository import SpaceRepository
 from atagia.models.schemas_jobs import EXTRACT_STREAM_NAME, JobEnvelope, JobType
-from atagia.models.schemas_memory import ConversationStatus, SpaceBoundaryMode
+from atagia.models.schemas_memory import (
+    ConversationStatus,
+    SpaceBoundaryMode,
+    TurnSurface,
+)
 from atagia.services.errors import (
     ConversationNotFoundError,
     MessageIdConflictError,
@@ -52,10 +58,41 @@ from atagia.services.proxy_transcript import (
     build_response_metadata,
 )
 
+from tests.turn_telemetry_support import sample_turn_telemetry
+
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 )
+
+
+def _proxy_turn_telemetry(
+    *,
+    user_id: str,
+    conversation_id: str,
+    request_message_id: str,
+) -> ProxyTurnTelemetry:
+    """Minimal telemetry payload for a finalize() call under test."""
+    telemetry = sample_turn_telemetry(TurnSurface.PROXY_COMPLETION)
+    return ProxyTurnTelemetry(
+        telemetry=telemetry,
+        # The fenced writer re-measures the turn from this origin, so it has to
+        # be a real perf_counter reading that already contains the sample's
+        # retrieval slice -- exactly as in production, where retrieval runs
+        # inside the turn rather than before it starts.
+        turn_started_at=perf_counter() - (telemetry.turn_to_event_write_wall_ms / 1000.0),
+        retrieval_event_id=None,
+        fallback_event={
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "request_message_id": request_message_id,
+            "assistant_mode_id": None,
+            "retrieval_plan_json": {},
+            "selected_memory_ids_json": [],
+            "context_view_json": {},
+            "outcome_json": {"memory_context_available": False},
+        },
+    )
 
 
 async def _seed(
@@ -329,6 +366,11 @@ async def test_completed_pair_replays_without_recreating_jobs() -> None:
             claim,
             response=_response(claim),
             durable_jobs=[_job(claim)],
+            turn_telemetry=_proxy_turn_telemetry(
+                user_id=claim.user_id,
+                conversation_id=claim.conversation_id,
+                request_message_id=claim.request_message_id,
+            ),
         )
 
         replay = await repository.reserve(
@@ -384,6 +426,11 @@ async def test_terminal_failpoints_roll_back_response_jobs_and_completed_state(
                 claim,
                 response=_response(claim),
                 durable_jobs=[_job(claim)],
+                turn_telemetry=_proxy_turn_telemetry(
+                    user_id=claim.user_id,
+                    conversation_id=claim.conversation_id,
+                    request_message_id=claim.request_message_id,
+                ),
                 failpoint=failpoint,
             )
         await close_connection(connection)
@@ -436,6 +483,11 @@ async def test_finalize_rechecks_active_conversation_after_lifecycle_wins(
                 claim,
                 response=_response(claim),
                 durable_jobs=[_job(claim)],
+                turn_telemetry=_proxy_turn_telemetry(
+                    user_id=claim.user_id,
+                    conversation_id=claim.conversation_id,
+                    request_message_id=claim.request_message_id,
+                ),
             )
 
         finalize_task = asyncio.create_task(finalize_after_barrier())
@@ -514,6 +566,11 @@ async def test_exposed_stream_cannot_be_taken_over_after_lease_expiry() -> None:
                 claim,
                 response=_response(claim),
                 durable_jobs=[_job(claim)],
+                turn_telemetry=_proxy_turn_telemetry(
+                    user_id=claim.user_id,
+                    conversation_id=claim.conversation_id,
+                    request_message_id=claim.request_message_id,
+                ),
             )
         assert (
             await MessageRepository(connection, clock).get_message_for_idempotency(
@@ -647,6 +704,11 @@ async def test_pair_evidence_survives_pruning_until_last_message_is_deleted() ->
             claim,
             response=_response(claim),
             durable_jobs=[_job(claim)],
+            turn_telemetry=_proxy_turn_telemetry(
+                user_id=claim.user_id,
+                conversation_id=claim.conversation_id,
+                request_message_id=claim.request_message_id,
+            ),
         )
         clock.advance(seconds=60)
         assert await repository.prune_terminal_diagnostics(before=clock.now()) == 1
@@ -696,6 +758,11 @@ async def test_request_and_response_sequences_are_durable_and_replay_validated()
             claim,
             response=_response(claim),
             durable_jobs=[_job(claim)],
+            turn_telemetry=_proxy_turn_telemetry(
+                user_id=claim.user_id,
+                conversation_id=claim.conversation_id,
+                request_message_id=claim.request_message_id,
+            ),
         )
         run = await repository.get_run(claim.pair_id)
         assert run is not None
@@ -1649,6 +1716,11 @@ async def test_namespace_change_fail_closes_unexposed_proxy_turn() -> None:
                 claim,
                 response=_response(claim),
                 durable_jobs=[_job(claim)],
+                turn_telemetry=_proxy_turn_telemetry(
+                    user_id=claim.user_id,
+                    conversation_id=claim.conversation_id,
+                    request_message_id=claim.request_message_id,
+                ),
             )
         assert changed.value.code == "proxy_namespace_changed"
         run = await repository.get_run(claim.pair_id)
@@ -1931,6 +2003,11 @@ async def test_expired_proxy_lease_cannot_finalize() -> None:
                 claim,
                 response=_response(claim),
                 durable_jobs=[_job(claim)],
+                turn_telemetry=_proxy_turn_telemetry(
+                    user_id=claim.user_id,
+                    conversation_id=claim.conversation_id,
+                    request_message_id=claim.request_message_id,
+                ),
             )
         assert (
             await MessageRepository(

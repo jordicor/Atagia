@@ -54,6 +54,40 @@ from atagia.services.errors import (
 RETRIEVAL_ELIGIBLE_MEMORY_STATUSES: tuple[MemoryStatus, ...] = (MemoryStatus.ACTIVE,)
 _SAFE_SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# memory_objects.queryable_at (migration 0071) is the first instant a memory
+# actually became retrievable, which is the only honest end point for ingest
+# latency: created_at is when the row entered the FTS index, and a row born
+# 'review_required' or 'pending_user_confirmation' is not retrievable then, or
+# possibly ever.
+#
+# Every UPDATE whose target status is chosen at runtime carries this assignment,
+# so the "stamp once, on the way in" rule lives in the statement instead of in
+# each caller's head:
+#   * `status` on the right-hand side reads the PRE-update value, so a row that
+#     is already active keeps whatever it has. Rewriting 'active' over 'active'
+#     neither restamps a live row nor invents a stamp for a pre-0071 row.
+#   * A row entering 'active' is stamped only while the column is NULL, so
+#     active -> archived -> active keeps the FIRST stamp.
+#   * Any other target status binds NULL, and COALESCE leaves the column alone.
+_QUERYABLE_AT_ASSIGNMENT = """queryable_at = CASE
+                    WHEN status = ? THEN queryable_at
+                    ELSE COALESCE(queryable_at, ?)
+                END"""
+
+
+def _queryable_at_stamp(status: MemoryStatus, timestamp: str) -> str | None:
+    """Return the queryable stamp for a row reaching `status`, else None."""
+    return timestamp if status is MemoryStatus.ACTIVE else None
+
+
+def _queryable_at_parameters(
+    status: MemoryStatus,
+    timestamp: str,
+) -> tuple[str, str | None]:
+    """Bind values for `_QUERYABLE_AT_ASSIGNMENT`, in statement order."""
+    return (MemoryStatus.ACTIVE.value, _queryable_at_stamp(status, timestamp))
+
+
 # Categories that the high-risk policy treats as inherently sensitive.
 # Used for the strictest-wins sensitivity derivation when callers don't pass
 # an explicit value; the namespace redesign plan lists these as private-or-
@@ -2642,6 +2676,7 @@ class MemoryObjectRepository(BaseRepository):
         parameters: list[Any] = [
             status.value,
             _encode_json(normalized_payload),
+            *_queryable_at_parameters(status, timestamp),
             timestamp,
             memory_id,
             user_id,
@@ -2655,11 +2690,15 @@ class MemoryObjectRepository(BaseRepository):
             UPDATE memory_objects
             SET status = ?,
                 payload_json = ?,
+                {queryable_at_assignment},
                 updated_at = ?
             WHERE id = ?
               AND user_id = ?
             {status_clause}
-            """.format(status_clause=status_clause),
+            """.format(
+                queryable_at_assignment=_QUERYABLE_AT_ASSIGNMENT,
+                status_clause=status_clause,
+            ),
             tuple(parameters),
         )
         if status is MemoryStatus.DELETED:
@@ -2729,6 +2768,9 @@ class MemoryObjectRepository(BaseRepository):
         }
 
         if existing is None:
+            # A summary mirror compacts many source objects, so it has no single
+            # source message whose arrival could measure ingest freshness:
+            # source_message_created_at stays NULL.
             return await self.create_memory_object(
                 user_id=user_id,
                 workspace_id=workspace_id,
@@ -2800,10 +2842,11 @@ class MemoryObjectRepository(BaseRepository):
                 preserve_verbatim = ?,
                 language_codes_json = ?,
                 status = ?,
+                {queryable_at_assignment},
                 updated_at = ?
             WHERE id = ?
               AND user_id = ?
-            """,
+            """.format(queryable_at_assignment=_QUERYABLE_AT_ASSIGNMENT),
             (
                 workspace_id,
                 conversation_id,
@@ -2839,6 +2882,7 @@ class MemoryObjectRepository(BaseRepository):
                 0,
                 language_codes_json,
                 status.value,
+                *_queryable_at_parameters(status, timestamp),
                 timestamp,
                 mirror_id,
                 user_id,
@@ -2921,6 +2965,7 @@ class MemoryObjectRepository(BaseRepository):
         source_mind_id: str | None = None,
         embodiment_id: str | None = None,
         realm_id: str | None = None,
+        source_message_created_at: str | None = None,
     ) -> dict[str, Any]:
         created, _was_created = await self._create_memory_object_impl(
             user_id=user_id,
@@ -2968,6 +3013,7 @@ class MemoryObjectRepository(BaseRepository):
             source_mind_id=source_mind_id,
             embodiment_id=embodiment_id,
             realm_id=realm_id,
+            source_message_created_at=source_message_created_at,
         )
         return created
 
@@ -3019,6 +3065,7 @@ class MemoryObjectRepository(BaseRepository):
         source_mind_id: str | None = None,
         embodiment_id: str | None = None,
         realm_id: str | None = None,
+        source_message_created_at: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         return await self._create_memory_object_impl(
             user_id=user_id,
@@ -3066,6 +3113,7 @@ class MemoryObjectRepository(BaseRepository):
             source_mind_id=source_mind_id,
             embodiment_id=embodiment_id,
             realm_id=realm_id,
+            source_message_created_at=source_message_created_at,
         )
 
     async def _create_memory_object_impl(
@@ -3119,6 +3167,7 @@ class MemoryObjectRepository(BaseRepository):
         source_mind_id: str | None = None,
         embodiment_id: str | None = None,
         realm_id: str | None = None,
+        source_message_created_at: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         resolved_memory_id = memory_id or new_memory_id()
         timestamp = self._timestamp()
@@ -3189,6 +3238,11 @@ class MemoryObjectRepository(BaseRepository):
             source_mind_id,
             embodiment_id,
             realm_id,
+            source_message_created_at,
+            # A memory born active is retrievable from this instant; one born
+            # 'review_required' or 'pending_user_confirmation' is not, so it
+            # inserts NULL and gets stamped later only if it transitions in.
+            _queryable_at_stamp(status, timestamp),
         )
         try:
             await self._connection.execute(
@@ -3239,9 +3293,11 @@ class MemoryObjectRepository(BaseRepository):
                     memory_owner_id,
                     source_mind_id,
                     embodiment_id,
-                    realm_id
+                    realm_id,
+                    source_message_created_at,
+                    queryable_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 parameters,
             )
@@ -3638,10 +3694,11 @@ class MemoryObjectRepository(BaseRepository):
                 platform_id_lock = ?,
                 extraction_hash = ?,
                 status = ?,
+                {queryable_at_assignment},
                 updated_at = ?
             WHERE id = ?
               AND user_id = ?
-            """,
+            """.format(queryable_at_assignment=_QUERYABLE_AT_ASSIGNMENT),
             (
                 resolved_privacy_level,
                 resolved_boundary.value,
@@ -3656,6 +3713,7 @@ class MemoryObjectRepository(BaseRepository):
                 resolved_platform_id_lock,
                 resolved_extraction_hash,
                 resolved_status,
+                *_queryable_at_parameters(MemoryStatus(resolved_status), timestamp),
                 timestamp,
                 memory_id,
                 user_id,

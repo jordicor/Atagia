@@ -59,6 +59,7 @@ from atagia.services.lifecycle_service import (
 from atagia.services.llm_client import LLMClient
 from atagia.services.retrieval_service import RetrievalService
 from tests.redis_real_support import RealRedisServer, running_redis_server
+from tests.recent_window_support import stored_recent_window
 
 
 MIGRATIONS_DIR = (
@@ -1018,7 +1019,7 @@ async def test_recent_window_publish_removes_stale_write_after_revision_bump(
 
         assert not await stale_publish
         assert (
-            await runtime.storage_backend.get_recent_window(
+            await stored_recent_window(runtime.storage_backend,
                 build_recent_window_key(USER_ID, CONVERSATION_ID)
             )
             is None
@@ -1132,7 +1133,7 @@ async def test_stale_recent_window_cleanup_cannot_delete_newer_publication(
         )
         release_old_publisher.set()
         assert not await old_publish
-        assert await runtime.storage_backend.get_recent_window(
+        assert await stored_recent_window(runtime.storage_backend,
             build_recent_window_key(USER_ID, CONVERSATION_ID)
         ) == [{"role": "assistant", "content": NEW_TEXT}]
     finally:

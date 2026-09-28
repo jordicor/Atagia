@@ -82,7 +82,7 @@ class QueueProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps({"equivalent": True}),
+                output_text="yes",
             )
         if not self.outputs:
             raise AssertionError("No queued output left for this test")
@@ -133,7 +133,7 @@ class FlipEquivalenceProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps({"equivalent": equivalent}),
+                output_text="yes" if equivalent else "no",
             )
         if not self.outputs:
             raise AssertionError("No queued output left for this test")
@@ -1841,5 +1841,54 @@ async def test_claim_key_mismatch_at_preview_skips_and_preserves_buffer(
         assert await beliefs.get_tension(
             str(belief["id"]), user_id="usr_1"
         ) == pytest.approx(0.60)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_promoted_belief_leaves_source_message_arrival_null() -> None:
+    connection, backend, memories, _beliefs, worker = await _build_runtime([])
+    try:
+        evidence_one = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_promotion_stamp_a",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            source_message_id="msg_1",
+            claim_key="response_style.debugging",
+        )
+        evidence_two = await _seed_evidence(
+            memories,
+            memory_id="mem_evidence_promotion_stamp_b",
+            conversation_id="cnv_2",
+            assistant_mode_id="research_deep_dive",
+            source_message_id="msg_2",
+            claim_key="response_style.debugging",
+        )
+        await backend.stream_add(
+            REVISE_STREAM_NAME,
+            _revision_job(
+                belief_id="",
+                evidence_memory_ids=[str(evidence_one["id"]), str(evidence_two["id"])],
+                source_message_id="msg_1",
+                scope=MemoryScope.CONVERSATION.value,
+            ).model_dump(mode="json"),
+        )
+
+        result = await worker.run_once()
+        beliefs = [
+            row
+            for row in await memories.list_for_user("usr_1")
+            if row["object_type"] == MemoryObjectType.BELIEF.value
+        ]
+
+        assert result.acked == 1
+        assert len(beliefs) == 1
+        # msg_1 exists in the fixture and is resolvable, so the NULL stamp is a
+        # deliberate omission: the claim was promoted because it recurred across
+        # cnv_1 and cnv_2, which is not a single-message derivation.
+        assert beliefs[0]["payload_json"]["source_message_ids"] == ["msg_1"]
+        assert beliefs[0]["payload_json"]["promotion_stats"]["distinct_conversations"] == 2
+        assert beliefs[0]["source_message_created_at"] is None
     finally:
         await connection.close()

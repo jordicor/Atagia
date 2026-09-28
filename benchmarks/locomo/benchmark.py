@@ -207,6 +207,9 @@ class LoCoMoBenchmark(BenchmarkRunner):
         community_corrections_path: str | Path | None = None,
         answer_postcondition_guard_enabled: bool = False,
         judge_protocol: JudgeProtocol = JudgeProtocol.SOURCE_AWARE_STRICT,
+        inference_access_mode: str | None = None,
+        local_llm_endpoints_file: str | Path | None = None,
+        zero_cost_openrouter_profile: str | None = None,
     ) -> None:
         self._judge_protocol = judge_protocol
         self._data_path = Path(data_path).expanduser()
@@ -249,7 +252,14 @@ class LoCoMoBenchmark(BenchmarkRunner):
         self._embedding_backend = embedding_backend
         self._embedding_model = embedding_model
         self._answer_postcondition_guard_enabled = answer_postcondition_guard_enabled
+        self._inference_access_mode = inference_access_mode
+        self._local_llm_endpoints_file = local_llm_endpoints_file
+        self._zero_cost_openrouter_profile = zero_cost_openrouter_profile
         self._adapter = LoCoMoAdapter(self._data_path)
+        # Effective-settings snapshot captured from the first live engine of a
+        # run (every engine in a run shares identical settings) and threaded into
+        # the run manifest so a run can prove its effective configuration.
+        self._effective_settings_report: dict[str, Any] | None = None
         # memory_quality judging needs the full conversation transcript; render
         # it once per conversation instead of once per question (12-26k tokens).
         self._transcript_cache: dict[str, str] = {}
@@ -274,6 +284,28 @@ class LoCoMoBenchmark(BenchmarkRunner):
             "llm_chat_model": self._answer_model or self._chat_model,
             "llm_component_models": dict(self._component_models),
         }
+
+    def _inference_access_kwargs(self) -> dict[str, Any]:
+        values: dict[str, Any] = {
+            "inference_access_mode": self._inference_access_mode,
+            "local_llm_endpoints_file": self._local_llm_endpoints_file,
+            "zero_cost_openrouter_profile": self._zero_cost_openrouter_profile,
+        }
+        if self._judge_model is not None:
+            values["_inference_startup_completion_models"] = {
+                "locomo.judge": self._judge_model
+            }
+        return values
+
+    def _capture_effective_settings(self, engine: Atagia) -> None:
+        """Record the engine's effective-settings report once per run.
+
+        Every engine created within a run shares identical settings, so the
+        first live engine's report is representative and is threaded into the
+        run manifest under ``effective_settings``.
+        """
+        if self._effective_settings_report is None:
+            self._effective_settings_report = engine.effective_settings_report()
 
     async def run(
         self,
@@ -311,6 +343,9 @@ class LoCoMoBenchmark(BenchmarkRunner):
         invocation_args: list[str] | None = None,
     ) -> BenchmarkReport:
         """Run the benchmark and return an aggregated report."""
+        # Each run captures its own effective-settings snapshot; a stale one
+        # from a prior run on a reused instance must never leak forward.
+        self._effective_settings_report = None
         dataset = self._adapter.load()
         selected_conversations = self._select_conversations(dataset, conversation_ids)
         ablation = self._benchmark_ablation(ablation)
@@ -558,6 +593,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
             },
             "invocation_args": invocation_args or [],
             "run_counters": run_counters.snapshot(),
+            "effective_settings": self._effective_settings_report or {},
         }
         report = self._build_report(
             conversation_reports,
@@ -1087,6 +1123,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                     **provider_api_key_kwargs(self._llm_provider, self._llm_api_key),
                     embedding_backend=self._embedding_backend,
                     embedding_model=self._embedding_model,
+                    **self._inference_access_kwargs(),
                     skip_belief_revision=ablation.skip_belief_revision
                     if ablation
                     else False,
@@ -1096,6 +1133,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                     ),
                 ) as open_engine:
                     engine = open_engine
+                    self._capture_effective_settings(engine)
                     report = await self._run_conversation_with_open_engine(
                         engine,
                         conversation,
@@ -2466,6 +2504,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
                 **provider_api_key_kwargs(self._llm_provider, self._llm_api_key),
                 embedding_backend=self._embedding_backend,
                 embedding_model=self._embedding_model,
+                **self._inference_access_kwargs(),
                 skip_belief_revision=ablation.skip_belief_revision
                 if ablation
                 else False,
@@ -3722,6 +3761,7 @@ class LoCoMoBenchmark(BenchmarkRunner):
             "git": _git_state(),
             "activation_flags": self._activation_flags(),
             "model_info": report.model_info,
+            "effective_settings": report.model_info.get("effective_settings", {}),
             "run_counters": normalize_run_counters(
                 report.model_info.get("run_counters")
             ),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from pydantic import BaseModel
 
@@ -416,6 +418,29 @@ class ClosingStreamProvider(LLMProvider):
             yield LLMStreamEvent(type="text", content="unreachable")
         finally:
             self.closed = True
+
+
+class CloseRaisingStreamProvider(LLMProvider):
+    """A provider whose stream raises on the way out of its own teardown."""
+
+    name = "close-raising-stream"
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        return LLMCompletionResponse(provider=self.name, model=request.model)
+
+    async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
+        return LLMEmbeddingResponse(
+            provider=self.name,
+            model=request.model,
+            vectors=[LLMEmbeddingVector(index=0, values=[0.1])],
+        )
+
+    async def stream(self, request: LLMCompletionRequest):
+        try:
+            yield LLMStreamEvent(type="text", content="partial")
+            yield LLMStreamEvent(type="text", content="unreachable")
+        finally:
+            raise RuntimeError("provider close exploded")
 
 
 class AbortObserver:
@@ -1406,6 +1431,35 @@ async def test_complete_applies_gemini_profile_without_exposing_thinking() -> No
 
 
 @pytest.mark.asyncio
+async def test_complete_defaults_direct_gemini_36_flash_thinking_to_low() -> None:
+    """The direct route to 3.6-flash must carry the same default as openrouter.
+
+    Without a profile the google provider falls back to ThinkingLevel.HIGH,
+    so this pins that an unsuffixed spec resolves to LOW. An unsupported
+    ``xhigh`` also falls back to that default; the explicitly mapped ``medium``
+    and ``high`` levels remain operator overrides, matching the openrouter
+    profile.
+    """
+    provider = RecordingProvider("gemini")
+    client = LLMClient(providers=[provider])
+
+    await client.complete(
+        _request().model_copy(
+            update={"model": "google/gemini-3.6-flash", "temperature": 0.0}
+        )
+    )
+    await client.complete(
+        _request().model_copy(update={"model": "google/gemini-3.6-flash,xhigh"})
+    )
+
+    assert provider.requests[0].model == "gemini-3.6-flash"
+    assert provider.requests[0].metadata["gemini_thinking_level"] == "LOW"
+    assert provider.requests[0].temperature == 1.0
+    assert provider.requests[0].metadata["atagia_effective_temperature"] == 1.0
+    assert provider.requests[1].metadata["gemini_thinking_level"] == "LOW"
+
+
+@pytest.mark.asyncio
 async def test_complete_applies_purpose_temperature_when_request_omits_temperature() -> (
     None
 ):
@@ -1947,6 +2001,40 @@ async def test_complete_streamed_closes_stream_on_observer_abort() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_provider_that_raises_on_close_does_not_become_the_outcome(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The teardown of a failed round-trip must not overwrite why it failed.
+
+    Every close happens inside an except handler that already holds a diagnosis
+    and is about to re-raise it. A provider raising on close used to replace that
+    diagnosis with an unrelated teardown error -- and in the proxy's abandon path
+    it escaped ``_ClosingStreamingResponse.__call__``'s ``finally`` into the ASGI
+    task error log, skipping the claim resolution queued behind it.
+
+    The failure is not swallowed either: it is logged with its traceback, which
+    is the whole difference between a deliberate diagnosis and a silent fallback.
+    """
+    provider = CloseRaisingStreamProvider()
+    client = LLMClient(provider_name=provider.name, providers=[provider])
+
+    with caplog.at_level(logging.WARNING, logger="atagia.services.llm_client"):
+        with pytest.raises(RuntimeError, match="observer abort"):
+            await client.complete_streamed(_request(), observer=AbortObserver())
+
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ] == ["Provider stream iterator raised while closing"]
+    assert any(
+        record.exc_info is not None
+        and "provider close exploded" in str(record.exc_info[1])
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_complete_structured_streamed_parses_json_payload() -> None:
     provider = JsonProvider('{"label":"ok","score":9}')
     client = LLMClient(provider_name="json", providers=[provider])
@@ -2020,7 +2108,7 @@ async def test_interactive_purpose_uses_short_retry_policy() -> None:
     )
 
     with pytest.raises(TransientLLMError):
-        await client.complete(_purpose_request("need_detection_language_card"))
+        await client.complete(_purpose_request("need_detection_query_language_card"))
 
     # Interactive purpose caps at 2 attempts regardless of the base policy.
     assert provider.calls == 2

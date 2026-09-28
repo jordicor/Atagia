@@ -29,6 +29,8 @@ from atagia.models.schemas_memory import ConversationStatus
 from atagia.services.conversation_activity_service import ConversationActivityService
 from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.errors import TranscriptRebuildInProgressError
+from tests.recent_window_support import stored_recent_window
+from tests.turn_telemetry_support import sample_turn_telemetry
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -1055,7 +1057,7 @@ async def test_single_warmup_rechecks_namespace_after_stats_refresh(
             await asyncio.wait_for(warmup_task, timeout=5.0)
         warmup_task = None
         assert (
-            await runtime_a.storage_backend.get_recent_window(
+            await stored_recent_window(runtime_a.storage_backend,
                 build_recent_window_key(user_id, conversation_id)
             )
             is None
@@ -1298,7 +1300,8 @@ async def test_activity_stats_aggregate_messages_retrieval_and_histograms(
                     "selected_memory_ids_json": [],
                     "context_view_json": {},
                     "outcome_json": {},
-                }
+                },
+                telemetry=sample_turn_telemetry(),
             )
             runtime.clock = FrozenClock(
                 datetime(2026, 3, 10, 12, 0, tzinfo=timezone.utc)
@@ -1463,7 +1466,7 @@ async def test_warmup_primes_recent_window_and_recommended_conversations(
             assert single["recent_message_ids"] == ["msg_4", "msg_5", "msg_6"]
             assert single["cached_context_available"] is False
             assert (
-                await runtime.storage_backend.get_recent_window(
+                await stored_recent_window(runtime.storage_backend,
                     build_recent_window_key("usr_1", "cnv_1")
                 )
                 == single["recent_messages"]
@@ -1577,7 +1580,7 @@ async def test_warmup_captured_window_cannot_publish_after_conversation_delete_w
             await warmup
 
         assert (
-            await runtime.storage_backend.get_recent_window(
+            await stored_recent_window(runtime.storage_backend,
                 build_recent_window_key("usr_window_race", "cnv_window_race")
             )
             is None
@@ -2040,7 +2043,7 @@ async def test_activity_consumers_reject_stats_from_an_older_message_source(
         read_task = None
         if consumer_kind in {"warmup", "recommended_warmup"}:
             assert (
-                await runtime_a.storage_backend.get_recent_window(
+                await stored_recent_window(runtime_a.storage_backend,
                     build_recent_window_key(user_id, conversation_id)
                 )
                 is None
@@ -2114,7 +2117,7 @@ async def test_warmup_survives_transient_context_cache_read_failure(
         assert warmed["cached_context_available"] is False
         assert "context_cache_read_failed" in warmed["warmup_errors"]
         assert (
-            await runtime.storage_backend.get_recent_window(
+            await stored_recent_window(runtime.storage_backend,
                 build_recent_window_key(user_id, conversation_id)
             )
             == warmed["recent_messages"]
@@ -2271,7 +2274,7 @@ async def test_warmup_cleans_exact_window_when_source_changes_after_publish(
 
         await asyncio.wait_for(reached.wait(), timeout=5.0)
         key = build_recent_window_key(user_id, conversation_id)
-        assert await runtime_a.storage_backend.get_recent_window(key) is not None
+        assert await stored_recent_window(runtime_a.storage_backend, key) is not None
         if source_change == "selection":
             await _commit_blocking_transcript_selection(
                 connection_b,
@@ -2291,7 +2294,7 @@ async def test_warmup_cleans_exact_window_when_source_changes_after_publish(
         with pytest.raises(TranscriptRebuildInProgressError):
             await asyncio.wait_for(warmup_task, timeout=5.0)
         warmup_task = None
-        assert await runtime_a.storage_backend.get_recent_window(key) is None
+        assert await stored_recent_window(runtime_a.storage_backend, key) is None
     finally:
         resume.set()
         if warmup_task is not None:
@@ -2403,7 +2406,7 @@ async def test_failed_warmup_cleanup_preserves_newer_recent_window(
             await asyncio.wait_for(warmup_task, timeout=5.0)
         warmup_task = None
         assert (
-            await runtime_a.storage_backend.get_recent_window(
+            await stored_recent_window(runtime_a.storage_backend,
                 build_recent_window_key(user_id, conversation_id)
             )
             == newer_messages
@@ -2496,7 +2499,7 @@ async def test_recommended_warmup_cleans_earlier_windows_when_later_source_chang
 
         for conversation_id in conversation_ids:
             assert (
-                await runtime_a.storage_backend.get_recent_window(
+                await stored_recent_window(runtime_a.storage_backend,
                     build_recent_window_key(user_id, conversation_id)
                 )
                 is None
@@ -2682,7 +2685,7 @@ async def test_warmup_cannot_repopulate_after_cross_runtime_selection_starts(
 
         await asyncio.wait_for(reached.wait(), timeout=5.0)
         assert (
-            await runtime_a.storage_backend.get_recent_window(
+            await stored_recent_window(runtime_a.storage_backend,
                 build_recent_window_key(user_id, conversation_id)
             )
             is not None
@@ -2698,7 +2701,7 @@ async def test_warmup_cannot_repopulate_after_cross_runtime_selection_starts(
             await asyncio.wait_for(warmup_task, timeout=5.0)
         warmup_task = None
         assert (
-            await runtime_a.storage_backend.get_recent_window(
+            await stored_recent_window(runtime_a.storage_backend,
                 build_recent_window_key(user_id, conversation_id)
             )
             is None
@@ -2805,7 +2808,7 @@ async def test_warmup_removes_published_window_after_conversation_source_changes
         )
 
         await asyncio.wait_for(reached.wait(), timeout=5.0)
-        assert await runtime_a.storage_backend.get_recent_window(
+        assert await stored_recent_window(runtime_a.storage_backend,
             build_recent_window_key(user_id, conversation_id)
         ) == [
             {
@@ -2855,7 +2858,7 @@ async def test_warmup_removes_published_window_after_conversation_source_changes
             await asyncio.wait_for(warmup_task, timeout=5.0)
         warmup_task = None
         assert (
-            await runtime_a.storage_backend.get_recent_window(
+            await stored_recent_window(runtime_a.storage_backend,
                 build_recent_window_key(user_id, conversation_id)
             )
             is None

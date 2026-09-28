@@ -30,6 +30,7 @@ from atagia.models.schemas_memory import (
     VerbatimPinTargetKind,
 )
 from atagia.services.context_cache_service import ContextCacheService
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
@@ -125,7 +126,11 @@ async def test_candidate_search_filters_by_active_embodiment() -> None:
             embodiment_id=None,
         )
 
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
         drone_ids = {
             row["id"]
             for row in await search.search(
@@ -338,7 +343,11 @@ async def test_verbatim_pins_filter_by_active_embodiment_in_crud_search_and_cand
         )
         assert {row["id"] for row in search_rows} == {"pin_drone"}
 
-        candidate_rows = await CandidateSearch(connection, clock).search(
+        candidate_rows = await CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        ).search(
             _plan(
                 active_embodiment_id="body_drone",
                 raw_context_access_mode="verbatim",
@@ -457,7 +466,11 @@ async def test_artifact_chunks_and_verbatim_evidence_carry_embodiment() -> None:
             raw_context_access_mode="verbatim",
         ).model_copy(update={"scope_filter": [MemoryScope.CHAT]})
         evidence_rows = [
-            row for row in await CandidateSearch(connection, clock).search(plan, "usr_1")
+            row for row in await CandidateSearch(
+                connection,
+                clock,
+                token_document_frequency_cache=TokenDocumentFrequencyCache(),
+            ).search(plan, "usr_1")
             if row.get("is_verbatim_evidence_window")
         ]
         assert evidence_rows

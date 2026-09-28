@@ -19,6 +19,7 @@ from openai import (
 )
 
 from atagia.services.llm_client import (
+    ConfigurationError,
     LLMCompletionRequest,
     LLMCompletionResponse,
     LLMEmbeddingRequest,
@@ -38,6 +39,8 @@ from atagia.services.llm_schema import (
     has_json_schema_nullability,
     strip_json_schema_nullability,
 )
+from atagia.services.inference_policy import local_provider_registry_key
+from atagia.services.local_endpoint_catalog import LocalEndpoint
 
 
 def _model_dump(value: Any) -> dict[str, Any]:
@@ -98,8 +101,7 @@ _TRANSIENT_API_ERROR_MESSAGE_FRAGMENTS = frozenset(
 def _is_transient_api_error(exc: APIError) -> bool:
     message = str(exc).lower()
     return any(
-        fragment in message
-        for fragment in _TRANSIENT_API_ERROR_MESSAGE_FRAGMENTS
+        fragment in message for fragment in _TRANSIENT_API_ERROR_MESSAGE_FRAGMENTS
     )
 
 
@@ -110,7 +112,9 @@ def _stringify_content(content: Any) -> str:
         return content
     if isinstance(content, list):
         return "".join(
-            item.get("text", "") if isinstance(item, dict) else getattr(item, "text", "")
+            item.get("text", "")
+            if isinstance(item, dict)
+            else getattr(item, "text", "")
             for item in content
         )
     return str(content)
@@ -123,13 +127,19 @@ def _openai_reasoning_model_id(model: str) -> str:
     return model_lower
 
 
-def _is_openai_reasoning_model(model: str) -> bool:
+def _is_openai_reasoning_model(model: str, *, provider_name: str) -> bool:
     model_id = _openai_reasoning_model_id(model)
-    return model_id in {"chat-latest", "gpt-chat-latest"} or model_id.startswith(("gpt-5", "o1", "o3", "o4"))
+    return (
+        model_id in {"chat-latest", "gpt-chat-latest"}
+        or model_id.startswith(("gpt-5", "o1", "o3", "o4"))
+        or (provider_name == "openai" and model_id.startswith("gpt-6"))
+    )
 
 
 def _uses_max_completion_tokens(model: str, *, provider_name: str) -> bool:
-    return provider_name == "openai" and _is_openai_reasoning_model(model)
+    return provider_name == "openai" and _is_openai_reasoning_model(
+        model, provider_name=provider_name
+    )
 
 
 _TRUNCATION_FINISH_REASONS = frozenset({"length"})
@@ -264,17 +274,27 @@ def _openai_messages(request: LLMCompletionRequest) -> list[dict[str, Any]]:
     return converted
 
 
-def _openai_message_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _openai_message_tool_calls(
+    tool_calls: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     for index, tool_call in enumerate(tool_calls):
-        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        function = (
+            tool_call.get("function")
+            if isinstance(tool_call.get("function"), dict)
+            else {}
+        )
         name = str(function.get("name") or tool_call.get("name") or "tool")
         raw_arguments = (
             function.get("arguments")
             if "arguments" in function
             else tool_call.get("arguments", tool_call.get("input", {}))
         )
-        arguments = raw_arguments if isinstance(raw_arguments, str) else json.dumps(raw_arguments)
+        arguments = (
+            raw_arguments
+            if isinstance(raw_arguments, str)
+            else json.dumps(raw_arguments)
+        )
         converted.append(
             {
                 "id": str(tool_call.get("id") or f"call_atagia_{index}"),
@@ -358,10 +378,11 @@ def _response_format(
 ) -> dict[str, Any] | None:
     if schema is None:
         return None
-    llm_schema = schema if preserve_nullability else strip_json_schema_nullability(schema)
-    strict = (
-        not _has_free_form_objects(llm_schema)
-        and (preserve_nullability or not has_json_schema_nullability(schema))
+    llm_schema = (
+        schema if preserve_nullability else strip_json_schema_nullability(schema)
+    )
+    strict = not _has_free_form_objects(llm_schema) and (
+        preserve_nullability or not has_json_schema_nullability(schema)
     )
     sanitized = _sanitize_strict_schema(llm_schema) if strict else llm_schema
     return {
@@ -390,6 +411,7 @@ class OpenAICompatibleProvider(LLMProvider):
         request_timeout_seconds: float | None = None,
         client: AsyncOpenAI | None = None,
         embedding_client: AsyncOpenAI | None = None,
+        restricted_transport: bool = False,
     ) -> None:
         client_kwargs: dict[str, Any] = {
             "api_key": api_key,
@@ -399,7 +421,21 @@ class OpenAICompatibleProvider(LLMProvider):
         }
         if request_timeout_seconds is not None:
             client_kwargs["timeout"] = request_timeout_seconds
-        self._client = client or AsyncOpenAI(**client_kwargs)
+        self._owned_http_clients: list[httpx.AsyncClient] = []
+        if client is not None:
+            self._client = client
+        else:
+            if restricted_transport:
+                http_client_kwargs: dict[str, Any] = {
+                    "trust_env": False,
+                    "follow_redirects": False,
+                }
+                if request_timeout_seconds is not None:
+                    http_client_kwargs["timeout"] = request_timeout_seconds
+                http_client = httpx.AsyncClient(**http_client_kwargs)
+                self._owned_http_clients.append(http_client)
+                client_kwargs["http_client"] = http_client
+            self._client = AsyncOpenAI(**client_kwargs)
         if embedding_client is not None:
             self._embedding_client = embedding_client
         elif embedding_base_url is not None and embedding_base_url != base_url:
@@ -409,7 +445,14 @@ class OpenAICompatibleProvider(LLMProvider):
         else:
             self._embedding_client = self._client
 
-    def _completion_kwargs(self, request: LLMCompletionRequest, *, stream: bool) -> dict[str, Any]:
+    async def aclose(self) -> None:
+        """Close the narrow set of internally owned restricted transports."""
+        for client in self._owned_http_clients:
+            await client.aclose()
+
+    def _completion_kwargs(
+        self, request: LLMCompletionRequest, *, stream: bool
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": request.model,
             "messages": _openai_messages(request),
@@ -430,7 +473,9 @@ class OpenAICompatibleProvider(LLMProvider):
             kwargs["extra_body"] = provider_extra_body
         if request.metadata.get("verbosity"):
             kwargs["verbosity"] = request.metadata["verbosity"]
-        if request.temperature is not None and not _is_openai_reasoning_model(request.model):
+        if request.temperature is not None and not _is_openai_reasoning_model(
+            request.model, provider_name=self.name
+        ):
             kwargs["temperature"] = request.temperature
         max_tokens = request.max_output_tokens
         if max_tokens is not None:
@@ -485,8 +530,7 @@ class OpenAICompatibleProvider(LLMProvider):
             not output_text
             and not tool_calls
             and not (
-                request.external_answer
-                and finish_reason in _TRUNCATION_FINISH_REASONS
+                request.external_answer and finish_reason in _TRUNCATION_FINISH_REASONS
             )
         ):
             raise _empty_content_error(self.name, finish_reason)
@@ -507,11 +551,22 @@ class OpenAICompatibleProvider(LLMProvider):
         )
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        from atagia.diagnostics.recorder import capture_raw_response, capture_sent_payload
+
+        kwargs = self._completion_kwargs(request, stream=False)
+        capture_sent_payload(kwargs)
         try:
-            response = await self._client.chat.completions.create(**self._completion_kwargs(request, stream=False))
+            response = await self._client.chat.completions.create(**kwargs)
         except json.JSONDecodeError as exc:
-            raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
-        except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
+            raise TransientLLMError(
+                "Provider returned a non-JSON HTTP response"
+            ) from exc
+        except (
+            APIConnectionError,
+            APITimeoutError,
+            RateLimitError,
+            InternalServerError,
+        ) as exc:
             raise _transient_error(exc) from exc
         except (httpx.TransportError, TimeoutError, ConnectionError) as exc:
             raise _transient_error(exc) from exc
@@ -521,6 +576,7 @@ class OpenAICompatibleProvider(LLMProvider):
             if _is_transient_api_error(exc):
                 raise _transient_error(exc) from exc
             raise LLMError(str(exc)) from exc
+        capture_raw_response(response)
         return self._map_completion_response(request, response)
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -535,8 +591,15 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             response = await self._embedding_client.embeddings.create(**kwargs)
         except json.JSONDecodeError as exc:
-            raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
-        except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
+            raise TransientLLMError(
+                "Provider returned a non-JSON HTTP response"
+            ) from exc
+        except (
+            APIConnectionError,
+            APITimeoutError,
+            RateLimitError,
+            InternalServerError,
+        ) as exc:
             raise _transient_error(exc) from exc
         except (httpx.TransportError, TimeoutError, ConnectionError) as exc:
             raise _transient_error(exc) from exc
@@ -548,7 +611,10 @@ class OpenAICompatibleProvider(LLMProvider):
             raise LLMError(str(exc)) from exc
 
         vectors = [
-            LLMEmbeddingVector(index=_getattr_or_key(item, "index", 0), values=list(_getattr_or_key(item, "embedding", [])))
+            LLMEmbeddingVector(
+                index=_getattr_or_key(item, "index", 0),
+                values=list(_getattr_or_key(item, "embedding", [])),
+            )
             for item in _getattr_or_key(response, "data", [])
         ]
         return LLMEmbeddingResponse(
@@ -558,12 +624,25 @@ class OpenAICompatibleProvider(LLMProvider):
             raw_response=_model_dump(response),
         )
 
-    async def stream(self, request: LLMCompletionRequest) -> AsyncIterator[LLMStreamEvent]:
+    async def stream(
+        self, request: LLMCompletionRequest
+    ) -> AsyncIterator[LLMStreamEvent]:
+        from atagia.diagnostics.recorder import capture_raw_response, capture_sent_payload
+
+        kwargs = self._completion_kwargs(request, stream=True)
+        capture_sent_payload(kwargs)
         try:
-            stream = await self._client.chat.completions.create(**self._completion_kwargs(request, stream=True))
+            stream = await self._client.chat.completions.create(**kwargs)
         except json.JSONDecodeError as exc:
-            raise TransientLLMError("Provider returned a non-JSON HTTP response") from exc
-        except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
+            raise TransientLLMError(
+                "Provider returned a non-JSON HTTP response"
+            ) from exc
+        except (
+            APIConnectionError,
+            APITimeoutError,
+            RateLimitError,
+            InternalServerError,
+        ) as exc:
             raise _transient_error(exc) from exc
         except (httpx.TransportError, TimeoutError, ConnectionError) as exc:
             raise _transient_error(exc) from exc
@@ -585,15 +664,16 @@ class OpenAICompatibleProvider(LLMProvider):
 
         try:
             async for chunk in stream:
+                capture_raw_response(chunk)
                 chunk_usage = _usage_to_dict(_getattr_or_key(chunk, "usage"))
                 if chunk_usage:
                     usage = chunk_usage
 
                 for choice in _getattr_or_key(chunk, "choices", []):
                     delta = _getattr_or_key(choice, "delta", {})
-                    thinking = _getattr_or_key(delta, "reasoning", None) or _getattr_or_key(
-                        delta, "reasoning_content", None
-                    )
+                    thinking = _getattr_or_key(
+                        delta, "reasoning", None
+                    ) or _getattr_or_key(delta, "reasoning_content", None)
                     if thinking:
                         yield LLMStreamEvent(type="thinking", content=thinking)
 
@@ -601,9 +681,12 @@ class OpenAICompatibleProvider(LLMProvider):
                     if content:
                         emitted_output_or_tool = True
                         output_char_count += len(str(content))
-                        output_tail = _output_tail_excerpt(
-                            f"{output_tail}{content}",
-                        ) or ""
+                        output_tail = (
+                            _output_tail_excerpt(
+                                f"{output_tail}{content}",
+                            )
+                            or ""
+                        )
                         yield LLMStreamEvent(type="text", content=content)
 
                     for tool_call in _getattr_or_key(delta, "tool_calls", []) or []:
@@ -633,7 +716,9 @@ class OpenAICompatibleProvider(LLMProvider):
                         for index in sorted(tool_buffers):
                             emitted_output_or_tool = True
                             emitted_tool_call = True
-                            yield LLMStreamEvent(type="tool_call", payload=tool_buffers[index])
+                            yield LLMStreamEvent(
+                                type="tool_call", payload=tool_buffers[index]
+                            )
                         tool_buffers.clear()
                     finish_error = _finish_reason_error(
                         self.name,
@@ -649,7 +734,12 @@ class OpenAICompatibleProvider(LLMProvider):
                         break
                 if pending_error is not None:
                     break
-        except (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError) as exc:
+        except (
+            APIConnectionError,
+            APITimeoutError,
+            RateLimitError,
+            InternalServerError,
+        ) as exc:
             raise _transient_error(exc) from exc
         except (httpx.TransportError, TimeoutError, ConnectionError) as exc:
             raise _transient_error(exc) from exc
@@ -690,10 +780,41 @@ class OpenAICompatibleProvider(LLMProvider):
             raise pending_error
 
 
+class LocalEndpointProvider(OpenAICompatibleProvider):
+    """One restricted OpenAI-compatible client bound to one catalog endpoint."""
+
+    def __init__(
+        self,
+        endpoint: LocalEndpoint,
+        *,
+        api_key: str,
+        request_timeout_seconds: float | None = None,
+    ) -> None:
+        self.endpoint_id = endpoint.endpoint_id
+        self.name = local_provider_registry_key(endpoint.endpoint_id)
+        super().__init__(
+            api_key=api_key,
+            base_url=endpoint.base_url,
+            request_timeout_seconds=request_timeout_seconds,
+            restricted_transport=True,
+        )
+
+
 class OpenAIProvider(OpenAICompatibleProvider):
     """Concrete OpenAI provider."""
 
     name = "openai"
+
+    def _completion_kwargs(
+        self, request: LLMCompletionRequest, *, stream: bool
+    ) -> dict[str, Any]:
+        kwargs = super()._completion_kwargs(request, stream=stream)
+        if "service_tier" in request.metadata:
+            tier = request.metadata["service_tier"]
+            if not isinstance(tier, str) or tier not in {"auto", "default", "flex", "priority"}:
+                raise ConfigurationError("Unsupported OpenAI service_tier")
+            kwargs["service_tier"] = tier
+        return kwargs
 
     def _completion_response_format(
         self,

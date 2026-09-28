@@ -49,11 +49,12 @@ from atagia.services.providers import build_llm_client
 # Load .env before any Settings.from_env() call resolves provider keys.
 load_dotenv()
 
-_DEFAULT_JUDGE_MODEL = "kimi/kimi-k2.7-code-highspeed"
-# Documented Kimi K2.7 Code rates (USD per 1M tokens); see benchmarks.locomo.rejudge.
-_KIMI_INPUT_PRICE = 0.95
-_KIMI_CACHED_INPUT_PRICE = 0.19
-_KIMI_OUTPUT_PRICE = 4.00
+_DEFAULT_JUDGE_MODEL = "openrouter/openai/gpt-5.6-luna,medium"
+# GPT-5.6 Luna direct-OpenAI list rates (USD per 1M tokens); deliberately
+# conservative vs the current OpenRouter promo — see benchmarks.locomo.rejudge.
+_LUNA_INPUT_PRICE = 0.20
+_LUNA_CACHED_INPUT_PRICE = 0.02
+_LUNA_OUTPUT_PRICE = 1.20
 _CHARS_PER_TOKEN = 4.0
 
 
@@ -198,8 +199,8 @@ def _project_cost(records: list[_QuestionRecord], transcripts_chars: int) -> dic
     input_tokens = input_chars / _CHARS_PER_TOKEN
     output_tokens = 200 * len(records)
     cost = (
-        input_tokens / 1_000_000 * _KIMI_INPUT_PRICE
-        + output_tokens / 1_000_000 * _KIMI_OUTPUT_PRICE
+        input_tokens / 1_000_000 * _LUNA_INPUT_PRICE
+        + output_tokens / 1_000_000 * _LUNA_OUTPUT_PRICE
     )
     return {
         "llm_calls_planned": len(records),
@@ -223,9 +224,9 @@ def _actual_cost(records: list[dict[str, Any]]) -> dict[str, Any]:
         output_tokens += float(counts.get("output_tokens") or 0.0)
     non_cached_input = max(0.0, input_tokens - cached_input_tokens)
     cost = (
-        non_cached_input / 1_000_000 * _KIMI_INPUT_PRICE
-        + cached_input_tokens / 1_000_000 * _KIMI_CACHED_INPUT_PRICE
-        + output_tokens / 1_000_000 * _KIMI_OUTPUT_PRICE
+        non_cached_input / 1_000_000 * _LUNA_INPUT_PRICE
+        + cached_input_tokens / 1_000_000 * _LUNA_CACHED_INPUT_PRICE
+        + output_tokens / 1_000_000 * _LUNA_OUTPUT_PRICE
     )
     return {
         "llm_calls": len(records),

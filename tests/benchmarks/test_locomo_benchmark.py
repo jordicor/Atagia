@@ -25,9 +25,11 @@ from benchmarks.locomo.__main__ import (
     _format_run_log_summary,
     _format_run_log_summary_json,
 )
+from benchmarks.invocation_args import redact_invocation_args
 from benchmarks.locomo import benchmark as locomo_benchmark_module
 from benchmarks.locomo.benchmark import LoCoMoBenchmark
 from atagia import Atagia
+from atagia.core.config import Settings
 from atagia.core.repositories import MessageRepository
 from atagia.models.schemas_replay import AblationConfig
 from atagia.services.retrieval_service import RetrievalService
@@ -74,11 +76,18 @@ def _is_language_profile_card_purpose(purpose: object) -> bool:
 
 
 _MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES = {
-    "memory_extraction_kind_scope_card",
-    "memory_extraction_evidence_card",
+    "memory_extraction_kind_card",
+    "memory_extraction_scope_card",
+    "memory_extraction_confidence_card",
+    "memory_extraction_evidence_support_card",
+    "memory_extraction_preserve_verbatim_card",
+    "memory_extraction_candidate_language_card",
+    "memory_extraction_source_reference_card",
     "memory_extraction_index_card",
-    "memory_extraction_temporal_card",
-    "memory_extraction_belief_card",
+    "memory_extraction_belief_key_card",
+    "memory_extraction_belief_value_card",
+    "memory_extraction_temporal_type_card",
+    "memory_extraction_temporal_interval_card",
     "memory_extraction_coverage_members_card",
 }
 
@@ -99,7 +108,8 @@ class BenchmarkProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -165,6 +175,7 @@ class BenchmarkProvider(LLMProvider):
                 output_text = memory_extraction_card_output_from_payload(
                     self._active_extraction_payload,
                     purpose,
+                    prompt="\n".join(message.content for message in request.messages),
                 )
                 if output_text == "none" or "|" not in output_text:
                     self._active_extraction_payload = None
@@ -172,6 +183,7 @@ class BenchmarkProvider(LLMProvider):
                 output_text = memory_extraction_card_output_from_payload(
                     self._active_extraction_payload or {"candidates": []},
                     purpose,
+                    prompt="\n".join(message.content for message in request.messages),
                 )
                 self._active_extraction_consumed.add(purpose)
                 if (
@@ -825,7 +837,7 @@ async def test_benchmark_single_conversation(
         1
         for request in provider.requests
         if _is_need_detection_card_purpose(request.metadata.get("purpose"))
-    ) == 24
+    ) == 27
     assert sum(
         1
         for request in provider.requests
@@ -948,7 +960,8 @@ async def test_benchmark_routes_models_by_phase_and_component(
     assert models_by_purpose["contract_projection"] == {"openai/ingest-model,minimal"}
     for purpose in (
         "need_detection_needs_card",
-        "need_detection_language_card",
+        "need_detection_query_language_card",
+        "need_detection_answer_language_card",
         "need_detection_memory_card",
         "need_detection_exact_card",
         "need_detection_shape_card",
@@ -983,7 +996,7 @@ async def test_benchmark_routes_models_by_phase_and_component(
     assert "answer_generation" not in report.conversations[0].results[0].trace
     llm_calls = report.conversations[0].results[0].trace["llm_calls"]
     llm_call_purposes = {call["purpose"] for call in llm_calls}
-    assert "need_detection_language_card" in llm_call_purposes
+    assert {"need_detection_query_language_card", "need_detection_answer_language_card"} <= llm_call_purposes
     assert llm_call_purposes >= {
         "applicability_relevance_card",
         "chat_reply",
@@ -1100,7 +1113,7 @@ async def test_benchmark_max_questions_limits_validation_run(
         1
         for request in provider.requests
         if _is_need_detection_card_purpose(request.metadata.get("purpose"))
-    ) == 8
+    ) == 9
     assert sum(
         1
         for request in provider.requests
@@ -1558,7 +1571,7 @@ async def test_benchmark_resume_checkpoint_skips_completed_questions(
         1
         for request in resume_provider.requests
         if _is_need_detection_card_purpose(request.metadata.get("purpose"))
-    ) == 8
+    ) == 9
     checkpoint = BenchmarkReport.model_validate_json(checkpoint_path.read_text())
     assert checkpoint.total_questions == 2
     assert report.model_info["resume_checkpoint"] is True
@@ -2275,8 +2288,8 @@ async def test_benchmark_corrections_overlay_substitutes_ground_truth(
 
     report = await benchmark.run()
 
-    # Without corrections: q1=correct, q2=correct, q3=wrong (green vs yellow) → 2/3
-    # With correction on q3: ground truth becomes "yellow" → q3 now correct → 3/3
+    # Without corrections: q1=correct, q2=correct, q3=wrong (green vs yellow) â†’ 2/3
+    # With correction on q3: ground truth becomes "yellow" â†’ q3 now correct â†’ 3/3
     assert report.total_correct == 3
     assert report.total_questions == 3
     assert report.overall_accuracy == pytest.approx(1.0)
@@ -3127,6 +3140,47 @@ def test_build_run_manifest_includes_reproducibility_fields(
     }
 
 
+def test_build_run_manifest_carries_applied_override_retrieval_params(
+    tmp_path: Path,
+) -> None:
+    """CS-1.2: the validated override_retrieval_params reach the run manifest via
+    report.ablation_config, so a saved run self-documents its retrieval tuning."""
+    data_path = _write_dataset(tmp_path)
+    benchmark = LoCoMoBenchmark(
+        data_path=data_path,
+        llm_provider="openai",
+        llm_api_key="test-openai-key",
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+    ablation = AblationConfig(
+        privacy_enforcement="off",
+        override_retrieval_params={"rerank_top_k": 3, "fts_limit": 24},
+    )
+    report = BenchmarkReport(
+        benchmark_name="LoCoMo",
+        overall_accuracy=1.0,
+        category_breakdown={1: 1.0},
+        conversations=[],
+        total_questions=0,
+        total_correct=0,
+        ablation_config=ablation.model_dump(mode="json", exclude_none=True),
+        timestamp="2026-04-01T00:00:00+00:00",
+        model_info={"provider": "openai"},
+        duration_seconds=1.0,
+    )
+    report_path = tmp_path / "locomo-report.json"
+    report_path.write_bytes(b'{"benchmark_name": "LoCoMo"}')
+
+    manifest = benchmark.build_run_manifest(report, report_path=report_path)
+
+    assert manifest["ablation_config"]["override_retrieval_params"] == {
+        "rerank_top_k": 3,
+        "fts_limit": 24,
+    }
+
+
 def test_build_run_manifest_includes_parallel_checkpoint_paths(tmp_path: Path) -> None:
     data_path = _write_two_conversation_dataset(tmp_path)
     benchmark = LoCoMoBenchmark(
@@ -3745,3 +3799,68 @@ def test_critical_evidence_custody_dedupe_into_unselected_stays_fusion_dedupe() 
     assert item["survival_stage"] == "fusion_dedupe"
     assert item["deduped_into"] == "mem_rep"
     assert item["deduped_into_selected"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_manifest_carries_effective_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The effective-settings block rides end-to-end: captured from the live
+    engine during the run, threaded through ``model_info``, and surfaced as a
+    top-level manifest key with the provider secret redacted."""
+    # ``service_mode`` is one of the fields library mode pins on its own
+    # authority, so it reports ``engine_override`` with no caller input at all.
+    # Setting the variable to the opposite value makes the assertion below prove
+    # the engine overrules a disagreeing environment, instead of depending on
+    # whether the machine running the test happens to export ATAGIA_SERVICE_MODE.
+    monkeypatch.setenv("ATAGIA_SERVICE_MODE", "true")
+    sentinel_key = "SENTINEL_OPENAI_KEY_9Z"
+    provider = BenchmarkProvider()
+    _install_stub_client(monkeypatch, provider)
+    benchmark = LoCoMoBenchmark(
+        data_path=_write_dataset(tmp_path),
+        llm_provider="openai",
+        llm_api_key=sentinel_key,
+        llm_model="answer-model",
+        judge_model="judge-model",
+        manifests_dir=MANIFESTS_DIR,
+    )
+
+    # The secret must be absent from BOTH vectors the manifest carries it on:
+    # the Settings block and the recorded invocation. Supplying it only through
+    # the constructor left `invocation_args` empty, so the final assertion never
+    # exercised the argv path that used to persist `--api-key <secret>` verbatim.
+    report = await benchmark.run(
+        invocation_args=redact_invocation_args(
+            ["--api-key", sentinel_key, "--provider", "openai"],
+            _build_parser(),
+        ),
+    )
+
+    effective = report.model_info["effective_settings"]
+    assert set(effective) == {"settings", "resolved_policy"}
+    assert len(effective["settings"]) == len(Settings.__dataclass_fields__)
+    openai_entry = effective["settings"]["openai_api_key"]
+    assert openai_entry["redacted"] is True
+    assert openai_entry["value"] == "<redacted:set>"
+    assert effective["settings"]["service_mode"]["provenance"] == "engine_override"
+    assert (
+        effective["resolved_policy"]["general_qa"]["context_budget_tokens"][
+            "provenance"
+        ]
+        == "manifest"
+    )
+
+    report_path = tmp_path / "locomo-report.json"
+    report_path.write_bytes(b'{"benchmark_name": "LoCoMo"}')
+    manifest = benchmark.build_run_manifest(report, report_path=report_path)
+
+    assert manifest["effective_settings"] == effective
+    assert manifest["model_info"]["invocation_args"] == [
+        "--api-key",
+        "<redacted:set>",
+        "--provider",
+        "openai",
+    ]
+    assert sentinel_key not in json.dumps(manifest)

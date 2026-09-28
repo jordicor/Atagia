@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import asyncio
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -29,6 +31,8 @@ from atagia.models.schemas_memory import (
     MemorySourceKind,
     SpaceBoundaryMode,
 )
+
+from tests.turn_telemetry_support import sample_turn_telemetry
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -172,7 +176,7 @@ def test_memory_routes_support_feedback_lookup_and_contract_view(
                 )
             )
             event = client.portal.call(
-                events.create_event,
+                partial(events.create_event, telemetry=sample_turn_telemetry()),
                 {
                     "user_id": "usr_1",
                     "conversation_id": "cnv_1",

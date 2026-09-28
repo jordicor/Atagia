@@ -48,6 +48,7 @@ from atagia.models.schemas_memory import (
     SpaceBoundaryMode,
     TemporalQueryRange,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -604,12 +605,12 @@ async def test_plan_exact_recall_materializes_anchor_only_fts_query() -> None:
         query_intelligence=QueryIntelligenceResult(
             needs=[],
             temporal_range=None,
-            sub_queries=["dose for amlodipine"],
+            sub_queries=["dose for fexofenadine"],
             sparse_query_hints=[
                 SparseQueryHint(
-                    sub_query_text="dose for amlodipine",
-                    fts_phrase="dose amlodipine 10 mg",
-                    must_keep_terms=["amlodipine", "10 mg"],
+                    sub_query_text="dose for fexofenadine",
+                    fts_phrase="dose fexofenadine 60 mg",
+                    must_keep_terms=["fexofenadine", "60 mg"],
                 )
             ],
             query_type="slot_fill",
@@ -624,10 +625,10 @@ async def test_plan_exact_recall_materializes_anchor_only_fts_query() -> None:
 
     assert plan.exact_recall_mode is True
     assert plan.sub_query_plans[0].fts_queries == [
-        '"10 mg"',
-        "dose amlodipine 10 mg",
-        "amlodipine 10 mg",
-        "dose OR amlodipine OR 10 OR mg",
+        '"60 mg"',
+        "dose fexofenadine 60 mg",
+        "fexofenadine 60 mg",
+        "dose OR fexofenadine OR 60 OR mg",
     ]
     assert plan.sub_query_plans[0].fts_query_kinds == [
         "quoted_phrase",
@@ -824,7 +825,11 @@ async def _build_candidate_runtime():
     conversations = ConversationRepository(connection, clock)
     messages = MessageRepository(connection, clock)
     memories = MemoryObjectRepository(connection, clock)
-    search = CandidateSearch(connection, clock)
+    search = CandidateSearch(
+        connection,
+        clock,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
     await users.create_user("usr_1")
     await users.create_user("usr_2")
     await conversations.create_conversation("cnv_1", "usr_1", None, "coding_debug", "User One")
@@ -979,6 +984,15 @@ def _persisted_surface_audit_entries(
         for entry in fts_query_audit
         if entry.get("source") == "persisted_surface"
     ]
+
+
+def _assert_zero_row_persisted_surface_execution(
+    fts_query_audit: list[dict[str, object]],
+) -> None:
+    entries = _persisted_surface_audit_entries(fts_query_audit)
+    assert len(entries) == 1
+    assert entries[0]["raw_rows"] == 0
+    assert entries[0]["raw_row_ids"] == []
 
 
 async def _create_persisted_surface_memory(
@@ -1227,6 +1241,7 @@ async def test_persisted_surface_diagnostic_reports_visible_rows_without_candida
                 "kind": "persisted_surface_surface_probe",
                 "match_mode": "implicit_and",
                 "raw_rows": 1,
+                "raw_row_ids": ["mem_surface_visible"],
                 "source": "persisted_surface",
                 "non_evidential": True,
             }
@@ -1334,7 +1349,7 @@ async def test_persisted_surface_diagnostic_respects_user_status_privacy_intimac
                 fts_query_audit=fts_query_audit,
             )
             assert candidates == []
-            assert _persisted_surface_audit_entries(fts_query_audit) == []
+            _assert_zero_row_persisted_surface_execution(fts_query_audit)
     finally:
         await connection.close()
 
@@ -1414,6 +1429,7 @@ async def test_phase8_persisted_surface_diagnostics_distinguish_policy_modes() -
                 "non_evidential": True,
                 "query": "phase8privatesurface",
                 "raw_rows": 1,
+                "raw_row_ids": ["mem_phase8_visible_surface"],
                 "source": "persisted_surface",
                 "subquery": "phase8privatesurface",
             }
@@ -1425,6 +1441,7 @@ async def test_phase8_persisted_surface_diagnostics_distinguish_policy_modes() -
                 "non_evidential": True,
                 "query": "phase8privatesurface",
                 "raw_rows": 1,
+                "raw_row_ids": ["mem_phase8_visible_surface"],
                 "source": "persisted_surface",
                 "subquery": "phase8privatesurface",
             }
@@ -1440,6 +1457,10 @@ async def test_phase8_persisted_surface_diagnostics_distinguish_policy_modes() -
                 "non_evidential": True,
                 "query": "phase8privatesurface",
                 "raw_rows": 2,
+                "raw_row_ids": [
+                    "mem_phase8_private_surface",
+                    "mem_phase8_visible_surface",
+                ],
                 "source": "persisted_surface",
                 "subquery": "phase8privatesurface",
             }
@@ -1544,6 +1565,7 @@ async def test_phase8_runtime_alias_policy_matrix_respects_base_memory_gates() -
                     "non_evidential": True,
                     "query": "phase8aliasbridge",
                     "raw_rows": 1,
+                    "raw_row_ids": ["mem_phase8_alias_visible"],
                     "source": "alias_anchor",
                     "subquery": "consulta de alias phase8",
                 }
@@ -1566,6 +1588,10 @@ async def test_phase8_runtime_alias_policy_matrix_respects_base_memory_gates() -
                 "non_evidential": True,
                 "query": "phase8aliasbridge",
                 "raw_rows": 2,
+                "raw_row_ids": [
+                    "mem_phase8_alias_visible",
+                    "mem_phase8_alias_private",
+                ],
                 "source": "alias_anchor",
                 "subquery": "consulta de alias phase8",
             }
@@ -1649,7 +1675,7 @@ async def test_persisted_surface_diagnostic_respects_active_space_gate() -> None
         assert visible_candidates == []
         assert _persisted_surface_audit_entries(visible_audit)[0]["raw_rows"] == 1
         assert blocked_candidates == []
-        assert _persisted_surface_audit_entries(blocked_audit) == []
+        _assert_zero_row_persisted_surface_execution(blocked_audit)
     finally:
         await connection.close()
 
@@ -1703,7 +1729,7 @@ async def test_persisted_surface_diagnostic_respects_active_mind_gate() -> None:
         assert visible_candidates == []
         assert _persisted_surface_audit_entries(visible_audit)[0]["raw_rows"] == 1
         assert blocked_candidates == []
-        assert _persisted_surface_audit_entries(blocked_audit) == []
+        _assert_zero_row_persisted_surface_execution(blocked_audit)
     finally:
         await connection.close()
 
@@ -1753,7 +1779,7 @@ async def test_persisted_surface_diagnostic_respects_active_embodiment_gate() ->
         assert visible_candidates == []
         assert _persisted_surface_audit_entries(visible_audit)[0]["raw_rows"] == 1
         assert blocked_candidates == []
-        assert _persisted_surface_audit_entries(blocked_audit) == []
+        _assert_zero_row_persisted_surface_execution(blocked_audit)
     finally:
         await connection.close()
 
@@ -1803,7 +1829,7 @@ async def test_persisted_surface_diagnostic_respects_active_realm_gate() -> None
         assert visible_candidates == []
         assert _persisted_surface_audit_entries(visible_audit)[0]["raw_rows"] == 1
         assert blocked_candidates == []
-        assert _persisted_surface_audit_entries(blocked_audit) == []
+        _assert_zero_row_persisted_surface_execution(blocked_audit)
     finally:
         await connection.close()
 
@@ -1862,6 +1888,7 @@ async def test_persisted_surface_candidate_recovers_english_memory_from_spanish_
                 "kind": "persisted_surface_surface_probe",
                 "match_mode": "implicit_and",
                 "raw_rows": 1,
+                "raw_row_ids": ["mem_surface_spanish_to_english"],
                 "source": "persisted_surface",
                 "non_evidential": True,
             }
@@ -2243,6 +2270,7 @@ async def test_candidate_search_records_raw_fts_rows_before_candidate_merge() ->
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
+            memory_id="mem_falcon",
         )
         plan = RetrievalPlan(
             assistant_mode_id="coding_debug",
@@ -2279,6 +2307,7 @@ async def test_candidate_search_records_raw_fts_rows_before_candidate_merge() ->
                 "kind": "default_and",
                 "match_mode": "implicit_and",
                 "raw_rows": 1,
+                "raw_row_ids": ["mem_falcon"],
             },
             {
                 "subquery": "Falcon account",
@@ -2286,8 +2315,216 @@ async def test_candidate_search_records_raw_fts_rows_before_candidate_merge() ->
                 "kind": "default_and",
                 "match_mode": "implicit_and",
                 "raw_rows": 0,
+                "raw_row_ids": [],
             },
         ]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fts_row_ids_separate_post_harvest_cut_from_never_matched() -> None:
+    """A row cut after harvest must be distinguishable from one never returned.
+
+    Both classes are absent from the candidate set, so the candidate set alone
+    cannot attribute the loss. ``raw_row_ids`` records what SQL actually handed
+    back for the executed query string, before any Python-side merge, dedupe or
+    the final ``max_candidates`` truncation, which is what makes the two
+    separable.
+    """
+    from atagia.services.retrieval_pipeline import RetrievalPipeline
+
+    connection, _messages, memories, search = await _build_candidate_runtime()
+    try:
+        matching_ids = [f"mem_zebra_{index}" for index in range(8)]
+        for index, memory_id in enumerate(matching_ids):
+            await memories.create_memory_object(
+                user_id="usr_1",
+                assistant_mode_id="coding_debug",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.GLOBAL_USER,
+                canonical_text=f"zebra sighting number {index}",
+                source_kind=MemorySourceKind.EXTRACTED,
+                confidence=0.8,
+                privacy_level=0,
+                memory_id=memory_id,
+            )
+        # Filler keeps the "zebra" document ratio below the corpus token filter
+        # threshold, so the planned query string is the one SQL executes.
+        for index in range(12):
+            await memories.create_memory_object(
+                user_id="usr_1",
+                assistant_mode_id="coding_debug",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.GLOBAL_USER,
+                canonical_text=f"giraffe sighting number {index}",
+                source_kind=MemorySourceKind.EXTRACTED,
+                confidence=0.8,
+                privacy_level=0,
+                memory_id=f"mem_giraffe_{index}",
+            )
+        plan = RetrievalPlan(
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_1",
+            sub_query_plans=[
+                PlannedSubQuery(
+                    text="zebra",
+                    fts_queries=["zebra"],
+                    fts_query_kinds=["default_and"],
+                )
+            ],
+            scope_filter=[MemoryScope.GLOBAL_USER],
+            status_filter=[MemoryStatus.ACTIVE],
+            max_candidates=3,
+            max_context_items=5,
+            privacy_ceiling=1,
+            retrieval_levels=[0],
+        )
+        fts_query_audit: list[dict[str, object]] = []
+
+        candidates = await search.search(
+            plan,
+            user_id="usr_1",
+            fts_query_audit=fts_query_audit,
+        )
+
+        assert len(fts_query_audit) == 1
+        entry = fts_query_audit[0]
+        # The audit must describe the executed string, not the planned one.
+        assert entry["query"] == "zebra"
+        # SQL overfetches max_candidates * 2 rows; the final sort keeps 3.
+        assert entry["raw_rows"] == 6
+        harvested = list(entry["raw_row_ids"])
+        assert len(harvested) == 6
+        candidate_ids = [str(candidate["id"]) for candidate in candidates]
+        assert len(candidate_ids) == 3
+        assert set(candidate_ids) < set(harvested)
+
+        harvested_then_cut = [
+            memory_id for memory_id in harvested if memory_id not in set(candidate_ids)
+        ]
+        never_harvested = [
+            memory_id for memory_id in matching_ids if memory_id not in set(harvested)
+        ]
+        assert len(harvested_then_cut) == 3
+        assert len(never_harvested) == 2
+        assert set(harvested_then_cut).isdisjoint(never_harvested)
+        # Indistinguishable downstream: neither class reaches the candidates.
+        for memory_id in harvested_then_cut + never_harvested:
+            assert memory_id not in candidate_ids
+        # A memory the query never matched appears in neither surface.
+        assert "mem_giraffe_0" not in harvested
+        assert "mem_giraffe_0" not in candidate_ids
+
+        trace = RetrievalPipeline._build_candidate_search_trace(
+            candidates,
+            plan,
+            1.0,
+            fts_query_audit,
+        )
+        execution = trace.per_subquery_counts[0].fts_query_executions[0]
+        assert execution.query == "zebra"
+        assert execution.raw_rows == 6
+        assert execution.raw_row_ids == harvested
+        # Every survivor is attributed to this query, so raw_rows - candidates
+        # is exactly the post-harvest loss for the main memory-object lane.
+        assert execution.candidates == 3
+        # The distinction survives serialization into outcome_json.
+        assert set(execution.model_dump()["raw_row_ids"]) - set(candidate_ids) == set(
+            harvested_then_cut
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fts_row_ids_follow_the_executed_query_not_the_planned_one() -> None:
+    """Harvested IDs must be keyed on the string SQL ran, not the planned one.
+
+    ``_corpus_filtered_fts_query`` rewrites a query before execution, so a
+    replay keyed on the planned string would read an empty harvest and
+    misattribute the loss to the SQL stage.
+    """
+    from atagia.services.retrieval_pipeline import RetrievalPipeline
+
+    connection, _messages, memories, search = await _build_candidate_runtime()
+    try:
+        for index in range(12):
+            await memories.create_memory_object(
+                user_id="usr_1",
+                assistant_mode_id="coding_debug",
+                object_type=MemoryObjectType.EVIDENCE,
+                scope=MemoryScope.GLOBAL_USER,
+                canonical_text=f"common entry number {index}",
+                source_kind=MemorySourceKind.EXTRACTED,
+                confidence=0.8,
+                privacy_level=0,
+                memory_id=f"mem_common_{index}",
+            )
+        await memories.create_memory_object(
+            user_id="usr_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.EVIDENCE,
+            scope=MemoryScope.GLOBAL_USER,
+            canonical_text="common pottery studio",
+            source_kind=MemorySourceKind.EXTRACTED,
+            confidence=0.8,
+            privacy_level=0,
+            memory_id="mem_pottery",
+        )
+        plan = RetrievalPlan(
+            assistant_mode_id="coding_debug",
+            conversation_id="cnv_1",
+            sub_query_plans=[
+                PlannedSubQuery(
+                    text="common pottery",
+                    fts_queries=["common pottery"],
+                    fts_query_kinds=["default_and"],
+                )
+            ],
+            scope_filter=[MemoryScope.GLOBAL_USER],
+            status_filter=[MemoryStatus.ACTIVE],
+            max_candidates=10,
+            max_context_items=5,
+            privacy_ceiling=1,
+            retrieval_levels=[0],
+        )
+        fts_query_audit: list[dict[str, object]] = []
+
+        candidates = await search.search(
+            plan,
+            user_id="usr_1",
+            fts_query_audit=fts_query_audit,
+        )
+
+        assert [str(candidate["id"]) for candidate in candidates] == ["mem_pottery"]
+        assert fts_query_audit == [
+            {
+                "subquery": "common pottery",
+                "query": "pottery",
+                "kind": "default_and",
+                "match_mode": "implicit_and",
+                "raw_rows": 1,
+                "raw_row_ids": ["mem_pottery"],
+            }
+        ]
+
+        trace = RetrievalPipeline._build_candidate_search_trace(
+            candidates,
+            plan,
+            1.0,
+            fts_query_audit,
+        )
+        executions = trace.per_subquery_counts[0].fts_query_executions
+        planned, executed = executions
+        # The planned string was never run: no rows, no IDs, nothing to attribute.
+        assert planned.query == "common pottery"
+        assert planned.raw_rows == 0
+        assert planned.raw_row_ids == []
+        # The rewritten string carries the harvest.
+        assert executed.query == "pottery"
+        assert executed.raw_rows == 1
+        assert executed.raw_row_ids == ["mem_pottery"]
     finally:
         await connection.close()
 
@@ -2301,24 +2538,24 @@ async def test_exact_recall_adds_corpus_near_fts_when_planned_queries_have_zero_
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text="The user takes amlodipine tablets on Tuesdays.",
+            canonical_text="The user takes fexofenadine tablets on Sundays.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
-            memory_id="mem_amlodipine",
+            memory_id="mem_fexofenadine",
         )
         plan = RetrievalPlan(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             sub_query_plans=[
                 PlannedSubQuery(
-                    text="dosis actual de amlodipino",
-                    sparse_phrase="dosis amlodipino",
-                    must_keep_terms=["dosis", "amlodipino"],
+                    text="dosis actual de fexofenadina",
+                    sparse_phrase="dosis fexofenadina",
+                    must_keep_terms=["dosis", "fexofenadina"],
                     fts_queries=[
-                        "amlodipino dosis",
-                        "dosis amlodipino",
-                        "dosis OR amlodipino",
+                        "fexofenadina dosis",
+                        "dosis fexofenadina",
+                        "dosis OR fexofenadina",
                     ],
                     fts_query_kinds=[
                         "anchor_first_and",
@@ -2343,7 +2580,7 @@ async def test_exact_recall_adds_corpus_near_fts_when_planned_queries_have_zero_
             fts_query_audit=fts_query_audit,
         )
 
-        assert [candidate["id"] for candidate in candidates] == ["mem_amlodipine"]
+        assert [candidate["id"] for candidate in candidates] == ["mem_fexofenadine"]
         corpus_near_audit = [
             entry
             for entry in fts_query_audit
@@ -2351,20 +2588,25 @@ async def test_exact_recall_adds_corpus_near_fts_when_planned_queries_have_zero_
         ]
         assert corpus_near_audit == [
             {
-                "subquery": "dosis actual de amlodipino",
-                "query": "amlodipine",
+                "subquery": "dosis actual de fexofenadina",
+                "query": "fexofenadine",
                 "kind": "corpus_near_or",
                 "match_mode": "implicit_and",
                 "raw_rows": 1,
+                "raw_row_ids": ["mem_fexofenadine"],
+                "source": "corpus_near",
+                "non_evidential": True,
             }
         ]
         assert candidates[0]["fts_query_matches"] == [
             {
-                "subquery": "dosis actual de amlodipino",
-                "query": "amlodipine",
+                "subquery": "dosis actual de fexofenadina",
+                "query": "fexofenadine",
                 "kind": "corpus_near_or",
                 "match_mode": "implicit_and",
                 "position_rank": 1,
+                "source": "corpus_near",
+                "non_evidential": True,
             }
         ]
     finally:
@@ -2380,21 +2622,21 @@ async def test_corpus_near_fts_is_exact_recall_only() -> None:
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text="The user takes amlodipine tablets on Tuesdays.",
+            canonical_text="The user takes fexofenadine tablets on Sundays.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
-            memory_id="mem_amlodipine",
+            memory_id="mem_fexofenadine",
         )
         plan = RetrievalPlan(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             sub_query_plans=[
                 PlannedSubQuery(
-                    text="dosis actual de amlodipino",
-                    sparse_phrase="dosis amlodipino",
-                    must_keep_terms=["dosis", "amlodipino"],
-                    fts_queries=["dosis OR amlodipino"],
+                    text="dosis actual de fexofenadina",
+                    sparse_phrase="dosis fexofenadina",
+                    must_keep_terms=["dosis", "fexofenadina"],
+                    fts_queries=["dosis OR fexofenadina"],
                     fts_query_kinds=["broad_or"],
                 )
             ],
@@ -2429,21 +2671,21 @@ async def test_phase3_multilingual_smoke_recovers_english_query_to_spanish_memor
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text="La usuaria toma amlodipino los martes.",
+            canonical_text="La usuaria toma fexofenadina los domingos.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
-            memory_id="mem_amlodipino_es",
+            memory_id="mem_fexofenadina_es",
         )
         plan = RetrievalPlan(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             sub_query_plans=[
                 PlannedSubQuery(
-                    text="current amlodipine dose",
-                    sparse_phrase="current amlodipine",
-                    must_keep_terms=["amlodipine"],
-                    fts_queries=["current amlodipine"],
+                    text="current fexofenadine dose",
+                    sparse_phrase="current fexofenadine",
+                    must_keep_terms=["fexofenadine"],
+                    fts_queries=["current fexofenadine"],
                     fts_query_kinds=["sparse_and"],
                 )
             ],
@@ -2463,10 +2705,10 @@ async def test_phase3_multilingual_smoke_recovers_english_query_to_spanish_memor
             fts_query_audit=fts_query_audit,
         )
 
-        assert [candidate["id"] for candidate in candidates] == ["mem_amlodipino_es"]
+        assert [candidate["id"] for candidate in candidates] == ["mem_fexofenadina_es"]
         assert any(
             entry["kind"] == "corpus_near_or"
-            and entry["query"] == "amlodipino"
+            and entry["query"] == "fexofenadina"
             and entry["raw_rows"] == 1
             for entry in fts_query_audit
         )
@@ -2483,21 +2725,21 @@ async def test_phase3_multilingual_smoke_keeps_sentence_initial_near_token() -> 
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text="The user takes amlodipine tablets on Tuesdays.",
+            canonical_text="The user takes fexofenadine tablets on Sundays.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
-            memory_id="mem_sentence_initial_amlodipine",
+            memory_id="mem_sentence_initial_fexofenadine",
         )
         plan = RetrievalPlan(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             sub_query_plans=[
                 PlannedSubQuery(
-                    text="Amlodipino dosis",
-                    sparse_phrase="amlodipino dosis",
-                    must_keep_terms=["amlodipino"],
-                    fts_queries=["amlodipino dosis"],
+                    text="Fexofenadina dosis",
+                    sparse_phrase="fexofenadina dosis",
+                    must_keep_terms=["fexofenadina"],
+                    fts_queries=["fexofenadina dosis"],
                     fts_query_kinds=["sparse_and"],
                 )
             ],
@@ -2518,11 +2760,11 @@ async def test_phase3_multilingual_smoke_keeps_sentence_initial_near_token() -> 
         )
 
         assert [candidate["id"] for candidate in candidates] == [
-            "mem_sentence_initial_amlodipine"
+            "mem_sentence_initial_fexofenadine"
         ]
         assert any(
             entry["kind"] == "corpus_near_or"
-            and entry["query"] == "amlodipine"
+            and entry["query"] == "fexofenadine"
             and entry["raw_rows"] == 1
             for entry in fts_query_audit
         )
@@ -2539,7 +2781,7 @@ async def test_phase3_multilingual_smoke_handles_code_switching_without_aliases(
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text="The Tuesday amlodipino plan is active.",
+            canonical_text="The Sunday fexofenadina plan is active.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
@@ -2550,10 +2792,10 @@ async def test_phase3_multilingual_smoke_handles_code_switching_without_aliases(
             conversation_id="cnv_1",
             sub_query_plans=[
                 PlannedSubQuery(
-                    text="dosis amlodipine martes",
-                    sparse_phrase="dosis amlodipine martes",
-                    must_keep_terms=["amlodipine"],
-                    fts_queries=["dosis amlodipine martes"],
+                    text="dosis fexofenadine domingos",
+                    sparse_phrase="dosis fexofenadine domingos",
+                    must_keep_terms=["fexofenadine"],
+                    fts_queries=["dosis fexofenadine domingos"],
                     fts_query_kinds=["sparse_and"],
                 )
             ],
@@ -2576,7 +2818,7 @@ async def test_phase3_multilingual_smoke_handles_code_switching_without_aliases(
         assert [candidate["id"] for candidate in candidates] == ["mem_codeswitch"]
         assert any(
             entry["kind"] == "corpus_near_or"
-            and entry["query"] == "amlodipino"
+            and entry["query"] == "fexofenadina"
             and entry["raw_rows"] == 1
             for entry in fts_query_audit
         )
@@ -2660,21 +2902,21 @@ async def test_runtime_alias_fts_recovers_visible_exact_recall_memory() -> None:
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text="The user takes amlodipine tablets on Tuesdays.",
+            canonical_text="The user takes fexofenadine tablets on Sundays.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
-            memory_id="mem_runtime_alias_amlodipine",
+            memory_id="mem_runtime_alias_fexofenadine",
         )
         plan = RetrievalPlan(
             assistant_mode_id="coding_debug",
             conversation_id="cnv_1",
             sub_query_plans=[
                 PlannedSubQuery(
-                    text="dosis actual de amlodipino",
-                    sparse_phrase="dosis amlodipino",
-                    must_keep_terms=["dosis", "amlodipino"],
-                    fts_queries=["amlodipino dosis"],
+                    text="dosis actual de fexofenadina",
+                    sparse_phrase="dosis fexofenadina",
+                    must_keep_terms=["dosis", "fexofenadina"],
+                    fts_queries=["fexofenadina dosis"],
                     fts_query_kinds=["sparse_and"],
                 )
             ],
@@ -2688,13 +2930,13 @@ async def test_runtime_alias_fts_recovers_visible_exact_recall_memory() -> None:
         )
         alias_groups = [
             RuntimeAliasGroupTrace(
-                sub_query_text="dosis actual de amlodipino",
+                sub_query_text="dosis actual de fexofenadina",
                 anchor_type="concept",
-                original_surface="amlodipino",
+                original_surface="fexofenadina",
                 anchor_confidence=0.88,
                 aliases=[
                     RuntimeAliasSurfaceTrace(
-                        surface="amlodipine",
+                        surface="fexofenadine",
                         alias_kind="translation",
                         alias_language="en",
                         confidence=0.84,
@@ -2712,11 +2954,11 @@ async def test_runtime_alias_fts_recovers_visible_exact_recall_memory() -> None:
         )
 
         assert [candidate["id"] for candidate in candidates] == [
-            "mem_runtime_alias_amlodipine"
+            "mem_runtime_alias_fexofenadine"
         ]
         assert any(
             entry["kind"] == "runtime_alias_or"
-            and entry["query"] == "amlodipine"
+            and entry["query"] == "fexofenadine"
             and entry["source"] == "alias_anchor"
             and entry["non_evidential"] is True
             and entry["raw_rows"] == 1
@@ -2725,8 +2967,8 @@ async def test_runtime_alias_fts_recovers_visible_exact_recall_memory() -> None:
         assert not any(entry["kind"] == "corpus_near_or" for entry in fts_query_audit)
         assert candidates[0]["fts_query_matches"] == [
             {
-                "subquery": "dosis actual de amlodipino",
-                "query": "amlodipine",
+                "subquery": "dosis actual de fexofenadina",
+                "query": "fexofenadine",
                 "kind": "runtime_alias_or",
                 "match_mode": "implicit_and",
                 "position_rank": 1,
@@ -2747,7 +2989,7 @@ async def test_runtime_alias_fts_is_exact_recall_or_slot_fill_only() -> None:
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text="The user takes amlodipine tablets on Tuesdays.",
+            canonical_text="The user takes fexofenadine tablets on Sundays.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
@@ -2758,9 +3000,9 @@ async def test_runtime_alias_fts_is_exact_recall_or_slot_fill_only() -> None:
             conversation_id="cnv_1",
             sub_query_plans=[
                 PlannedSubQuery(
-                    text="dosis actual de amlodipino",
-                    sparse_phrase="dosis amlodipino",
-                    fts_queries=["amlodipino dosis"],
+                    text="dosis actual de fexofenadina",
+                    sparse_phrase="dosis fexofenadina",
+                    fts_queries=["fexofenadina dosis"],
                     fts_query_kinds=["sparse_and"],
                 )
             ],
@@ -2781,13 +3023,13 @@ async def test_runtime_alias_fts_is_exact_recall_or_slot_fill_only() -> None:
             fts_query_audit=fts_query_audit,
             runtime_alias_groups=[
                 RuntimeAliasGroupTrace(
-                    sub_query_text="dosis actual de amlodipino",
+                    sub_query_text="dosis actual de fexofenadina",
                     anchor_type="concept",
-                    original_surface="amlodipino",
+                    original_surface="fexofenadina",
                     anchor_confidence=0.88,
                     aliases=[
                         RuntimeAliasSurfaceTrace(
-                            surface="amlodipine",
+                            surface="fexofenadine",
                             alias_kind="translation",
                             confidence=0.84,
                         )
@@ -2811,7 +3053,7 @@ async def test_runtime_alias_fts_recovers_slot_fill_without_exact_recall() -> No
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text="The user takes amlodipine tablets on Tuesdays.",
+            canonical_text="The user takes fexofenadine tablets on Sundays.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
@@ -2822,9 +3064,9 @@ async def test_runtime_alias_fts_recovers_slot_fill_without_exact_recall() -> No
             conversation_id="cnv_1",
             sub_query_plans=[
                 PlannedSubQuery(
-                    text="dosis actual de amlodipino",
-                    sparse_phrase="dosis amlodipino",
-                    fts_queries=["amlodipino dosis"],
+                    text="dosis actual de fexofenadina",
+                    sparse_phrase="dosis fexofenadina",
+                    fts_queries=["fexofenadina dosis"],
                     fts_query_kinds=["sparse_and"],
                 )
             ],
@@ -2845,13 +3087,13 @@ async def test_runtime_alias_fts_recovers_slot_fill_without_exact_recall() -> No
             fts_query_audit=fts_query_audit,
             runtime_alias_groups=[
                 RuntimeAliasGroupTrace(
-                    sub_query_text="dosis actual de amlodipino",
+                    sub_query_text="dosis actual de fexofenadina",
                     anchor_type="concept",
-                    original_surface="amlodipino",
+                    original_surface="fexofenadina",
                     anchor_confidence=0.88,
                     aliases=[
                         RuntimeAliasSurfaceTrace(
-                            surface="amlodipine",
+                            surface="fexofenadine",
                             alias_kind="translation",
                             confidence=0.84,
                         )
@@ -2865,7 +3107,7 @@ async def test_runtime_alias_fts_recovers_slot_fill_without_exact_recall() -> No
         ]
         assert any(
             entry["kind"] == "runtime_alias_or"
-            and entry["query"] == "amlodipine"
+            and entry["query"] == "fexofenadine"
             and entry["source"] == "alias_anchor"
             and entry["non_evidential"] is True
             and entry["raw_rows"] == 1
@@ -2873,8 +3115,8 @@ async def test_runtime_alias_fts_recovers_slot_fill_without_exact_recall() -> No
         )
         assert candidates[0]["fts_query_matches"] == [
             {
-                "subquery": "dosis actual de amlodipino",
-                "query": "amlodipine",
+                "subquery": "dosis actual de fexofenadina",
+                "query": "fexofenadine",
                 "kind": "runtime_alias_or",
                 "match_mode": "implicit_and",
                 "position_rank": 1,
@@ -3240,41 +3482,41 @@ def test_retrieval_fts_queries_single_word() -> None:
 
 
 def test_retrieval_fts_queries_three_content_tokens() -> None:
-    queries = build_retrieval_fts_queries("Jon lost banker")
+    queries = build_retrieval_fts_queries("Inez returned telescope")
     assert len(queries) == 2
-    assert queries[0] == "jon lost banker"
-    assert queries[1] == "jon OR lost OR banker"
+    assert queries[0] == "inez returned telescope"
+    assert queries[1] == "inez OR returned OR telescope"
 
 
 def test_retrieval_fts_query_specs_label_mechanical_rewrites() -> None:
-    specs = build_retrieval_fts_query_specs("Jon lost banker")
+    specs = build_retrieval_fts_query_specs("Inez returned telescope")
     assert [(spec.query, spec.kind) for spec in specs] == [
-        ("jon lost banker", "default_and"),
-        ("jon OR lost OR banker", "broad_or"),
+        ("inez returned telescope", "default_and"),
+        ("inez OR returned OR telescope", "broad_or"),
     ]
 
 
 def test_exact_recall_fts_queries_add_anchor_only_and_without_changing_default_shape() -> None:
     default_queries = build_retrieval_fts_queries(
-        "dose amlodipine 10 mg",
-        must_keep_terms=["amlodipine", "10 mg"],
+        "dose fexofenadine 60 mg",
+        must_keep_terms=["fexofenadine", "60 mg"],
     )
     exact_specs = build_retrieval_fts_query_specs(
-        "dose amlodipine 10 mg",
-        must_keep_terms=["amlodipine", "10 mg"],
+        "dose fexofenadine 60 mg",
+        must_keep_terms=["fexofenadine", "60 mg"],
         exact_recall=True,
     )
 
     assert default_queries == [
-        "amlodipine 10 mg dose",
-        "dose amlodipine 10 mg",
-        "dose OR amlodipine OR 10 OR mg",
+        "fexofenadine 60 mg dose",
+        "dose fexofenadine 60 mg",
+        "dose OR fexofenadine OR 60 OR mg",
     ]
     assert [(spec.query, spec.kind) for spec in exact_specs] == [
-        ("amlodipine 10 mg dose", "anchor_first_and"),
-        ("dose amlodipine 10 mg", "sparse_and"),
-        ("amlodipine 10 mg", "anchor_only_and"),
-        ("dose OR amlodipine OR 10 OR mg", "broad_or"),
+        ("fexofenadine 60 mg dose", "anchor_first_and"),
+        ("dose fexofenadine 60 mg", "sparse_and"),
+        ("fexofenadine 60 mg", "anchor_only_and"),
+        ("dose OR fexofenadine OR 60 OR mg", "broad_or"),
     ]
 
 
@@ -3316,7 +3558,7 @@ async def test_content_bearing_query_finds_candidates_via_or_fallback() -> None:
             assistant_mode_id="coding_debug",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text="Jon lost his job as a banker last year",
+            canonical_text="Inez returned her rented telescope last year",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.9,
             privacy_level=0,
@@ -3325,11 +3567,11 @@ async def test_content_bearing_query_finds_candidates_via_or_fallback() -> None:
         planner = RetrievalPlanner()
         policy = _resolved_policy()
         plan = planner.build_plan(
-            original_query="What happened to Jon's banking job?",
+            original_query="What happened to Inez's telescope rental?",
             query_intelligence=QueryIntelligenceResult(
                 needs=[],
                 temporal_range=None,
-                sub_queries=["jon lost job as banker"],
+                sub_queries=["inez returned rented telescope"],
                 query_type="default",
                 retrieval_levels=[0],
             ),
@@ -3345,7 +3587,7 @@ async def test_content_bearing_query_finds_candidates_via_or_fallback() -> None:
             f"Expected at least 1 candidate but got {len(candidates)}; "
             f"fts_queries={plan.fts_queries}"
         )
-        assert "banker" in candidates[0]["canonical_text"]
+        assert "telescope" in candidates[0]["canonical_text"]
     finally:
         await connection.close()
 

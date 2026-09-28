@@ -30,6 +30,7 @@ from atagia.models.schemas_memory import (
     VerbatimPinTargetKind,
 )
 from atagia.services.embeddings import EmbeddingMatch
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -75,7 +76,13 @@ async def _build_runtime(
     conversations = ConversationRepository(connection, clock)
     memories = MemoryObjectRepository(connection, clock)
     embedding_index = FakeEmbeddingIndex(matches, vector_limit=embedding_vector_limit)
-    search = CandidateSearch(connection, clock, embedding_index=embedding_index, settings=settings)
+    search = CandidateSearch(
+        connection,
+        clock,
+        embedding_index=embedding_index,
+        settings=settings,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
     await users.create_user("usr_1")
     await users.create_user("usr_2")
     await workspaces.create_workspace("wrk_1", "usr_1", "Workspace")
@@ -1578,7 +1585,11 @@ async def test_memory_fts_bm25_column_weights_prefer_canonical_text_matches() ->
 
 
 def test_rank_fusion_prefers_exact_single_hit_for_default_queries() -> None:
-    search = CandidateSearch(None, FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)))
+    search = CandidateSearch(
+        None,
+        FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)),
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
 
     _raw_exact, exact_score = search._compute_rank_fusion_scores(  # noqa: SLF001
         [1],
@@ -1595,7 +1606,11 @@ def test_rank_fusion_prefers_exact_single_hit_for_default_queries() -> None:
 
 
 def test_rank_fusion_keeps_coverage_bias_for_broad_list_queries() -> None:
-    search = CandidateSearch(None, FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)))
+    search = CandidateSearch(
+        None,
+        FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)),
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
 
     _raw_exact, exact_score = search._compute_rank_fusion_scores(  # noqa: SLF001
         [1],
@@ -1611,8 +1626,181 @@ def test_rank_fusion_keeps_coverage_bias_for_broad_list_queries() -> None:
     assert generic_score > exact_score
 
 
+def test_broad_list_comparable_rrf_keeps_rank_quality_comparable_across_lanes() -> None:
+    settings = replace(
+        Settings.from_env(),
+        broad_list_comparable_rrf_enabled=True,
+    )
+    search = CandidateSearch(
+        None,
+        FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)),
+        settings=settings,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
+
+    _raw_enriched, enriched_rank_one = search._compute_rank_fusion_scores(  # noqa: SLF001
+        [1],
+        max_lists=5,
+        query_type="broad_list",
+    )
+    _raw_base, base_rank_ninety = search._compute_rank_fusion_scores(  # noqa: SLF001
+        [90],
+        max_lists=1,
+        query_type="broad_list",
+    )
+
+    assert enriched_rank_one == pytest.approx(1.0)
+    assert enriched_rank_one > base_rank_ninety
+
+    aggregated = {}
+    candidate = {
+        "id": "mem_enriched",
+        "position_rank": 1,
+        "channel_ranks": {"fts": 1},
+        "retrieval_sources": ["fts"],
+        "retrieval_source": "fts",
+        "rrf_score": 1.0,
+        "rrf_score_raw": 1.0,
+    }
+    broad_plan = _plan().model_copy(update={"query_type": "broad_list"})
+    search._merge_sub_query_candidates(  # noqa: SLF001
+        aggregated,
+        [candidate],
+        plan=broad_plan,
+        sub_query_text="enriched facet",
+        total_sub_queries=5,
+    )
+
+    assert aggregated["mem_enriched"]["rrf_subquery_coverage"] == pytest.approx(0.2)
+
+    empty_plan_aggregate = {}
+    search._merge_sub_query_candidates(  # noqa: SLF001
+        empty_plan_aggregate,
+        [candidate],
+        plan=broad_plan,
+        sub_query_text="degenerate facet",
+        total_sub_queries=0,
+    )
+    assert "rrf_subquery_coverage" not in empty_plan_aggregate["mem_enriched"]
+
+
+@pytest.mark.asyncio
+async def test_fused_guard_ordering_populates_callback_flags_before_sort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    search = CandidateSearch(
+        None,
+        FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)),
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
+    plan = _plan().model_copy(update={"callback_bias": True})
+    candidates = [
+        {
+            "id": "mem_coverage",
+            "scope": MemoryScope.CONVERSATION,
+            "updated_at": "2026-04-04T10:00:00+00:00",
+            "temporal_type": "unknown",
+            "rrf_score": 0.9,
+        },
+        {
+            "id": "mem_callback",
+            "scope": MemoryScope.CONVERSATION,
+            "updated_at": "2026-04-04T09:00:00+00:00",
+            "temporal_type": "unknown",
+            "rrf_score": 0.2,
+        },
+    ]
+
+    async def populate_flags(
+        _search: CandidateSearch,
+        prepared: list[dict[str, object]],
+        *,
+        user_id: str,
+    ) -> None:
+        assert user_id == "usr_1"
+        for candidate in prepared:
+            candidate["assistant_source_match"] = (
+                candidate["id"] == "mem_callback"
+            )
+
+    monkeypatch.setattr(
+        CandidateSearch,
+        "_populate_callback_source_flags",
+        populate_flags,
+    )
+
+    ordered = await search.order_candidates_with_guards(
+        candidates,
+        plan,
+        user_id="usr_1",
+    )
+
+    assert [candidate["id"] for candidate in ordered] == [
+        "mem_callback",
+        "mem_coverage",
+    ]
+    assert all("assistant_source_match" in candidate for candidate in ordered)
+
+
+@pytest.mark.asyncio
+async def test_callback_source_flag_rejects_cross_user_source_message() -> None:
+    connection, memories, search, _embedding_index = await _build_runtime([])
+    try:
+        await _seed_memory(
+            memories,
+            memory_id="mem_usr_1",
+            user_id="usr_1",
+            canonical_text="callback candidate",
+            scope=MemoryScope.CONVERSATION,
+            workspace_id="wrk_1",
+            conversation_id="cnv_1",
+        )
+        await connection.execute(
+            """
+            INSERT INTO messages (
+                id, conversation_id, role, seq, text, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "msg_usr_2_assistant",
+                "cnv_2",
+                "assistant",
+                1,
+                "foreign assistant reply",
+                "2026-04-04T10:00:00+00:00",
+            ),
+        )
+        await connection.execute(
+            """
+            UPDATE memory_objects
+            SET payload_json = ?
+            WHERE user_id = ? AND id = ?
+            """,
+            (
+                '{"source_message_ids":["msg_usr_2_assistant"]}',
+                "usr_1",
+                "mem_usr_1",
+            ),
+        )
+        await connection.commit()
+        candidates = [{"id": "mem_usr_1"}]
+
+        await search._populate_callback_source_flags(  # noqa: SLF001
+            candidates,
+            user_id="usr_1",
+        )
+
+        assert candidates[0]["assistant_source_match"] is False
+    finally:
+        await connection.close()
+
+
 def test_rank_fusion_applies_query_type_channel_weighting() -> None:
-    search = CandidateSearch(None, FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)))
+    search = CandidateSearch(
+        None,
+        FrozenClock(datetime(2026, 4, 4, 11, 0, tzinfo=timezone.utc)),
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
 
     _raw_fts, exact_fts_score = search._compute_rank_fusion_scores(  # noqa: SLF001
         [1],

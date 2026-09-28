@@ -126,6 +126,23 @@ class RetrievalService:
         user_id: str,
         conversation_id: str,
         message_text: str,
+        **kwargs: Any,
+    ) -> PipelineResult:
+        recorder = getattr(self.runtime.llm_client, "_diagnostic_recorder", None)
+        if recorder is None:
+            return await self._retrieve_with_connection_impl(connection, user_id=user_id, conversation_id=conversation_id, message_text=message_text, **kwargs)
+        with recorder.operation("retrieval", component="retrieval", user_id=user_id, input_data={"conversation_id": conversation_id, "message": recorder.blob(message_text)}):
+            result = await self._retrieve_with_connection_impl(connection, user_id=user_id, conversation_id=conversation_id, message_text=message_text, **kwargs)
+            recorder.no_call("retrieval_result", component="retrieval", user_id=user_id, data={"retrieval_plan": recorder.blob(result.retrieval_plan), "raw_candidates": recorder.blob(result.raw_candidates), "scored_candidates": recorder.blob(result.scored_candidates), "composed_context": recorder.blob(result.composed_context), "trace": recorder.blob(result.trace) if result.trace is not None else None})
+            return result
+
+    async def _retrieve_with_connection_impl(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        user_id: str,
+        conversation_id: str,
+        message_text: str,
         mode: str | None = None,
         operational_profile: ResolvedOperationalProfile | None = None,
         ablation: AblationConfig | None = None,
@@ -304,6 +321,7 @@ class RetrievalService:
             llm_client=self.runtime.llm_client,
             embedding_index=self.runtime.embedding_index,
             clock=self.runtime.clock,
+            token_document_frequency_cache=self.runtime.token_document_frequency_cache,
             settings=self.runtime.settings,
         ).execute(
             message_text=message_text,

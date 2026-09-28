@@ -82,6 +82,8 @@ class TextChunk:
     chunk_count: int = 1
     level1_failure_reason: str | None = None
     level1_attempts: int = 0
+    char_start: int = 0
+    char_end: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,17 +122,30 @@ class TextChunker:
         *,
         min_segment_chars: int = LEVEL0_MIN_SEGMENT_CHARS,
     ) -> list[str]:
-        normalized = self._normalize_text(text)
-        if not normalized:
-            return []
+        return [
+            text[start:end]
+            for start, end in self._natural_segment_spans(
+                text, min_segment_chars=min_segment_chars
+            )
+        ]
 
-        positions = self._find_separator_positions(normalized)
-        raw_segments = self._segments_from_positions(normalized, positions)
-        cleaned_segments = [self._trim_segment(segment) for segment in raw_segments]
-        non_empty_segments = [segment for segment in cleaned_segments if segment]
-        if not non_empty_segments:
-            return [normalized]
-        return self._merge_small_segments(non_empty_segments, min_segment_chars=min_segment_chars)
+    def _natural_segment_spans(
+        self,
+        text: str,
+        *,
+        min_segment_chars: int,
+    ) -> list[tuple[int, int]]:
+        if not text.strip():
+            return []
+        positions = self._find_separator_positions(text)
+        spans = [
+            trimmed
+            for start, end in self._segments_from_positions(text, positions)
+            if (trimmed := self._trim_segment(text, start, end)) is not None
+        ]
+        if not spans:
+            return [self._strip_span(text, 0, len(text))]
+        return self._merge_small_segments(spans, min_segment_chars=min_segment_chars)
 
     async def plan_chunks(
         self,
@@ -139,34 +154,47 @@ class TextChunker:
         threshold_tokens: int = CHUNKING_THRESHOLD_TOKENS,
         metadata: dict[str, Any] | None = None,
     ) -> ChunkingPlan:
-        normalized = self._normalize_text(text)
-        if not normalized:
+        if not text.strip():
             return ChunkingPlan(chunks=[], chunked=False, fallback_count=0)
 
-        if self.estimate_tokens(normalized) <= threshold_tokens:
+        source_start, source_end = self._strip_span(text, 0, len(text))
+        source_text = text[source_start:source_end]
+
+        if self.estimate_tokens(source_text) <= threshold_tokens:
             return ChunkingPlan(
-                chunks=[TextChunk(text=normalized)],
+                chunks=[TextChunk(text=source_text, char_start=source_start, char_end=source_end)],
                 chunked=False,
                 fallback_count=0,
             )
 
-        level0_segments = self.split_by_natural_separators(normalized) or [normalized]
+        level0_spans = self._natural_segment_spans(
+            text, min_segment_chars=LEVEL0_MIN_SEGMENT_CHARS
+        ) or [(source_start, source_end)]
         chunks: list[TextChunk] = []
         fallback_count = 0
-        level0_used = len(level0_segments) > 1
+        level0_used = len(level0_spans) > 1
 
-        for segment_index, segment in enumerate(level0_segments, start=1):
+        for segment_index, (segment_start, segment_end) in enumerate(level0_spans, start=1):
+            segment = text[segment_start:segment_end]
             if self.estimate_tokens(segment) <= LEVEL1_MAX_CHUNK_TOKENS:
                 chunks.append(
                     TextChunk(
                         text=segment,
                         chunking_strategy="level0" if level0_used else None,
+                        char_start=segment_start,
+                        char_end=segment_end,
                     )
                 )
                 continue
             try:
-                for chunk_text in await self.chunk_with_ai_level1(segment, metadata=metadata):
-                    chunks.append(TextChunk(text=chunk_text, chunking_strategy="level1"))
+                level1_texts = await self.chunk_with_ai_level1(segment, metadata=metadata)
+                for chunk_text, start, end in self._locate_chunks(segment, level1_texts):
+                    chunks.append(TextChunk(
+                        text=chunk_text,
+                        chunking_strategy="level1",
+                        char_start=segment_start + start,
+                        char_end=segment_start + end,
+                    ))
             except Level1ChunkingError as exc:
                 fallback_count += 1
                 self._log_level1_fallback(
@@ -174,20 +202,23 @@ class TextChunker:
                     segment_index=segment_index,
                     error=exc,
                 )
-                for chunk_text in self._split_deterministically(segment):
+                fallback_texts = self._split_deterministically(segment)
+                for chunk_text, start, end in self._locate_chunks(segment, fallback_texts):
                     chunks.append(
                         TextChunk(
                             text=chunk_text,
                             chunking_strategy="deterministic_fallback",
                             level1_failure_reason=exc.reason,
                             level1_attempts=exc.attempts,
+                            char_start=segment_start + start,
+                            char_end=segment_start + end,
                         )
                     )
 
         chunked = len(chunks) > 1 or fallback_count > 0
         if not chunked:
             return ChunkingPlan(
-                chunks=[TextChunk(text=chunks[0].text)],
+                chunks=[replace(chunks[0], chunking_strategy=None)],
                 chunked=False,
                 fallback_count=fallback_count,
             )
@@ -224,8 +255,25 @@ class TextChunker:
         return self._validate_and_create_chunks(text, markers, cut_marker_ids)
 
     @staticmethod
-    def _normalize_text(text: str) -> str:
-        return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    def _strip_span(text: str, start: int, end: int) -> tuple[int, int]:
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        return start, end
+
+    @staticmethod
+    def _locate_chunks(text: str, chunks: list[str]) -> list[tuple[str, int, int]]:
+        located: list[tuple[str, int, int]] = []
+        cursor = 0
+        for chunk in chunks:
+            start = text.find(chunk, cursor)
+            if not chunk or start < 0:
+                raise ValueError("chunk_source_span_mismatch")
+            end = start + len(chunk)
+            located.append((chunk, start, end))
+            cursor = end
+        return located
 
     @staticmethod
     def _find_separator_positions(text: str) -> list[int]:
@@ -251,45 +299,46 @@ class TextChunker:
         return deduped
 
     @staticmethod
-    def _segments_from_positions(text: str, positions: list[int]) -> list[str]:
+    def _segments_from_positions(text: str, positions: list[int]) -> list[tuple[int, int]]:
         boundaries = [*positions, len(text)]
-        segments: list[str] = []
+        segments: list[tuple[int, int]] = []
         for start, end in zip(boundaries, boundaries[1:], strict=False):
             if start >= end:
                 continue
-            segments.append(text[start:end])
+            segments.append((start, end))
         return segments
 
     @staticmethod
-    def _trim_segment(segment: str) -> str:
-        cleaned = segment.strip()
-        if not cleaned:
-            return ""
-        cleaned_lines = cleaned.splitlines()
-        while cleaned_lines and HORIZONTAL_RULE_PATTERN.fullmatch(cleaned_lines[0].strip()):
-            cleaned_lines.pop(0)
-        while cleaned_lines and HORIZONTAL_RULE_PATTERN.fullmatch(cleaned_lines[-1].strip()):
-            cleaned_lines.pop()
-        return "\n".join(cleaned_lines).strip()
+    def _trim_segment(text: str, start: int, end: int) -> tuple[int, int] | None:
+        start, end = TextChunker._strip_span(text, start, end)
+        if start == end:
+            return None
+        lines = text[start:end].splitlines(keepends=True)
+        while lines and HORIZONTAL_RULE_PATTERN.fullmatch(lines[0].strip()):
+            start += len(lines.pop(0))
+        while lines and HORIZONTAL_RULE_PATTERN.fullmatch(lines[-1].strip()):
+            end -= len(lines.pop())
+        start, end = TextChunker._strip_span(text, start, end)
+        return (start, end) if start < end else None
 
     @staticmethod
     def _merge_small_segments(
-        segments: list[str],
+        segments: list[tuple[int, int]],
         *,
         min_segment_chars: int,
-    ) -> list[str]:
+    ) -> list[tuple[int, int]]:
         if not segments:
             return []
-        merged: list[str] = []
+        merged: list[tuple[int, int]] = []
         buffer = segments[0]
         for segment in segments[1:]:
-            if len(buffer) < min_segment_chars or len(segment) < min_segment_chars:
-                buffer = f"{buffer}\n\n{segment}".strip()
+            if buffer[1] - buffer[0] < min_segment_chars or segment[1] - segment[0] < min_segment_chars:
+                buffer = (buffer[0], segment[1])
                 continue
             merged.append(buffer)
             buffer = segment
-        if len(buffer) < min_segment_chars and merged:
-            merged[-1] = f"{merged[-1]}\n\n{buffer}".strip()
+        if buffer[1] - buffer[0] < min_segment_chars and merged:
+            merged[-1] = (merged[-1][0], buffer[1])
         else:
             merged.append(buffer)
         return merged
@@ -456,14 +505,14 @@ class TextChunker:
             raise Level1ChunkingError("no_valid_cuts")
 
         chunks = self._create_chunks_from_positions(text, unique_positions)
-        chunks = self._merge_small_chunks(chunks)
+        chunks = self._merge_small_chunks(text, chunks)
         for chunk in chunks:
             token_count = self.estimate_tokens(chunk)
             if token_count > LEVEL1_MAX_CHUNK_TOKENS:
                 raise Level1ChunkingError("all_cuts_rejected")
         return chunks
 
-    def _merge_small_chunks(self, chunks: list[str]) -> list[str]:
+    def _merge_small_chunks(self, text: str, chunks: list[str]) -> list[str]:
         merged = [chunk for chunk in chunks if chunk.strip()]
         if not merged:
             raise Level1ChunkingError("all_cuts_rejected")
@@ -488,7 +537,8 @@ class TextChunker:
 
             left_index = min(index, neighbor_index)
             right_index = max(index, neighbor_index)
-            combined = f"{merged[left_index]}\n\n{merged[right_index]}".strip()
+            located = self._locate_chunks(text, merged)
+            combined = text[located[left_index][1]:located[right_index][2]]
             if self.estimate_tokens(combined) > LEVEL1_MAX_CHUNK_TOKENS:
                 raise Level1ChunkingError("all_cuts_rejected")
             merged[left_index] = combined
@@ -498,14 +548,13 @@ class TextChunker:
         return merged
 
     def _split_deterministically(self, text: str) -> list[str]:
-        normalized = self._normalize_text(text)
-        if not normalized:
+        if not text.strip():
             return []
 
         target_chars = LEVEL1_TARGET_CHUNK_TOKENS * 4
         max_chars = LEVEL1_MAX_CHUNK_TOKENS * 4
         chunks: list[str] = []
-        remaining = normalized
+        remaining = text.strip()
 
         while self.estimate_tokens(remaining) > LEVEL1_MAX_CHUNK_TOKENS:
             split_index = self._find_split_index(remaining, min(len(remaining), target_chars))
@@ -522,7 +571,8 @@ class TextChunker:
 
         if remaining:
             if chunks and self.estimate_tokens(remaining) < LEVEL1_MIN_CHUNK_TOKENS:
-                merged_tail = f"{chunks[-1]}\n\n{remaining}".strip()
+                located = self._locate_chunks(text, [*chunks, remaining])
+                merged_tail = text[located[-2][1]:located[-1][2]]
                 if self.estimate_tokens(merged_tail) <= LEVEL1_MAX_CHUNK_TOKENS:
                     chunks[-1] = merged_tail
                 else:

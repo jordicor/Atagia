@@ -15,9 +15,18 @@ from atagia.core.repositories import (
     MessageRepository,
     UserRepository,
 )
-from atagia.core.retrieval_event_repository import MemoryFeedbackRepository, RetrievalEventRepository
+from atagia.core.retrieval_event_repository import (
+    MemoryFeedbackRepository,
+    RetrievalEventRepository,
+)
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
+from atagia.models.schemas_memory import (
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+)
+
+from tests.turn_telemetry_support import sample_turn_telemetry
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -87,7 +96,8 @@ async def test_retrieval_event_round_trip_create_get_and_list() -> None:
                     "items_dropped": 0,
                 },
                 "outcome_json": {"zero_candidates": True},
-            }
+            },
+            telemetry=sample_turn_telemetry(),
         )
 
         fetched = await events.get_event(created["id"], "usr_1")
@@ -116,7 +126,8 @@ async def test_retrieval_events_are_isolated_by_user_id() -> None:
                 "selected_memory_ids_json": ["mem_1"],
                 "context_view_json": {"selected_memory_ids": ["mem_1"], "items_included": 1, "items_dropped": 0},
                 "outcome_json": {},
-            }
+            },
+            telemetry=sample_turn_telemetry(),
         )
         second = await events.create_event(
             {
@@ -129,7 +140,8 @@ async def test_retrieval_events_are_isolated_by_user_id() -> None:
                 "selected_memory_ids_json": [],
                 "context_view_json": {"selected_memory_ids": [], "items_included": 0, "items_dropped": 0},
                 "outcome_json": {},
-            }
+            },
+            telemetry=sample_turn_telemetry(),
         )
 
         assert await events.get_event(first["id"], "usr_2") is None
@@ -155,7 +167,8 @@ async def test_memory_feedback_round_trip() -> None:
                 "selected_memory_ids_json": ["mem_1"],
                 "context_view_json": {"selected_memory_ids": ["mem_1"], "items_included": 1, "items_dropped": 0},
                 "outcome_json": {},
-            }
+            },
+            telemetry=sample_turn_telemetry(),
         )
 
         created = await feedback.create_feedback(
@@ -191,7 +204,8 @@ async def test_memory_feedback_rejects_memory_owned_by_another_user() -> None:
                 "selected_memory_ids_json": [],
                 "context_view_json": {"selected_memory_ids": [], "items_included": 0, "items_dropped": 0},
                 "outcome_json": {},
-            }
+            },
+            telemetry=sample_turn_telemetry(),
         )
 
         with pytest.raises(ValueError, match="Memory object mem_2 does not belong to user usr_1"):
@@ -222,7 +236,8 @@ async def test_memory_feedback_rejects_same_user_memory_not_selected_in_event() 
                 "selected_memory_ids_json": [],
                 "context_view_json": {"selected_memory_ids": [], "items_included": 0, "items_dropped": 0},
                 "outcome_json": {},
-            }
+            },
+            telemetry=sample_turn_telemetry(),
         )
 
         with pytest.raises(

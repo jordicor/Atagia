@@ -16,11 +16,17 @@ from pydantic import (
     model_validator,
 )
 
+from pydantic.json_schema import SkipJsonSchema
+
 from atagia.core import json_utils
 from atagia.core.language_codes import (
     normalize_iso_639_1_code,
     normalize_optional_iso_639_1_code,
 )
+from atagia.core.source_references import SourceReference
+from atagia.memory.claim_keys import validate_claim_key
+from atagia.memory.extraction_temporal import TemporalIntervalResolution
+from atagia.memory.date_resolution import DateResolution
 
 
 class MemoryObjectType(str, Enum):
@@ -531,7 +537,6 @@ class RetrievalParams(BaseModel):
 
     fts_limit: int = Field(ge=0)
     vector_limit: int = Field(ge=0)
-    graph_hops: int = Field(ge=0)
     rerank_top_k: int = Field(gt=0)
     final_context_items: int = Field(gt=0)
 
@@ -585,7 +590,6 @@ class OperationalRetrievalParamsOverride(BaseModel):
 
     fts_limit: int | None = Field(default=None, ge=0)
     vector_limit: int | None = Field(default=None, ge=0)
-    graph_hops: int | None = Field(default=None, ge=0)
     rerank_top_k: int | None = Field(default=None, gt=0)
     final_context_items: int | None = Field(default=None, gt=0)
 
@@ -815,6 +819,8 @@ class ExtractedMemoryBase(BaseModel):
     evidence_polarity: MemoryEvidencePolarity | None = None
     speaker_relation_to_subject: MemoryEvidenceSpeakerRelation | None = None
     source_quote: str | None = None
+    # Resolved by code from visible IDs, never supplied as model-written offsets.
+    source_reference: SourceReference | None = None
     trigger_message_ids: list[str] = Field(default_factory=list)
     trigger_quote: str | None = None
     support_rationale: str | None = None
@@ -904,7 +910,7 @@ class ExtractedMemoryBase(BaseModel):
         normalized = value.strip()
         return normalized or None
 
-    @field_validator("source_quote", "trigger_quote", "support_rationale")
+    @field_validator("support_rationale")
     @classmethod
     def validate_optional_evidence_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -1004,6 +1010,11 @@ class ExtractedBelief(ExtractedMemoryBase):
     claim_key: str = Field(min_length=1)
     claim_value: str = Field(min_length=1)
 
+    @field_validator("claim_key")
+    @classmethod
+    def validate_claim_key_syntax(cls, value: str) -> str:
+        return validate_claim_key(value)
+
 
 class ExtractedContractSignal(ExtractedMemoryBase):
     """Collaboration preference signal extracted from the message."""
@@ -1082,7 +1093,7 @@ class ExtractionResult(BaseModel):
                     and normalized_item.get("claim_key") is not None
                     and normalized_item.get("claim_value") is not None
                 ):
-                    claim_key = str(normalized_item.get("claim_key") or "").strip()
+                    claim_key = normalized_item.get("claim_key")
                     claim_value_raw = normalized_item.get("claim_value")
                     if isinstance(claim_value_raw, str):
                         claim_value = claim_value_raw.strip()
@@ -1090,7 +1101,7 @@ class ExtractionResult(BaseModel):
                         claim_value = ""
                     else:
                         claim_value = json_utils.dumps(claim_value_raw, sort_keys=True)
-                    if claim_key and claim_value:
+                    if isinstance(claim_key, str) and claim_key and claim_value:
                         normalized_item["claim_key"] = claim_key
                         normalized_item["claim_value"] = claim_value
                         beliefs.append(normalized_item)
@@ -1162,6 +1173,10 @@ class LeanTemporalStatus(BaseModel):
     valid_from_iso: str | None = None
     valid_to_iso: str | None = None
 
+    date_resolution: SkipJsonSchema[DateResolution | None] = None
+    date_interval: SkipJsonSchema[TemporalIntervalResolution | None] = None
+    date_not_applicable: SkipJsonSchema[dict[str, str | None] | None] = None
+
     @field_validator("valid_from_iso", "valid_to_iso")
     @classmethod
     def validate_temporal_iso(cls, value: str | None) -> str | None:
@@ -1184,11 +1199,11 @@ class LeanTemporalStatus(BaseModel):
 class CoverageMember(BaseModel):
     """One asserted member of an enumerable attribute carried by a candidate.
 
-    Emitted by the ``coverage_members`` extraction card for facts that assert an
-    entity as a member of an enumerable set (a person's doctors, a list of
-    cities, contacts, products, ...). ``member_key`` is the normalized identity
-    used to collapse near-duplicate carriers; ``display_text`` is the
-    answer-facing label.
+    Built from the coverage-members list and separate identity decision for
+    facts that assert an entity as a member of an enumerable set (a person's
+    doctors, a list of cities, contacts, products, ...). ``member_key`` is the
+    normalized identity used to collapse near-duplicate carriers;
+    ``display_text`` is the answer-facing label.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1213,7 +1228,9 @@ class LeanExtractionCandidate(BaseModel):
     language_codes: list[str]
     index_text: str | None = None
     preserve_verbatim: bool = False
+    # Source text is copied by the card assembler, without whitespace normalization.
     source_span: str | None = None
+    source_reference: SourceReference | None = None
     temporal_status: LeanTemporalStatus | None = None
     support_kind: MemoryEvidenceSupportKind = MemoryEvidenceSupportKind.DIRECT
     claim_key: str | None = None
@@ -1247,8 +1264,7 @@ class LeanExtractionCandidate(BaseModel):
     def validate_source_span(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        normalized = " ".join(value.split())
-        return normalized or None
+        return value if value.strip() else None
 
     @model_validator(mode="after")
     def validate_language_codes(self) -> "LeanExtractionCandidate":
@@ -1265,11 +1281,11 @@ class LeanExtractionCandidate(BaseModel):
     @model_validator(mode="after")
     def validate_belief_claim(self) -> "LeanExtractionCandidate":
         if self.kind == "belief":
-            claim_key = (self.claim_key or "").strip()
+            claim_key = self.claim_key or ""
             claim_value = (self.claim_value or "").strip()
             if not claim_key or not claim_value:
                 raise ValueError("belief candidates require non-empty claim_key and claim_value")
-            self.claim_key = claim_key
+            self.claim_key = validate_claim_key(claim_key)
             self.claim_value = claim_value
         return self
 
@@ -2030,6 +2046,10 @@ class ScoredCandidate(BaseModel):
     penalty: float = Field(ge=0.0)
     final_score: float
     resolved_date: str | None = None
+    date_certainty: Literal["exact", "uncertain", "unknown"] | None = None
+    date_resolution_status: Literal[
+        "completed", "pending_analysis", "unprocessed", "stale", "not_applicable"
+    ] = "unprocessed"
 
 
 class ComposedContext(BaseModel):
@@ -2063,62 +2083,6 @@ class ComposedContext(BaseModel):
     budget_tokens: int = Field(ge=0)
     items_included: int = Field(ge=0)
     items_dropped: int = Field(ge=0)
-
-
-class MemoryObject(BaseModel):
-    """Canonical memory object."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    user_id: str
-    workspace_id: str | None = None
-    conversation_id: str | None = None
-    assistant_mode_id: str | None = None
-    # Namespace redesign identity axes. `user_persona_id`, `platform_id` and
-    # `character_id` are explicit caller inputs (never inferred from prompt
-    # text). `platform_id` is required at write time after the public cut;
-    # storage keeps it nullable for legacy rows during the additive phase.
-    user_persona_id: str | None = None
-    platform_id: str | None = None
-    character_id: str | None = None
-    active_presence_id: str | None = None
-    source_presence_id: str | None = None
-    presence_cluster_id: str | None = None
-    space_id: str | None = None
-    space_boundary_mode: SpaceBoundaryMode | None = None
-    memory_owner_id: str | None = None
-    source_mind_id: str | None = None
-    embodiment_id: str | None = None
-    realm_id: str | None = None
-    object_type: MemoryObjectType
-    scope: MemoryScope
-    canonical_text: str
-    index_text: str | None = None
-    payload_json: dict[str, Any] = Field(default_factory=dict)
-    source_kind: MemorySourceKind
-    confidence: float = 0.5
-    stability: float = 0.5
-    vitality: float = 0.0
-    maya_score: float = 0.0
-    privacy_level: int = 0
-    sensitivity: MemorySensitivity = MemorySensitivity.UNKNOWN
-    themes: list[str] = Field(default_factory=list)
-    auto_expires: bool = False
-    platform_locked: bool = False
-    platform_id_lock: str | None = None
-    memory_category: MemoryCategory = MemoryCategory.UNKNOWN
-    intimacy_boundary: IntimacyBoundary = IntimacyBoundary.ORDINARY
-    intimacy_boundary_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    preserve_verbatim: bool = False
-    temporal_type: str = "unknown"
-    tension_score: float = 0.0
-    tension_updated_at: datetime | None = None
-    valid_from: datetime | None = None
-    valid_to: datetime | None = None
-    status: MemoryStatus = MemoryStatus.ACTIVE
-    created_at: datetime
-    updated_at: datetime
 
 
 class ContractDimensionCurrent(BaseModel):
@@ -2544,18 +2508,35 @@ class NeedDetectionTrace(BaseModel):
 
 
 class FtsQueryExecutionCount(BaseModel):
-    """Per-FTS-query execution diagnostics for one sub-query."""
+    """Per-FTS-query execution diagnostics for one sub-query.
+
+    ``persisted_surface_*`` kinds run as a dry-run probe (harvest recorded, rows
+    never merged) unless the plan set ``exact_recall_needed`` or a ``slot_fill``
+    query type, so on any other plan they report rows without candidates by
+    design and are not evidence of a downstream drop.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     query: str
     kind: str = "unknown"
     match_mode: str = "implicit_and"
+    # Pipeline lane that issued this SQL event. ``single`` covers direct
+    # CandidateSearch callers and older traces without base/enriched lanes.
+    lane: str = "single"
     source: str = "planned"
     non_evidential: Literal[True] = True
     # Rows returned by SQL after filters and channel limit, before merge/fusion.
     raw_rows: int = Field(ge=0, default=0)
     candidates: int = Field(ge=0, default=0)
+    # Memory IDs harvested by this exact executed query string, in row order and
+    # deduplicated. Recorded at ``fetchall`` time, so before every Python-side
+    # merge, dedupe and the final ``max_candidates`` truncation. A memory that
+    # appears here but not in the raw candidate set was harvested and then
+    # dropped downstream; a memory absent from here was never returned by this
+    # query at all. Distinct from ``raw_rows``: one memory can back several
+    # retrieval-surface rows.
+    raw_row_ids: list[str] = Field(default_factory=list)
 
 
 class SubQuerySearchCount(BaseModel):
@@ -2925,6 +2906,67 @@ class LLMStructuredOutputDiagnostic(BaseModel):
     debug_artifact_path: str | None = None
 
 
+class TurnSurface(str, Enum):
+    """Which entry point produced a persisted turn, and therefore what its
+    telemetry covers.
+
+    ``CONTEXT`` is retrieval only: the host runs its own model, so the LLM
+    counters cover Atagia's retrieval-stage calls and nothing else. The other
+    three cover a complete turn including the reply call.
+    """
+
+    CHAT = "chat"
+    CONTEXT = "context"
+    PROXY_COMPLETION = "proxy_completion"
+    PROXY_STREAM = "proxy_stream"
+
+
+class LLMPurposeMetricsTrace(BaseModel):
+    """Provider round-trips and wall time spent on one purpose label (CS-1.5).
+
+    Calls and latency live in ONE entry per purpose rather than in two parallel
+    maps: two maps keyed by the same dimension drift apart the moment one gains
+    a label the other does not have.
+
+    ``latency_ms`` is ``None`` only on the entries migration 0070 carried
+    forward from the calls-only breakdown 0069 recorded: the count is a real
+    measurement and survives, the latency was never taken. It is an ABSENT
+    measurement -- a reader must never fold it in as zero. Writers always supply
+    a real number, and ``TurnTelemetry.__post_init__`` rejects a null on the
+    write path, so a null can only ever be that backfill.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    calls: int = Field(ge=0, default=0)
+    latency_ms: float | None = Field(ge=0.0, default=None)
+
+
+class LLMCallMetricsTrace(BaseModel):
+    """Per-turn LLM provider-call counts and latency on the retrieval trace.
+
+    CS-1.4 (counts) and CS-1.5 (latency per purpose). This is a TURN-level
+    metric, not a retrieval-stage-only one: it covers every synchronous provider
+    round-trip of the turn (need detection, staleness, planner,
+    applicability/scoring cards, and the reply). It is derived from the turn's
+    ``TurnTelemetry``, never built independently, so the trace and the typed
+    telemetry columns cannot report different numbers for the same turn.
+    Background extraction/contract/consequence work runs post-response via
+    workers and is deliberately excluded.
+
+    Every turn surface populates it: the chat service after its answer, the
+    sidecar for its retrieval scope, and the proxy surfaces when the terminal
+    commit upgrades the sidecar's row to full-turn telemetry.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    total_calls: int = Field(ge=0, default=0)
+    failed_calls: int = Field(ge=0, default=0)
+    total_latency_ms: float = Field(ge=0.0, default=0.0)
+    by_purpose: dict[str, LLMPurposeMetricsTrace] = Field(default_factory=dict)
+
+
 class RetrievalTrace(BaseModel):
     """Complete trace of a retrieval operation."""
 
@@ -2941,6 +2983,22 @@ class RetrievalTrace(BaseModel):
     degraded_mode: bool = False
     raw_context_access_mode: str = "normal"
     privacy_enforcement: Literal["enforce", "audit_only", "off"] = "enforce"
+    # Override knobs actually applied to this retrieval from
+    # AblationConfig.override_retrieval_params. Applied equals requested by
+    # construction: the AblationConfig boundary rejects both unrecognized keys
+    # and values outside the range the engine can honor, so nothing normalizes a
+    # request into something else on the way in and there is no value the engine
+    # silently substitutes on the way out. Recording it makes each run
+    # self-documenting about the tuning in effect.
+    applied_override_retrieval_params: dict[str, Any] = Field(default_factory=dict)
+    # Per-turn LLM provider-call metrics (CS-1.4/CS-1.5). The retrieval pipeline
+    # leaves it unset because the numbers are turn-level, not retrieval-only; the
+    # turn surface attaches them once its telemetry is built (chat after the
+    # answer, the sidecar for its retrieval scope, the proxy at the terminal
+    # commit). None therefore means "no turn surface owns this trace yet", never
+    # "this turn made no calls" -- which is exactly what it wrongly meant on
+    # three of the four surfaces before they all populated it.
+    llm_call_metrics: LLMCallMetricsTrace | None = None
     policy_filter_audit: dict[str, Any] = Field(default_factory=dict)
     topic_snapshot: TopicWorkingSetTrace = Field(default_factory=TopicWorkingSetTrace)
     need_detection: NeedDetectionTrace | None = None

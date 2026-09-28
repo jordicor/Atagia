@@ -115,7 +115,8 @@ async def test_exact_slot_fill_for_spanish_address_query() -> None:
         "Cual es la direccion del nuevo estudio de Nora?",
         {
             "need_detection_needs_card": "none",
-            "need_detection_language_card": "es\nes",
+            "need_detection_query_language_card": "es",
+            "need_detection_answer_language_card": "es",
             "need_detection_memory_card": "personal",
             "need_detection_exact_card": "yes",
             "need_detection_shape_card": "slot",
@@ -126,7 +127,7 @@ async def test_exact_slot_fill_for_spanish_address_query() -> None:
         },
     )
 
-    assert len(provider.requests) == 8
+    assert len(provider.requests) == 9
     assert result.query_language == "es"
     assert result.answer_language == "es"
     assert result.memory_dependence is MemoryDependence.PERSONAL
@@ -146,7 +147,8 @@ async def test_exact_facets_cover_multiple_saved_detail_types() -> None:
         "What specific API rate limit configuration does Ben need?",
         {
             "need_detection_needs_card": "none",
-            "need_detection_language_card": "en\nen",
+            "need_detection_query_language_card": "en",
+            "need_detection_answer_language_card": "en",
             "need_detection_memory_card": "personal",
             "need_detection_exact_card": "yes",
             "need_detection_shape_card": "slot",
@@ -177,7 +179,8 @@ async def test_broad_list_exact_recall_keeps_original_query_as_single_sub_query(
         "What concrete items was Nora packing for Imani's field expedition?",
         {
             "need_detection_needs_card": "none",
-            "need_detection_language_card": "en\nen",
+            "need_detection_query_language_card": "en",
+            "need_detection_answer_language_card": "en",
             "need_detection_memory_card": "personal",
             "need_detection_exact_card": "yes",
             "need_detection_shape_card": "list",
@@ -207,7 +210,8 @@ async def test_public_exact_sounding_world_question_does_not_trigger_memory_exac
         "Who wrote Romeo and Juliet?",
         {
             "need_detection_needs_card": "none",
-            "need_detection_language_card": "en\nen",
+            "need_detection_query_language_card": "en",
+            "need_detection_answer_language_card": "en",
             "need_detection_memory_card": "world",
             "need_detection_exact_card": "no",
             "need_detection_shape_card": "default",

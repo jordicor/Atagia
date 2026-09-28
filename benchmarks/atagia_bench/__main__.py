@@ -34,6 +34,7 @@ from benchmarks.failure_taxonomy import (
     format_failure_taxonomy_summary,
     save_failure_taxonomy_report,
 )
+from benchmarks.invocation_args import redact_invocation_args
 from benchmarks.output_root import assert_outside_repo, bench_output_root
 from benchmarks.retained_db_paths import default_benchmark_db_dir
 from benchmarks.scorer import JudgeProtocol
@@ -46,7 +47,7 @@ load_dotenv()
 _DEFAULT_OUTPUT_DIR = bench_output_root() / "atagia_bench"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 _DEFAULT_HOLDOUT_FILE = Path(__file__).resolve().parent / "data" / "holdout_v1.json"
-_DEFAULT_JUDGE_MODEL = "kimi/kimi-k2.7-code"
+_DEFAULT_JUDGE_MODEL = "openrouter/openai/gpt-5.6-luna,medium"
 _DEFAULT_PRIVACY_ENFORCEMENT = "off"
 
 
@@ -130,7 +131,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         required=True,
-        help="LLM provider name (anthropic, openai, openrouter)",
+        help="LLM provider name (anthropic, openai, openrouter, local)",
     )
     parser.add_argument(
         "--model",
@@ -150,8 +151,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--judge-model",
         default=None,
         help=(
-            "LLM model for scoring; defaults to direct Kimi "
-            "kimi-k2.7-code for benchmark judging"
+            "LLM model for scoring; defaults to OpenRouter "
+            "gpt-5.6-luna at medium reasoning effort for benchmark judging"
         ),
     )
     parser.add_argument(
@@ -289,6 +290,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--embedding-model",
         default=None,
         help="Embedding model name (required when backend is sqlite_vec)",
+    )
+    parser.add_argument(
+        "--inference-access-mode",
+        choices=("unrestricted", "local_only", "zero_cost"),
+        default=None,
+        help="Restrict all Atagia-owned inference routes (defaults to environment/unrestricted).",
+    )
+    parser.add_argument(
+        "--local-llm-endpoints-file",
+        default=None,
+        help="Absolute path to the version-one local endpoint catalog JSON.",
+    )
+    parser.add_argument(
+        "--zero-cost-openrouter-profile",
+        default=None,
+        help="Required dedicated OpenRouter profile declaration for external zero-cost routes.",
     )
     parser.add_argument(
         "--ablation",
@@ -498,6 +515,9 @@ async def _run_async(
         answer_stance=args.answer_stance,
         answer_stance_prompt_variant=args.answer_stance_prompt_variant,
         llm_call_delay_ms=args.llm_call_delay_ms,
+        inference_access_mode=args.inference_access_mode,
+        local_llm_endpoints_file=args.local_llm_endpoints_file,
+        zero_cost_openrouter_profile=args.zero_cost_openrouter_profile,
     )
     report = await runner.run(
         persona_ids=_parse_csv_list(args.personas),
@@ -532,7 +552,7 @@ async def _run_async(
         keep_db=args.keep_db,
         reuse_db=args.reuse_db,
         evaluate_only=args.evaluate_only,
-        invocation_args=sys.argv[1:],
+        invocation_args=redact_invocation_args(sys.argv[1:], _build_parser()),
     )
     report_path = runner.save_report(report, args.output)
 

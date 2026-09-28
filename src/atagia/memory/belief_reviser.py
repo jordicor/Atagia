@@ -923,6 +923,12 @@ class BeliefReviser:
         )
         if scope_identifiers is None:
             raise ValueError(f"Cannot resolve identifiers for belief scope {scope.value}")
+        # A successor belief is derived from the base belief plus every new
+        # evidence row that triggered the revision, so it has no single source
+        # message whose arrival could measure ingest freshness:
+        # source_message_created_at stays NULL. payload["source_message_ids"]
+        # records only the message that triggered this revision, not the
+        # observations the claim was merged from.
         created = await self._memory_repository.create_memory_object(
             user_id=str(base_belief["user_id"]),
             workspace_id=scope_identifiers["workspace_id"],

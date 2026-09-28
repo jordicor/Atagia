@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 import asyncio
-from contextlib import asynccontextmanager, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass, replace
+from enum import StrEnum
+from functools import partial
 import json
 import logging
 import sqlite3
+from time import perf_counter
 import time
 import uuid
 from typing import Any
@@ -33,7 +36,8 @@ from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepositor
 from atagia.integrations.message_projection import message_to_text, tool_message_to_text
 from atagia.integrations.prompt_injection import build_injection_decision
 from atagia.core.mind_repository import MindNotFoundError
-from atagia.models.schemas_memory import ResponseMode
+from atagia.models.schemas_api import ContextResult
+from atagia.models.schemas_memory import ResponseMode, TurnSurface
 from atagia.models.schemas_openai_proxy import (
     OpenAIChatCompletionRequest,
     OpenAIModelList,
@@ -44,7 +48,7 @@ from atagia.memory.operational_profile import (
     OperationalProfileNotAuthorizedError,
     UnknownOperationalProfileError,
 )
-from atagia.services.chat_support import chat_model
+from atagia.services.chat_support import build_turn_telemetry, chat_model
 from atagia.services.errors import (
     AssistantModeMismatchError,
     ConversationNotActiveError,
@@ -52,11 +56,14 @@ from atagia.services.errors import (
     MessageIdConflictError,
     ProxyTurnError,
     SourceSequenceConflictError,
+    TranscriptRebuildInProgressError,
+    TranscriptRebuildRemediationRequiredError,
     UnknownAssistantModeError,
     UserDeletedError,
     WorkspaceMismatchError,
     WorkspaceNotFoundError,
 )
+from atagia.services.llm_run_guard import LLMCallMeter
 from atagia.services.llm_client import (
     LLMCompletionRequest,
     LLMCompletionResponse,
@@ -90,6 +97,7 @@ from atagia.services.proxy_transcript import (
 )
 from atagia.services.proxy_turn_service import (
     ProxyTerminalJobPlan,
+    ProxyTurnTelemetry,
     dispatch_proxy_terminal_jobs,
     finalize_proxy_turn,
 )
@@ -104,6 +112,14 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_MODE_VALUES: frozenset[str] = frozenset(mode.value for mode in ResponseMode)
 
+# Context errors that must reach their own exception handler untouched instead
+# of being wrapped as an internal failure. The two transcript-rebuild errors
+# belong here for a reason worth stating: they already produce the documented
+# 409/503 responses when raised from _prepare_turn, but the same condition
+# raised inside get_context used to fall through to the generic branch below and
+# surface as a 500 "Internal memory context failure" -- the same fail-closed
+# event reported as a retryable conflict or as a server fault depending only on
+# which stage noticed it. Clients cannot act on that.
 _HARD_CONTEXT_ERRORS = (
     AssistantModeMismatchError,
     ConversationNotActiveError,
@@ -112,6 +128,8 @@ _HARD_CONTEXT_ERRORS = (
     MindNotFoundError,
     OperationalProfileNotAuthorizedError,
     SourceSequenceConflictError,
+    TranscriptRebuildInProgressError,
+    TranscriptRebuildRemediationRequiredError,
     UnknownAssistantModeError,
     UnknownOperationalProfileError,
     UserDeletedError,
@@ -167,6 +185,98 @@ class PreparedProxyTurn:
     input_projection: ProxyInputProjection
     input_metadata: dict[str, Any]
     reservation: ProxyTurnReservation
+
+
+@dataclass(frozen=True, slots=True)
+class ProxyContextAttempt:
+    """The outcome of one memory-context fetch plus what it cost.
+
+    ``context`` is None when the fetch failed open. ``elapsed_ms`` is measured
+    either way, because a fail-open still consumed retrieval time and provider
+    round-trips that the turn's meter has already counted.
+    """
+
+    context: ContextResult | None
+    elapsed_ms: float
+
+
+class _ProxyStreamBody(AsyncIterator[str]):
+    """The SSE body iterator, with a close that resolves the turn either way.
+
+    AN ASYNC GENERATOR OWNS NOTHING UNTIL ITS BODY STARTS -- AND NOTHING AGAIN
+    ONCE IT IS CANCELLED. Those are two halves of one problem, and only a close
+    that runs OUTSIDE the generator covers both.
+
+    A generator that was never iterated marks itself closed and runs no code at
+    all, so every ``aclosing`` scope, every ``try`` and every ``finally`` written
+    inside it is dead when the client is already gone at dispatch. The provider
+    round-trip is in flight by then -- the setup coroutine pulled its first event
+    to prove it had output -- so nothing would close it until the loop's
+    async-generator finalizer got to it, in a task outside the request and after
+    the turn's accounting closed.
+
+    A generator cancelled INSIDE ``__anext__`` is the wider case and the worse
+    one. Only cancellation delivered AT a ``yield`` leaves a generator SUSPENDED,
+    which is what makes a later ``aclose`` able to revive it; cancellation that
+    lands while its frame is running TERMINATES it, so ``aclose`` forwards to a
+    corpse. What teardown it did attempt ran inside the cancelled scope, where
+    anyio re-delivers the cancellation at every suspension point: the provider
+    close is entered and cancelled, the claim resolution is entered and
+    cancelled, and the turn is left mid-teardown. A streamed turn spends
+    essentially all of its wall time parked in ``__anext__`` waiting for the next
+    token, so this is where a disconnect lands by default.
+
+    THE CLOSE IS THEREFORE UNCONDITIONAL. This object is CREATED by the setup
+    coroutine rather than started by the consumer, so its ``aclose`` runs in the
+    request that owns the turn whichever shape happened, and it always forwards
+    to the body AND then runs the abandon path. It does not try to work out which
+    of them already ran, because that question has no reliable answer from out
+    here: a terminated generator is indistinguishable from an exhausted one. Both
+    steps are idempotent instead -- ``aclose`` on a closed or exhausted generator
+    runs no code, and ``mark_ambiguous_exposed`` is fenced on the
+    ``emission_started`` state plus this claim's owner token and fence, so it
+    matches no row once the turn completed or was already resolved.
+
+    The price is one no-op single-row UPDATE per streamed turn (~1.7ms, measured
+    locally), paid after the last byte and off the first-byte path. What it buys
+    is a claim row that cannot be left saying ``emission_started`` forever: the
+    30s lease expires, but nothing reaps an expired row, so without this the
+    turn's own record of itself stays wrong for good.
+    """
+
+    __slots__ = ("_body", "_abandon_exposed")
+
+    def __init__(
+        self,
+        body: AsyncIterator[str],
+        *,
+        abandon_exposed: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._body = body
+        self._abandon_exposed = abandon_exposed
+
+    async def __anext__(self) -> str:
+        return await self._body.__anext__()
+
+    async def aclose(self) -> None:
+        # `finally`, so a body whose own teardown raises still gets its claim
+        # resolved before that error propagates.
+        #
+        # NOT SHIELDED, and that is measured rather than assumed. An
+        # `anyio.CancelScope(shield=True)` only defeats an anyio-scope
+        # cancellation; a native `asyncio.Task.cancel()` goes straight through
+        # it. This method runs from `_ClosingStreamingResponse.__call__`'s
+        # `finally`, which is AFTER Starlette's disconnect task group has exited,
+        # and the app's middleware stack is pure-ASGI -- no `BaseHTTPMiddleware`,
+        # so no anyio scope encloses this frame. The only cancellation that can
+        # still arrive is uvicorn cancelling the request task at its
+        # graceful-shutdown deadline, which is exactly the flavor a shield does
+        # not stop. Shielding here would buy nothing and would make a write with
+        # a 60s SQLite busy timeout uninterruptible during shutdown.
+        try:
+            await self._body.aclose()
+        finally:
+            await self._abandon_exposed()
 
 
 @dataclass(slots=True)
@@ -256,6 +366,8 @@ class OpenAIProxyService:
         )
         replay = prepared.reservation.replay
         if replay is not None:
+            # A replay re-emits a turn that was already measured and persisted;
+            # measuring it again would double-count one turn's provider calls.
             return _completion_payload_from_envelope(
                 completion_id=completion_id,
                 created=created,
@@ -268,9 +380,11 @@ class OpenAIProxyService:
                 "Proxy turn reservation returned neither claim nor replay"
             )
 
+        turn_call_meter = self.runtime.llm_client.begin_turn_call_meter()
+        turn_started_at = perf_counter()
         try:
             async with self._renewing_claim(claim):
-                context = await self._context_for_turn_fail_open(
+                context_attempt = await self._context_for_turn_fail_open(
                     prepared.identity,
                     prepared.input_projection,
                     message_metadata=prepared.input_metadata,
@@ -280,7 +394,11 @@ class OpenAIProxyService:
                         purpose="sidecar_context",
                     ),
                 )
-                llm_request = self._llm_request(request, context, prepared.identity)
+                llm_request = self._llm_request(
+                    request,
+                    context_attempt.context,
+                    prepared.identity,
+                )
                 claim = await self._establish_final_fingerprint(
                     claim,
                     final_provider_fingerprint(llm_request),
@@ -299,12 +417,22 @@ class OpenAIProxyService:
                     claim=claim,
                     response=transcript_response,
                     job_plan=job_plan,
+                    turn_telemetry=self._turn_telemetry(
+                        prepared=prepared,
+                        claim=claim,
+                        context_attempt=context_attempt,
+                        meter=turn_call_meter,
+                        surface=TurnSurface.PROXY_COMPLETION,
+                        turn_started_at=turn_started_at,
+                    ),
                 )
         except BaseException as exc:
             await self._abandon_pre_emission_best_effort(claim, exc)
             if isinstance(exc, ProxyTurnError):
                 raise _proxy_protocol_error(exc) from exc
             raise
+        finally:
+            self.runtime.llm_client.end_turn_call_meter(turn_call_meter)
 
         await self._dispatch_terminal_jobs_best_effort(durable_jobs)
         return _completion_payload_from_envelope(
@@ -395,9 +523,17 @@ class OpenAIProxyService:
             raise RuntimeError(
                 "Proxy turn reservation returned neither claim nor replay"
             )
+        # One meter for the whole streamed turn, bound twice. This setup
+        # coroutine returns before the reply is consumed, and the provider call
+        # is only recorded once the stream is exhausted inside the response
+        # generator, so the generator re-binds THIS meter object rather than
+        # starting a second one. Without that, a streamed turn would persist its
+        # retrieval calls and silently drop the reply call.
+        turn_call_meter = self.runtime.llm_client.begin_turn_call_meter()
+        turn_started_at = perf_counter()
         try:
             async with self._renewing_claim(claim):
-                context = await self._context_for_turn_fail_open(
+                context_attempt = await self._context_for_turn_fail_open(
                     prepared.identity,
                     prepared.input_projection,
                     message_metadata=prepared.input_metadata,
@@ -407,25 +543,56 @@ class OpenAIProxyService:
                         purpose="sidecar_context",
                     ),
                 )
-                llm_request = self._llm_request(request, context, prepared.identity)
+                llm_request = self._llm_request(
+                    request,
+                    context_attempt.context,
+                    prepared.identity,
+                )
                 claim = await self._establish_final_fingerprint(
                     claim,
                     final_provider_fingerprint(llm_request),
                 )
                 stream = self.runtime.llm_client.stream(llm_request)
-                first_event = await _first_output_or_done_stream_event(stream)
-                claim = await self._mark_emission_started(claim)
+                # Ownership of `stream` transfers to the response generator only
+                # if the rest of this setup succeeds. Until then the round-trip
+                # is already in flight and this frame is the only thing that can
+                # close it, so a failure here has to close it HERE -- before the
+                # turn is abandoned and before the meter's scope ends below.
+                # Leaving it suspended would defer the cancelled-call record to
+                # generator finalization, which runs in another task, after this
+                # turn's accounting is already closed.
+                try:
+                    first_event = await _first_output_or_done_stream_event(stream)
+                    claim = await self._mark_emission_started(claim)
+                except BaseException:
+                    await stream.aclose()
+                    raise
         except BaseException as exc:
             await self._abandon_pre_emission_best_effort(claim, exc)
             raise
-        return self._stream_response(
-            request=request,
-            prepared=prepared,
-            claim=claim,
-            stream=stream,
-            first_event=first_event,
-            completion_id=completion_id,
-            created=created,
+        finally:
+            self.runtime.llm_client.end_turn_call_meter(turn_call_meter)
+        # Ownership of `stream` transfers here, to an object rather than to the
+        # generator itself: the consumer may drop the response without ever
+        # iterating it, and a generator that never started cannot close anything.
+        return _ProxyStreamBody(
+            self._stream_response(
+                request=request,
+                prepared=prepared,
+                claim=claim,
+                stream=stream,
+                first_event=first_event,
+                completion_id=completion_id,
+                created=created,
+                context_attempt=context_attempt,
+                meter=turn_call_meter,
+                turn_started_at=turn_started_at,
+            ),
+            abandon_exposed=partial(
+                self._abandon_exposed_stream,
+                claim=claim,
+                stream=stream,
+            ),
         )
 
     async def _stream_response(
@@ -438,19 +605,41 @@ class OpenAIProxyService:
         first_event: LLMStreamEvent,
         completion_id: str,
         created: int,
+        context_attempt: ProxyContextAttempt,
+        meter: LLMCallMeter,
+        turn_started_at: float,
     ) -> AsyncIterator[str]:
-        async with self._renewing_claim(claim) as ownership_lost:
-            async for chunk in self._stream_response_owned(
-                request=request,
-                prepared=prepared,
-                claim=claim,
-                stream=stream,
-                first_event=first_event,
-                completion_id=completion_id,
-                created=created,
-                ownership_lost=ownership_lost,
-            ):
-                yield chunk
+        self.runtime.llm_client.bind_turn_call_meter(meter)
+        try:
+            async with self._renewing_claim(claim) as ownership_lost:
+                # `aclosing`, not a bare `async for`: this generator is the one
+                # `_ProxyStreamBody` closes when an ASGI server abandons the
+                # response, and a bare loop would leave the whole chain below it
+                # -- the SSE writer, the event prepender, and the provider stream
+                # itself -- suspended at their yields. The abandoned round-trip
+                # would then only be recorded when each of them is finalized
+                # separately, after the `finally` below has already closed this
+                # turn's accounting. Closing the chain from here collapses it in
+                # one ordered pass while the meter is still live.
+                async with aclosing(
+                    self._stream_response_owned(
+                        request=request,
+                        prepared=prepared,
+                        claim=claim,
+                        stream=stream,
+                        first_event=first_event,
+                        completion_id=completion_id,
+                        created=created,
+                        ownership_lost=ownership_lost,
+                        context_attempt=context_attempt,
+                        meter=meter,
+                        turn_started_at=turn_started_at,
+                    )
+                ) as chunks:
+                    async for chunk in chunks:
+                        yield chunk
+        finally:
+            self.runtime.llm_client.end_turn_call_meter(meter)
 
     async def _stream_response_owned(
         self,
@@ -463,6 +652,9 @@ class OpenAIProxyService:
         completion_id: str,
         created: int,
         ownership_lost: asyncio.Event,
+        context_attempt: ProxyContextAttempt,
+        meter: LLMCallMeter,
+        turn_started_at: float,
     ) -> AsyncIterator[str]:
         accumulated = ""
         tool_calls: list[dict[str, Any]] = []
@@ -470,46 +662,72 @@ class OpenAIProxyService:
         finish_reason: str | None = None
         tool_index = 0
         try:
-            yield _sse(
-                _chunk_payload(
-                    completion_id=completion_id,
-                    created=created,
-                    model=request.model,
-                    delta={"role": "assistant"},
+            # THE PROVIDER ROUND-TRIP IS OWNED HERE, and by this scope alone.
+            # `stream` has already produced its first event, so this wraps a
+            # STARTED generator: closing it always reaches a suspended frame and
+            # always ends the round-trip. That is the difference that matters --
+            # a scope around a generator that has never been iterated closes
+            # nothing, because `aclose` on an unstarted async generator runs no
+            # code at all.
+            #
+            # Opened before the first yield for the same reason. The role chunk
+            # below is the first body write after `http.response.start`, so a
+            # client that is already gone lands on exactly that yield, and a
+            # scope entered after it would leave the round-trip suspended --
+            # deferring its cancellation record to a finalizer that runs outside
+            # this turn, after the accounting below has closed.
+            async with aclosing(stream):
+                yield _sse(
+                    _chunk_payload(
+                        completion_id=completion_id,
+                        created=created,
+                        model=request.model,
+                        delta={"role": "assistant"},
+                    )
                 )
-            )
-            saw_done = False
-            async for event in _prepend_stream_event(first_event, stream):
-                if ownership_lost.is_set():
-                    raise LLMError("Proxy stream ownership is no longer current")
-                if saw_done:
-                    raise LLMError("LLM stream produced events after its done event")
-                if event.type == "done":
-                    saw_done = True
-                    event_usage = event.payload.get("usage")
-                    if isinstance(event_usage, dict):
-                        provider_usage = dict(event_usage)
-                    event_finish_reason = event.payload.get("finish_reason")
-                    if event_finish_reason is not None:
-                        finish_reason = normalize_completion_finish_reason(
-                            event_finish_reason,
-                            has_tool_calls=bool(tool_calls),
+                saw_done = False
+                # A second scope, for a different job: this one finalizes the
+                # prepending wrapper's own frame once it has started. It owns no
+                # round-trip, so it is safe for it to be a no-op when the client
+                # leaves before the loop begins.
+                async with aclosing(
+                    _prepend_stream_event(first_event, stream)
+                ) as events:
+                    async for event in events:
+                        if ownership_lost.is_set():
+                            raise LLMError(
+                                "Proxy stream ownership is no longer current"
+                            )
+                        if saw_done:
+                            raise LLMError(
+                                "LLM stream produced events after its done event"
+                            )
+                        if event.type == "done":
+                            saw_done = True
+                            event_usage = event.payload.get("usage")
+                            if isinstance(event_usage, dict):
+                                provider_usage = dict(event_usage)
+                            event_finish_reason = event.payload.get("finish_reason")
+                            if event_finish_reason is not None:
+                                finish_reason = normalize_completion_finish_reason(
+                                    event_finish_reason,
+                                    has_tool_calls=bool(tool_calls),
+                                )
+                            continue
+                        chunk, text_delta, tool_call_delta = _stream_event_chunk(
+                            completion_id=completion_id,
+                            created=created,
+                            model=request.model,
+                            event=event,
+                            tool_index=tool_index,
                         )
-                    continue
-                chunk, text_delta, tool_call_delta = _stream_event_chunk(
-                    completion_id=completion_id,
-                    created=created,
-                    model=request.model,
-                    event=event,
-                    tool_index=tool_index,
-                )
-                if chunk is None:
-                    continue
-                accumulated += text_delta
-                if tool_call_delta:
-                    tool_calls.append(dict(event.payload))
-                    tool_index += 1
-                yield _sse(chunk)
+                        if chunk is None:
+                            continue
+                        accumulated += text_delta
+                        if tool_call_delta:
+                            tool_calls.append(dict(event.payload))
+                            tool_index += 1
+                        yield _sse(chunk)
             if ownership_lost.is_set():
                 raise LLMError("Proxy stream ownership is no longer current")
         except BaseException as exc:
@@ -517,7 +735,10 @@ class OpenAIProxyService:
             if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
                 raise
             logger.exception("OpenAI-compatible proxy stream failed after emission")
-            yield _sse_error("Upstream stream failed")
+            yield _sse_error(
+                "Upstream stream failed",
+                code=ProxyStreamErrorCode.UPSTREAM_STREAM_FAILED,
+            )
             return
         finish_reason = normalize_completion_finish_reason(
             finish_reason,
@@ -545,13 +766,46 @@ class OpenAIProxyService:
                 claim=claim,
                 response=transcript_response,
                 job_plan=job_plan,
+                # Snapshotted here, after the provider stream was drained above:
+                # LLMClient records a streamed call only once its iterator is
+                # exhausted, so this is the first point where the meter holds the
+                # reply round-trip as well as the retrieval ones.
+                turn_telemetry=self._turn_telemetry(
+                    prepared=prepared,
+                    claim=claim,
+                    context_attempt=context_attempt,
+                    meter=meter,
+                    surface=TurnSurface.PROXY_STREAM,
+                    turn_started_at=turn_started_at,
+                ),
             )
         except BaseException as exc:
+            # DOCUMENTED EXCEPTION to this changeset's fail-fast rule: a failing
+            # telemetry write aborts the turn everywhere else, but not here.
+            # Emission already began -- the 200 and the response headers went out
+            # with the first SSE chunk -- so there is no status code left to
+            # change, and raising would only tear the connection down with no
+            # diagnostic for the client. Nothing is half-written either: the
+            # telemetry write lives inside finalize_proxy_turn's terminal
+            # transaction, so it rolls back together with the response row, the
+            # durable jobs and the completion, and the claim is marked ambiguous
+            # above. The turn is therefore reported as failed to the client and
+            # left uncommitted in the database, which is the same outcome the
+            # fail-fast rule produces on every other surface.
+            #
+            # The run state alone cannot tell a host WHICH of the two exposed
+            # failures happened -- an upstream stream failure lands in exactly
+            # the same 'ambiguous_exposed' state -- so the SSE payload carries a
+            # distinct code. See ProxyStreamErrorCode for why the distinction
+            # changes what a host should do next.
             await self._mark_ambiguous_best_effort(claim, exc)
             if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
                 raise
             logger.exception("OpenAI-compatible proxy terminal stream commit failed")
-            yield _sse_error("Stream completion could not be committed")
+            yield _sse_error(
+                "Stream completion could not be committed",
+                code=ProxyStreamErrorCode.STREAM_COMMIT_FAILED,
+            )
             return
         await self._dispatch_terminal_jobs_best_effort(durable_jobs)
         yield _sse(
@@ -976,6 +1230,78 @@ class OpenAIProxyService:
             occurred_at=response_occurred_at,
         )
 
+    def _turn_telemetry(
+        self,
+        *,
+        prepared: PreparedProxyTurn,
+        claim: ProxyTurnClaim,
+        context_attempt: ProxyContextAttempt,
+        meter: LLMCallMeter,
+        surface: TurnSurface,
+        turn_started_at: float,
+    ) -> ProxyTurnTelemetry:
+        """Describe one proxy turn for the fenced terminal commit.
+
+        A proxy turn's retrieval already wrote a retrieval event through the
+        sidecar, so the normal case completes that row. When memory context
+        failed open there is no such row, and the turn still has to be counted:
+        the fallback event carries the same turn measurements with an empty
+        retrieval plan and context view, which reads exactly as "this turn ran
+        without retrieval".
+
+        A fail-open reports the time the attempt actually took, not 0.0: the
+        meter was bound before it, so its provider round-trips are already in
+        the call counters and a zero here would describe a turn that spent
+        seconds in retrieval as having spent none.
+
+        ``turn_to_event_write_wall_ms`` is only provisional here:
+        ``turn_started_at`` rides along so the fenced writer can re-measure at
+        the instant it writes the row, which is what every other surface means
+        by that column.
+        """
+        identity = prepared.identity
+        context = context_attempt.context
+        telemetry = build_turn_telemetry(
+            surface=surface,
+            meter=meter,
+            turn_to_event_write_wall_ms=(perf_counter() - turn_started_at) * 1000.0,
+            retrieval_duration_ms=(
+                context_attempt.elapsed_ms
+                if context is None
+                else float(context.retrieval_duration_ms)
+            ),
+            stage_timings_ms={} if context is None else dict(context.stage_timings_ms),
+        )
+        return ProxyTurnTelemetry(
+            telemetry=telemetry,
+            turn_started_at=turn_started_at,
+            retrieval_event_id=(
+                None if context is None else context.retrieval_event_id
+            ),
+            fallback_event={
+                "user_id": claim.user_id,
+                "conversation_id": claim.conversation_id,
+                "request_message_id": claim.request_message_id,
+                "assistant_mode_id": identity.assistant_mode_id,
+                "user_persona_id": identity.user_persona_id,
+                "platform_id": identity.platform_id or "default",
+                "character_id": identity.character_id or identity.workspace_id,
+                "mode": identity.mode,
+                "incognito": bool(identity.incognito),
+                "retrieval_plan_json": {},
+                "selected_memory_ids_json": [],
+                "context_view_json": {},
+                "outcome_json": {
+                    "memory_context_available": False,
+                    # A failed-open turn still made provider calls, so the row
+                    # carries the same call metrics as any other proxy turn.
+                    "llm_call_metrics": telemetry.llm_call_metrics().model_dump(
+                        mode="json"
+                    ),
+                },
+            },
+        )
+
     async def _abandon_pre_emission_best_effort(
         self,
         claim: ProxyTurnClaim,
@@ -995,6 +1321,44 @@ class OpenAIProxyService:
         finally:
             if connection is not None:
                 await connection.close()
+
+    async def _abandon_exposed_stream(
+        self,
+        *,
+        claim: ProxyTurnClaim,
+        stream: AsyncIterator[LLMStreamEvent],
+    ) -> None:
+        """Close an exposed turn's round-trip and resolve its claim, idempotently.
+
+        Runs on the teardown of EVERY streamed turn, not only on abandoned ones,
+        because the body cannot be trusted to have finished its own: a body
+        cancelled inside ``__anext__`` is terminated mid-teardown, with its
+        provider close and its claim resolution both interrupted, and from
+        outside it is indistinguishable from one that ran to exhaustion. See
+        ``_ProxyStreamBody`` for why that distinction is unrecoverable out here.
+
+        Same two steps the body performs on a disconnect, in the same order:
+        close the provider round-trip first so its cancellation is recorded, then
+        resolve the claim. AMBIGUOUS rather than abandoned, because emission was
+        already marked started before this body existed -- the turn committed to
+        exposing this reply and cannot prove nothing reached the client.
+
+        Both steps no-op when the body already did them, and when it completed
+        the turn instead: ``aclose`` on a closed generator runs no code, and
+        ``mark_ambiguous_exposed`` is fenced on ``state='emission_started'`` plus
+        this claim's owner token and fence, so it matches no row on a turn that
+        reached ``completed`` or was already resolved. That is what makes running
+        it unconditionally safe.
+        """
+        try:
+            await stream.aclose()
+        finally:
+            await self._mark_ambiguous_best_effort(
+                claim,
+                RuntimeError(
+                    "Proxy stream body was dropped before it emitted any chunk"
+                ),
+            )
 
     async def _mark_ambiguous_best_effort(
         self,
@@ -1051,9 +1415,18 @@ class OpenAIProxyService:
         *,
         message_metadata: dict[str, Any],
         prompt_authority_context: PromptAuthorityContext | None = None,
-    ) -> Any | None:
+    ) -> ProxyContextAttempt:
+        """Fetch memory context, returning what it cost even when it fails open.
+
+        A fail-open is NOT a free turn: the meter is already bound when this
+        runs, so retrieval round-trips made before the failure are counted on
+        the turn. Reporting retrieval_duration_ms 0.0 for those turns claimed
+        the opposite, so the elapsed time is measured here and travels with the
+        outcome instead of being discarded at the ``return None``.
+        """
+        started_at = perf_counter()
         try:
-            return await SidecarService(self.runtime).get_context(
+            context = await SidecarService(self.runtime).get_context(
                 user_id=identity.user_id,
                 conversation_id=identity.conversation_id,
                 message=input_projection.text,
@@ -1091,7 +1464,10 @@ class OpenAIProxyService:
                     "OpenAI-compatible proxy memory context failed; continuing without Atagia context",
                     exc_info=True,
                 )
-                return None
+                return ProxyContextAttempt(
+                    context=None,
+                    elapsed_ms=(perf_counter() - started_at) * 1000.0,
+                )
             logger.exception("OpenAI-compatible proxy memory context failed internally")
             raise OpenAIProxyProtocolError(
                 500,
@@ -1099,6 +1475,10 @@ class OpenAIProxyService:
                 error_type="server_error",
                 code="memory_context_internal_error",
             ) from exc
+        return ProxyContextAttempt(
+            context=context,
+            elapsed_ms=(perf_counter() - started_at) * 1000.0,
+        )
 
     def _resolve_identity(
         self,
@@ -1330,7 +1710,7 @@ class OpenAIProxyService:
     def _llm_request(
         self,
         request: OpenAIChatCompletionRequest,
-        context: Any,
+        context: ContextResult | None,
         identity: OpenAIProxyIdentity,
     ) -> LLMCompletionRequest:
         upstream_model = (
@@ -1754,6 +2134,15 @@ async def _prepend_stream_event(
     first_event: LLMStreamEvent,
     stream: AsyncIterator[LLMStreamEvent],
 ) -> AsyncIterator[LLMStreamEvent]:
+    """Re-attach the event that was pulled to prove the stream had output.
+
+    DOES NOT OWN ``stream``, deliberately. Ownership expressed inside an async
+    generator only exists once that generator's body has started, and this one is
+    created at a point its consumer may never reach -- so an `aclosing` here
+    would read like a guarantee while closing nothing. The single owner is the
+    `aclosing(stream)` in ``_stream_response_owned``, which wraps a generator
+    that has ALREADY produced an event and therefore always has a frame to close.
+    """
     yield first_event
     async for event in stream:
         yield event
@@ -1814,12 +2203,43 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _sse_error(message: str) -> str:
+class ProxyStreamErrorCode(StrEnum):
+    """Machine-readable cause carried by an in-band SSE error.
+
+    Once a chunk has gone out the status code is spent, so the cause has to
+    travel in the payload. The two causes below leave the SAME database state --
+    the run is ``ambiguous_exposed`` and the turn is never committed -- but they
+    are not the same event, and a single shared error type would make them
+    indistinguishable to the host that has to decide what to do next:
+
+    * ``UPSTREAM_STREAM_FAILED`` -- the provider died mid-answer. Nothing
+      complete was ever produced; retrying re-attempts a generation that failed.
+    * ``STREAM_COMMIT_FAILED`` -- the answer WAS produced and the user already
+      read it; Atagia then failed to persist the turn. Retrying this one shows
+      the user a second answer to a question they have already been answered,
+      and the memory side of the turn is missing either way.
+    """
+
+    UPSTREAM_STREAM_FAILED = "upstream_stream_failed"
+    STREAM_COMMIT_FAILED = "stream_commit_failed"
+
+
+# OpenAI clients branch on ``error.type``, so the two causes carry different
+# types as well as different codes. Missing an entry here is a KeyError at the
+# yield site rather than a silently generic error on the wire.
+_PROXY_STREAM_ERROR_TYPES: dict[ProxyStreamErrorCode, str] = {
+    ProxyStreamErrorCode.UPSTREAM_STREAM_FAILED: "atagia_upstream_stream_error",
+    ProxyStreamErrorCode.STREAM_COMMIT_FAILED: "atagia_stream_commit_error",
+}
+
+
+def _sse_error(message: str, *, code: ProxyStreamErrorCode) -> str:
     return _sse(
         {
             "error": {
                 "message": message,
-                "type": "atagia_upstream_stream_error",
+                "type": _PROXY_STREAM_ERROR_TYPES[code],
+                "code": code.value,
             }
         }
     )

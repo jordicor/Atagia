@@ -53,6 +53,7 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.retrieval_pipeline import RetrievalPipeline
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -111,7 +112,8 @@ class GateProvider(LLMProvider):
         if purpose.startswith("need_detection_") and purpose.endswith("_card"):
             output = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": self._memory_dependence or "mixed",
                 "need_detection_exact_card": (
                     "yes" if self._exact_recall_needed else "no"
@@ -219,6 +221,7 @@ async def _build_runtime(
         embedding_index=NoneBackend(),
         clock=clock,
         settings=_settings(),
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
     )
     manifest = ManifestLoader(MANIFESTS_DIR).load_all()[mode_id]
     resolved_policy = PolicyResolver().resolve(manifest, None, None)
@@ -336,6 +339,14 @@ async def test_gate_on_world_skips_expensive_retrieval_stages(
         # Real need-detection trace survives.
         assert trace.need_detection is not None
         assert trace.need_detection.degraded_mode is False
+        assert trace.candidate_search is not None
+        base_executions = [
+            execution
+            for count in trace.candidate_search.per_subquery_counts
+            for execution in count.fts_query_executions
+        ]
+        assert any("mem_1" in execution.raw_row_ids for execution in base_executions)
+        assert all(execution.candidates == 0 for execution in base_executions)
 
         # The gate emits exactly one INFO line documenting the skip with the
         # world classification and the discarded-base-candidate count (the

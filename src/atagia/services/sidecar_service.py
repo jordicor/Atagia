@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Iterable
 
 import aiosqlite
@@ -21,6 +22,7 @@ from atagia.core.repositories import (
 from atagia.core.initial_context_package_repository import (
     InitialContextPackageRepository,
 )
+from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.job_run_repository import JobRunRepository
 from atagia.core.embodiment_repository import EmbodimentRepository, embodiment_snapshot
 from atagia.core.mind_repository import MindRepository, mind_snapshot
@@ -38,7 +40,10 @@ from atagia.core.transcript_rebuild_repository import (
     TranscriptRebuildRepository,
     UserAvailabilitySnapshot,
 )
-from atagia.memory.context_envelope import allocate_context_envelope_budget
+from atagia.memory.context_envelope import (
+    allocate_context_envelope_budget,
+    effective_budget_under_envelope,
+)
 from atagia.memory.lifecycle_runner import (
     request_lifecycle_piggyback,
 )
@@ -50,6 +55,7 @@ from atagia.models.schemas_memory import (
     MemoryPrivacyMode,
     MindTopology,
     ResponseMode,
+    TurnSurface,
     resolve_confirmation_strategy,
     resolve_memory_privacy_mode,
 )
@@ -63,6 +69,7 @@ from atagia.services.chat_support import (
     build_response_language_guidance,
     build_message_jobs,
     build_system_prompt,
+    build_turn_telemetry,
     enqueue_message_jobs,
     filter_topic_working_set_snapshot,
     render_assistant_guidance_block,
@@ -221,9 +228,24 @@ class SidecarService:
         )
         cache_service = ContextCacheService(self.runtime)
         await self._ensure_user_exists_before_cache_guard(user_id)
+        # Same two clocks as the chat surface. The TURN clock starts BEFORE the
+        # per-user cache guard, which is held for a whole turn and blocks a
+        # same-user follow-up for up to CACHE_GUARD_ACQUIRE_TIMEOUT_SECONDS:
+        # queueing behind another turn is time the caller waits, so it belongs
+        # inside turn_to_event_write_wall_ms, and starting after the guard hid
+        # contention entirely. The RETRIEVAL clock keeps its own, tighter origin at the
+        # resolve call site below, because lock wait is not retrieval work --
+        # one origin for both would report a turn that spent 380ms queueing as
+        # 380ms of retrieval.
+        turn_started_at = perf_counter()
         async with cache_service.user_cache_guard(user_id):
             await wait_for_in_memory_worker_quiescence(self.runtime)
             connection = await self.runtime.open_connection()
+            # Retrieval-scope LLM call meter. Meters nest, so when a proxy turn
+            # has already bound its own turn meter this one measures the
+            # retrieval slice while the proxy's keeps counting the whole turn.
+            retrieval_call_meter = self.runtime.llm_client.begin_turn_call_meter()
+            retrieval_duration_ms = 0.0
             try:
                 await self.ensure_user_exists(connection, user_id)
                 conversation = await self.ensure_conversation(
@@ -305,6 +327,11 @@ class SidecarService:
                     source_seq=resolved_source_seq,
                     existing_message=existing_user_message,
                 )
+                # Retrieval wall time is measured at the call site rather than
+                # read off the pipeline trace: a cache hit never enters the
+                # pipeline yet still costs a lookup plus a staleness decision,
+                # and that cost has to appear in the persisted number.
+                retrieval_started_at = perf_counter()
                 if resolved_response_mode is ResponseMode.NORMAL:
                     resolution = await cache_service.resolve_with_connection(
                         connection,
@@ -335,6 +362,9 @@ class SidecarService:
                         ablation=ablation,
                         prompt_authority_context=authority_context,
                     )
+                retrieval_duration_ms = (
+                    perf_counter() - retrieval_started_at
+                ) * 1000.0
                 topic_snapshot = await self._topic_snapshot(
                     connection,
                     user_id=user_id,
@@ -421,11 +451,93 @@ class SidecarService:
                                 message_id=str(user_message["id"]),
                                 commit=False,
                             )
+                    # A retrieval ran and produced a context view, so it gets a
+                    # retrieval event exactly like a chat turn does. Hosts that
+                    # call get_context own the reply, so the LLM counters cover
+                    # Atagia's retrieval calls only; the proxy upgrades this row
+                    # to full-turn telemetry when its reply lands.
+                    #
+                    # The write follows the message write above: a retry with the
+                    # same message_id overwrites this turn's row with the newest
+                    # measurement instead of adding a second one, so the ledger
+                    # stays retry-safe exactly like the message table.
+                    context_telemetry = build_turn_telemetry(
+                        surface=TurnSurface.CONTEXT,
+                        meter=retrieval_call_meter,
+                        turn_to_event_write_wall_ms=(
+                            perf_counter() - turn_started_at
+                        ) * 1000.0,
+                        retrieval_duration_ms=retrieval_duration_ms,
+                        stage_timings_ms=resolution.stage_timings,
+                    )
+                    # The same metrics the typed columns carry also go into the
+                    # trace: a reader of outcome_json must not see a null call
+                    # count on a row whose retrieval demonstrably made calls.
+                    context_llm_call_metrics = (
+                        context_telemetry.llm_call_metrics().model_dump(mode="json")
+                    )
+                    if resolution.retrieval_trace is not None:
+                        resolution.retrieval_trace["llm_call_metrics"] = (
+                            context_llm_call_metrics
+                        )
+                    retrieval_event = await RetrievalEventRepository(
+                        connection,
+                        self.runtime.clock,
+                    ).upsert_context_event(
+                        {
+                            "user_id": user_id,
+                            "conversation_id": str(conversation["id"]),
+                            "request_message_id": user_message["id"],
+                            "assistant_mode_id": (
+                                resolution.resolved_policy.profile_id.value
+                            ),
+                            "user_persona_id": conversation.get("user_persona_id"),
+                            "platform_id": conversation.get("platform_id") or "default",
+                            "character_id": conversation.get("character_id")
+                            or conversation.get("workspace_id"),
+                            "mode": conversation.get("mode")
+                            or resolution.resolved_policy.profile_id.value,
+                            "incognito": bool(conversation.get("incognito"))
+                            or bool(conversation.get("isolated_mode")),
+                            "remember_across_chats": bool(
+                                memory_preferences["remember_across_chats"]
+                            ),
+                            "remember_across_devices": bool(
+                                memory_preferences["remember_across_devices"]
+                            ),
+                            "retrieval_plan_json": resolution.source_retrieval_plan,
+                            "selected_memory_ids_json": (
+                                resolution.composed_context.selected_memory_ids
+                            ),
+                            "context_view_json": resolution.composed_context.model_dump(
+                                mode="json"
+                            ),
+                            "outcome_json": {
+                                "llm_call_metrics": context_llm_call_metrics,
+                                "response_mode": resolved_response_mode.value,
+                                "adaptive_retrieval": resolved_adaptive_retrieval,
+                                "from_cache": resolution.from_cache,
+                                "cache_key": resolution.cache_key,
+                                "cache_source": resolution.cache_source,
+                                "cache_age_seconds": resolution.cache_age_seconds,
+                                "staleness": resolution.staleness,
+                                "need_detection_skipped": (
+                                    resolution.need_detection_skipped
+                                ),
+                                "detected_needs": resolution.detected_needs,
+                                "retrieval_trace": resolution.retrieval_trace,
+                                "stage_timings_ms": resolution.stage_timings,
+                            },
+                        },
+                        telemetry=context_telemetry,
+                        commit=False,
+                    )
                     await connection.commit()
                 except BaseException:
                     await connection.rollback()
                     raise
             finally:
+                self.runtime.llm_client.end_turn_call_meter(retrieval_call_meter)
                 await connection.close()
             await cache_service.publish_pending_cache_entry(
                 resolution,
@@ -475,8 +587,21 @@ class SidecarService:
             resolution.source_retrieval_plan.get("raw_context_access_mode", "normal")
         )
         if not self.runtime.settings.benchmark_disable_raw_recent_transcript:
-            recent_transcript_budget_tokens = (
-                context_envelope_budget.recent_transcript_budget_tokens
+            recent_transcript_budget_tokens = effective_budget_under_envelope(
+                knob="transcript_budget_tokens",
+                policy_budget_tokens=(
+                    resolution.resolved_policy.transcript_budget_tokens
+                ),
+                envelope_budget_tokens=(
+                    context_envelope_budget.recent_transcript_budget_tokens
+                ),
+                override_budget_tokens=(
+                    None
+                    if ablation is None
+                    else (ablation.override_retrieval_params or {}).get(
+                        "transcript_budget_tokens"
+                    )
+                ),
             )
             recent_transcript_budget_initial_tokens = recent_transcript_budget_tokens
             recent_transcript = build_recent_transcript_window(
@@ -686,7 +811,8 @@ class SidecarService:
             memories=resolution.memory_summaries,
             contract=resolution.current_contract,
             detected_needs=resolution.detected_needs,
-            stage_timings=resolution.stage_timings,
+            stage_timings_ms=resolution.stage_timings,
+            retrieval_duration_ms=retrieval_duration_ms,
             from_cache=resolution.from_cache,
             staleness=resolution.staleness,
             next_refresh_strategy=resolution.next_refresh_strategy,
@@ -697,6 +823,7 @@ class SidecarService:
             adaptive_retrieval=resolved_adaptive_retrieval,
             memory_processing=memory_processing,
             request_message_id=str(user_message["id"]),
+            retrieval_event_id=str(retrieval_event["id"]),
             initial_context_package=initial_context_package.diagnostics,
         )
         return result

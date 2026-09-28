@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -18,6 +20,7 @@ from atagia.core.language_codes import (
     normalize_iso_639_1_code,
     normalize_optional_iso_639_1_code,
 )
+from atagia.core.text_utils import strip_card_output_wrappers
 from atagia.memory.card_prompt import compose_card_prompt
 from atagia.models.schemas_memory import (
     ExplicitLanguageAbility,
@@ -47,6 +50,7 @@ CardName = Literal["observed", "preference", "ability", "norm"]
 
 USER_LANGUAGE_PROFILE_CARD_CONCURRENCY = 2
 USER_LANGUAGE_PROFILE_CARD_TEMPERATURE = 0.2
+USER_LANGUAGE_PROFILE_CARD_RESULT_LIMIT = 64
 
 _CARD_NAMES: tuple[CardName, ...] = ("observed", "preference", "ability", "norm")
 _CARD_PURPOSES: dict[CardName, str] = {
@@ -224,6 +228,7 @@ class UserCommunicationProfileService:
         self._include_examples = examples_enabled_for_component(
             resolved_settings, "extractor"
         )
+        self._card_results: OrderedDict[str, _UserLanguageProfileUpdate] = OrderedDict()
 
     async def update_from_message(
         self,
@@ -360,10 +365,25 @@ class UserCommunicationProfileService:
                 ),
             },
         )
+        # The effective request includes the card prompt, model, user, and authority
+        # metadata. Reuse only its classification; each message still merges its
+        # own timestamp and source reference into the current profile.
+        request_key = hashlib.sha256(
+            request.model_dump_json().encode("utf-8")
+        ).hexdigest()
+        cached_update = self._card_results.get(request_key)
+        if cached_update is not None:
+            self._card_results.move_to_end(request_key)
+            return _LanguageProfileCardResult(card_name=card_name, update=cached_update)
         response = await self._llm_client.complete(request)
+        update, complete = _parse_card_output(card_name, response.output_text)
+        if complete:
+            self._card_results[request_key] = update
+            if len(self._card_results) > USER_LANGUAGE_PROFILE_CARD_RESULT_LIMIT:
+                self._card_results.popitem(last=False)
         return _LanguageProfileCardResult(
             card_name=card_name,
-            update=_parse_card_output(card_name, response.output_text),
+            update=update,
         )
 
     @staticmethod
@@ -687,36 +707,41 @@ def _card_prompt(
     return instruction, examples
 
 
-def _parse_card_output(card_name: CardName, text: str) -> _UserLanguageProfileUpdate:
+def _parse_card_output(
+    card_name: CardName, text: str
+) -> tuple[_UserLanguageProfileUpdate, bool]:
     stripped = (
-        text.strip()
+        strip_card_output_wrappers(text)
         .replace("<TAB>", " ")
         .replace("<tab>", " ")
         .replace("\\t", " ")
         .replace("\t", " ")
     )
     if not stripped:
-        return _UserLanguageProfileUpdate()
+        return _UserLanguageProfileUpdate(), False
     lines = [line.strip() for line in stripped.splitlines() if line.strip()]
     if len(lines) == 1 and "," in lines[0]:
         lines = [piece.strip() for piece in lines[0].split(",") if piece.strip()]
     if any(_clean_token(line) == "none" for line in lines):
-        return _UserLanguageProfileUpdate()
+        return _UserLanguageProfileUpdate(), len(lines) == 1
     if card_name == "observed":
+        language_codes, complete = _language_codes_from_text(stripped)
         return _UserLanguageProfileUpdate(
             observed_user_languages=[
                 _ObservedLanguageDraft(
                     language_code=code,
                     confidence=_DRAFT_CONFIDENCE,
                 )
-                for code in _dedupe(_language_codes_from_text(stripped))
+                for code in _dedupe(language_codes)
             ]
-        )
+        ), complete
     if card_name == "preference":
         rows: list[_PreferenceDraft] = []
+        complete = True
         for line in lines:
             tokens = _line_tokens(line)
-            if len(tokens) < 2:
+            if not 2 <= len(tokens) <= 3:
+                complete = False
                 continue
             kind = tokens[0]
             language = _language_code_or_none(tokens[1])
@@ -732,12 +757,16 @@ def _parse_card_output(card_name: CardName, text: str) -> _UserLanguageProfileUp
                         confidence=_DRAFT_CONFIDENCE,
                     )
                 )
-        return _UserLanguageProfileUpdate(explicit_language_preferences=_dedupe(rows))
+            else:
+                complete = False
+        return _UserLanguageProfileUpdate(explicit_language_preferences=_dedupe(rows)), complete
     if card_name == "ability":
         rows: list[_AbilityDraft] = []
+        complete = True
         for line in lines:
             tokens = _line_tokens(line)
-            if len(tokens) < 2:
+            if len(tokens) != 2:
+                complete = False
                 continue
             kind = tokens[0]
             language = _language_code_or_none(tokens[1])
@@ -749,11 +778,15 @@ def _parse_card_output(card_name: CardName, text: str) -> _UserLanguageProfileUp
                         confidence=_DRAFT_CONFIDENCE,
                     )
                 )
-        return _UserLanguageProfileUpdate(explicit_language_abilities=_dedupe(rows))
+            else:
+                complete = False
+        return _UserLanguageProfileUpdate(explicit_language_abilities=_dedupe(rows)), complete
     rows: list[_NormDraft] = []
+    complete = True
     for line in lines:
         tokens = _line_tokens(line)
-        if len(tokens) < 2:
+        if not 2 <= len(tokens) <= 3:
+            complete = False
             continue
         kind = tokens[0]
         language = _language_code_or_none(tokens[1])
@@ -769,7 +802,9 @@ def _parse_card_output(card_name: CardName, text: str) -> _UserLanguageProfileUp
                     confidence=_DRAFT_CONFIDENCE,
                 )
             )
-    return _UserLanguageProfileUpdate(contextual_norms=_dedupe(rows))
+        else:
+            complete = False
+    return _UserLanguageProfileUpdate(contextual_norms=_dedupe(rows)), complete
 
 
 def _merge_card_updates(
@@ -800,23 +835,26 @@ def _line_tokens(line: str) -> list[str]:
 
 
 def _clean_token(value: str) -> str:
-    return value.strip().strip("`*_.,;[](){}\"'").casefold()
+    return strip_card_output_wrappers(value).strip("`*_.,;[](){}\"'").casefold()
 
 
 def _language_code_or_none(value: Any) -> str | None:
     return normalize_optional_iso_639_1_code(value)
 
 
-def _language_codes_from_text(text: str) -> list[str]:
+def _language_codes_from_text(text: str) -> tuple[list[str], bool]:
     normalized = text
     for separator in ("\n", "\t", "|", ",", ";", ":", "/", "\\t", "<TAB>", "<tab>"):
         normalized = normalized.replace(separator, " ")
     codes: list[str] = []
+    complete = True
     for piece in normalized.split():
         code = _language_code_or_none(_clean_token(piece))
         if code is not None:
             codes.append(code)
-    return codes
+        else:
+            complete = False
+    return codes, complete and bool(codes)
 
 
 def _normalize_context_label(value: str) -> str | None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -37,6 +39,8 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.embeddings import EmbeddingIndex
+
+from tests.turn_telemetry_support import sample_turn_telemetry
 from tests.extraction_payload_support import (
     is_memory_extraction_card_purpose,
     memory_extraction_card_output_from_payload,
@@ -78,6 +82,7 @@ class QueueProvider(LLMProvider):
             output_text = memory_extraction_card_output_from_payload(
                 self._active_extraction_payload,
                 purpose,
+                prompt="\n".join(message.content for message in request.messages),
             )
             return LLMCompletionResponse(
                 provider=self.name,
@@ -258,10 +263,12 @@ def test_admin_can_inspect_and_reset_llm_run_guard(tmp_path: Path) -> None:
     with TestClient(app) as client:
         guard = client.app.state.runtime.llm_client.llm_run_guard
         assert guard is not None
-        guard.record_failure(
-            call_type="completion",
+        guarded_call = guard.begin_call(
             purpose="extractor",
             request_model="openai/test-model",
+        )
+        guard.record_failure(
+            guarded_call,
             latency_ms=12.0,
             error_type="TransientLLMError",
         )
@@ -423,7 +430,7 @@ def test_admin_routes_require_admin_key_and_can_inspect_retrieval_event(tmp_path
             client.portal.call(messages.create_message, "msg_1", "cnv_1", "user", 1, "Need help", 2, {})
             client.portal.call(messages.create_message, "msg_2", "cnv_1", "assistant", 2, "Try this", 2, {})
             event = client.portal.call(
-                events.create_event,
+                partial(events.create_event, telemetry=sample_turn_telemetry()),
                 {
                     "user_id": "usr_1",
                     "conversation_id": "cnv_1",
@@ -1036,12 +1043,13 @@ def test_admin_embeddings_backfill_route_returns_counters_and_honors_user_id(tmp
 
 
 class CoverageMembersProvider(LLMProvider):
-    """Provider returning a fixed coverage-members card line."""
+    """Provider returning one membership list and one member identity."""
 
     name = "admin-coverage-members-tests"
 
-    def __init__(self, output_text: str) -> None:
-        self.output_text = output_text
+    def __init__(self, members_output: str, identity_output: str) -> None:
+        self.members_output = members_output
+        self.identity_output = identity_output
         self.requests: list[LLMCompletionRequest] = []
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
@@ -1049,7 +1057,11 @@ class CoverageMembersProvider(LLMProvider):
         return LLMCompletionResponse(
             provider=self.name,
             model=request.model,
-            output_text=self.output_text,
+            output_text=(
+                self.identity_output
+                if request.metadata["purpose"] == "memory_extraction_coverage_member_identity_card"
+                else self.members_output
+            ),
         )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
@@ -1113,7 +1125,8 @@ def test_admin_coverage_backfill_route_rejects_bad_args(tmp_path: Path) -> None:
 def test_admin_coverage_backfill_route_returns_counters_and_honors_user_id(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     provider = CoverageMembersProvider(
-        'cand_001 | [{"member_key": "dr. navarro", "display_text": "Dr. Navarro"}]'
+        '"Dr. Navarro"',
+        "Dr. Navarro",
     )
     with TestClient(app) as client:
         runtime = client.app.state.runtime
@@ -1155,10 +1168,14 @@ def test_admin_coverage_backfill_route_returns_counters_and_honors_user_id(tmp_p
             "delay_ms": 0,
             "user_id": "usr_1",
         }
-        assert len(provider.requests) == 1
+        assert len(provider.requests) == 2
         assert (
             provider.requests[0].metadata["purpose"]
             == "memory_extraction_coverage_members_card"
+        )
+        assert (
+            provider.requests[1].metadata["purpose"]
+            == "memory_extraction_coverage_member_identity_card"
         )
         with _connection(client) as connection:
             memories = MemoryObjectRepository(connection, runtime.clock)

@@ -48,7 +48,7 @@ from atagia.memory.extraction_mapping import (
 )
 from atagia.memory.extraction_cards import extract_lean_with_cards
 from atagia.memory.intent_classifier import (
-    are_claim_keys_equivalent,
+    ClaimKeyEquivalenceSession,
     is_explicit_user_statement,
 )
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
@@ -80,7 +80,6 @@ from atagia.models.schemas_memory import (
     MemoryCategory,
     MemoryEvidencePolarity,
     MemoryEvidenceSpeakerRelation,
-    MemoryEvidenceSpanRole,
     MemoryEvidenceSupportKind,
     MemoryObjectType,
     MemoryPrivacyMode,
@@ -253,6 +252,27 @@ class MemoryExtractor:
             )
         )
         self._extraction_model = resolve_component_model(resolved_settings, "extractor")
+        self._date_resolution_model = resolve_component_model(resolved_settings, "date_resolution")
+        self._extraction_temporal_type_model = resolve_component_model(
+            resolved_settings, "extraction_temporal_type"
+        )
+        self._member_identity_model = resolve_component_model(
+            resolved_settings, "extraction_member_identity"
+        )
+        self._extraction_evidence_model = resolve_component_model(
+            resolved_settings, "extraction_evidence"
+        )
+        self._extraction_classification_models = {
+            "memory_kind": resolve_component_model(resolved_settings, "extraction_kind"),
+            "memory_scope": resolve_component_model(resolved_settings, "extraction_scope"),
+            "memory_confidence": resolve_component_model(resolved_settings, "extraction_confidence"),
+        }
+        self._extraction_evidence_support_model = resolve_component_model(
+            resolved_settings, "extraction_evidence_support"
+        )
+        self._extraction_preserve_verbatim_model = resolve_component_model(
+            resolved_settings, "extraction_preserve_verbatim"
+        )
         self._extraction_include_examples = examples_enabled_for_component(
             resolved_settings, "extractor"
         )
@@ -373,9 +393,16 @@ class MemoryExtractor:
             raise ValueError(
                 "Conversation context source_message_id must belong to the active conversation"
             )
+        if message_text != str(source_message.get("text") or ""):
+            raise ValueError("Extraction text must match the stored source message exactly")
         resolved_occurred_at = resolve_message_occurred_at(
             source_message
         ) or normalize_optional_timestamp(occurred_at)
+        # Ingest freshness starts when the message row was written, not at its
+        # occurred_at: callers may backdate occurred_at to any historical
+        # instant (transcript imports do), which would make the interval to the
+        # memory's created_at meaningless.
+        source_message_created_at = str(source_message["created_at"])
 
         cold_start = await self._is_cold_start(context, resolved_policy)
         chunk_plan = await self._plan_extraction_chunks(
@@ -384,13 +411,16 @@ class MemoryExtractor:
         )
         chunk_extractions = await self._extract_chunk_results(
             chunk_plan=chunk_plan,
+            source_text=message_text,
             role=role,
             context=context,
             resolved_policy=resolved_policy,
             cold_start=cold_start,
             occurred_at=resolved_occurred_at,
         )
-        chunk_extractions = await self._dedupe_chunk_beliefs(chunk_extractions)
+        chunk_extractions = await self._dedupe_chunk_beliefs(
+            chunk_extractions, user_id=context.user_id
+        )
         result = self._merge_chunk_results(chunk_extractions)
         if result.nothing_durable:
             return ExtractionPersistenceDetails(
@@ -417,6 +447,7 @@ class MemoryExtractor:
                 cold_start=cold_start,
                 explicit_user_statement=explicit_user_statement,
                 occurred_at=resolved_occurred_at,
+                source_message_created_at=source_message_created_at,
             )
             (
                 packet_report,
@@ -453,6 +484,7 @@ class MemoryExtractor:
                 cold_start=cold_start,
                 explicit_user_statement=explicit_user_statement,
                 occurred_at=resolved_occurred_at,
+                source_message_created_at=source_message_created_at,
                 chunk=chunk_extraction.chunk,
                 chunked=True,
             )
@@ -482,13 +514,18 @@ class MemoryExtractor:
     async def _dedupe_chunk_beliefs(
         self,
         chunk_extractions: list[_ChunkExtraction],
+        *,
+        user_id: str,
     ) -> list[_ChunkExtraction]:
+        equivalence = ClaimKeyEquivalenceSession(
+            self._llm_client, self._classifier_model, user_id=user_id
+        )
         seen_beliefs: list[ExtractedBelief] = []
         deduped_runs: list[_ChunkExtraction] = []
         for chunk_extraction in chunk_extractions:
             filtered_beliefs: list[ExtractedBelief] = []
             for belief in chunk_extraction.result.beliefs:
-                if await self._is_duplicate_belief(belief, seen_beliefs):
+                if await self._is_duplicate_belief(belief, seen_beliefs, equivalence):
                     continue
                 filtered_beliefs.append(belief)
                 seen_beliefs.append(belief)
@@ -541,6 +578,7 @@ class MemoryExtractor:
         self,
         candidate: ExtractedBelief,
         seen_beliefs: list[ExtractedBelief],
+        equivalence: ClaimKeyEquivalenceSession,
     ) -> bool:
         for existing in seen_beliefs:
             if existing.scope != candidate.scope:
@@ -549,12 +587,7 @@ class MemoryExtractor:
                 continue
             if existing.claim_key == candidate.claim_key:
                 return True
-            if await are_claim_keys_equivalent(
-                self._llm_client,
-                self._classifier_model,
-                existing.claim_key,
-                candidate.claim_key,
-            ):
+            if await equivalence.compare(existing.claim_key, candidate.claim_key):
                 return True
         return False
 
@@ -570,8 +603,12 @@ class MemoryExtractor:
             <= self._chunking_extraction_threshold_tokens
         ):
             normalized = message_text.strip() or message_text
+            char_start = len(message_text) - len(message_text.lstrip()) if normalized.strip() else 0
             return ChunkingPlan(
-                chunks=[TextChunk(text=normalized)],
+                chunks=[TextChunk(
+                    text=normalized, char_start=char_start,
+                    char_end=char_start + len(normalized),
+                )],
                 chunked=False,
                 fallback_count=0,
             )
@@ -591,6 +628,7 @@ class MemoryExtractor:
         self,
         *,
         chunk_plan: ChunkingPlan,
+        source_text: str,
         role: str,
         context: ExtractionConversationContext,
         resolved_policy: ResolvedRetrievalPolicy,
@@ -609,6 +647,8 @@ class MemoryExtractor:
         prior_chunk_context = ""
         chunk_extractions: list[_ChunkExtraction] = []
         for chunk in chunk_plan.chunks:
+            if source_text[chunk.char_start:chunk.char_end] != chunk.text:
+                raise ValueError("Extraction chunks must preserve original source intervals")
             started_at = perf_counter()
             result = await self._complete_card_extraction_with_retry(
                 message_text=chunk.text,
@@ -619,6 +659,17 @@ class MemoryExtractor:
                 prior_chunk_context=prior_chunk_context,
                 source_input_tokens=self._text_chunker.estimate_tokens(chunk.text),
             )
+            for item in (
+                *result.evidences, *result.beliefs,
+                *result.contract_signals, *result.state_updates,
+            ):
+                if item.source_reference is None:
+                    raise ValueError("Extracted memory is missing its source reference")
+                item.source_reference = item.source_reference.rebase(
+                    chunk_text=chunk.text, source_text=source_text,
+                    chunk_start=chunk.char_start,
+                )
+                item.source_quote = item.source_reference.quote(source_text)
             chunk_extractions.append(_ChunkExtraction(chunk=chunk, result=result))
             prior_chunk_context = self._extend_prior_chunk_context(
                 prior_chunk_context, result
@@ -718,6 +769,13 @@ class MemoryExtractor:
         lean_result, repairs = await extract_lean_with_cards(
             llm_client=self._llm_client,
             model=self._extraction_model,
+            evidence_model=self._extraction_evidence_model,
+            temporal_type_model=self._extraction_temporal_type_model,
+            date_model=self._date_resolution_model,
+            classification_models=self._extraction_classification_models,
+            member_identity_model=self._member_identity_model,
+            support_model=self._extraction_evidence_support_model,
+            preserve_model=self._extraction_preserve_verbatim_model,
             message_text=message_text,
             role=role,
             context=context,
@@ -833,6 +891,7 @@ class MemoryExtractor:
         cold_start: bool,
         explicit_user_statement: bool,
         occurred_at: str | None = None,
+        source_message_created_at: str | None = None,
         chunk: TextChunk | None = None,
         chunked: bool = False,
         commit: bool = True,
@@ -1054,7 +1113,6 @@ class MemoryExtractor:
                         item=item,
                         memory_id=str(merged["id"]),
                         context=context,
-                        message_text=message_text,
                         commit=False,
                     )
                     await self._maybe_project_fact_facet(
@@ -1123,6 +1181,7 @@ class MemoryExtractor:
                         payload["level1_attempts"] = chunk.level1_attempts
                 payload["extraction_hash"] = extraction_hash
                 payload["source_message_ids"] = [context.source_message_id]
+                payload["source_occurred_at"] = occurred_at
                 if occurred_at is not None:
                     payload["source_message_window_start_occurred_at"] = occurred_at
                     payload["source_message_window_end_occurred_at"] = occurred_at
@@ -1195,6 +1254,7 @@ class MemoryExtractor:
                     source_mind_id=context.source_mind_id or context.active_mind_id,
                     embodiment_id=context.active_embodiment_id,
                     realm_id=context.active_realm_id,
+                    source_message_created_at=source_message_created_at,
                     commit=False,
                 )
                 if isinstance(item, ExtractedBelief) and was_created:
@@ -1237,7 +1297,6 @@ class MemoryExtractor:
                     item=item,
                     memory_id=str(created["id"]),
                     context=context,
-                    message_text=message_text,
                     commit=False,
                 )
                 await self._maybe_project_fact_facet(
@@ -1391,7 +1450,6 @@ class MemoryExtractor:
         item: ExtractedMemoryBase,
         memory_id: str,
         context: ExtractionConversationContext,
-        message_text: str,
         commit: bool,
     ) -> dict[str, Any] | None:
         support_kind = item.support_kind or MemoryEvidenceSupportKind.DIRECT
@@ -1399,19 +1457,16 @@ class MemoryExtractor:
         speaker_relation = (
             item.speaker_relation_to_subject or MemoryEvidenceSpeakerRelation.UNKNOWN
         )
-        trigger_spans = self._trigger_evidence_spans(item, context)
+        recent_ids = {message.id for message in context.recent_messages}
+        trigger_ids = [value for value in item.trigger_message_ids if value in recent_ids]
         if (
             support_kind is MemoryEvidenceSupportKind.CONTEXTUAL_DIRECT
-            and not trigger_spans
+            and not trigger_ids
         ):
             support_kind = MemoryEvidenceSupportKind.WEAK_SIGNAL
 
-        source_quote = item.source_quote or message_text
-        trigger_quote_by_message_id = {
-            str(span["message_id"]): str(span["quote_text"])
-            for span in trigger_spans
-            if span.get("message_id") and span.get("quote_text")
-        }
+        if item.source_reference is None:
+            raise ValueError("Extracted memory is missing its source reference")
         return await self._memory_provenance_writer.create_packet_from_source_messages(
             user_id=context.user_id,
             memory_id=memory_id,
@@ -1423,44 +1478,12 @@ class MemoryExtractor:
             confidence=item.confidence,
             confidence_details=item.confidence_details,
             rationale=item.support_rationale,
-            source_quote_by_message_id={context.source_message_id: source_quote},
-            trigger_message_ids=item.trigger_message_ids,
-            trigger_quote_by_message_id=trigger_quote_by_message_id,
+            source_reference_by_message_id={
+                context.source_message_id: item.source_reference,
+            },
+            trigger_message_ids=trigger_ids,
             commit=commit,
         )
-
-    @staticmethod
-    def _trigger_evidence_spans(
-        item: ExtractedMemoryBase,
-        context: ExtractionConversationContext,
-    ) -> list[dict[str, Any]]:
-        recent_by_id = {
-            str(message.id): message
-            for message in context.recent_messages
-            if message.id is not None
-        }
-        spans: list[dict[str, Any]] = []
-        for trigger_id in item.trigger_message_ids:
-            trigger = recent_by_id.get(trigger_id)
-            if trigger is None:
-                continue
-            quote_text = (
-                item.trigger_quote
-                if len(item.trigger_message_ids) == 1 and item.trigger_quote
-                else trigger.content
-            )
-            spans.append(
-                {
-                    "span_role": MemoryEvidenceSpanRole.TRIGGER.value,
-                    "message_id": trigger_id,
-                    "conversation_id": context.conversation_id,
-                    "quote_text": quote_text,
-                    "seq": trigger.seq,
-                    "occurred_at": trigger.occurred_at,
-                    "metadata": {"source": "memory_extractor_recent_context"},
-                }
-            )
-        return spans
 
     async def _run_retrieval_packet_ingest_surfaces(
         self,
@@ -2093,12 +2116,6 @@ class MemoryExtractor:
         anchor = self._parse_temporal_datetime(occurred_at)
         valid_from = self._normalize_temporal_iso(item.valid_from_iso, anchor=anchor)
         valid_to = self._normalize_temporal_iso(item.valid_to_iso, anchor=anchor)
-        if (
-            item.temporal_type == "ephemeral"
-            and valid_from is None
-            and anchor is not None
-        ):
-            valid_from = anchor.isoformat()
         return valid_from, valid_to, item.temporal_type
 
     @staticmethod

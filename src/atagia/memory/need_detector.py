@@ -5,11 +5,20 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import html
+import json
 from typing import Any, Literal
 
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.memory.card_prompt import compose_card_prompt
+from atagia.memory.need_choices import (
+    CHOICE_CARD_NAMES,
+    FACET_CHOICES,
+    LANGUAGE_CHOICES,
+    LANGUAGE_DECISIONS,
+    build_need_choice_questions,
+    decode_need_choices,
+)
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.models.schemas_memory import (
     DetectedNeed,
@@ -23,6 +32,7 @@ from atagia.models.schemas_memory import (
     UserCommunicationProfile,
 )
 from atagia.services.llm_client import (
+    ConfigurationError,
     LLMClient,
     LLMCompletionRequest,
     LLMMessage,
@@ -30,6 +40,7 @@ from atagia.services.llm_client import (
 )
 from atagia.services.model_resolution import (
     examples_enabled_for_component,
+    parse_model_spec,
     resolve_component_model,
 )
 from atagia.services.prompt_authority import (
@@ -41,7 +52,8 @@ from atagia.services.prompt_authority import (
 
 NeedCardName = Literal[
     "needs",
-    "language",
+    "query_language",
+    "answer_language",
     "memory",
     "exact",
     "shape",
@@ -53,7 +65,7 @@ NeedCardName = Literal[
 
 _CARD_NAMES: tuple[NeedCardName, ...] = (
     "needs",
-    "language",
+    "query_language",
     "memory",
     "exact",
     "shape",
@@ -64,7 +76,8 @@ _CARD_NAMES: tuple[NeedCardName, ...] = (
 
 _CARD_COMPONENT_IDS: dict[NeedCardName, str] = {
     "needs": "need_detector_needs",
-    "language": "need_detector_language",
+    "query_language": "need_detector_query_language",
+    "answer_language": "need_detector_answer_language",
     "memory": "need_detector_memory",
     "exact": "need_detector_exact",
     "shape": "need_detector_shape",
@@ -76,7 +89,8 @@ _CARD_COMPONENT_IDS: dict[NeedCardName, str] = {
 
 _CARD_PURPOSES: dict[NeedCardName, str] = {
     "needs": "need_detection_needs_card",
-    "language": "need_detection_language_card",
+    "query_language": "need_detection_query_language_card",
+    "answer_language": "need_detection_answer_language_card",
     "memory": "need_detection_memory_card",
     "exact": "need_detection_exact_card",
     "shape": "need_detection_shape_card",
@@ -159,10 +173,18 @@ class NeedDetector:
             )
             for card_name, component_id in _CARD_COMPONENT_IDS.items()
         }
-        self._card_include_examples = {
-            card_name: examples_enabled_for_component(resolved_settings, component_id)
-            for card_name, component_id in _CARD_COMPONENT_IDS.items()
-        }
+        self._card_include_examples = {}
+        for card_name, component_id in _CARD_COMPONENT_IDS.items():
+            example_component_id = component_id
+            # Keep the established language toggle until a card overrides it.
+            if (
+                card_name in LANGUAGE_DECISIONS
+                and component_id not in resolved_settings.llm_component_examples
+            ):
+                example_component_id = "need_detector_language"
+            self._card_include_examples[card_name] = examples_enabled_for_component(
+                resolved_settings, example_component_id,
+            )
 
     async def detect(
         self,
@@ -187,58 +209,79 @@ class NeedDetector:
                 purpose="need_detection",
             )
         )
-        base_calls = await asyncio.gather(
-            *(
-                self._run_card(
-                    card_name=card_name,
-                    message_text=message_text,
-                    role=role,
-                    context=context,
-                    resolved_policy=resolved_policy,
-                    content_language_profile=content_language_profile,
-                    user_communication_profile=user_communication_profile,
-                    prompt_authority_context=authority_context,
+        attempts: dict[NeedCardName, NeedCardCall] = {}
+
+        async def run_card(
+            card_name: NeedCardName,
+            *,
+            query_language: str | None = None,
+            search_words: list[str] | None = None,
+        ) -> NeedCardCall:
+            return await self._run_card(
+                card_name=card_name,
+                message_text=message_text,
+                role=role,
+                context=context,
+                resolved_policy=resolved_policy,
+                content_language_profile=content_language_profile,
+                user_communication_profile=user_communication_profile,
+                prompt_authority_context=authority_context,
+                query_language=query_language,
+                search_words=search_words,
+                card_attempts=attempts,
+            )
+
+        async def run_language_chain() -> None:
+            query_call = await run_card("query_language")
+            if not query_call.parse_valid:
+                raise ValueError(
+                    "query language card failed: "
+                    + (query_call.error or f"invalid output: {query_call.raw_output!r}")
                 )
-                for card_name in _CARD_NAMES
+            answer_call = await run_card(
+                "answer_language", query_language=query_call.parsed["query_language"]
             )
-        )
-        calls = list(base_calls)
-        if _should_run_search_words_other_language(calls, content_language_profile):
-            search_words = _normalize_text_list(
-                _calls_by_card(calls)
-                .get("search_words", NeedCardCall("search_words", ""))
-                .parsed.get("anchor_terms")
-                or []
-            )
-            calls.append(
-                await self._run_card(
-                    card_name="search_words_other_language",
-                    message_text=message_text,
-                    role=role,
-                    context=context,
-                    resolved_policy=resolved_policy,
-                    content_language_profile=content_language_profile,
-                    user_communication_profile=user_communication_profile,
-                    prompt_authority_context=authority_context,
-                    search_words=search_words,
+            if not answer_call.parse_valid:
+                raise ValueError(
+                    "answer language card failed: "
+                    + (answer_call.error or f"invalid output: {answer_call.raw_output!r}")
                 )
+
+        try:
+            try:
+                async with asyncio.TaskGroup() as card_group:
+                    card_group.create_task(run_language_chain())
+                    for card_name in _CARD_NAMES:
+                        if card_name != "query_language":
+                            card_group.create_task(run_card(card_name))
+            except BaseExceptionGroup as card_errors:
+                # TaskGroup cancels and joins outstanding cards before an error
+                # escapes; unwrap the original error type for the caller.
+                raise card_errors.exceptions[0] from None
+
+            calls = [attempts[name] for name in _CARD_NAMES]
+            calls.append(attempts["answer_language"])
+            if _should_run_search_words_other_language(calls, content_language_profile):
+                search_words = _normalize_text_list(
+                    attempts["search_words"].parsed.get("anchor_terms") or []
+                )
+                calls.append(await run_card(
+                    "search_words_other_language", search_words=search_words
+                ))
+            return self._merge_cards(
+                message_text=message_text,
+                context=context,
+                resolved_policy=resolved_policy,
+                content_language_profile=content_language_profile,
+                calls=calls,
             )
-        if card_call_trace_sink is not None:
-            card_call_trace_sink.extend(calls)
-        if all(not call.parse_valid for call in calls):
-            errors = "; ".join(
-                call.error or f"{call.card_name}: invalid output"
-                for call in calls
-            )
-            raise ValueError(f"all need detection cards failed: {errors}")
-        result = self._merge_cards(
-            message_text=message_text,
-            context=context,
-            resolved_policy=resolved_policy,
-            content_language_profile=content_language_profile,
-            calls=list(calls),
-        )
-        return result
+        finally:
+            if card_call_trace_sink is not None:
+                card_call_trace_sink.extend(
+                    attempts[name]
+                    for name in (*_CARD_NAMES, "answer_language", "search_words_other_language")
+                    if name in attempts
+                )
 
     async def _run_card(
         self,
@@ -252,8 +295,17 @@ class NeedDetector:
         user_communication_profile: UserCommunicationProfile | None,
         prompt_authority_context: PromptAuthorityContext,
         search_words: list[str] | None = None,
+        query_language: str | None = None,
+        card_attempts: dict[NeedCardName, NeedCardCall] | None = None,
     ) -> NeedCardCall:
         model = self._card_models[card_name]
+        typed_choice = parse_model_spec(model).provider_slug == "typesafe"
+        if typed_choice and card_name == "needs" and not resolved_policy.need_triggers:
+            # The policy's empty set is authoritative; no inference is needed.
+            call = NeedCardCall(card_name, model, parsed={"needs": []}, parse_valid=True)
+            if card_attempts is not None:
+                card_attempts[card_name] = call
+            return call
         request = self._card_request(
             card_name=card_name,
             model=model,
@@ -265,27 +317,69 @@ class NeedDetector:
             user_communication_profile=user_communication_profile,
             prompt_authority_context=prompt_authority_context,
             search_words=search_words,
+            query_language=query_language,
         )
         card_prompt = request.messages[-1].content
         try:
             response = await self._llm_client.complete(request)
+        except asyncio.CancelledError:
+            if card_attempts is not None:
+                card_attempts[card_name] = NeedCardCall(
+                    card_name=card_name,
+                    model=model,
+                    prompt=card_prompt,
+                    error="CancelledError: card request cancelled",
+                )
+            raise
         except Exception as exc:  # noqa: BLE001
-            return NeedCardCall(
+            call = NeedCardCall(
                 card_name=card_name,
                 model=model,
                 prompt=card_prompt,
                 parse_valid=False,
                 error=f"{exc.__class__.__name__}: {exc}",
             )
-        parsed, valid = _parse_card_output(card_name, response.output_text)
-        return NeedCardCall(
+            if card_attempts is not None:
+                card_attempts[card_name] = call
+            if typed_choice:
+                # A failed typed decision must not silently trigger the
+                # generative card's conservative missing-output defaults.
+                raise
+            return call
+        raw_output = response.output_text
+        try:
+            if typed_choice:
+                parsed = decode_need_choices(
+                    card_name, response.choice_answers, request.choice_questions or {}
+                )
+                valid = True
+                raw_output = json.dumps({
+                    key: answer.model_dump(mode="json")
+                    for key, answer in response.choice_answers.items()
+                })
+            else:
+                parsed, valid = _parse_card_output(card_name, raw_output)
+        except Exception as exc:  # noqa: BLE001
+            if card_attempts is not None:
+                card_attempts[card_name] = NeedCardCall(
+                    card_name=card_name,
+                    model=model,
+                    prompt=card_prompt,
+                    raw_output=raw_output,
+                    error=f"{exc.__class__.__name__}: {exc}",
+                )
+            raise
+        call = NeedCardCall(
             card_name=card_name,
             model=model,
             prompt=card_prompt,
-            raw_output=response.output_text,
+            raw_output=raw_output,
             parsed=parsed,
             parse_valid=valid,
         )
+        if card_attempts is not None:
+            card_attempts[card_name] = call
+        return call
 
     def _card_request(
         self,
@@ -300,8 +394,14 @@ class NeedDetector:
         user_communication_profile: UserCommunicationProfile | None,
         prompt_authority_context: PromptAuthorityContext,
         search_words: list[str] | None = None,
+        query_language: str | None = None,
     ) -> LLMCompletionRequest:
+        typed_choice = parse_model_spec(model).provider_slug == "typesafe"
+        if typed_choice and card_name not in CHOICE_CARD_NAMES:
+            raise ConfigurationError(f"TypeSafe does not support the {card_name} need card")
         instruction, examples, max_output_tokens = _card_task(card_name)
+        if typed_choice and card_name in LANGUAGE_DECISIONS:
+            instruction, examples = LANGUAGE_DECISIONS[card_name], None
         task = compose_card_prompt(
             instruction,
             examples,
@@ -322,6 +422,10 @@ class NeedDetector:
                     content_language_profile=content_language_profile,
                     user_communication_profile=user_communication_profile,
                     clock=self._clock,
+                ),
+                (
+                    f"Known query language: {query_language or 'unknown'}"
+                    if card_name == "answer_language" else ""
                 ),
                 _search_words_block(card_name, search_words),
                 task,
@@ -344,12 +448,20 @@ class NeedDetector:
                 LLMMessage(role="user", content=prompt),
             ],
             max_output_tokens=max_output_tokens,
+            choice_questions=(
+                build_need_choice_questions(
+                    card_name,
+                    enabled_needs={need: _NEED_DESCRIPTIONS[need] for need in resolved_policy.need_triggers},
+                )
+                if typed_choice else None
+            ),
             metadata={
                 "user_id": context.user_id,
                 "conversation_id": context.conversation_id,
                 "assistant_mode_id": context.assistant_mode_id,
                 "purpose": _CARD_PURPOSES[card_name],
                 "need_detection_card": card_name,
+                **({"decision_target": card_name} if card_name in LANGUAGE_DECISIONS else {}),
                 **prompt_authority_metadata(
                     prompt_authority_context,
                     prompt_authority_kind="process_metadata",
@@ -379,8 +491,8 @@ class NeedDetector:
             call = by_card.get(card_name)
             return call.parsed if call is not None and call.parse_valid else {}
 
-        query_language = parsed("language").get("query_language")
-        answer_language = parsed("language").get("answer_language")
+        query_language = parsed("query_language").get("query_language")
+        answer_language = parsed("answer_language").get("answer_language")
         memory_dependence = parsed("memory").get("memory_dependence")
         if memory_dependence not in {item.value for item in MemoryDependence}:
             memory_dependence = MemoryDependence.MIXED.value
@@ -490,7 +602,12 @@ class NeedDetector:
             sparse_query_hints=[
                 {
                     "sub_query_text": original_query,
-                    "fts_phrase": original_query,
+                    # The LLM search words are the best lexical evidence:
+                    # they become the primary FTS clause instead of the raw
+                    # question shape (which drags stopword noise into AND
+                    # queries). Fall back to the raw question when the card
+                    # produced no terms.
+                    "fts_phrase": " ".join(anchor_terms) if anchor_terms else original_query,
                     "must_keep_terms": must_keep_terms,
                 }
             ],
@@ -499,7 +616,9 @@ class NeedDetector:
             anchors=anchors,
             query_type=query_type,
             memory_dependence=MemoryDependence(memory_dependence),
-            retrieval_levels=[0],
+            # Broad/episode-level questions need L1/L2 summaries as retrieval
+            # candidates; narrow lookups stay on L0 facts.
+            retrieval_levels=[0, 1, 2] if query_type == "broad_list" else [0],
             exact_recall_needed=bool(exact_recall_needed),
             exact_facets=exact_facets,
         )
@@ -654,30 +773,27 @@ def _card_task(card_name: NeedCardName) -> tuple[str, str | None, int]:
             "none",
             64,
         )
-    if card_name == "language":
+    if card_name == "query_language":
         return (
-            "Read the user message. Write two language codes.\n\n"
-            "Line 1 = the language of the user message.\n"
-            "Line 2 = the language to answer in.\n\n"
-            "Normally line 1 and line 2 are the same language.\n"
-            "If the user asks to translate into a language, or asks to answer in a different language, "
-            "then line 2 is that language. If the user profile contains an explicit answer-language preference "
-            "that clearly applies, use that for line 2.\n\n"
-            "Use two-letter ISO 639-1 codes. Examples: en, es, fr, de, it, pt, ru, ja, zh.\n\n"
-            "Output only the two codes. One code per line. No spaces. No extra words.",
+            LANGUAGE_DECISIONS[card_name]
+            + " Output only one two-letter ISO 639-1 code, or unknown when no supported code can be determined. No extra words.",
             "User message: Hola, que tal?\n"
-            "es\n"
             "es\n\n"
-            "User message: What time is it?\n"
-            "en\n"
-            "en\n\n"
             "User message: Translate \"house\" to French.\n"
-            "en\n"
-            "fr\n\n"
-            "User message: Answer in English: donde estas?\n"
-            "es\n"
             "en",
-            24,
+            8,
+        )
+    if card_name == "answer_language":
+        return (
+            LANGUAGE_DECISIONS[card_name]
+            + " Output only one two-letter ISO 639-1 code, or unknown when no supported code can be determined. No extra words.",
+            "User message: Translate \"house\" to French.\n"
+            "Known query language: en\n"
+            "fr\n\n"
+            "User message: Where is my package?\n"
+            "Known query language: en\n"
+            "en",
+            8,
         )
     if card_name == "memory":
         return (
@@ -746,17 +862,8 @@ def _card_task(card_name: NeedCardName) -> tuple[str, str | None, int]:
         return (
             "Read the user message. Which kinds of exact saved detail does the answer need? "
             "Pick all that fit, or none if no exact detail is needed.\n\n"
-            "date = a date, day, or time.\n"
-            "phone = a phone number.\n"
-            "email = an email address.\n"
-            "quantity = a number or amount, like a dose, count, price, or size.\n"
-            "location = a place or address.\n"
-            "person = a person's name.\n"
-            "organization = an organization, company, team, or group name.\n"
-            "medication = the name of a medicine or drug.\n"
-            "code = technical text strings: API keys, prefixes, config strings, or software library names.\n"
-            "wording = exact words the user wants kept, like a quote, slogan, or name.\n\n"
-            "Output only the matching tags. Put one tag per line. If nothing fits, write: none",
+            + "".join(f"{tag} = {description}.\n" for tag, (_, description) in FACET_CHOICES.items())
+            + "\nOutput only the matching tags. Put one tag per line. If nothing fits, write: none",
             "What dose of aspirin do I take?\n"
             "quantity\n"
             "medication\n\n"
@@ -849,14 +956,12 @@ def _parse_card_output(card_name: NeedCardName, text: str) -> tuple[dict[str, An
         .replace("<tab>", "\t")
         .replace("\\t", "\t")
     )
-    if card_name == "language":
-        pieces = _language_codes_from_output(stripped)
-        query_language = pieces[0] if len(pieces) >= 1 else ""
-        answer_language = pieces[1] if len(pieces) >= 2 else ""
-        return {
-            "query_language": query_language or None,
-            "answer_language": answer_language or None,
-        }, len(query_language) == 2 and len(answer_language) == 2
+    if card_name in LANGUAGE_DECISIONS:
+        code = stripped.lower()
+        if code == "unknown":
+            return {card_name: None}, True
+        valid = len(stripped) == 2 and stripped.isascii() and code in LANGUAGE_CHOICES
+        return {card_name: code if valid else None}, valid
     if card_name == "needs":
         return _parse_needs(stripped)
     if card_name == "memory":
@@ -1014,7 +1119,7 @@ def _should_run_search_words_other_language(
     search_words = parsed("search_words").get("anchor_terms") or []
     if not search_words:
         return False
-    query_language = parsed("language").get("query_language")
+    query_language = parsed("query_language").get("query_language")
     if not isinstance(query_language, str) or not query_language:
         return False
     target_content_languages = _content_language_codes(content_language_profile)
@@ -1152,34 +1257,6 @@ def _language_code_or_none(value: Any) -> str | None:
     if len(code) == 2 and code.isalpha():
         return code
     return None
-
-
-def _language_codes_from_output(text: str) -> list[str]:
-    normalized = (
-        text.strip()
-        .replace("<TAB>", "\n")
-        .replace("<tab>", "\n")
-        .replace("\\t", "\n")
-        .replace("\t", "\n")
-        .replace("|", "\n")
-    )
-    codes: list[str] = []
-    for line in normalized.splitlines():
-        atoms = [_clean_atom(piece) for piece in line.replace(":", " ").split()]
-        two_letter_atoms = [
-            atom for atom in atoms if len(atom) == 2 and atom.isalpha()
-        ]
-        if two_letter_atoms:
-            codes.append(two_letter_atoms[-1])
-    if len(codes) >= 2:
-        return codes[:2]
-    atoms = [_clean_atom(piece) for piece in normalized.split()]
-    for atom in atoms:
-        if len(atom) == 2 and atom.isalpha():
-            codes.append(atom)
-        if len(codes) == 2:
-            break
-    return codes[:2]
 
 
 def _parse_yes_no(text: str) -> tuple[bool | None, bool]:

@@ -12,7 +12,12 @@ from atagia.memory.context_composer import ContextComposer
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.models.schemas_memory import ScoredCandidate
 from atagia.services.answer_postcondition import _verification_prompt
-from atagia.services.chat_support import answer_support_prompt_payload
+from atagia.services.chat_support import (
+    answer_support_prompt_payload,
+    build_system_prompt,
+    render_answer_support_block,
+)
+from atagia.integrations.prompt_injection import minimal_memory_payload
 
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
 
@@ -1463,12 +1468,12 @@ def test_memory_block_redacts_high_risk_secret_literals() -> None:
         conversation_messages=[],
     )
 
-    assert "privacy_level: 3" in context.memory_block
-    assert "memory_category: pin_or_password" in context.memory_block
-    assert "preserve_verbatim: true" in context.memory_block
-    assert "disclosure_action: withhold_secret_literal" in context.memory_block
     assert "raw value withheld" in context.memory_block
     assert "1234" not in context.memory_block
+    assert "privacy_level" not in context.memory_block
+    assert "memory_category" not in context.memory_block
+    assert "preserve_verbatim" not in context.memory_block
+    assert "disclosure_action" not in context.memory_block
 
 
 def test_answer_evidence_and_verifier_prompt_omit_withheld_secret_literals() -> None:
@@ -1644,17 +1649,12 @@ def test_privacy_off_can_render_high_risk_secret_literals() -> None:
         redact_high_risk_secret_literals=False,
     )
 
-    assert (
-        "privacy_restrictions_inactive: high_risk_secret_literal_unredacted"
-        in context.memory_block
-    )
-    assert "privacy_classification_non_blocking: level_3" in context.memory_block
-    assert "memory_category_non_blocking: pin_or_password" in context.memory_block
-    assert "privacy_level: 3" not in context.memory_block
-    assert "memory_category: pin_or_password" not in context.memory_block
     assert "The account PIN is 1234." in context.memory_block
     assert "raw value withheld" not in context.memory_block
-    assert "disclosure_action: withhold_secret_literal" not in context.memory_block
+    assert "privacy_restrictions_inactive" not in context.memory_block
+    assert "privacy_level" not in context.memory_block
+    assert "memory_category" not in context.memory_block
+    assert "disclosure_action" not in context.memory_block
 
 
 def test_privacy_off_renders_source_quote_for_high_risk_secret() -> None:
@@ -1698,14 +1698,14 @@ def test_privacy_off_renders_source_quote_for_high_risk_secret() -> None:
     assert secret_message_text in context.memory_block
 
 
-def test_privacy_off_renders_source_time_private_text_as_non_blocking_context() -> None:
+def test_privacy_off_renders_source_time_private_text() -> None:
     composer = _composer()
     candidate = _candidate(
         "mem_private",
         final_score=0.91,
         canonical_text=(
-            "Ben is seeing Dr. Reeves for anxiety. He asked at the time "
-            "not to use that information in other contexts."
+            "Keira visits Dr. Elin Frost about tinnitus. She initially requested "
+            "that these visits be discussed only in this chat."
         ),
     )
     candidate.memory_object.update(
@@ -1724,10 +1724,9 @@ def test_privacy_off_renders_source_time_private_text_as_non_blocking_context() 
         redact_high_risk_secret_literals=False,
     )
 
-    assert "privacy_classification_non_blocking: level_3" in context.memory_block
-    assert "memory_category_non_blocking: interaction_contract" in context.memory_block
-    assert "privacy_level: 3" not in context.memory_block
-    assert "Ben is seeing Dr. Reeves for anxiety." in context.memory_block
+    assert "Keira visits Dr. Elin Frost about tinnitus." in context.memory_block
+    assert "privacy_level" not in context.memory_block
+    assert "memory_category" not in context.memory_block
 
 
 def test_budget_exhaustion_keeps_only_top_candidates_that_fit() -> None:
@@ -1946,7 +1945,7 @@ def test_budgeted_marginal_strategy_prefers_higher_value_per_token_set() -> None
     assert "long operational narrative" not in budgeted.memory_block
 
 
-def test_temporal_memory_includes_validity_window_in_rendered_block() -> None:
+def test_temporal_memory_renders_single_date_without_placeholders() -> None:
     composer = _composer()
     context = composer.compose(
         scored_candidates=[
@@ -1977,37 +1976,35 @@ def test_temporal_memory_includes_validity_window_in_rendered_block() -> None:
         conversation_messages=[],
     )
 
-    # Bounded memory shows both dates
-    assert (
-        "valid_window: 2041-05-15T00:00:00+00:00 to 2041-05-31T23:59:59+00:00"
-        in context.memory_block
-    )
-    # Open-ended (only valid_from) shows from-date and ?
-    assert "valid_window: 2023-07-02T00:00:00+00:00 to ?" in context.memory_block
-    # Non-temporal memory has no valid_window segment
+    # A bounded state preserves both established interval endpoints.
+    assert "date: from 2041-05-15T00:00:00+00:00 through 2041-05-31T23:59:59+00:00" in context.memory_block
+    # Open-ended (only valid_from) shows the from-date with no placeholder
+    assert "date: from 2023-07-02T00:00:00+00:00" in context.memory_block
+    assert " to ?" not in context.memory_block
+    # Non-temporal memory has no date segment
     # (verified by making sure the line for mem_no_time does not include the marker)
     lines = context.memory_block.splitlines()
     no_time_line = next(
         line for line in lines if "User prefers direct answers." in line
     )
     no_time_header = lines[lines.index(no_time_line) - 1]
-    assert "valid_window:" not in no_time_header
+    assert "date:" not in no_time_header
 
 
-def test_event_triggered_memory_renders_event_time_before_source_window() -> None:
+def test_event_triggered_memory_preserves_known_interval() -> None:
     composer = _composer()
     context = composer.compose(
         scored_candidates=[
             _candidate(
                 "mem_event",
                 final_score=0.9,
-                canonical_text="Melanie celebrated her daughter's birthday last night with a concert.",
-                valid_from="2023-08-13T00:00:00+00:00",
-                valid_to="2023-08-14T14:24:00+00:00",
+                canonical_text="Zora completed a lino-printing workshop last night.",
+                valid_from="2025-02-08T00:00:00+00:00",
+                valid_to="2025-02-09T09:15:00+00:00",
                 temporal_type="event_triggered",
                 payload_json={
-                    "source_message_window_start_occurred_at": "2023-08-14T14:24:00+00:00",
-                    "source_message_window_end_occurred_at": "2023-08-14T14:24:00+00:00",
+                    "source_message_window_start_occurred_at": "2025-02-09T09:15:00+00:00",
+                    "source_message_window_end_occurred_at": "2025-02-09T09:15:00+00:00",
                 },
             )
         ],
@@ -2018,14 +2015,10 @@ def test_event_triggered_memory_renders_event_time_before_source_window() -> Non
     )
 
     header = context.memory_block.splitlines()[1]
-    assert (
-        "event_time: 2023-08-13T00:00:00+00:00 to 2023-08-14T14:24:00+00:00" in header
-    )
-    assert (
-        "source_window: 2023-08-14T14:24:00+00:00 to 2023-08-14T14:24:00+00:00"
-        in header
-    )
-    assert header.index("event_time:") < header.index("source_window:")
+    # Established interval bounds remain visible instead of a single event date.
+    assert "date: from 2025-02-08T00:00:00+00:00 through 2025-02-09T09:15:00+00:00" in header
+    assert "event_time:" not in header
+    assert "source_window:" not in header
 
 
 def test_resolved_date_is_rendered_in_memory_metadata() -> None:
@@ -2045,7 +2038,7 @@ def test_resolved_date_is_rendered_in_memory_metadata() -> None:
         conversation_messages=[],
     )
 
-    assert "resolved_date: 2024-06-15" in context.memory_block
+    assert "date: 2024-06-15" in context.memory_block
 
 
 def test_exact_recall_memory_includes_source_quote_from_source_message() -> None:
@@ -2082,10 +2075,8 @@ def test_exact_recall_memory_includes_source_quote_from_source_message() -> None
         exact_recall_mode=True,
     )
 
-    assert (
-        "source_window: 2024-02-12T08:40:00+00:00 to 2024-02-12T08:40:00+00:00"
-        in context.memory_block
-    )
+    assert "date: source timestamp: 2024-02-12T08:40:00+00:00" in context.memory_block
+    assert "source_window:" not in context.memory_block
     assert (
         "source_quote: user @ 2024-02-12T08:40:00+00:00 seq 2: "
         "Nia: My observatory access badge expired yesterday"
@@ -2180,9 +2171,9 @@ def test_exact_recall_keeps_compact_source_quote_when_full_quote_exceeds_budget(
 ):
     composer = _composer()
     candidate = _candidate(
-        "mem_job_loss",
+        "mem_telescope_return",
         final_score=0.9,
-        canonical_text="Jon left his banker job to start a business.",
+        canonical_text="Inez returned her rented telescope before joining an astronomy club.",
         payload_json={"source_message_ids": ["msg_1", "msg_2", "msg_3"]},
     )
     source_messages = [
@@ -2190,10 +2181,10 @@ def test_exact_recall_keeps_compact_source_quote_when_full_quote_exceeds_budget(
             "id": f"msg_{index}",
             "role": "user",
             "seq": index,
-            "occurred_at": "2023-01-20T16:04:00+00:00",
+            "occurred_at": "2025-06-18T08:20:00+00:00",
             "text": (
-                "Jon: Lost my job as a banker yesterday, so I'm gonna start my own "
-                "business. This extra wording is deliberately long enough to make "
+                "Inez: I returned the rented telescope yesterday and signed up for an "
+                "astronomy club. This extra wording is deliberately long enough to make "
                 "the full three-message source quote too expensive for this test."
             ),
         }
@@ -2238,7 +2229,7 @@ def test_exact_recall_keeps_compact_source_quote_when_full_quote_exceeds_budget(
     )
 
     assert (
-        "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 1: Jon: Lost my job as a banker yesterday"
+        "source_quote: user @ 2025-06-18T08:20:00+00:00 seq 1: Inez: I returned the rented telescope yesterday"
         in context.memory_block
     )
     assert "seq 2:" not in context.memory_block
@@ -2383,9 +2374,9 @@ def test_default_source_quote_renders_for_non_exact_queries() -> None:
     context = composer.compose(
         scored_candidates=[
             _candidate(
-                "mem_job_loss",
+                "mem_telescope_return",
                 final_score=0.9,
-                canonical_text="Jon is no longer in a secure banker job.",
+                canonical_text="Inez no longer has the rented telescope.",
                 payload_json={"source_message_ids": ["msg_1"]},
             )
         ],
@@ -2397,15 +2388,15 @@ def test_default_source_quote_renders_for_non_exact_queries() -> None:
                 "id": "msg_1",
                 "role": "user",
                 "seq": 4,
-                "occurred_at": "2023-01-20T16:04:00+00:00",
-                "text": "Jon: Lost my job as a banker yesterday.",
+                "occurred_at": "2025-06-18T08:20:00+00:00",
+                "text": "Inez: I returned the rented telescope yesterday.",
             }
         ],
     )
 
-    assert "mem_job_loss" in context.selected_memory_ids
+    assert "mem_telescope_return" in context.selected_memory_ids
     assert (
-        "source_quote: user @ 2023-01-20T16:04:00+00:00 seq 4: Jon: Lost my job as a banker yesterday."
+        "source_quote: user @ 2025-06-18T08:20:00+00:00 seq 4: Inez: I returned the rented telescope yesterday."
         in context.memory_block
     )
 
@@ -2640,7 +2631,7 @@ def test_source_quote_respects_message_raw_inclusion_policy() -> None:
     assert "source_quote:" not in context.memory_block
 
 
-def test_conversation_chunk_summary_includes_source_window_and_excerpt() -> None:
+def test_conversation_chunk_summary_includes_date_and_excerpt() -> None:
     composer = _composer()
     context = composer.compose(
         scored_candidates=[
@@ -2673,10 +2664,8 @@ def test_conversation_chunk_summary_includes_source_window_and_excerpt() -> None
         conversation_messages=[],
     )
 
-    assert (
-        "source_window: 2023-07-03T13:36:00 to 2023-07-03T13:36:00"
-        in context.memory_block
-    )
+    assert "date: source timestamp: 2023-07-03T13:36:00" in context.memory_block
+    assert "source_window:" not in context.memory_block
     assert (
         "source_excerpt: assistant @ 2023-07-03T13:36:00: "
         "Oren: I registered for a paper marbling workshop yesterday."
@@ -2684,7 +2673,7 @@ def test_conversation_chunk_summary_includes_source_window_and_excerpt() -> None
     )
 
 
-def test_verbatim_evidence_search_candidate_includes_source_window() -> None:
+def test_verbatim_evidence_search_candidate_includes_source_date() -> None:
     composer = _composer()
     context = composer.compose(
         scored_candidates=[
@@ -2710,9 +2699,10 @@ def test_verbatim_evidence_search_candidate_includes_source_window() -> None:
     )
 
     assert (
-        "source_window: 2026-04-04T11:00:00+00:00 to 2026-04-04T11:01:00+00:00"
+        "date: source window: 2026-04-04T11:00:00+00:00 to 2026-04-04T11:01:00+00:00"
         in context.memory_block
     )
+    assert "source_window:" not in context.memory_block
 
 
 def test_evidence_obligation_reserves_literal_support_for_source_summary() -> None:
@@ -3634,7 +3624,7 @@ def test_conflicting_fresher_fact_facet_uses_span_coadmission_flag() -> None:
     )
 
     assert "source_span: I now debug by investigating breadth first." in context.memory_block
-    assert "fact_facet_span_coadmitted: true" in context.memory_block
+    assert "fact_facet_span_coadmitted" not in context.memory_block
     assert (
         "fact_facet_pointer: workflow.debugging.style: investigate_breadth_first"
         in context.memory_block
@@ -4255,9 +4245,12 @@ def test_class_capped_hierarchical_pair_co_skips_without_orphan_l0() -> None:
             _candidate(
                 "sum_l1",
                 final_score=0.90,
+                # Sized so the L1 entry exceeds the summary class share left
+                # over after sum_a and sum_b, forcing the class-cap co-skip.
                 canonical_text=(
                     "Vela summarized the port transfer across sessions and its "
-                    "effects on the archive."
+                    "effects on the archive. Vela summarized the port transfer "
+                    "across sessions and its effects on the archive."
                 ),
                 object_type="summary_view",
                 payload_json={
@@ -4867,7 +4860,7 @@ def test_fact_facet_span_coadmission_renders_source_span_as_primary_context() ->
         fact_facet_span_coadmission_enabled=True,
     )
 
-    assert "fact_facet_span_coadmitted: true" in context.memory_block
+    assert "fact_facet_span_coadmitted" not in context.memory_block
     assert (
         "source_span: We need Redis-backed FastAPI rate limiting at The prism crate is in archive bay four.."
         in context.memory_block
@@ -4883,7 +4876,7 @@ def _oversized_window(memory_id: str, source_msg: str, *, final_score: float):
     # fact, but low score. Sized so a single window admitted ahead of the facts
     # consumes enough of the budget to evict a gold fact (the compact-gold
     # eviction symptom).
-    filler = "unrelated logistics scheduling travel weather chitchat " * 8
+    filler = "unrelated logistics scheduling travel weather chitchat " * 16
     return _candidate(
         memory_id,
         final_score=final_score,
@@ -5161,6 +5154,45 @@ def _exhaustive_compose(
         enable_evidence_obligation_coverage=True,
         enable_final_answer_evidence_pack=enable_final_answer_evidence_pack,
     )
+
+
+def test_source_inventory_does_not_veto_two_facts_in_source_text() -> None:
+    context = _exhaustive_compose(
+        _composer(),
+        [
+            _member_candidate(
+                "mem_two_facts",
+                final_score=0.95,
+                canonical_text=(
+                    "Mara's birthday is May 4, 1991, and she traveled to Kyoto "
+                    "in 2024."
+                ),
+                members=[("mara", "Mara"), ("lisbon", "Lisbon")],
+                source_message_ids=["msg_two_facts"],
+            )
+        ],
+        final_context_items=5,
+    )
+    policy = _resolved_policy()
+    prompt = build_system_prompt(
+        "coding_debug",
+        policy,
+        "",
+        "",
+        context.memory_block,
+        "",
+        answer_support_block=render_answer_support_block(context),
+    )
+    host_payload = minimal_memory_payload(prompt)
+
+    for rendered in (prompt, host_payload):
+        assert "May 4, 1991" in rendered
+        assert "Kyoto" in rendered
+        assert "source_inventory:" in rendered
+        assert "- Mara" in rendered
+        assert "- Lisbon" in rendered
+        assert "not an answer allowlist" in rendered
+        assert "allowed_values:" not in rendered
 
 
 def test_exhaustive_selects_all_members_despite_duplicate_carriers() -> None:
@@ -5858,3 +5890,338 @@ def test_exhaustive_coverage_independent_of_ranking_and_budget_property() -> Non
             else:
                 assert context.coverage_state == "insufficient"
                 assert covered == set()
+
+
+
+def test_selected_packet_span_keeps_late_literal_clause_and_attribution() -> None:
+    quote = (
+        "I checked the maintenance log after breakfast. The first entry said the "
+        "pump stalled on Monday, and I copied that into my notebook before I "
+        "noticed the timestamp on the next page. The signed correction at the "
+        "end says the pump stalled on Thursday, not Monday."
+    )
+    assert len(quote) + len("user @ 2026-04-12T08:30:00+00:00 seq 4: ") > 260
+    candidate = _candidate(
+        "mem_pump_log",
+        final_score=0.92,
+        canonical_text="The corrected pump log places the stall on Thursday.",
+        evidence_packets=[
+            {
+                "support_kind": "direct",
+                "evidence_polarity": "supports",
+                "spans": [
+                    {
+                        "span_role": "source",
+                        "quote_text": quote,
+                        "seq": 4,
+                        "occurred_at": "2026-04-12T08:30:00+00:00",
+                        "metadata_json": {"message_role": "user"},
+                    }
+                ],
+            }
+        ],
+    )
+
+    context = _composer().compose(
+        scored_candidates=[candidate],
+        current_contract={},
+        user_state=None,
+        resolved_policy=_resolved_policy(700),
+        conversation_messages=[],
+        query_text="Which day did the pump stall?",
+        query_type="temporal",
+    )
+
+    assert quote in context.memory_block
+    assert (
+        "source_quote: user @ 2026-04-12T08:30:00+00:00 seq 4: " + quote
+    ) in context.memory_block
+    assert "support: direct, polarity: supports" in context.memory_block
+    assert context.selected_memory_ids == ["mem_pump_log"]
+    assert context.total_tokens_estimate <= context.budget_tokens
+
+
+def test_packet_span_stays_bounded_when_completion_would_displace_memory() -> None:
+    composer = _composer()
+    quote = (
+        "The train leaves from platform four according to the itinerary. "
+        "The agent repeated the platform during check-in and wrote it on the "
+        "ticket envelope for everyone in the group. The same platform also "
+        "appeared on the printed itinerary posted beside the station entrance. "
+        "Later, the station sent a correction: platform six is the final "
+        "departure platform."
+    )
+    first = _candidate(
+        "mem_train",
+        final_score=0.95,
+        canonical_text="The departure platform was corrected.",
+        evidence_packets=[
+            {"support_kind": "direct", "spans": [
+                {"span_role": "source", "quote_text": quote}
+            ]}
+        ],
+    )
+    second = _candidate(
+        "mem_luggage",
+        final_score=0.90,
+        canonical_text="The group has two checked bags.",
+    )
+    bare_first = composer._format_memory_entry(1, first)
+    bare_second = composer._format_memory_entry(2, second)
+    budget = (
+        composer.estimate_tokens(composer.render_contract_block({}, _resolved_policy()))
+        + composer.estimate_tokens("[Retrieved Memories]\n")
+        + composer.estimate_tokens(bare_first)
+        + composer.estimate_tokens(bare_second)
+    )
+
+    context = composer.compose(
+        scored_candidates=[first, second],
+        current_contract={},
+        user_state=None,
+        resolved_policy=_resolved_policy(budget),
+        conversation_messages=[],
+        query_text="Which platform and how many checked bags?",
+        query_type="slot_fill",
+    )
+
+    assert context.selected_memory_ids == ["mem_train", "mem_luggage"]
+    assert "source_quote:" in context.memory_block
+    assert "..." in context.memory_block
+    assert quote not in context.memory_block
+    assert "two checked bags" in context.memory_block
+    assert context.total_tokens_estimate <= budget
+
+
+def test_packet_completion_preserves_multilingual_unicode_and_internal_whitespace() -> None:
+    quote = (
+        "El aviso inicial indicaba que la reunión sería el martes en la sala "
+        "pequeña. Lo anoté con cuidado porque el cambio afectaba al equipo "
+        "de São Paulo y a la compañera que venía de Zúrich.\n\n"
+        "Corrección final: no será el martes; será el jueves. 🌿"
+    )
+    assert len(quote) > 200
+    candidate = _candidate(
+        "mem_meeting",
+        final_score=0.91,
+        canonical_text="The meeting moved to Thursday.",
+        evidence_packets=[
+            {
+                "support_kind": "direct",
+                "spans": [
+                    {
+                        "span_role": "source",
+                        "quote_text": quote,
+                        "metadata_json": {"message_role": "user"},
+                    },
+                    {
+                        "span_role": "trigger",
+                        "quote_text": "¿Qué día será finalmente la reunión?",
+                        "metadata_json": {"message_role": "assistant"},
+                    },
+                ],
+            }
+        ],
+    )
+
+    context = _composer().compose(
+        scored_candidates=[candidate],
+        current_contract={},
+        user_state=None,
+        resolved_policy=_resolved_policy(800),
+        conversation_messages=[],
+        query_text="¿Qué día será finalmente la reunión?",
+        query_type="temporal",
+    )
+
+    assert quote in context.memory_block
+    assert "Corrección final: no será el martes; será el jueves. 🌿" in context.memory_block
+    assert "trigger_quote: assistant: ¿Qué día será finalmente la reunión?" in context.memory_block
+    assert context.total_tokens_estimate <= context.budget_tokens
+
+
+def test_packet_completion_precedes_optional_quote_and_survives_rerender() -> None:
+    composer = _composer()
+    packet_quote = (
+        "The workshop note first assigned delivery to the east entrance. "
+        "The coordinator repeated that location when the schedule was drafted. "
+        "The printed checklist still had the same entrance in two separate "
+        "places when the team met before lunch. After the access inspection, "
+        "the signed final note moved delivery to the north entrance instead "
+        "of the east entrance."
+    )
+    optional = _candidate(
+        "mem_optional",
+        final_score=0.95,
+        canonical_text="A delivery coordinator kept a schedule.",
+        payload_json={"source_message_ids": ["msg_optional"]},
+    )
+    packet = _candidate(
+        "mem_packet",
+        final_score=0.90,
+        canonical_text="Delivery moved to the north entrance.",
+        evidence_packets=[
+            {"support_kind": "direct", "spans": [
+                {"span_role": "source", "quote_text": packet_quote}
+            ]}
+        ],
+    )
+    bare_optional = composer._format_memory_entry(1, optional)
+    bare_packet = composer._format_memory_entry(2, packet)
+    full_packet, _ = composer._complete_rendered_packet_spans(
+        packet, bare_packet, query_text="Where is delivery?"
+    )
+    packet_delta = (
+        composer.estimate_tokens(full_packet)
+        - composer.estimate_tokens(bare_packet)
+    )
+    assert packet_delta > 0
+    budget = (
+        composer.estimate_tokens(composer.render_contract_block({}, _resolved_policy()))
+        + composer.estimate_tokens("[Retrieved Memories]\n")
+        + composer.estimate_tokens(bare_optional)
+        + composer.estimate_tokens(bare_packet)
+        + packet_delta
+    )
+    messages = [
+        {
+            "id": "msg_optional",
+            "role": "user",
+            "seq": 1,
+            "occurred_at": "2026-04-12T09:00:00+00:00",
+            "text": "The coordinator kept a detailed delivery schedule in the shared notebook.",
+        }
+    ]
+    kwargs = dict(
+        scored_candidates=[optional, packet],
+        current_contract={},
+        user_state=None,
+        conversation_messages=messages,
+        query_text="Where is delivery?",
+        query_type="slot_fill",
+    )
+
+    tight = composer.compose(
+        resolved_policy=_resolved_policy(budget),
+        **kwargs,
+    )
+    roomy = composer.compose(
+        resolved_policy=_resolved_policy(budget + 150),
+        **kwargs,
+    )
+
+    assert tight.selected_memory_ids == roomy.selected_memory_ids == [
+        "mem_optional", "mem_packet"
+    ]
+    assert packet_quote in tight.memory_block
+    assert "shared notebook" not in tight.memory_block
+    assert packet_quote in roomy.memory_block
+    assert "shared notebook" in roomy.memory_block
+    assert roomy.total_tokens_estimate <= roomy.budget_tokens
+
+
+def test_completed_packet_span_deduplicates_same_optional_source_message() -> None:
+    quote = (
+        "The original handoff note placed the shipment at the east loading bay. "
+        "The dispatcher repeated that location during the morning briefing, "
+        "and the team copied it into the delivery sheet. After the site check, "
+        "the signed correction moved the shipment to the west loading bay."
+    )
+    candidate = _candidate(
+        "mem_handoff",
+        final_score=0.93,
+        canonical_text="The shipment moved to the west loading bay.",
+        payload_json={"source_message_ids": ["msg_handoff"]},
+        evidence_packets=[
+            {
+                "support_kind": "direct",
+                "spans": [
+                    {
+                        "span_role": "source",
+                        "quote_text": quote,
+                        "seq": 8,
+                        "occurred_at": "2026-04-12T08:00:00+00:00",
+                        "metadata_json": {"message_role": "user"},
+                    }
+                ],
+            }
+        ],
+    )
+
+    for budget in (2000, 20000):
+        context = _composer().compose(
+            scored_candidates=[candidate],
+            current_contract={},
+            user_state=None,
+            resolved_policy=_resolved_policy(budget),
+            conversation_messages=[
+                {
+                    "id": "msg_handoff",
+                    "role": "user",
+                    "seq": 8,
+                    "occurred_at": "2026-04-12T08:00:00+00:00",
+                    "text": quote,
+                }
+            ],
+            query_text="Which bay did the signed correction choose?",
+            query_type="slot_fill",
+        )
+
+        assert context.selected_memory_ids == ["mem_handoff"]
+        assert context.memory_block.count(quote) == 1
+        assert context.memory_block.count("source_quote:") == 1
+        assert (
+            "source_quote: user @ 2026-04-12T08:00:00+00:00 seq 8: " + quote
+            in context.memory_block
+        )
+        assert context.total_tokens_estimate <= budget
+
+
+def test_fact_facet_packet_completion_keeps_one_source_and_secret_redaction() -> None:
+    quote = (
+        "The registration desk originally sent visitors to the south gate. "
+        "That note stayed on the printed map through the morning briefing. "
+        "The final signed direction replaced it with the west gate, and the "
+        "south gate instruction was explicitly withdrawn."
+    )
+    facet = _candidate(
+        "mff_gate",
+        final_score=0.93,
+        canonical_text="visitor gate: west gate",
+        payload_json={
+            "source_kind_variant": "fact_facet",
+            "fact_facet": {"fact_id": "mff_gate", "surface_class": "structured"},
+        },
+        evidence_packets=[
+            {"support_kind": "direct", "spans": [
+                {"span_role": "source", "quote_text": quote}
+            ]}
+        ],
+    )
+    kwargs = dict(
+        scored_candidates=[facet],
+        current_contract={},
+        user_state=None,
+        resolved_policy=_resolved_policy(800),
+        conversation_messages=[],
+        query_text="Which gate should visitors use?",
+        query_type="slot_fill",
+        fact_facet_span_coadmission_enabled=True,
+    )
+
+    clear = _composer().compose(**kwargs)
+    assert clear.selected_memory_ids == ["mff_gate"]
+    assert clear.memory_block.count(quote) == 1
+    assert "source_span: " + quote in clear.memory_block
+
+    facet.memory_object.update(
+        {
+            "privacy_level": 3,
+            "memory_category": "pin_or_password",
+            "preserve_verbatim": True,
+        }
+    )
+    withheld = _composer().compose(**kwargs)
+    assert withheld.selected_memory_ids == ["mff_gate"]
+    assert quote not in withheld.memory_block
+    assert "raw value withheld" in withheld.memory_block

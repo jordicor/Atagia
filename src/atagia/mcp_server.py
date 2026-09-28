@@ -101,7 +101,6 @@ except (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = "atagia.db"
 DEFAULT_TRANSPORT = "stdio"
 DEFAULT_SEARCH_LIMIT = 10
 DEFAULT_LIST_LIMIT = 20
@@ -129,7 +128,10 @@ class AtagiaContext:
 @asynccontextmanager
 async def lifespan(_server: FastMCP) -> AsyncIterator[AtagiaContext]:
     """Initialize and close the shared Atagia engine for MCP requests."""
-    engine = Atagia(db_path=os.environ.get("ATAGIA_DB_PATH", DEFAULT_DB_PATH))
+    # No default here: with `ATAGIA_DB_PATH` unset the engine resolves
+    # `ATAGIA_SQLITE_PATH`, so the server cannot open a different file than the
+    # rest of the stack.
+    engine = Atagia(db_path=os.environ.get("ATAGIA_DB_PATH"))
     user_id = _required_env_text("ATAGIA_USER_ID")
     platform_id = _required_env_text("ATAGIA_PLATFORM_ID")
     user_persona_id = _optional_env_text("ATAGIA_USER_PERSONA_ID")
@@ -426,7 +428,7 @@ async def _get_context_impl(
             "memories": [memory.model_dump(mode="json") for memory in context.memories],
             "contract": context.contract,
             "detected_needs": context.detected_needs,
-            "stage_timings": context.stage_timings,
+            "stage_timings_ms": context.stage_timings_ms,
             "response_mode": context.response_mode,
             "adaptive_retrieval": context.adaptive_retrieval,
             "memory_processing": (

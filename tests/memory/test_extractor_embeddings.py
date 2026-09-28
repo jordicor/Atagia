@@ -62,6 +62,7 @@ class ExtractionProvider(LLMProvider):
                 output_text=memory_extraction_card_output_from_payload(
                     self.payload,
                     request.metadata.get("purpose"),
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         return LLMCompletionResponse(

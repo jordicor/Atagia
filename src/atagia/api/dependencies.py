@@ -13,6 +13,7 @@ from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.storage_backend import StorageBackend
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.llm_client import LLMClient
 from atagia.services.prompt_authority import (
@@ -90,6 +91,11 @@ def get_llm_client(request: Request) -> LLMClient[Any]:
 def get_embedding_index(request: Request) -> EmbeddingIndex:
     """Return the configured embedding index."""
     return get_runtime(request).embedding_index
+
+
+def get_token_document_frequency_cache(request: Request) -> TokenDocumentFrequencyCache:
+    """Return the process-lifetime per-user corpus statistics cache."""
+    return get_runtime(request).token_document_frequency_cache
 
 
 def get_manifest_loader(request: Request) -> ManifestLoader:

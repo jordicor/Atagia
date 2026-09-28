@@ -241,9 +241,9 @@ async with client:
 
 Auto-mode selection rule: if `base_url` is passed or `ATAGIA_BASE_URL` is set,
 `connect_atagia` returns the HTTP client; otherwise it returns the local
-client backed by `db_path` (resolved from `ATAGIA_DB_PATH`,
-`ATAGIA_SQLITE_PATH`, or `atagia.db` in that order). Environment variables
-read by auto mode:
+client backed by `db_path` (resolved from `ATAGIA_DB_PATH`, then by the engine
+from `ATAGIA_SQLITE_PATH` and its `./data/atagia.db` default). Environment
+variables read by auto mode:
 
 - `ATAGIA_BASE_URL` -- HTTP service base URL
 - `ATAGIA_SERVICE_API_KEY` -- shared server-side credential for non-admin HTTP

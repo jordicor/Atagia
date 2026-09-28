@@ -936,6 +936,10 @@ class RevisionWorker:
             raise ValueError(
                 f"Cannot resolve identifiers for promoted belief scope {target_scope.value}"
             )
+        # A promoted belief exists because the same claim recurred across the
+        # distinct conversations and sessions counted in `stats`, so no single
+        # message arrival can measure its ingest freshness:
+        # source_message_created_at stays NULL.
         try:
             created = await self._memory_repository.create_memory_object(
                 user_id=payload.user_id,

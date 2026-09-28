@@ -33,6 +33,7 @@ from atagia.models.schemas_memory import (
     SpaceBoundaryMode,
     SummaryViewKind,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -70,7 +71,12 @@ async def _build_runtime(settings: Settings | None = None):
     messages = MessageRepository(connection, clock)
     memories = MemoryObjectRepository(connection, clock)
     resolved_settings = settings or _settings()
-    search = CandidateSearch(connection, clock, settings=resolved_settings)
+    search = CandidateSearch(
+        connection,
+        clock,
+        settings=resolved_settings,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
     await users.create_user("usr_1")
     await users.create_user("usr_2")
     await workspaces.create_workspace("wrk_1", "usr_1", "Workspace")
@@ -527,29 +533,29 @@ async def test_verbatim_evidence_search_exact_recall_falls_back_when_precise_que
             texts=[
                 (
                     "user",
-                    "On Tuesdays I take amlodipine 10 mg and it makes me dizzy for a few hours.",
+                    "I take fexofenadine 60 mg on Sundays before the garden club meets.",
                 ),
-                ("assistant", "Thanks, I noted the Tuesday amlodipine dose."),
+                ("assistant", "Thanks, I noted the Sunday fexofenadine dose."),
             ],
         )
 
         plan = RetrievalPlan(
-            original_query="What is Rosa's current amlodipine dose?",
+            original_query="What is Leonie's current fexofenadine dose?",
             assistant_mode_id="general_qa",
             workspace_id="wrk_1",
             conversation_id="cnv_1",
             fts_queries=[
-                "rosa amlodipine dose current",
-                "rosa OR amlodipine OR dose OR current",
+                "leonie fexofenadine dose current",
+                "leonie OR fexofenadine OR dose OR current",
             ],
             sub_query_plans=[
                 PlannedSubQuery(
-                    text="What is Rosa's current amlodipine dose?",
-                    sparse_phrase="Rosa amlodipine dose",
-                    must_keep_terms=["Rosa", "amlodipine", "dose", "current"],
+                    text="What is Leonie's current fexofenadine dose?",
+                    sparse_phrase="Leonie fexofenadine dose",
+                    must_keep_terms=["Leonie", "fexofenadine", "dose", "current"],
                     fts_queries=[
-                        "rosa amlodipine dose current",
-                        "rosa OR amlodipine OR dose OR current",
+                        "leonie fexofenadine dose current",
+                        "leonie OR fexofenadine OR dose OR current",
                     ],
                 )
             ],
@@ -572,7 +578,7 @@ async def test_verbatim_evidence_search_exact_recall_falls_back_when_precise_que
         ]
         assert evidence_windows, "expected verbatim-evidence-search fallback to recover a broader transcript window"
         top_window = evidence_windows[0]
-        assert "amlodipine 10 mg" in str(top_window["canonical_text"]).lower()
+        assert "fexofenadine 60 mg" in str(top_window["canonical_text"]).lower()
     finally:
         await connection.close()
 
@@ -1409,38 +1415,38 @@ async def test_verbatim_evidence_search_enabled_allows_active_conversation_despi
             texts=[
                 (
                     "user",
-                    "On Tuesdays I take amlodipine 10 mg and it makes me dizzy for a few hours.",
+                    "I take fexofenadine 60 mg on Sundays before the garden club meets.",
                 ),
-                ("assistant", "I noted the Tuesday amlodipine dose."),
+                ("assistant", "I noted the Sunday fexofenadine dose."),
             ],
         )
         await _seed_messages(
             messages,
             conversation_id="cnv_other_private",
             texts=[
-                ("user", "My therapist is Dr. Reeves."),
+                ("user", "My audiologist is Dr. Elin Frost."),
                 ("assistant", "I will keep that private."),
             ],
         )
 
         candidates = await search.search(
             RetrievalPlan(
-                original_query="What is Rosa's current amlodipine dose?",
+                original_query="What is Leonie's current fexofenadine dose?",
                 assistant_mode_id="personal_assistant",
                 workspace_id=None,
                 conversation_id="cnv_private",
                 fts_queries=[
-                    "rosa amlodipine dose current",
-                    "rosa OR amlodipine OR dose OR current",
+                    "leonie fexofenadine dose current",
+                    "leonie OR fexofenadine OR dose OR current",
                 ],
                 sub_query_plans=[
                     PlannedSubQuery(
-                        text="What is Rosa's current amlodipine dose?",
-                        sparse_phrase="Rosa amlodipine dose",
-                        must_keep_terms=["Rosa", "amlodipine", "dose", "current"],
+                        text="What is Leonie's current fexofenadine dose?",
+                        sparse_phrase="Leonie fexofenadine dose",
+                        must_keep_terms=["Leonie", "fexofenadine", "dose", "current"],
                         fts_queries=[
-                            "rosa amlodipine dose current",
-                            "rosa OR amlodipine OR dose OR current",
+                            "leonie fexofenadine dose current",
+                            "leonie OR fexofenadine OR dose OR current",
                         ],
                     )
                 ],
@@ -1464,7 +1470,7 @@ async def test_verbatim_evidence_search_enabled_allows_active_conversation_despi
         assert evidence_windows, "expected current conversation to bypass mode privacy ceiling"
         assert any(
             candidate.get("verbatim_evidence_window_conversation_id") == "cnv_private"
-            and "amlodipine 10 mg" in str(candidate.get("canonical_text", "")).lower()
+            and "fexofenadine 60 mg" in str(candidate.get("canonical_text", "")).lower()
             for candidate in evidence_windows
         )
         assert all(

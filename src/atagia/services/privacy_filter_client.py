@@ -10,6 +10,11 @@ from typing import Any
 import httpx
 
 from atagia.core.config import Settings
+from atagia.services.inference_policy import (
+    InferenceAccessPolicy,
+    audit_privacy_filter_startup_urls,
+)
+from atagia.services.inference_routes import InferenceAccessMode
 
 
 class PrivacyFilterError(RuntimeError):
@@ -74,18 +79,30 @@ class OpenAIPrivacyFilterClient:
         fallback_url: str,
         timeout_seconds: float,
         http_client: httpx.AsyncClient | None = None,
+        restricted_transport: bool = False,
     ) -> None:
         self._primary_url = primary_url.rstrip("/")
         self._fallback_url = fallback_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._http_client = http_client
+        self._restricted_transport = restricted_transport
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "OpenAIPrivacyFilterClient":
+    def from_settings(
+        cls,
+        settings: Settings,
+        *,
+        inference_access_policy: InferenceAccessPolicy | None = None,
+    ) -> "OpenAIPrivacyFilterClient":
+        policy = inference_access_policy or InferenceAccessPolicy(
+            InferenceAccessMode(settings.inference_access_mode)
+        )
+        audit_privacy_filter_startup_urls(settings, policy)
         return cls(
             primary_url=settings.opf_primary_url,
             fallback_url=settings.opf_fallback_url,
             timeout_seconds=settings.opf_timeout_seconds,
+            restricted_transport=bool(policy.restricted),
         )
 
     @property
@@ -101,7 +118,9 @@ class OpenAIPrivacyFilterClient:
             try:
                 payload = await self._request_json("GET", f"{base_url}/health")
                 if not isinstance(payload, dict):
-                    raise PrivacyFilterError(f"OPF /health returned non-object JSON from {base_url}")
+                    raise PrivacyFilterError(
+                        f"OPF /health returned non-object JSON from {base_url}"
+                    )
             except Exception as exc:  # noqa: BLE001 - failover needs the last cause.
                 last_error = exc
                 continue
@@ -155,7 +174,10 @@ class OpenAIPrivacyFilterClient:
             response.raise_for_status()
             return response.json()
 
-        async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
+        client_kwargs: dict[str, Any] = {"timeout": self._timeout_seconds}
+        if self._restricted_transport:
+            client_kwargs.update(trust_env=False, follow_redirects=False)
+        async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.request(method, url, **kwargs)
             response.raise_for_status()
             return response.json()

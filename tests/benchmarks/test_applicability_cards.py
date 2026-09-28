@@ -68,3 +68,20 @@ def test_estimate_cost_uses_cached_minimax_input_rate() -> None:
     )
 
     assert cost == (800 * 0.30 + 200 * 0.06 + 100 * 1.20) / 1_000_000
+
+
+def test_unprocessed_date_expectations_do_not_count_as_full_match() -> None:
+    case = next(
+        case for case in load_cases(_DEFAULT_CASES_PATH)
+        if any(value is not None for value in (case.expected_resolved_dates or {}).values())
+    )
+    memory_ids = list(dict.fromkeys([*case.expected_top_ids, *case.expected_useful_ids]))
+    score = score_output(
+        [{"memory_id": memory_id, "resolved_date": None, "date_resolution_status": "unprocessed"}
+         for memory_id in memory_ids],
+        case,
+    )
+    assert score["ranking_match"] is True
+    assert score["exact_match"] is False
+    assert score["date_evaluation_status"] == "unavailable_unprocessed"
+    assert all(value is None for value in score["expected_date_matches"].values())

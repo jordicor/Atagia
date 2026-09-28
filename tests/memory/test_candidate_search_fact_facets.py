@@ -32,6 +32,7 @@ from atagia.models.schemas_memory import (
     PlannedSubQuery,
     RetrievalPlan,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -187,6 +188,7 @@ async def test_fact_facet_candidate_channel_is_flag_gated() -> None:
             connection,
             clock,
             settings=_settings(fact_facet_retrieval_enabled=False),
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
         )
         disabled_results = await disabled_search.search(_plan(), "usr_1")
         assert all("fact_facet" not in row.get("retrieval_sources", []) for row in disabled_results)
@@ -195,6 +197,7 @@ async def test_fact_facet_candidate_channel_is_flag_gated() -> None:
             connection,
             clock,
             settings=_settings(fact_facet_retrieval_enabled=True),
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
         )
         results = await enabled_search.search(_plan(), "usr_1")
 
@@ -235,6 +238,7 @@ async def test_fact_facet_structured_only_excludes_generic_rows() -> None:
                 fact_facet_retrieval_enabled=True,
                 fact_facet_structured_only=False,
             ),
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
         )
         broad_results = await broad_search.search(_plan(), "usr_1")
         assert any(row.get("is_fact_facet_candidate") is True for row in broad_results)
@@ -246,6 +250,7 @@ async def test_fact_facet_structured_only_excludes_generic_rows() -> None:
                 fact_facet_retrieval_enabled=True,
                 fact_facet_structured_only=True,
             ),
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
         )
         structured_results = await structured_search.search(_plan(), "usr_1")
         assert all(

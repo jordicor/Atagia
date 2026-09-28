@@ -37,6 +37,7 @@ from atagia.services.llm_client import (
 )
 from atagia.workers.evaluation_worker import EvaluationWorker
 from tests.durable_job_support import DurableJobTestBackend
+from tests.turn_telemetry_support import sample_turn_telemetry
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -141,7 +142,8 @@ async def _build_runtime():
             },
             "outcome_json": {},
             "created_at": "2026-03-31T09:05:00+00:00",
-        }
+        },
+        telemetry=sample_turn_telemetry(),
     )
     await feedback.create_feedback(
         retrieval_event_id="ret_1",

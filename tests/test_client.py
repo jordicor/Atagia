@@ -52,7 +52,8 @@ class ClientProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -125,6 +126,7 @@ class ClientProvider(LLMProvider):
                         "nothing_durable": True,
                     },
                     purpose,
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         if purpose == "contract_projection":

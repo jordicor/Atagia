@@ -9,6 +9,7 @@ import aiosqlite
 from atagia.core.clock import Clock
 from atagia.core.memory_evidence_repository import MemoryEvidenceRepository
 from atagia.core.repositories import MessageRepository
+from atagia.core.source_references import SourceReference, source_sha256
 from atagia.models.schemas_memory import (
     MemoryEvidencePolarity,
     MemoryEvidenceSpeakerRelation,
@@ -42,9 +43,8 @@ class MemoryProvenanceWriter:
         confidence: float = 0.5,
         confidence_details: dict[str, Any] | None = None,
         rationale: str | None = None,
-        source_quote_by_message_id: dict[str, str] | None = None,
+        source_reference_by_message_id: dict[str, SourceReference] | None = None,
         trigger_message_ids: list[str] | None = None,
-        trigger_quote_by_message_id: dict[str, str] | None = None,
         max_source_spans: int = DEFAULT_MAX_SOURCE_SPANS,
         commit: bool = True,
     ) -> dict[str, Any] | None:
@@ -53,6 +53,9 @@ class MemoryProvenanceWriter:
         normalized_source_ids = self._unique_strings(source_message_ids)
         if not normalized_source_ids:
             return None
+        source_references = source_reference_by_message_id or {}
+        if set(source_references) - set(normalized_source_ids):
+            raise ValueError("Source references must belong to the packet's source messages")
 
         source_spans = await self._spans_for_message_ids(
             user_id=user_id,
@@ -61,7 +64,7 @@ class MemoryProvenanceWriter:
                 max_count=max_source_spans,
             ),
             span_role=MemoryEvidenceSpanRole.SOURCE,
-            quote_by_message_id=source_quote_by_message_id or {},
+            reference_by_message_id=source_references,
             metadata={"source": writer_kind},
         )
         if not source_spans:
@@ -70,7 +73,7 @@ class MemoryProvenanceWriter:
             user_id=user_id,
             message_ids=self._unique_strings(trigger_message_ids or []),
             span_role=MemoryEvidenceSpanRole.TRIGGER,
-            quote_by_message_id=trigger_quote_by_message_id or {},
+            reference_by_message_id={},
             metadata={"source": f"{writer_kind}_trigger"},
         )
         spans = [*source_spans, *trigger_spans]
@@ -101,31 +104,38 @@ class MemoryProvenanceWriter:
         user_id: str,
         message_ids: list[str],
         span_role: MemoryEvidenceSpanRole,
-        quote_by_message_id: dict[str, str],
+        reference_by_message_id: dict[str, SourceReference],
         metadata: dict[str, Any],
     ) -> list[dict[str, Any]]:
         spans: list[dict[str, Any]] = []
         for message_id in message_ids:
             message = await self._message_repository.get_message(message_id, user_id)
+            reference = reference_by_message_id.get(message_id)
             if message is None:
+                if reference is not None:
+                    raise ValueError("Referenced source message does not belong to this user")
                 continue
-            quote, char_start, char_end, used_fallback = self._quote_for_message(
-                message_text=str(message.get("text") or ""),
-                requested_quote=quote_by_message_id.get(message_id),
-            )
-            if not quote:
-                continue
+            message_text = str(message.get("text") or "")
+            if reference is None:
+                # Writers with no selected subrange explicitly cite the full message.
+                if not message_text.strip():
+                    continue
+                reference = SourceReference(
+                    char_start=len(message_text) - len(message_text.lstrip()),
+                    char_end=len(message_text.rstrip()),
+                    source_sha256=source_sha256(message_text),
+                )
+            quote = reference.quote(message_text)
             span_metadata = dict(metadata)
-            if used_fallback:
-                span_metadata["quote_fallback"] = "full_message_exact"
+            span_metadata["source_reference"] = reference.model_dump(mode="json")
             spans.append(
                 {
                     "span_role": span_role.value,
                     "message_id": message_id,
                     "conversation_id": message.get("conversation_id"),
                     "quote_text": quote,
-                    "char_start": char_start,
-                    "char_end": char_end,
+                    "char_start": reference.char_start,
+                    "char_end": reference.char_end,
                     "seq": message.get("seq"),
                     "occurred_at": message.get("occurred_at")
                     or message.get("created_at"),
@@ -159,24 +169,3 @@ class MemoryProvenanceWriter:
             seen.add(text)
             normalized.append(text)
         return normalized
-
-    @staticmethod
-    def _quote_for_message(
-        *,
-        message_text: str,
-        requested_quote: str | None,
-    ) -> tuple[str, int | None, int | None, bool]:
-        if requested_quote is not None:
-            quote = str(requested_quote).strip()
-            if quote:
-                start = message_text.find(quote)
-                if start >= 0:
-                    return quote, start, start + len(quote), False
-
-        fallback = message_text.strip()
-        if not fallback:
-            return "", None, None, requested_quote is not None
-        start = message_text.find(fallback)
-        char_start = start if start >= 0 else None
-        char_end = start + len(fallback) if start >= 0 else None
-        return fallback, char_start, char_end, requested_quote is not None

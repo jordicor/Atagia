@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import hashlib
 import secrets
+from time import perf_counter
 from typing import Any, Awaitable, Callable, Literal, Mapping, Sequence
 
 from atagia.core.conversation_namespace import (
@@ -17,6 +18,10 @@ from atagia.core.conversation_namespace import (
 from atagia.core.job_run_repository import JobRunRepository
 from atagia.core.presence_repository import PresenceRepository, presence_snapshot
 from atagia.core.repositories import BaseRepository, MessageRepository
+from atagia.core.retrieval_event_repository import (
+    RetrievalEventRepository,
+    TurnTelemetry,
+)
 from atagia.core.transcript_rebuild_repository import (
     TranscriptRebuildRepository,
     UserAvailabilitySnapshot,
@@ -101,6 +106,28 @@ class ProxyTurnResponseMessage:
     metadata: dict[str, Any]
     source_seq: int | None = None
     occurred_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProxyTurnTelemetry:
+    """Per-turn telemetry applied inside the fenced terminal commit.
+
+    ``retrieval_event_id`` is the row the turn's retrieval already wrote. When
+    memory context failed open there is no such row and the turn still has to be
+    counted, so ``fallback_event`` is inserted instead, carrying the same
+    measurements with an empty retrieval plan and context view.
+
+    ``turn_started_at`` is a ``perf_counter`` origin, not a wall-clock instant:
+    the turn's wall time is re-measured at the moment the row is written so
+    ``turn_to_event_write_wall_ms`` means the same span here as on the chat and
+    context surfaces, instead of stopping short of the persistence work that
+    this telemetry is part of.
+    """
+
+    telemetry: TurnTelemetry
+    turn_started_at: float
+    retrieval_event_id: str | None
+    fallback_event: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -839,9 +866,10 @@ class ProxyTurnRepository(BaseRepository):
         durable_jobs: Sequence[ProxyDurableJobInsert] | None = None,
         durable_job_builder: Callable[[], Awaitable[Sequence[ProxyDurableJobInsert]]]
         | None = None,
+        turn_telemetry: ProxyTurnTelemetry,
         failpoint: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
-        """Atomically persist the response, durable jobs, linkage, and completion."""
+        """Atomically persist the response, telemetry, jobs, linkage, and completion."""
 
         if (durable_jobs is None) == (durable_job_builder is None):
             raise ValueError(
@@ -917,6 +945,11 @@ class ProxyTurnRepository(BaseRepository):
             )
             _call_failpoint(failpoint, "response_inserted")
             response_source_seq = int(response_row["seq"])
+            # Inside the fence, and only now: the retrieval event's
+            # response_message_id has a row to point at, and the turn's LLM
+            # counters are final. A failure here aborts the whole terminal
+            # commit rather than leaving an unmeasured turn behind.
+            await self._write_turn_telemetry(claim, turn_telemetry)
 
             job_repository = JobRunRepository(self._connection, self._clock)
             job_ids: list[str] = []
@@ -1524,6 +1557,37 @@ class ProxyTurnRepository(BaseRepository):
             response_message_id=str(run["response_message_id"]),
             response_row=response,
             replay_envelope=dict(replay),
+        )
+
+    async def _write_turn_telemetry(
+        self,
+        claim: ProxyTurnClaim,
+        turn_telemetry: ProxyTurnTelemetry,
+    ) -> None:
+        """Record the completed turn's telemetry on its retrieval event."""
+        events = RetrievalEventRepository(self._connection, self._clock)
+        telemetry = replace(
+            turn_telemetry.telemetry,
+            turn_to_event_write_wall_ms=(
+                (perf_counter() - turn_telemetry.turn_started_at) * 1000.0
+            ),
+        )
+        if turn_telemetry.retrieval_event_id is not None:
+            await events.complete_turn_telemetry(
+                turn_telemetry.retrieval_event_id,
+                claim.user_id,
+                response_message_id=claim.response_message_id,
+                telemetry=telemetry,
+                commit=False,
+            )
+            return
+        await events.create_event(
+            {
+                **turn_telemetry.fallback_event,
+                "response_message_id": claim.response_message_id,
+            },
+            telemetry=telemetry,
+            commit=False,
         )
 
     async def _insert_or_validate_response(

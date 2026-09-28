@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from hashlib import sha256
 import json
 import re
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from atagia.core.clock import FrozenClock
 from atagia.core.communication_profile_repository import CommunicationProfileRepository
@@ -30,6 +32,8 @@ from atagia.memory.policy_manifest import (
     sync_assistant_modes,
 )
 from atagia.memory.context_composer import ContextComposer
+from atagia.memory.date_resolution import DateResolution, parse_date_resolution
+from atagia.memory.context_envelope import ContextBudgetAboveEnvelopeError
 from atagia.models.schemas_memory import (
     DetectedNeed,
     ExplicitLanguagePreference,
@@ -65,6 +69,7 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.retrieval_pipeline import RetrievalPipeline
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -280,13 +285,10 @@ class PipelineProvider(LLMProvider):
                 if isinstance(item, dict) and item.get("need_type")
             ]
             return "\n".join(labels) if labels else "none"
-        if purpose == "need_detection_language_card":
-            return "\n".join(
-                [
-                    str(self.need_response.get("query_language") or "en"),
-                    str(self.need_response.get("answer_language") or "en"),
-                ]
-            )
+        if purpose == "need_detection_query_language_card":
+            return str(self.need_response.get("query_language") or "en")
+        if purpose == "need_detection_answer_language_card":
+            return str(self.need_response.get("answer_language") or "en")
         if purpose == "need_detection_memory_card":
             return str(self.need_response.get("memory_dependence") or "mixed")
         if purpose == "need_detection_exact_card":
@@ -524,6 +526,7 @@ async def _build_runtime(
         embedding_index=NoneBackend(),
         clock=clock,
         settings=resolved_settings,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
     )
     manifest = ManifestLoader(MANIFESTS_DIR).load_all()[mode_id]
     resolved_policy = PolicyResolver().resolve(manifest, None, None)
@@ -558,6 +561,7 @@ async def _seed_memory(
     space_id: str | None = None,
     space_boundary_mode: SpaceBoundaryMode | None = None,
     language_codes: list[str] | None = None,
+    payload_json: dict[str, object] | None = None,
 ) -> dict[str, object]:
     scope_canonical = {
         MemoryScope.CONVERSATION: MemoryScope.CHAT.value,
@@ -573,6 +577,7 @@ async def _seed_memory(
         object_type=object_type,
         scope=scope,
         canonical_text=canonical_text,
+        payload=payload_json,
         source_kind=MemorySourceKind.EXTRACTED
         if object_type is not MemoryObjectType.INTERACTION_CONTRACT
         else MemorySourceKind.INFERRED,
@@ -589,6 +594,65 @@ async def _seed_memory(
         if space_boundary_mode is not None
         else None,
     )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_reuses_resolved_date_across_distinct_queries() -> None:
+    provider = PipelineProvider(score_map={"memory_retry": 0.9})
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider)
+    try:
+        text = "retry loop websocket backoff during deployment"
+        annotation = DateResolution(
+            **parse_date_resolution("uncertain|ref|days|0", "2026-04-05").model_dump(),
+            source_text_sha256=sha256(text.encode()).hexdigest(),
+            reference_date="2026-04-05",
+        )
+        await _seed_memory(
+            memories,
+            memory_id="memory_retry",
+            canonical_text=text,
+            payload_json={
+                "source_occurred_at": "2026-04-05T12:00:00+00:00",
+                "date_resolution": annotation.model_dump(mode="json"),
+            },
+            scope=MemoryScope.CONVERSATION,
+        )
+        for query in (
+            "What happened to retry loop websocket backoff?",
+            "Tell me about retry loop websocket backoff.",
+        ):
+            result = await pipeline.execute(
+                message_text=query,
+                conversation_context=context,
+                resolved_policy=resolved_policy,
+                cold_start=False,
+                conversation_messages=[{"role": "user", "text": query}],
+                trace=RetrievalTrace(
+                    query_text=query,
+                    user_id="usr_1",
+                    conversation_id="cnv_1",
+                    timestamp_iso="2026-04-05T12:00:00+00:00",
+                ),
+            )
+            assert "memory_retry" in result.composed_context.selected_memory_ids
+            candidate = next(c for c in result.scored_candidates if c.memory_id == "memory_retry")
+            assert candidate.resolved_date == "2026-04-05"
+            assert candidate.date_certainty == "uncertain"
+            assert candidate.date_resolution_status == "completed"
+        purposes = [request.metadata.get("purpose") for request in provider.requests]
+        assert purposes.count("applicability_relevance_card") == 2
+        assert purposes.count("applicability_date_card") == 0
+        assert purposes.count("memory_date_resolution") == 0
+    finally:
+        await connection.close()
 
 
 @pytest.mark.asyncio
@@ -1649,7 +1713,7 @@ async def test_privacy_enforcement_off_disables_high_risk_redaction_in_context()
         assert "raw value withheld" not in result.composed_context.memory_block
         assert (
             "privacy_restrictions_inactive: high_risk_secret_literal_unredacted"
-            in result.composed_context.memory_block
+            not in result.composed_context.memory_block
         )
     finally:
         await connection.close()
@@ -1936,9 +2000,14 @@ async def test_pipeline_hydrates_evidence_packets_only_when_ablation_enabled() -
 
 
 @pytest.mark.asyncio
-async def test_pipeline_applies_structural_context_envelope_budget_by_default(
+async def test_pipeline_effective_budget_is_min_of_manifest_and_envelope_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """By default (no ablation) the composer budget is
+    ``min(manifest policy budget, envelope allocation)``. The default fixture
+    mode is ``coding_debug`` (manifest budget 5300), which sits below the
+    default envelope allocation (5489), so the manifest value binds
+    end-to-end."""
     observed_budgets: list[int] = []
     original_compose = ContextComposer.compose
 
@@ -1959,6 +2028,7 @@ async def test_pipeline_applies_structural_context_envelope_budget_by_default(
         context,
     ) = await _build_runtime(provider=provider)
     try:
+        assert resolved_policy.context_budget_tokens == 5_300
         await _seed_memory(
             memories,
             memory_id="mem_1",
@@ -1976,15 +2046,21 @@ async def test_pipeline_applies_structural_context_envelope_budget_by_default(
             ],
         )
 
-        assert observed_budgets == [5_489]
+        assert observed_budgets == [5_300]
     finally:
         await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_pipeline_applies_context_envelope_budget_to_composer(
+async def test_pipeline_low_envelope_caps_manifest_budget_for_composer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """When the envelope allocation is lower than the manifest budget it becomes
+    the binding cap the composer sees. The default fixture mode is
+    ``coding_debug`` (manifest budget 5300); a 3000-token envelope allocates
+    2010 tokens to retrieved context, so ``min(5300, 2010) = 2010`` reaches the
+    composer. A ``final_context_items`` override is threaded through
+    unchanged."""
     observed_budgets: list[int] = []
     observed_final_items: list[int] = []
     original_compose = ContextComposer.compose
@@ -2009,6 +2085,7 @@ async def test_pipeline_applies_context_envelope_budget_to_composer(
         context,
     ) = await _build_runtime(provider=provider)
     try:
+        assert resolved_policy.context_budget_tokens == 5_300
         await _seed_memory(
             memories,
             memory_id="mem_1",
@@ -2022,7 +2099,7 @@ async def test_pipeline_applies_context_envelope_budget_to_composer(
             resolved_policy=resolved_policy,
             cold_start=False,
             ablation=AblationConfig(
-                context_envelope_budget_tokens=10_000,
+                context_envelope_budget_tokens=3_000,
                 override_retrieval_params={"final_context_items": 3},
             ),
             conversation_messages=[
@@ -2030,7 +2107,7 @@ async def test_pipeline_applies_context_envelope_budget_to_composer(
             ],
         )
 
-        assert observed_budgets == [6_700]
+        assert observed_budgets == [2_010]
         assert observed_final_items == [3]
         expanded_policy = resolved_policy.model_copy(
             update={
@@ -2046,6 +2123,244 @@ async def test_pipeline_applies_context_envelope_budget_to_composer(
         assert capped_policy.retrieval_params.final_context_items == 20
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_effective_budget_capped_at_envelope_when_manifest_exceeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the manifest budget exceeds the envelope allocation the envelope
+    caps it. ``research_deep_dive`` (manifest budget 6100) is above the default
+    envelope allocation (5489), so the composer sees 5489."""
+    observed_budgets: list[int] = []
+    original_compose = ContextComposer.compose
+
+    def _capture_compose(self: ContextComposer, *args, **kwargs):
+        observed_policy = kwargs["resolved_policy"]
+        observed_budgets.append(observed_policy.context_budget_tokens)
+        return original_compose(self, *args, **kwargs)
+
+    monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
+    provider = PipelineProvider(score_map={"mem_1": 0.91})
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider, mode_id="research_deep_dive")
+    try:
+        assert resolved_policy.context_budget_tokens == 6_100
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+            assistant_mode_id="research_deep_dive",
+        )
+
+        await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"}
+            ],
+        )
+
+        assert observed_budgets == [5_489]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_budget_override_below_the_envelope_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit override BELOW the envelope allocation wins outright.
+
+    The override REPLACES the manifest value (2800) rather than restricting it:
+    4096 sits ABOVE the manifest and still runs, because the envelope allocation
+    (5489) is the only ceiling. An ablation exists to probe budgets the shipped
+    manifests do not ship.
+    """
+    observed_budgets: list[int] = []
+    original_compose = ContextComposer.compose
+
+    def _capture_compose(self: ContextComposer, *args, **kwargs):
+        observed_policy = kwargs["resolved_policy"]
+        observed_budgets.append(observed_policy.context_budget_tokens)
+        return original_compose(self, *args, **kwargs)
+
+    monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
+    provider = PipelineProvider(score_map={"mem_1": 0.91})
+    (
+        connection,
+        memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(provider=provider, mode_id="general_qa")
+    try:
+        assert resolved_policy.context_budget_tokens == 2_800
+        await _seed_memory(
+            memories,
+            memory_id="mem_1",
+            canonical_text="retry loop websocket backoff",
+            scope=MemoryScope.CONVERSATION,
+            assistant_mode_id="general_qa",
+        )
+
+        await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            ablation=AblationConfig(
+                override_retrieval_params={"context_budget_tokens": 4_096}
+            ),
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"}
+            ],
+        )
+
+        assert observed_budgets == [4_096]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested", [5_490, 9_000, 500_000])
+async def test_pipeline_budget_override_above_the_envelope_raises(
+    requested: int,
+) -> None:
+    """A budget override cannot raise the ceiling above the envelope allocation.
+
+    The envelope is the hard ceiling and nothing downstream re-caps the value:
+    the composer used it raw, and an overshoot silently starved the initial
+    context package to zero tokens. Capping quietly would leave a run reporting
+    a budget the engine never honored, which is the defect class this whole
+    phase exists to remove, so a contradictory configuration fails loudly and
+    names the knob that CAN legitimately raise the ceiling.
+    """
+    (
+        connection,
+        _memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(mode_id="general_qa")
+    try:
+        with pytest.raises(ContextBudgetAboveEnvelopeError) as excinfo:
+            await pipeline.execute(
+                message_text="retry loop websocket backoff",
+                conversation_context=context,
+                resolved_policy=resolved_policy,
+                cold_start=False,
+                ablation=AblationConfig(
+                    override_retrieval_params={"context_budget_tokens": requested}
+                ),
+                conversation_messages=[
+                    {"role": "user", "text": "retry loop websocket backoff"}
+                ],
+            )
+        message = str(excinfo.value)
+        assert str(requested) in message
+        assert "5489" in message
+        assert "context_envelope_budget_tokens" in message
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_budget_override_above_a_raised_envelope_is_allowed() -> None:
+    """The envelope knob is the documented way to raise the ceiling.
+
+    The error tells the caller to raise ``context_envelope_budget_tokens``, so
+    doing that must actually work -- otherwise the guidance is a dead end.
+    """
+    (
+        connection,
+        _memories,
+        _contracts,
+        pipeline,
+        _provider,
+        resolved_policy,
+        context,
+    ) = await _build_runtime(mode_id="general_qa")
+    try:
+        effective = pipeline._override_policy(
+            resolved_policy,
+            AblationConfig(
+                context_envelope_budget_tokens=32_768,
+                override_retrieval_params={"context_budget_tokens": 9_000},
+            ),
+        )
+        assert effective.context_budget_tokens == 9_000
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_manifest_budget_is_live_not_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-dead-knob guard: two modes with distinct sub-envelope manifest budgets
+    must yield distinct composer budgets. Under the old bug both would collapse
+    to the identical envelope allocation (5489); with min() semantics each mode
+    carries its own manifest value end-to-end."""
+    observed_budgets: dict[str, int] = {}
+    original_compose = ContextComposer.compose
+
+    for mode_id, expected_budget in (("general_qa", 2_800), ("coding_debug", 5_300)):
+
+        def _capture_compose(self: ContextComposer, *args, _mode=mode_id, **kwargs):
+            observed_policy = kwargs["resolved_policy"]
+            observed_budgets[_mode] = observed_policy.context_budget_tokens
+            return original_compose(self, *args, **kwargs)
+
+        monkeypatch.setattr(ContextComposer, "compose", _capture_compose)
+        provider = PipelineProvider(score_map={"mem_1": 0.91})
+        (
+            connection,
+            memories,
+            _contracts,
+            pipeline,
+            _provider,
+            resolved_policy,
+            context,
+        ) = await _build_runtime(provider=provider, mode_id=mode_id)
+        try:
+            assert resolved_policy.context_budget_tokens == expected_budget
+            await _seed_memory(
+                memories,
+                memory_id="mem_1",
+                canonical_text="retry loop websocket backoff",
+                scope=MemoryScope.CONVERSATION,
+                assistant_mode_id=mode_id,
+            )
+
+            await pipeline.execute(
+                message_text="retry loop websocket backoff",
+                conversation_context=context,
+                resolved_policy=resolved_policy,
+                cold_start=False,
+                conversation_messages=[
+                    {"role": "user", "text": "retry loop websocket backoff"}
+                ],
+            )
+        finally:
+            await connection.close()
+
+    assert observed_budgets == {"general_qa": 2_800, "coding_debug": 5_300}
+    assert observed_budgets["general_qa"] != observed_budgets["coding_debug"]
 
 
 @pytest.mark.asyncio
@@ -3137,7 +3452,7 @@ async def test_pipeline_passes_user_communication_profile_to_need_detection_and_
         need_prompt = next(
             request.messages[1].content
             for request in provider.requests
-            if request.metadata.get("purpose") == "need_detection_language_card"
+            if request.metadata.get("purpose") == "need_detection_answer_language_card"
         )
         assert "User communication profile:" in need_prompt
         assert (
@@ -3159,6 +3474,76 @@ async def test_pipeline_passes_user_communication_profile_to_need_detection_and_
         assert (
             trace.need_detection.user_communication_profile.preference_language_codes
             == ["es"]
+        )
+
+        profile_repository = CommunicationProfileRepository(
+            connection,
+            FrozenClock(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc)),
+        )
+        profile = await profile_repository.get_user_language_profile_for_context(context)
+        assert profile is not None
+        profile.explicit_language_preferences.extend(
+            [
+                ExplicitLanguagePreference(
+                    language_code=language_code,
+                    preference_kind=kind,
+                    context_label="ordinary_chat",
+                    source_refs=[
+                        LanguageProfileSourceRef(
+                            source_kind="source_message",
+                            conversation_id="cnv_1",
+                            source_message_id="msg_correction",
+                        )
+                    ],
+                    confidence=0.92,
+                )
+                for language_code, kind in (
+                    ("es", "avoid_language"),
+                    ("ca", "default_answer_language"),
+                )
+            ]
+        )
+        await profile_repository.upsert_user_language_profile(
+            context, profile, scope=MemoryScope.CHARACTER
+        )
+        provider.need_response["answer_language"] = "ca"
+        corrected_trace = RetrievalTrace(
+            query_text="retry loop websocket backoff",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-09T12:01:00Z",
+        )
+        corrected = await pipeline.execute(
+            message_text="retry loop websocket backoff",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[
+                {"role": "user", "text": "retry loop websocket backoff"},
+            ],
+            trace=corrected_trace,
+        )
+        corrected_prompt = next(
+            request.messages[1].content
+            for request in reversed(provider.requests)
+            if request.metadata.get("purpose") == "need_detection_answer_language_card"
+        )
+        assert "ca/default_answer_language/ordinary_chat" in corrected_prompt
+        assert "es/avoid_language/ordinary_chat" in corrected_prompt
+        assert corrected.retrieval_plan.answer_language == "ca"
+        assert corrected_trace.need_detection is not None
+        assert corrected_trace.need_detection.user_communication_profile is not None
+        assert "ca" in (
+            corrected_trace.need_detection.user_communication_profile.preference_language_codes
+        )
+        corrected_profile = await profile_repository.get_user_language_profile_for_context(
+            context
+        )
+        assert corrected_profile is not None
+        assert any(
+            source.source_message_id == "msg_correction"
+            for preference in corrected_profile.explicit_language_preferences
+            for source in preference.source_refs
         )
     finally:
         await connection.close()
@@ -3437,11 +3822,11 @@ async def test_pipeline_does_not_backfill_source_quote_from_other_conversation()
         need_response={
             "needs": [],
             "temporal_range": None,
-            "sub_queries": ["Jon banker job"],
+            "sub_queries": ["Inez rented telescope"],
             "sparse_query_hints": [
                 {
-                    "sub_query_text": "Jon banker job",
-                    "fts_phrase": "Jon banker job",
+                    "sub_query_text": "Inez rented telescope",
+                    "fts_phrase": "Inez rented telescope",
                 }
             ],
             "query_type": "temporal",
@@ -3475,22 +3860,22 @@ async def test_pipeline_does_not_backfill_source_quote_from_other_conversation()
             conversation_id="cnv_other",
             role="user",
             seq=None,
-            text="Jon: Lost my job as a banker yesterday.",
-            occurred_at="2023-01-20T16:04:00+00:00",
+            text="Inez: I returned the rented telescope yesterday.",
+            occurred_at="2025-06-18T08:20:00+00:00",
         )
         await memories.create_memory_object(
             user_id="usr_1",
             assistant_mode_id="general_qa",
             object_type=MemoryObjectType.EVIDENCE,
             scope=MemoryScope.GLOBAL_USER,
-            canonical_text="Jon lost his banker job before starting a business.",
+            canonical_text="Inez returned her rented telescope before joining an astronomy club.",
             source_kind=MemorySourceKind.EXTRACTED,
             confidence=0.8,
             privacy_level=0,
             payload={
                 "source_message_ids": ["msg_other_source"],
-                "source_message_window_start_occurred_at": "2023-01-20T16:04:00+00:00",
-                "source_message_window_end_occurred_at": "2023-01-20T16:04:00+00:00",
+                "source_message_window_start_occurred_at": "2025-06-18T08:20:00+00:00",
+                "source_message_window_end_occurred_at": "2025-06-18T08:20:00+00:00",
             },
             memory_id="mem_cross_chat_source",
             platform_id="default",
@@ -3498,7 +3883,7 @@ async def test_pipeline_does_not_backfill_source_quote_from_other_conversation()
         )
 
         result = await pipeline.execute(
-            message_text="When did Jon lose his job as a banker?",
+            message_text="When did Inez return the rented telescope?",
             conversation_context=context.model_copy(
                 update={"assistant_mode_id": "general_qa"}
             ),
@@ -3509,7 +3894,7 @@ async def test_pipeline_does_not_backfill_source_quote_from_other_conversation()
                     "id": "msg_current",
                     "conversation_id": "cnv_1",
                     "role": "user",
-                    "text": "When did Jon lose his job as a banker?",
+                    "text": "When did Inez return the rented telescope?",
                 },
             ],
         )
@@ -3814,24 +4199,16 @@ async def test_pipeline_exact_recall_plan_exposes_anchor_only_fts_materializatio
         sub_query = result.retrieval_plan.sub_query_plans[0]
         assert result.retrieval_plan.exact_recall_mode is True
         assert sub_query.must_keep_terms == ["Falcon", "SA42"]
-        assert sub_query.fts_query_kinds == [
-            "anchor_first_and",
-            "sparse_and",
-            "anchor_only_and",
-            "broad_or",
-        ]
+        # The LLM search words are the primary FTS clause (no raw-question
+        # tokens); the identical sparse/anchor-only rewrites dedupe to it.
+        assert sub_query.fts_query_kinds == ["anchor_first_and"]
         assert "falcon sa42" in sub_query.fts_queries
         assert {candidate["id"] for candidate in result.raw_candidates} == {
             "mem_falcon_service_account",
         }
         fts_matches = result.raw_candidates[0]["fts_query_matches"]
         assert {
-            ("falcon sa42", "anchor_only_and", "implicit_and"),
-            (
-                "which OR service OR account OR did OR falcon OR use OR sa42",
-                "broad_or",
-                "explicit_or",
-            ),
+            ("falcon sa42", "anchor_first_and", "implicit_and"),
         }.issubset(
             {
                 (match["query"], match["kind"], match["match_mode"])
@@ -4157,6 +4534,12 @@ async def test_pipeline_merges_base_and_enriched_candidates() -> None:
             canonical_text="anniversary dinner restaurant reservation",
             scope=MemoryScope.CONVERSATION,
         )
+        trace = RetrievalTrace(
+            query_text="retry loop websocket backoff",
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-09T12:00:00Z",
+        )
 
         result = await pipeline.execute(
             message_text="retry loop websocket backoff",
@@ -4166,13 +4549,74 @@ async def test_pipeline_merges_base_and_enriched_candidates() -> None:
             conversation_messages=[
                 {"role": "user", "text": "retry loop websocket backoff"},
             ],
+            trace=trace,
         )
 
         assert result.degraded_mode is False
         returned_ids = {candidate["id"] for candidate in result.raw_candidates}
         assert {"mem_base", "mem_enriched"}.issubset(returned_ids)
+        assert trace.candidate_search is not None
+        search_counts = {
+            count.subquery: count
+            for count in trace.candidate_search.per_subquery_counts
+        }
+        # Both lane audits may be grouped under the effective plan's subquery.
+        # Check the actual executed SQL and lane labels, not the presentation key.
+        executions = [
+            execution
+            for count in search_counts.values()
+            for execution in count.fts_query_executions
+        ]
+        base_executions = [item for item in executions if item.lane == "base"]
+        enriched_executions = [item for item in executions if item.lane == "enriched"]
+        assert any("mem_base" in execution.raw_row_ids for execution in base_executions)
+        assert any(
+            "mem_enriched" in execution.raw_row_ids
+            for execution in enriched_executions
+        )
+        assert any(execution.lane == "base" for execution in base_executions)
+        assert any(execution.lane == "enriched" for execution in enriched_executions)
     finally:
         await connection.close()
+
+
+def test_fts_trace_keeps_identical_lane_executions_separate() -> None:
+    sub_query = PlannedSubQuery(
+        text="same query",
+        fts_queries=["same query"],
+        fts_query_kinds=["planned"],
+    )
+    audit = [
+        {
+            "subquery": "same query",
+            "query": "same query",
+            "kind": "planned",
+            "lane": "base",
+            "raw_rows": 3,
+            "raw_row_ids": ["mem_1", "mem_2"],
+        },
+        {
+            "subquery": "same query",
+            "query": "same query",
+            "kind": "planned",
+            "lane": "enriched",
+            "raw_rows": 4,
+            "raw_row_ids": ["mem_2", "mem_3"],
+        },
+    ]
+
+    executions = RetrievalPipeline._build_fts_query_execution_counts(
+        [],
+        sub_query,
+        audit,
+    )
+
+    assert [(execution.lane, execution.raw_rows) for execution in executions] == [
+        ("base", 3),
+        ("enriched", 4),
+    ]
+    assert executions[0].raw_row_ids == ["mem_1", "mem_2"]
+    assert executions[1].raw_row_ids == ["mem_2", "mem_3"]
 
 
 @pytest.mark.asyncio
@@ -4322,6 +4766,107 @@ def test_ambiguity_recovery_expands_scoring_budget() -> None:
 
     assert policy.retrieval_params.rerank_top_k < 32
     assert expanded.retrieval_params.rerank_top_k == 32
+
+
+def test_recall_recovery_scoring_cap_bounds_expansion_and_existing_limit() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+    plan = _slot_fill_plan(exact_recall_mode=True)
+
+    expanded = RetrievalPipeline._expand_recall_or_recovery_scoring_budget(
+        policy,
+        plan,
+        degraded_mode=False,
+        detected_needs=[],
+        item_count=100,
+        cap=32,
+    )
+    above_cap_policy = policy.model_copy(
+        update={
+            "retrieval_params": policy.retrieval_params.model_copy(
+                update={"rerank_top_k": 64}
+            )
+        }
+    )
+    lowered = RetrievalPipeline._expand_recall_or_recovery_scoring_budget(
+        above_cap_policy,
+        plan,
+        degraded_mode=False,
+        detected_needs=[],
+        item_count=100,
+        cap=32,
+    )
+
+    assert expanded.retrieval_params.rerank_top_k == 32
+    assert lowered.retrieval_params.rerank_top_k == 32
+
+
+def test_small_corpus_budget_remains_exempt_from_recall_recovery_cap() -> None:
+    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["general_qa"]
+    policy = PolicyResolver().resolve(manifest, None, None)
+
+    expanded = RetrievalPipeline._expand_candidate_budget(
+        policy,
+        item_count=40,
+    )
+
+    assert expanded.retrieval_params.rerank_top_k == 40
+    assert expanded.retrieval_params.final_context_items == 40
+
+
+@pytest.mark.asyncio
+async def test_recall_recovery_regrounding_is_hard_bounded_to_cap_plus_ten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def add_support(
+        _pipeline: RetrievalPipeline,
+        *,
+        shortlist: list[dict[str, object]],
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        return [
+            *shortlist,
+            *({"id": f"support_{index}"} for index in range(8)),
+        ]
+
+    async def add_windows(
+        _pipeline: RetrievalPipeline,
+        *,
+        shortlist: list[dict[str, object]],
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        return [
+            *shortlist,
+            *({"id": f"window_{index}"} for index in range(8)),
+        ]
+
+    monkeypatch.setattr(
+        RetrievalPipeline,
+        "_reground_summary_support_shortlist",
+        add_support,
+    )
+    monkeypatch.setattr(
+        RetrievalPipeline,
+        "_reground_summary_source_window_shortlist",
+        add_windows,
+    )
+    pipeline = RetrievalPipeline.__new__(RetrievalPipeline)
+    shortlist = [{"id": f"candidate_{index}"} for index in range(32)]
+
+    regrounded = await pipeline._reground_scoring_shortlist(
+        shortlist=shortlist,
+        filtered_candidates=[],
+        conversation_context=object(),  # type: ignore[arg-type]
+        resolved_policy=object(),  # type: ignore[arg-type]
+        detected_needs=[],
+        retrieval_plan=_slot_fill_plan(exact_recall_mode=True),
+        query_text="remembered detail",
+    )
+
+    assert len(regrounded) == 42
+    assert [candidate["id"] for candidate in regrounded[:32]] == [
+        f"candidate_{index}" for index in range(32)
+    ]
 
 
 def test_under_specified_recovery_expands_context_items_with_low_cap() -> None:
@@ -5777,5 +6322,117 @@ async def test_fusion_dedupe_member_join_inactive_outside_exhaustive_coverage() 
             record.get("drop_stage") != "fusion_dedupe"
             for record in result.candidate_custody
         )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_trace_records_applied_override_retrieval_params() -> None:
+    """CS-1.2: the trace records what the engine APPLIED.
+
+    Recorded and requested are now equal by construction -- the AblationConfig
+    boundary rejects any value the engine cannot honor instead of clamping it,
+    so no normalization step sits between the two. That makes the recorded map
+    worth checking against the OBJECTS that carry the values (the plan and the
+    effective policy), which is what proves the engine ran them; asserting it
+    against the request dict alone would now be a tautology.
+    """
+    connection, _memories, _contracts, pipeline, _p, resolved_policy, context = (
+        await _build_runtime()
+    )
+    try:
+        query = "retry loop websocket backoff"
+        trace = RetrievalTrace(
+            query_text=query,
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-05T12:00:00Z",
+        )
+        requested = {
+            "rerank_top_k": 3,
+            "fts_limit": 24,
+            "privacy_ceiling": 2,
+            "max_context_items": 4,
+        }
+        ablation = AblationConfig(
+            skip_need_detection=True,
+            override_retrieval_params=requested,
+        )
+        result = await pipeline.execute(
+            message_text=query,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": query}],
+            ablation=ablation,
+            trace=trace,
+        )
+
+        applied = trace.applied_override_retrieval_params
+        assert applied == requested
+        # The recorded values are the ones the engine ran, checked against the
+        # objects that carry them rather than against the same dict again.
+        effective_policy = pipeline._override_policy(resolved_policy, ablation)
+        assert effective_policy.privacy_ceiling == applied["privacy_ceiling"]
+        assert effective_policy.retrieval_params.rerank_top_k == applied["rerank_top_k"]
+        assert effective_policy.retrieval_params.fts_limit == applied["fts_limit"]
+        assert result.retrieval_plan.privacy_ceiling == applied["privacy_ceiling"]
+        assert result.retrieval_plan.max_context_items == applied["max_context_items"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [
+        # The historical divergence: recorded 99, engine ran 3.
+        {"privacy_ceiling": 99},
+        {"max_context_items": 0},
+        # The model_copy(update=...) hole: this used to build a RetrievalParams
+        # violating its own gt=0 instead of failing.
+        {"rerank_top_k": 0},
+    ],
+)
+def test_unhonorable_override_never_reaches_a_run(
+    requested: dict[str, object],
+) -> None:
+    """A run that cannot be honored is not started, so it cannot be recorded.
+
+    This is the other half of the contract above: applied == requested holds
+    because a request the engine would have to alter is refused outright.
+    """
+    with pytest.raises(ValidationError):
+        AblationConfig(
+            skip_need_detection=True,
+            override_retrieval_params=requested,
+        )
+
+
+@pytest.mark.asyncio
+async def test_trace_applied_override_params_empty_without_overrides() -> None:
+    """Without overrides the trace records an empty applied map (not null),
+    keeping the run record explicit."""
+    connection, _memories, _contracts, pipeline, _p, resolved_policy, context = (
+        await _build_runtime()
+    )
+    try:
+        query = "retry loop websocket backoff"
+        trace = RetrievalTrace(
+            query_text=query,
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            timestamp_iso="2026-04-05T12:00:00Z",
+        )
+        await pipeline.execute(
+            message_text=query,
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+            cold_start=False,
+            conversation_messages=[{"role": "user", "text": query}],
+            ablation=AblationConfig(skip_need_detection=True),
+            trace=trace,
+        )
+
+        assert trace.applied_override_retrieval_params == {}
     finally:
         await connection.close()

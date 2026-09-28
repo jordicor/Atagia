@@ -6,6 +6,12 @@ from benchmarks.consequence_detection_cards.compare import (
     load_cases,
     score_output,
 )
+from benchmarks.consequence_detection_cards.typed_choices import (
+    _apply_recorded_call_failure,
+    _arm_order,
+    _recorded_call_failure,
+    _summarize_arm,
+)
 
 
 def test_consequence_detection_cards_case_set_loads() -> None:
@@ -115,3 +121,112 @@ def test_json_prompt_escapes_data_content() -> None:
 
     assert "&lt;tag attr=&quot;1&quot;&gt;" in prompt
     assert "&lt;unsafe attr=&quot;1&quot;&gt;" in prompt
+
+
+def test_typed_choice_comparison_alternates_arm_order() -> None:
+    assert _arm_order(0) == ("before", "after")
+    assert _arm_order(1) == ("after", "before")
+
+
+def test_typed_choice_summary_retains_correctness_errors_usage_and_counts() -> None:
+    rows = [
+        {
+            "elapsed_ms": 120.0,
+            "score": {
+                "exact_match": True,
+                "detection_match": True,
+                "sentiment_match": True,
+                "link_match": True,
+                "technical_failure": False,
+            },
+        },
+        {
+            "elapsed_ms": 180.0,
+            "score": {
+                "exact_match": False,
+                "detection_match": True,
+                "sentiment_match": False,
+                "link_match": True,
+                "technical_failure": True,
+            },
+        },
+    ]
+    calls = [
+        {
+            "purpose": "consequence_gate_card",
+            "latency_ms": 10.0,
+            "token_counts": {"input_tokens": 20, "output_tokens": 0},
+            "usage": {"input_tokens": 20, "output_tokens": 0},
+            "error": None,
+        },
+        {
+            "purpose": "consequence_action_card",
+            "latency_ms": 30.0,
+            "token_counts": {"input_tokens": 40, "output_tokens": 5},
+            "usage": {"input_tokens": 40, "output_tokens": 5},
+            "error": None,
+        },
+    ]
+
+    summary = _summarize_arm(rows, calls)
+
+    assert summary["cases"] == 2
+    assert summary["exact_matches"] == 1
+    assert summary["detection_matches"] == 2
+    assert summary["sentiment_matches"] == 1
+    assert summary["link_matches"] == 2
+    assert summary["technical_failures"] == 1
+    assert summary["latency_p50_ms"] == 150.0
+    assert summary["all_calls"]["total_calls"] == 2
+    assert summary["decision_calls"]["total_calls"] == 1
+
+
+def test_typed_choice_comparison_treats_recorded_provider_errors_as_failures() -> None:
+    error = _recorded_call_failure(
+        [
+            {
+                "purpose": "consequence_gate_card",
+                "error": {"type": "RuntimeError", "message": "synthetic failure"},
+            },
+            {"purpose": "consequence_action_card", "error": None},
+        ]
+    )
+
+    assert error == {
+        "type": "RecordedLLMFailure",
+        "message": "1 LLM call(s) failed in recorded purposes: consequence_gate_card",
+    }
+
+
+def test_recorded_failure_cannot_score_a_negative_fixture_as_correct() -> None:
+    case = BenchmarkCase(
+        case_id="negative_fixture",
+        message="What time is it?",
+        recent_assistant_messages=(),
+        expected_is_consequence=False,
+        expected_action_terms=(),
+        expected_outcome_terms=(),
+        expected_sentiment=None,
+        expected_link_id=None,
+        expected_language_codes=(),
+    )
+    row = {
+        "output": None,
+        "error": None,
+        "score": score_output(None, case, error=None),
+    }
+
+    _apply_recorded_call_failure(
+        row,
+        case=case,
+        calls=[
+            {
+                "purpose": "consequence_gate_card",
+                "error": {"type": "RuntimeError", "message": "synthetic failure"},
+            }
+        ],
+    )
+
+    assert row["error"]["type"] == "RecordedLLMFailure"
+    assert row["score"]["technical_failure"] is True
+    assert row["score"]["exact_match"] is False

@@ -79,11 +79,18 @@ _NO_DURABLE_OUTPUT = json.dumps(
 )
 
 _MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES = {
-    "memory_extraction_kind_scope_card",
-    "memory_extraction_evidence_card",
+    "memory_extraction_kind_card",
+    "memory_extraction_scope_card",
+    "memory_extraction_confidence_card",
+    "memory_extraction_evidence_support_card",
+    "memory_extraction_preserve_verbatim_card",
+    "memory_extraction_candidate_language_card",
+    "memory_extraction_source_reference_card",
     "memory_extraction_index_card",
-    "memory_extraction_temporal_card",
-    "memory_extraction_belief_card",
+    "memory_extraction_belief_key_card",
+    "memory_extraction_belief_value_card",
+    "memory_extraction_temporal_type_card",
+    "memory_extraction_temporal_interval_card",
     "memory_extraction_coverage_members_card",
 }
 
@@ -108,7 +115,8 @@ class ConfirmationFlowProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -217,6 +225,7 @@ class ConfirmationFlowProvider(LLMProvider):
                 output_text = memory_extraction_card_output_from_payload(
                     self._active_extraction_payload,
                     purpose,
+                    prompt="\n".join(message.content for message in request.messages),
                 )
                 if output_text == "none" or "|" not in output_text:
                     self._active_extraction_payload = None
@@ -228,6 +237,7 @@ class ConfirmationFlowProvider(LLMProvider):
             output_text = memory_extraction_card_output_from_payload(
                 self._active_extraction_payload or {"candidates": []},
                 purpose,
+                prompt="\n".join(message.content for message in request.messages),
             )
             self._active_extraction_consumed.add(purpose)
             if (

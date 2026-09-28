@@ -12,12 +12,16 @@ from atagia.integrations.message_projection import message_to_text
 from atagia.integrations.prompt_injection import (
     ATAGIA_CONTEXT_FOOTER,
     ATAGIA_CONTEXT_HEADER,
+    MINIMAL_MEMORY_INSTRUCTION,
     ContextInjectionDecision,
     append_context_to_prompt,
     build_injection_decision,
     context_messages_for_provider,
     extract_context_message_id,
     extract_context_system_prompt,
+    extract_prompt_data_sections,
+    extract_prompt_data_sections_by_tag,
+    minimal_memory_payload,
 )
 from atagia.integrations.sidecar_bridge import (
     DEFAULT_MODE,
@@ -42,6 +46,7 @@ __all__ = [
     "AURVEK_PLATFORM_ID",
     "DEFAULT_MODE",
     "DEFAULT_TIMEOUT_SECONDS",
+    "MINIMAL_MEMORY_INSTRUCTION",
     "AtagiaClientProtocol",
     "AurvekNamespace",
     "ClientFactory",
@@ -63,5 +68,8 @@ __all__ = [
     "context_messages_for_provider",
     "extract_context_message_id",
     "extract_context_system_prompt",
+    "extract_prompt_data_sections",
+    "extract_prompt_data_sections_by_tag",
     "message_to_text",
+    "minimal_memory_payload",
 ]

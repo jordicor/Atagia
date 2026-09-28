@@ -29,6 +29,7 @@ from atagia.models.schemas_memory import (
     ScoredCandidate,
 )
 from atagia.services.llm_client import LLMClient
+from atagia.services.model_resolution import parse_model_spec
 from atagia.services.providers import build_llm_client
 
 from benchmarks.json_artifacts import write_json_atomic
@@ -45,7 +46,6 @@ VariantName = Literal[
     "cards_single",
     "cards_batch_4",
     "cards_batch_8",
-    "cards_batch_4_no_date",
 ]
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -58,10 +58,15 @@ _ALLOWED_VARIANTS: tuple[VariantName, ...] = (
     "cards_single",
     "cards_batch_4",
     "cards_batch_8",
-    "cards_batch_4_no_date",
 )
 _FIXED_CLOCK = datetime(2026, 6, 17, tzinfo=timezone.utc)
 _MODEL_PRICE_PER_MILLION = {
+    "typesafe/jev-latest": {
+        "input_tokens": 0.042,
+        "output_tokens": 0.0,
+        "cached_input_tokens": 0.042,
+        "source": "TypeSafe console usage pricing, checked 2026-09-17",
+    },
     "google/gemini-3.1-flash-lite": {
         "input_tokens": 0.25,
         "output_tokens": 1.50,
@@ -73,6 +78,15 @@ _MODEL_PRICE_PER_MILLION = {
         "output_tokens": 1.20,
         "cached_input_tokens": 0.06,
         "source": "MiniMax M3 standard pay-as-you-go <=512k input pricing",
+    },
+    "openrouter/openai/gpt-5.6-luna": {
+        "input_tokens": 0.10,
+        "output_tokens": 0.60,
+        "cached_input_tokens": 0.01,
+        "source": (
+            "OpenRouter GPT-5.6 Luna promo pricing, checked 2026-07-31 "
+            "(OpenAI direct list after 2026-07-30 cut: 0.20/1.20, cached 0.02)"
+        ),
     },
 }
 
@@ -110,10 +124,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=",".join(_DEFAULT_VARIANTS),
         help=(
             "Comma-separated variants: cards_single,cards_batch_4,"
-            "cards_batch_8,cards_batch_4_no_date"
+            "cards_batch_8"
         ),
     )
     parser.add_argument("--card-model", default=_DIRECT_GEMINI_FLASH_LITE_MODEL)
+    parser.add_argument(
+        "--relevance-model",
+        default=None,
+        help="Override relevance (for example typesafe/jev-latest); dates come from persisted ingestion annotations.",
+    )
     parser.add_argument(
         "--model",
         default=None,
@@ -158,6 +177,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         llm_forced_global_model=card_model,
     )
     client = build_llm_client(settings)
+    if relevance_model := getattr(args, "relevance_model", None):
+        client._provider(parse_model_spec(relevance_model).provider_name)
     recorder = LLMCallRecorder(progress_interval=args.llm_progress_every)
     install_llm_call_recorder(client, recorder)
 
@@ -189,6 +210,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 variant=variant,
                 card_model=card_model,
                 repetition=repetition + 1,
+                relevance_model=getattr(args, "relevance_model", None),
             )
         print(
             f"{variant} {case.case_id} rep={repetition + 1} "
@@ -231,6 +253,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         card_model=card_model,
         cases_path=Path(args.cases),
     )
+    summary["relevance_model"] = getattr(args, "relevance_model", None) or card_model
     summary_path = write_json_atomic(output_dir / "summary.json", summary)
     per_case_path = write_jsonl_atomic(output_dir / "per_case.jsonl", rows)
     calls_path = write_json_atomic(output_dir / "llm_calls.json", recorder.records())
@@ -241,6 +264,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     write_json_atomic(output_dir / "summary.json", summary)
     print(json.dumps(summary["artifacts"], indent=2, sort_keys=True))
+    await client.aclose()
     return summary
 
 
@@ -252,9 +276,22 @@ async def run_one_variant(
     variant: VariantName,
     card_model: str,
     repetition: int,
+    relevance_model: str | None = None,
 ) -> dict[str, Any]:
     model = card_model
-    settings = replace(base_settings, llm_forced_global_model=model)
+    settings = replace(
+        base_settings,
+        llm_forced_global_model=None,
+        llm_finite_decisions_enabled=(
+            base_settings.llm_finite_decisions_enabled
+            or parse_model_spec(relevance_model or model).provider_slug == "typesafe"
+        ),
+        llm_component_models={
+            **base_settings.llm_component_models,
+            "applicability_scorer": model,
+            "applicability_relevance": relevance_model or model,
+        },
+    )
     scorer = ApplicabilityScorer(
         llm_client=client,
         clock=FrozenClock(_FIXED_CLOCK),
@@ -284,7 +321,6 @@ async def run_one_variant(
             retrieval_plan=retrieval_plan,
             trace=trace,
             card_batch_size=_card_batch_size_for_variant(variant),
-            date_card_enabled=(variant != "cards_batch_4_no_date"),
         )
         error = None
     except Exception as exc:  # noqa: BLE001
@@ -309,6 +345,7 @@ async def run_one_variant(
         "variant": variant,
         "repetition": repetition,
         "model": model,
+        "relevance_model": relevance_model or model,
         "wall_time_ms": wall_time_ms,
         "expected": {
             "top_ids": list(case.expected_top_ids),
@@ -882,6 +919,8 @@ def normalize_scored(scored: list[ScoredCandidate]) -> list[dict[str, Any]]:
             "retrieval_score": item.retrieval_score,
             "final_score": item.final_score,
             "resolved_date": item.resolved_date,
+            "date_certainty": item.date_certainty,
+            "date_resolution_status": item.date_resolution_status,
             "object_type": item.memory_object.get("object_type"),
             "canonical_text": item.memory_object.get("canonical_text"),
         }
@@ -899,21 +938,26 @@ def score_output(output: list[dict[str, Any]], case: BenchmarkCase) -> dict[str,
     useful_hits = sorted(expected_useful & top3)
     drop_cutoff = max(1, len(expected_useful))
     drop_hits = sorted(expected_drop & set(ranked_ids[:drop_cutoff]))
-    expected_date_matches: dict[str, bool] = {}
+    expected_date_matches: dict[str, bool | None] = {}
     output_by_id = {str(item["memory_id"]): item for item in output}
     for memory_id, expected_date in (case.expected_resolved_dates or {}).items():
+        item = output_by_id.get(memory_id, {})
         expected_date_matches[memory_id] = (
-            output_by_id.get(memory_id, {}).get("resolved_date") == expected_date
+            item.get("resolved_date") == expected_date
+            if item.get("date_resolution_status") == "completed"
+            else None
         )
     useful_recall = _safe_div(len(useful_hits), len(expected_useful))
-    exact_match = (
-        top_hit
-        and useful_recall >= 1.0
-        and not drop_hits
-        and all(expected_date_matches.values())
-    )
+    ranking_match = top_hit and useful_recall >= 1.0 and not drop_hits
+    exact_match = ranking_match and all(expected_date_matches.values())
     return {
         "exact_match": exact_match,
+        "ranking_match": ranking_match,
+        "date_evaluation_status": (
+            "unavailable_unprocessed"
+            if any(value is None for value in expected_date_matches.values())
+            else "evaluated" if expected_date_matches else "not_requested"
+        ),
         "top_hit": top_hit,
         "top_id": top_id,
         "ranked_ids": ranked_ids,
@@ -948,7 +992,6 @@ def summarize_run(
         parse_invalid = sum(int(row.get("parse_invalid_count") or 0) for row in variant_rows)
         llm_records = recorder.records_for_context(variant=variant)
         llm_summary = summarize_llm_calls(llm_records)
-        model = card_model
         by_variant[variant] = {
             "cases": len(variant_rows),
             "exact_match_count": exact,
@@ -961,10 +1004,7 @@ def summarize_run(
             "failed_trials": failed,
             "parse_invalid_count": parse_invalid,
             "wall_time_ms": _latency_summary(latencies),
-            "estimated_cost_usd": _estimate_cost_usd(
-                model,
-                llm_summary.get("token_totals") or {},
-            ),
+            "estimated_cost_usd": _estimate_records_cost_usd(llm_records),
             "llm_call_summary": llm_summary,
             "mismatch_case_ids": [
                 row["case_id"]
@@ -982,11 +1022,10 @@ def summarize_run(
         "card_model": card_model,
         "variants": by_variant,
         "pairwise": pairwise_disagreements(rows),
-        "pricing_assumptions": _pricing_assumptions(card_model),
-        "estimated_cost_usd": sum(
-            float(row.get("estimated_cost_usd") or 0.0)
-            for row in by_variant.values()
+        "pricing_assumptions": _pricing_assumptions(
+            *(str(record.get("request_model") or card_model) for record in recorder.records())
         ),
+        "estimated_cost_usd": _estimate_records_cost_usd(recorder.records()),
         "llm_call_summary": llm_call_summary,
     }
 
@@ -1034,8 +1073,11 @@ def _normalize_candidate(raw: dict[str, Any], index: int) -> dict[str, Any]:
         "platform_id": str(raw.get("platform_id") or "default"),
         "platform_id_lock": raw.get("platform_id_lock"),
         "temporal_type": str(raw.get("temporal_type") or "unknown"),
-        "valid_from": str(raw.get("valid_from") or ""),
-        "valid_to": str(raw.get("valid_to") or ""),
+        # Absent validity bounds are NULL/None in production rows; an empty
+        # string would pass the scorer's `is None` guards and fail fast in
+        # datetime parsing.
+        "valid_from": str(raw["valid_from"]) if raw.get("valid_from") else None,
+        "valid_to": str(raw["valid_to"]) if raw.get("valid_to") else None,
         "canonical_text": str(raw["canonical_text"]),
         "payload_json": payload_json,
         "vitality": float(raw.get("vitality", 0.25)),
@@ -1161,6 +1203,22 @@ def _parse_invalid_count(
         }:
             count += 1
     return count
+
+
+def _estimate_records_cost_usd(records: list[dict[str, Any]]) -> float | None:
+    """Price each actual route; unknown pricing is not zero-dollar usage."""
+    total = 0.0
+    for record in records:
+        if record.get("error"):
+            return None
+        estimate = _estimate_cost_usd(
+            str(record.get("request_model") or ""),
+            summarize_llm_calls([record]).get("token_totals") or {},
+        )
+        if estimate is None:
+            return None
+        total += estimate
+    return total
 
 
 def _estimate_cost_usd(model: str, token_totals: dict[str, Any]) -> float | None:

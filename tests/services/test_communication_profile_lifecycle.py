@@ -35,6 +35,7 @@ from atagia.services.lifecycle_service import (
     ERASE_ALL_DATA_CONFIRMATION,
     ConversationLifecycleService,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -79,6 +80,7 @@ def _runtime(clock: FrozenClock) -> SimpleNamespace:
         storage_backend=InProcessBackend(),
         database_path=":memory:",
         embedding_index=_NoopEmbeddingIndex(),
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
     )
 
 

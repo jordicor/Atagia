@@ -26,9 +26,14 @@ from atagia.core.repositories import (
 from atagia.core.summary_repository import SummaryRepository
 from atagia.core.space_repository import SpaceRepository
 from atagia.core.storage_backend import build_recent_window_key
+from atagia.core.user_lifecycle_repository import UserLifecycleRepository
+from atagia.memory.context_envelope import ContextBudgetAboveEnvelopeError
 from atagia.models.schemas_jobs import JobType
 from atagia.models.schemas_memory import SpaceBoundaryMode
+from atagia.models.schemas_replay import AblationConfig
 from atagia.services.chat_service import ChatService
+from atagia.services.chat_support import RECENT_WINDOW_MESSAGES
+from atagia.services.context_cache_service import ContextCacheService
 from atagia.services.errors import (
     ConversationNotActiveError,
     ConversationNotFoundError,
@@ -43,6 +48,8 @@ from atagia.services.llm_client import (
     LLMError,
     LLMProvider,
 )
+
+from tests.recent_window_support import stored_recent_window
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -80,7 +87,8 @@ class ChatServiceProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -477,7 +485,7 @@ async def test_chat_reply_publishes_committed_window_with_exact_conversation_rev
         assert captured["key"] == recent_window_key
         assert captured["messages"] == expected_window
         assert (
-            await runtime.storage_backend.get_recent_window(recent_window_key)
+            await stored_recent_window(runtime.storage_backend, recent_window_key)
             == expected_window
         )
 
@@ -506,6 +514,277 @@ async def test_chat_reply_publishes_committed_window_with_exact_conversation_rev
         assert captured["conversation_source_revision"] == (
             conversation_identity.source_revision
         )
+    finally:
+        await runtime.close()
+
+
+class RevisionBumpingChatServiceProvider(ChatServiceProvider):
+    """Advance the user's cache revision while the model call is in flight.
+
+    Stands in for any background worker write: every derived table has an
+    ``icp_source_*`` trigger that advances ``user_lifecycles.cache_revision``,
+    so this is what a memory extraction landing mid-turn does to the turn's
+    captured cache coordinates.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.runtime: AppRuntime | None = None
+        self.user_id = ""
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        if str(request.metadata.get("purpose")) == "chat_reply":
+            assert self.runtime is not None
+            connection = await self.runtime.open_connection()
+            try:
+                repository = UserLifecycleRepository(connection, self.runtime.clock)
+                identity = await repository.get_active_identity(self.user_id)
+                assert identity is not None
+                assert (
+                    await repository.bump_cache_revision(
+                        self.user_id,
+                        expected_lifecycle_epoch=identity.lifecycle_epoch,
+                    )
+                    is not None
+                )
+            finally:
+                await connection.close()
+        return await super().complete(request)
+
+
+async def _committed_window(
+    runtime: AppRuntime,
+    *,
+    user_id: str,
+    conversation_id: str,
+) -> list[dict[str, str]]:
+    connection = await runtime.open_connection()
+    try:
+        rows = await MessageRepository(connection, runtime.clock).get_recent_messages(
+            conversation_id,
+            user_id,
+            limit=RECENT_WINDOW_MESSAGES,
+        )
+    finally:
+        await connection.close()
+    return [{"role": str(row["role"]), "content": str(row["text"])} for row in rows]
+
+
+async def _post_commit_errors(
+    runtime: AppRuntime,
+    *,
+    user_id: str,
+    retrieval_event_id: str,
+) -> list[str]:
+    connection = await runtime.open_connection()
+    try:
+        event = await RetrievalEventRepository(connection, runtime.clock).get_event(
+            retrieval_event_id,
+            user_id,
+        )
+    finally:
+        await connection.close()
+    assert event is not None
+    return list(event["outcome_json"]["post_commit_errors"])
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_publishes_recent_window_after_a_mid_turn_revision_bump(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A derived-state write during the model call must not lose the window.
+
+    The turn captures its cache coordinates before the model call and commits
+    seconds later, so any worker write in between leaves those coordinates a
+    revision behind. Publishing the recent window under them is refused, and
+    the conversation is left with the previous turn's window: unreadable to a
+    reader holding live coordinates, and never replaced by the transcript this
+    turn committed.
+    """
+    provider = RevisionBumpingChatServiceProvider()
+    monkeypatch.setattr(
+        "atagia.app.build_llm_client",
+        lambda _settings: LLMClient(provider_name=provider.name, providers=[provider]),
+    )
+    runtime = await initialize_runtime(_settings(tmp_path))
+    provider.runtime = runtime
+    provider.user_id = "usr_1"
+    original_publish = runtime.storage_backend.set_recent_window_for_lifecycle
+    captured: dict[str, object] = {}
+
+    async def capture_recent_window(
+        key: str,
+        messages: list[dict[str, object]],
+        **identity: object,
+    ) -> bool:
+        captured["messages"] = messages
+        captured.update(identity)
+        return await original_publish(key, messages, **identity)
+
+    monkeypatch.setattr(
+        runtime.storage_backend,
+        "set_recent_window_for_lifecycle",
+        capture_recent_window,
+    )
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        chat = ChatService(runtime)
+        await chat.chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="Please help me debug this retry loop.",
+            assistant_mode_id="coding_debug",
+        )
+        second = await chat.chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="The retry guard still loops on the second attempt.",
+            assistant_mode_id="coding_debug",
+        )
+
+        assert "recent_window_failed" not in await _post_commit_errors(
+            runtime,
+            user_id="usr_1",
+            retrieval_event_id=second.retrieval_event_id,
+        )
+        committed = await _committed_window(
+            runtime,
+            user_id="usr_1",
+            conversation_id="cnv_1",
+        )
+        assert captured["messages"] == committed
+        assert (
+            await stored_recent_window(runtime.storage_backend,
+                build_recent_window_key("usr_1", "cnv_1")
+            )
+            == committed
+        )
+
+        connection = await runtime.open_connection()
+        try:
+            live_identity = await UserLifecycleRepository(
+                connection,
+                runtime.clock,
+            ).get_active_identity("usr_1")
+        finally:
+            await connection.close()
+        assert live_identity is not None
+        # The published value is keyed to the identity it actually describes,
+        # not to the one the turn captured before the model call.
+        assert captured["lifecycle_epoch"] == live_identity.lifecycle_epoch
+        assert captured["cache_revision"] == live_identity.cache_revision
+        assert captured["derivation_revision"] == live_identity.derivation_revision
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_drops_the_superseded_window_when_publishing_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused publish must leave no window, never an out-of-date one.
+
+    The window an earlier turn published no longer describes the transcript
+    this turn committed. The read fence keeps it from being served as current,
+    but only dropping it lets the next publish start from an honest miss
+    instead of a window nobody can read.
+    """
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        chat = ChatService(runtime)
+        await chat.chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="Please help me debug this retry loop.",
+            assistant_mode_id="coding_debug",
+        )
+        window_key = build_recent_window_key("usr_1", "cnv_1")
+        first_window = await stored_recent_window(runtime.storage_backend, window_key)
+        assert first_window == await _committed_window(
+            runtime,
+            user_id="usr_1",
+            conversation_id="cnv_1",
+        )
+
+        async def refuse_publish(self: ContextCacheService, **_identity: object) -> bool:
+            return False
+
+        monkeypatch.setattr(
+            ContextCacheService,
+            "publish_recent_window",
+            refuse_publish,
+        )
+        second = await chat.chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="The retry guard still loops on the second attempt.",
+            assistant_mode_id="coding_debug",
+        )
+
+        assert "recent_window_failed" in await _post_commit_errors(
+            runtime,
+            user_id="usr_1",
+            retrieval_event_id=second.retrieval_event_id,
+        )
+        assert await stored_recent_window(runtime.storage_backend, window_key) is None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_drops_the_superseded_window_when_publishing_is_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation must not skip the compensating drop.
+
+    A cancelled publish leaves exactly what a failed one leaves: committed
+    messages and a window describing the transcript before them. ``except
+    Exception`` never sees ``CancelledError``, so the drop was skipped and the
+    superseded entry outlived the turn.
+    """
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        chat = ChatService(runtime)
+        await chat.chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="Please help me debug this retry loop.",
+            assistant_mode_id="coding_debug",
+        )
+        window_key = build_recent_window_key("usr_1", "cnv_1")
+        assert await stored_recent_window(runtime.storage_backend, window_key) == (
+            await _committed_window(
+                runtime,
+                user_id="usr_1",
+                conversation_id="cnv_1",
+            )
+        )
+
+        async def cancel_publish(
+            self: ContextCacheService,
+            **_identity: object,
+        ) -> bool:
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(
+            ContextCacheService,
+            "publish_recent_window",
+            cancel_publish,
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await chat.chat_reply(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="The retry guard still loops on the second attempt.",
+                assistant_mode_id="coding_debug",
+            )
+
+        assert await stored_recent_window(runtime.storage_backend, window_key) is None
     finally:
         await runtime.close()
 
@@ -1034,16 +1313,128 @@ async def test_chat_reply_uses_windowed_transcript_and_records_trace(
             assert event["outcome_json"]["transcript_window"]["chunk_ids"] == [
                 "sum_old"
             ]
-            # The recent-transcript budget is derived from the unified context
-            # envelope (context_envelope_budget_tokens pinned to 4096 in
-            # _settings * the recent_transcript ratio 0.20 = floor(819.2) =
-            # 819), not from the manifest's transcript_budget_tokens field.
+            # The recent-transcript budget is min(manifest, envelope): the
+            # coding_debug manifest asks for 8000 and the envelope allocates
+            # 819 (context_envelope_budget_tokens pinned to 4096 in _settings *
+            # the recent_transcript ratio 0.20 = floor(819.2)), so the envelope
+            # is the binding ceiling here. Both inputs are live -- see
+            # test_chat_reply_transcript_budget_honors_the_manifest_ceiling for
+            # the case where the manifest binds instead.
             assert event["outcome_json"]["transcript_window"]["budget_tokens"] == 819
             assert event["outcome_json"]["transcript_window"]["budget_used_tokens"] > 0
         finally:
             await connection.close()
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("envelope_tokens", "override_tokens", "expected_budget_tokens"),
+    [
+        # Manifest binds: the coding_debug manifest asks for 8000 and the
+        # envelope allocates floor(65536 * 0.20) = 13107, so the manifest is
+        # the lower ceiling and the one that must show up.
+        (65_536, None, 8_000),
+        # Envelope binds: floor(4096 * 0.20) = 819 is below the manifest value.
+        (4_096, None, 819),
+        # An explicit override below both replaces the manifest value.
+        (65_536, 512, 512),
+    ],
+)
+async def test_chat_reply_transcript_budget_honors_the_manifest_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    envelope_tokens: int,
+    override_tokens: int | None,
+    expected_budget_tokens: int,
+) -> None:
+    """CS-1.3: ``transcript_budget_tokens`` is a live knob, not decoration.
+
+    It used to be resolved and then ignored -- the transcript builder read the
+    envelope allocation alone, so overrides of 1, 64 and 999999 all produced the
+    identical budget. It now behaves exactly like ``context_budget_tokens``:
+    manifest and envelope are both ceilings and the effective budget is their
+    min, with an explicit override replacing the manifest value.
+    """
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        connection = await runtime.open_connection()
+        try:
+            messages = MessageRepository(connection, runtime.clock)
+            for seq in range(1, 5):
+                await messages.create_message(
+                    f"msg_{seq}",
+                    "cnv_1",
+                    "user" if seq % 2 else "assistant",
+                    seq,
+                    f"recent-{seq}",
+                    None,
+                    {},
+                )
+        finally:
+            await connection.close()
+
+        result = await ChatService(runtime).chat_reply(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="What should I check next?",
+            assistant_mode_id="coding_debug",
+            ablation=AblationConfig(
+                context_envelope_budget_tokens=envelope_tokens,
+                override_retrieval_params=(
+                    None
+                    if override_tokens is None
+                    else {"transcript_budget_tokens": override_tokens}
+                ),
+            ),
+        )
+
+        connection = await runtime.open_connection()
+        try:
+            event = await RetrievalEventRepository(connection, runtime.clock).get_event(
+                result.retrieval_event_id,
+                "usr_1",
+            )
+            assert event is not None
+            window = event["outcome_json"]["transcript_window"]
+            assert window["budget_tokens"] == expected_budget_tokens
+        finally:
+            await connection.close()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_reply_transcript_budget_override_above_the_envelope_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transcript budget obeys the same envelope ceiling as the context one.
+
+    Two sibling budget knobs with two different override contracts would be a
+    trap, so an override above the envelope allocation fails loudly here too.
+    """
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
+        with pytest.raises(ContextBudgetAboveEnvelopeError) as excinfo:
+            await ChatService(runtime).chat_reply(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                message_text="What should I check next?",
+                assistant_mode_id="coding_debug",
+                ablation=AblationConfig(
+                    override_retrieval_params={"transcript_budget_tokens": 999_999}
+                ),
+            )
+        message = str(excinfo.value)
+        assert "transcript_budget_tokens" in message
+        assert "999999" in message
+    finally:
+        await runtime.close()
+
 
 
 @pytest.mark.asyncio

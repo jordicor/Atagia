@@ -45,6 +45,7 @@ from atagia.models.schemas_memory import (
     VerbatimPinTargetKind,
 )
 from atagia.services.context_cache_service import ContextCacheService
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -318,7 +319,11 @@ async def test_ojocentauri_grants_fail_closed_for_unknown_targets() -> None:
             active_mind_id=DEFAULT_OVERSEER_MIND_ID,
             mind_topology=MindTopology.OJOCENTAURI,
         )
-        assert {row["id"] for row in await CandidateSearch(connection, clock).search(plan, "usr_1")} == {
+        assert {row["id"] for row in await CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        ).search(plan, "usr_1")} == {
             "mem_overseer"
         }
     finally:
@@ -394,7 +399,11 @@ async def test_ojocentauri_ignores_malformed_grant_from_non_overseer_mind() -> N
             active_mind_id="mind_alpha",
             mind_topology=MindTopology.OJOCENTAURI,
         )
-        rows = await CandidateSearch(connection, clock).search(plan, "usr_1")
+        rows = await CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        ).search(plan, "usr_1")
         assert {row["id"] for row in rows} == {"mem_alpha"}
         assert all(row.get("mind_relation") != "granted" for row in rows)
     finally:
@@ -448,7 +457,11 @@ async def test_ojocentauri_candidate_search_requires_active_grant() -> None:
             memory_owner_id=None,
         )
 
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
         plan = _plan(
             active_mind_id=DEFAULT_OVERSEER_MIND_ID,
             mind_topology=MindTopology.OJOCENTAURI,
@@ -600,7 +613,11 @@ async def test_candidate_search_filters_by_active_mind_boundary() -> None:
             memory_owner_id=None,
         )
 
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         multi_ids = {
             row["id"]
@@ -662,7 +679,11 @@ async def test_phase3_cross_mind_visibility_fails_closed_without_grants() -> Non
             memory_owner_id=None,
         )
 
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         main_multi_ids = {
             row["id"]
@@ -923,7 +944,11 @@ async def test_verbatim_pins_filter_by_active_mind_in_crud_search_and_candidates
         )
         assert {row["id"] for row in search_rows} == {"pin_alpha"}
 
-        candidate_rows = await CandidateSearch(connection, clock).search(
+        candidate_rows = await CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        ).search(
             _plan(
                 active_mind_id="mind_alpha",
                 mind_topology=MindTopology.MULTI_MIND,
@@ -1066,7 +1091,11 @@ async def test_verbatim_evidence_candidates_carry_active_mind_fields() -> None:
             mind_topology=MindTopology.MULTI_MIND,
             raw_context_access_mode="verbatim",
         ).model_copy(update={"scope_filter": [MemoryScope.CHAT]})
-        rows = await CandidateSearch(connection, clock).search(
+        rows = await CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        ).search(
             plan,
             "usr_1",
         )

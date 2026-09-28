@@ -44,6 +44,7 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.retrieval_pipeline import RetrievalPipeline
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -137,8 +138,8 @@ class InvariantProvider(LLMProvider):
     def _need_card_output(self, purpose: str) -> str:
         if purpose == "need_detection_needs_card":
             return "none"
-        if purpose == "need_detection_language_card":
-            return "en\nen"
+        if purpose in {"need_detection_query_language_card", "need_detection_answer_language_card"}:
+            return "en"
         if purpose == "need_detection_memory_card":
             return str(self.need_response.get("memory_dependence") or "mixed")
         if purpose == "need_detection_exact_card":
@@ -224,6 +225,7 @@ async def _build_runtime(
         embedding_index=NoneBackend(),
         clock=clock,
         settings=resolved_settings,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
     )
     resolved_policy = PolicyResolver().resolve(manifests[mode_id], None, None)
     context = ExtractionConversationContext(

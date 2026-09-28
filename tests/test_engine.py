@@ -54,6 +54,9 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.job_tracking_service import JobTrackingService
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
+
+from tests.turn_telemetry_support import sample_turn_telemetry
 from tests.extraction_payload_support import (
     is_memory_extraction_card_purpose,
     memory_extraction_card_output_from_payload,
@@ -193,7 +196,8 @@ class EngineProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -266,6 +270,7 @@ class EngineProvider(LLMProvider):
                         "nothing_durable": True,
                     },
                     purpose,
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         if purpose == "contract_projection":
@@ -916,7 +921,11 @@ async def test_conversation_delete_tombstones_retrieval_surfaces(
                 == []
             )
 
-            search = CandidateSearch(connection, engine.runtime.clock)
+            search = CandidateSearch(
+                connection,
+                engine.runtime.clock,
+                token_document_frequency_cache=TokenDocumentFrequencyCache(),
+            )
             candidates = await search.search(
                 _persisted_surface_exact_plan(
                     "conversationtombsurface",
@@ -1001,7 +1010,9 @@ async def test_user_erasure_deletes_retrieval_surfaces_and_fts_rows(
             )
 
             before_candidates = await CandidateSearch(
-                connection, engine.runtime.clock
+                connection,
+                engine.runtime.clock,
+                token_document_frequency_cache=TokenDocumentFrequencyCache(),
             ).search(
                 _persisted_surface_exact_plan(
                     "usererasuresurface",
@@ -1050,7 +1061,11 @@ async def test_user_erasure_deletes_retrieval_surfaces_and_fts_rows(
                 == []
             )
             assert (
-                await CandidateSearch(connection, engine.runtime.clock).search(
+                await CandidateSearch(
+                    connection,
+                    engine.runtime.clock,
+                    token_document_frequency_cache=TokenDocumentFrequencyCache(),
+                ).search(
                     _persisted_surface_exact_plan(
                         "usererasuresurface",
                         conversation_id="cnv_surface_erase",
@@ -1185,7 +1200,8 @@ async def test_lifecycle_deletes_only_targeted_retrieval_events(
                         "selected_memory_ids_json": selected_ids,
                         "context_view_json": {"event_id": event_id},
                         "outcome_json": {},
-                    }
+                    },
+                    telemetry=sample_turn_telemetry(),
                 )
         finally:
             await connection.close()
@@ -1360,13 +1376,15 @@ async def test_engine_get_context_includes_recent_transcript_without_fts_overlap
 async def test_engine_get_context_keeps_recent_transcript_inside_context_envelope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The coding_debug manifest asks for 8000 transcript tokens; the default 8192
+    # envelope allocates 1638 to that section. The envelope is the hard ceiling,
+    # so the manifest value can only lower it, never raise it.
     provider = EngineProvider()
     _install_stub_client(monkeypatch, provider)
     engine = Atagia(
         db_path=":memory:",
         openai_api_key="test-openai-key",
         llm_forced_global_model="openai/test-model",
-        recent_transcript_budget_tokens=30000,
     )
 
     await engine.setup()
@@ -1692,7 +1710,7 @@ async def test_engine_chat_can_disable_raw_recent_transcript_for_benchmarks(
 
 
 @pytest.mark.asyncio
-async def test_engine_get_context_cache_hit_exposes_observability_without_retrieval_events(
+async def test_engine_get_context_cache_hit_exposes_observability_and_records_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = EngineProvider()
@@ -1731,10 +1749,51 @@ async def test_engine_get_context_cache_hit_exposes_observability_without_retrie
             "Please help me debug this retry loop."
         ]
         assert "continue" not in [entry.text for entry in second.recent_transcript]
+        # A retrieve-only call is still a retrieval, cache hit included, so both
+        # calls persist a queryable event under the retrieval-only surface.
+        assert first.retrieval_event_id is not None
+        assert second.retrieval_event_id is not None
+        assert first.retrieval_duration_ms > 0.0
         connection = await engine.runtime.open_connection()
         try:
             events = RetrievalEventRepository(connection, engine.runtime.clock)
-            assert await events.list_events("usr_1", "cnv_1", limit=10) == []
+            listed = await events.list_events("usr_1", "cnv_1", limit=10)
+            assert {event["id"] for event in listed} == {
+                first.retrieval_event_id,
+                second.retrieval_event_id,
+            }
+            assert {event["turn_surface"] for event in listed} == {"context"}
+            assert all(event["response_message_id"] is None for event in listed)
+            assert all(event["retrieval_duration_ms"] > 0.0 for event in listed)
+            assert all(event["turn_to_event_write_wall_ms"] > 0.0 for event in listed)
+            # The retrieve-only surface counts retrieval-stage calls only: the
+            # host runs the reply itself, so no reply round-trip is recorded.
+            fresh = next(
+                event for event in listed if event["id"] == first.retrieval_event_id
+            )
+            cached = next(
+                event for event in listed if event["id"] == second.retrieval_event_id
+            )
+            assert fresh["llm_failed_calls"] == 0
+            assert fresh["stage_timings_ms_json"]
+            # The cache hit still costs a staleness decision, and that decision
+            # is a provider round-trip the meter has to see -- the whole point
+            # of metering this surface separately.
+            assert cached["llm_total_calls"] >= 1
+            assert "context_cache_signal_detection" in (
+                cached["llm_by_purpose_json"]
+            )
+            assert cached["llm_total_latency_ms"] > 0.0
+            assert "chat_reply" not in cached["llm_by_purpose_json"]
+            for event in listed:
+                by_purpose = event["llm_by_purpose_json"]
+                assert sum(usage["calls"] for usage in by_purpose.values()) == (
+                    event["llm_total_calls"]
+                )
+                # CS-1.5: the breakdown accounts for the turn's wall time too.
+                assert sum(
+                    usage["latency_ms"] for usage in by_purpose.values()
+                ) == pytest.approx(event["llm_total_latency_ms"])
         finally:
             await connection.close()
     finally:

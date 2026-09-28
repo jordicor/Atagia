@@ -98,6 +98,16 @@ def _common_fields(candidate: LeanExtractionCandidate) -> dict[str, object]:
         valid_to_iso = None
         temporal_confidence = _MAPPED_TEMPORAL_CONFIDENCE_ABSENT
 
+    temporal_payload = {}
+    status = candidate.temporal_status
+    if status is not None:
+        if status.date_resolution is not None:
+            temporal_payload["date_resolution"] = status.date_resolution.model_dump(mode="json")
+        if status.date_interval is not None:
+            temporal_payload["date_interval"] = status.date_interval.model_dump(mode="json")
+        if status.date_not_applicable:
+            temporal_payload["date_resolution_not_applicable"] = dict(status.date_not_applicable)
+
     return {
         "canonical_text": candidate.canonical_text,
         "index_text": candidate.index_text,
@@ -108,6 +118,7 @@ def _common_fields(candidate: LeanExtractionCandidate) -> dict[str, object]:
         "evidence_polarity": MemoryEvidencePolarity.SUPPORTS,
         "speaker_relation_to_subject": MemoryEvidenceSpeakerRelation.UNKNOWN,
         "source_quote": candidate.source_span,
+        "source_reference": candidate.source_reference,
         "trigger_message_ids": [],
         "trigger_quote": None,
         "support_rationale": None,
@@ -122,6 +133,7 @@ def _common_fields(candidate: LeanExtractionCandidate) -> dict[str, object]:
         "preserve_verbatim": candidate.preserve_verbatim,
         "subject_presence_ids": [],
         "payload": {
+            **temporal_payload,
             # Always emit the key so a processed row is distinguishable from a
             # legacy (never-processed) one: key-presence is the processed marker.
             # ``[]`` means "processed, no enumerable members". Stored as plain

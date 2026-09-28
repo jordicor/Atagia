@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -1282,5 +1282,74 @@ async def test_projection_isolated_per_user_and_rejects_mismatched_context_user(
                 resolved_policy=policy,
                 user_id="usr_1",
             )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_contract_memory_stamps_server_side_message_arrival_not_occurred_at() -> None:
+    payload = {
+        "signals": [
+            {
+                "canonical_text": "I prefer direct concise answers",
+                "dimension_name": "directness",
+                "value_json": {"label": "direct", "score": 0.88},
+                "confidence": 0.82,
+                "scope": "assistant_mode",
+                "source_kind": "inferred",
+                "privacy_level": 1,
+                "language_codes": ["en"],
+            }
+        ],
+        "nothing_durable": False,
+    }
+    (
+        connection,
+        clock,
+        conversations,
+        messages,
+        memories,
+        _contracts,
+        projector,
+        _provider,
+        loader,
+    ) = await _build_runtime([payload])
+    try:
+        await _create_conversation(conversations, "coding_debug")
+        # A transcript import can backdate occurred_at to any historical
+        # instant, so the ingest-freshness stamp must come from created_at.
+        source_message = await _create_message(
+            messages,
+            conversation_id="cnv_1",
+            message_id="msg_1",
+            seq=1,
+            text="I prefer direct concise answers.",
+            occurred_at="2019-01-02T03:04:05",
+        )
+        clock.advance(seconds=45)
+
+        signals = await projector.project(
+            message_text=source_message["text"],
+            role="user",
+            conversation_context=_context(
+                conversation_id="cnv_1",
+                message_id="msg_1",
+                mode_id="coding_debug",
+            ),
+            resolved_policy=_resolved_policy(loader, "coding_debug"),
+            user_id="usr_1",
+        )
+
+        persisted = await memories.list_for_user("usr_1")
+
+        assert len(signals) == 1
+        assert len(persisted) == 1
+        assert persisted[0]["source_message_created_at"] == str(source_message["created_at"])
+        assert persisted[0]["source_message_created_at"] != str(source_message["occurred_at"])
+        assert persisted[0]["created_at"] > str(source_message["created_at"])
+        assert (
+            datetime.fromisoformat(str(persisted[0]["created_at"]))
+            - datetime.fromisoformat(str(source_message["created_at"]))
+        ) == timedelta(seconds=45)
     finally:
         await connection.close()

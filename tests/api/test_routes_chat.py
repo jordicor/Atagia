@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -45,6 +47,8 @@ from atagia.services.llm_client import (
     LLMProvider,
 )
 from atagia.services.selected_transcript_service import SelectedTranscriptService
+
+from tests.turn_telemetry_support import sample_turn_telemetry
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -95,7 +99,8 @@ class QueueProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -415,7 +420,7 @@ def test_incognito_route_toggles_and_hides_broad_conversation_memories(
                 )
             )
             client.portal.call(
-                events.create_event,
+                partial(events.create_event, telemetry=sample_turn_telemetry()),
                 {
                     "id": "evt_incognito_peer",
                     "user_id": "usr_incognito",

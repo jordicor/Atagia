@@ -32,6 +32,7 @@ from atagia.models.schemas_memory import (
 )
 from atagia.services.artifact_service import ArtifactService
 from atagia.services.embeddings import EmbeddingMatch
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 
@@ -99,7 +100,11 @@ async def test_candidate_search_surfaces_artifact_chunks_in_artifact_mode() -> N
         conversations = ConversationRepository(connection, clock)
         messages = MessageRepository(connection, clock)
         artifacts = ArtifactService(connection, clock)
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         await users.create_user("usr_a")
         await connection.execute(
@@ -191,7 +196,11 @@ async def test_candidate_search_keeps_own_severance_space_artifact_chunks() -> N
         conversations = ConversationRepository(connection, clock)
         messages = MessageRepository(connection, clock)
         artifacts = ArtifactService(connection, clock)
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         await users.create_user("usr_a")
         await connection.execute(
@@ -300,7 +309,11 @@ async def test_candidate_search_filters_intimacy_bound_artifacts_until_authorize
         conversations = ConversationRepository(connection, clock)
         messages = MessageRepository(connection, clock)
         artifacts = ArtifactService(connection, clock)
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         await users.create_user("usr_a")
         await connection.execute(
@@ -396,7 +409,11 @@ async def test_artifact_chunk_search_allows_private_sensitivity_only_when_plan_a
         conversations = ConversationRepository(connection, clock)
         messages = MessageRepository(connection, clock)
         artifacts = ArtifactRepository(connection, clock)
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         await users.create_user("usr_a")
         await connection.execute(
@@ -476,7 +493,11 @@ async def test_artifact_chunks_do_not_leak_from_conversation_scope_to_global_sco
         conversations = ConversationRepository(connection, clock)
         messages = MessageRepository(connection, clock)
         artifacts = ArtifactService(connection, clock)
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         await users.create_user("usr_a")
         await connection.execute(
@@ -566,7 +587,11 @@ async def test_exact_recall_artifact_search_falls_back_to_broader_fts_queries() 
         conversations = ConversationRepository(connection, clock)
         messages = MessageRepository(connection, clock)
         artifacts = ArtifactService(connection, clock)
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         await users.create_user("usr_a")
         await connection.execute(
@@ -665,7 +690,11 @@ async def test_artifact_search_includes_chunks_linked_to_retrieved_source_messag
         messages = MessageRepository(connection, clock)
         memories = MemoryObjectRepository(connection, clock)
         artifacts = ArtifactService(connection, clock)
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         await users.create_user("usr_a")
         await connection.execute(
@@ -770,7 +799,12 @@ async def test_artifact_search_includes_chunks_linked_to_embedding_candidates() 
         memories = MemoryObjectRepository(connection, clock)
         artifacts = ArtifactRepository(connection, clock)
         embedding_index = FakeEmbeddingIndex([EmbeddingMatch(memory_id="mem_semantic", score=0.92)])
-        search = CandidateSearch(connection, clock, embedding_index=embedding_index)
+        search = CandidateSearch(
+            connection,
+            clock,
+            embedding_index=embedding_index,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         await users.create_user("usr_a")
         await connection.execute(
@@ -861,7 +895,11 @@ async def test_artifact_search_tries_original_query_rewrites_after_sparse_querie
         conversations = ConversationRepository(connection, clock)
         messages = MessageRepository(connection, clock)
         artifacts = ArtifactService(connection, clock)
-        search = CandidateSearch(connection, clock)
+        search = CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        )
 
         await users.create_user("usr_a")
         await connection.execute(

@@ -63,6 +63,7 @@ from atagia.services.worker_job_lease import JobLeaseLostError
 from atagia.transport_ids import encode_path_id
 from atagia.workers.ingest_worker import IngestWorker
 from atagia.workers.transcript_rebuild_worker import TranscriptRebuildWorker
+from tests.turn_telemetry_support import sample_turn_telemetry
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -1287,7 +1288,8 @@ async def test_undo_rebuilds_activity_and_removes_abandoned_retrieval_trace(
                     "context_view_json": {"branch": "old"},
                     "outcome_json": {"used": True},
                     "created_at": "2026-07-12T12:09:30+00:00",
-                }
+                },
+                telemetry=sample_turn_telemetry(),
             )
             stats = await ConversationActivityService(
                 runtime

@@ -30,6 +30,7 @@ from atagia.memory.contract_projection import ContractProjector
 from atagia.memory.context_envelope import (
     ContextEnvelopeBudget,
     allocate_context_envelope_budget,
+    effective_budget_under_envelope,
 )
 from atagia.memory.coverage_expander import CoverageExpansionPlan, CoverageExpander
 from atagia.memory.need_detector import NeedCardCall, NeedDetector
@@ -40,6 +41,7 @@ from atagia.memory.retrieval_planner import (
     RetrievalPlanner,
     build_retrieval_fts_queries,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 from atagia.models.schemas_memory import (
     AdaptiveGateStatus,
     CandidateSearchTrace,
@@ -81,7 +83,11 @@ from atagia.models.schemas_memory import (
     UserCommunicationProfile,
     UserCommunicationProfileTrace,
 )
-from atagia.models.schemas_replay import AblationConfig, PipelineResult
+from atagia.models.schemas_replay import (
+    LLM_COVERAGE_MAX_SUBQUERIES,
+    AblationConfig,
+    PipelineResult,
+)
 from atagia.services.embeddings import EmbeddingIndex
 from atagia.services.llm_client import LLMClient
 from atagia.services.prompt_authority import (
@@ -113,8 +119,8 @@ COVERAGE_INHERITED_SCORE_CAP: Final[float] = 0.70
 COVERAGE_INHERITED_SCORE_FLOOR: Final[float] = 0.05
 SUMMARY_SOURCE_WINDOW_PER_RUN_LIMIT: Final[int] = 4
 SUMMARY_SOURCE_WINDOW_SIZE: Final[int] = 7
+RECALL_RECOVERY_REGROUNDING_ADDITION_LIMIT: Final[int] = 10
 LLM_COVERAGE_CANDIDATE_LIMIT: Final[int] = 12
-LLM_COVERAGE_MAX_SUBQUERIES: Final[int] = 3
 PRIVACY_OFF_RETRIEVAL_STATUSES: Final[tuple[MemoryStatus, ...]] = (
     MemoryStatus.ACTIVE,
     MemoryStatus.REVIEW_REQUIRED,
@@ -294,10 +300,12 @@ class RetrievalPipeline:
 
     def __init__(
         self,
+        *,
         connection: aiosqlite.Connection,
         llm_client: LLMClient[Any],
         embedding_index: EmbeddingIndex,
         clock: Clock,
+        token_document_frequency_cache: TokenDocumentFrequencyCache,
         settings: Settings | None = None,
     ) -> None:
         self._connection = connection
@@ -325,6 +333,7 @@ class RetrievalPipeline:
         self._candidate_search = CandidateSearch(
             connection,
             clock,
+            token_document_frequency_cache=token_document_frequency_cache,
             embedding_index=embedding_index,
             settings=self._settings,
         )
@@ -390,6 +399,15 @@ class RetrievalPipeline:
         character_id = _effective_character_id(conversation_context)
         if trace is not None:
             trace.privacy_enforcement = effective_ablation.privacy_enforcement
+            # Applied equals requested by construction: the AblationConfig
+            # boundary rejects any key the engine does not read and any value it
+            # cannot honor rather than normalizing them, and it stores the
+            # result as an immutable mapping, so nothing can add a key between
+            # that check and this copy. This is exactly what every consumer
+            # below reads and exactly what the caller asked for.
+            trace.applied_override_retrieval_params = dict(
+                effective_ablation.override_retrieval_params or {}
+            )
         if effective_ablation.privacy_enforcement != "enforce":
             logger.warning(
                 "retrieval_privacy_enforcement_not_enforced_for_request",
@@ -714,6 +732,10 @@ class RetrievalPipeline:
                     stage_timings=stage_timings,
                     trace=trace,
                     pipeline_start=pipeline_start,
+                    fts_query_audit=[
+                        {**entry, "lane": "base"}
+                        for entry in base_fts_query_audit
+                    ],
                 )
             if trace is not None:
                 trace.raw_context_access_mode = (
@@ -751,11 +773,16 @@ class RetrievalPipeline:
                     *self._planner_temporary_scaffolding(retrieval_plan),
                 ],
             )
-        fts_query_audit = (
-            enriched_fts_query_audit
-            if enriched_plan is not None
-            else base_fts_query_audit
-        )
+        # Both lanes executed real SQL. Preserve both audit streams even when
+        # the enriched plan becomes the effective ranking plan; otherwise a
+        # base-only harvest is indistinguishable from a query that never ran.
+        fts_query_audit = [
+            *({**entry, "lane": "base"} for entry in base_fts_query_audit),
+            *(
+                {**entry, "lane": "enriched"}
+                for entry in enriched_fts_query_audit
+            ),
+        ]
         raw_candidates = self._merge_candidates(base_candidates, enriched_candidates)
         coverage_candidates = await self._measure_stage(
             stage_timings,
@@ -766,7 +793,11 @@ class RetrievalPipeline:
                 retrieval_plan=retrieval_plan,
             ),
         )
-        raw_candidates = self._merge_candidates(raw_candidates, coverage_candidates)
+        raw_candidates = self._merge_candidates(
+            raw_candidates,
+            coverage_candidates,
+            lane_labels=("merged", "coverage"),
+        )
         llm_coverage_candidates = await self._measure_stage(
             stage_timings,
             "llm_coverage_expansion",
@@ -778,7 +809,11 @@ class RetrievalPipeline:
                 ablation=effective_ablation,
             ),
         )
-        raw_candidates = self._merge_candidates(raw_candidates, llm_coverage_candidates)
+        raw_candidates = self._merge_candidates(
+            raw_candidates,
+            llm_coverage_candidates,
+            lane_labels=("merged", "llm_coverage"),
+        )
         # Regrounding is decided by the winning plan (enriched when available)
         # so the base search does not inject derived memories when high-stakes
         # needs require direct evidence.
@@ -862,31 +897,28 @@ class RetrievalPipeline:
             degraded_mode=degraded_mode,
             detected_needs=detected_needs,
             item_count=len(scoring_pool),
+            cap=self._settings.recall_recovery_scoring_max_candidates,
         )
         scoring_policy = self._policy_for_late_privacy_mode(
             scoring_policy,
             effective_ablation,
         )
-        shortlist = early_diversity_select(
+        shortlist = await self._select_scoring_shortlist(
             scoring_pool,
-            query_type=retrieval_plan.query_type,
+            retrieval_plan=retrieval_plan,
             shortlist_k=scoring_policy.retrieval_params.rerank_top_k,
+            user_id=conversation_context.user_id,
         )
         # Obligation-driven support recovery still searches the PRE-dedupe
         # pool: a summary's exact L0 support may be a collapsed carrier, and
         # evidence obligations outrank the dedupe (recovered carriers are not
         # custody-labeled as deduped).
-        shortlist = await self._reground_summary_support_shortlist(
+        shortlist = await self._reground_scoring_shortlist(
             shortlist=shortlist,
             filtered_candidates=filtered_candidates,
             conversation_context=conversation_context,
             resolved_policy=scoring_policy,
             detected_needs=detected_needs,
-            retrieval_plan=retrieval_plan,
-        )
-        shortlist = await self._reground_summary_source_window_shortlist(
-            shortlist=shortlist,
-            conversation_context=conversation_context,
             retrieval_plan=retrieval_plan,
             query_text=message_text,
         )
@@ -1441,6 +1473,7 @@ class RetrievalPipeline:
         stage_timings: dict[str, float],
         trace: RetrievalTrace | None,
         pipeline_start: float,
+        fts_query_audit: list[dict[str, Any]],
     ) -> PipelineResult:
         """Compose context for a gate-skipped turn (D4).
 
@@ -1581,8 +1614,8 @@ class RetrievalPipeline:
             trace.candidate_search = self._build_candidate_search_trace(
                 raw_candidates,
                 retrieval_plan,
-                0.0,
-                [],
+                stage_timings.get("base_candidate_search", 0.0),
+                fts_query_audit,
             )
             trace.policy_filter_audit = self._build_policy_filter_audit(
                 effective_ablation.privacy_enforcement,
@@ -1928,7 +1961,11 @@ class RetrievalPipeline:
                     runtime_alias_groups=runtime_alias_groups,
                 ),
             )
-            raw_candidates = self._merge_candidates(raw_candidates, searched_candidates)
+            raw_candidates = self._merge_candidates(
+                raw_candidates,
+                searched_candidates,
+                lane_labels=("merged", "exact_recall_search"),
+            )
         pre_regrounding_candidates = list(raw_candidates)
         raw_candidates = self._apply_regrounding_requirements(
             raw_candidates, retrieval_plan
@@ -1977,22 +2014,18 @@ class RetrievalPipeline:
             scoring_policy,
             effective_ablation,
         )
-        shortlist = early_diversity_select(
+        shortlist = await self._select_scoring_shortlist(
             filtered_candidates,
-            query_type=retrieval_plan.query_type,
+            retrieval_plan=retrieval_plan,
             shortlist_k=scoring_policy.retrieval_params.rerank_top_k,
+            user_id=conversation_context.user_id,
         )
-        shortlist = await self._reground_summary_support_shortlist(
+        shortlist = await self._reground_scoring_shortlist(
             shortlist=shortlist,
             filtered_candidates=filtered_candidates,
             conversation_context=conversation_context,
             resolved_policy=scoring_policy,
             detected_needs=detected_needs,
-            retrieval_plan=retrieval_plan,
-        )
-        shortlist = await self._reground_summary_source_window_shortlist(
-            shortlist=shortlist,
-            conversation_context=conversation_context,
             retrieval_plan=retrieval_plan,
             query_text=message_text,
         )
@@ -2243,8 +2276,9 @@ class RetrievalPipeline:
         degraded_mode: bool,
         detected_needs: list[Any],
         item_count: int,
+        cap: int | None = None,
     ) -> ResolvedRetrievalPolicy:
-        """Score all recall/recovery candidates while the candidate set is bounded."""
+        """Expand recall/recovery scoring, bounded by an optional challenger cap."""
         recovery_needs = {
             NeedTrigger.AMBIGUITY,
             NeedTrigger.FOLLOW_UP_FAILURE,
@@ -2267,13 +2301,69 @@ class RetrievalPipeline:
             and not exhaustive_coverage
         ):
             return resolved_policy
-        if item_count <= resolved_policy.retrieval_params.rerank_top_k:
+        current_limit = resolved_policy.retrieval_params.rerank_top_k
+        target_limit = max(current_limit, item_count)
+        if cap is not None:
+            target_limit = min(target_limit, cap)
+        if target_limit == current_limit:
             return resolved_policy
         expanded_retrieval = resolved_policy.retrieval_params.model_copy(
-            update={"rerank_top_k": item_count}
+            update={"rerank_top_k": target_limit}
         )
         return resolved_policy.model_copy(
             update={"retrieval_params": expanded_retrieval}
+        )
+
+    async def _select_scoring_shortlist(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        retrieval_plan: RetrievalPlan,
+        shortlist_k: int,
+        user_id: str,
+    ) -> list[dict[str, Any]]:
+        """Apply optional fused guards before the second shortlist cut."""
+        ordered = candidates
+        if self._settings.fused_candidate_guard_ordering_enabled:
+            ordered = await self._candidate_search.order_candidates_with_guards(
+                candidates,
+                retrieval_plan,
+                user_id=user_id,
+            )
+            selected: list[dict[str, Any]] = []
+            guard_bucket: list[dict[str, Any]] = []
+            active_priority: tuple[int, int] | None = None
+            for candidate in ordered:
+                priority = self._candidate_search.candidate_guard_priority(
+                    candidate,
+                    retrieval_plan,
+                )
+                if active_priority is not None and priority != active_priority:
+                    selected.extend(
+                        early_diversity_select(
+                            guard_bucket,
+                            query_type=retrieval_plan.query_type,
+                            shortlist_k=shortlist_k - len(selected),
+                        )
+                    )
+                    if len(selected) >= shortlist_k:
+                        return selected[:shortlist_k]
+                    guard_bucket = []
+                active_priority = priority
+                guard_bucket.append(candidate)
+            if guard_bucket and len(selected) < shortlist_k:
+                selected.extend(
+                    early_diversity_select(
+                        guard_bucket,
+                        query_type=retrieval_plan.query_type,
+                        shortlist_k=shortlist_k - len(selected),
+                    )
+                )
+            return selected[:shortlist_k]
+        return early_diversity_select(
+            ordered,
+            query_type=retrieval_plan.query_type,
+            shortlist_k=shortlist_k,
         )
 
     @staticmethod
@@ -2393,39 +2483,103 @@ class RetrievalPipeline:
     def _merge_candidates(
         base: list[dict[str, Any]],
         enriched: list[dict[str, Any]],
+        *,
+        lane_labels: tuple[str, str] = ("base", "enriched"),
     ) -> list[dict[str, Any]]:
         """Merge base and enriched candidate lists, deduping by memory_id.
 
         Preserves the entry with the higher ``rrf_score`` when a memory
-        appears in both lists. Base comes first so its ordering survives
-        ties, which keeps degraded-mode outputs deterministic.
+        appears in both lists, then orders the union by that normalized
+        retrieval score (descending) so a candidate found only by the
+        enriched lane reaches the shortlist on merit instead of sitting
+        behind the whole base lane. The sort is stable, so equal scores
+        keep the base-first insertion order and degraded-mode outputs stay
+        deterministic. Lane provenance is recorded under
+        ``retrieval_lanes`` for tracing.
         """
         if not enriched:
-            return list(base)
+            return [
+                RetrievalPipeline._with_lane_provenance(candidate, lane_labels[0])
+                for candidate in base
+            ]
         if not base:
-            return list(enriched)
+            return [
+                RetrievalPipeline._with_lane_provenance(candidate, lane_labels[1])
+                for candidate in enriched
+            ]
         merged: dict[str, dict[str, Any]] = {}
         order: list[str] = []
         for candidate in base:
             memory_id = str(candidate["id"])
-            merged[memory_id] = candidate
+            merged[memory_id] = RetrievalPipeline._with_lane_provenance(
+                candidate, lane_labels[0]
+            )
             order.append(memory_id)
         for candidate in enriched:
             memory_id = str(candidate["id"])
+            RetrievalPipeline._with_lane_provenance(candidate, lane_labels[1])
             existing = merged.get(memory_id)
             if existing is None:
                 merged[memory_id] = candidate
                 order.append(memory_id)
                 continue
-            existing_score = float(existing.get("rrf_score") or 0.0)
-            candidate_score = float(candidate.get("rrf_score") or 0.0)
-            if candidate_score > existing_score:
+            for lane in candidate["retrieval_lanes"]:
+                if lane not in existing["retrieval_lanes"]:
+                    existing["retrieval_lanes"].append(lane)
+            existing_score = RetrievalPipeline._normalized_retrieval_score(
+                existing.get("rrf_score")
+            )
+            candidate_score = RetrievalPipeline._normalized_retrieval_score(
+                candidate.get("rrf_score")
+            )
+            existing_priority = (
+                existing_score,
+                RetrievalPipeline._normalized_retrieval_score(
+                    existing.get("rrf_subquery_coverage")
+                ),
+            )
+            candidate_priority = (
+                candidate_score,
+                RetrievalPipeline._normalized_retrieval_score(
+                    candidate.get("rrf_subquery_coverage")
+                ),
+            )
+            if candidate_priority > existing_priority:
                 replacement = dict(candidate)
                 CandidateSearch._merge_fts_query_matches(replacement, existing)
+                replacement["retrieval_lanes"] = list(existing["retrieval_lanes"])
                 merged[memory_id] = replacement
             else:
                 CandidateSearch._merge_fts_query_matches(existing, candidate)
-        return [merged[memory_id] for memory_id in order]
+        fused = [merged[memory_id] for memory_id in order]
+        fused.sort(
+            key=lambda candidate: (
+                -RetrievalPipeline._normalized_retrieval_score(
+                    candidate.get("rrf_score")
+                ),
+                -RetrievalPipeline._normalized_retrieval_score(
+                    candidate.get("rrf_subquery_coverage")
+                ),
+                -RetrievalPipeline._normalized_retrieval_score(
+                    candidate.get("coverage_inherited_score")
+                ),
+            )
+        )
+        return fused
+
+    @staticmethod
+    def _with_lane_provenance(
+        candidate: dict[str, Any],
+        lane_label: str,
+    ) -> dict[str, Any]:
+        """Record the retrieval lane that surfaced the candidate for tracing."""
+        lanes = candidate.get("retrieval_lanes")
+        if not isinstance(lanes, list):
+            lanes = []
+            candidate["retrieval_lanes"] = lanes
+        if lane_label not in lanes:
+            lanes.append(lane_label)
+        return candidate
 
     async def _source_message_coverage_candidates(
         self,
@@ -2657,16 +2811,23 @@ class RetrievalPipeline:
     @staticmethod
     def _llm_coverage_candidate_limit(ablation: AblationConfig) -> int:
         override_params = ablation.override_retrieval_params or {}
-        if "llm_coverage_candidate_limit" not in override_params:
-            return LLM_COVERAGE_CANDIDATE_LIMIT
-        return max(1, int(override_params["llm_coverage_candidate_limit"]))
+        # Annotated rather than coerced: the AblationConfig boundary already
+        # guarantees an in-range int, and re-coercing here would reintroduce the
+        # silent normalization this phase removed.
+        limit: int = override_params.get(
+            "llm_coverage_candidate_limit",
+            LLM_COVERAGE_CANDIDATE_LIMIT,
+        )
+        return limit
 
     @staticmethod
     def _llm_coverage_max_subqueries(ablation: AblationConfig) -> int:
         override_params = ablation.override_retrieval_params or {}
-        if "llm_coverage_max_subqueries" not in override_params:
-            return LLM_COVERAGE_MAX_SUBQUERIES
-        return max(1, min(3, int(override_params["llm_coverage_max_subqueries"])))
+        max_subqueries: int = override_params.get(
+            "llm_coverage_max_subqueries",
+            LLM_COVERAGE_MAX_SUBQUERIES,
+        )
+        return max_subqueries
 
     @staticmethod
     def _should_expand_source_message_coverage(
@@ -2745,13 +2906,12 @@ class RetrievalPipeline:
     ) -> dict[str, Any]:
         annotated = dict(candidate)
         source_score = cls._normalized_retrieval_score(source_metadata.get("rrf_score"))
-        inherited_score = min(
+        # The inherited score is neighbor provenance, not retrieval evidence:
+        # keep it under its own key so coverage-only siblings never outrank
+        # genuinely retrieved candidates in the fused merge order.
+        annotated["coverage_inherited_score"] = min(
             COVERAGE_INHERITED_SCORE_CAP,
             max(COVERAGE_INHERITED_SCORE_FLOOR, source_score * 0.8),
-        )
-        annotated["rrf_score"] = max(
-            cls._normalized_retrieval_score(annotated.get("rrf_score")),
-            inherited_score,
         )
         annotated.setdefault("channel_ranks", {})
         annotated["coverage_source_message_id"] = source_message_id
@@ -2845,21 +3005,24 @@ class RetrievalPipeline:
             plan.status_filter = self._privacy_off_status_filter(plan.status_filter)
         if ablation.force_all_scopes:
             plan.scope_filter = list(MemoryScope)
+        # Values arrive already validated from the AblationConfig boundary,
+        # against the bounds RetrievalPlan declares for these very fields. That
+        # is what makes plain assignment safe here: RetrievalPlan is not
+        # validate_assignment, so an unchecked value would be written straight
+        # past its own Field constraints.
         override_params = ablation.override_retrieval_params or {}
         if "max_candidates" in override_params:
-            plan.max_candidates = max(0, int(override_params["max_candidates"]))
+            plan.max_candidates = override_params["max_candidates"]
         if "max_context_items" in override_params:
-            plan.max_context_items = max(1, int(override_params["max_context_items"]))
+            plan.max_context_items = override_params["max_context_items"]
         if "vector_limit" in override_params:
-            plan.vector_limit = max(0, int(override_params["vector_limit"]))
+            plan.vector_limit = override_params["vector_limit"]
         if "privacy_ceiling" in override_params:
-            plan.privacy_ceiling = max(
-                0, min(3, int(override_params["privacy_ceiling"]))
-            )
+            plan.privacy_ceiling = override_params["privacy_ceiling"]
         if "allow_private_sensitivity" in override_params:
-            plan.allow_private_sensitivity = bool(
-                override_params["allow_private_sensitivity"]
-            )
+            plan.allow_private_sensitivity = override_params[
+                "allow_private_sensitivity"
+            ]
         return plan
 
     async def _safe_content_language_profile(
@@ -3156,7 +3319,10 @@ class RetrievalPipeline:
         privacy_enforcement: str,
     ) -> list[dict[str, Any]]:
         if not self._policy_filters_enforced(privacy_enforcement):
-            return list(candidates)
+            # Policy gates stay off, but the pool order must not depend on the
+            # privacy mode: apply the same top-retrieval-score preservation
+            # quota the enforced path gets from ``filter_candidates``.
+            return self._scorer.preserve_top_retrieval_scores(list(candidates))
         return self._scorer.filter_candidates(
             candidates,
             resolved_policy,
@@ -3205,6 +3371,35 @@ class RetrievalPipeline:
             == SummaryViewKind.CONVERSATION_CHUNK.value
             and bool(payload_json.get("source_excerpt_messages"))
         )
+
+    async def _reground_scoring_shortlist(
+        self,
+        *,
+        shortlist: list[dict[str, Any]],
+        filtered_candidates: list[dict[str, Any]],
+        conversation_context: ExtractionConversationContext,
+        resolved_policy: ResolvedRetrievalPolicy,
+        detected_needs: list[Any],
+        retrieval_plan: RetrievalPlan,
+        query_text: str,
+    ) -> list[dict[str, Any]]:
+        """Run both additive regrounding passes under one hard size bound."""
+        maximum_size = len(shortlist) + RECALL_RECOVERY_REGROUNDING_ADDITION_LIMIT
+        regrounded = await self._reground_summary_support_shortlist(
+            shortlist=shortlist,
+            filtered_candidates=filtered_candidates,
+            conversation_context=conversation_context,
+            resolved_policy=resolved_policy,
+            detected_needs=detected_needs,
+            retrieval_plan=retrieval_plan,
+        )
+        regrounded = await self._reground_summary_source_window_shortlist(
+            shortlist=regrounded,
+            conversation_context=conversation_context,
+            retrieval_plan=retrieval_plan,
+            query_text=query_text,
+        )
+        return regrounded[:maximum_size]
 
     async def _reground_summary_source_window_shortlist(
         self,
@@ -3798,34 +3993,50 @@ class RetrievalPipeline:
         for field_name in RetrievalParams.model_fields:
             if field_name in override_params:
                 retrieval_updates[field_name] = override_params[field_name]
+        # model_validate, not model_copy(update=...): model_copy assigns without
+        # running validation, so an override could build a RetrievalParams that
+        # violates its own Field bounds (rerank_top_k=0 against gt=0). The
+        # AblationConfig boundary already rejects those values; constructing
+        # through validation is what makes that a structural guarantee instead
+        # of a convention two modules have to keep in step. The enclosing
+        # ResolvedRetrievalPolicy copy below stays a model_copy because that
+        # model declares no Field bounds of its own to enforce -- notably
+        # transcript_budget_tokens legitimately reaches 0 when the envelope
+        # allocates nothing to the transcript section.
         retrieval_params = (
-            resolved_policy.retrieval_params.model_copy(update=retrieval_updates)
+            RetrievalParams.model_validate(
+                {**resolved_policy.retrieval_params.model_dump(), **retrieval_updates}
+            )
             if retrieval_updates
             else resolved_policy.retrieval_params
         )
         updates: dict[str, Any] = {"retrieval_params": retrieval_params}
+        # Both prompt-section budgets are resolved against the same envelope
+        # ceiling, which neither input can raise. Below it they are NOT
+        # symmetric: the manifest/policy value can only lower the budget, while
+        # an explicit override REPLACES it and may sit above the manifest --
+        # an ablation exists to probe budgets the shipped manifests do not
+        # ship. An override above the allocation raises rather than being
+        # capped -- see ``effective_budget_under_envelope``.
         envelope_budget = self._effective_context_envelope_budget(ablation)
-        updates["context_budget_tokens"] = (
-            envelope_budget.retrieved_context_budget_tokens
+        updates["context_budget_tokens"] = effective_budget_under_envelope(
+            knob="context_budget_tokens",
+            policy_budget_tokens=resolved_policy.context_budget_tokens,
+            envelope_budget_tokens=envelope_budget.retrieved_context_budget_tokens,
+            override_budget_tokens=override_params.get("context_budget_tokens"),
         )
-        if "context_budget_tokens" in override_params:
-            updates["context_budget_tokens"] = max(
-                1,
-                int(override_params["context_budget_tokens"]),
-            )
-        if "transcript_budget_tokens" in override_params:
-            updates["transcript_budget_tokens"] = max(
-                1,
-                int(override_params["transcript_budget_tokens"]),
-            )
+        updates["transcript_budget_tokens"] = effective_budget_under_envelope(
+            knob="transcript_budget_tokens",
+            policy_budget_tokens=resolved_policy.transcript_budget_tokens,
+            envelope_budget_tokens=envelope_budget.recent_transcript_budget_tokens,
+            override_budget_tokens=override_params.get("transcript_budget_tokens"),
+        )
         if "privacy_ceiling" in override_params:
-            updates["privacy_ceiling"] = max(
-                0, min(3, int(override_params["privacy_ceiling"]))
-            )
+            updates["privacy_ceiling"] = override_params["privacy_ceiling"]
         if "allow_private_sensitivity" in override_params:
-            updates["allow_private_sensitivity"] = bool(
-                override_params["allow_private_sensitivity"]
-            )
+            updates["allow_private_sensitivity"] = override_params[
+                "allow_private_sensitivity"
+            ]
         return resolved_policy.model_copy(update=updates)
 
     def _effective_context_envelope_budget(
@@ -3853,11 +4064,17 @@ class RetrievalPipeline:
         override_params = ablation.override_retrieval_params or {}
         if "final_context_items" not in override_params:
             return resolved_policy
-        cap = max(1, int(override_params["final_context_items"]))
+        cap = override_params["final_context_items"]
         if resolved_policy.retrieval_params.final_context_items <= cap:
             return resolved_policy
-        retrieval_params = resolved_policy.retrieval_params.model_copy(
-            update={"final_context_items": cap}
+        # Validated construction for the same reason as _override_policy: the
+        # cap comes from an override, so it must build the model through its own
+        # constraints rather than being assigned past them.
+        retrieval_params = RetrievalParams.model_validate(
+            {
+                **resolved_policy.retrieval_params.model_dump(),
+                "final_context_items": cap,
+            }
         )
         return resolved_policy.model_copy(update={"retrieval_params": retrieval_params})
 
@@ -3994,51 +4211,59 @@ class RetrievalPipeline:
         )
         per_subquery_counts: list[SubQuerySearchCount] = []
         for sub_query in retrieval_plan.sub_query_plans:
-            sub_verbatim = 0
-            sub_artifact = 0
-            sub_fts = 0
-            sub_fact_facet = 0
-            sub_emb = 0
-            sub_raw = 0
-            for candidate in raw_candidates:
-                matched = candidate.get("matched_sub_queries") or []
-                if sub_query.text in matched:
-                    channel_ranks = candidate.get("channel_ranks") or {}
-                    if channel_ranks.get("verbatim_pin") is not None or candidate.get(
-                        "is_verbatim_pin"
-                    ):
-                        sub_verbatim += 1
-                    if channel_ranks.get("artifact_chunk") is not None or candidate.get(
-                        "is_artifact_chunk"
-                    ):
-                        sub_artifact += 1
-                    if channel_ranks.get("fts") is not None:
-                        sub_fts += 1
-                    if channel_ranks.get("fact_facet") is not None or candidate.get(
-                        "is_fact_facet_candidate"
-                    ):
-                        sub_fact_facet += 1
-                    if channel_ranks.get("embedding") is not None:
-                        sub_emb += 1
-                    if channel_ranks.get(
-                        "verbatim_evidence_search"
-                    ) is not None or candidate.get("is_verbatim_evidence_window"):
-                        sub_raw += 1
+            channel_counts = RetrievalPipeline._subquery_channel_counts(
+                raw_candidates,
+                sub_query.text,
+            )
             per_subquery_counts.append(
                 SubQuerySearchCount(
                     subquery=sub_query.text,
-                    verbatim_pin=sub_verbatim,
-                    artifact_chunk=sub_artifact,
-                    fts=sub_fts,
-                    fact_facet=sub_fact_facet,
-                    embedding=sub_emb,
-                    verbatim_evidence_search=sub_raw,
+                    **channel_counts,
                     fts_queries=list(sub_query.fts_queries),
                     fts_query_kinds=list(sub_query.fts_query_kinds),
                     fts_query_executions=RetrievalPipeline._build_fts_query_execution_counts(
                         raw_candidates,
                         sub_query,
                         fts_query_audit,
+                    ),
+                )
+            )
+        planned_subqueries = {
+            sub_query.text for sub_query in retrieval_plan.sub_query_plans
+        }
+        audit_only_queries: dict[str, list[tuple[str, str]]] = {}
+        for entry in fts_query_audit or []:
+            if not isinstance(entry, dict):
+                continue
+            subquery = str(entry.get("subquery") or "")
+            query = str(entry.get("query") or "")
+            kind = str(entry.get("kind") or "unknown")
+            if not subquery or not query or subquery in planned_subqueries:
+                continue
+            signature = (query, kind)
+            queries = audit_only_queries.setdefault(subquery, [])
+            if signature not in queries:
+                queries.append(signature)
+        for subquery, query_signatures in audit_only_queries.items():
+            fts_queries = [query for query, _kind in query_signatures]
+            fts_query_kinds = [kind for _query, kind in query_signatures]
+            per_subquery_counts.append(
+                SubQuerySearchCount(
+                    subquery=subquery,
+                    **RetrievalPipeline._subquery_channel_counts(
+                        raw_candidates,
+                        subquery,
+                    ),
+                    fts_queries=fts_queries,
+                    fts_query_kinds=fts_query_kinds,
+                    fts_query_executions=(
+                        RetrievalPipeline._build_fts_query_execution_counts_for_values(
+                            raw_candidates,
+                            subquery=subquery,
+                            fts_queries=fts_queries,
+                            fts_query_kinds=fts_query_kinds,
+                            fts_query_audit=fts_query_audit,
+                        )
                     ),
                 )
             )
@@ -4058,55 +4283,100 @@ class RetrievalPipeline:
         )
 
     @staticmethod
+    def _subquery_channel_counts(
+        raw_candidates: list[dict[str, Any]],
+        subquery: str,
+    ) -> dict[str, int]:
+        counts = {
+            "verbatim_pin": 0,
+            "artifact_chunk": 0,
+            "fts": 0,
+            "fact_facet": 0,
+            "embedding": 0,
+            "verbatim_evidence_search": 0,
+        }
+        for candidate in raw_candidates:
+            if subquery not in (candidate.get("matched_sub_queries") or []):
+                continue
+            channel_ranks = candidate.get("channel_ranks") or {}
+            if channel_ranks.get("verbatim_pin") is not None or candidate.get(
+                "is_verbatim_pin"
+            ):
+                counts["verbatim_pin"] += 1
+            if channel_ranks.get("artifact_chunk") is not None or candidate.get(
+                "is_artifact_chunk"
+            ):
+                counts["artifact_chunk"] += 1
+            if channel_ranks.get("fts") is not None:
+                counts["fts"] += 1
+            if channel_ranks.get("fact_facet") is not None or candidate.get(
+                "is_fact_facet_candidate"
+            ):
+                counts["fact_facet"] += 1
+            if channel_ranks.get("embedding") is not None:
+                counts["embedding"] += 1
+            if channel_ranks.get(
+                "verbatim_evidence_search"
+            ) is not None or candidate.get("is_verbatim_evidence_window"):
+                counts["verbatim_evidence_search"] += 1
+        return counts
+
+    @staticmethod
     def _build_fts_query_execution_counts(
         raw_candidates: list[dict[str, Any]],
         sub_query: PlannedSubQuery,
         fts_query_audit: list[dict[str, Any]] | None = None,
     ) -> list[FtsQueryExecutionCount]:
-        query_kinds = list(sub_query.fts_query_kinds)
-        raw_rows_by_query = RetrievalPipeline._raw_fts_query_rows_by_signature(
-            fts_query_audit,
+        return RetrievalPipeline._build_fts_query_execution_counts_for_values(
+            raw_candidates,
+            subquery=sub_query.text,
+            fts_queries=list(sub_query.fts_queries),
+            fts_query_kinds=list(sub_query.fts_query_kinds),
+            fts_query_audit=fts_query_audit,
         )
-        executions: list[FtsQueryExecutionCount] = []
-        seen_signatures: set[tuple[str, str, str]] = set()
-        for index, fts_query in enumerate(sub_query.fts_queries):
-            kind = str(query_kinds[index]) if index < len(query_kinds) else "unknown"
-            signature = (sub_query.text, fts_query, kind)
-            seen_signatures.add(signature)
-            executions.append(
-                FtsQueryExecutionCount(
-                    query=fts_query,
-                    kind=kind,
-                    match_mode=CandidateSearch._fts_query_match_mode(fts_query),
-                    source="planned",
-                    non_evidential=True,
-                    raw_rows=raw_rows_by_query.get(
-                        (
-                            sub_query.text,
-                            fts_query,
-                            kind,
-                        ),
-                        0,
-                    ),
-                    candidates=RetrievalPipeline._count_fts_query_matched_candidates(
-                        raw_candidates,
-                        subquery=sub_query.text,
-                        query=fts_query,
-                        kind=kind,
-                    ),
-                )
+
+    @staticmethod
+    def _build_fts_query_execution_counts_for_values(
+        raw_candidates: list[dict[str, Any]],
+        *,
+        subquery: str,
+        fts_queries: list[str],
+        fts_query_kinds: list[str],
+        fts_query_audit: list[dict[str, Any]] | None = None,
+    ) -> list[FtsQueryExecutionCount]:
+        """Keep every SQL execution as a distinct, lane-attributed event."""
+        planned_signatures = {
+            (
+                str(fts_query),
+                str(fts_query_kinds[index])
+                if index < len(fts_query_kinds)
+                else "unknown",
             )
+            for index, fts_query in enumerate(fts_queries)
+        }
+        executions: list[FtsQueryExecutionCount] = []
+        executed_planned_signatures: set[tuple[str, str]] = set()
         for entry in fts_query_audit or []:
             if not isinstance(entry, dict):
                 continue
-            if str(entry.get("subquery") or "") != sub_query.text:
+            if str(entry.get("subquery") or "") != subquery:
                 continue
             query = str(entry.get("query") or "")
             kind = str(entry.get("kind") or "unknown")
-            signature = (sub_query.text, query, kind)
-            if not query or signature in seen_signatures:
+            if not query:
                 continue
-            seen_signatures.add(signature)
+            signature = (query, kind)
+            is_planned = signature in planned_signatures
+            if is_planned:
+                executed_planned_signatures.add(signature)
+            raw_row_ids_value = entry.get("raw_row_ids")
+            raw_row_ids = list(
+                dict.fromkeys(
+                    str(row_id)
+                    for row_id in raw_row_ids_value or []
+                    if row_id
+                )
+            )
             executions.append(
                 FtsQueryExecutionCount(
                     query=query,
@@ -4115,15 +4385,47 @@ class RetrievalPipeline:
                         entry.get("match_mode")
                         or CandidateSearch._fts_query_match_mode(query)
                     ),
-                    source=str(entry.get("source") or "dynamic"),
+                    lane=str(entry.get("lane") or "single"),
+                    # CandidateSearch omits the field only for its default
+                    # planned lane; every dynamic surface names its source.
+                    source=str(entry.get("source") or "planned"),
                     non_evidential=bool(entry.get("non_evidential", True)),
-                    raw_rows=raw_rows_by_query.get(signature, 0),
+                    raw_rows=max(0, int(entry.get("raw_rows") or 0)),
                     candidates=RetrievalPipeline._count_fts_query_matched_candidates(
                         raw_candidates,
-                        subquery=sub_query.text,
+                        subquery=subquery,
                         query=query,
                         kind=kind,
+                        raw_row_ids=(
+                            raw_row_ids
+                            if raw_row_ids_value is not None
+                            else None
+                        ),
                     ),
+                    raw_row_ids=raw_row_ids,
+                )
+            )
+        for index, fts_query in enumerate(fts_queries):
+            kind = (
+                str(fts_query_kinds[index])
+                if index < len(fts_query_kinds)
+                else "unknown"
+            )
+            signature = (str(fts_query), kind)
+            if signature in executed_planned_signatures:
+                continue
+            executions.append(
+                FtsQueryExecutionCount(
+                    query=str(fts_query),
+                    kind=kind,
+                    match_mode=CandidateSearch._fts_query_match_mode(
+                        str(fts_query)
+                    ),
+                    source="planned",
+                    non_evidential=True,
+                    raw_rows=0,
+                    candidates=0,
+                    raw_row_ids=[],
                 )
             )
         return executions
@@ -4135,6 +4437,7 @@ class RetrievalPipeline:
         subquery: str,
         query: str,
         kind: str,
+        raw_row_ids: list[str] | None = None,
     ) -> int:
         matched_candidate_ids: set[str] = set()
         for candidate in raw_candidates:
@@ -4148,23 +4451,9 @@ class RetrievalPipeline:
                 if str(match.get("kind") or "unknown") != kind:
                     continue
                 matched_candidate_ids.add(str(candidate.get("id") or ""))
+        if raw_row_ids is not None:
+            return len(matched_candidate_ids.intersection(raw_row_ids))
         return len(matched_candidate_ids)
-
-    @staticmethod
-    def _raw_fts_query_rows_by_signature(
-        fts_query_audit: list[dict[str, Any]] | None,
-    ) -> Counter[tuple[str, str, str]]:
-        raw_rows_by_query: Counter[tuple[str, str, str]] = Counter()
-        for entry in fts_query_audit or []:
-            if not isinstance(entry, dict):
-                continue
-            signature = (
-                str(entry.get("subquery") or ""),
-                str(entry.get("query") or ""),
-                str(entry.get("kind") or "unknown"),
-            )
-            raw_rows_by_query[signature] += max(0, int(entry.get("raw_rows") or 0))
-        return raw_rows_by_query
 
     @staticmethod
     def _build_scoring_trace(

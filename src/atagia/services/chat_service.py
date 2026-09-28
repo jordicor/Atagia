@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, replace
+from atagia.diagnostics.recorder import capture_chat_operation
 import logging
+from time import perf_counter
 from typing import Any
+
+import aiosqlite
 
 from atagia.core.conversation_lifecycle_repository import (
     ConversationLifecycleRepository,
@@ -23,9 +28,11 @@ from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.core.topic_repository import TopicRepository
 from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
+from atagia.core.user_lifecycle_repository import UserLifecycleRepository
 from atagia.memory.context_envelope import (
     ContextEnvelopeBudget,
     allocate_context_envelope_budget,
+    effective_budget_under_envelope,
 )
 from atagia.memory.lifecycle_runner import request_lifecycle_piggyback
 from atagia.core.summary_repository import SummaryRepository
@@ -42,6 +49,7 @@ from atagia.models.schemas_memory import (
     ConversationStatus,
     MindTopology,
     ResponseMode,
+    TurnSurface,
 )
 from atagia.models.schemas_replay import AblationConfig
 from atagia.services.artifact_service import ArtifactService
@@ -54,6 +62,7 @@ from atagia.services.chat_support import (
     build_system_prompt,
     build_transcript_window,
     build_transcript_window_trace,
+    build_turn_telemetry,
     chat_model,
     enqueue_message_jobs,
     filter_topic_working_set_snapshot,
@@ -182,6 +191,7 @@ class ChatService:
 
     runtime: Any
 
+    @capture_chat_operation
     async def chat_reply(
         self,
         user_id: str,
@@ -237,10 +247,29 @@ class ChatService:
             purpose="chat_reply",
         )
         cache_service = ContextCacheService(self.runtime)
+        # TWO clocks, deliberately. The turn's wall clock starts BEFORE the
+        # per-user cache guard, which is held for a whole turn and blocks a
+        # same-user follow-up for up to CACHE_GUARD_ACQUIRE_TIMEOUT_SECONDS:
+        # queueing behind another turn is time the caller waits, so it belongs
+        # inside turn_to_event_write_wall_ms, and starting here hid contention
+        # entirely. retrieval_duration_ms keeps its own, tighter origin at the
+        # resolve call site below, because lock wait is not retrieval work -- one
+        # origin for both would report a turn that spent 380ms queueing as 380ms
+        # of retrieval, and the difference between the two would stop meaning
+        # anything. (The difference is still not "everything after retrieval":
+        # it excludes the post-write tail the column's name now announces.)
+        turn_started_at = perf_counter()
         async with cache_service.user_cache_guard(user_id):
             await wait_for_in_memory_worker_quiescence(self.runtime)
             connection = await self.runtime.open_connection()
             chat_result: ChatResult | None = None
+            # Per-turn LLM call meter (CS-1.4). Bound to the current context so it
+            # counts every synchronous provider round-trip of the turn (retrieval
+            # cards through the chat reply), then unbound in the finally below. The
+            # metrics dict is filled once the answer is generated (see below).
+            turn_call_meter = self.runtime.llm_client.begin_turn_call_meter()
+            turn_llm_call_metrics: dict[str, Any] | None = None
+            retrieval_duration_ms = 0.0
             try:
                 rebuild_repository = TranscriptRebuildRepository(
                     connection,
@@ -431,6 +460,11 @@ class ChatService:
                     confirmation_plan is not None
                     and confirmation_plan.response_intent is not None
                 )
+                # Retrieval wall time is measured at the call site rather than
+                # read off the pipeline trace: a cache hit never enters the
+                # pipeline yet still costs a lookup plus a staleness decision,
+                # and that cost has to appear in the persisted number.
+                retrieval_started_at = perf_counter()
                 if resolved_response_mode is ResponseMode.NORMAL:
                     resolution = await cache_service.resolve_with_connection(
                         connection,
@@ -461,6 +495,9 @@ class ChatService:
                         ablation=ablation,
                         prompt_authority_context=authority_context,
                     )
+                retrieval_duration_ms = (
+                    perf_counter() - retrieval_started_at
+                ) * 1000.0
                 topic_snapshot = await TopicRepository(
                     connection,
                     self.runtime.clock,
@@ -509,8 +546,21 @@ class ChatService:
                     transcript_entries = []
                     transcript_trace = build_transcript_window_trace([], 0)
                 else:
-                    transcript_budget_tokens = (
-                        context_envelope_budget.recent_transcript_budget_tokens
+                    transcript_budget_tokens = effective_budget_under_envelope(
+                        knob="transcript_budget_tokens",
+                        policy_budget_tokens=(
+                            resolution.resolved_policy.transcript_budget_tokens
+                        ),
+                        envelope_budget_tokens=(
+                            context_envelope_budget.recent_transcript_budget_tokens
+                        ),
+                        override_budget_tokens=(
+                            None
+                            if ablation is None
+                            else (ablation.override_retrieval_params or {}).get(
+                                "transcript_budget_tokens"
+                            )
+                        ),
                     )
                     transcript_budget_initial_tokens = transcript_budget_tokens
                     transcript_entries = build_transcript_window(
@@ -779,6 +829,53 @@ class ChatService:
                 else:
                     llm_response = await self.runtime.llm_client.complete(chat_request)
                     assistant_output_text = llm_response.output_text
+                recorder = getattr(self.runtime.llm_client, "_diagnostic_recorder", None)
+                if recorder is not None:
+                    recorder.no_call(
+                        "answer_effect",
+                        component="chat",
+                        user_id=user_id,
+                        data={
+                            "conversation_id": conversation_id,
+                            "messages": recorder.blob(chat_request.messages),
+                            "model": chat_request.model,
+                            "max_output_tokens": chat_request.max_output_tokens,
+                            "final_output": recorder.blob(assistant_output_text),
+                            "selected_memory_ids": resolution.composed_context.selected_memory_ids,
+                            "postcondition": recorder.blob(answer_postcondition_report) if answer_postcondition_report is not None else None,
+                        },
+                    )
+                # Snapshot the per-turn LLM call metrics here: the chat reply is
+                # the last synchronous provider call of the turn, so this captures
+                # the full retrieval + answer count. Attaching before the DB write
+                # means the persisted retrieval_event trace and the returned debug
+                # payload carry the same numbers. Background extraction/contract
+                # work runs post-response via workers and is intentionally excluded.
+                #
+                # The call counters are snapshotted at this instant on purpose,
+                # but the turn's wall time is not: it is replaced just before the
+                # telemetry write below, so every surface means the same span by
+                # turn_to_event_write_wall_ms -- start of turn to the instant the
+                # row is written -- instead of stopping here and excluding
+                # message persistence, which is real work the caller waits for.
+                # The span deliberately stops AT the write and not at the end of
+                # the turn: see migration 0072 for the measured tail it leaves
+                # out and why closing it costs more than it is worth.
+                turn_telemetry = build_turn_telemetry(
+                    surface=TurnSurface.CHAT,
+                    meter=turn_call_meter,
+                    turn_to_event_write_wall_ms=(perf_counter() - turn_started_at) * 1000.0,
+                    retrieval_duration_ms=retrieval_duration_ms,
+                    stage_timings_ms=resolution.stage_timings,
+                )
+                # One object feeds both the typed telemetry columns and the trace
+                # payload, so a turn cannot persist one count in the columns and
+                # a different one in outcome_json.
+                turn_llm_call_metrics = turn_telemetry.llm_call_metrics().model_dump(
+                    mode="json"
+                )
+                if resolution.retrieval_trace is not None:
+                    resolution.retrieval_trace["llm_call_metrics"] = turn_llm_call_metrics
                 response_text = assistant_output_text
                 if (
                     confirmation_plan is not None
@@ -893,6 +990,11 @@ class ChatService:
                             "selected_memory_ids_json": resolution.composed_context.selected_memory_ids,
                             "context_view_json": composed_context_json,
                             "outcome_json": {
+                                # Turn-level, not retrieval-level: persisted here
+                                # too so cache-hit turns (retrieval_trace is None)
+                                # still record their call count -- that fast path
+                                # is exactly what later phases widen.
+                                "llm_call_metrics": turn_llm_call_metrics,
                                 "response_mode": resolved_response_mode.value,
                                 "adaptive_retrieval": resolved_adaptive_retrieval,
                                 "cold_start": cold_start,
@@ -939,6 +1041,14 @@ class ChatService:
                                 **resolution.candidate_search_summary,
                             },
                         },
+                        # Measured here, not at answer-ready: the turn is only
+                        # over for the caller once this row exists.
+                        telemetry=replace(
+                            turn_telemetry,
+                            turn_to_event_write_wall_ms=(
+                                (perf_counter() - turn_started_at) * 1000.0
+                            ),
+                        ),
                         commit=False,
                     )
                     confirmation_embedding_upserts = []
@@ -989,35 +1099,18 @@ class ChatService:
                         commit=False,
                         dispatch=False,
                     )
-                    recent_window_rows = await messages.get_recent_messages(
-                        conversation_id,
-                        user_id,
-                        limit=RECENT_WINDOW_MESSAGES,
-                    )
-                    recent_window_messages = [
-                        {
-                            "role": str(message["role"]),
-                            "content": str(message["text"]),
-                        }
-                        for message in recent_window_rows
-                    ]
-                    recent_window_conversation_identity = (
-                        await ConversationLifecycleRepository(
-                            connection,
-                            self.runtime.clock,
-                        ).get_active_identity(
-                            user_id=user_id,
-                            conversation_id=conversation_id,
-                        )
-                    )
-                    if recent_window_conversation_identity is None:
-                        raise ConversationNotActiveError(
-                            "Conversation source identity is unavailable"
-                        )
                     await connection.commit()
                 except Exception:
                     await connection.rollback()
                     raise
+                # Everything from the terminal commit onward is pure SQL and
+                # stream dispatch, so nothing here reopens the LLM call counters
+                # snapshotted above -- with ONE dormant exception: this call
+                # reaches SQLiteVecBackend.upsert, which goes through
+                # llm_client.embed and IS metered. With embedding_backend="none"
+                # (the default) it makes no round-trip; enable an embedding
+                # backend and these embeddings land on the turn's meter after
+                # the telemetry snapshot, so they would be spent but unreported.
                 await confirmations.apply_post_commit_embeddings(
                     confirmation_embedding_upserts
                 )
@@ -1051,6 +1144,15 @@ class ChatService:
                         post_commit_errors.append("cache_publish_failed")
 
                 if resolved_response_mode is ResponseMode.SMART_FAST:
+                    # Unbind the turn's meter BEFORE scheduling the warm.
+                    # asyncio.create_task copies the current context, so a meter
+                    # still bound here would follow the warm and charge its
+                    # round-trips to a turn whose row is already written -- calls
+                    # that then appear in no persisted telemetry at all. The
+                    # sidecar surface already unbinds first; this matches it.
+                    # Ending the meter twice is a no-op (removal is by identity),
+                    # so the finally below stays correct.
+                    self.runtime.llm_client.end_turn_call_meter(turn_call_meter)
                     cache_service.schedule_smart_fast_warm(
                         user_id=user_id,
                         conversation_id=conversation_id,
@@ -1064,38 +1166,50 @@ class ChatService:
                         adaptive_retrieval=resolved_adaptive_retrieval,
                     )
 
+                published_recent_window = False
                 try:
-                    published_recent_window = (
-                        resolution.cache_lifecycle_epoch is not None
-                        and resolution.cache_lifecycle_cleanup_key is not None
-                        and resolution.cache_revision is not None
-                        and resolution.source_derivation_revision is not None
-                        and await cache_service.publish_recent_window(
-                            user_id=user_id,
-                            conversation_id=conversation_id,
-                            messages=recent_window_messages,
-                            lifecycle_epoch=resolution.cache_lifecycle_epoch,
-                            lifecycle_cleanup_key=(
-                                resolution.cache_lifecycle_cleanup_key
-                            ),
-                            cache_revision=resolution.cache_revision,
-                            derivation_revision=(resolution.source_derivation_revision),
-                            conversation_lifecycle_epoch=(
-                                recent_window_conversation_identity.lifecycle_epoch
-                            ),
-                            conversation_source_revision=(
-                                recent_window_conversation_identity.source_revision
-                            ),
-                        )
+                    published_recent_window = await _publish_committed_recent_window(
+                        connection,
+                        cache_service=cache_service,
+                        clock=self.runtime.clock,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
                     )
-                    if not published_recent_window:
-                        raise RuntimeError("user lifecycle is not publishable")
                 except Exception:
                     logger.exception(
                         "Failed to update recent window for conversation_id=%s",
                         conversation_id,
                     )
+                except BaseException:
+                    # Cancellation leaves EXACTLY the state a failed publish
+                    # leaves: this turn's messages are already committed, so the
+                    # window still published for the conversation describes an
+                    # older transcript. `except Exception` never sees
+                    # CancelledError, so the compensating drop below was skipped
+                    # and the superseded entry survived the turn. Drop it here,
+                    # then let the cancellation continue unchanged.
+                    await _drop_superseded_recent_window(
+                        cache_service,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                    )
+                    raise
+                if not published_recent_window:
                     post_commit_errors.append("recent_window_failed")
+                    # This turn committed new messages, so whatever window is
+                    # still published for the conversation now describes an
+                    # older transcript. The read side refuses any window whose
+                    # identity is not the reader's, so a survivor can no longer
+                    # be served as current -- but it would sit there until some
+                    # later turn overwrote it, and no reader would get the
+                    # window it is entitled to. Dropping it is what turns a
+                    # failed publish into an honest miss.
+                    if not await _drop_superseded_recent_window(
+                        cache_service,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                    ):
+                        post_commit_errors.append("recent_window_stale_entry_retained")
 
                 try:
                     await job_tracking.dispatch_pending_jobs(
@@ -1133,6 +1247,7 @@ class ChatService:
                         "response_mode": resolved_response_mode.value,
                         "adaptive_retrieval": resolved_adaptive_retrieval,
                         "cold_start": cold_start,
+                        "llm_call_metrics": turn_llm_call_metrics,
                         "detected_needs": list(resolution.detected_needs),
                         "retrieval_plan": dict(resolution.source_retrieval_plan),
                         "selected_memory_ids": resolution.composed_context.selected_memory_ids,
@@ -1206,6 +1321,7 @@ class ChatService:
             except LLMError as exc:
                 raise LLMUnavailableError("LLM service unavailable") from exc
             finally:
+                self.runtime.llm_client.end_turn_call_meter(turn_call_meter)
                 await connection.close()
             if self.runtime.settings.lifecycle_lazy_enabled:
                 try:
@@ -1246,6 +1362,9 @@ class ChatService:
             },
             "post_commit_errors": list(payload.get("post_commit_errors") or []),
             "answer_postcondition_guard": postcondition_summary,
+            # Counts, latency, and engine-internal purpose labels only: no user
+            # data, so non-admin debug callers keep the cost signal.
+            "llm_call_metrics": payload.get("llm_call_metrics"),
             "authority": authority,
         }
 
@@ -1284,6 +1403,118 @@ class ChatService:
                 reason="resolved_policy_allows_intimacy_context"
             )
         return {}
+
+
+async def _drop_superseded_recent_window(
+    cache_service: ContextCacheService,
+    *,
+    user_id: str,
+    conversation_id: str,
+) -> bool:
+    """Delete the conversation's published window, cancellation included.
+
+    Deletion is by ``(user_id, conversation_id)``, not by cache identity: the
+    entry to remove was published by an EARLIER turn under a different
+    identity, so the identity-scoped primitive could not reach it and would
+    leave the superseded window in place. The key is derived from the pair, so
+    this can only ever touch this conversation's own entry.
+
+    The drop is shielded because the caller runs it on the cancellation path
+    too: a plain ``await`` there is itself cancelled at the first suspension,
+    which is how a cancelled turn used to leave the superseded entry published.
+
+    Returns whether the conversation is now free of a superseded window, which
+    is what the caller reports. Deleting nothing counts: an entry that was not
+    there was not left behind.
+    """
+
+    task = asyncio.ensure_future(
+        cache_service.drop_recent_window(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+    )
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except Exception:
+            logger.exception(
+                "Failed to drop the superseded recent window for "
+                "conversation_id=%s during cancellation",
+                conversation_id,
+            )
+        raise
+    except Exception:
+        logger.exception(
+            "Failed to drop the superseded recent window for conversation_id=%s",
+            conversation_id,
+        )
+        return False
+    return True
+
+
+async def _publish_committed_recent_window(
+    connection: aiosqlite.Connection,
+    *,
+    cache_service: ContextCacheService,
+    clock: Any,
+    user_id: str,
+    conversation_id: str,
+) -> bool:
+    """Publish the committed transcript window under live cache coordinates.
+
+    The window content and the coordinates it is stamped with are read in one
+    SQLite read transaction, so a published entry always names the exact
+    canonical state it describes.
+
+    Reusing the coordinates captured before the model call does not work: any
+    derived-state write by a background worker advances
+    ``user_lifecycles.cache_revision`` through the ``icp_source_*`` triggers,
+    and a turn spans seconds of model latency, so the pre-call snapshot is
+    routinely one revision behind by the time the turn commits. The publish
+    fence then rejects a window whose transcript is perfectly current.
+    """
+
+    await connection.execute("BEGIN")
+    try:
+        lifecycle_identity = await UserLifecycleRepository(
+            connection,
+            clock,
+        ).get_active_identity(user_id)
+        conversation_identity = await ConversationLifecycleRepository(
+            connection,
+            clock,
+        ).get_active_identity(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+        window_rows = await MessageRepository(connection, clock).get_recent_messages(
+            conversation_id,
+            user_id,
+            limit=RECENT_WINDOW_MESSAGES,
+        )
+        await connection.commit()
+    except BaseException:
+        await connection.rollback()
+        raise
+    if lifecycle_identity is None or conversation_identity is None:
+        return False
+    return await cache_service.publish_recent_window(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        messages=[
+            {"role": str(row["role"]), "content": str(row["text"])}
+            for row in window_rows
+        ],
+        lifecycle_epoch=lifecycle_identity.lifecycle_epoch,
+        lifecycle_cleanup_key=lifecycle_identity.lifecycle_cleanup_key,
+        cache_revision=lifecycle_identity.cache_revision,
+        derivation_revision=lifecycle_identity.derivation_revision,
+        conversation_lifecycle_epoch=conversation_identity.lifecycle_epoch,
+        conversation_source_revision=conversation_identity.source_revision,
+    )
 
 
 def _build_turn_jobs(

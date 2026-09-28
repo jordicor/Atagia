@@ -35,8 +35,13 @@ from benchmarks.failure_taxonomy import (
     format_failure_taxonomy_summary,
     save_failure_taxonomy_report,
 )
+from benchmarks.invocation_args import redact_invocation_args
 from benchmarks.llm_run_guard import LLMRunGuardConfig
 from benchmarks.locomo.benchmark import LoCoMoBenchmark
+from benchmarks.locomo.single_turn_probe import (
+    SingleTurnProbeReport,
+    run_single_turn_probe,
+)
 from benchmarks.locomo.retrieval_readout import (
     build_retrieval_readout,
     save_retrieval_readout,
@@ -56,7 +61,7 @@ from atagia.services.model_resolution import COMPONENTS_BY_ID
 
 _DEFAULT_OUTPUT_DIR = bench_output_root() / "locomo"
 _DEFAULT_MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
-_DEFAULT_JUDGE_MODEL = "kimi/kimi-k2.7-code"
+_DEFAULT_JUDGE_MODEL = "openrouter/openai/gpt-5.6-luna,medium"
 _DEFAULT_PRIVACY_ENFORCEMENT = "off"
 _BENCHMARK_DB_FILENAME = "benchmark.db"
 _BENCHMARK_DB_METADATA_FILENAME = "run_metadata.json"
@@ -178,8 +183,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--judge-model",
         default=None,
         help=(
-            "Optional LLM model for scoring; defaults to direct Kimi "
-            "kimi-k2.7-code for benchmark judging"
+            "Optional LLM model for scoring; defaults to OpenRouter "
+            "gpt-5.6-luna at medium reasoning effort for benchmark judging"
         ),
     )
     parser.add_argument(
@@ -295,6 +300,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--embedding-model",
         default=None,
         help="Embedding model name (required when backend is sqlite_vec)",
+    )
+    parser.add_argument(
+        "--inference-access-mode",
+        choices=("unrestricted", "local_only", "zero_cost"),
+        default=None,
+        help="Restrict all Atagia-owned inference routes (defaults to environment/unrestricted).",
+    )
+    parser.add_argument(
+        "--local-llm-endpoints-file",
+        default=None,
+        help="Absolute path to the version-one local endpoint catalog JSON.",
+    )
+    parser.add_argument(
+        "--zero-cost-openrouter-profile",
+        default=None,
+        help="Required dedicated OpenRouter profile declaration for external zero-cost routes.",
     )
     parser.add_argument(
         "--corrections",
@@ -585,6 +606,34 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Summarize --summarize-run-log as JSON.",
     )
+    parser.add_argument(
+        "--single-turn-probe",
+        action="store_true",
+        help=(
+            "Measure one question with no parallelism against a retained DB "
+            "(--reuse-db or --reuse-db-dir) and print latency JSON. Skips "
+            "judging; does not mutate the retained DB or any other mode."
+        ),
+    )
+    parser.add_argument(
+        "--question",
+        default=None,
+        help="Single question id to measure with --single-turn-probe.",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help=(
+            "Number of in-process repeats for --single-turn-probe; the first "
+            "repeat is cold (fresh runtime), later repeats reuse the warm engine."
+        ),
+    )
+    parser.add_argument(
+        "--single-turn-probe-output",
+        default=None,
+        help="Optional file for --single-turn-probe JSON; defaults to stdout.",
+    )
     return parser
 
 
@@ -596,6 +645,49 @@ def _resolve_judge_model(args: argparse.Namespace) -> str | None:
 
 def _resolve_answer_model(args: argparse.Namespace) -> str | None:
     return args.answer_model or args.model
+
+
+def _build_benchmark(args: argparse.Namespace) -> LoCoMoBenchmark:
+    return LoCoMoBenchmark(
+        data_path=args.data_path,
+        llm_provider=args.provider,
+        llm_api_key=args.api_key,
+        llm_model=args.model,
+        answer_model=args.answer_model,
+        judge_model=_resolve_judge_model(args),
+        forced_global_model=args.forced_global_model,
+        ingest_model=args.ingest_model,
+        retrieval_model=args.retrieval_model,
+        chat_model_override=args.chat_model,
+        component_models=_parse_component_model_overrides(args.component_model),
+        manifests_dir=args.manifests_dir,
+        embedding_backend=args.embedding_backend,
+        embedding_model=args.embedding_model,
+        corrections_path=args.corrections,
+        community_corrections_path=args.community_corrections,
+        answer_postcondition_guard_enabled=args.answer_postcondition_guard,
+        judge_protocol=JudgeProtocol(args.judge_protocol),
+        inference_access_mode=args.inference_access_mode,
+        local_llm_endpoints_file=args.local_llm_endpoints_file,
+        zero_cost_openrouter_profile=args.zero_cost_openrouter_profile,
+    )
+
+
+async def _run_single_turn_probe_async(
+    args: argparse.Namespace,
+) -> SingleTurnProbeReport:
+    return await run_single_turn_probe(
+        benchmark=_build_benchmark(args),
+        question_id=args.question,
+        reuse_db=args.reuse_db,
+        reuse_db_dir=args.reuse_db_dir,
+        repeats=args.repeats,
+        ablation=_benchmark_ablation(
+            args.ablation,
+            getattr(args, "privacy_enforcement", None),
+        ),
+        allow_untrusted_reuse=args.allow_untrusted,
+    )
 
 
 def _parse_component_model_overrides(raw_values: list[str] | None) -> dict[str, str]:
@@ -710,26 +802,7 @@ async def _run_async(
     dict[str, object],
     BenchmarkDiffReport | None,
 ]:
-    benchmark = LoCoMoBenchmark(
-        data_path=args.data_path,
-        llm_provider=args.provider,
-        llm_api_key=args.api_key,
-        llm_model=args.model,
-        answer_model=args.answer_model,
-        judge_model=_resolve_judge_model(args),
-        forced_global_model=args.forced_global_model,
-        ingest_model=args.ingest_model,
-        retrieval_model=args.retrieval_model,
-        chat_model_override=args.chat_model,
-        component_models=_parse_component_model_overrides(args.component_model),
-        manifests_dir=args.manifests_dir,
-        embedding_backend=args.embedding_backend,
-        embedding_model=args.embedding_model,
-        corrections_path=args.corrections,
-        community_corrections_path=args.community_corrections,
-        answer_postcondition_guard_enabled=args.answer_postcondition_guard,
-        judge_protocol=JudgeProtocol(args.judge_protocol),
-    )
+    benchmark = _build_benchmark(args)
     checkpoint_path = (
         Path(args.checkpoint_output).expanduser()
         if args.checkpoint_output is not None
@@ -773,7 +846,7 @@ async def _run_async(
         ingest_mode=args.ingest_mode,
         flush_every_turns=args.flush_every_turns,
         stage_sleep_seconds=args.stage_sleep_seconds,
-        invocation_args=sys.argv[1:],
+        invocation_args=redact_invocation_args(sys.argv[1:], _build_parser()),
     )
     report_path = benchmark.save_report(report, args.output)
 
@@ -1976,6 +2049,37 @@ def main() -> None:
         parser.error(
             "--embedding-model is required when --embedding-backend is sqlite_vec"
         )
+    if args.single_turn_probe:
+        if args.question is None:
+            parser.error("--single-turn-probe requires --question")
+        if args.repeats < 1:
+            parser.error("--repeats must be at least 1")
+        if args.reuse_db is None and args.reuse_db_dir is None:
+            parser.error(
+                "--single-turn-probe requires --reuse-db or --reuse-db-dir"
+            )
+        if args.reuse_db is not None and args.reuse_db_dir is not None:
+            parser.error("--reuse-db and --reuse-db-dir are mutually exclusive")
+        if (
+            args.resume_db is not None
+            or args.resume_db_dir is not None
+            or args.ingest_only
+            or args.evaluate_only
+        ):
+            parser.error(
+                "--single-turn-probe cannot be combined with resume, ingest-only, "
+                "or evaluate-only options"
+            )
+        probe_report = asyncio.run(_run_single_turn_probe_async(args))
+        probe_json = probe_report.model_dump_json(indent=2)
+        if args.single_turn_probe_output is not None:
+            output_path = Path(args.single_turn_probe_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(probe_json + "\n", encoding="utf-8")
+            print(f"Single-turn probe written to: {output_path}")
+        else:
+            print(probe_json)
+        return
     if args.reuse_db is not None and args.reuse_db_dir is not None:
         parser.error("--reuse-db and --reuse-db-dir are mutually exclusive")
     if args.resume_db is not None and args.resume_db_dir is not None:

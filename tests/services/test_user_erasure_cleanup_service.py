@@ -31,6 +31,8 @@ from atagia.services.user_erasure_cleanup_service import (
     UserErasureCleanupService,
     recover_pending_user_erasures,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
+from tests.recent_window_support import stored_recent_window
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -144,6 +146,7 @@ def _runtime(database_path: str, backend: InProcessBackend) -> SimpleNamespace:
         storage_backend=backend,
         database_path=database_path,
         embedding_index=_NoopEmbeddingIndex(),
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
     )
 
 
@@ -201,7 +204,12 @@ async def test_external_failure_is_resumable_and_startup_recovery_finishes_exact
     )
     assert notification_id is not None
 
-    service = ConversationLifecycleService(_runtime(database_path, backend))
+    runtime = _runtime(database_path, backend)
+    cache = runtime.token_document_frequency_cache
+    await cache.ubiquitous_token_ratios(connection, CLOCK, "usr_cleanup")
+    assert "usr_cleanup" in cache._entries  # noqa: SLF001
+
+    service = ConversationLifecycleService(runtime)
     with pytest.raises(UserErasureCleanupPendingError):
         await service.erase_user_data(
             connection,
@@ -209,6 +217,10 @@ async def test_external_failure_is_resumable_and_startup_recovery_finishes_exact
             confirmation=ERASE_ALL_DATA_CONFIRMATION,
         )
 
+    # Canonical deletion committed before the transient backend failed. The
+    # exception path must still evict process-lifetime statistics derived from
+    # those rows.
+    assert "usr_cleanup" not in cache._entries  # noqa: SLF001
     assert (
         await (
             await connection.execute("SELECT 1 FROM users WHERE id = 'usr_cleanup'")
@@ -223,7 +235,7 @@ async def test_external_failure_is_resumable_and_startup_recovery_finishes_exact
     assert pending["erasure_cleanup_state"] == "pending"
     assert pending["cleanup_id"] is not None
     recent_window_key = build_recent_window_key("usr_cleanup", "cnv_cleanup")
-    assert await backend.get_recent_window(recent_window_key) is not None
+    assert await stored_recent_window(backend, recent_window_key) is not None
 
     await close_connection(connection)
     connection = await open_connection(database_path)
@@ -244,7 +256,7 @@ async def test_external_failure_is_resumable_and_startup_recovery_finishes_exact
         assert state is not None
         assert state["erasure_cleanup_state"] == "verified"
         assert state["cleanup_id"] is None
-        assert await backend.get_recent_window(recent_window_key) is None
+        assert await stored_recent_window(backend, recent_window_key) is None
         assert await backend.get_context_view("ctx-cleanup") is None
         assert (
             await backend.publish_job_notification(
@@ -572,7 +584,7 @@ async def test_stale_cleaner_cannot_purge_recreated_user_lifecycle(
             "user_id": "usr_cleanup",
             "conversation_id": "cnv_recreated",
         }
-        assert await backend.get_recent_window(recent_window_key) == [
+        assert await stored_recent_window(backend, recent_window_key) == [
             {"role": "user", "text": "new lifecycle"}
         ]
         notification = await backend.dequeue_job(
@@ -590,3 +602,35 @@ async def test_stale_cleaner_cannot_purge_recreated_user_lifecycle(
         if second_connection is not None:
             await close_connection(second_connection)
         await close_connection(first_connection)
+
+
+@pytest.mark.asyncio
+async def test_erasure_drops_corpus_statistics_derived_from_erased_content(
+    tmp_path: Path,
+) -> None:
+    """Erasure must not leave a user's derived statistics in process memory.
+
+    The corpus-statistics cache lives for the process lifetime and is only
+    self-correcting on a TTL, so without an explicit drop a user's token
+    frequencies would survive their erasure -- and a recreated ``user_id``
+    would inherit them.
+    """
+    database_path = str(tmp_path / "erasure-corpus-statistics.db")
+    backend = InProcessBackend()
+    connection = await initialize_database(database_path, MIGRATIONS_DIR)
+    try:
+        await UserRepository(connection, CLOCK).create_user("usr_cleanup")
+        runtime = _runtime(database_path, backend)
+        cache = runtime.token_document_frequency_cache
+        await cache.ubiquitous_token_ratios(connection, CLOCK, "usr_cleanup")
+        assert "usr_cleanup" in cache._entries  # noqa: SLF001
+
+        await ConversationLifecycleService(runtime).erase_user_data(
+            connection,
+            user_id="usr_cleanup",
+            confirmation=ERASE_ALL_DATA_CONFIRMATION,
+        )
+
+        assert "usr_cleanup" not in cache._entries  # noqa: SLF001
+    finally:
+        await close_connection(connection)

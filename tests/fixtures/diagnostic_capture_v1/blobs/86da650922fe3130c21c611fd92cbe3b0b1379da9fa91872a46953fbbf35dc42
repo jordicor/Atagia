@@ -1,0 +1,1 @@
+{"answers":{"place":{"choice":"attic","confidence":1.0,"probabilities":{"attic":1.0,"cellar":0.0},"type":"choice"}},"model":"jev-test-revision","usage":{"input_tokens":12,"output_tokens":0}}

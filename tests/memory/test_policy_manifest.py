@@ -14,6 +14,8 @@ from atagia.memory.policy_manifest import (
     DEFAULT_RETRIEVAL_SCOPE_FILTER,
     ManifestLoader,
     PolicyResolver,
+    ResolvedRetrievalPolicy,
+    resolved_policy_provenance,
     sync_assistant_modes,
 )
 from atagia.models.schemas_memory import MemoryScope, OperationalPolicyOverride
@@ -235,3 +237,62 @@ async def test_sync_assistant_modes_updates_existing_rows(tmp_path: Path) -> Non
         assert row["updated_at"] == "2026-03-30T17:01:30+00:00"
     finally:
         await connection.close()
+
+
+def test_resolved_policy_provenance_names_the_layer_that_produced_each_field(
+    tmp_path: Path,
+) -> None:
+    """Provenance is a claim about the manifest FILE, not about the schema.
+
+    Every resolved field used to be tagged ``manifest``, including fields no
+    manifest declares and fields no manifest even CAN declare. That attributes a
+    value to a source that did not produce it, which is the exact defect class
+    the effective-settings report exists to remove.
+    """
+    manifests_dir = _copy_manifests_to(tmp_path)
+    payload = _load_manifest_json(manifests_dir, "general_qa.json")
+    assert "allow_intimacy_context" not in payload
+    manifest = ManifestLoader(manifests_dir).get("general_qa")
+
+    provenance = resolved_policy_provenance(manifest)
+
+    assert set(provenance) == set(ResolvedRetrievalPolicy.model_fields)
+    # Declared in the file.
+    for declared in (
+        "profile_id",
+        "display_name",
+        "privacy_ceiling",
+        "context_budget_tokens",
+        "transcript_budget_tokens",
+        "retrieval_params",
+        "context_cache_policy",
+    ):
+        assert provenance[declared] == "manifest", declared
+    # Schema default: the manifest owns the field but this file leaves it unset.
+    assert provenance["allow_intimacy_context"] == "default"
+    # The resolver decides these outright; no manifest field feeds them.
+    for resolver_owned in (
+        "cross_chat_allowed",
+        "allowed_scopes",
+        "allow_private_sensitivity",
+    ):
+        assert provenance[resolver_owned] == "resolver", resolver_owned
+    # Derived from the manifest payload rather than declared in it.
+    assert provenance["prompt_hash"] == "computed"
+
+
+def test_declaring_an_optional_field_flips_its_provenance_to_manifest(
+    tmp_path: Path,
+) -> None:
+    """The tag follows the file: declaring the field the previous test found
+    unset makes it manifest-sourced, even when the declared value equals the
+    schema default (configuring something is not the same as leaving it out)."""
+    manifests_dir = _copy_manifests_to(tmp_path)
+    payload = _load_manifest_json(manifests_dir, "general_qa.json")
+    payload["allow_intimacy_context"] = False
+    _write_manifest_json(manifests_dir, "general_qa.json", payload)
+
+    manifest = ManifestLoader(manifests_dir).get("general_qa")
+
+    assert manifest.allow_intimacy_context is False
+    assert resolved_policy_provenance(manifest)["allow_intimacy_context"] == "manifest"

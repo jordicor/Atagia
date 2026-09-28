@@ -1083,6 +1083,10 @@ class ContextResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     request_message_id: str | None = None
+    # Identifies the persisted retrieval event for this call, so a host that
+    # runs its own model can attach memory feedback to what it was actually
+    # given and can join its own latency numbers to Atagia's.
+    retrieval_event_id: str | None = None
     system_prompt: str
     topic_working_set: TopicWorkingSetTrace = Field(
         default_factory=TopicWorkingSetTrace
@@ -1099,7 +1103,13 @@ class ContextResult(BaseModel):
     memories: list[MemorySummary] = Field(default_factory=list)
     contract: dict[str, dict[str, Any]] = Field(default_factory=dict)
     detected_needs: list[str] = Field(default_factory=list)
-    stage_timings: dict[str, float] = Field(default_factory=dict)
+    # Milliseconds. The unit is in the name because this is a host-facing
+    # field with an open key set: a host summing it has no other way to know
+    # whether a value is seconds or milliseconds.
+    stage_timings_ms: dict[str, float] = Field(default_factory=dict)
+    # Wall time of the whole retrieval, cache hits included, so a host can see
+    # what Atagia cost it without summing the stage breakdown.
+    retrieval_duration_ms: float = Field(ge=0.0, default=0.0)
     from_cache: bool = False
     staleness: float = 1.0
     next_refresh_strategy: Literal["cache", "sync"] = "sync"

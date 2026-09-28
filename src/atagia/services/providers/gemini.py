@@ -594,12 +594,16 @@ class GeminiProvider(LLMProvider):
         )
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        from atagia.diagnostics.recorder import capture_raw_response, capture_sent_payload
+
+        kwargs = _completion_kwargs(request)
+        capture_sent_payload(kwargs)
         try:
-            response = await self._client.aio.models.generate_content(
-                **_completion_kwargs(request)
-            )
+            response = await self._client.aio.models.generate_content(**kwargs)
         except Exception as exc:
             raise _map_exception(exc) from exc
+
+        capture_raw_response(response)
 
         block_reason = _blocked_reason(response)
         if block_reason is not None:
@@ -676,6 +680,10 @@ class GeminiProvider(LLMProvider):
         )
 
     async def stream(self, request: LLMCompletionRequest) -> AsyncIterator[LLMStreamEvent]:
+        from atagia.diagnostics.recorder import capture_raw_response, capture_sent_payload
+
+        kwargs = _completion_kwargs(request)
+        capture_sent_payload(kwargs)
         emitted_any = False
         emitted_output_or_tool = False
         emitted_tool_call = False
@@ -684,10 +692,9 @@ class GeminiProvider(LLMProvider):
         last_finish_reason: str | None = None
         stream: Any | None = None
         try:
-            stream = await self._client.aio.models.generate_content_stream(
-                **_completion_kwargs(request)
-            )
+            stream = await self._client.aio.models.generate_content_stream(**kwargs)
             async for chunk in stream:
+                capture_raw_response(chunk)
                 chunk_usage = _usage_to_dict(_getattr_or_key(chunk, "usage_metadata"))
                 if chunk_usage:
                     usage = chunk_usage

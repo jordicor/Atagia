@@ -41,6 +41,7 @@ from atagia.services.chat_support import (
 )
 from atagia.services.context_cache_service import (
     CONTEXT_CACHE_KEY_VERSION,
+    AdaptiveContextResolution,
     ContextCacheService,
 )
 from atagia.services.lifecycle_service import ConversationLifecycleService
@@ -90,7 +91,8 @@ class ContextCacheProvider(LLMProvider):
         if _is_need_detection_card_purpose(purpose):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -335,10 +337,10 @@ def test_guard_retrieval_diagnostics_include_answer_evidence() -> None:
     assert diagnostics["answer_evidence"]["items"][0]["supporting_quote"] == (
         "Mira: I want to keep one paint swatch."
     )
-    assert diagnostics["answer_support"]["allowed_values"][0]["display_text"] == (
+    assert diagnostics["answer_support"]["source_inventory"][0]["display_text"] == (
         "paint swatch"
     )
-    assert diagnostics["answer_support"]["coverage_state"] == "complete"
+    assert diagnostics["answer_support"]["source_group_coverage_state"] == "complete"
 
 
 async def _build_runtime(
@@ -386,10 +388,12 @@ async def _seed_conversation(
         await connection.close()
 
 
-def _normal_cache_key(
+def _cache_key(
     runtime: AppRuntime,
     service: ContextCacheService,
     conversation: dict[str, object],
+    *,
+    response_mode: ResponseMode = ResponseMode.NORMAL,
 ) -> str:
     snapshot = default_operational_profile_snapshot(
         loader=runtime.operational_profile_loader,
@@ -403,6 +407,7 @@ def _normal_cache_key(
         active_presence_id=conversation.get("active_presence_id"),
         active_space_id=conversation.get("active_space_id"),
         operational_profile_token=snapshot.token,
+        response_mode=response_mode,
         lifecycle_epoch=str(conversation["_lifecycle_epoch"]),
         cache_revision=int(conversation["_cache_revision"]),
         derivation_revision=int(conversation["_derivation_revision"]),
@@ -927,7 +932,7 @@ async def test_context_cache_service_policy_hash_mismatch_forces_sync(
     try:
         conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
         service = ContextCacheService(runtime)
-        cache_key = _normal_cache_key(runtime, service, conversation)
+        cache_key = _cache_key(runtime, service, conversation)
         await runtime.storage_backend.set_context_view(
             cache_key,
             _cache_entry_payload(
@@ -968,7 +973,7 @@ async def test_context_cache_service_effective_policy_hash_mismatch_forces_sync(
     try:
         conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
         service = ContextCacheService(runtime)
-        cache_key = _normal_cache_key(runtime, service, conversation)
+        cache_key = _cache_key(runtime, service, conversation)
         payload = _cache_entry_payload(
             runtime,
             cache_key=cache_key,
@@ -1001,6 +1006,123 @@ async def test_context_cache_service_effective_policy_hash_mismatch_forces_sync(
         await runtime.close()
 
 
+async def _resolve_smart_fast_warm(
+    runtime: AppRuntime,
+    service: ContextCacheService,
+) -> AdaptiveContextResolution:
+    connection = await runtime.open_connection()
+    try:
+        return await service.resolve_fast_with_connection(
+            connection,
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            message_text="continue",
+            response_mode=ResponseMode.SMART_FAST,
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_smart_fast_serves_a_warm_entry_composed_under_the_current_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The positive control for the two refusals below.
+
+    Without it, "the entry was not served" cannot be told apart from "the entry
+    was never read".
+    """
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(
+            runtime, user_id="usr_1", conversation_id="cnv_1"
+        )
+        service = ContextCacheService(runtime)
+        cache_key = _cache_key(
+            runtime,
+            service,
+            conversation,
+            response_mode=ResponseMode.SMART_FAST,
+        )
+        await runtime.storage_backend.set_context_view(
+            cache_key,
+            _cache_entry_payload(
+                runtime,
+                cache_key=cache_key,
+                lifecycle_epoch=str(conversation["_lifecycle_epoch"]),
+                cache_revision=int(conversation["_cache_revision"]),
+                derivation_revision=int(conversation["_derivation_revision"]),
+            ),
+            ttl_seconds=30,
+        )
+
+        resolution = await _resolve_smart_fast_warm(runtime, service)
+
+        assert resolution.from_cache is True
+        assert resolution.source_retrieval_plan["smart_fast_warm_entry_present"] is True
+        assert await runtime.storage_backend.get_context_view(cache_key) is not None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_field",
+    ["policy_prompt_hash", "effective_policy_hash"],
+)
+async def test_smart_fast_refuses_a_warm_entry_composed_under_another_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stale_field: str,
+) -> None:
+    """The fast path must apply the policy check the normal path gets for free.
+
+    The normal path discards on these two signals through the staleness scorer.
+    The smart_fast warm read makes no staleness call at all and validates only
+    the lifecycle/cache/derivation identity triple -- and the cache key carries
+    neither hash -- so an edited manifest (or any policy change that bumps no
+    lifecycle revision) left smart_fast serving memory context composed under
+    the OLD policy until the entry's TTL expired.
+    """
+    runtime, _provider = await _build_runtime(tmp_path, monkeypatch)
+    try:
+        conversation = await _seed_conversation(
+            runtime, user_id="usr_1", conversation_id="cnv_1"
+        )
+        service = ContextCacheService(runtime)
+        cache_key = _cache_key(
+            runtime,
+            service,
+            conversation,
+            response_mode=ResponseMode.SMART_FAST,
+        )
+        payload = _cache_entry_payload(
+            runtime,
+            cache_key=cache_key,
+            lifecycle_epoch=str(conversation["_lifecycle_epoch"]),
+            cache_revision=int(conversation["_cache_revision"]),
+            derivation_revision=int(conversation["_derivation_revision"]),
+        )
+        payload[stale_field] = "composed-under-another-policy"
+        await runtime.storage_backend.set_context_view(
+            cache_key,
+            payload,
+            ttl_seconds=30,
+        )
+
+        resolution = await _resolve_smart_fast_warm(runtime, service)
+
+        assert resolution.from_cache is False
+        assert resolution.source_retrieval_plan["smart_fast_warm_read_allowed"] is True
+        assert resolution.source_retrieval_plan["smart_fast_warm_entry_present"] is False
+        assert resolution.memory_summaries == []
+        # Dropped rather than left to expire, exactly as the normal path drops it.
+        assert await runtime.storage_backend.get_context_view(cache_key) is None
+    finally:
+        await runtime.close()
+
+
 @pytest.mark.asyncio
 async def test_context_cache_service_workspace_mismatch_forces_sync(
     tmp_path: Path,
@@ -1010,7 +1132,7 @@ async def test_context_cache_service_workspace_mismatch_forces_sync(
     try:
         conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
         service = ContextCacheService(runtime)
-        cache_key = _normal_cache_key(runtime, service, conversation)
+        cache_key = _cache_key(runtime, service, conversation)
         await runtime.storage_backend.set_context_view(
             cache_key,
             _cache_entry_payload(
@@ -1051,7 +1173,7 @@ async def test_context_cache_service_invalid_cache_entry_is_deleted_before_sync(
     try:
         conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
         service = ContextCacheService(runtime)
-        cache_key = _normal_cache_key(runtime, service, conversation)
+        cache_key = _cache_key(runtime, service, conversation)
         await runtime.storage_backend.set_context_view(
             cache_key,
             {"cache_key": cache_key},
@@ -1271,7 +1393,7 @@ async def test_context_cache_service_retrieval_overrides_disable_cache(
     try:
         conversation = await _seed_conversation(runtime, user_id="usr_1", conversation_id="cnv_1")
         service = ContextCacheService(runtime)
-        cache_key = _normal_cache_key(runtime, service, conversation)
+        cache_key = _cache_key(runtime, service, conversation)
         await runtime.storage_backend.set_context_view(
             cache_key,
             _cache_entry_payload(

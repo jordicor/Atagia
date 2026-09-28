@@ -69,7 +69,12 @@ ATAGIA_BENCH_ANSWER_MAX_OUTPUT_TOKENS = 8192
 THIRD_PARTY_BENCH_ANSWER_MAX_OUTPUT_TOKENS = 8192
 
 # === Benchmarks - judges and graders ===
-GENERIC_JUDGE_MAX_OUTPUT_TOKENS = 8192
+# The default judge is a reasoning model (gpt-5.6-luna,medium); thinking tokens
+# spend from this budget before the verdict, and the 2026-07-31 effort-ladder
+# runs measured occasional deep-thinking calls exceeding 8192. 24576 held
+# across ~9000 judge calls including max effort. This is a ceiling, not a
+# target: non-reasoning judges are unaffected.
+GENERIC_JUDGE_MAX_OUTPUT_TOKENS = 24576
 ATAGIA_BENCH_ABSTENTION_GRADER_MAX_OUTPUT_TOKENS = 8192
 ATAGIA_BENCH_GATED_FACT_GRADER_MAX_OUTPUT_TOKENS = 8192
 ATAGIA_BENCH_SUPERSESSION_GRADER_MAX_OUTPUT_TOKENS = 8192

@@ -31,7 +31,7 @@ from atagia.core.summary_repository import SummaryRepository
 from atagia.memory.consequence_builder import ConsequenceChainBuilder
 from atagia.memory.consequence_detector import ConsequenceDetector
 from atagia.memory.extractor import MemoryExtractor
-from atagia.memory.intent_classifier import are_claim_keys_equivalent
+from atagia.memory.intent_classifier import ClaimKeyEquivalenceSession
 from atagia.memory.language_profile import UserCommunicationProfileService
 from atagia.memory.policy_manifest import (
     ManifestLoader,
@@ -722,6 +722,9 @@ class IngestWorker:
             if row.get("object_type") == MemoryObjectType.BELIEF.value
         ]
         evidence_ids = [str(row["id"]) for row in evidence_rows]
+        equivalence = ClaimKeyEquivalenceSession(
+            self._llm_client, self._classifier_model, user_id=envelope.user_id
+        )
 
         for belief_row in belief_rows:
             payload_json = belief_row.get("payload_json")
@@ -762,6 +765,7 @@ class IngestWorker:
                 mind_topology=job_payload.mind_topology,
                 active_embodiment_id=job_payload.active_embodiment_id,
                 active_realm_id=job_payload.active_realm_id,
+                equivalence=equivalence,
             )
             await self._enqueue_revision_job(
                 envelope=envelope,
@@ -1265,6 +1269,7 @@ class IngestWorker:
         mind_topology: str | None = None,
         active_embodiment_id: str | None = None,
         active_realm_id: str | None = None,
+        equivalence: ClaimKeyEquivalenceSession,
     ) -> str | None:
         candidates = (
             await self._belief_repository.find_active_belief_candidates_by_claim_key(
@@ -1279,15 +1284,8 @@ class IngestWorker:
                 remember_across_devices=remember_across_devices,
             )
         )
-        ranked: list[tuple[int, str]] = []
+        eligible: list[dict[str, Any]] = []
         for candidate in candidates:
-            if not await are_claim_keys_equivalent(
-                self._llm_client,
-                self._classifier_model,
-                claim_key,
-                str(candidate["claim_key"]),
-            ):
-                continue
             belief_id = str(candidate["belief_id"])
             if belief_id == current_belief_id:
                 continue
@@ -1317,22 +1315,32 @@ class IngestWorker:
             )
             if source_message_id in source_ids:
                 continue
-            score = 0
-            if candidate.get("scope") == scope:
-                score += 4
-            if (
-                conversation_id is not None
-                and candidate.get("conversation_id") == conversation_id
-            ):
-                score += 3
-            if (
-                workspace_id is not None
-                and candidate.get("workspace_id") == workspace_id
-            ):
-                score += 2
-            if candidate.get("assistant_mode_id") == assistant_mode_id:
-                score += 1
-            ranked.append((score, belief_id))
+            eligible.append(candidate)
+        ranked: list[tuple[int, str]] = []
+        for start in range(0, len(eligible), 8):
+            group = eligible[start : start + 8]
+            answers = await equivalence.compare_batch(
+                [(claim_key, str(candidate["claim_key"])) for candidate in group]
+            )
+            for candidate, is_equivalent in zip(group, answers, strict=True):
+                if not is_equivalent:
+                    continue
+                score = 0
+                if candidate.get("scope") == scope:
+                    score += 4
+                if (
+                    conversation_id is not None
+                    and candidate.get("conversation_id") == conversation_id
+                ):
+                    score += 3
+                if (
+                    workspace_id is not None
+                    and candidate.get("workspace_id") == workspace_id
+                ):
+                    score += 2
+                if candidate.get("assistant_mode_id") == assistant_mode_id:
+                    score += 1
+                ranked.append((score, str(candidate["belief_id"])))
         if not ranked:
             return None
         ranked.sort(key=lambda item: (-item[0], item[1]))

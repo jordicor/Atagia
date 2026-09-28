@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
@@ -11,7 +11,13 @@ import pytest
 
 from atagia.core.clock import FrozenClock
 from atagia.core.db_sqlite import initialize_database
-from atagia.core.repositories import ConversationRepository, MemoryObjectRepository, UserRepository, WorkspaceRepository
+from atagia.core.repositories import (
+    ConversationRepository,
+    MemoryObjectRepository,
+    MessageRepository,
+    UserRepository,
+    WorkspaceRepository,
+)
 from atagia.memory.consequence_builder import ConsequenceChainBuilder
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver, sync_assistant_modes
 from atagia.models.schemas_memory import (
@@ -33,6 +39,9 @@ from atagia.services.llm_client import (
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
+
+RUNTIME_NOW = datetime(2026, 4, 2, 14, 0, tzinfo=timezone.utc)
+MESSAGE_ARRIVAL_LAG_SECONDS = 30.0
 
 
 class QueueProvider(LLMProvider):
@@ -61,7 +70,7 @@ class QueueProvider(LLMProvider):
 
 async def _build_runtime(*, outputs: list[str], fail: bool = False):
     connection = await initialize_database(":memory:", MIGRATIONS_DIR)
-    clock = FrozenClock(datetime(2026, 4, 2, 14, 0, tzinfo=timezone.utc))
+    clock = FrozenClock(RUNTIME_NOW)
     manifest_loader = ManifestLoader(MANIFESTS_DIR)
     await sync_assistant_modes(connection, manifest_loader.load_all(), clock)
     users = UserRepository(connection, clock)
@@ -71,6 +80,27 @@ async def _build_runtime(*, outputs: list[str], fail: bool = False):
     await users.create_user("usr_1")
     await workspaces.create_workspace("wrk_1", "usr_1", "Workspace")
     await conversations.create_conversation("cnv_1", "usr_1", "wrk_1", "coding_debug", "Chat")
+    # The real conversation messages arrived before the chain is built, so they
+    # are written through a repository whose clock sits earlier than the
+    # builder's. That keeps ingest-freshness assertions on a positive interval.
+    message_repository = MessageRepository(
+        connection,
+        FrozenClock(RUNTIME_NOW - timedelta(seconds=MESSAGE_ARRIVAL_LAG_SECONDS)),
+    )
+    await message_repository.create_message(
+        "msg_assistant_1",
+        "cnv_1",
+        "assistant",
+        1,
+        "Suggested a large refactor.",
+    )
+    await message_repository.create_message(
+        "msg_user_1",
+        "cnv_1",
+        "user",
+        2,
+        "Regressions appeared afterwards.",
+    )
     provider = QueueProvider(outputs, fail=fail)
     builder = ConsequenceChainBuilder(
         connection=connection,
@@ -475,6 +505,131 @@ async def test_builder_returns_none_when_action_memory_cannot_be_found_or_create
         )
 
         assert result is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_outcome_memory_stamps_source_message_arrival_and_chain_parts_do_not() -> None:
+    connection, memories, builder, resolved_policy, context = await _build_runtime(
+        outputs=[json.dumps({"tendency_text": "This workflow prefers incremental changes."})]
+    )
+    try:
+        result = await builder.build_chain(
+            ConsequenceSignal(
+                is_consequence=True,
+                action_description="Suggested a large refactor.",
+                outcome_description="Regressions appeared afterwards.",
+                outcome_sentiment="negative",
+                confidence=0.8,
+                likely_action_message_id=None,
+            ),
+            user_id="usr_1",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+        )
+
+        assert result is not None
+        cursor = await connection.execute(
+            "SELECT created_at FROM messages WHERE id = ?",
+            ("msg_user_1",),
+        )
+        message_row = await cursor.fetchone()
+        assert message_row is not None
+        source_message_created_at = str(message_row["created_at"])
+
+        outcome = await memories.get_memory_object(result.outcome_memory_id, "usr_1")
+        assert outcome is not None
+        assert outcome["source_message_created_at"] == source_message_created_at
+        assert outcome["created_at"] > source_message_created_at
+        assert (
+            datetime.fromisoformat(str(outcome["created_at"]))
+            - datetime.fromisoformat(source_message_created_at)
+        ) == timedelta(seconds=MESSAGE_ARRIVAL_LAG_SECONDS)
+
+        # The action memory reconstructs an earlier assistant turn and the
+        # tendency spans action plus outcome, so neither carries an arrival
+        # instant that would mean ingest lag.
+        action = await memories.get_memory_object(result.action_memory_id, "usr_1")
+        tendency = await memories.get_memory_object(str(result.tendency_belief_id), "usr_1")
+        assert action is not None
+        assert tendency is not None
+        assert action["source_message_created_at"] is None
+        assert tendency["source_message_created_at"] is None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_linked_action_memory_leaves_source_message_arrival_null() -> None:
+    connection, memories, builder, resolved_policy, context = await _build_runtime(
+        outputs=[json.dumps({"tendency_text": ""})]
+    )
+    try:
+        result = await builder.build_chain(
+            ConsequenceSignal(
+                is_consequence=True,
+                action_description="Suggested a large refactor.",
+                outcome_description="Regressions appeared afterwards.",
+                outcome_sentiment="negative",
+                confidence=0.86,
+                likely_action_message_id="msg_assistant_1",
+            ),
+            user_id="usr_1",
+            conversation_context=context,
+            resolved_policy=resolved_policy,
+        )
+
+        assert result is not None
+        assert result.tendency_belief_id is None
+        action = await memories.get_memory_object(result.action_memory_id, "usr_1")
+        outcome = await memories.get_memory_object(result.outcome_memory_id, "usr_1")
+        assert action is not None
+        assert outcome is not None
+        assert action["payload_json"]["source_message_ids"] == ["msg_assistant_1"]
+        assert action["source_message_created_at"] is None
+        assert outcome["source_message_created_at"] is not None
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_build_chain_rejects_unresolvable_or_foreign_source_message() -> None:
+    connection, _memories, builder, resolved_policy, context = await _build_runtime(
+        outputs=[json.dumps({"tendency_text": "Unused tendency."})]
+    )
+    try:
+        conversations = ConversationRepository(connection, FrozenClock(RUNTIME_NOW))
+        await conversations.create_conversation(
+            "cnv_2", "usr_1", "wrk_1", "coding_debug", "Other chat"
+        )
+        other_messages = MessageRepository(connection, FrozenClock(RUNTIME_NOW))
+        await other_messages.create_message(
+            "msg_other_conversation",
+            "cnv_2",
+            "user",
+            1,
+            "Unrelated report from another chat.",
+        )
+
+        signal = ConsequenceSignal(
+            is_consequence=True,
+            action_description="Suggested a large refactor.",
+            outcome_description="Regressions appeared afterwards.",
+            outcome_sentiment="negative",
+            confidence=0.8,
+            likely_action_message_id=None,
+        )
+        for source_message_id in ("msg_missing", "msg_other_conversation"):
+            with pytest.raises(ValueError, match="must belong to the active conversation"):
+                await builder.build_chain(
+                    signal,
+                    user_id="usr_1",
+                    conversation_context=context.model_copy(
+                        update={"source_message_id": source_message_id}
+                    ),
+                    resolved_policy=resolved_policy,
+                )
     finally:
         await connection.close()
 

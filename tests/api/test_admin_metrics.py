@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +25,14 @@ from atagia.core.retrieval_event_repository import (
     MemoryFeedbackRepository,
     RetrievalEventRepository,
 )
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind
+from atagia.models.schemas_memory import (
+    MemoryObjectType,
+    MemoryScope,
+    MemorySourceKind,
+    TurnSurface,
+)
+
+from tests.turn_telemetry_support import sample_turn_telemetry
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -156,7 +165,7 @@ def test_admin_metrics_routes_support_compute_latest_history_and_summary(
                 )
             )
             client.portal.call(
-                events.create_event,
+                partial(events.create_event, telemetry=sample_turn_telemetry()),
                 {
                     "id": "ret_1",
                     "user_id": "usr_1",
@@ -249,6 +258,44 @@ def test_admin_metrics_routes_support_compute_latest_history_and_summary(
                 "2026-03-30",
             ]
 
+            # A retrieve-only sidecar call in the same window. It is not
+            # comparable with the chat turn above, which is why the summary has
+            # to keep the two apart.
+            client.portal.call(
+                messages.create_message,
+                "msg_3",
+                "cnv_1",
+                "user",
+                3,
+                "Sidecar prompt",
+                2,
+                {},
+            )
+            client.portal.call(
+                partial(
+                    events.create_event,
+                    telemetry=sample_turn_telemetry(TurnSurface.CONTEXT),
+                ),
+                {
+                    "id": "ret_ctx_1",
+                    "user_id": "usr_1",
+                    "conversation_id": "cnv_1",
+                    "request_message_id": "msg_3",
+                    "response_message_id": None,
+                    "assistant_mode_id": "coding_debug",
+                    "retrieval_plan_json": {"fts_queries": ["retry"]},
+                    "selected_memory_ids_json": ["mem_1"],
+                    "context_view_json": {
+                        "selected_memory_ids": ["mem_1"],
+                        "items_included": 5,
+                        "items_dropped": 0,
+                        "total_tokens_estimate": 400,
+                    },
+                    "outcome_json": {"cold_start": False, "zero_candidates": False},
+                    "created_at": "2026-03-31T09:10:03+00:00",
+                },
+            )
+
             summary_response = client.get(
                 "/v1/admin/metrics/retrieval-summary",
                 params={
@@ -259,8 +306,44 @@ def test_admin_metrics_routes_support_compute_latest_history_and_summary(
                 headers={"Authorization": "Bearer admin-key"},
             )
             assert summary_response.status_code == 200
-            assert summary_response.json()["total_events"] == 1
-            assert summary_response.json()["avg_items_included"] == 1.0
+            summary_payload = summary_response.json()
+            assert summary_payload["total_events"] == 2
+            assert summary_payload["avg_items_included"] == 3.0
+            assert summary_payload["surface_filter"] is None
+            assert set(summary_payload["by_surface"]) == {"chat", "context"}
+            assert summary_payload["by_surface"]["chat"]["total_events"] == 1
+            assert summary_payload["by_surface"]["chat"]["avg_items_included"] == 1.0
+            assert summary_payload["by_surface"]["context"]["total_events"] == 1
+            assert summary_payload["by_surface"]["context"]["avg_items_included"] == 5.0
+
+            chat_summary_response = client.get(
+                "/v1/admin/metrics/retrieval-summary",
+                params={
+                    "user_id": "usr_1",
+                    "from_date": "2026-03-31",
+                    "to_date": "2026-03-31",
+                    "turn_surface": "chat",
+                },
+                headers={"Authorization": "Bearer admin-key"},
+            )
+            assert chat_summary_response.status_code == 200
+            chat_summary_payload = chat_summary_response.json()
+            assert chat_summary_payload["surface_filter"] == "chat"
+            assert chat_summary_payload["total_events"] == 1
+            assert chat_summary_payload["avg_items_included"] == 1.0
+            assert set(chat_summary_payload["by_surface"]) == {"chat"}
+
+            unknown_surface_response = client.get(
+                "/v1/admin/metrics/retrieval-summary",
+                params={
+                    "user_id": "usr_1",
+                    "from_date": "2026-03-31",
+                    "to_date": "2026-03-31",
+                    "turn_surface": "not-a-surface",
+                },
+                headers={"Authorization": "Bearer admin-key"},
+            )
+            assert unknown_surface_response.status_code == 422
 
             audit_entries = client.portal.call(
                 AdminAuditRepository(connection, runtime.clock).list_entries

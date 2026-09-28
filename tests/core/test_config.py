@@ -9,7 +9,6 @@ import pytest
 
 from atagia.core.env import env_bool
 from atagia.core.config import (
-    MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS,
     Settings,
     default_resource_path,
 )
@@ -70,6 +69,67 @@ def test_packaged_resources_are_present() -> None:
     assert packaged.joinpath("operational_profiles", "normal.json").is_file()
 
 
+def test_finite_decision_routing_is_opt_in() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.llm_finite_decisions_enabled is False
+    assert settings.llm_finite_decision_model is None
+
+
+def test_topic_update_mode_defaults_to_selective_and_rejects_invalid_values() -> None:
+    assert Settings.from_env({}).topic_working_set_update_mode == "selective"
+    assert (
+        Settings.from_env(
+            {"ATAGIA_TOPIC_WORKING_SET_UPDATE_MODE": "direct"}
+        ).topic_working_set_update_mode
+        == "direct"
+    )
+    with pytest.raises(ValueError, match="topic_working_set_update_mode"):
+        Settings.from_env({"ATAGIA_TOPIC_WORKING_SET_UPDATE_MODE": "automatic"})
+
+
+def test_provider_dispatch_limit_loads_and_rejects_nonpositive_values() -> None:
+    assert Settings.from_env({}).llm_max_concurrent_requests_per_provider == 4
+    assert (
+        Settings.from_env(
+            {"ATAGIA_LLM_MAX_CONCURRENT_REQUESTS_PER_PROVIDER": "2"}
+        ).llm_max_concurrent_requests_per_provider
+        == 2
+    )
+    with pytest.raises(ValueError, match="llm_max_concurrent_requests_per_provider"):
+        Settings.from_env({"ATAGIA_LLM_MAX_CONCURRENT_REQUESTS_PER_PROVIDER": "0"})
+
+
+def test_finite_decision_routing_loads_an_ordinary_model() -> None:
+    settings = Settings.from_env(
+        {
+            "ATAGIA_LLM_FINITE_DECISIONS_ENABLED": "true",
+            "ATAGIA_LLM_FINITE_DECISION_MODEL": "openai/decision-model",
+        }
+    )
+
+    assert settings.llm_finite_decisions_enabled is True
+    assert settings.llm_finite_decision_model == "openai/decision-model"
+
+
+def test_disabled_finite_decisions_reject_a_dormant_typesafe_override() -> None:
+    with pytest.raises(ValueError, match="FINITE_DECISIONS_ENABLED=true"):
+        Settings.from_env(
+            {
+                "ATAGIA_LLM_MODEL__NEED_DETECTOR_MEMORY": "typesafe/jev-latest",
+            }
+        )
+
+
+def test_disabled_finite_decisions_reject_a_decision_model() -> None:
+    with pytest.raises(ValueError, match="FINITE_DECISIONS_ENABLED=true"):
+        Settings.from_env(
+            {
+                "ATAGIA_LLM_FINITE_DECISION_MODEL": "openai/decision-model",
+            }
+        )
+
+
 def test_openai_proxy_and_cors_settings_can_be_overridden(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -120,6 +180,29 @@ def test_workers_can_be_enabled_explicitly(monkeypatch) -> None:
     settings = Settings.from_env()
 
     assert settings.workers_enabled is True
+
+
+def test_inference_access_settings_default_and_environment_values(
+    tmp_path: Path,
+) -> None:
+    catalog_path = tmp_path / "local-endpoints.json"
+    settings = Settings.from_env(
+        {
+            "ATAGIA_INFERENCE_ACCESS_MODE": " LOCAL_ONLY ",
+            "ATAGIA_LOCAL_LLM_ENDPOINTS_FILE": str(catalog_path),
+            "ATAGIA_ZERO_COST_OPENROUTER_PROFILE": "dedicated_free_tier_no_byok",
+        }
+    )
+
+    assert Settings.from_env({}).inference_access_mode == "unrestricted"
+    assert settings.inference_access_mode == "local_only"
+    assert settings.local_llm_endpoints_file == str(catalog_path)
+    assert settings.zero_cost_openrouter_profile == "dedicated_free_tier_no_byok"
+
+
+def test_inference_access_settings_reject_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="inference_access_mode"):
+        Settings.from_env({"ATAGIA_INFERENCE_ACCESS_MODE": "free-ish"})
 
 
 def test_default_language_code_default_and_override(
@@ -176,6 +259,62 @@ def test_compactor_summary_card_concurrency_rejects_non_positive(
     monkeypatch.setenv("ATAGIA_COMPACTOR_SUMMARY_CARD_CONCURRENCY", "0")
 
     with pytest.raises(ValueError, match="compactor_summary_card_concurrency"):
+        Settings.from_env()
+
+
+def test_applicability_scorer_card_concurrency_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ATAGIA_APPLICABILITY_SCORER_CARD_CONCURRENCY", raising=False)
+    assert Settings.from_env().applicability_scorer_card_concurrency == 4
+
+    monkeypatch.setenv("ATAGIA_APPLICABILITY_SCORER_CARD_CONCURRENCY", "1")
+    assert Settings.from_env().applicability_scorer_card_concurrency == 1
+
+
+def test_applicability_scorer_card_concurrency_rejects_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_APPLICABILITY_SCORER_CARD_CONCURRENCY", "0")
+
+    with pytest.raises(ValueError, match="applicability_scorer_card_concurrency"):
+        Settings.from_env()
+
+
+def test_ranking_challenger_settings_default_off_and_accept_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "ATAGIA_RECALL_RECOVERY_SCORING_MAX_CANDIDATES",
+        raising=False,
+    )
+    monkeypatch.delenv("ATAGIA_BROAD_LIST_COMPARABLE_RRF_ENABLED", raising=False)
+    monkeypatch.delenv("ATAGIA_FUSED_CANDIDATE_GUARD_ORDERING_ENABLED", raising=False)
+
+    defaults = Settings.from_env()
+    assert defaults.recall_recovery_scoring_max_candidates is None
+    assert defaults.broad_list_comparable_rrf_enabled is False
+    assert defaults.fused_candidate_guard_ordering_enabled is False
+
+    monkeypatch.setenv("ATAGIA_RECALL_RECOVERY_SCORING_MAX_CANDIDATES", "32")
+    monkeypatch.setenv("ATAGIA_BROAD_LIST_COMPARABLE_RRF_ENABLED", "true")
+    monkeypatch.setenv("ATAGIA_FUSED_CANDIDATE_GUARD_ORDERING_ENABLED", "true")
+
+    challenger = Settings.from_env()
+    assert challenger.recall_recovery_scoring_max_candidates == 32
+    assert challenger.broad_list_comparable_rrf_enabled is True
+    assert challenger.fused_candidate_guard_ordering_enabled is True
+
+
+def test_recall_recovery_scoring_cap_rejects_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ATAGIA_RECALL_RECOVERY_SCORING_MAX_CANDIDATES", "0")
+
+    with pytest.raises(
+        ValueError,
+        match="recall_recovery_scoring_max_candidates",
+    ):
         Settings.from_env()
 
 
@@ -413,11 +552,18 @@ def test_llm_run_guard_settings_use_defaults(monkeypatch) -> None:
 
     assert settings.llm_run_guard_enabled is True
     assert settings.llm_run_guard_mode == "enforce"
+    # Both absolute caps on the PROCESS-WIDE run default to None. A cumulative
+    # count over a run that never ends is a budget, not a health reading: a
+    # healthy long-lived process crosses any fixed number eventually and the
+    # guard then blocks until an operator resets it. The knobs stay settable for
+    # a deployment that wants a finite process budget on purpose.
     assert settings.llm_run_guard_max_total_calls is None
-    assert settings.llm_run_guard_max_total_failed_calls == 80
+    assert settings.llm_run_guard_max_total_failed_calls is None
     assert settings.llm_run_guard_max_failed_call_ratio == 0.50
     assert settings.llm_run_guard_max_failed_ratio_per_purpose == 0.50
     assert settings.llm_run_guard_max_consecutive_failures_per_purpose == 8
+    assert settings.llm_run_guard_health_window_calls == 200
+    assert settings.llm_run_guard_recovery_seconds == 60.0
     assert settings.bulk_ingest_llm_run_guard_max_total_calls == 10000
     assert settings.bulk_ingest_llm_run_guard_max_total_failed_calls == 40
     assert settings.bulk_ingest_llm_run_guard_max_failed_call_ratio == 0.20
@@ -685,60 +831,6 @@ def test_chunking_threshold_must_be_positive(monkeypatch) -> None:
         Settings.from_env()
 
 
-def test_recent_transcript_budget_defaults_to_policy_with_floor(monkeypatch) -> None:
-    monkeypatch.delenv("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS", raising=False)
-
-    settings = Settings.from_env()
-
-    assert settings.recent_transcript_budget_tokens is None
-    assert settings.effective_recent_transcript_budget_tokens(4000) == 4000
-    assert (
-        settings.effective_recent_transcript_budget_tokens(512)
-        == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
-    )
-
-
-def test_recent_transcript_budget_can_be_overridden_from_env(monkeypatch) -> None:
-    monkeypatch.setenv("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS", "30000")
-
-    settings = Settings.from_env()
-
-    assert settings.recent_transcript_budget_tokens == 30000
-    assert settings.effective_recent_transcript_budget_tokens(4000) == 30000
-
-
-def test_recent_transcript_budget_override_is_floored(monkeypatch) -> None:
-    monkeypatch.setenv("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS", "512")
-
-    settings = Settings.from_env()
-
-    assert (
-        settings.effective_recent_transcript_budget_tokens(4000)
-        == MIN_RECENT_TRANSCRIPT_BUDGET_TOKENS
-    )
-
-
-def test_recent_transcript_budget_respects_hard_cap(monkeypatch) -> None:
-    monkeypatch.setenv("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS", "30000")
-
-    settings = Settings.from_env()
-
-    assert (
-        settings.effective_recent_transcript_budget_tokens(
-            4000,
-            hard_cap_tokens=2000,
-        )
-        == 2000
-    )
-
-
-def test_recent_transcript_budget_rejects_non_positive_override(monkeypatch) -> None:
-    monkeypatch.setenv("ATAGIA_RECENT_TRANSCRIPT_BUDGET_TOKENS", "0")
-
-    with pytest.raises(ValueError):
-        Settings.from_env()
-
-
 def test_context_envelope_defaults_to_structural_8k_budget(monkeypatch) -> None:
     monkeypatch.delenv("ATAGIA_CONTEXT_ENVELOPE_BUDGET_TOKENS", raising=False)
     monkeypatch.delenv("ATAGIA_CONTEXT_ENVELOPE_RATIOS", raising=False)
@@ -945,7 +1037,7 @@ def test_operational_profile_settings_can_be_overridden(monkeypatch) -> None:
 
     settings = Settings.from_env()
 
-    assert settings.operational_profiles_path == "/tmp/profiles"
+    assert settings.operational_profiles_path == str(Path("/tmp/profiles"))
     assert settings.operational_high_risk_enabled is True
     assert settings.operational_allowed_profiles == ("normal", "offline", "emergency")
 

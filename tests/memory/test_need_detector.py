@@ -106,7 +106,8 @@ def _settings(
 def _default_outputs() -> dict[str, str]:
     return {
         "need_detection_needs_card": "none",
-        "need_detection_language_card": "en\nen",
+        "need_detection_query_language_card": "en",
+        "need_detection_answer_language_card": "en",
         "need_detection_memory_card": "personal",
         "need_detection_exact_card": "yes",
         "need_detection_shape_card": "slot",
@@ -135,7 +136,7 @@ async def test_need_detector_runs_parallel_cards_and_merges_result() -> None:
 
     purposes = {request.metadata["purpose"] for request in provider.requests}
     assert purposes == set(_default_outputs())
-    assert len(provider.requests) == 8
+    assert len(provider.requests) == 9
     assert detected.query_language == "en"
     assert detected.answer_language == "en"
     assert detected.memory_dependence is MemoryDependence.PERSONAL
@@ -177,10 +178,8 @@ async def test_need_detector_uses_card_specific_models() -> None:
     models_by_purpose = {
         str(request.metadata["purpose"]): request.model for request in provider.requests
     }
-    assert (
-        models_by_purpose["need_detection_language_card"]
-        == "openrouter/acme/language-card"
-    )
+    assert models_by_purpose["need_detection_query_language_card"] == "openrouter/acme/language-card"
+    assert models_by_purpose["need_detection_answer_language_card"] == "openrouter/acme/language-card"
     assert (
         models_by_purpose["need_detection_search_words_card"]
         == "openrouter/acme/search-words-card"
@@ -195,7 +194,8 @@ async def test_need_detector_uses_card_specific_models() -> None:
 async def test_need_detector_keeps_world_questions_non_exact() -> None:
     outputs = {
         "need_detection_needs_card": "none",
-        "need_detection_language_card": "en\nen",
+        "need_detection_query_language_card": "en",
+        "need_detection_answer_language_card": "en",
         "need_detection_memory_card": "world",
         "need_detection_exact_card": "no",
         "need_detection_shape_card": "default",
@@ -231,7 +231,8 @@ async def test_need_detector_rescues_conversation_label_for_saved_detail() -> No
     # shape (slot/list/time) both corroborate a saved detail.
     outputs = {
         "need_detection_needs_card": "none",
-        "need_detection_language_card": "en\nen",
+        "need_detection_query_language_card": "en",
+        "need_detection_answer_language_card": "en",
         "need_detection_memory_card": "conversation",
         "need_detection_exact_card": "yes",
         "need_detection_shape_card": "slot",
@@ -265,7 +266,8 @@ async def test_need_detector_keeps_conversation_skip_for_in_chat_detail() -> Non
     # gate still skips memory retrieval.
     outputs = {
         "need_detection_needs_card": "none",
-        "need_detection_language_card": "en\nen",
+        "need_detection_query_language_card": "en",
+        "need_detection_answer_language_card": "en",
         "need_detection_memory_card": "conversation",
         "need_detection_exact_card": "yes",
         "need_detection_shape_card": "default",
@@ -295,7 +297,8 @@ async def test_need_detector_keeps_conversation_skip_for_in_chat_detail() -> Non
 async def test_need_detector_defaults_conservatively_when_exact_card_is_invalid() -> None:
     outputs = {
         "need_detection_needs_card": "none",
-        "need_detection_language_card": "en\nen",
+        "need_detection_query_language_card": "en",
+        "need_detection_answer_language_card": "en",
         "need_detection_memory_card": "personal",
         "need_detection_exact_card": "maybe",
         "need_detection_shape_card": "default",
@@ -417,7 +420,7 @@ def test_need_card_prompts_do_not_leak_shadow_benchmark_content() -> None:
     engine_prompt = "\n".join(
         compose_card_prompt(instruction, examples, include_examples=True)
         for instruction, examples, _max_output_tokens in (
-            _card_task(card_name) for card_name in _CARD_NAMES
+            _card_task(card_name) for card_name in (*_CARD_NAMES, "answer_language")
         )
     )
     cases = [asdict(case) for case in harness._case_set()]

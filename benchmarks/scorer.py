@@ -96,10 +96,14 @@ class LLMJudgeScorer:
         llm_client: LLMClient[object],
         judge_model: str,
         protocol: JudgeProtocol = JudgeProtocol.SOURCE_AWARE_STRICT,
+        max_output_tokens: int = GENERIC_JUDGE_MAX_OUTPUT_TOKENS,
     ) -> None:
         self._llm_client = llm_client
         self._judge_model = judge_model
         self._protocol = protocol
+        # Reasoning-model judges spend thinking tokens inside this budget, so
+        # high-effort specs can need more room than the generic default.
+        self._max_output_tokens = max_output_tokens
 
     @property
     def judge_model(self) -> str:
@@ -151,7 +155,7 @@ class LLMJudgeScorer:
                     LLMMessage(role="system", content=instruction),
                     LLMMessage(role="user", content=user_content),
                 ],
-                max_output_tokens=GENERIC_JUDGE_MAX_OUTPUT_TOKENS,
+                max_output_tokens=self._max_output_tokens,
                 metadata={
                     "purpose": "benchmark_judge",
                     "question": question,

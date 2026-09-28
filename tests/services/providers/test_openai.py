@@ -10,6 +10,7 @@ import openai
 import pytest
 
 from atagia.services.llm_client import (
+    ConfigurationError,
     LLMCompletionRequest,
     LLMEmbeddingRequest,
     LLMError,
@@ -87,6 +88,62 @@ class FakeOpenAIClient:
     ) -> None:
         self.chat = SimpleNamespace(completions=completions)
         self.embeddings = embeddings
+
+
+@pytest.mark.parametrize("tier", [None, "auto", "default", "flex", "priority"])
+async def test_openai_service_tier_reaches_complete_and_stream(tier: str | None) -> None:
+    completion_response = SimpleNamespace(
+        model="gpt-6-luna",
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content="ok", tool_calls=None),
+            finish_reason="stop",
+        )],
+        usage=None,
+        model_dump=lambda: {"service_tier": tier},
+    )
+    completion = FakeChatCompletions(create_result=completion_response)
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completion, FakeEmbeddings()),
+    )
+    metadata = {} if tier is None else {"service_tier": tier}
+    request = _request(model="gpt-6-luna").model_copy(
+        update={"metadata": metadata, "response_schema": None, "tools": []},
+    )
+    await provider.complete(request)
+    assert completion.calls[0].get("service_tier") == tier
+    assert ("service_tier" in completion.calls[0]) is (tier is not None)
+
+    stream = FakeStream([SimpleNamespace(
+        usage=None,
+        choices=[SimpleNamespace(
+            delta=SimpleNamespace(content="ok", tool_calls=None),
+            finish_reason="stop",
+        )],
+    )])
+    streaming_completion = FakeChatCompletions(create_result=stream)
+    streaming_provider = OpenAIProvider(
+        api_key="test",
+        client=FakeOpenAIClient(streaming_completion, FakeEmbeddings()),
+    )
+    assert [event.type async for event in streaming_provider.stream(request)] == ["text", "done"]
+    assert streaming_completion.calls[0].get("service_tier") == tier
+    assert ("service_tier" in streaming_completion.calls[0]) is (tier is not None)
+
+
+@pytest.mark.parametrize("tier", [None, "fast", "scale", 3, ["default"]])
+async def test_openai_service_tier_rejects_invalid_explicit_values(tier: object) -> None:
+    completions = FakeChatCompletions()
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings()),
+    )
+    request = _request(model="gpt-6-luna").model_copy(
+        update={"metadata": {"service_tier": tier}, "response_schema": None, "tools": []},
+    )
+    with pytest.raises(ConfigurationError, match="service_tier"):
+        await provider.complete(request)
+    with pytest.raises(ConfigurationError, match="service_tier"):
+        [event async for event in provider.stream(request)]
+    assert completions.calls == []
 
 
 def _request(model: str = "gpt-5-mini") -> LLMCompletionRequest:
@@ -449,6 +506,67 @@ async def test_openai_chat_latest_uses_completion_tokens_and_omits_temperature()
     assert "temperature" not in call
     assert call["max_completion_tokens"] == 8192
     assert "max_tokens" not in call
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6-sol"])
+async def test_openai_gpt6_plain_completion_uses_reasoning_token_field(model: str) -> None:
+    response = SimpleNamespace(
+        model=model,
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+        usage=None,
+        model_dump=lambda: {},
+    )
+    completions = FakeChatCompletions(create_result=response)
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings())
+    )
+    request = _request(model=model).model_copy(
+        update={"response_schema": None, "tools": []}
+    )
+
+    await provider.complete(request)
+
+    call = completions.calls[0]
+    assert call["max_completion_tokens"] == 8192
+    assert "max_tokens" not in call
+    assert "temperature" not in call
+    assert "reasoning_effort" not in call
+    assert "response_format" not in call
+
+
+@pytest.mark.asyncio
+async def test_openai_gpt6_plain_stream_uses_reasoning_token_field() -> None:
+    stream = FakeStream(
+        [
+            SimpleNamespace(
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="ok", tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+        ]
+    )
+    completions = FakeChatCompletions(create_result=stream)
+    provider = OpenAIProvider(
+        api_key="test", client=FakeOpenAIClient(completions, FakeEmbeddings())
+    )
+    request = _request(model="gpt-6-luna").model_copy(
+        update={"response_schema": None, "tools": []}
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    call = completions.calls[0]
+    assert [event.type for event in events] == ["text", "done"]
+    assert call["max_completion_tokens"] == 8192
+    assert "max_tokens" not in call
+    assert "temperature" not in call
+    assert "reasoning_effort" not in call
+    assert "response_format" not in call
 
 
 @pytest.mark.asyncio

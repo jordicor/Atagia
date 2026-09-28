@@ -98,43 +98,43 @@ async def test_memory_evidence_repository_round_trips_packets_and_enforces_user_
         await _insert_assistant_mode(connection)
         await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
         await conversations.create_conversation("cnv_b", "usr_b", None, "coding_debug", "Chat B")
-        await messages.create_message("msg_trigger", "cnv_a", "assistant", 1, "What's your fave?", 4, {})
+        await messages.create_message("msg_trigger", "cnv_a", "assistant", 1, "Which nib width do you like?", 4, {})
         await messages.create_message(
             "msg_source",
             "cnv_a",
             "user",
             2,
-            "Yeah, me too! Contemporary dance really speaks to me.",
+            "I keep picking broad nibs for my fountain pens.",
             9,
             {},
-            occurred_at="2023-01-20T16:04:00+00:00",
+            occurred_at="2025-02-09T09:15:00+00:00",
         )
         await messages.create_message("msg_other_user", "cnv_b", "user", 1, "Other user's evidence.", 4, {})
         await _create_test_memory(
             memories,
             user_id="usr_a",
-            memory_id="mem_gina",
-            canonical_text="Gina's favorite dance style is contemporary.",
+            memory_id="mem_nib_preference",
+            canonical_text="Noor prefers broad fountain-pen nibs.",
         )
 
         packet = await evidence.create_support_edge_with_spans(
             user_id="usr_a",
-            memory_id="mem_gina",
+            memory_id="mem_nib_preference",
             support_kind="contextual_direct",
             evidence_polarity="supports",
             speaker_relation_to_subject="self_report",
             confidence=0.91,
-            rationale="Gina answers the favorite-dance question.",
+            rationale="Noor answers the fountain-pen nib question.",
             spans=[
                 {
                     "span_role": "source",
                     "message_id": "msg_source",
-                    "quote_text": "Contemporary dance really speaks to me.",
+                    "quote_text": "broad nibs for my fountain pens.",
                 },
                 {
                     "span_role": "trigger",
                     "message_id": "msg_trigger",
-                    "quote_text": "What's your fave?",
+                    "quote_text": "Which nib width do you like?",
                 },
             ],
         )
@@ -143,18 +143,18 @@ async def test_memory_evidence_repository_round_trips_packets_and_enforces_user_
         assert [span["span_role"] for span in packet["spans"]] == ["source", "trigger"]
         packets = await evidence.list_packets_for_memory_ids(
             user_id="usr_a",
-            memory_ids=["mem_gina"],
+            memory_ids=["mem_nib_preference"],
         )
-        assert packets["mem_gina"][0]["speaker_relation_to_subject"] == "self_report"
+        assert packets["mem_nib_preference"][0]["speaker_relation_to_subject"] == "self_report"
         assert await evidence.list_packets_for_memory_ids(
             user_id="usr_b",
-            memory_ids=["mem_gina"],
+            memory_ids=["mem_nib_preference"],
         ) == {}
 
         with pytest.raises(ValueError, match="same user"):
             await evidence.create_support_edge_with_spans(
                 user_id="usr_a",
-                memory_id="mem_gina",
+                memory_id="mem_nib_preference",
                 spans=[
                     {
                         "span_role": "source",
@@ -254,7 +254,9 @@ async def test_memory_evidence_repository_preserves_quote_whitespace() -> None:
 
 
 @pytest.mark.asyncio
-async def test_memory_provenance_writer_falls_back_to_exact_message_text() -> None:
+async def test_memory_provenance_writer_copies_verified_source_coordinates() -> None:
+    from atagia.core.source_references import SourceReference, SourceReferenceCatalog, source_sha256
+
     connection, clock = await _connection_and_clock()
     try:
         users = UserRepository(connection, clock)
@@ -265,9 +267,12 @@ async def test_memory_provenance_writer_falls_back_to_exact_message_text() -> No
         message_text = "Gina: I won regionals.\n\n[Attachments omitted]\nimage attachment"
 
         await users.create_user("usr_a")
+        await users.create_user("usr_other")
         await _insert_assistant_mode(connection)
         await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+        await conversations.create_conversation("cnv_other", "usr_other", None, "coding_debug", "Other chat")
         await messages.create_message("msg_source", "cnv_a", "user", 1, message_text, 8, {})
+        await messages.create_message("msg_other", "cnv_other", "user", 1, message_text, 8, {})
         await _create_test_memory(
             memories,
             user_id="usr_a",
@@ -282,8 +287,8 @@ async def test_memory_provenance_writer_falls_back_to_exact_message_text() -> No
             source_message_ids=["msg_source"],
             writer_kind="test",
             support_kind="direct",
-            source_quote_by_message_id={
-                "msg_source": "Gina: I won regionals. [Attachments omitted] image attachment"
+            source_reference_by_message_id={
+                "msg_source": SourceReferenceCatalog(message_text).resolve("r1", "r12")
             },
         )
 
@@ -292,7 +297,81 @@ async def test_memory_provenance_writer_falls_back_to_exact_message_text() -> No
         assert span["quote_text"] == message_text
         assert span["char_start"] == 0
         assert span["char_end"] == len(message_text)
-        assert span["metadata_json"]["quote_fallback"] == "full_message_exact"
+        assert "quote_fallback" not in span["metadata_json"]
+        assert span["metadata_json"]["source_reference"]["start_ref"] == "r1"
+
+        for source_id, reference, error in (
+            (
+                "msg_source",
+                SourceReference(char_start=0, char_end=4, source_sha256=source_sha256("changed")),
+                "source snapshot",
+            ),
+            (
+                "msg_source",
+                SourceReference(char_start=0, char_end=len(message_text) + 1, source_sha256=source_sha256(message_text)),
+                "outside the source",
+            ),
+            (
+                "msg_other",
+                SourceReferenceCatalog(message_text).resolve("r1", "r1"),
+                "does not belong to this user",
+            ),
+        ):
+            with pytest.raises(ValueError, match=error):
+                await writer.create_packet_from_source_messages(
+                    user_id="usr_a", memory_id="mem_gina",
+                    source_message_ids=[source_id], writer_kind="test", support_kind="direct",
+                    source_reference_by_message_id={source_id: reference},
+                )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_provenance_keeps_repeated_quote_occurrences_distinct() -> None:
+    from atagia.core.source_references import SourceReferenceCatalog
+
+    connection, clock = await _connection_and_clock()
+    try:
+        users = UserRepository(connection, clock)
+        conversations = ConversationRepository(connection, clock)
+        messages = MessageRepository(connection, clock)
+        memories = MemoryObjectRepository(connection, clock)
+        source = "Use BLUE. Again: Use BLUE."
+
+        await users.create_user("usr_a")
+        await _insert_assistant_mode(connection)
+        await conversations.create_conversation("cnv_a", "usr_a", None, "coding_debug", "Chat A")
+        await messages.create_message("msg_source", "cnv_a", "user", 1, source, 8, {})
+        await _create_test_memory(
+            memories,
+            user_id="usr_a",
+            memory_id="mem_color",
+            canonical_text="Use BLUE.",
+        )
+        catalog = SourceReferenceCatalog(source)
+        first = catalog.resolve("r1", "r3")
+        second = catalog.resolve("r6", "r8")
+        writer = MemoryProvenanceWriter(connection, clock)
+
+        for reference in (first, second, second):
+            packet = await writer.create_packet_from_source_messages(
+                user_id="usr_a",
+                memory_id="mem_color",
+                source_message_ids=["msg_source"],
+                writer_kind="test",
+                support_kind="direct",
+                source_reference_by_message_id={"msg_source": reference},
+            )
+
+        assert packet is not None
+        assert len(packet["spans"]) == 2
+        assert {span["quote_text"] for span in packet["spans"]} == {"Use BLUE."}
+        assert {(span["char_start"], span["char_end"]) for span in packet["spans"]} == {
+            (0, 9),
+            (17, 26),
+        }
+        assert await _count_table(connection, "memory_support_edges") == 1
     finally:
         await connection.close()
 
@@ -1456,6 +1535,9 @@ async def test_upsert_summary_mirror_is_deterministic_and_updates_in_place() -> 
         assert rows[0]["payload_json"]["source_object_ids"] == ["mem_1", "mem_2"]
         assert rows[0]["privacy_level"] == 2
         assert rows[0]["language_codes_json"] == ["en", "es"]
+        # A summary mirror compacts many source objects, so it has no single
+        # message arrival to measure ingest freshness against.
+        assert rows[0]["source_message_created_at"] is None
         surface_rows = await surfaces.list_surfaces_for_memory(
             user_id="usr_a",
             memory_id=first["id"],
@@ -1574,7 +1656,7 @@ async def test_memory_retrieval_surface_rejects_blank_and_evidential_rows() -> N
             memories,
             user_id="usr_a",
             memory_id="mem_a",
-            canonical_text="Rosa takes amlodipine.",
+            canonical_text="Leonie takes fexofenadine.",
         )
 
         with pytest.raises(ValueError, match="surface_text must be non-empty"):
@@ -1590,7 +1672,7 @@ async def test_memory_retrieval_surface_rejects_blank_and_evidential_rows() -> N
                 user_id="usr_a",
                 memory_id="mem_a",
                 surface_type="alias",
-                surface_text="amlodipino",
+                surface_text="fexofenadina",
                 non_evidential=False,
             )
 
@@ -1599,7 +1681,7 @@ async def test_memory_retrieval_surface_rejects_blank_and_evidential_rows() -> N
                 user_id="usr_b",
                 memory_id="mem_a",
                 surface_type="alias",
-                surface_text="amlodipino",
+                surface_text="fexofenadina",
             )
     finally:
         await connection.close()
@@ -1619,20 +1701,20 @@ async def test_memory_retrieval_surface_stale_and_delete_behavior() -> None:
             memories,
             user_id="usr_a",
             memory_id="mem_a",
-            canonical_text="Rosa takes amlodipine 10 mg.",
+            canonical_text="Leonie takes fexofenadine 60 mg.",
         )
 
         active = await surfaces.upsert_surface(
             user_id="usr_a",
             memory_id="mem_a",
             surface_type="alias",
-            surface_text="amlodipino",
+            surface_text="fexofenadina",
             alias_kind="translation",
             language_code="es",
         )
         assert [row["id"] for row in await surfaces.search_active_surfaces(
             user_id="usr_a",
-            fts_query="amlodipino",
+            fts_query="fexofenadina",
         )] == [active["id"]]
 
         assert await surfaces.mark_surfaces_stale_for_memory(
@@ -1646,14 +1728,14 @@ async def test_memory_retrieval_surface_stale_and_delete_behavior() -> None:
         assert stale_rows[0]["status"] == "stale"
         assert await surfaces.search_active_surfaces(
             user_id="usr_a",
-            fts_query="amlodipino",
+            fts_query="fexofenadina",
         ) == []
 
         restored = await surfaces.upsert_surface(
             user_id="usr_a",
             memory_id="mem_a",
             surface_type="alias",
-            surface_text="amlodipino",
+            surface_text="fexofenadina",
             alias_kind="translation",
             language_code="es",
         )
@@ -1666,7 +1748,7 @@ async def test_memory_retrieval_surface_stale_and_delete_behavior() -> None:
         ) == 1
         assert await surfaces.search_active_surfaces(
             user_id="usr_a",
-            fts_query="amlodipino",
+            fts_query="fexofenadina",
         ) == []
 
         assert await surfaces.delete_surfaces_for_memory(
@@ -1679,7 +1761,7 @@ async def test_memory_retrieval_surface_stale_and_delete_behavior() -> None:
         ) == []
         assert await surfaces.search_active_surfaces(
             user_id="usr_a",
-            fts_query="amlodipino",
+            fts_query="fexofenadina",
         ) == []
     finally:
         await connection.close()

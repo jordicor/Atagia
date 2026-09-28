@@ -27,6 +27,7 @@ from atagia.models.schemas_memory import (
     MindTopology,
     SpaceBoundaryMode,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -59,7 +60,11 @@ async def _build_runtime():
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     memories = MemoryObjectRepository(connection, clock)
-    search = CandidateSearch(connection, clock)
+    search = CandidateSearch(
+        connection,
+        clock,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
     await users.create_user("usr_1")
     await workspaces.create_workspace("wrk_1", "usr_1", "Primary Workspace")
     await workspaces.create_workspace("wrk_2", "usr_1", "Other Workspace")
@@ -505,6 +510,7 @@ async def test_phase8_language_mix_uses_base_metadata_not_surfaces_or_index_text
         connection,
         clock,
         embedding_index=fake_embedding_index,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
     )
     try:
         await _seed_memory(

@@ -18,7 +18,7 @@ from atagia.core.ids import generate_prefixed_id
 from atagia.core.language_codes import normalize_optional_iso_639_1_code
 from atagia.core.llm_output_limits import CONSEQUENCE_BUILDER_MAX_OUTPUT_TOKENS
 from atagia.core.memory_provenance import MemoryProvenanceWriter
-from atagia.core.repositories import MemoryObjectRepository
+from atagia.core.repositories import MemoryObjectRepository, MessageRepository
 from atagia.memory.embodiment_policy import embodiment_visibility_sql_clause_for_context
 from atagia.memory.policy_manifest import ResolvedRetrievalPolicy
 from atagia.memory.mind_policy import mind_visibility_sql_clause_for_context
@@ -132,6 +132,7 @@ class ConsequenceChainBuilder:
         self._llm_client = llm_client
         self._clock = clock
         self._memory_repository = MemoryObjectRepository(connection, clock)
+        self._message_repository = MessageRepository(connection, clock)
         self._link_repository = BeliefRepository(connection, clock)
         self._consequence_repository = ConsequenceRepository(connection, clock)
         self._memory_provenance_writer = MemoryProvenanceWriter(connection, clock)
@@ -150,6 +151,23 @@ class ConsequenceChainBuilder:
     ) -> ConsequenceChainResult | None:
         if not signal.is_consequence:
             return None
+
+        source_message = await self._message_repository.get_message(
+            conversation_context.source_message_id,
+            user_id,
+        )
+        if (
+            source_message is None
+            or source_message["conversation_id"] != conversation_context.conversation_id
+        ):
+            raise ValueError(
+                "Conversation context source_message_id must belong to the active conversation"
+            )
+        # Ingest freshness starts when the message row was written, not at its
+        # occurred_at: callers may backdate occurred_at to any historical
+        # instant (transcript imports do), which would make the interval to the
+        # memory's created_at meaningless.
+        source_message_created_at = str(source_message["created_at"])
 
         resolving_action = True
         try:
@@ -204,6 +222,7 @@ class ConsequenceChainBuilder:
                 action_memory=action_memory,
                 conversation_context=conversation_context,
                 resolved_policy=resolved_policy,
+                source_message_created_at=source_message_created_at,
             )
             await self._persist_consequence_packet(
                 memory=outcome_memory,
@@ -488,6 +507,12 @@ class ConsequenceChainBuilder:
         scope = MemoryScope.CHAT
         storage_scope = self._storage_scope(scope)
         scope_ids = self._legacy_scope_ids(scope, conversation_context)
+        # This memory reconstructs an assistant action after the fact, so it
+        # carries no source_message_created_at: its single source message is an
+        # earlier assistant turn when the detector linked one, and the current
+        # turn otherwise. Stamping it would make the same column mean "ingest
+        # lag" on some rows and "how long until the user reported a
+        # consequence" on others, decided by an LLM link.
         source_message_ids = (
             [signal.likely_action_message_id]
             if signal.likely_action_message_id is not None
@@ -552,6 +577,7 @@ class ConsequenceChainBuilder:
         action_memory: dict[str, Any],
         conversation_context: ExtractionConversationContext,
         resolved_policy: ResolvedRetrievalPolicy,
+        source_message_created_at: str,
     ) -> dict[str, Any]:
         action_scope = MemoryScope.CHAT
         storage_scope = self._storage_scope(action_scope)
@@ -604,6 +630,7 @@ class ConsequenceChainBuilder:
             source_mind_id=conversation_context.source_mind_id or conversation_context.active_mind_id,
             embodiment_id=conversation_context.active_embodiment_id,
             realm_id=conversation_context.active_realm_id,
+            source_message_created_at=source_message_created_at,
             commit=False,
         )
 
@@ -623,6 +650,9 @@ class ConsequenceChainBuilder:
         tendency_scope = self._tendency_scope(conversation_context)
         storage_scope = self._storage_scope(tendency_scope)
         scope_ids = self._legacy_scope_ids(tendency_scope, conversation_context)
+        # A tendency is inferred from the action and the later outcome together,
+        # so it spans two messages and has no single arrival instant to measure
+        # ingest freshness against: source_message_created_at stays NULL.
         source_message_ids = [conversation_context.source_message_id]
         if signal.likely_action_message_id is not None:
             source_message_ids.append(signal.likely_action_message_id)

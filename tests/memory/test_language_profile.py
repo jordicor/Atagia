@@ -236,6 +236,105 @@ async def test_language_profile_merges_preferences_abilities_and_observations() 
 
 
 @pytest.mark.asyncio
+async def test_identical_message_reuses_cards_but_preserves_new_evidence_and_correction() -> None:
+    connection, repository, provider, service = await _seed_service(
+        [
+            {
+                "user_language_profile_observed_card": "es",
+                "user_language_profile_preference_card": "default_answer_language es default",
+            },
+            {
+                "user_language_profile_observed_card": "es\nca",
+                "user_language_profile_preference_card": (
+                    "avoid_language es default\n"
+                    "default_answer_language ca default"
+                ),
+                "user_language_profile_norm_card": "language_switch_ok ca default",
+            },
+        ]
+    )
+    try:
+        for message_id, occurred_at in (
+            ("msg_1", "2026-05-20T12:03:00+00:00"),
+            ("msg_2", "2026-05-20T12:04:00+00:00"),
+        ):
+            await service.update_from_message(
+                message_text="Please answer in Spanish.",
+                role="user",
+                conversation_context=_context(source_message_id=message_id),
+                occurred_at=occurred_at,
+            )
+        assert len(provider.requests) == 4
+
+        await service.update_from_message(
+            message_text="Correction: avoid Spanish; answer in Catalan. Switching is fine.",
+            role="user",
+            conversation_context=_context(source_message_id="msg_3"),
+            occurred_at="2026-05-20T12:05:00+00:00",
+        )
+        assert len(provider.requests) == 8
+        profile = await repository.get_user_language_profile_for_context(_context())
+        assert profile is not None
+        spanish = next(
+            row for row in profile.observed_user_languages if row.language_code == "es"
+        )
+        assert spanish.message_count == 3
+        assert spanish.last_seen_at == "2026-05-20T12:05:00+00:00"
+        assert [ref.source_message_id for ref in spanish.source_refs] == [
+            "msg_1", "msg_2", "msg_3"
+        ]
+        assert {row.language_code for row in profile.observed_user_languages} == {
+            "es", "ca"
+        }
+        assert any(
+            row.preference_kind == "avoid_language" and row.language_code == "es"
+            for row in profile.explicit_language_preferences
+        )
+        assert any(
+            row.preference_kind == "default_answer_language"
+            and row.language_code == "ca"
+            for row in profile.explicit_language_preferences
+        )
+        assert any(row.norm_kind == "language_switch_ok" for row in profile.contextual_norms)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("card_name", "partial_output", "complete_output"),
+    [
+        ("user_language_profile_observed_card", "es\ninvalid", "es"),
+        (
+            "user_language_profile_preference_card",
+            "default_answer_language es default\ninvalid",
+            "default_answer_language es default",
+        ),
+    ],
+)
+async def test_partial_card_output_is_not_reused(
+    card_name: str, partial_output: str, complete_output: str
+) -> None:
+    connection, _repository, provider, service = await _seed_service(
+        [{card_name: partial_output}, {card_name: complete_output}]
+    )
+    try:
+        for message_id in ("msg_1", "msg_2"):
+            await service.update_from_message(
+                message_text="Please answer in Spanish.",
+                role="user",
+                conversation_context=_context(source_message_id=message_id),
+            )
+
+        assert len(provider.requests) == 5
+        assert [request.metadata["purpose"] for request in provider.requests].count(
+            card_name
+        ) == 2
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_language_profile_does_not_merge_from_stale_profile_rows() -> None:
     connection, repository, _provider, service = await _seed_service(
         [

@@ -186,130 +186,15 @@ def _assert_champion_text_absent(
 # Assertion: symbol identity (strongest) + rendered byte-identity, examples ON/OFF.
 # No champion duplicate exists; the benchmark has only concurrency variants, no
 # challenger prompt to exclude.
-def _extraction_engine_prompts(include_examples: bool) -> str:
-    from atagia.memory.extraction_cards import (
-        CandidateDraft,
-        build_candidate_prompt,
-        build_enrichment_prompt,
-    )
-    from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
-    from atagia.models.schemas_memory import ExtractionConversationContext
-
-    manifest = ManifestLoader(MANIFESTS_DIR).load_all()["coding_debug"]
-    resolved_policy = PolicyResolver().resolve(manifest, None, None)
-    context = ExtractionConversationContext(
-        user_id="usr_fidelity",
-        conversation_id="cnv_fidelity",
-        source_message_id="msg_fidelity",
-        workspace_id="ws_fidelity",
-        assistant_mode_id="coding_debug",
-        recent_messages=[],
-        privacy_enforcement="off",
-    )
-    candidate = CandidateDraft(candidate_id="cand_001", canonical_text="placeholder")
-    prompts = [
-        build_candidate_prompt(
-            message_text="placeholder message",
-            role="user",
-            context=context,
-            resolved_policy=resolved_policy,
-            allowed_write_scopes=("chat", "character", "user"),
-            occurred_at=None,
-            prior_chunk_context=None,
-            include_examples=include_examples,
-        )
-    ]
-    for card in (
-        "kind_scope",
-        "evidence",
-        "index",
-        "temporal",
-        "belief",
-        "coverage_members",
-    ):
-        prompts.append(
-            build_enrichment_prompt(
-                card,
-                message_text="placeholder message",
-                role="user",
-                context=context,
-                resolved_policy=resolved_policy,
-                allowed_write_scopes=("chat", "character", "user"),
-                occurred_at=None,
-                prior_chunk_context=None,
-                candidates=(candidate,),
-                include_examples=include_examples,
-            )
-        )
-    return "\n".join(prompts)
-
-
-def test_memory_extraction_cards_use_engine_prompt() -> None:
+def test_memory_extraction_cards_use_engine_execution() -> None:
     import benchmarks.memory_extraction_cards.compare as bench
     import atagia.memory.extraction_cards as engine
 
-    # Identity: the benchmark's champion builders ARE the engine builders.
-    assert bench.build_candidate_prompt is engine.build_candidate_prompt
-    assert bench.build_enrichment_prompt is engine.build_enrichment_prompt
-    assert bench._CARD_SYSTEM_PROMPTS is engine._CARD_SYSTEM_PROMPTS
-
-    from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
-    from atagia.models.schemas_memory import ExtractionConversationContext
-
-    # Rendered byte-identity through both module references, examples ON and OFF.
-    for include_examples in (True, False):
-        engine_text = _extraction_engine_prompts(include_examples)
-        assert engine_text.strip(), "engine extraction prompt must be non-empty"
-        # Render the same cards through the benchmark's imported symbols.
-        loader = ManifestLoader(MANIFESTS_DIR).load_all()["coding_debug"]
-        policy = PolicyResolver().resolve(loader, None, None)
-        context = ExtractionConversationContext(
-            user_id="usr_fidelity",
-            conversation_id="cnv_fidelity",
-            source_message_id="msg_fidelity",
-            workspace_id="ws_fidelity",
-            assistant_mode_id="coding_debug",
-            recent_messages=[],
-            privacy_enforcement="off",
-        )
-        candidate = bench.CandidateDraft(
-            candidate_id="cand_001", canonical_text="placeholder"
-        )
-        bench_prompts = [
-            bench.build_candidate_prompt(
-                message_text="placeholder message",
-                role="user",
-                context=context,
-                resolved_policy=policy,
-                allowed_write_scopes=("chat", "character", "user"),
-                occurred_at=None,
-                prior_chunk_context=None,
-                include_examples=include_examples,
-            )
-        ]
-        for card in (
-            "kind_scope",
-            "evidence",
-            "index",
-            "temporal",
-            "belief",
-            "coverage_members",
-        ):
-            bench_prompts.append(
-                bench.build_enrichment_prompt(
-                    card,
-                    message_text="placeholder message",
-                    role="user",
-                    context=context,
-                    resolved_policy=policy,
-                    allowed_write_scopes=("chat", "character", "user"),
-                    occurred_at=None,
-                    prior_chunk_context=None,
-                    candidates=(candidate,),
-                    include_examples=include_examples,
-                )
-            )
-        assert "\n".join(bench_prompts) == engine_text
+    # The benchmark imports the entire graph; full synthetic execution is
+    # covered by test_shadow_runner_executes_the_complete_production_graph.
+    assert bench.extract_lean_with_cards is engine.extract_lean_with_cards
+    local_functions = {node.name for node in ast.parse(Path(bench.__file__).read_text(encoding="utf-8")).body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert not any(name.startswith(("build_", "parse_")) and ("card" in name or "prompt" in name) for name in local_functions)
 
 
 def test_coverage_format_champion_system_message_uses_engine_prompt() -> None:
@@ -319,7 +204,8 @@ def test_coverage_format_champion_system_message_uses_engine_prompt() -> None:
     champion = engine.card_system_prompt("coverage_members")
     assert champion.strip()
     assert bench.card_system_prompt is engine.card_system_prompt
-    assert bench.system_message("json_shipped") == champion
+    assert bench.system_message("current") == champion
+    assert bench.run_coverage_members_card is engine.run_coverage_members_card
 
     literals = _module_string_literals(
         "benchmarks/memory_extraction_cards/coverage_format_compare.py"
@@ -474,32 +360,26 @@ def test_consequence_detection_cards_use_engine_prompt() -> None:
 #   against a capturing provider (mirrors test_applicability_scorer._capture_card_prompts).
 # Assertion: structural invariant (benchmark imports the engine scorer) +
 #   non-empty engine-rendered card prompt + CONTENT anti-reintroduction (the
-#   champion relevance/date card instruction text is ABSENT from the benchmark
+#   champion relevance card instruction text is ABSENT from the benchmark
 #   source, so a name-agnostic inline ``task=(...)`` champion copy is caught).
-# No challenger prompt to exclude (only concurrency/date-toggle variants).
+# No challenger prompt to exclude (only concurrency variants).
 def test_applicability_cards_use_engine_prompt() -> None:
     import asyncio
 
     import benchmarks.applicability_cards.compare as bench
     from atagia.memory import applicability_scorer as engine
     from atagia.memory.applicability_scorer import (
-        APPLICABILITY_DATE_CARD_INSTRUCTION,
         APPLICABILITY_RELEVANCE_CARD_INSTRUCTION,
         ApplicabilityScorer,
     )
     from atagia.services.llm_client import LLMClient
 
-    engine_test_helpers = pytest.importorskip(
-        "tests.memory.test_applicability_scorer",
-        reason="private applicability scorer tests are not present in this checkout",
-    )
+    from tests import applicability_support as engine_test_helpers
 
     # Reuse the engine test's synthetic-case helpers (same shapes the leak-guard
     # test feeds through score_shortlist) so the rendered prompt is a faithful
     # engine production prompt, not a hand-built candidate dict.
-    CannedApplicabilityCardProvider = (
-        engine_test_helpers.CannedApplicabilityCardProvider
-    )
+    CannedApplicabilityProvider = engine_test_helpers.CannedApplicabilityProvider
     _candidate = engine_test_helpers._candidate
     _context = engine_test_helpers._context
     _resolved_policy = engine_test_helpers._resolved_policy
@@ -507,9 +387,8 @@ def test_applicability_cards_use_engine_prompt() -> None:
     # Structural invariant: benchmark uses the engine scorer, not a copy.
     assert bench.ApplicabilityScorer is engine.ApplicabilityScorer
 
-    provider = CannedApplicabilityCardProvider(
-        relevance_output="candidate_000 exact",
-        date_output="candidate_000 none",
+    provider = CannedApplicabilityProvider(
+        [{"memory_id": "mem_relative", "label": "exact"}]
     )
     scorer = ApplicabilityScorer(
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
@@ -531,20 +410,18 @@ def test_applicability_cards_use_engine_prompt() -> None:
             detected_needs=[],
         )
     )
-    assert provider.requests, "score_shortlist must issue at least one card request"
+    assert len(provider.requests) == 1
+    assert provider.requests[0].metadata["purpose"] == "applicability_relevance_card"
     rendered = provider.requests[0].messages[1].content
     assert rendered.strip(), "engine applicability card prompt must be non-empty"
 
-    # Content anti-reintroduction: the champion relevance/date card instruction
+    # Content anti-reintroduction: the champion relevance card instruction
     # text must NOT appear as a literal in the benchmark source (a faithful
     # benchmark drives the engine scorer and never hand-copies these prompts).
     _assert_champion_text_absent(
         anchors={
             "relevance": _instruction_head_anchor(
                 APPLICABILITY_RELEVANCE_CARD_INSTRUCTION, line_count=3
-            ),
-            "date": _instruction_head_anchor(
-                APPLICABILITY_DATE_CARD_INSTRUCTION, line_count=3
             ),
         },
         benchmark_source=_benchmark_source_text(
@@ -559,8 +436,8 @@ def test_applicability_cards_use_engine_prompt() -> None:
 # ---------------------------------------------------------------------------
 # Champion path: the benchmark calls the engine TopicWorkingSetUpdater._build_*
 #   methods directly (compare.py _run_existing_route_card / _run_new_topic_track_card /
-#   _run_content_cards / _run_boundary_cards) for the 4 DEFAULT cards -- no copy.
-# Engine path: the same 4 TopicWorkingSetUpdater._build_* methods.
+#   _run_content_cards / _run_boundary_cards) for the default cards -- no copy.
+# Engine path: the same TopicWorkingSetUpdater._build_* methods.
 # Assertion: structural invariant (benchmark imports the engine updater) +
 #   non-empty engine rendering of all 4 default cards + CONTENT anti-reintroduction
 #   (each champion card's distinctive text is ABSENT from the benchmark source, so
@@ -578,6 +455,7 @@ def test_topic_working_set_cards_use_engine_prompt() -> None:
     import benchmarks.topic_working_set_cards.compare as bench
     from atagia.memory import topic_working_set as engine
     from atagia.memory.topic_working_set import (
+        _CONTENT_FIELDS,
         _TopicContent,
         _TopicRoute,
         TopicUpdateActionType,
@@ -634,13 +512,17 @@ def test_topic_working_set_cards_use_engine_prompt() -> None:
         "new_topic_track": updater._build_new_topic_track_prompt(
             conversation_id="cnv_1", snapshot=snapshot, messages=messages
         ),
-        "content": updater._build_content_prompt(
-            conversation_id="cnv_1",
-            snapshot=snapshot,
-            messages=messages,
-            route=route,
-            existing_topic=None,
-        ),
+        **{
+            f"content_{field_name}": "\n".join(
+                updater._build_content_prompt(
+                    field_name=field_name,
+                    messages=messages,
+                    route=route,
+                    existing_topic=None,
+                )
+            )
+            for field_name in _CONTENT_FIELDS
+        },
         "boundary": updater._build_target_boundary_prompt(
             conversation_id="cnv_1", messages=messages, route=route, content=content
         ),
@@ -651,12 +533,15 @@ def test_topic_working_set_cards_use_engine_prompt() -> None:
     # Content anti-reintroduction: the champion card text must NOT appear as a
     # literal in the benchmark source (a faithful benchmark drives the engine
     # updater and never hand-copies these prompts). The anchor is taken from each
-    # champion's examples block -- the part the new_topic_track challengers (which
-    # duplicate the instruction head verbatim) deliberately omit -- so a genuine
-    # champion copy is caught while the documented challengers are not.
+    # champion's examples block for cards that use examples. Content cards omit
+    # examples, so their instruction head anchors the same guard.
     _assert_champion_text_absent(
         anchors={
-            name: _examples_block_anchor(prompt)
+            name: (
+                _instruction_head_anchor(prompt)
+                if name.startswith("content_")
+                else _examples_block_anchor(prompt)
+            )
             for name, prompt in default_prompts.items()
         },
         benchmark_source=_benchmark_source_text(

@@ -1,0 +1,122 @@
+[
+  {
+    "case_id": "compact-sentiment-en-01",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "en",
+    "previous_message": "Lower the microphone input gain by two steps and record another sample.",
+    "message": "I made that change, and the new recording is clear all the way through.",
+    "expected": "positive",
+    "rationale": "Anaphoric reference to the assistant's gain adjustment reports a clear success."
+  },
+  {
+    "case_id": "compact-sentiment-en-02",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "en",
+    "previous_message": "Use the revised print profile for the next label sheet.",
+    "message": "The revised print profile gave every label the correct margins.",
+    "expected": "positive",
+    "rationale": "The reported print result meets the user's goal."
+  },
+  {
+    "case_id": "compact-sentiment-en-03",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "en",
+    "previous_message": "Move the backup job to the later time slot.",
+    "message": "After moving the backup job, none of last night's files appeared in the archive.",
+    "expected": "negative",
+    "rationale": "The absent archive files report an unsuccessful outcome without an explicit failure label."
+  },
+  {
+    "case_id": "compact-sentiment-en-04",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "en",
+    "previous_message": "Enable the higher resolution export preset.",
+    "message": "The higher resolution export looks sharper, but it takes twice as long to generate.",
+    "expected": "neutral",
+    "rationale": "Image quality improved while export time became worse."
+  },
+  {
+    "case_id": "compact-sentiment-es-01",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "es",
+    "previous_message": "Prueba a actualizar el controlador de la impresora.",
+    "message": "Al actualizar el controlador, la impresora volvió a sacar las páginas completas.",
+    "expected": "positive",
+    "rationale": "The pages now print completely after the suggested update."
+  },
+  {
+    "case_id": "compact-sentiment-es-02",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "es",
+    "previous_message": "Cambia el filtro para mostrar solo los pedidos pendientes.",
+    "message": "Después de cambiar el filtro, no aparece ninguno de los pedidos pendientes que necesito revisar.",
+    "expected": "negative",
+    "rationale": "The desired pending orders are absent, reporting a bad result without a failure label."
+  },
+  {
+    "case_id": "compact-sentiment-es-03",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "es",
+    "previous_message": "Renombra la columna antes de importar la hoja.",
+    "message": "Renombré la columna y la importación se detuvo con un error nuevo.",
+    "expected": "negative",
+    "rationale": "The attempted import ends with a new error."
+  },
+  {
+    "case_id": "compact-sentiment-es-04",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "es",
+    "previous_message": "Activa la limpieza automática de imágenes duplicadas.",
+    "message": "La limpieza quitó las copias repetidas de una carpeta, pero dejó sin procesar los duplicados de la otra.",
+    "expected": "neutral",
+    "rationale": "Duplicates were removed from one folder but remained in the other."
+  },
+  {
+    "case_id": "compact-sentiment-ca-01",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "ca",
+    "previous_message": "Prova de reduir la mida de les miniatures.",
+    "message": "Amb les miniatures més petites, la pàgina es carrega ràpid i totes les imatges es veuen bé.",
+    "expected": "positive",
+    "rationale": "The page is faster and the images remain usable."
+  },
+  {
+    "case_id": "compact-sentiment-ca-02",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "ca",
+    "previous_message": "Canvia el port del lector de targetes i torna a provar-lo.",
+    "message": "Ho he fet, i ara el lector no detecta cap targeta.",
+    "expected": "negative",
+    "rationale": "Anaphoric reference to the assistant's port change reports a clear regression."
+  },
+  {
+    "case_id": "compact-sentiment-ca-03",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "ca",
+    "previous_message": "Canvia la plantilla del resum mensual.",
+    "message": "Amb la plantilla nova, els totals són correctes, però els noms de les categories surten tallats.",
+    "expected": "neutral",
+    "rationale": "Correct totals and truncated category names make the result mixed."
+  },
+  {
+    "case_id": "compact-sentiment-ca-04",
+    "split": "compact_followup",
+    "card": "consequence_sentiment",
+    "language": "ca",
+    "previous_message": "Activa la sincronització del calendari amb el telèfon.",
+    "message": "Ara les cites noves arriben al telèfon, però les antigues apareixen duplicades.",
+    "expected": "neutral",
+    "rationale": "New appointments sync, while older appointments are duplicated."
+  }
+]

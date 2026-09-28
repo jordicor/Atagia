@@ -25,6 +25,8 @@ from atagia.core.config import Settings
 from atagia.core.llm_output_limits import TOPIC_WORKING_SET_MAX_OUTPUT_TOKENS
 from atagia.memory.topic_working_set import (
     _CONTENT_ACTIONS,
+    _CONTENT_CARD_NAMES,
+    _CONTENT_FIELDS,
     _TopicBoundary,
     _TopicCardPlan,
     _TopicContent,
@@ -33,12 +35,13 @@ from atagia.memory.topic_working_set import (
     _line_tokens,
     _message_ids_from_messages,
     _parse_boundary_card_output,
-    _parse_content_card_output,
+    _parse_content_field_output,
     _parse_route_card_output,
     _topic_card_plan_to_structured_plan,
     _topic_ids_from_snapshot,
     _topics_by_id_from_snapshot,
     _valid_message_ids_from_tokens,
+    TopicContentField,
     TopicUpdateActionType,
     TopicWorkingSetPlan,
     TopicWorkingSetUpdater,
@@ -421,13 +424,7 @@ async def run_cards_current(
         case=case,
         routes=content_routes,
     )
-    contents: dict[str, _TopicContent] = {}
-    for result in content_results:
-        card_outputs[f"content:{result.target_id}"] = _jsonable_card_result(result)
-        if result.error:
-            errors.append({"card": "content", "target_id": result.target_id, "message": result.error})
-        if result.target_id is not None:
-            contents[result.target_id] = cast(_TopicContent, result.parsed)
+    contents = _collect_content_results(content_results, card_outputs, errors)
 
     boundary_results = await _run_boundary_cards(
         updater=updater,
@@ -536,13 +533,7 @@ async def run_cards_split_route_v1(
         case=case,
         routes=content_routes,
     )
-    contents: dict[str, _TopicContent] = {}
-    for result in content_results:
-        card_outputs[f"content:{result.target_id}"] = _jsonable_card_result(result)
-        if result.error:
-            errors.append({"card": "content", "target_id": result.target_id, "message": result.error})
-        if result.target_id is not None:
-            contents[result.target_id] = cast(_TopicContent, result.parsed)
+    contents = _collect_content_results(content_results, card_outputs, errors)
 
     boundary_results = await _run_boundary_cards(
         updater=updater,
@@ -651,19 +642,7 @@ async def run_cards_split_route_v2(
         case=case,
         routes=content_routes,
     )
-    contents: dict[str, _TopicContent] = {}
-    for result in content_results:
-        card_outputs[f"content:{result.target_id}"] = _jsonable_card_result(result)
-        if result.error:
-            errors.append(
-                {
-                    "card": "content",
-                    "target_id": result.target_id,
-                    "message": result.error,
-                }
-            )
-        if result.target_id is not None:
-            contents[result.target_id] = cast(_TopicContent, result.parsed)
+    contents = _collect_content_results(content_results, card_outputs, errors)
 
     boundary_results = await _run_boundary_cards(
         updater=updater,
@@ -772,19 +751,7 @@ async def run_cards_split_route_v3(
         case=case,
         routes=content_routes,
     )
-    contents: dict[str, _TopicContent] = {}
-    for result in content_results:
-        card_outputs[f"content:{result.target_id}"] = _jsonable_card_result(result)
-        if result.error:
-            errors.append(
-                {
-                    "card": "content",
-                    "target_id": result.target_id,
-                    "message": result.error,
-                }
-            )
-        if result.target_id is not None:
-            contents[result.target_id] = cast(_TopicContent, result.parsed)
+    contents = _collect_content_results(content_results, card_outputs, errors)
 
     boundary_results = await _run_boundary_cards(
         updater=updater,
@@ -906,19 +873,7 @@ async def run_cards_split_route_v4(
         case=case,
         routes=content_routes,
     )
-    contents: dict[str, _TopicContent] = {}
-    for result in content_results:
-        card_outputs[f"content:{result.target_id}"] = _jsonable_card_result(result)
-        if result.error:
-            errors.append(
-                {
-                    "card": "content",
-                    "target_id": result.target_id,
-                    "message": result.error,
-                }
-            )
-        if result.target_id is not None:
-            contents[result.target_id] = cast(_TopicContent, result.parsed)
+    contents = _collect_content_results(content_results, card_outputs, errors)
 
     boundary_results = await _run_boundary_cards(
         updater=updater,
@@ -1038,19 +993,7 @@ async def run_cards_split_route_v5(
         case=case,
         routes=content_routes,
     )
-    contents: dict[str, _TopicContent] = {}
-    for result in content_results:
-        card_outputs[f"content:{result.target_id}"] = _jsonable_card_result(result)
-        if result.error:
-            errors.append(
-                {
-                    "card": "content",
-                    "target_id": result.target_id,
-                    "message": result.error,
-                }
-            )
-        if result.target_id is not None:
-            contents[result.target_id] = cast(_TopicContent, result.parsed)
+    contents = _collect_content_results(content_results, card_outputs, errors)
 
     boundary_results = await _run_boundary_cards_v5(
         client=client,
@@ -1376,16 +1319,15 @@ async def _run_content_cards(
     topics_by_id = _topics_by_id_from_snapshot(case.snapshot)
     semaphore = asyncio.Semaphore(2)
 
-    async def run_one(route: _TopicRoute) -> CardResult:
+    async def run_one(route: _TopicRoute, field_name: TopicContentField) -> CardResult:
         async with semaphore:
             request = _request_with_model(
                 updater._card_request(
-                    card_name="content",
+                    card_name=_CONTENT_CARD_NAMES[field_name],
                     user_id="benchmark-user",
                     conversation_id=case.conversation_id,
                     prompt=updater._build_content_prompt(
-                        conversation_id=case.conversation_id,
-                        snapshot=case.snapshot,
+                        field_name=field_name,
                         messages=case.messages,
                         route=route,
                         existing_topic=topics_by_id.get(route.target_id),
@@ -1399,30 +1341,61 @@ async def _run_content_cards(
                 response = await client.complete(request)
             except Exception as exc:  # noqa: BLE001
                 return CardResult(
-                    "content",
+                    field_name,
                     route.target_id,
                     None,
-                    _TopicContent(),
+                    None,
                     False,
                     _error_message(exc),
                 )
-            content = _parse_content_card_output(response.output_text)
-            has_signal = bool(
-                content.title
-                or content.summary
-                or content.active_goal
-                or content.open_questions
-                or content.decisions
-            )
+            try:
+                value = _parse_content_field_output(
+                    response.output_text,
+                    field_name=field_name,
+                    action=route.action,
+                )
+            except ValueError as exc:
+                return CardResult(
+                    field_name,
+                    route.target_id,
+                    response.output_text,
+                    None,
+                    False,
+                    str(exc),
+                )
             return CardResult(
-                "content",
+                field_name,
                 route.target_id,
                 response.output_text,
-                content,
-                _plain_card_output_valid(response.output_text, has_signal),
+                value,
+                True,
             )
 
-    return list(await asyncio.gather(*(run_one(route) for route in routes)))
+    return list(
+        await asyncio.gather(
+            *(run_one(route, field_name) for route in routes for field_name in _CONTENT_FIELDS)
+        )
+    )
+
+
+def _collect_content_results(
+    results: list[CardResult],
+    card_outputs: dict[str, dict[str, Any]],
+    errors: list[dict[str, Any]],
+) -> dict[str, _TopicContent]:
+    fields_by_target: dict[str, dict[str, Any]] = {}
+    for result in results:
+        card_outputs[f"content_{result.card_name}:{result.target_id}"] = _jsonable_card_result(result)
+        if result.error:
+            errors.append(
+                {"card": result.card_name, "target_id": result.target_id, "message": result.error}
+            )
+        if result.target_id is not None:
+            fields_by_target.setdefault(result.target_id, {})[result.card_name] = result.parsed
+    return {
+        target_id: _TopicContent(**fields)
+        for target_id, fields in fields_by_target.items()
+    }
 
 
 async def _run_boundary_cards(
@@ -2099,6 +2072,10 @@ def normalize_plan(plan: TopicWorkingSetPlan) -> dict[str, Any]:
                 "active_goal": _none_if_empty(action.active_goal),
                 "open_questions": _dedupe_strings(action.open_questions),
                 "decisions": _dedupe_strings(action.decisions),
+                "clear_summary": action.clear_summary,
+                "clear_active_goal": action.clear_active_goal,
+                "clear_open_questions": action.clear_open_questions,
+                "clear_decisions": action.clear_decisions,
                 "artifact_ids": _dedupe_strings(action.artifact_ids),
                 "source_message_ids": _dedupe_strings(action.source_message_ids),
                 "confidence": _none_if_float_sentinel(action.confidence),
@@ -2255,8 +2232,13 @@ def project_topic_state(snapshot: dict[str, Any], plan: dict[str, Any]) -> dict[
         ):
             if action.get(field_name) is not None:
                 topic[field_name] = action[field_name]
+        for field_name in ("summary", "active_goal"):
+            if action.get(f"clear_{field_name}"):
+                topic[field_name] = ""
         for list_field in ("open_questions", "decisions", "artifact_ids"):
-            if action.get(list_field):
+            if action.get(f"clear_{list_field}"):
+                topic[list_field] = []
+            elif action.get(list_field):
                 topic[list_field] = list(action[list_field])
     rows = sorted(topics.values(), key=lambda row: str(row["id"]))
     return {

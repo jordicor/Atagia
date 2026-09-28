@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from contextlib import aclosing, nullcontext
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
 import logging
 import math
 import random
+from uuid import uuid4
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, AsyncIterator, Generic, TypeVar
@@ -17,6 +19,31 @@ from typing import Any, AsyncIterator, Generic, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from atagia.core.llm_output_limits import apply_min_output_threshold
+from atagia.core.text_utils import strip_card_output_wrappers
+from atagia.diagnostics.recorder import DiagnosticRecorder, bind_attempt, current_operation
+from atagia.models.schemas_decisions import (
+    ChoiceAnswer,
+    ChoiceQuestion,
+    ScoreAnswer,
+    ScoreDecision,
+    ScoreQuestion,
+)
+from atagia.services.inference_policy import (
+    InferenceAccessPolicy,
+    local_provider_registry_key,
+    resolve_internal_inference_route,
+)
+from atagia.services.inference_routes import (
+    BaseUrlClass,
+    InferenceAccessMode,
+    InferenceCostClass,
+    InferenceOperation,
+    InferenceRouteError,
+    ParsedLocalModelSpec,
+    ResolvedInferenceRoute,
+    parse_local_model_spec,
+)
+from atagia.services.local_endpoint_catalog import LocalEndpointCatalog
 from atagia.services.structured_json import (
     StructuredJSONDecodeError,
     decode_structured_json_payload,
@@ -30,9 +57,17 @@ from atagia.services.model_resolution import (
     parse_model_spec,
 )
 from atagia.services.llm_run_guard import (
+    LLMCallMeter,
+    LLMCallOutcome,
     LLMRunGuard,
+    LLMRunGuardCall,
     LLMRunGuardConfig,
     LLMRunGuardDecision,
+    begin_isolated_llm_call_meter,
+    begin_llm_call_meter,
+    bind_llm_call_meter,
+    end_llm_call_meter,
+    record_call_on_active_meter,
 )
 from atagia.services.llm_reliability import (
     LLMRunawayAbort,
@@ -46,7 +81,80 @@ from atagia.services.llm_temperature import (
 )
 
 T = TypeVar("T")
+Q = TypeVar("Q", ChoiceQuestion, ScoreQuestion)
 logger = logging.getLogger(__name__)
+_TYPESAFE_SINGLE_QUESTION_BYTES = 30_000
+_TYPESAFE_REQUEST_BYTES = 60_000
+
+
+def _typesafe_question_batches(
+    model: str,
+    messages: list[LLMMessage],
+    questions: dict[str, Q],
+) -> list[dict[str, Q]]:
+    """Pack prepared questions under conservative Jev 32k/64k token bounds.
+
+    UTF-8 JSON byte length bounds token count without guessing Jev's tokenizer.
+    Headroom covers framing. Only questions are split; the state is never cut.
+    Each returned batch becomes a separate metered provider attempt.
+    """
+    state = [{"role": message.role, "content": message.content} for message in messages]
+    request_model = parse_model_spec(model).request_model
+
+    def size(batch: dict[str, Q]) -> int:
+        payload = {
+            "model": request_model,
+            "state": state,
+            "questions": {
+                key: question.model_dump(mode="json") for key, question in batch.items()
+            },
+        }
+        return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + 1024
+
+    batches: list[dict[str, Q]] = []
+    current: dict[str, Q] = {}
+    for question_id, question in questions.items():
+        single = {question_id: question}
+        if size(single) > _TYPESAFE_SINGLE_QUESTION_BYTES:
+            raise ConfigurationError("TypeSafe state and one question exceed the safe 32k-token bound")
+        proposed = {**current, question_id: question}
+        if current and size(proposed) > _TYPESAFE_REQUEST_BYTES:
+            batches.append(current)
+            current = single
+        else:
+            current = proposed
+    if current:
+        batches.append(current)
+    return batches
+
+
+_DIAGNOSTIC_METADATA_KEYS = frozenset({
+    "purpose", "stage", "user_id", "turn_id", "job_id", "conversation_id",
+    "reasoning_effort", "verbosity", "openai_tool_choice", "service_tier",
+    "anthropic_prompt_cache", "thinking_budget_tokens", "anthropic_thinking_adaptive",
+    "anthropic_output_effort", "gemini_thinking_level", "gemini_google_search",
+    "openrouter_native_structured_output", "provider_extra_body", "task_type", "title",
+    "atagia_model_spec", "atagia_provider_slug", "atagia_component_id",
+    "atagia_temperature_source", "atagia_requested_temperature", "atagia_effective_temperature",
+    "atagia_temperature_reason", "atagia_partial_stream_retry",
+})
+
+
+def _diagnostic_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {key: metadata[key] for key in _DIAGNOSTIC_METADATA_KEYS if key in metadata}
+
+
+def _diagnostic_has_credentials(value: Any) -> bool:
+    if isinstance(value, dict):
+        forbidden = {"api_key", "authorization", "headers", "extra_headers", "password", "secret", "credentials", "access_token"}
+        return any(str(key).lower() in forbidden or _diagnostic_has_credentials(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_diagnostic_has_credentials(item) for item in value)
+    return False
+
+
+def _diagnostic_utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 _STRICT_JSON_FALLBACK_INSTRUCTION = (
     "Return exactly one raw JSON object or array. Start with { or [. "
@@ -86,11 +194,29 @@ def known_intimacy_context_metadata(
 
 
 class LLMError(RuntimeError):
-    """Base LLM client error."""
+    """Base LLM client error: the caller did not get a usable model answer.
+
+    NOT "the provider call failed". The hierarchy already contains local
+    refusals in which no provider was ever touched (``ConfigurationError``,
+    ``LLMRunGuardError``) and provider successes that failed downstream
+    (``StructuredOutputError``), and it contains them deliberately: every
+    handler in this repo that catches ``LLMError`` is answering "I did not get
+    an answer, degrade" -- a 503, an abstention, a skipped background refresh --
+    and that answer is correct for a local refusal too.
+
+    What that shared base does NOT license is REROUTING. A handler that responds
+    by calling the provider again (a fallback model, a retry, a second provider)
+    must first exclude the refusals that no re-call can satisfy; see
+    ``_is_policy_blocked_error``, which does exactly that.
+    """
 
 
 class LLMPolicyBlockedError(LLMError):
     """Raised when a provider refuses or blocks a request for policy reasons."""
+
+
+class InferenceAccessDeniedError(LLMError):
+    """Terminal refusal raised before an inference route reaches a provider."""
 
 
 class ConfigurationError(LLMError):
@@ -124,9 +250,7 @@ class TransientLLMError(LLMError):
         retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(message)
-        self.retry_after_seconds = _normalize_retry_after_seconds(
-            retry_after_seconds
-        )
+        self.retry_after_seconds = _normalize_retry_after_seconds(retry_after_seconds)
 
 
 class LLMRequestError(LLMError):
@@ -161,7 +285,28 @@ class OutputLimitExceededError(LLMError):
 
 
 class LLMRunGuardError(LLMError):
-    """Raised when runtime LLM budget or health thresholds are exceeded."""
+    """Raised when the run guard refuses a call: budget spent or health blown.
+
+    A LOCAL REFUSAL -- the provider was never touched. Re-issuing the same
+    request through any fallback path cannot help, because the refusal is about
+    the RUN rather than about the request: every fallback's own ``begin_call``
+    refuses it too. Nothing may respond to this by calling a provider again.
+
+    It stays an ``LLMError`` on purpose, and the alternative was measured rather
+    than assumed. Every reachable ``except LLMError`` in this repo responds by
+    degrading -- ``chat_service`` turns it into a 503, the OpenAI proxy route
+    into a structured ``llm_unavailable`` 503, ``answer_postcondition`` into an
+    abstention that still delivers the already-generated answer, the ingest
+    worker into a skipped refresh -- and every one of those is the right answer
+    for "stop spending". Reparenting off ``LLMError`` would turn each of them
+    into an uncaught ``RuntimeError`` unless it were individually re-taught this
+    class: two 503s would become 500s, the proxy would lose its error envelope,
+    and the postcondition path would discard an answer the operator already paid
+    for, which is the exact failure the guard's own design forbids. The failure
+    mode of forgetting is what settles it: under this hierarchy a handler that
+    has never heard of the guard degrades correctly, and under a reparented one
+    it crashes.
+    """
 
     def __init__(self, decision: LLMRunGuardDecision) -> None:
         self.decision = decision
@@ -180,12 +325,26 @@ class RetryPolicy:
     jitter_fraction: float = 0.15
 
 
+class _DispatchPermit:
+    """Release a provider slot once, including before retry backoff."""
+
+    def __init__(self, semaphore: asyncio.Semaphore) -> None:
+        self._semaphore = semaphore
+        self._released = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._semaphore.release()
+
+
 # Interactive retrieval gates degrade gracefully (e.g. need detection falls back
 # to base search), so they should not pay long backoff inside a live turn. These
 # are the exact `request.metadata["purpose"]` strings used by those stages.
 INTERACTIVE_RETRIEVAL_PURPOSES: frozenset[str] = frozenset(
     {
-        "need_detection_language_card",
+        "need_detection_query_language_card",
+        "need_detection_answer_language_card",
         "need_detection_needs_card",
         "need_detection_memory_card",
         "need_detection_exact_card",
@@ -196,7 +355,6 @@ INTERACTIVE_RETRIEVAL_PURPOSES: frozenset[str] = frozenset(
         "need_detection_search_words_other_language_card",
         "applicability_scoring",
         "applicability_relevance_card",
-        "applicability_date_card",
         "context_cache_signal_detection",
         "coverage_expansion",
     }
@@ -211,14 +369,23 @@ _DEFAULT_EXTRACTION_RETRY_POLICY = RetryPolicy(
 )
 _MEMORY_EXTRACTION_PURPOSES: frozenset[str] = frozenset(
     {
+        "memory_date_resolution",
         "memory_extraction",
         "memory_extraction_candidate_card",
-        "memory_extraction_kind_scope_card",
-        "memory_extraction_evidence_card",
+        "memory_extraction_kind_card",
+        "memory_extraction_scope_card",
+        "memory_extraction_confidence_card",
+        "memory_extraction_evidence_support_card",
+        "memory_extraction_preserve_verbatim_card",
+        "memory_extraction_candidate_language_card",
+        "memory_extraction_source_reference_card",
         "memory_extraction_index_card",
-        "memory_extraction_temporal_card",
-        "memory_extraction_belief_card",
+        "memory_extraction_belief_key_card",
+        "memory_extraction_belief_value_card",
+        "memory_extraction_temporal_type_card",
+        "memory_extraction_temporal_interval_card",
         "memory_extraction_coverage_members_card",
+        "memory_extraction_coverage_member_identity_card",
     }
 )
 _PARTIAL_STREAM_RETRY_PURPOSES: frozenset[str] = _MEMORY_EXTRACTION_PURPOSES
@@ -333,6 +500,9 @@ class LLMCompletionRequest(BaseModel):
     max_output_tokens: int | None = None
     tools: list[LLMToolSpec] = Field(default_factory=list)
     response_schema: dict[str, Any] | None = None
+    choice_questions: dict[str, ChoiceQuestion] | None = None
+    score_questions: dict[str, ScoreQuestion] | None = None
+    finite_choice: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
     include_thinking: bool = False
     # External answer requests own a hard caller/server ceiling. They must not
@@ -353,6 +523,8 @@ class LLMCompletionResponse(BaseModel):
     usage: dict[str, Any] = Field(default_factory=dict)
     finish_reason: str | None = None
     raw_response: dict[str, Any] = Field(default_factory=dict)
+    choice_answers: dict[str, ChoiceAnswer] = Field(default_factory=dict)
+    score_answers: dict[str, ScoreAnswer] = Field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,6 +626,11 @@ class LLMProvider:
     supports_embeddings: bool = True
     supports_embedding_dimensions: bool = False
     supports_native_structured_output: bool = True
+    supports_choices: bool = False
+    supports_scores: bool = False
+
+    async def aclose(self) -> None:
+        """Release resources owned by this adapter, when applicable."""
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         raise NotImplementedError
@@ -461,7 +638,9 @@ class LLMProvider:
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
         raise NotImplementedError
 
-    async def stream(self, request: LLMCompletionRequest) -> AsyncIterator[LLMStreamEvent]:
+    async def stream(
+        self, request: LLMCompletionRequest
+    ) -> AsyncIterator[LLMStreamEvent]:
         response = await self.complete(request)
         if response.thinking:
             yield LLMStreamEvent(type="thinking", content=response.thinking)
@@ -477,7 +656,9 @@ class LLMProvider:
             done_payload["finish_reason"] = response.finish_reason
         yield LLMStreamEvent(type="done", payload=done_payload)
 
-    def supports_native_structured_output_for(self, request: LLMCompletionRequest) -> bool:
+    def supports_native_structured_output_for(
+        self, request: LLMCompletionRequest
+    ) -> bool:
         """Return whether this provider can enforce the schema for this request."""
         return self.supports_native_structured_output
 
@@ -488,6 +669,15 @@ class _PreOutputStreamError(RuntimeError):
     def __init__(self, original: LLMError) -> None:
         super().__init__(str(original))
         self.original = original
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedProviderRequest:
+    """Provider-bound request plus immutable, separately resolved route."""
+
+    provider_name: str
+    request: LLMCompletionRequest | LLMEmbeddingRequest
+    route: ResolvedInferenceRoute
 
 
 class LLMClient(Generic[T]):
@@ -508,34 +698,82 @@ class LLMClient(Generic[T]):
         structured_output_rescue_model: str | None = None,
         technical_recovery_config: LLMTechnicalRecoveryConfig | None = None,
         llm_run_guard: LLMRunGuard | None = None,
+        inference_access_policy: InferenceAccessPolicy | None = None,
+        local_endpoint_catalog: LocalEndpointCatalog | None = None,
+        max_concurrent_requests_per_provider: int = 4,
+        diagnostic_recorder: DiagnosticRecorder | None = None,
     ) -> None:
-        self._provider_name = provider_name.strip().lower() if provider_name is not None else None
-        self._providers = {provider.name.strip().lower(): provider for provider in (providers or [])}
+        if max_concurrent_requests_per_provider <= 0:
+            raise ValueError("max_concurrent_requests_per_provider must be positive")
+        self._provider_name = (
+            provider_name.strip().lower() if provider_name is not None else None
+        )
+        self._providers = {
+            provider.name.strip().lower(): provider for provider in (providers or [])
+        }
+        self._dispatch_semaphores = {
+            name: asyncio.Semaphore(max_concurrent_requests_per_provider)
+            for name in self._providers
+        }
+        self._max_concurrent_requests_per_provider = max_concurrent_requests_per_provider
         self._retry_policy = retry_policy or RetryPolicy()
         self._interactive_retry_policy = (
             interactive_retry_policy or _DEFAULT_INTERACTIVE_RETRY_POLICY
         )
         self._extraction_retry_policy = (
-            extraction_retry_policy
-            or retry_policy
-            or _DEFAULT_EXTRACTION_RETRY_POLICY
+            extraction_retry_policy or retry_policy or _DEFAULT_EXTRACTION_RETRY_POLICY
         )
-        self._allow_unqualified_single_provider_models = allow_unqualified_single_provider_models
+        self._allow_unqualified_single_provider_models = (
+            allow_unqualified_single_provider_models
+        )
         self._intimacy_fallback_models = dict(intimacy_fallback_models or {})
         self._intimacy_proactive_routing_enabled = intimacy_proactive_routing_enabled
         if structured_output_retry_attempts < 0:
             raise ValueError("structured_output_retry_attempts must be non-negative")
         self._structured_output_retry_attempts = structured_output_retry_attempts
         self._structured_output_rescue_enabled = structured_output_rescue_enabled
-        rescue_model = structured_output_rescue_model.strip() if structured_output_rescue_model else None
+        rescue_model = (
+            structured_output_rescue_model.strip()
+            if structured_output_rescue_model
+            else None
+        )
         self._structured_output_rescue_model = rescue_model or None
         self._technical_recovery_config = (
             technical_recovery_config or LLMTechnicalRecoveryConfig.default_enabled()
         )
         self._llm_run_guard = llm_run_guard
+        self._inference_access_policy = (
+            inference_access_policy
+            or InferenceAccessPolicy(InferenceAccessMode.UNRESTRICTED)
+        )
+        self._local_endpoint_catalog = local_endpoint_catalog
+        self._diagnostic_recorder = diagnostic_recorder
 
     def register_provider(self, provider: LLMProvider) -> None:
-        self._providers[provider.name.strip().lower()] = provider
+        name = provider.name.strip().lower()
+        self._providers[name] = provider
+        self._dispatch_semaphores.setdefault(
+            name, asyncio.Semaphore(self._max_concurrent_requests_per_provider)
+        )
+
+    async def _acquire_dispatch(self, provider_name: str) -> _DispatchPermit:
+        """Limit in-flight calls per provider across one engine client's tasks.
+
+        Separate client instances and OS processes do not share these slots.
+        The run guard starts after acquisition, so queued or cancelled waiters
+        cannot consume a provider attempt or a guard reservation.
+        """
+        self._provider(provider_name)
+        semaphore = self._dispatch_semaphores[provider_name]
+        await semaphore.acquire()
+        return _DispatchPermit(semaphore)
+
+    async def aclose(self) -> None:
+        """Close owned provider transports after a runtime or benchmark."""
+        for provider in self._providers.values():
+            await provider.aclose()
+        if self._diagnostic_recorder is not None:
+            self._diagnostic_recorder.close()
 
     @property
     def llm_run_guard(self) -> LLMRunGuard | None:
@@ -572,6 +810,33 @@ class LLMClient(Generic[T]):
             config=config,
         )
 
+    def begin_turn_call_meter(self) -> LLMCallMeter:
+        """Bind a per-turn LLM call meter to the current async context.
+
+        The returned meter SHOULD be released with ``end_turn_call_meter`` in a
+        ``finally``. The meter counts every provider round-trip made in this
+        context (retrieval cards, staleness, planner, scoring, chat reply) and
+        is independent of the run guard.
+        """
+        return begin_llm_call_meter()
+
+    def begin_isolated_call_meter(self) -> LLMCallMeter:
+        """Bind a meter for background work, detached from the spawning turn.
+
+        A task spawned from a turn inherits a copy of that turn's meter stack,
+        so its calls would land on a row that has already been written. This
+        replaces the inherited stack for the duration of the background task.
+        """
+        return begin_isolated_llm_call_meter()
+
+    def bind_turn_call_meter(self, meter: LLMCallMeter) -> None:
+        """Re-bind an existing turn meter in a second async scope of the same turn."""
+        bind_llm_call_meter(meter)
+
+    def end_turn_call_meter(self, meter: LLMCallMeter) -> None:
+        """Unbind a per-turn LLM call meter, by identity, from this context."""
+        end_llm_call_meter(meter)
+
     @property
     def provider_name(self) -> str | None:
         return self._provider_name
@@ -592,6 +857,9 @@ class LLMClient(Generic[T]):
         return provider
 
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        if request.choice_questions is not None or request.score_questions is not None:
+            # Typed requests must stay on the selected typed provider.
+            return await self._complete_once(request)
         normalized_request = request.model_copy(
             update={
                 "max_output_tokens": (
@@ -601,22 +869,236 @@ class LLMClient(Generic[T]):
                 )
             }
         )
+        if request.finite_choice:
+            # Keep the normal LLM output floor and the configured proactive
+            # privacy route, but never repair or switch providers after failure.
+            proactive_request = self._proactive_intimacy_request(normalized_request)
+            if proactive_request is not None:
+                if parse_model_spec(proactive_request.model).provider_slug == "typesafe":
+                    raise ConfigurationError("A text choice cannot route to TypeSafe")
+                return await self._complete_once(proactive_request)
+            return await self._complete_once(normalized_request)
+        route = self._completion_route_for_request(normalized_request)
         return await self._with_output_limit_recovery(
             normalized_request,
-            self._complete_with_intimacy_routing,
+            lambda current_request: self._complete_with_intimacy_routing(
+                current_request,
+                route=route,
+            ),
             operation_name="completion",
             allow_recovery=not normalized_request.external_answer,
         )
 
+    async def complete_choice_questions(
+        self,
+        *,
+        model: str,
+        messages: list[LLMMessage],
+        questions: dict[str, ChoiceQuestion],
+        metadata: dict[str, Any],
+        max_output_tokens: int = 64,
+        concurrency: int = 2,
+        dispatch_semaphore: asyncio.Semaphore | None = None,
+    ) -> dict[str, str]:
+        """Run prepared questions of one card against the selected model.
+
+        Each question contains its complete task and target in ``instructions``;
+        question IDs only connect answers to callers. The shared state is sent
+        once to TypeSafe, while an ordinary LLM receives one narrow question per
+        request. A failed sibling cancels and joins the others before returning.
+        Pass the extraction card's shared semaphore without acquiring it in the
+        caller; this method acquires it for each provider request.
+        """
+        if not questions or not messages:
+            raise ValueError("Finite choices require questions and state messages")
+        if any(not question_id.strip() for question_id in questions):
+            raise ValueError("Finite choice question IDs must be nonempty")
+        if not isinstance(metadata.get("purpose"), str) or not metadata["purpose"].strip():
+            raise ValueError("Finite choices require a request purpose")
+        if concurrency < 1:
+            raise ValueError("Finite choice concurrency must be positive")
+
+        async def complete_bounded(request: LLMCompletionRequest) -> LLMCompletionResponse:
+            if dispatch_semaphore is None:
+                return await self.complete(request)
+            async with dispatch_semaphore:
+                return await self.complete(request)
+
+        if parse_model_spec(model).provider_slug == "typesafe":
+            answers: dict[str, str] = {}
+            for batch in _typesafe_question_batches(model, messages, questions):
+                response = await complete_bounded(
+                    LLMCompletionRequest(
+                        model=model,
+                        messages=messages,
+                        choice_questions=batch,
+                        metadata=metadata,
+                    )
+                )
+                if response.choice_answers.keys() != batch.keys():
+                    raise LLMError("Finite choice answer IDs do not match the questions")
+                selected = {
+                    question_id: answer.choice
+                    for question_id, answer in response.choice_answers.items()
+                }
+                if any(
+                    answer not in batch[question_id].criteria
+                    for question_id, answer in selected.items()
+                ):
+                    raise LLMError("Finite choice response contains an unknown option")
+                answers.update(selected)
+            return answers
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def complete_one(question_id: str, question: ChoiceQuestion) -> str:
+            options = "\n".join(
+                f"- {json.dumps(option, ensure_ascii=False)}"
+                + (f": {description}" if description is not None else "")
+                for option, description in question.criteria.items()
+            )
+            instruction = (
+                f"{question.instructions}\n\nChoose exactly one option key:\n{options}\n"
+                "Return only the exact option key, without quotes or explanation."
+            )
+            async with semaphore:
+                response = await complete_bounded(
+                    LLMCompletionRequest(
+                        model=model,
+                        messages=[LLMMessage(role="system", content=instruction), *messages],
+                        max_output_tokens=max_output_tokens,
+                        finite_choice=True,
+                        metadata={**metadata, "stage": question_id},
+                    )
+                )
+            answer = response.output_text.strip()
+            if answer not in question.criteria:
+                answer = strip_card_output_wrappers(answer)
+            if answer not in question.criteria:
+                raise LLMError("Finite choice response contains an unknown option")
+            return answer
+
+        tasks = [
+            asyncio.create_task(complete_one(question_id, question))
+            for question_id, question in questions.items()
+        ]
+        try:
+            values = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return dict(zip(questions, values, strict=True))
+
+    async def complete_score_questions(
+        self,
+        *,
+        model: str,
+        messages: list[LLMMessage],
+        questions: dict[str, ScoreQuestion],
+        metadata: dict[str, Any],
+        max_output_tokens: int = 64,
+        concurrency: int = 2,
+        dispatch_semaphore: asyncio.Semaphore | None = None,
+    ) -> dict[str, ScoreDecision]:
+        """Rate prepared five-level questions with a common [0, 1] result.
+
+        TypeSafe returns its weighted 0..4 score and separate certainty. An LLM
+        returns a continuous [0, 1] number guided by the same rubric. The
+        shared dispatch semaphore is acquired here per provider request.
+        """
+        if not questions or not messages:
+            raise ValueError("Finite scores require questions and state messages")
+        if any(not question_id.strip() for question_id in questions):
+            raise ValueError("Finite score question IDs must be nonempty")
+        if not isinstance(metadata.get("purpose"), str) or not metadata["purpose"].strip():
+            raise ValueError("Finite scores require a request purpose")
+        if concurrency < 1:
+            raise ValueError("Finite score concurrency must be positive")
+
+        async def complete_bounded(request: LLMCompletionRequest) -> LLMCompletionResponse:
+            if dispatch_semaphore is None:
+                return await self.complete(request)
+            async with dispatch_semaphore:
+                return await self.complete(request)
+
+        if parse_model_spec(model).provider_slug == "typesafe":
+            answers: dict[str, ScoreDecision] = {}
+            for batch in _typesafe_question_batches(model, messages, questions):
+                response = await complete_bounded(
+                    LLMCompletionRequest(
+                        model=model,
+                        messages=messages,
+                        score_questions=batch,
+                        metadata=metadata,
+                    )
+                )
+                if response.score_answers.keys() != batch.keys():
+                    raise LLMError("Finite score answer IDs do not match the questions")
+                answers.update({
+                    question_id: ScoreDecision(
+                        normalized_score=answer.normalized_score,
+                        typed_answer=answer,
+                    )
+                    for question_id, answer in response.score_answers.items()
+                })
+            return answers
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def complete_one(question_id: str, question: ScoreQuestion) -> ScoreDecision:
+            rubric = "\n".join(
+                f"- {index / 4:.2f}: {description}"
+                for index, description in enumerate(question.criteria)
+            )
+            instruction = (
+                f"{question.instructions}\n\nUse these anchors for a continuous score "
+                f"between 0 and 1:\n{rubric}\nReturn only one number between 0 and 1. "
+                "Intermediate values are allowed; do not round to an anchor."
+            )
+            async with semaphore:
+                response = await complete_bounded(
+                    LLMCompletionRequest(
+                        model=model,
+                        messages=[LLMMessage(role="system", content=instruction), *messages],
+                        max_output_tokens=max_output_tokens,
+                        finite_choice=True,
+                        metadata={**metadata, "stage": question_id},
+                    )
+                )
+            try:
+                value = float(strip_card_output_wrappers(response.output_text))
+            except ValueError:
+                raise LLMError("Finite score response is not a single number") from None
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise LLMError("Finite score response is outside [0, 1]")
+            return ScoreDecision(normalized_score=value)
+
+        tasks = [
+            asyncio.create_task(complete_one(question_id, question))
+            for question_id, question in questions.items()
+        ]
+        try:
+            values = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return dict(zip(questions, values, strict=True))
+
     async def _complete_with_intimacy_routing(
         self,
         normalized_request: LLMCompletionRequest,
+        *,
+        route: ResolvedInferenceRoute,
     ) -> LLMCompletionResponse:
         proactive_request = self._proactive_intimacy_request(normalized_request)
         if proactive_request is not None:
             return await self._complete_once(proactive_request)
         try:
-            return await self._complete_once(normalized_request)
+            return await self._complete_once(normalized_request, route=route)
         except LLMError as exc:
             fallback_request = self._intimacy_fallback_request(normalized_request, exc)
             if fallback_request is None:
@@ -626,30 +1108,54 @@ class LLMClient(Generic[T]):
     async def _complete_once(
         self,
         request: LLMCompletionRequest,
+        *,
+        route: ResolvedInferenceRoute | None = None,
     ) -> LLMCompletionResponse:
-        provider, provider_request = self._completion_provider_request(request)
+        if request.choice_questions is not None and request.score_questions is not None:
+            raise ConfigurationError("Typed decisions require one homogeneous question kind")
+        resolved = self._completion_provider_request(request, route=route)
+        provider_request = resolved.request
+        assert isinstance(provider_request, LLMCompletionRequest)
+        if request.choice_questions is not None or request.score_questions is not None:
+            provider = self._provider_for_resolved_request(resolved)
+            if request.choice_questions is not None and not provider.supports_choices:
+                raise ConfigurationError("Selected provider does not support typed choices")
+            if request.score_questions is not None and not provider.supports_scores:
+                raise ConfigurationError("Selected provider does not support typed scores")
         return await self._with_retries(
-            lambda: provider.complete(provider_request),
+            lambda: self._provider(resolved.provider_name).complete(provider_request),
             request=provider_request,
-            call_type="completion",
+            route=resolved.route,
+            provider_name=resolved.provider_name,
         )
 
     async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-        provider, provider_request = self._embedding_provider_request(request)
+        resolved = self._embedding_provider_request(request)
+        provider_request = resolved.request
+        assert isinstance(provider_request, LLMEmbeddingRequest)
         return await self._with_retries(
-            lambda: provider.embed(provider_request),
+            lambda: self._provider(resolved.provider_name).embed(provider_request),
             request=provider_request,
-            call_type="embedding",
+            route=resolved.route,
+            provider_name=resolved.provider_name,
         )
 
     def supports_embedding_dimensions(self, model_spec: str) -> bool:
         """Return whether the provider for an embedding model supports dimensions."""
         if self._provider_name is not None:
             return self.provider.supports_embedding_dimensions
-        parsed = self._parse_model_spec(model_spec, allow_thinking=False)
-        return self._provider(parsed.provider_name).supports_embedding_dimensions
+        resolved = self._embedding_provider_request(
+            LLMEmbeddingRequest(model=model_spec, input_texts=[])
+        )
+        return self._provider_for_resolved_request(
+            resolved
+        ).supports_embedding_dimensions
 
-    async def stream(self, request: LLMCompletionRequest) -> AsyncIterator[LLMStreamEvent]:
+    async def stream(
+        self, request: LLMCompletionRequest
+    ) -> AsyncIterator[LLMStreamEvent]:
+        if request.choice_questions is not None or request.score_questions is not None or request.finite_choice:
+            raise ConfigurationError("Typed choices require complete(), not text streaming")
         normalized_request = request.model_copy(
             update={
                 "max_output_tokens": (
@@ -659,29 +1165,69 @@ class LLMClient(Generic[T]):
                 )
             }
         )
+        route = self._completion_route_for_request(normalized_request)
+        # `aclosing` is what makes an abandoned stream observable. A bare
+        # `async for` leaves the inner generator suspended when this one is
+        # closed, so `_stream_once` would only learn about the disconnect
+        # whenever the garbage collector got around to finalizing it -- after the
+        # turn that paid for the round-trip has already written its telemetry.
         proactive_request = self._proactive_intimacy_request(normalized_request)
         if proactive_request is not None:
-            async for event in self._stream_once(proactive_request):
-                yield event
+            async with aclosing(self._stream_once(proactive_request)) as events:
+                async for event in events:
+                    yield event
             return
         try:
-            async for event in self._stream_once(normalized_request):
-                yield event
+            async with aclosing(
+                self._stream_once(normalized_request, route=route)
+            ) as events:
+                async for event in events:
+                    yield event
             return
         except _PreOutputStreamError as exc:
-            fallback_request = self._intimacy_fallback_request(normalized_request, exc.original)
+            fallback_request = self._intimacy_fallback_request(
+                normalized_request, exc.original
+            )
             if fallback_request is None:
                 raise exc.original from exc
-            async for event in self._stream_once(fallback_request):
-                yield event
+            async with aclosing(self._stream_once(fallback_request)) as events:
+                async for event in events:
+                    yield event
 
     async def _stream_once(
         self,
         request: LLMCompletionRequest,
         *,
         observer: Any | None = None,
+        route: ResolvedInferenceRoute | None = None,
     ) -> AsyncIterator[LLMStreamEvent]:
-        provider, provider_request = self._completion_provider_request(request)
+        recorder = self._diagnostic_recorder
+        if recorder is None:
+            async with aclosing(self._stream_once_impl(request, observer=observer, route=route)) as events:
+                async for event in events:
+                    yield event
+            return
+        safe_metadata = _diagnostic_metadata(request.metadata)
+        if _diagnostic_has_credentials(safe_metadata.get("provider_extra_body")):
+            recorder._fail(ValueError("provider_extra_body contains credential fields"))
+        request_ref = recorder.blob(request.model_copy(update={"metadata": safe_metadata}))
+        prompt_ref = recorder.blob(request.messages)
+        contract_ref = recorder.blob({"choice_questions": request.choice_questions, "score_questions": request.score_questions, "response_schema": request.response_schema, "tools": request.tools})
+        with recorder.operation(self._request_purpose(request), component=component_id_for_llm_purpose(self._request_purpose(request)), input_data={"request": request_ref, "requested_model": request.model, "prompt_sha256": prompt_ref["sha256"] if prompt_ref else None, "contract_sha256": contract_ref["sha256"] if contract_ref else None}):
+            async with aclosing(self._stream_once_impl(request, observer=observer, route=route)) as events:
+                async for event in events:
+                    yield event
+
+    async def _stream_once_impl(
+        self,
+        request: LLMCompletionRequest,
+        *,
+        observer: Any | None = None,
+        route: ResolvedInferenceRoute | None = None,
+    ) -> AsyncIterator[LLMStreamEvent]:
+        resolved = self._completion_provider_request(request, route=route)
+        provider_request = resolved.request
+        assert isinstance(provider_request, LLMCompletionRequest)
         observer = self._stream_observer(observer)
         retry_policy = self._retry_policy_for(provider_request)
         last_error: LLMError | None = None
@@ -689,37 +1235,58 @@ class LLMClient(Generic[T]):
             emitted_any = False
             output_text = ""
             usage: dict[str, Any] = {}
-            stream_iterator = provider.stream(provider_request)
-            started_at = perf_counter()
-            self._guard_before_call(provider_request, call_type="stream")
+            self._authorize_inference_route(resolved.route)
+            permit = await self._acquire_dispatch(resolved.provider_name)
+            try:
+                guarded_call = self._begin_guarded_call(provider_request)
+            except BaseException:
+                permit.release()
+                raise
+            try:
+                provider = self._provider(resolved.provider_name)
+                started_at = perf_counter()
+                stream_iterator = provider.stream(provider_request)
+            except BaseException:
+                permit.release()
+                raise
+            recorder = self._diagnostic_recorder
+            current = current_operation(recorder)
+            attempt_id = uuid4().hex if recorder is not None and current is not None else None
+            if recorder is not None and current is not None and attempt_id is not None:
+                recorder.event("provider_attempt", phase="start", trace_id=current[0], operation_id=current[1], attempt_id=attempt_id, purpose=self._request_purpose(provider_request), status="started", data={"attempt_number": attempt, "resolved_provider": resolved.provider_name, "resolved_model": provider_request.model, "started_at": _diagnostic_utc_now()})
+                original_iterator = stream_iterator
+
+                async def captured_stream() -> AsyncIterator[LLMStreamEvent]:
+                    with bind_attempt(recorder, attempt_id):
+                        async for captured_event in original_iterator:
+                            yield captured_event
+
+                stream_iterator = captured_stream()
             try:
                 async for event in stream_iterator:
                     emitted_any = True
                     if event.type == "text" and event.content:
                         output_text += event.content
                         if observer is not None:
-                            await observer.on_text(event.content, output_text, provider_request)
-                    if event.type == "done" and isinstance(event.payload.get("usage"), dict):
-                        usage = dict(event.payload["usage"])
+                            await observer.on_text(
+                                event.content, output_text, provider_request
+                            )
+                    # Read usage from WHEREVER the stream publishes it, not only
+                    # from the terminal event. A cancelled stream never reaches
+                    # its terminal event, so anything published earlier is the
+                    # only usage that call will ever have; the terminal event
+                    # still wins for a completed stream because it arrives last.
+                    event_usage = event.payload.get("usage")
+                    if isinstance(event_usage, dict):
+                        usage = dict(event_usage)
                     yield event
-                self._guard_record_success(
-                    provider_request,
-                    call_type="stream",
-                    provider=provider.name,
-                    response_model=str(
-                        provider_request.metadata.get("atagia_model_spec")
-                        or provider_request.model
-                    ),
-                    usage=usage,
-                    latency_ms=(perf_counter() - started_at) * 1000.0,
-                )
-                return
             except LLMRunawayAbort as exc:
+                self._diagnostic_attempt_end(attempt_id, provider_request, "partial" if emitted_any else "failure", error=exc, partial_output=output_text, partial_usage=usage)
                 await self._close_stream_iterator(stream_iterator)
                 output_limit_error = self._runaway_abort_error(exc, provider_request)
-                self._guard_record_failure(
+                self._record_provider_call_failure(
                     provider_request,
-                    call_type="stream",
+                    guarded_call,
                     exc=output_limit_error,
                     latency_ms=(perf_counter() - started_at) * 1000.0,
                 )
@@ -727,10 +1294,11 @@ class LLMClient(Generic[T]):
                     raise output_limit_error from exc
                 raise _PreOutputStreamError(output_limit_error) from exc
             except TransientLLMError as exc:
+                self._diagnostic_attempt_end(attempt_id, provider_request, "partial" if emitted_any else "failure", error=exc, partial_output=output_text, partial_usage=usage)
                 await self._close_stream_iterator(stream_iterator)
-                self._guard_record_failure(
+                self._record_provider_call_failure(
                     provider_request,
-                    call_type="stream",
+                    guarded_call,
                     exc=exc,
                     latency_ms=(perf_counter() - started_at) * 1000.0,
                 )
@@ -739,6 +1307,7 @@ class LLMClient(Generic[T]):
                 last_error = exc
                 if attempt == retry_policy.attempts:
                     break
+                permit.release()
                 await self._sleep_before_retry(
                     retry_policy,
                     attempt,
@@ -746,19 +1315,60 @@ class LLMClient(Generic[T]):
                     request=provider_request,
                 )
             except LLMError as exc:
+                self._diagnostic_attempt_end(attempt_id, provider_request, "partial" if emitted_any else "failure", error=exc, partial_output=output_text, partial_usage=usage)
                 await self._close_stream_iterator(stream_iterator)
-                self._guard_record_failure(
+                self._record_provider_call_failure(
                     provider_request,
-                    call_type="stream",
+                    guarded_call,
                     exc=exc,
                     latency_ms=(perf_counter() - started_at) * 1000.0,
                 )
                 if emitted_any:
                     raise
                 raise _PreOutputStreamError(exc) from exc
-            except BaseException:
+            except Exception as exc:
+                # A provider or adapter error that was not normalized into an
+                # LLMError is still a failed round-trip, not an abandoned one.
+                self._diagnostic_attempt_end(attempt_id, provider_request, "partial" if emitted_any else "failure", error=exc, partial_output=output_text, partial_usage=usage)
+                self._record_provider_call_failure(
+                    provider_request,
+                    guarded_call,
+                    exc=exc,
+                    latency_ms=(perf_counter() - started_at) * 1000.0,
+                )
                 await self._close_stream_iterator(stream_iterator)
                 raise
+            except BaseException:
+                # Everything that is NOT an Exception -- CancelledError,
+                self._diagnostic_attempt_end(attempt_id, provider_request, "cancelled", partial_output=output_text, partial_usage=usage)
+                # GeneratorExit, KeyboardInterrupt, SystemExit -- means the
+                # consumer or the process went away mid-stream (a proxy client
+                # disconnect is the common one). Record before closing the
+                # iterator: the close is awaited inside a cancellation, so it can
+                # be interrupted, and the round-trip is already spent either way.
+                self._record_provider_call_cancelled(
+                    provider_request,
+                    guarded_call,
+                    usage=usage,
+                    latency_ms=(perf_counter() - started_at) * 1000.0,
+                )
+                await self._close_stream_iterator(stream_iterator)
+                raise
+            else:
+                # OUTSIDE the try. Recording a success inside it would let any
+                # LLMError raised while recording (LLMRunGuardError is one) be
+                # caught by this method's own `except LLMError`, which would
+                # record a SECOND, failed round-trip for the same provider call.
+                self._record_provider_call_success(
+                    provider_request,
+                    guarded_call,
+                    usage=usage,
+                    latency_ms=(perf_counter() - started_at) * 1000.0,
+                )
+                self._diagnostic_attempt_end(attempt_id, provider_request, "success", partial_output=output_text, partial_usage=usage)
+                return
+            finally:
+                permit.release()
         if last_error is None:
             raise LLMError("LLM stream failed without a captured error")
         raise _PreOutputStreamError(last_error)
@@ -769,6 +1379,8 @@ class LLMClient(Generic[T]):
         *,
         observer: Any | None = None,
     ) -> LLMCompletionResponse:
+        if request.choice_questions is not None or request.score_questions is not None or request.finite_choice:
+            raise ConfigurationError("Finite choices require complete(), not text streaming")
         normalized_request = request.model_copy(
             update={
                 "max_output_tokens": (
@@ -778,11 +1390,13 @@ class LLMClient(Generic[T]):
                 )
             }
         )
+        route = self._completion_route_for_request(normalized_request)
         return await self._with_output_limit_recovery(
             normalized_request,
             lambda retry_request: self._complete_streamed_with_intimacy_routing(
                 retry_request,
                 observer=observer,
+                route=route,
             ),
             operation_name="streamed_completion",
             retry_observer=observer,
@@ -794,25 +1408,39 @@ class LLMClient(Generic[T]):
         normalized_request: LLMCompletionRequest,
         *,
         observer: Any | None = None,
+        route: ResolvedInferenceRoute,
     ) -> LLMCompletionResponse:
         proactive_request = self._proactive_intimacy_request(normalized_request)
         if proactive_request is not None:
-            return await self._complete_streamed_once(proactive_request, observer=observer)
+            return await self._complete_streamed_once(
+                proactive_request, observer=observer
+            )
         try:
-            return await self._complete_streamed_once(normalized_request, observer=observer)
+            return await self._complete_streamed_once(
+                normalized_request,
+                observer=observer,
+                route=route,
+            )
         except _PreOutputStreamError as exc:
-            fallback_request = self._intimacy_fallback_request(normalized_request, exc.original)
+            fallback_request = self._intimacy_fallback_request(
+                normalized_request, exc.original
+            )
             if fallback_request is None:
                 raise exc.original from exc
-            return await self._complete_streamed_once(fallback_request, observer=observer)
+            return await self._complete_streamed_once(
+                fallback_request, observer=observer
+            )
 
     async def _complete_streamed_once(
         self,
         request: LLMCompletionRequest,
         *,
         observer: Any | None = None,
+        route: ResolvedInferenceRoute | None = None,
     ) -> LLMCompletionResponse:
-        provider, provider_request = self._completion_provider_request(request)
+        resolved = self._completion_provider_request(request, route=route)
+        provider_request = resolved.request
+        assert isinstance(provider_request, LLMCompletionRequest)
         observer = self._stream_observer(observer)
         retry_policy = self._retry_policy_for(provider_request)
         last_error: LLMError | None = None
@@ -823,51 +1451,50 @@ class LLMClient(Generic[T]):
             tool_calls: list[dict[str, Any]] = []
             usage: dict[str, Any] = {}
             finish_reason: str | None = None
-            stream_iterator = provider.stream(provider_request)
-            started_at = perf_counter()
-            self._guard_before_call(provider_request, call_type="streamed_completion")
+            self._authorize_inference_route(resolved.route)
+            permit = await self._acquire_dispatch(resolved.provider_name)
+            try:
+                guarded_call = self._begin_guarded_call(provider_request)
+            except BaseException:
+                permit.release()
+                raise
+            try:
+                provider = self._provider(resolved.provider_name)
+                started_at = perf_counter()
+                stream_iterator = provider.stream(provider_request)
+            except BaseException:
+                permit.release()
+                raise
             try:
                 async for event in stream_iterator:
                     emitted_any = True
+                    # Usage is read outside the type dispatch below for the same
+                    # reason as in ``_stream_once``: a cancelled stream never
+                    # reaches its terminal event, so whatever was published
+                    # earlier is the only usage this call will ever have.
+                    event_usage = event.payload.get("usage")
+                    if isinstance(event_usage, dict):
+                        usage = dict(event_usage)
                     if event.type == "text" and event.content:
                         output_text += event.content
                         if observer is not None:
-                            await observer.on_text(event.content, output_text, provider_request)
+                            await observer.on_text(
+                                event.content, output_text, provider_request
+                            )
                     elif event.type == "thinking" and event.content:
                         thinking += event.content
                     elif event.type == "tool_call":
                         tool_calls.append(dict(event.payload))
                     elif event.type == "done":
-                        event_usage = event.payload.get("usage")
-                        if isinstance(event_usage, dict):
-                            usage = event_usage
                         event_finish_reason = event.payload.get("finish_reason")
                         if isinstance(event_finish_reason, str):
                             finish_reason = event_finish_reason
-                response = LLMCompletionResponse(
-                    provider=provider.name,
-                    model=str(provider_request.metadata.get("atagia_model_spec") or provider_request.model),
-                    output_text=output_text,
-                    thinking=thinking or None,
-                    tool_calls=tool_calls,
-                    usage=usage,
-                    finish_reason=finish_reason,
-                )
-                self._guard_record_success(
-                    provider_request,
-                    call_type="streamed_completion",
-                    provider=response.provider,
-                    response_model=response.model,
-                    usage=response.usage,
-                    latency_ms=(perf_counter() - started_at) * 1000.0,
-                )
-                return response
             except LLMRunawayAbort as exc:
                 await self._close_stream_iterator(stream_iterator)
                 output_limit_error = self._runaway_abort_error(exc, provider_request)
-                self._guard_record_failure(
+                self._record_provider_call_failure(
                     provider_request,
-                    call_type="streamed_completion",
+                    guarded_call,
                     exc=output_limit_error,
                     latency_ms=(perf_counter() - started_at) * 1000.0,
                 )
@@ -876,9 +1503,9 @@ class LLMClient(Generic[T]):
                 raise _PreOutputStreamError(output_limit_error) from exc
             except TransientLLMError as exc:
                 await self._close_stream_iterator(stream_iterator)
-                self._guard_record_failure(
+                self._record_provider_call_failure(
                     provider_request,
-                    call_type="streamed_completion",
+                    guarded_call,
                     exc=exc,
                     latency_ms=(perf_counter() - started_at) * 1000.0,
                 )
@@ -900,6 +1527,7 @@ class LLMClient(Generic[T]):
                         attempt,
                     )
                     await self._reset_stream_observer_for_retry(observer, exc)
+                permit.release()
                 await self._sleep_before_retry(
                     retry_policy,
                     attempt,
@@ -908,18 +1536,63 @@ class LLMClient(Generic[T]):
                 )
             except LLMError as exc:
                 await self._close_stream_iterator(stream_iterator)
-                self._guard_record_failure(
+                self._record_provider_call_failure(
                     provider_request,
-                    call_type="streamed_completion",
+                    guarded_call,
                     exc=exc,
                     latency_ms=(perf_counter() - started_at) * 1000.0,
                 )
                 if emitted_any:
                     raise
                 raise _PreOutputStreamError(exc) from exc
-            except BaseException:
+            except Exception as exc:
+                # Not normalized into an LLMError, but still a failed round-trip.
+                self._record_provider_call_failure(
+                    provider_request,
+                    guarded_call,
+                    exc=exc,
+                    latency_ms=(perf_counter() - started_at) * 1000.0,
+                )
                 await self._close_stream_iterator(stream_iterator)
                 raise
+            except BaseException:
+                # Not an Exception: the caller or the process abandoned the call.
+                # Record before closing the iterator -- the close is awaited
+                # inside a cancellation and can itself be interrupted, and the
+                # round-trip is already spent either way.
+                self._record_provider_call_cancelled(
+                    provider_request,
+                    guarded_call,
+                    usage=usage,
+                    latency_ms=(perf_counter() - started_at) * 1000.0,
+                )
+                await self._close_stream_iterator(stream_iterator)
+                raise
+            else:
+                # OUTSIDE the try, for the same reason as `_stream_once`: a
+                # success recorded inside it could be re-caught by this method's
+                # own `except LLMError` and metered a second time as a failure.
+                response = LLMCompletionResponse(
+                    provider=provider.name,
+                    model=str(
+                        provider_request.metadata.get("atagia_model_spec")
+                        or provider_request.model
+                    ),
+                    output_text=output_text,
+                    thinking=thinking or None,
+                    tool_calls=tool_calls,
+                    usage=usage,
+                    finish_reason=finish_reason,
+                )
+                self._record_provider_call_success(
+                    provider_request,
+                    guarded_call,
+                    usage=response.usage,
+                    latency_ms=(perf_counter() - started_at) * 1000.0,
+                )
+                return response
+            finally:
+                permit.release()
         if last_error is None:
             raise LLMError("LLM streamed completion failed without a captured error")
         raise _PreOutputStreamError(last_error)
@@ -943,6 +1616,11 @@ class LLMClient(Generic[T]):
         for recovery_attempt in range(0, attempts + 1):
             try:
                 response = await operation(current_request)
+            except InferenceAccessDeniedError:
+                # An access denial is terminal and cannot be repaired by a
+                # second request, even if the request otherwise qualifies for
+                # technical output-limit recovery.
+                raise
             except OutputLimitExceededError as exc:
                 last_error = exc
                 if recovery_attempt >= attempts:
@@ -1002,7 +1680,9 @@ class LLMClient(Generic[T]):
             return False
         if not self._technical_recovery_config.output_limit_retries_enabled():
             return False
-        strategy = request.metadata.get("atagia_technical_recovery_output_limit_strategy")
+        strategy = request.metadata.get(
+            "atagia_technical_recovery_output_limit_strategy"
+        )
         if isinstance(strategy, str) and strategy.strip().lower() == "caller":
             return False
         enabled = request.metadata.get("atagia_technical_recovery_output_limit_retry")
@@ -1212,7 +1892,9 @@ class LLMClient(Generic[T]):
         if isinstance(component_id, str) and component_id.strip():
             return component_id.strip()
         purpose = request.metadata.get("purpose")
-        return component_id_for_llm_purpose(purpose if isinstance(purpose, str) else None)
+        return component_id_for_llm_purpose(
+            purpose if isinstance(purpose, str) else None
+        )
 
     @classmethod
     def _metadata_indicates_known_intimacy(cls, metadata: dict[str, Any]) -> bool:
@@ -1231,7 +1913,9 @@ class LLMClient(Generic[T]):
                 return True
         boundaries = metadata.get("intimacy_boundaries")
         if isinstance(boundaries, list):
-            return any(cls._nonordinary_intimacy_boundary(value) for value in boundaries)
+            return any(
+                cls._nonordinary_intimacy_boundary(value) for value in boundaries
+            )
         return False
 
     @staticmethod
@@ -1252,9 +1936,23 @@ class LLMClient(Generic[T]):
 
     @staticmethod
     def _is_policy_blocked_error(exc: LLMError) -> bool:
+        """Whether ``exc`` is a provider policy refusal worth rerouting.
+
+        This predicate gates the ONE path in the client that answers an error by
+        calling a provider again (the intimacy fallback model), so it is where a
+        local refusal has to be excluded: the run guard's message is free text
+        assembled from violation strings, and the substring test below is one
+        unlucky wording away from reading "guard blocked the request" as
+        "provider blocked the response" and spending a second call to be refused
+        again.
+        """
+        if isinstance(exc, (InferenceAccessDeniedError, LLMRunGuardError)):
+            return False
         if isinstance(exc, LLMPolicyBlockedError):
             return True
-        if isinstance(exc, (OutputLimitExceededError, StructuredOutputError, TransientLLMError)):
+        if isinstance(
+            exc, (OutputLimitExceededError, StructuredOutputError, TransientLLMError)
+        ):
             return False
         message = str(exc).lower()
         return any(
@@ -1291,36 +1989,257 @@ class LLMClient(Generic[T]):
     def _completion_provider_request(
         self,
         request: LLMCompletionRequest,
-    ) -> tuple[LLMProvider, LLMCompletionRequest]:
+        *,
+        route: ResolvedInferenceRoute | None = None,
+    ) -> _ResolvedProviderRequest:
         if self._provider_name is not None:
-            return self.provider, request
+            return _ResolvedProviderRequest(
+                provider_name=self._provider_name,
+                request=request,
+                route=route
+                or self._direct_provider_route(
+                    request.model,
+                    InferenceOperation.COMPLETION,
+                ),
+            )
+        resolved_route = route or self._resolve_inference_route(
+            request.model, InferenceOperation.COMPLETION
+        )
+        if resolved_route.provider_slug == "local":
+            parsed = parse_local_model_spec(resolved_route.canonical_model_spec)
+            return _ResolvedProviderRequest(
+                provider_name=local_provider_registry_key(parsed.endpoint_id),
+                request=self._local_completion_request_for_provider(request, parsed),
+                route=resolved_route,
+            )
+        self._reject_zero_cost_openrouter_caller_features(request, resolved_route)
         parsed = self._parse_model_spec(request.model, allow_thinking=True)
-        provider = self._provider(parsed.provider_name)
-        return provider, self._completion_request_for_provider(request, parsed)
+        return _ResolvedProviderRequest(
+            provider_name=parsed.provider_name,
+            request=self._completion_request_for_provider(request, parsed),
+            route=resolved_route,
+        )
+
+    def _completion_route_for_request(
+        self,
+        request: LLMCompletionRequest,
+    ) -> ResolvedInferenceRoute:
+        if self._provider_name is not None:
+            return self._direct_provider_route(
+                request.model,
+                InferenceOperation.COMPLETION,
+            )
+        return self._resolve_inference_route(
+            request.model,
+            InferenceOperation.COMPLETION,
+        )
 
     def _embedding_provider_request(
         self,
         request: LLMEmbeddingRequest,
-    ) -> tuple[LLMProvider, LLMEmbeddingRequest]:
+    ) -> _ResolvedProviderRequest:
         if self._provider_name is not None:
-            return self._provider(self._provider_name), request
+            return _ResolvedProviderRequest(
+                provider_name=self._provider_name,
+                request=request,
+                route=self._direct_provider_route(
+                    request.model,
+                    InferenceOperation.EMBEDDING,
+                ),
+            )
+        route = self._resolve_inference_route(
+            request.model,
+            InferenceOperation.EMBEDDING,
+        )
+        if route.provider_slug == "local":
+            parsed = parse_local_model_spec(
+                route.canonical_model_spec,
+                allow_thinking=False,
+            )
+            return _ResolvedProviderRequest(
+                provider_name=local_provider_registry_key(parsed.endpoint_id),
+                request=self._local_embedding_request_for_provider(request, parsed),
+                route=route,
+            )
         parsed = self._parse_model_spec(request.model, allow_thinking=False)
-        provider = self._provider(parsed.provider_name)
         metadata = dict(request.metadata)
         metadata.setdefault("atagia_model_spec", parsed.canonical_model)
-        provider_request = request.model_copy(
+        return _ResolvedProviderRequest(
+            provider_name=parsed.provider_name,
+            request=request.model_copy(
+                update={
+                    "model": parsed.request_model,
+                    "metadata": metadata,
+                }
+            ),
+            route=route,
+        )
+
+    def _resolve_inference_route(
+        self,
+        model_spec: str,
+        operation: InferenceOperation,
+    ) -> ResolvedInferenceRoute:
+        try:
+            return resolve_internal_inference_route(
+                model_spec,
+                operation,
+                local_catalog=self._local_endpoint_catalog,
+            )
+        except InferenceRouteError as exc:
+            if (
+                self._inference_access_policy.mode
+                is not InferenceAccessMode.UNRESTRICTED
+                or model_spec.strip().lower().startswith("local/")
+            ):
+                if (
+                    self._inference_access_policy.mode is InferenceAccessMode.ZERO_COST
+                    and model_spec.strip().lower().startswith("openrouter/")
+                ):
+                    raise InferenceAccessDeniedError(
+                        "Inference access denied: zero_cost denied a malformed "
+                        "OpenRouter route."
+                    ) from exc
+                raise ConfigurationError(str(exc)) from exc
+            parsed = self._parse_model_spec(
+                model_spec,
+                allow_thinking=operation is InferenceOperation.COMPLETION,
+            )
+            return ResolvedInferenceRoute(
+                operation=operation,
+                canonical_model_spec=parsed.canonical_spec,
+                provider_slug=parsed.provider_slug,
+                endpoint_id=None,
+                base_url_class=BaseUrlClass.EXTERNAL,
+                cost_class=InferenceCostClass.METERED,
+            )
+
+    @staticmethod
+    def _direct_provider_route(
+        model_spec: str,
+        operation: InferenceOperation,
+    ) -> ResolvedInferenceRoute:
+        """Classify the legacy direct-provider shortcut as non-local.
+
+        The shortcut has no catalog-backed endpoint identity, so a restricted
+        policy must reject it even if request metadata claims otherwise.
+        """
+        return ResolvedInferenceRoute(
+            operation=operation,
+            canonical_model_spec=model_spec,
+            provider_slug="direct",
+            endpoint_id=None,
+            base_url_class=BaseUrlClass.EXTERNAL,
+            cost_class=InferenceCostClass.UNKNOWN,
+        )
+
+    def _provider_for_resolved_request(
+        self,
+        resolved: _ResolvedProviderRequest,
+    ) -> LLMProvider:
+        self._authorize_inference_route(resolved.route)
+        return self._provider(resolved.provider_name)
+
+    def _authorize_inference_route(self, route: ResolvedInferenceRoute) -> None:
+        denial = self._inference_access_policy.denial_reason(
+            route,
+            local_catalog=self._local_endpoint_catalog,
+        )
+        if denial is not None:
+            raise InferenceAccessDeniedError(
+                f"Inference access denied for route {route.canonical_model_spec!r}: {denial}"
+            )
+
+    def _local_completion_request_for_provider(
+        self,
+        request: LLMCompletionRequest,
+        parsed: ParsedLocalModelSpec,
+    ) -> LLMCompletionRequest:
+        self._reject_restricted_local_provider_extra_body(request.metadata)
+        metadata = copy.deepcopy(request.metadata)
+        metadata["atagia_model_spec"] = parsed.canonical_spec
+        metadata["atagia_canonical_model"] = parsed.canonical_spec
+        metadata["atagia_provider_slug"] = "local"
+        metadata["atagia_local_endpoint_id"] = parsed.endpoint_id
+        if parsed.thinking_level is None:
+            metadata.pop("reasoning_effort", None)
+        else:
+            metadata["reasoning_effort"] = parsed.thinking_level
+        return request.model_copy(
             update={
-                "model": parsed.request_model,
+                "model": parsed.served_model_id,
                 "metadata": metadata,
             }
         )
-        return provider, provider_request
+
+    def _local_embedding_request_for_provider(
+        self,
+        request: LLMEmbeddingRequest,
+        parsed: ParsedLocalModelSpec,
+    ) -> LLMEmbeddingRequest:
+        self._reject_restricted_local_provider_extra_body(request.metadata)
+        metadata = copy.deepcopy(request.metadata)
+        metadata["atagia_model_spec"] = parsed.canonical_spec
+        metadata["atagia_canonical_model"] = parsed.canonical_spec
+        metadata["atagia_provider_slug"] = "local"
+        metadata["atagia_local_endpoint_id"] = parsed.endpoint_id
+        return request.model_copy(
+            update={
+                "model": parsed.served_model_id,
+                "metadata": metadata,
+            }
+        )
+
+    def _reject_restricted_local_provider_extra_body(
+        self,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Keep a restricted local route's wire model owned by its catalog."""
+        if (
+            self._inference_access_policy.mode is InferenceAccessMode.ZERO_COST
+            and "provider_extra_body" in metadata
+        ):
+            raise InferenceAccessDeniedError(
+                "Inference access denied: zero_cost local routes do not permit "
+                "provider_extra_body."
+            )
+        if self._inference_access_policy.restricted and metadata.get(
+            "provider_extra_body"
+        ):
+            raise InferenceAccessDeniedError(
+                "Inference access denied: restricted local routes do not permit "
+                "provider_extra_body."
+            )
+
+    def _reject_zero_cost_openrouter_caller_features(
+        self,
+        request: LLMCompletionRequest,
+        route: ResolvedInferenceRoute,
+    ) -> None:
+        """Reject caller-controlled OpenRouter routing and tool features."""
+        if (
+            self._inference_access_policy.mode is not InferenceAccessMode.ZERO_COST
+            or route.provider_slug != "openrouter"
+        ):
+            return
+        if "provider_extra_body" in request.metadata:
+            raise InferenceAccessDeniedError(
+                "Inference access denied: zero_cost OpenRouter does not permit "
+                "caller-supplied provider_extra_body."
+            )
+        if request.tools:
+            raise InferenceAccessDeniedError(
+                "Inference access denied: zero_cost OpenRouter does not permit tools."
+            )
 
     def _parse_model_spec(self, model: str, *, allow_thinking: bool) -> ParsedModelSpec:
         try:
             return parse_model_spec(model, allow_thinking=allow_thinking)
         except ModelResolutionError as exc:
-            if self._allow_unqualified_single_provider_models and len(self._providers) == 1:
+            if (
+                self._allow_unqualified_single_provider_models
+                and len(self._providers) == 1
+            ):
                 provider = next(iter(self._providers))
                 return ParsedModelSpec(
                     raw_spec=model,
@@ -1343,6 +2262,14 @@ class LLMClient(Generic[T]):
         metadata.setdefault("atagia_canonical_model", parsed.canonical_model)
         metadata.setdefault("atagia_provider_slug", parsed.provider_slug)
         metadata = self._apply_model_profile(parsed, metadata)
+        if (
+            self._inference_access_policy.mode is InferenceAccessMode.ZERO_COST
+            and parsed.provider_slug == "openrouter"
+        ):
+            # The adapter owns the complete OpenRouter routing body. Profiles
+            # may set ordinary-provider preferences, but none may reach this
+            # restricted request.
+            metadata.pop("provider_extra_body", None)
         temperature = self._resolve_completion_temperature(
             parsed,
             request.temperature,
@@ -1440,7 +2367,9 @@ class LLMClient(Generic[T]):
             if level in profile.thinking_level_map:
                 provider_value = profile.thinking_level_map[level]
             elif profile.default_thinking_level in profile.thinking_level_map:
-                provider_value = profile.thinking_level_map[profile.default_thinking_level]
+                provider_value = profile.thinking_level_map[
+                    profile.default_thinking_level
+                ]
 
         if parsed.provider_slug == "openai":
             metadata = self._apply_profile_extra_body(profile, metadata)
@@ -1508,7 +2437,9 @@ class LLMClient(Generic[T]):
         return metadata
 
     @classmethod
-    def _deep_merge_dicts(cls, base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    def _deep_merge_dicts(
+        cls, base: dict[str, Any], overlay: dict[str, Any]
+    ) -> dict[str, Any]:
         result = copy.deepcopy(base)
         for key, value in overlay.items():
             if isinstance(value, dict) and isinstance(result.get(key), dict):
@@ -1529,6 +2460,21 @@ class LLMClient(Generic[T]):
         request: LLMCompletionRequest,
         schema: type[T],
     ) -> StructuredCompletionResult[T]:
+        recorder = self._diagnostic_recorder
+        if recorder is None:
+            return await self._complete_structured_with_response_impl(request, schema)
+        with recorder.operation("structured_completion", component=component_id_for_llm_purpose(self._request_purpose(request)), card=self._request_purpose(request), user_id=str(request.metadata.get("user_id")) if request.metadata.get("user_id") is not None else None, input_data={"requested_model": request.model, "schema": recorder.blob(schema.model_json_schema() if hasattr(schema, "model_json_schema") else str(schema))}):
+            result = await self._complete_structured_with_response_impl(request, schema)
+            recorder.no_call("structured_validation", component="llm_client", data={"status": "success", "parsed": recorder.blob(result.value), "used_schema_fallback": result.used_schema_fallback, "used_structured_output_retry": result.used_structured_output_retry, "used_structured_output_rescue": result.used_structured_output_rescue})
+            return result
+
+    async def _complete_structured_with_response_impl(
+        self,
+        request: LLMCompletionRequest,
+        schema: type[T],
+    ) -> StructuredCompletionResult[T]:
+        if request.choice_questions is not None or request.score_questions is not None or request.finite_choice:
+            raise ConfigurationError("Typed choices require complete(), not JSON generation")
         try:
             return await self._complete_structured_once(request, schema)
         except StructuredOutputError as exc:
@@ -1563,7 +2509,9 @@ class LLMClient(Generic[T]):
                 used_structured_output_retry=True,
             )
 
-        rescue_request = self._structured_output_rescue_request(request, schema, last_error)
+        rescue_request = self._structured_output_rescue_request(
+            request, schema, last_error
+        )
         if rescue_request is None:
             raise last_error from initial_error
 
@@ -1601,8 +2549,18 @@ class LLMClient(Generic[T]):
             if not self._should_retry_without_schema(exc, completion_request):
                 raise
             used_schema_fallback = True
-            response = await self.complete(self._schema_drop_fallback_request(request, exc))
-        value = self._validate_structured_response(response, schema, used_schema_fallback)
+            response = await self.complete(
+                self._schema_drop_fallback_request(request, exc)
+            )
+        try:
+            value = self._validate_structured_response(
+                response, schema, used_schema_fallback
+            )
+        except StructuredOutputError as exc:
+            recorder = self._diagnostic_recorder
+            if recorder is not None:
+                recorder.no_call("structured_validation", component="llm_client", data={"status": "failure", "error_type": type(exc).__name__, "reason": exc.reason, "details": exc.details})
+            raise
         return StructuredCompletionResult(
             value=value,
             response=response,
@@ -1616,6 +2574,8 @@ class LLMClient(Generic[T]):
         *,
         observer: Any | None = None,
     ) -> T:
+        if request.choice_questions is not None or request.score_questions is not None or request.finite_choice:
+            raise ConfigurationError("Typed choices require complete(), not JSON generation")
         try:
             return await self._complete_structured_streamed_once(
                 request,
@@ -1642,7 +2602,9 @@ class LLMClient(Generic[T]):
             except StructuredOutputError as exc:
                 last_error = exc
 
-        rescue_request = self._structured_output_rescue_request(request, schema, last_error)
+        rescue_request = self._structured_output_rescue_request(
+            request, schema, last_error
+        )
         if rescue_request is None:
             raise last_error from initial_error
         try:
@@ -1663,7 +2625,9 @@ class LLMClient(Generic[T]):
             completion_request = self._schema_prompt_fallback_request(request)
             used_schema_fallback = True
         try:
-            response = await self.complete_streamed(completion_request, observer=observer)
+            response = await self.complete_streamed(
+                completion_request, observer=observer
+            )
         except LLMError as exc:
             if not self._should_retry_without_schema(exc, completion_request):
                 raise
@@ -1672,7 +2636,9 @@ class LLMClient(Generic[T]):
                 self._schema_drop_fallback_request(request, exc),
                 observer=observer,
             )
-        return self._validate_structured_response(response, schema, used_schema_fallback)
+        return self._validate_structured_response(
+            response, schema, used_schema_fallback
+        )
 
     def _structured_output_repair_request(
         self,
@@ -1799,7 +2765,9 @@ class LLMClient(Generic[T]):
         return "\n\n".join(parts)
 
     @staticmethod
-    def _structured_output_error_details_for_prompt(error: StructuredOutputError) -> str:
+    def _structured_output_error_details_for_prompt(
+        error: StructuredOutputError,
+    ) -> str:
         if not error.details:
             return "- Structured output validation failed."
         lines = [
@@ -1819,7 +2787,9 @@ class LLMClient(Generic[T]):
         if not text:
             return ""
         if len(text) > _STRUCTURED_OUTPUT_REPAIR_MAX_OUTPUT_CHARS:
-            text = text[:_STRUCTURED_OUTPUT_REPAIR_MAX_OUTPUT_CHARS] + "\n...[truncated]"
+            text = (
+                text[:_STRUCTURED_OUTPUT_REPAIR_MAX_OUTPUT_CHARS] + "\n...[truncated]"
+            )
         return text
 
     @staticmethod
@@ -1843,11 +2813,16 @@ class LLMClient(Generic[T]):
     def _should_prompt_for_structured_json(self, request: LLMCompletionRequest) -> bool:
         if request.response_schema is None:
             return False
-        provider, provider_request = self._completion_provider_request(request)
+        resolved = self._completion_provider_request(request)
+        provider = self._provider_for_resolved_request(resolved)
+        provider_request = resolved.request
+        assert isinstance(provider_request, LLMCompletionRequest)
         return not provider.supports_native_structured_output_for(provider_request)
 
     @classmethod
-    def _schema_prompt_fallback_request(cls, request: LLMCompletionRequest) -> LLMCompletionRequest:
+    def _schema_prompt_fallback_request(
+        cls, request: LLMCompletionRequest
+    ) -> LLMCompletionRequest:
         return request.model_copy(
             update={
                 "response_schema": None,
@@ -1855,7 +2830,9 @@ class LLMClient(Generic[T]):
                     *request.messages,
                     LLMMessage(
                         role="user",
-                        content=cls._schema_prompt_fallback_instruction(request.response_schema),
+                        content=cls._schema_prompt_fallback_instruction(
+                            request.response_schema
+                        ),
                     ),
                 ],
             }
@@ -1910,25 +2887,69 @@ class LLMClient(Generic[T]):
         operation: Any,
         *,
         request: LLMCompletionRequest | LLMEmbeddingRequest,
-        call_type: str,
+        route: ResolvedInferenceRoute,
+        provider_name: str,
+    ) -> Any:
+        recorder = self._diagnostic_recorder
+        if recorder is None:
+            return await self._with_retries_impl(operation, request=request, route=route, provider_name=provider_name)
+        metadata = request.metadata
+        safe_metadata = _diagnostic_metadata(metadata)
+        if _diagnostic_has_credentials(safe_metadata.get("provider_extra_body")):
+            recorder._fail(ValueError("provider_extra_body contains credential fields"))
+        request_ref = recorder.blob(request.model_copy(update={"metadata": safe_metadata}))
+        prompt_ref = recorder.blob(request.messages) if isinstance(request, LLMCompletionRequest) else recorder.blob(request.input_texts)
+        contract_ref = recorder.blob({"choice_questions": request.choice_questions, "score_questions": request.score_questions, "response_schema": request.response_schema, "tools": request.tools}) if isinstance(request, LLMCompletionRequest) else None
+        with recorder.operation(
+            self._request_purpose(request),
+            component=component_id_for_llm_purpose(self._request_purpose(request)),
+            card=str(metadata.get("stage")) if metadata.get("stage") else None,
+            user_id=str(metadata.get("user_id")) if metadata.get("user_id") is not None else None,
+            turn_id=str(metadata.get("turn_id")) if metadata.get("turn_id") is not None else None,
+            job_id=str(metadata.get("job_id")) if metadata.get("job_id") is not None else None,
+            input_data={"request": request_ref, "requested_model": request.model, "resolved_provider": provider_name, "prompt_sha256": prompt_ref["sha256"] if prompt_ref else None, "contract_sha256": contract_ref["sha256"] if contract_ref else None},
+        ):
+            return await self._with_retries_impl(operation, request=request, route=route, provider_name=provider_name)
+
+    async def _with_retries_impl(
+        self,
+        operation: Any,
+        *,
+        request: LLMCompletionRequest | LLMEmbeddingRequest,
+        route: ResolvedInferenceRoute,
+        provider_name: str,
     ) -> Any:
         retry_policy = self._retry_policy_for(request)
         last_error: Exception | None = None
         for attempt in range(1, retry_policy.attempts + 1):
-            started_at = perf_counter()
-            self._guard_before_call(request, call_type=call_type)
+            self._authorize_inference_route(route)
+            permit = await self._acquire_dispatch(provider_name)
             try:
-                response = await operation()
+                guarded_call = self._begin_guarded_call(request)
+            except BaseException:
+                permit.release()
+                raise
+            started_at = perf_counter()
+            recorder = self._diagnostic_recorder
+            current = current_operation(recorder)
+            attempt_id = uuid4().hex if recorder is not None and current is not None else None
+            if recorder is not None and current is not None and attempt_id is not None:
+                recorder.event("provider_attempt", phase="start", trace_id=current[0], operation_id=current[1], attempt_id=attempt_id, purpose=self._request_purpose(request), status="started", data={"attempt_number": attempt, "request_kind": "embedding" if isinstance(request, LLMEmbeddingRequest) else "completion", "resolved_provider": provider_name, "resolved_model": request.model, "started_at": _diagnostic_utc_now()})
+            try:
+                with bind_attempt(recorder, attempt_id) if recorder is not None and attempt_id is not None else nullcontext():
+                    response = await operation()
             except TransientLLMError as exc:
-                self._guard_record_failure(
+                self._diagnostic_attempt_end(attempt_id, request, "failure", error=exc)
+                self._record_provider_call_failure(
                     request,
-                    call_type=call_type,
+                    guarded_call,
                     exc=exc,
                     latency_ms=(perf_counter() - started_at) * 1000.0,
                 )
                 last_error = exc
                 if attempt == retry_policy.attempts:
                     break
+                permit.release()
                 await self._sleep_before_retry(
                     retry_policy,
                     attempt,
@@ -1936,86 +2957,97 @@ class LLMClient(Generic[T]):
                     request=request,
                 )
             except Exception as exc:
-                self._guard_record_failure(
+                self._diagnostic_attempt_end(attempt_id, request, "failure", error=exc)
+                self._record_provider_call_failure(
                     request,
-                    call_type=call_type,
+                    guarded_call,
                     exc=exc,
                     latency_ms=(perf_counter() - started_at) * 1000.0,
                 )
                 raise
-            else:
-                self._guard_record_success(
+            except BaseException:
+                self._diagnostic_attempt_end(attempt_id, request, "cancelled")
+                # CancelledError and GeneratorExit do not derive from Exception,
+                # so without this clause an abandoned call spends provider work
+                # that no counter ever sees. A non-streamed call has no partial
+                # response to read usage from: the provider either returned or
+                # it did not.
+                self._record_provider_call_cancelled(
                     request,
-                    call_type=call_type,
-                    provider=getattr(response, "provider", None),
-                    response_model=getattr(response, "model", None),
+                    guarded_call,
+                    usage=None,
+                    latency_ms=(perf_counter() - started_at) * 1000.0,
+                )
+                raise
+            else:
+                self._record_provider_call_success(
+                    request,
+                    guarded_call,
                     usage=getattr(response, "usage", None),
                     latency_ms=(perf_counter() - started_at) * 1000.0,
                 )
+                self._diagnostic_attempt_end(attempt_id, request, "success", response=response)
                 return response
+            finally:
+                permit.release()
         if last_error is None:
             raise LLMError("LLM operation failed without a captured error")
         raise last_error
 
-    def _guard_before_call(
+    def _diagnostic_attempt_end(
+        self,
+        attempt_id: str | None,
+        request: LLMCompletionRequest | LLMEmbeddingRequest,
+        status: str,
+        *,
+        response: Any = None,
+        error: BaseException | None = None,
+        partial_output: str | None = None,
+        partial_usage: dict[str, Any] | None = None,
+    ) -> None:
+        recorder = self._diagnostic_recorder
+        current = current_operation(recorder)
+        if recorder is None or current is None or attempt_id is None:
+            return
+        raw = getattr(response, "raw_response", None)
+        if isinstance(response, LLMEmbeddingResponse):
+            response_content: Any = {
+                "provider": response.provider,
+                "model": response.model,
+                "vector_count": len(response.vectors),
+                "dimensions": [len(vector.values) for vector in response.vectors],
+            }
+            raw = None
+        else:
+            response_content = response
+        usage = getattr(response, "usage", None) if response is not None else partial_usage
+        reported_cost = None
+        if isinstance(usage, dict):
+            if "cost" in usage:
+                reported_cost = usage["cost"]
+            elif isinstance(usage.get("cost_details"), dict):
+                reported_cost = usage["cost_details"].get("upstream_inference_cost")
+        recorder.event("provider_attempt", phase="end", trace_id=current[0], operation_id=current[1], attempt_id=attempt_id, purpose=self._request_purpose(request), status=status, data={"response": recorder.blob(response_content) if response is not None else None, "raw_response": recorder.blob(raw) if raw is not None else None, "partial_output": recorder.blob(partial_output) if partial_output is not None else None, "usage": usage if isinstance(usage, dict) else None, "usage_provenance": "provider" if usage else "unknown", "cost_usd": reported_cost, "cost_provenance": "provider" if reported_cost is not None else "unknown", "error_type": type(error).__name__ if error is not None else None, "finished_at": _diagnostic_utc_now()})
+
+    def _begin_guarded_call(
         self,
         request: LLMCompletionRequest | LLMEmbeddingRequest,
-        *,
-        call_type: str,
-    ) -> None:
+    ) -> LLMRunGuardCall | None:
+        """Gate one provider round-trip and return the ticket to record it on.
+
+        THE PRE-CALL CHECK IS THE ONLY GATE. Every outcome recording below is
+        pure bookkeeping that latches a verdict for the NEXT call; none of them
+        may turn a round-trip that already reached the provider into an error to
+        its caller. Returns ``None`` when no guard is configured, which is the
+        normal state for bare clients in tests -- the per-turn meter still runs.
+        """
         if self._llm_run_guard is None:
-            return
-        decision = self._llm_run_guard.check_before_call(
-            call_type=call_type,
+            return None
+        guarded_call = self._llm_run_guard.begin_call(
             purpose=self._request_purpose(request),
             request_model=request.model,
         )
-        self._raise_if_guard_blocks(decision)
-
-    def _guard_record_success(
-        self,
-        request: LLMCompletionRequest | LLMEmbeddingRequest,
-        *,
-        call_type: str,
-        provider: str | None,
-        response_model: str | None,
-        usage: dict[str, Any] | None,
-        latency_ms: float,
-    ) -> None:
-        if self._llm_run_guard is None:
-            return
-        decision = self._llm_run_guard.record_success(
-            call_type=call_type,
-            purpose=self._request_purpose(request),
-            request_model=request.model,
-            response_model=response_model,
-            provider=provider,
-            usage=usage or {},
-            latency_ms=latency_ms,
-        )
-        self._raise_if_guard_blocks(decision)
-
-    def _guard_record_failure(
-        self,
-        request: LLMCompletionRequest | LLMEmbeddingRequest,
-        *,
-        call_type: str,
-        exc: Exception,
-        latency_ms: float,
-    ) -> None:
-        if self._llm_run_guard is None:
-            return
-        decision = self._llm_run_guard.record_failure(
-            call_type=call_type,
-            purpose=self._request_purpose(request),
-            request_model=request.model,
-            latency_ms=latency_ms,
-            error_type=type(exc).__name__,
-        )
-        self._raise_if_guard_blocks(decision)
-
-    @staticmethod
-    def _raise_if_guard_blocks(decision: LLMRunGuardDecision) -> None:
+        decision = guarded_call.decision
         if decision.should_block:
             logger.error(
                 "LLM run guard blocked further provider calls",
@@ -2025,6 +3057,123 @@ class LLMClient(Generic[T]):
                 },
             )
             raise LLMRunGuardError(decision)
+        return guarded_call
+
+    def _record_provider_call_success(
+        self,
+        request: LLMCompletionRequest | LLMEmbeddingRequest,
+        guarded_call: LLMRunGuardCall | None,
+        *,
+        usage: dict[str, Any] | None,
+        latency_ms: float,
+    ) -> None:
+        # Per-turn trace meter first: it must reflect every provider round-trip
+        # regardless of whether a run guard is configured (the guard is optional;
+        # bare clients in tests have none). This is the single success choke point
+        # for completion/streamed_completion/stream, so it cannot miss a call.
+        record_call_on_active_meter(
+            purpose=self._request_purpose(request),
+            latency_ms=latency_ms,
+            outcome=LLMCallOutcome.SUCCESS,
+        )
+        if guarded_call is None or self._llm_run_guard is None:
+            return
+        self._log_if_guard_tripped(
+            self._llm_run_guard.record_success(
+                guarded_call,
+                usage=usage or {},
+                latency_ms=latency_ms,
+            )
+        )
+
+    def _record_provider_call_failure(
+        self,
+        request: LLMCompletionRequest | LLMEmbeddingRequest,
+        guarded_call: LLMRunGuardCall | None,
+        *,
+        exc: BaseException,
+        latency_ms: float,
+    ) -> None:
+        # A failed attempt is still a real provider round-trip: count it in the
+        # per-turn meter (guard-independent) before the guard's failure logic.
+        record_call_on_active_meter(
+            purpose=self._request_purpose(request),
+            latency_ms=latency_ms,
+            outcome=LLMCallOutcome.FAILURE,
+        )
+        if guarded_call is None or self._llm_run_guard is None:
+            return
+        self._log_if_guard_tripped(
+            self._llm_run_guard.record_failure(
+                guarded_call,
+                latency_ms=latency_ms,
+                error_type=type(exc).__name__,
+            )
+        )
+
+    def _record_provider_call_cancelled(
+        self,
+        request: LLMCompletionRequest | LLMEmbeddingRequest,
+        guarded_call: LLMRunGuardCall | None,
+        *,
+        usage: dict[str, Any] | None,
+        latency_ms: float,
+    ) -> None:
+        """Record a round-trip whose caller went away (disconnect, cancellation).
+
+        The provider did the work and the operator pays for it, so it must be
+        counted; it is not a provider failure, so it must not move the health
+        signals. Recorded BEFORE the iterator is closed and the exception is
+        re-raised, so telemetry survives a cleanup that itself gets cancelled.
+
+        ``usage`` is whatever the stream had already published when the caller
+        left, which is normally nothing: a cancelled stream never delivers the
+        terminal event that carries the provider's usage totals. See
+        ``LLMRunGuard.record_cancellation`` for what that costs.
+        """
+        record_call_on_active_meter(
+            purpose=self._request_purpose(request),
+            latency_ms=latency_ms,
+            outcome=LLMCallOutcome.CANCELLED,
+        )
+        if guarded_call is None or self._llm_run_guard is None:
+            return
+        self._log_if_guard_tripped(
+            self._llm_run_guard.record_cancellation(
+                guarded_call,
+                usage=usage or {},
+                latency_ms=latency_ms,
+            )
+        )
+
+    @staticmethod
+    def _log_if_guard_tripped(decision: LLMRunGuardDecision) -> None:
+        """Report the outcome on which the run crossed into violation.
+
+        Keyed on ``tripped``, NOT on ``should_block``: audit mode returns
+        ``should_block=False`` by construction, so a log keyed on blocking never
+        records the moment the guard would have fired -- which is the only event
+        audit mode exists to produce. Keyed on ``violations`` being non-empty it
+        would instead fire on every call for as long as the run stays degraded.
+        ``tripped`` is true exactly once per trip, in both modes.
+
+        Deliberately not an exception: the round-trip this decision came from is
+        already spent, and its result belongs to the caller that paid for it.
+        """
+        if not decision.tripped:
+            return
+        logger.error(
+            "LLM run guard tripped"
+            + (
+                "; the next provider call will be blocked"
+                if decision.should_block
+                else " (audit mode: calls continue, nothing is blocked)"
+            ),
+            extra={
+                "violations": list(decision.violations),
+                "llm_guard": decision.snapshot,
+            },
+        )
 
     @staticmethod
     def _request_purpose(
@@ -2071,7 +3220,9 @@ class LLMClient(Generic[T]):
         retry_after = exc.retry_after_seconds
         if retry_after is None or retry_after <= retry_policy.max_delay_seconds:
             return False
-        return self._request_purpose(request) in _BACKGROUND_DEFERABLE_RETRY_AFTER_PURPOSES
+        return (
+            self._request_purpose(request) in _BACKGROUND_DEFERABLE_RETRY_AFTER_PURPOSES
+        )
 
     @staticmethod
     def _retry_delay_seconds(
@@ -2097,7 +3248,10 @@ class LLMClient(Generic[T]):
     @staticmethod
     def _should_retry_after_partial_stream(request: LLMCompletionRequest) -> bool:
         purpose = request.metadata.get("purpose")
-        if not isinstance(purpose, str) or purpose not in _PARTIAL_STREAM_RETRY_PURPOSES:
+        if (
+            not isinstance(purpose, str)
+            or purpose not in _PARTIAL_STREAM_RETRY_PURPOSES
+        ):
             return False
         mode = request.metadata.get("atagia_partial_stream_retry")
         if isinstance(mode, str) and mode.strip().lower() == "discard_and_retry":
@@ -2105,7 +3259,9 @@ class LLMClient(Generic[T]):
         return False
 
     @staticmethod
-    def _should_retry_without_schema(exc: LLMError, request: LLMCompletionRequest) -> bool:
+    def _should_retry_without_schema(
+        exc: LLMError, request: LLMCompletionRequest
+    ) -> bool:
         """Decide whether to retry via prompt-JSON after a native-schema failure.
 
         ``request`` is the request that was actually sent. When the schema was
@@ -2114,6 +3270,8 @@ class LLMClient(Generic[T]):
         guarantees the failed attempt used the native structured path. The
         trigger is a typed client-request-class 4xx, not error-string matching.
         """
+        if isinstance(exc, InferenceAccessDeniedError):
+            return False
         if request.response_schema is None:
             return False
         return isinstance(exc, LLMRequestError) and 400 <= exc.status_code < 500
@@ -2124,12 +3282,39 @@ class LLMClient(Generic[T]):
 
     @staticmethod
     async def _close_stream_iterator(stream_iterator: Any) -> None:
+        """Close a provider iterator without letting its close become the outcome.
+
+        EVERY CALLER REACHES HERE FROM AN EXCEPT HANDLER, holding an outcome it
+        is about to record and re-raise. A provider whose iterator raises on
+        close must not displace that outcome, and it would in three separate
+        ways: at the call sites that close BEFORE recording, the round-trip's
+        failure is never metered at all; at the ones that close after, an
+        unrelated teardown error replaces the LLMError the caller diagnosed; and
+        in the proxy's abandon path it escapes ``_ClosingStreamingResponse``'s
+        ``finally`` into the ASGI task error log, having skipped the claim
+        resolution queued behind it.
+
+        So the close failure is LOGGED with its traceback and the original
+        outcome continues. That is a diagnosis, not a fallback: nothing here is
+        being recovered or retried, because there is nothing left to recover --
+        the round-trip is already spent, already recorded, and the only thing
+        lost is a socket the provider's own transport still owns.
+
+        ``BaseException`` is deliberately NOT caught. A close that is cancelled
+        is the enclosing cancellation being re-delivered at this suspension
+        point, and swallowing that would strand the cancel.
+        """
         aclose = getattr(stream_iterator, "aclose", None)
         if not callable(aclose):
             return
-        result = aclose()
-        if hasattr(result, "__await__"):
-            await result
+        try:
+            result = aclose()
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:
+            logger.warning(
+                "Provider stream iterator raised while closing", exc_info=True
+            )
 
     def _validate_structured_response(
         self,

@@ -21,6 +21,7 @@ from atagia.api.dependencies import (
     get_runtime,
     get_settings,
     get_storage_backend,
+    get_token_document_frequency_cache,
 )
 from atagia.api.path_ids import TransportIdRoute
 from atagia.core.clock import Clock
@@ -45,6 +46,7 @@ from atagia.memory.lifecycle import LifecycleCycleResult
 from atagia.memory.lifecycle_runner import LifecycleLockError, run_lifecycle_direct
 from atagia.memory.metrics_computer import MetricsComputer, normalize_time_bucket
 from atagia.memory.policy_manifest import ManifestLoader
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 from atagia.models.schemas_api import AdminMetricsComputeRequest
 from atagia.models.schemas_api import (
     AdminCoverageMembersBackfillRequest,
@@ -54,7 +56,7 @@ from atagia.models.schemas_api import (
     AdminReviewMemoryListResponse,
 )
 from atagia.models.schemas_api import WorkerControlRequest, WorkerControlResponse
-from atagia.models.schemas_memory import MemoryCategory, MemoryStatus
+from atagia.models.schemas_memory import MemoryCategory, MemoryStatus, TurnSurface
 from atagia.models.schemas_jobs import WorkerControlMode
 from atagia.models.schemas_evaluation import MetricName, RetrievalSummaryStats
 from atagia.models.schemas_jobs import (
@@ -1362,6 +1364,10 @@ async def get_retrieval_summary(
     from_date: str = Query(...),
     to_date: str = Query(...),
     user_id: str | None = Query(default=None),
+    # Omitting the surface covers all of them, which blends retrieval-only
+    # context events with whole-turn chat and proxy events; the response splits
+    # them in by_surface either way. FastAPI rejects an unknown surface with 422.
+    turn_surface: TurnSurface | None = Query(default=None),
     auth_context: AuthContext = Depends(get_admin_auth_context),
     connection: aiosqlite.Connection = Depends(get_connection),
     clock: Clock = Depends(get_clock),
@@ -1382,6 +1388,7 @@ async def get_retrieval_summary(
         to_date=normalized_to,
         user_id=user_id,
         assistant_mode_id=None,
+        turn_surface=turn_surface,
     )
     await _audit_admin_action(
         connection,
@@ -1408,6 +1415,9 @@ async def replay_retrieval_event(
     llm_client: LLMClient[object] = Depends(get_llm_client),
     embedding_index: EmbeddingIndex = Depends(get_embedding_index),
     settings: Settings = Depends(get_settings),
+    token_document_frequency_cache: TokenDocumentFrequencyCache = Depends(
+        get_token_document_frequency_cache
+    ),
 ) -> ReplayResult:
     await _require_memory_scope_available(connection, clock, payload.user_id)
     replay_service = ReplayService(
@@ -1417,6 +1427,7 @@ async def replay_retrieval_event(
             llm_client=llm_client,
             embedding_index=embedding_index,
             clock=clock,
+            token_document_frequency_cache=token_document_frequency_cache,
             settings=settings,
         ),
         clock=clock,
@@ -1452,6 +1463,9 @@ async def replay_conversation(
     llm_client: LLMClient[object] = Depends(get_llm_client),
     embedding_index: EmbeddingIndex = Depends(get_embedding_index),
     settings: Settings = Depends(get_settings),
+    token_document_frequency_cache: TokenDocumentFrequencyCache = Depends(
+        get_token_document_frequency_cache
+    ),
 ) -> list[ReplayResult]:
     await _require_memory_scope_available(connection, clock, payload.user_id)
     replay_service = ReplayService(
@@ -1461,6 +1475,7 @@ async def replay_conversation(
             llm_client=llm_client,
             embedding_index=embedding_index,
             clock=clock,
+            token_document_frequency_cache=token_document_frequency_cache,
             settings=settings,
         ),
         clock=clock,

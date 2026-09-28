@@ -1,40 +1,10 @@
-"""Compare four OUTPUT-FORMAT variants of the coverage_members extraction card.
+"""Compare current coverage extraction with explicit experimental formats.
 
-This is a shadow benchmark. It does NOT change production ingestion. The
-``coverage_members`` card is a SECOND-PASS enrichment card: candidates are
-already fixed when it runs and are injected into the prompt as a ``<candidates>``
-block (``cand_001: <text>``). The model's only job is to attach, per known
-candidate id, a variable-length list of members (each ``member_key`` +
-``display_text``), or an empty list.
-
-We FIX the candidate set in the dataset (we do NOT run the upstream candidate
-card) so this experiment isolates the coverage_members OUTPUT FORMAT only:
-which wire format do weak local models (MiniMax) produce most accurately?
-
-Four variants, everything held constant except the format instructions, the
-examples, the system message, and the parser:
-
-- ``json_shipped`` (CHAMPION, fully imported -- fidelity): user prompt is the
-  engine ``build_enrichment_prompt(card_name="coverage_members", ...)`` and the
-  parser is the engine ``parse_coverage_members_card_output``. The system message
-  comes from the engine ``card_system_prompt("coverage_members")`` accessor.
-  System prompt, user prompt builder, and parser are imported, never copied.
-- ``json_neutral`` -- identical to ``json_shipped`` (same imported engine user
-  prompt and engine parser) EXCEPT a format-neutral system message. The system
-  string is the only experimental knob.
-- ``line`` (CHALLENGER, experimental): reuses the engine ``_candidate_block`` and
-  ``_source_context_block`` scaffolding and swaps ONLY the task/format/examples to
-  a line-per-member format ``cand_001 | <member_key> | <display_text>``.
-- ``tags_skeleton`` (CHALLENGER, experimental): a very explicit prompt that
-  pre-fills a skeleton of one empty ``<cand_NNN></cand_NNN>`` block per known
-  candidate and asks the model to fill each block, one ``<member_key> |
-  <display_text>`` line per member.
-
-The challenger prompts and the ``json_neutral`` system string live in this
-benchmark and are clearly labeled challengers-under-evaluation. ``member_key`` is
-always the LLM's SEMANTIC identity for a member; every parser here is purely
-MECHANICAL structural parsing of a machine-generated grammar (id-driven line and
-tag parsing) -- no keyword lists, no semantic regex.
+This shadow benchmark fixes the candidate set and never changes ingestion.
+``current`` runs production's one-candidate membership list and per-member
+identity decisions. ``line`` and ``tags_skeleton`` are older compound-output
+challengers kept for comparison. They use one call for all candidates, so both
+quality and total provider attempts must be read alongside their differing work.
 """
 
 from __future__ import annotations
@@ -53,15 +23,17 @@ from dotenv import load_dotenv
 
 from atagia.core.config import Settings
 from atagia.core.text_utils import truncate_inline
+from atagia.memory.coverage_members_card import (
+    DISPLAY_TEXT_MAX_CHARS as _COVERAGE_DISPLAY_TEXT_MAX_CHARS,
+    MEMBERS_PURPOSE,
+)
 from atagia.memory.extraction_cards import (
     CandidateDraft,
-    _COVERAGE_DISPLAY_TEXT_MAX_CHARS,
     _candidate_block,
     _norm,
     _source_context_block,
-    build_enrichment_prompt,
     card_system_prompt,
-    parse_coverage_members_card_output,
+    run_coverage_members_card,
 )
 from atagia.memory.policy_manifest import ManifestLoader, PolicyResolver
 from atagia.models.schemas_memory import (
@@ -76,7 +48,6 @@ from atagia.services.providers import build_llm_client
 from benchmarks.json_artifacts import write_json_atomic
 from benchmarks.llm_metrics import (
     LLMCallRecorder,
-    install_llm_call_recorder,
     summarize_llm_calls,
 )
 from benchmarks.output_root import assert_outside_repo, resolve_output_dir
@@ -84,14 +55,12 @@ from benchmarks.output_root import assert_outside_repo, resolve_output_dir
 load_dotenv()
 
 VariantName = Literal[
-    "json_shipped",
-    "json_neutral",
+    "current",
     "line",
     "tags_skeleton",
 ]
 _ALLOWED_VARIANTS: tuple[VariantName, ...] = (
-    "json_shipped",
-    "json_neutral",
+    "current",
     "line",
     "tags_skeleton",
 )
@@ -111,17 +80,11 @@ _DEFAULT_MODELS: tuple[str, ...] = (
     _DIRECT_GEMINI_FLASH_LITE_MODEL,
 )
 
-_COVERAGE_CARD_PURPOSE = "memory_extraction_coverage_members_card"
+_COVERAGE_CARD_PURPOSE = MEMBERS_PURPOSE
 _COVERAGE_CARD_MAX_OUTPUT_TOKENS = 1024
 
 # --- System messages -------------------------------------------------------
-# Champion (json_shipped): the exact production coverage-card system message is
-# resolved through the imported engine accessor in ``system_message`` below.
-# Experimental knob (json_neutral): format-neutral system message.
-_SYSTEM_JSON_NEUTRAL = (
-    "Extract durable memory and write one output line per candidate in the "
-    "exact format the task shows. Write only the requested lines. No explanation."
-)
+# Current uses production's system prompts through run_coverage_members_card.
 # Challenger (line).
 _SYSTEM_LINE = "Write only the requested plain-text lines. No JSON. No explanation."
 # Challenger (tags_skeleton).
@@ -172,13 +135,7 @@ class CoverageCase:
 
 @dataclass(frozen=True, slots=True)
 class ParseResult:
-    """Mechanical parse output for one variant of one trial.
-
-    ``members`` mirrors the engine parser return shape
-    (``dict[candidate_id -> list[CoverageMember]]``). ``missing_block_ids`` and
-    ``invented_ids`` are id-driven diagnostics surfaced for the scorer; they stay
-    empty for the JSON line-oriented variants where the concept does not apply.
-    """
+    """Member results and parser diagnostics for one trial."""
 
     members: dict[str, list[CoverageMember]]
     malformed_count: int
@@ -198,22 +155,8 @@ def build_prompt(
     allowed_write_scopes: tuple[str, ...],
     include_examples: bool,
 ) -> str:
-    if variant in ("json_shipped", "json_neutral"):
-        # Both JSON variants share the imported engine user prompt verbatim; only
-        # their system message differs. Fidelity is enforced by importing the
-        # engine builder rather than copying it.
-        return build_enrichment_prompt(
-            "coverage_members",
-            message_text=case.message,
-            role=case.role,
-            context=context,
-            resolved_policy=policy,
-            allowed_write_scopes=allowed_write_scopes,
-            occurred_at=case.occurred_at,
-            prior_chunk_context=None,
-            candidates=case.candidates,
-            include_examples=include_examples,
-        )
+    if variant == "current":
+        raise ValueError("Current coverage must run through the production executor")
     source_block = _source_context_block(
         message_text=case.message,
         role=case.role,
@@ -352,10 +295,8 @@ def _tags_skeleton(candidates: tuple[CandidateDraft, ...]) -> str:
 
 
 def system_message(variant: VariantName) -> str:
-    if variant == "json_shipped":
+    if variant == "current":
         return card_system_prompt("coverage_members")
-    if variant == "json_neutral":
-        return _SYSTEM_JSON_NEUTRAL
     if variant == "line":
         return _SYSTEM_LINE
     return _SYSTEM_TAGS
@@ -369,9 +310,8 @@ def parse_variant_output(
     text: str,
     known_ids: tuple[str, ...],
 ) -> ParseResult:
-    if variant in ("json_shipped", "json_neutral"):
-        members, malformed = parse_coverage_members_card_output(text)
-        return ParseResult(members=members, malformed_count=malformed)
+    if variant == "current":
+        raise ValueError("Current coverage must be parsed by the production executor")
     if variant == "line":
         return parse_line_members(text, known_ids)
     return parse_tag_members(text, known_ids)
@@ -405,12 +345,7 @@ def parse_line_members(text: str, known_ids: tuple[str, ...]) -> ParseResult:
         if len(parts) < 3:
             malformed += 1
             continue
-        # Note: the JSON variant's imported engine parser dedups member_keys via
-        # the case-PRESERVING `_clean_text_value`, while the line/tag challengers
-        # dedup via casefold `_norm` here. This does NOT bias F1: final scoring in
-        # `score_candidate` re-applies `_norm` to BOTH predicted and gold keys
-        # before the set comparison, so the comparison is on the same footing for
-        # every format regardless of which normalization deduped the parse.
+        # The challenger supplies a key; deduplication here is mechanical.
         member_key = _norm(parts[1].replace("|", " "))
         display_text = truncate_inline(parts[2], _COVERAGE_DISPLAY_TEXT_MAX_CHARS)
         if not member_key or not display_text:
@@ -514,13 +449,12 @@ def parse_tag_members(text: str, known_ids: tuple[str, ...]) -> ParseResult:
 
 
 def _is_empty_sentinel(value: str) -> bool:
-    # Match the engine's `_coverage_members_from_json` empty set exactly so the
-    # challengers and the JSON champion agree on what counts as "no members".
+    # Historical challengers accept their own no-member markers.
     return _clean_atom(value) in {"none", "null", "[]"}
 
 
 # ---------------------------------------------------------------------------
-# Mechanical line/atom helpers (mirror the engine's, for benchmark-local use)
+# Mechanical helpers for benchmark-only challenger formats
 # ---------------------------------------------------------------------------
 def _card_lines(text: str) -> list[str]:
     stripped = (
@@ -674,7 +608,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--variants",
         default=",".join(_ALLOWED_VARIANTS),
-        help="Comma-separated variants: json_shipped,json_neutral,line,tags_skeleton",
+        help="Comma-separated variants: current,line,tags_skeleton",
     )
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument(
@@ -702,6 +636,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the offline parser/scorer self-test (no LLM calls). Exits non-zero on failure.",
     )
     return parser
+
+
+def install_provider_attempt_recorder(
+    client: LLMClient[Any], recorder: LLMCallRecorder
+) -> None:
+    """Record each provider attempt, including retries within one client call."""
+
+    if getattr(client, "_coverage_attempt_recorder_installed", False):
+        raise ValueError("Coverage attempt recorder is already installed")
+    for provider in client._providers.values():
+        original_complete = provider.complete
+
+        async def recorded_complete(
+            request: LLMCompletionRequest,
+            *,
+            _original=original_complete,
+        ):
+            started = perf_counter()
+            try:
+                response = await _original(request)
+            except BaseException as exc:
+                recorder.record_completion_failure(
+                    request,
+                    (perf_counter() - started) * 1000.0,
+                    exc,  # type: ignore[arg-type]
+                )
+                raise
+            recorder.record_completion_success(
+                request, response, (perf_counter() - started) * 1000.0
+            )
+            return response
+
+        provider.complete = recorded_complete  # type: ignore[method-assign]
+    client._coverage_attempt_recorder_installed = True  # type: ignore[attr-defined]
 
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -734,7 +702,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             settings = replace(settings, card_examples_enabled=(args.examples == "on"))
         include_examples = examples_enabled_for_component(settings, "extractor")
         client = build_llm_client(settings)
-        install_llm_call_recorder(client, recorder)
+        install_provider_attempt_recorder(client, recorder)
 
         trial_specs = [
             (repetition, case, variant)
@@ -829,45 +797,69 @@ async def run_trial(
     trial_timeout_seconds: float,
 ) -> dict[str, Any]:
     context = _context_for_case(case)
-    policy = _resolved_policy(case.mode)
-    allowed_write_scopes = ("chat", "character", "user")
-    prompt = build_prompt(
-        variant,
-        case=case,
-        context=context,
-        policy=policy,
-        allowed_write_scopes=allowed_write_scopes,
-        include_examples=include_examples,
-    )
     known_ids = tuple(candidate.candidate_id for candidate in case.candidates)
-    request = LLMCompletionRequest(
-        model=model,
-        messages=[
-            LLMMessage(role="system", content=system_message(variant)),
-            LLMMessage(role="user", content=prompt),
-        ],
-        max_output_tokens=_COVERAGE_CARD_MAX_OUTPUT_TOKENS,
-        metadata={
-            "user_id": context.user_id,
-            "conversation_id": context.conversation_id,
-            "assistant_mode_id": context.assistant_mode_id,
-            "purpose": _COVERAGE_CARD_PURPOSE,
-            "memory_extraction_card": "coverage_members",
-            "coverage_format_variant": variant,
-            **prompt_authority_metadata(
-                _authority_context(context, purpose=_COVERAGE_CARD_PURPOSE),
-                prompt_authority_kind="process_metadata",
-            ),
-        },
+    authority_metadata = prompt_authority_metadata(
+        _authority_context(context, purpose=_COVERAGE_CARD_PURPOSE),
+        prompt_authority_kind="process_metadata",
     )
     started = perf_counter()
     error: dict[str, Any] | None = None
     raw_output: str | None = None
+    parse: ParseResult | None = None
     try:
-        response = await asyncio.wait_for(
-            client.complete(request), timeout=trial_timeout_seconds
-        )
-        raw_output = response.output_text
+        if variant == "current":
+            result = await asyncio.wait_for(
+                run_coverage_members_card(
+                    client,
+                    model=model,
+                    message_text=case.message,
+                    role=case.role,
+                    context=context,
+                    occurred_at=case.occurred_at,
+                    prior_chunk_context=None,
+                    candidates=case.candidates,
+                    include_examples=include_examples,
+                    metadata={
+                        "memory_extraction_card": "coverage_members",
+                        "coverage_format_variant": variant,
+                        **authority_metadata,
+                    },
+                ),
+                timeout=trial_timeout_seconds,
+            )
+            raw_output = result.raw_output
+            parse = ParseResult(members=result.parsed, malformed_count=0)
+        else:
+            prompt = build_prompt(
+                variant,
+                case=case,
+                context=context,
+                policy=_resolved_policy(case.mode),
+                allowed_write_scopes=("chat", "character", "user"),
+                include_examples=include_examples,
+            )
+            request = LLMCompletionRequest(
+                model=model,
+                messages=[
+                    LLMMessage(role="system", content=system_message(variant)),
+                    LLMMessage(role="user", content=prompt),
+                ],
+                max_output_tokens=_COVERAGE_CARD_MAX_OUTPUT_TOKENS,
+                metadata={
+                    "user_id": context.user_id,
+                    "conversation_id": context.conversation_id,
+                    "assistant_mode_id": context.assistant_mode_id,
+                    "purpose": _COVERAGE_CARD_PURPOSE,
+                    "memory_extraction_card": "coverage_members",
+                    "coverage_format_variant": variant,
+                    **authority_metadata,
+                },
+            )
+            response = await asyncio.wait_for(
+                client.complete(request), timeout=trial_timeout_seconds
+            )
+            raw_output = response.output_text
+            parse = parse_variant_output(variant, raw_output, known_ids)
     except TimeoutError:
         error = {
             "type": "TimeoutError",
@@ -884,8 +876,8 @@ async def run_trial(
             malformed_count=max(1, len(known_ids)),
             missing_block_ids=known_ids,
         )
-    else:
-        parse = parse_variant_output(variant, raw_output or "", known_ids)
+    if parse is None:
+        raise RuntimeError("Coverage trial ended without a parsed result")
     score = score_trial(case, parse)
     return {
         "case_id": case.case_id,
@@ -931,9 +923,15 @@ def summarize_run(
                 for row in rows
                 if row["model"] == model and row["variant"] == variant
             ]
-            by_model_variant[f"{model}::{variant}"] = _aggregate_cell(
+            cell = _aggregate_cell(
                 cell_rows, model=model, variant=variant
             )
+            attempts = recorder.records_for_context(model=model, variant=variant)
+            cell["provider_attempts"] = len(attempts)
+            cell["mean_provider_attempts"] = (
+                len(attempts) / len(cell_rows) if cell_rows else None
+            )
+            by_model_variant[f"{model}::{variant}"] = cell
     return {
         "benchmark": "coverage_format_compare",
         "started_at": started_at.isoformat(),
@@ -994,9 +992,9 @@ def _aggregate_cell(
 def render_markdown_table(summary: dict[str, Any]) -> str:
     header = (
         "| model | variant | F1 | exact_candidate_rate | malformed_rate | "
-        "missing_block_rate | empty_accuracy | wall_ms |"
+        "missing_block_rate | empty_accuracy | attempts/trial | wall_ms |"
     )
-    divider = "| --- | --- | --- | --- | --- | --- | --- | --- |"
+    divider = "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     lines = [
         "# coverage_format_compare",
         "",
@@ -1010,11 +1008,11 @@ def render_markdown_table(summary: dict[str, Any]) -> str:
         for variant in summary["variants"]:
             cell = summary["results"].get(f"{model}::{variant}", {})
             if not cell or int(cell.get("trials", 0)) == 0:
-                lines.append(f"| {model} | {variant} | - | - | - | - | - | - |")
+                lines.append(f"| {model} | {variant} | - | - | - | - | - | - | - |")
                 continue
             lines.append(
                 "| {model} | {variant} | {f1:.3f} | {exact:.3f} | {malformed:.3f} | "
-                "{missing:.3f} | {empty:.3f} | {wall:.0f} |".format(
+                "{missing:.3f} | {empty:.3f} | {attempts:.2f} | {wall:.0f} |".format(
                     model=model,
                     variant=variant,
                     f1=cell["mean_f1"],
@@ -1022,6 +1020,7 @@ def render_markdown_table(summary: dict[str, Any]) -> str:
                     malformed=cell["malformed_rate"],
                     missing=cell["missing_block_rate"],
                     empty=cell["empty_accuracy"],
+                    attempts=cell["mean_provider_attempts"],
                     wall=cell["mean_wall_ms"],
                 )
             )
@@ -1173,12 +1172,11 @@ def write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> Path:
 # Offline self-test (NO LLM calls)
 # ---------------------------------------------------------------------------
 def run_self_test() -> int:
-    """Drive each variant's parser + the scorer with canned outputs, no LLM.
+    """Drive challenger parsers and the scorer with canned outputs, no LLM.
 
-    Returns 0 on success, non-zero on any assertion failure. Covers: clean parse
-    -> malformed 0 and correct member sets; malformed input -> malformed_count>0;
-    id-driven missing-block detection; pipe-in-label survival in the line/tag
-    parsers (which a naive ``;``/``,`` split would phantom-split).
+    The current route is exercised through run_trial in focused offline tests.
+    Covers clean and malformed challenger output, missing-block detection, and
+    labels with punctuation.
     """
 
     failures: list[str] = []
@@ -1192,36 +1190,6 @@ def run_self_test() -> int:
 
     known_two = ("cand_001", "cand_002")
     known_one = ("cand_001",)
-
-    # --- json_shipped / json_neutral (engine parser) ----------------------
-    json_good = (
-        'cand_001 | [{"member_key": "dr. a", "display_text": "Dr. A"}, '
-        '{"member_key": "dr. b", "display_text": "Dr. B"}]\n'
-        "cand_002 | []"
-    )
-    parse_json_good = parse_variant_output("json_shipped", json_good, known_two)
-    check(parse_json_good.malformed_count == 0, "json_good clean parse -> malformed 0")
-    check(
-        {m.member_key for m in parse_json_good.members.get("cand_001", [])}
-        == {"dr. a", "dr. b"},
-        "json_good cand_001 member set",
-    )
-    check(parse_json_good.members.get("cand_002") == [], "json_good cand_002 empty")
-
-    json_bad = "cand_001 | [not valid json}\ncand_002 [missing pipe]"
-    parse_json_bad = parse_variant_output("json_neutral", json_bad, known_two)
-    check(parse_json_bad.malformed_count > 0, "json_bad -> malformed > 0")
-
-    # Pipe-in-label survives in the JSON variant (JSON quoting protects it).
-    json_pipe = (
-        'cand_001 | [{"member_key": "q3 | revenue", "display_text": "Q3 | revenue"}]'
-    )
-    parse_json_pipe = parse_variant_output("json_shipped", json_pipe, known_one)
-    check(
-        {m.member_key for m in parse_json_pipe.members.get("cand_001", [])}
-        == {"q3 | revenue"},
-        "json pipe-in-label preserved",
-    )
 
     # --- line variant -----------------------------------------------------
     line_good = "cand_001 | dr. a | Dr. A\ncand_001 | dr. b | Dr. B\ncand_002 | none"

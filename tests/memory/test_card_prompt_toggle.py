@@ -70,7 +70,7 @@ def test_settings_default_keeps_examples_on() -> None:
 
 
 def test_need_detector_card_task_gates_examples() -> None:
-    for card_name in _CARD_NAMES:
+    for card_name in (*_CARD_NAMES, "answer_language"):
         instruction, examples, _ = need_card_task(card_name)
         # The demonstration block lives in `examples`, never baked into the
         # instruction (an inline value hint like "Examples: en, es" is not a

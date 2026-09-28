@@ -258,6 +258,86 @@ async def test_compaction_refresh_preserves_privacy_enforcement_variant() -> Non
 
 
 @pytest.mark.asyncio
+async def test_repeated_conversation_compaction_skips_unchanged_icp_refresh() -> None:
+    connection, backend, messages, summaries, _memories, worker = await _build_runtime(
+        _segmentation_card_outputs([(1, 2, "First summary.")], [(3, 3, "New summary.")])
+    )
+    refresh_calls = 0
+    original_refresh = worker._enqueue_initial_context_package_refresh
+
+    async def record_refresh(**kwargs):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        await original_refresh(**kwargs)
+
+    worker._enqueue_initial_context_package_refresh = record_refresh
+    provider = worker._compactor._llm_client.provider
+    try:
+        await connection.execute(
+            "UPDATE conversations SET isolated_mode = 1 WHERE id = ?", ("cnv_1",)
+        )
+        await connection.commit()
+        await _seed_messages(messages)
+        job = _compaction_job(job_kind=CompactionJobKind.CONVERSATION_CHUNK.value)
+        await backend.stream_add(COMPACT_STREAM_NAME, job.model_dump(mode="json"))
+        first = await worker.run_once()
+        request_count = len(provider.requests)
+        assert request_count == 2
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            job.model_copy(update={"job_id": "job_compact_2"}).model_dump(mode="json"),
+        )
+        repeated = await worker.run_once()
+
+        assert first.acked == 1
+        assert repeated.acked == 1
+        assert refresh_calls == 1
+        assert len(provider.requests) == request_count
+        assert len(await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10)) == 1
+
+        await messages.create_message(
+            "msg_3", "cnv_1", "user", 3, "Another new detail.", 4, {}
+        )
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            job.model_copy(update={"job_id": "job_compact_3"}).model_dump(mode="json"),
+        )
+        changed = await worker.run_once()
+
+        assert changed.acked == 1
+        assert refresh_calls == 2
+        assert len(provider.requests) == 4
+        assert len(await summaries.list_conversation_chunks("usr_1", "cnv_1", limit=10)) == 2
+    finally:
+        await backend.close()
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_workspace_rollup_does_not_enqueue_icp_refresh() -> None:
+    connection, backend, _messages, _summaries, _memories, worker = await _build_runtime(
+        {}
+    )
+    try:
+        await backend.stream_add(
+            COMPACT_STREAM_NAME,
+            _compaction_job(
+                job_kind=CompactionJobKind.WORKSPACE_ROLLUP.value
+            ).model_dump(mode="json"),
+        )
+        result = await worker.run_once()
+
+        assert result.acked == 1
+        assert await backend.dequeue_durable_envelope(
+            INITIAL_CONTEXT_PACKAGE_STREAM_NAME
+        ) is None
+        assert worker._compactor._llm_client.provider.requests == []
+    finally:
+        await backend.close()
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_compaction_worker_skips_temporary_conversation_chunk_job() -> None:
     connection, backend, messages, summaries, _memories, worker = await _build_runtime(
         {}

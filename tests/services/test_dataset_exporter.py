@@ -23,6 +23,7 @@ from atagia.core.retrieval_event_repository import RetrievalEventRepository
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
 from atagia.models.schemas_memory import IntimacyBoundary, MemoryObjectType, MemoryScope, MemorySourceKind
 from atagia.models.schemas_replay import ConversationExportKind, ExportAnonymizationMode
+from tests.turn_telemetry_support import sample_turn_telemetry
 from atagia.services.dataset_exporter import (
     AnonymizedExportDisabledError,
     DatasetExporter,
@@ -188,7 +189,8 @@ async def _build_runtime():
                 "scored_candidates": [{"memory_id": "mem_1", "final_score": 0.9}],
             },
             "created_at": "2026-04-05T14:00:00+00:00",
-        }
+        },
+        telemetry=sample_turn_telemetry(),
     )
     return connection, clock
 

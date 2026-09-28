@@ -57,7 +57,6 @@ class RetrievalParamsOverride(BaseModel):
 
     fts_limit: int | None = Field(default=None, ge=0)
     vector_limit: int | None = Field(default=None, ge=0)
-    graph_hops: int | None = Field(default=None, ge=0)
     rerank_top_k: int | None = Field(default=None, gt=0)
     final_context_items: int | None = Field(default=None, gt=0)
 
@@ -123,6 +122,101 @@ class ResolvedRetrievalPolicy(BaseModel):
     transcript_budget_tokens: int
     retrieval_params: RetrievalParams
     context_cache_policy: ContextCachePolicy
+
+
+# Provenance vocabulary for a resolved retrieval policy. `manifest` is a claim
+# about the FILE, not about the schema: a field the manifest JSON never declares
+# was not decided by the manifest, and reporting it as one attributes a value to
+# a source that did not produce it.
+POLICY_PROVENANCE_MANIFEST = "manifest"
+POLICY_PROVENANCE_DEFAULT = "default"
+POLICY_PROVENANCE_RESOLVER = "resolver"
+POLICY_PROVENANCE_COMPUTED = "computed"
+
+# Resolved-policy field -> the manifest field whose value it carries. These are
+# `manifest` when the manifest file declares that field and `default` when it
+# leaves it out and the schema default applies.
+_POLICY_FIELD_MANIFEST_SOURCES: dict[str, str] = {
+    "profile_id": "profile_id",
+    "display_name": "display_name",
+    "allow_intimacy_context": "allow_intimacy_context",
+    "preferred_memory_types": "preferred_memory_types",
+    "need_triggers": "need_triggers",
+    "contract_dimensions_priority": "contract_dimensions_priority",
+    "privacy_ceiling": "privacy_ceiling",
+    "context_budget_tokens": "context_budget_tokens",
+    "transcript_budget_tokens": "transcript_budget_tokens",
+    "retrieval_params": "retrieval_params",
+    "context_cache_policy": "context_cache_policy",
+}
+
+# Fields `PolicyResolver.resolve` decides on its own authority: `cross_chat_allowed`
+# and `allowed_scopes` are constants it writes, and `allow_private_sensitivity` is
+# a model default it never sets. No manifest field feeds any of them, so no
+# manifest can change them.
+_RESOLVER_OWNED_POLICY_FIELDS: frozenset[str] = frozenset(
+    {
+        "cross_chat_allowed",
+        "allowed_scopes",
+        "allow_private_sensitivity",
+    }
+)
+
+# Derived from the manifest payload rather than declared in it.
+_COMPUTED_POLICY_FIELDS: frozenset[str] = frozenset({"prompt_hash"})
+
+if (
+    frozenset(_POLICY_FIELD_MANIFEST_SOURCES)
+    | _RESOLVER_OWNED_POLICY_FIELDS
+    | _COMPUTED_POLICY_FIELDS
+    != frozenset(ResolvedRetrievalPolicy.model_fields)
+    or len(_POLICY_FIELD_MANIFEST_SOURCES)
+    + len(_RESOLVER_OWNED_POLICY_FIELDS)
+    + len(_COMPUTED_POLICY_FIELDS)
+    != len(ResolvedRetrievalPolicy.model_fields)
+):  # pragma: no cover - import-time structural guard
+    raise RuntimeError(
+        "resolved-policy provenance classification drifted: every "
+        "ResolvedRetrievalPolicy field must be classified exactly once as "
+        "manifest-sourced, resolver-owned, or computed"
+    )
+
+if not frozenset(_POLICY_FIELD_MANIFEST_SOURCES.values()) <= frozenset(
+    RetrievalProfileManifest.model_fields
+):  # pragma: no cover - import-time structural guard
+    raise RuntimeError(
+        "resolved-policy provenance references a manifest field that does not "
+        "exist on RetrievalProfileManifest"
+    )
+
+
+def resolved_policy_provenance(manifest: RetrievalProfileManifest) -> dict[str, str]:
+    """Per-field source of the policy ``PolicyResolver.resolve`` returns.
+
+    Membership in ``model_fields_set`` is the test: it holds exactly the fields
+    the manifest JSON declared, so a field the file omits reports ``default``
+    (the schema default produced the value) instead of claiming the manifest set
+    it. Run-level resolution has no workspace, conversation, or operational
+    override, so those layers cannot appear here.
+    """
+    declared = manifest.model_fields_set
+    provenance: dict[str, str] = {
+        field: POLICY_PROVENANCE_RESOLVER for field in _RESOLVER_OWNED_POLICY_FIELDS
+    }
+    provenance.update(
+        {field: POLICY_PROVENANCE_COMPUTED for field in _COMPUTED_POLICY_FIELDS}
+    )
+    provenance.update(
+        {
+            policy_field: (
+                POLICY_PROVENANCE_MANIFEST
+                if manifest_field in declared
+                else POLICY_PROVENANCE_DEFAULT
+            )
+            for policy_field, manifest_field in _POLICY_FIELD_MANIFEST_SOURCES.items()
+        }
+    )
+    return provenance
 
 
 class ManifestLoader:

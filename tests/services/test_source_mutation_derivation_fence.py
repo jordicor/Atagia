@@ -65,6 +65,7 @@ from atagia.services.worker_effect_fence import (
     StaleJobEffectFenceError,
     WorkerEffectFence,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -940,6 +941,7 @@ async def test_memory_edit_removes_old_fact_and_evidence_retrieval_surfaces(
         connection,
         clock,
         settings=_candidate_settings(),
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
     )
     try:
         await _seed_city_retrieval_surfaces(connection, clock)
@@ -1254,6 +1256,7 @@ async def test_archive_and_delete_hide_old_fact_surfaces_from_active_retrieval(
         connection,
         clock,
         settings=_candidate_settings(),
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
     )
     try:
         await _seed_city_retrieval_surfaces(connection, clock)

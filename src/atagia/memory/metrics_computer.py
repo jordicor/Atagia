@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date
 import html
 import logging
@@ -17,22 +18,16 @@ from atagia.models.schemas_evaluation import (
     ContractComplianceEvaluation,
     MetricResult,
     MetricName,
+    RetrievalEventMeasurements,
     RetrievalSummaryStats,
 )
+from atagia.models.schemas_memory import TurnSurface
 from atagia.services.llm_client import LLMClient, LLMCompletionRequest, LLMMessage, StructuredOutputError
 from atagia.services.model_resolution import resolve_component_model
 
 logger = logging.getLogger(__name__)
 
 CCR_SAMPLE_LIMIT = 50
-SYSTEM_METRIC_NAMES = (
-    "retrieval_latency_ms",
-    "avg_items_included",
-    "avg_items_dropped",
-    "avg_token_estimate",
-    "cold_start_rate",
-    "zero_candidate_rate",
-)
 
 CCR_PROMPT_TEMPLATE = """You are evaluating whether an assistant response complies with an interaction contract.
 
@@ -364,16 +359,40 @@ class MetricsComputer:
         )
 
     async def compute_system_metrics(self, time_bucket: str) -> dict[str, MetricResult]:
+        """Compute the per-bucket system scalars persisted to evaluation_metrics.
+
+        System metrics are stored as one scalar per bucket with no surface
+        dimension, so they stay deliberately blended across surfaces. Callers
+        that need the chat-only or context-only view read the retrieval summary
+        and its per-surface breakdown instead.
+
+        The two latency series persist under two distinct metric names, each
+        carrying its own population in ``sample_count``:
+        ``retrieval_stage_latency_ms`` is the measured retrieval stage and
+        ``request_to_event_wall_ms`` is the pre-migration request-to-event wall
+        gap. Neither reuses the old ``retrieval_latency_ms`` name, which this
+        code no longer writes: rows still carrying that name are exactly the
+        ones computed under the blended definition, so a bucket cannot be
+        misread across the cutover. A bucket whose events all predate the
+        turn-telemetry migration persists ``retrieval_stage_latency_ms`` with
+        ``sample_count=0``, which is the existing "no data" convention rather
+        than a zero-millisecond retrieval.
+        """
         summary = await self.summarize_retrieval_events(
             from_date=time_bucket,
             to_date=time_bucket,
             user_id=None,
             assistant_mode_id=None,
+            turn_surface=None,
         )
         return {
-            "retrieval_latency_ms": MetricResult(
-                value=summary.avg_retrieval_latency_ms,
-                sample_count=summary.total_events,
+            "retrieval_stage_latency_ms": MetricResult(
+                value=summary.avg_retrieval_stage_latency_ms,
+                sample_count=summary.retrieval_stage_latency_sample_count,
+            ),
+            "request_to_event_wall_ms": MetricResult(
+                value=summary.avg_request_to_event_wall_ms,
+                sample_count=summary.request_to_event_wall_sample_count,
             ),
             "avg_items_included": MetricResult(
                 value=summary.avg_items_included,
@@ -404,40 +423,209 @@ class MetricsComputer:
         to_date: str,
         user_id: str | None,
         assistant_mode_id: str | None,
+        turn_surface: TurnSurface | None,
     ) -> RetrievalSummaryStats:
+        """Summarize raw retrieval events, split by the surface that wrote them.
+
+        ``turn_surface=None`` covers every surface, which mixes whole-turn
+        events (``chat`` and the proxy surfaces) with retrieval-only ``context``
+        events written by the sidecar. The mix is unavoidable at the top level
+        and is why the result always carries ``by_surface``.
+        """
         where_clause, parameters = self._event_range_where_clause(
             from_date=from_date,
             to_date=to_date,
             user_id=user_id,
             assistant_mode_id=assistant_mode_id,
+            turn_surface=turn_surface,
             alias="re",
         )
+        # Three latency series, never one blended average. A row lands in
+        # exactly one of them:
+        #   - retrieval_duration_ms IS NOT NULL and retrieval produced memory
+        #     context: the retrieval stage measured itself when the event was
+        #     written. This is the real retrieval figure and the only thing the
+        #     measured series contains.
+        #   - retrieval_duration_ms IS NOT NULL and outcome_json says
+        #     memory_context_available=false: the proxy's fail-open fallback
+        #     row. Its duration is real spend and stays visible, but it timed an
+        #     attempt that FAILED -- a failure that gave up early would pull the
+        #     success average down, one that failed on a timeout would push it
+        #     up, and either way the figure would no longer describe what a
+        #     working retrieval costs. It gets its own series.
+        #   - retrieval_duration_ms IS NULL: the row predates the turn-telemetry
+        #     migration, which is the only way the column can be NULL (writers
+        #     have supplied it ever since). All those rows can offer is the wall
+        #     gap between the request message landing and the event row being
+        #     written -- a different physical quantity, since it also contains
+        #     the reply generation. Averaging it together with the measured
+        #     stage duration produces a number that is neither, so it stays its
+        #     own series under its own name. Every pre-migration row is a chat
+        #     turn: get_context wrote no events back then, so the migration's
+        #     'chat' backfill of turn_surface is accurate rather than a guess.
+        # memory_context_available is written by exactly one writer, the proxy
+        # fail-open fallback event, and only ever as false; its absence is
+        # therefore "retrieval ran", not "unknown".
+        # Each COUNT is taken over the exact expression its AVG consumes, so a
+        # sample count is the population behind its figure by construction.
         cursor = await self._connection.execute(
             """
+            WITH scoped_events AS (
+                SELECT
+                    re.turn_surface AS turn_surface,
+                    re.outcome_json AS outcome_json,
+                    re.context_view_json AS context_view_json,
+                    CASE
+                        WHEN COALESCE(json_extract(re.outcome_json, '$.memory_context_available'), 1) = 1
+                        THEN re.retrieval_duration_ms
+                    END AS retrieval_stage_latency_ms,
+                    CASE
+                        WHEN COALESCE(json_extract(re.outcome_json, '$.memory_context_available'), 1) = 0
+                        THEN re.retrieval_duration_ms
+                    END AS failed_retrieval_stage_latency_ms,
+                    CASE
+                        WHEN re.retrieval_duration_ms IS NULL
+                        THEN (julianday(re.created_at) - julianday(request_message.created_at)) * 86400000.0
+                    END AS request_to_event_wall_ms
+                FROM retrieval_events AS re
+                JOIN messages AS request_message
+                  ON request_message.id = re.request_message_id
+                WHERE {where_clause}
+            )
             SELECT
+                turn_surface,
                 COUNT(*) AS total_events,
-                COALESCE(SUM(CASE WHEN COALESCE(json_extract(re.outcome_json, '$.cold_start'), 0) = 1 THEN 1 ELSE 0 END), 0) AS cold_start_count,
-                COALESCE(SUM(CASE WHEN COALESCE(json_extract(re.outcome_json, '$.zero_candidates'), 0) = 1 THEN 1 ELSE 0 END), 0) AS zero_candidate_count,
-                COALESCE(AVG(COALESCE(json_extract(re.context_view_json, '$.items_included'), 0)), 0.0) AS avg_items_included,
-                COALESCE(AVG(COALESCE(json_extract(re.context_view_json, '$.items_dropped'), 0)), 0.0) AS avg_items_dropped,
-                COALESCE(AVG(COALESCE(json_extract(re.context_view_json, '$.total_tokens_estimate'), 0)), 0.0) AS avg_token_estimate,
-                COALESCE(AVG((julianday(re.created_at) - julianday(request_message.created_at)) * 86400000.0), 0.0) AS avg_retrieval_latency_ms
-            FROM retrieval_events AS re
-            JOIN messages AS request_message
-              ON request_message.id = re.request_message_id
-            WHERE {where_clause}
+                COALESCE(SUM(CASE WHEN COALESCE(json_extract(outcome_json, '$.cold_start'), 0) = 1 THEN 1 ELSE 0 END), 0) AS cold_start_count,
+                COALESCE(SUM(CASE WHEN COALESCE(json_extract(outcome_json, '$.zero_candidates'), 0) = 1 THEN 1 ELSE 0 END), 0) AS zero_candidate_count,
+                COALESCE(AVG(COALESCE(json_extract(context_view_json, '$.items_included'), 0)), 0.0) AS avg_items_included,
+                COALESCE(AVG(COALESCE(json_extract(context_view_json, '$.items_dropped'), 0)), 0.0) AS avg_items_dropped,
+                COALESCE(AVG(COALESCE(json_extract(context_view_json, '$.total_tokens_estimate'), 0)), 0.0) AS avg_token_estimate,
+                COALESCE(AVG(retrieval_stage_latency_ms), 0.0) AS avg_retrieval_stage_latency_ms,
+                COUNT(retrieval_stage_latency_ms) AS retrieval_stage_latency_sample_count,
+                COALESCE(AVG(failed_retrieval_stage_latency_ms), 0.0) AS avg_failed_retrieval_stage_latency_ms,
+                COUNT(failed_retrieval_stage_latency_ms) AS failed_retrieval_stage_latency_sample_count,
+                COALESCE(AVG(request_to_event_wall_ms), 0.0) AS avg_request_to_event_wall_ms,
+                COUNT(request_to_event_wall_ms) AS request_to_event_wall_sample_count
+            FROM scoped_events
+            GROUP BY turn_surface
+            ORDER BY turn_surface
             """.format(where_clause=where_clause),
             tuple(parameters),
         )
-        row = await cursor.fetchone()
+        rows = await cursor.fetchall()
+        by_surface = {
+            TurnSurface(row["turn_surface"]): self._surface_measurements(row)
+            for row in rows
+        }
+        totals = self._combine_measurements(by_surface.values())
         return RetrievalSummaryStats(
+            **totals.model_dump(),
+            surface_filter=turn_surface,
+            by_surface=by_surface,
+        )
+
+    @staticmethod
+    def _surface_measurements(row: aiosqlite.Row) -> RetrievalEventMeasurements:
+        return RetrievalEventMeasurements(
             total_events=int(row["total_events"] or 0),
             cold_start_count=int(row["cold_start_count"] or 0),
             zero_candidate_count=int(row["zero_candidate_count"] or 0),
             avg_items_included=float(row["avg_items_included"] or 0.0),
             avg_items_dropped=float(row["avg_items_dropped"] or 0.0),
             avg_token_estimate=float(row["avg_token_estimate"] or 0.0),
-            avg_retrieval_latency_ms=float(row["avg_retrieval_latency_ms"] or 0.0),
+            avg_retrieval_stage_latency_ms=float(
+                row["avg_retrieval_stage_latency_ms"] or 0.0
+            ),
+            retrieval_stage_latency_sample_count=int(
+                row["retrieval_stage_latency_sample_count"] or 0
+            ),
+            avg_failed_retrieval_stage_latency_ms=float(
+                row["avg_failed_retrieval_stage_latency_ms"] or 0.0
+            ),
+            failed_retrieval_stage_latency_sample_count=int(
+                row["failed_retrieval_stage_latency_sample_count"] or 0
+            ),
+            avg_request_to_event_wall_ms=float(
+                row["avg_request_to_event_wall_ms"] or 0.0
+            ),
+            request_to_event_wall_sample_count=int(
+                row["request_to_event_wall_sample_count"] or 0
+            ),
+        )
+
+    @staticmethod
+    def _weighted_average(pairs: Iterable[tuple[float, int]]) -> float:
+        """Fold per-group averages into one, weighted by each group's own count.
+
+        The weight must be the population behind that specific average, not the
+        group's event count: the two latency series are each computed over a
+        subset of the rows, so weighting them by ``total_events`` would credit
+        every group with samples it never contributed. A total weight of 0 means
+        nothing was measured, which reports as 0.0 alongside a 0 sample count.
+        """
+        weighted_total = 0.0
+        total_weight = 0
+        for average, weight in pairs:
+            weighted_total += average * weight
+            total_weight += weight
+        if total_weight == 0:
+            return 0.0
+        return weighted_total / total_weight
+
+    @classmethod
+    def _combine_measurements(
+        cls,
+        measurements: Iterable[RetrievalEventMeasurements],
+    ) -> RetrievalEventMeasurements:
+        """Fold per-surface groups back into the all-surfaces totals.
+
+        Each group average is weighted by its own sample count, which reproduces
+        the average SQL would have produced over the ungrouped rows.
+        """
+        groups = list(measurements)
+        return RetrievalEventMeasurements(
+            total_events=sum(group.total_events for group in groups),
+            cold_start_count=sum(group.cold_start_count for group in groups),
+            zero_candidate_count=sum(group.zero_candidate_count for group in groups),
+            avg_items_included=cls._weighted_average(
+                (group.avg_items_included, group.total_events) for group in groups
+            ),
+            avg_items_dropped=cls._weighted_average(
+                (group.avg_items_dropped, group.total_events) for group in groups
+            ),
+            avg_token_estimate=cls._weighted_average(
+                (group.avg_token_estimate, group.total_events) for group in groups
+            ),
+            avg_retrieval_stage_latency_ms=cls._weighted_average(
+                (
+                    group.avg_retrieval_stage_latency_ms,
+                    group.retrieval_stage_latency_sample_count,
+                )
+                for group in groups
+            ),
+            retrieval_stage_latency_sample_count=sum(
+                group.retrieval_stage_latency_sample_count for group in groups
+            ),
+            avg_failed_retrieval_stage_latency_ms=cls._weighted_average(
+                (
+                    group.avg_failed_retrieval_stage_latency_ms,
+                    group.failed_retrieval_stage_latency_sample_count,
+                )
+                for group in groups
+            ),
+            failed_retrieval_stage_latency_sample_count=sum(
+                group.failed_retrieval_stage_latency_sample_count for group in groups
+            ),
+            avg_request_to_event_wall_ms=cls._weighted_average(
+                (
+                    group.avg_request_to_event_wall_ms,
+                    group.request_to_event_wall_sample_count,
+                )
+                for group in groups
+            ),
+            request_to_event_wall_sample_count=sum(
+                group.request_to_event_wall_sample_count for group in groups
+            ),
         )
 
     async def _compute_feedback_event_ratio(
@@ -553,6 +741,7 @@ class MetricsComputer:
         to_date: str,
         user_id: str | None,
         assistant_mode_id: str | None,
+        turn_surface: TurnSurface | None,
         alias: str,
     ) -> tuple[str, list[Any]]:
         assert alias.isidentifier(), f"Invalid SQL alias: {alias}"
@@ -567,6 +756,9 @@ class MetricsComputer:
         if assistant_mode_id is not None:
             clauses.append(f"{alias}.assistant_mode_id = ?")
             parameters.append(assistant_mode_id)
+        if turn_surface is not None:
+            clauses.append(f"{alias}.turn_surface = ?")
+            parameters.append(turn_surface.value)
         return " AND ".join(clauses), parameters
 
 

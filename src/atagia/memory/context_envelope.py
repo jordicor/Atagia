@@ -39,6 +39,48 @@ class ContextEnvelopeBudget:
         }
 
 
+class ContextBudgetAboveEnvelopeError(ValueError):
+    """Raised when an explicit budget override exceeds its envelope allocation."""
+
+
+def effective_budget_under_envelope(
+    *,
+    knob: str,
+    policy_budget_tokens: int,
+    envelope_budget_tokens: int,
+    override_budget_tokens: int | None,
+) -> int:
+    """Resolve one prompt-section budget against its envelope allocation.
+
+    The envelope allocation is the hard ceiling, and neither input can raise it.
+    Below it the two inputs are NOT symmetric:
+
+    * the manifest/policy value is purely restrictive -- it can only lower the
+      budget, via ``min()``;
+    * an explicit ablation override REPLACES the policy value outright, so it can
+      sit above or below the manifest as long as it stays under the envelope.
+      That is the point of the knob: an ablation exists to run configurations the
+      shipped manifests do not, and the envelope still bounds it.
+
+    An override that asks for more than the envelope allocation is a
+    contradictory experiment configuration, so it raises instead of being
+    silently capped -- a run must never report a budget the engine did not honor.
+    """
+    if override_budget_tokens is not None:
+        if override_budget_tokens > envelope_budget_tokens:
+            raise ContextBudgetAboveEnvelopeError(
+                f"override_retrieval_params['{knob}']={override_budget_tokens} "
+                "exceeds the context envelope allocation "
+                f"({envelope_budget_tokens} tokens). The envelope is the hard "
+                "ceiling: raise context_envelope_budget_tokens (or the section "
+                "ratio) instead of overriding the section budget above it."
+            )
+        # No min() here: the above-envelope case already raised, so the
+        # override is known to be at or under the ceiling.
+        return override_budget_tokens
+    return min(policy_budget_tokens, envelope_budget_tokens)
+
+
 def allocate_context_envelope_budget(
     total_budget_tokens: int,
     ratios: Mapping[str, float] | None = None,

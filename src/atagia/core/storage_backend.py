@@ -529,7 +529,30 @@ def _job_matches_conversation(payload: Any, conversation_id: str) -> bool:
 class StorageBackend:
     """Interface for Redis-backed or in-process transient state."""
 
-    async def get_recent_window(self, key: str) -> list[dict[str, Any]] | None:
+    async def get_recent_window_for_cache_identity(
+        self,
+        key: str,
+        *,
+        user_id: str,
+        conversation_id: str,
+        lifecycle_cleanup_key: str,
+        lifecycle_epoch: str,
+        cache_revision: int,
+        derivation_revision: int,
+        conversation_lifecycle_epoch: str,
+        conversation_source_revision: int,
+    ) -> list[dict[str, Any]] | None:
+        """Return the window only when it was published under this identity.
+
+        The read enforces the same identity contract the write does. A key-only
+        read cannot tell a window that describes the caller's canonical state
+        from one published by an older turn, an older lifecycle, or a
+        conversation whose transcript has since been rebuilt -- and the stored
+        payload carries no self-describing coordinates, so a caller has no way
+        to check afterwards either. A mismatch is an honest miss (``None``), so
+        the caller falls back to SQLite instead of serving a stale transcript.
+        """
+
         raise NotImplementedError
 
     async def set_recent_window_for_lifecycle(
@@ -1092,8 +1115,36 @@ class InProcessBackend(StorageBackend):
                     set(),
                 ).add(key)
 
-    async def get_recent_window(self, key: str) -> list[dict[str, Any]] | None:
+    async def get_recent_window_for_cache_identity(
+        self,
+        key: str,
+        *,
+        user_id: str,
+        conversation_id: str,
+        lifecycle_cleanup_key: str,
+        lifecycle_epoch: str,
+        cache_revision: int,
+        derivation_revision: int,
+        conversation_lifecycle_epoch: str,
+        conversation_source_revision: int,
+    ) -> list[dict[str, Any]] | None:
+        requested_identity = RecentWindowIdentity(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            lifecycle_cleanup_key=lifecycle_cleanup_key,
+            lifecycle_epoch=lifecycle_epoch,
+            cache_revision=cache_revision,
+            derivation_revision=derivation_revision,
+            conversation_lifecycle_epoch=conversation_lifecycle_epoch,
+            conversation_source_revision=conversation_source_revision,
+        )
+        if not _recent_window_identity_is_valid(
+            requested_identity
+        ) or key != build_recent_window_key(user_id, conversation_id):
+            return None
         with self._guard:
+            if self._recent_window_cache_identities.get(key) != requested_identity:
+                return None
             value = self._recent_windows.get(key)
             return copy.deepcopy(value) if value is not None else None
 

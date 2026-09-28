@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -51,6 +52,41 @@ class CannedCardProvider(LLMProvider):
         raise AssertionError("Embeddings are not used by need detector tests")
 
 
+class GatedLanguageProvider(CannedCardProvider):
+    def __init__(self, outputs: dict[str, str], *, query_error: Exception | None = None) -> None:
+        super().__init__(outputs)
+        self.query_error = query_error
+        self.memory_started = asyncio.Event()
+        self.release_memory = asyncio.Event()
+        self.memory_cancelled = asyncio.Event()
+        self.memory_finished = asyncio.Event()
+        self.answer_started = asyncio.Event()
+
+    async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        self.requests.append(request)
+        purpose = str(request.metadata["purpose"])
+        if purpose == "need_detection_memory_card":
+            self.memory_started.set()
+            try:
+                await self.release_memory.wait()
+            except asyncio.CancelledError:
+                self.memory_cancelled.set()
+                raise
+            finally:
+                self.memory_finished.set()
+        if purpose == "need_detection_query_language_card":
+            await self.memory_started.wait()
+            if self.query_error is not None:
+                raise self.query_error
+        if purpose == "need_detection_answer_language_card":
+            self.answer_started.set()
+        return LLMCompletionResponse(
+            provider=self.name,
+            model=request.model,
+            output_text=self.outputs.get(purpose, "none"),
+        )
+
+
 def _resolved_policy(mode_id: str = "coding_debug"):
     loader = ManifestLoader(MANIFESTS_DIR)
     manifest = loader.load_all()[mode_id]
@@ -98,10 +134,11 @@ def _settings() -> Settings:
     )
 
 
-def _outputs(language: str = "es\nfr") -> dict[str, str]:
+def _outputs(query_language: str = "es", answer_language: str = "fr") -> dict[str, str]:
     return {
         "need_detection_needs_card": "none",
-        "need_detection_language_card": language,
+        "need_detection_query_language_card": query_language,
+        "need_detection_answer_language_card": answer_language,
         "need_detection_memory_card": "personal",
         "need_detection_exact_card": "yes",
         "need_detection_shape_card": "slot",
@@ -113,7 +150,168 @@ def _outputs(language: str = "es\nfr") -> dict[str, str]:
 
 @pytest.mark.asyncio
 async def test_language_card_result_controls_query_and_answer_language() -> None:
-    provider = CannedCardProvider(_outputs("es\nfr"))
+    provider = CannedCardProvider(_outputs("es", "fr"))
+    detector = NeedDetector(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=_clock(),
+        settings=_settings(),
+    )
+
+    trace = []
+    result = await detector.detect(
+        message_text="Responde en frances: cual es mi direccion?",
+        role="user",
+        conversation_context=_context(),
+        resolved_policy=_resolved_policy(),
+        content_language_profile=[],
+        card_call_trace_sink=trace,
+    )
+
+    assert result.query_language == "es"
+    assert result.answer_language == "fr"
+    language_requests = [
+        request for request in provider.requests
+        if request.metadata["purpose"] in {
+            "need_detection_query_language_card",
+            "need_detection_answer_language_card",
+        }
+    ]
+    assert [request.metadata["purpose"] for request in language_requests] == [
+        "need_detection_query_language_card",
+        "need_detection_answer_language_card",
+    ]
+    assert "Known query language: es" in language_requests[1].messages[1].content
+    assert "Write two language codes" not in language_requests[1].messages[1].content
+    assert [call.card_name for call in trace if call.card_name.endswith("language")] == [
+        "query_language", "answer_language"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_answer_language_starts_before_an_unrelated_card_finishes() -> None:
+    provider = GatedLanguageProvider(_outputs("es", "fr"))
+    detector = NeedDetector(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=_clock(),
+        settings=_settings(),
+    )
+    detection = asyncio.create_task(detector.detect(
+        message_text="Responde en frances: cual es mi direccion?",
+        role="user",
+        conversation_context=_context(),
+        resolved_policy=_resolved_policy(),
+        content_language_profile=[],
+    ))
+
+    try:
+        await asyncio.wait_for(provider.answer_started.wait(), 2)
+        assert provider.memory_started.is_set()
+        assert not provider.release_memory.is_set()
+        assert not detection.done()
+    finally:
+        provider.release_memory.set()
+
+    result = await asyncio.wait_for(detection, 2)
+    assert (result.query_language, result.answer_language) == ("es", "fr")
+
+
+@pytest.mark.parametrize(
+    ("query_output", "answer_output", "query_error", "failed_card", "expected_error"),
+    [
+        ("es\nfr", "fr", None, "query_language", "invalid output"),
+        ("es", "fr", RuntimeError("query transport failed"), "query_language", "RuntimeError: query transport failed"),
+        ("es", "fr explanation", None, "answer_language", "invalid output"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_language_failure_cancels_other_cards_and_keeps_attempt_traces(
+    query_output: str,
+    answer_output: str,
+    query_error: Exception | None,
+    failed_card: str,
+    expected_error: str,
+) -> None:
+    provider = GatedLanguageProvider(
+        _outputs(query_output, answer_output), query_error=query_error
+    )
+    detector = NeedDetector(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=_clock(),
+        settings=_settings(),
+    )
+    trace = []
+
+    with pytest.raises(
+        ValueError, match=failed_card.replace("_", " ") + " card failed: .*" + expected_error
+    ):
+        await asyncio.wait_for(detector.detect(
+            message_text="Responde en frances: cual es mi direccion?",
+            role="user",
+            conversation_context=_context(),
+            resolved_policy=_resolved_policy(),
+            content_language_profile=[],
+            card_call_trace_sink=trace,
+        ), 2)
+
+    assert provider.memory_cancelled.is_set()
+    assert provider.memory_finished.is_set()
+    assert provider.answer_started.is_set() is (failed_card == "answer_language")
+    failed_call = next(call for call in trace if call.card_name == failed_card)
+    memory_call = next(call for call in trace if call.card_name == "memory")
+    assert failed_call.parse_valid is False
+    assert failed_call.error is not None or failed_call.raw_output in {
+        query_output, answer_output
+    }
+    assert memory_call.error == "CancelledError: card request cancelled"
+    assert memory_call.prompt is not None
+
+
+@pytest.mark.parametrize(
+    ("card_name", "raw_output"),
+    [
+        ("query_language", "es\nfr"),
+        ("query_language", "zz"),
+        ("answer_language", "fr explanation"),
+        ("answer_language", "none"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_language_output_fails_without_default(
+    card_name: str, raw_output: str
+) -> None:
+    outputs = _outputs()
+    outputs[f"need_detection_{card_name}_card"] = raw_output
+    provider = CannedCardProvider(outputs)
+    detector = NeedDetector(
+        llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
+        clock=_clock(),
+        settings=_settings(),
+    )
+    trace = []
+
+    with pytest.raises(ValueError, match=card_name.replace("_", " ") + " card failed"):
+        await detector.detect(
+            message_text="Responde en frances: cual es mi direccion?",
+            role="user",
+            conversation_context=_context(),
+            resolved_policy=_resolved_policy(),
+            content_language_profile=[],
+            card_call_trace_sink=trace,
+        )
+
+    invalid_call = next(call for call in trace if call.card_name == card_name)
+    assert invalid_call.raw_output == raw_output
+    assert invalid_call.parse_valid is False
+    if card_name == "query_language":
+        assert not any(
+            request.metadata["purpose"] == "need_detection_answer_language_card"
+            for request in provider.requests
+        )
+
+
+@pytest.mark.asyncio
+async def test_unknown_query_language_keeps_explicit_answer_target() -> None:
+    provider = CannedCardProvider(_outputs("unknown", "fr"))
     detector = NeedDetector(
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         clock=_clock(),
@@ -121,20 +319,25 @@ async def test_language_card_result_controls_query_and_answer_language() -> None
     )
 
     result = await detector.detect(
-        message_text="Responde en frances: cual es mi direccion?",
+        message_text="Reply in French: 42?",
         role="user",
         conversation_context=_context(),
         resolved_policy=_resolved_policy(),
         content_language_profile=[],
     )
 
-    assert result.query_language == "es"
+    assert result.query_language is None
     assert result.answer_language == "fr"
+    answer_request = next(
+        request for request in provider.requests
+        if request.metadata["purpose"] == "need_detection_answer_language_card"
+    )
+    assert "Known query language: unknown" in answer_request.messages[1].content
 
 
 @pytest.mark.asyncio
 async def test_anchor_card_aliases_are_materialized_for_saved_memory_language() -> None:
-    outputs = _outputs("es\nes")
+    outputs = _outputs("es", "es")
     outputs["need_detection_search_words_card"] = "ibuprofeno"
     outputs["need_detection_search_words_other_language_card"] = (
         "ibuprofeno => ibuprofen"
@@ -178,7 +381,7 @@ async def test_anchor_card_aliases_are_materialized_for_saved_memory_language() 
 
 @pytest.mark.asyncio
 async def test_other_language_search_words_card_is_not_called_when_languages_match() -> None:
-    provider = CannedCardProvider(_outputs("es\nes"))
+    provider = CannedCardProvider(_outputs("es", "es"))
     detector = NeedDetector(
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         clock=_clock(),
@@ -206,7 +409,7 @@ async def test_other_language_search_words_card_is_not_called_when_languages_mat
 
 @pytest.mark.asyncio
 async def test_other_language_search_words_card_is_not_called_without_search_words() -> None:
-    outputs = _outputs("es\nes")
+    outputs = _outputs("es", "es")
     outputs["need_detection_search_words_card"] = "none"
     provider = CannedCardProvider(outputs)
     detector = NeedDetector(
@@ -271,7 +474,7 @@ async def test_content_language_profile_is_rendered_for_each_card() -> None:
 
 @pytest.mark.asyncio
 async def test_user_communication_profile_is_rendered_as_control_plane_only() -> None:
-    provider = CannedCardProvider(_outputs("fr\nfr"))
+    provider = CannedCardProvider(_outputs("fr", "fr"))
     detector = NeedDetector(
         llm_client=LLMClient(provider_name=provider.name, providers=[provider]),
         clock=_clock(),

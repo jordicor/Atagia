@@ -20,6 +20,7 @@ class ModelProfile:
 
 
 MODEL_PROFILES: dict[str, ModelProfile] = {
+    "typesafe/jev-latest": ModelProfile(omit_temperature=True),
     "openai/gpt-4o-mini": ModelProfile(),
     "openai/gpt-5-mini": ModelProfile(
         thinking_level_map={
@@ -38,6 +39,20 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
             "low": "low",
             "medium": "medium",
             "high": "high",
+        },
+        default_thinking_level="none",
+    ),
+    "openai/gpt-5.6-luna": ModelProfile(
+        # GPT-5.6 accepts none/low/medium/high/xhigh/max (docs checked 2026-07-31);
+        # "minimal" is not confirmed for 5.6, so it maps to low.
+        thinking_level_map={
+            "none": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
         },
         default_thinking_level="none",
     ),
@@ -95,6 +110,35 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         default_thinking_level="minimal",
         temperature_floor=1.0,
     ),
+    "google/gemini-3.5-flash-lite": ModelProfile(
+        thinking_level_map={
+            "none": "MINIMAL",
+            "minimal": "MINIMAL",
+            "low": "LOW",
+            "medium": "MEDIUM",
+            "high": "HIGH",
+        },
+        default_thinking_level="minimal",
+        temperature_floor=1.0,
+    ),
+    # Direct twin of "openrouter/google/gemini-3.6-flash" below. Without an
+    # entry here the google provider falls through to its own HIGH default
+    # (providers/gemini.py::_thinking_config), which is the runaway-reasoning
+    # cost the openrouter cap exists to prevent. The cap is "low", not the
+    # "minimal" used by the lite siblings, so both routes to 3.6-flash think
+    # the same amount. Levels above the map ("xhigh", "max") resolve back to
+    # the default entry, so the cap holds for every requested level.
+    "google/gemini-3.6-flash": ModelProfile(
+        thinking_level_map={
+            "none": "MINIMAL",
+            "minimal": "MINIMAL",
+            "low": "LOW",
+            "medium": "MEDIUM",
+            "high": "HIGH",
+        },
+        default_thinking_level="low",
+        temperature_floor=1.0,
+    ),
     "openrouter/google/gemini-3.1-flash-lite": ModelProfile(
         thinking_level_map={
             "none": "minimal",
@@ -106,6 +150,46 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         },
         default_thinking_level="minimal",
         temperature_floor=1.0,
+        extra_body={"reasoning": {}},
+    ),
+    # Gemini 3.5/3.6 think by default (3.6-flash can burn the whole output
+    # budget on reasoning); cap thinking explicitly for Atagia workloads.
+    "openrouter/google/gemini-3.5-flash-lite": ModelProfile(
+        thinking_level_map={
+            "none": "minimal",
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "high",
+        },
+        default_thinking_level="minimal",
+        temperature_floor=1.0,
+        extra_body={"reasoning": {}},
+    ),
+    "openrouter/google/gemini-3.6-flash": ModelProfile(
+        thinking_level_map={
+            "none": "minimal",
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "high",
+        },
+        default_thinking_level="low",
+        temperature_floor=1.0,
+        extra_body={"reasoning": {}},
+    ),
+    "openrouter/deepseek/deepseek-v4-flash-0731": ModelProfile(
+        thinking_level_map={
+            "none": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+        },
+        default_thinking_level="none",
         extra_body={"reasoning": {}},
     ),
     "openrouter/deepseek/deepseek-v4-flash": ModelProfile(
@@ -174,6 +258,35 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
             "xhigh": "xhigh",
         },
         default_thinking_level="none",
+        extra_body={"reasoning": {}},
+    ),
+    "openrouter/openai/gpt-5.6-luna": ModelProfile(
+        # GPT-5.6 accepts none/low/medium/high/xhigh/max (docs checked 2026-07-31).
+        thinking_level_map={
+            "none": "none",
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
+        },
+        default_thinking_level="none",
+        extra_body={"reasoning": {}},
+    ),
+    "openrouter/openai/gpt-6-luna": ModelProfile(
+        # Keep small extraction calls non-reasoning unless explicitly requested.
+        thinking_level_map={
+            "none": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
+        },
+        default_thinking_level="none",
+        omit_temperature=True,
         extra_body={"reasoning": {}},
     ),
     "openai/qwen3-coder:30b": ModelProfile(

@@ -48,7 +48,12 @@ def trusted_evaluation_ablation(ablation: AblationConfig | None) -> AblationConf
     override_params = dict(ablation.override_retrieval_params or {})
     override_params["privacy_ceiling"] = 3
     override_params["allow_private_sensitivity"] = True
-    return ablation.model_copy(update={"override_retrieval_params": override_params})
+    # model_validate (not model_copy) so the unknown-key validator reruns:
+    # this keeps AblationConfig the single validated boundary even if this
+    # merge ever starts pulling keys from a config/CLI source.
+    return AblationConfig.model_validate(
+        {**ablation.model_dump(), "override_retrieval_params": override_params}
+    )
 
 
 async def activate_trusted_evaluation_memories(runtime: Any, user_id: str) -> int:

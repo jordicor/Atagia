@@ -58,6 +58,7 @@ from atagia.services.run_counters import (
     RunCounterAccumulator,
     use_run_counter_accumulator,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 )
@@ -2255,6 +2256,7 @@ async def test_workspace_rollup_privacy_gate_audit_is_recoverable_by_collector()
         search_results = await CandidateSearch(
             connection,
             FrozenClock(datetime(2026, 4, 3, 14, 0, tzinfo=timezone.utc)),
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
         ).search(
             RetrievalPlan(
                 assistant_mode_id="coding_debug",

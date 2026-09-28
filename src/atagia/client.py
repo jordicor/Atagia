@@ -1326,12 +1326,14 @@ async def connect_atagia(
     openai_api_key: str | None = None,
     google_api_key: str | None = None,
     openrouter_api_key: str | None = None,
+    inference_access_mode: str | None = None,
+    local_llm_endpoints_file: str | Path | None = None,
+    zero_cost_openrouter_profile: str | None = None,
     embedding_backend: str | None = None,
     embedding_model: str | None = None,
     context_cache_enabled: bool | None = None,
     disable_chunking_extraction: bool | None = None,
     assistant_guidance_enabled: bool | None = None,
-    recent_transcript_budget_tokens: int | None = None,
     http_client: httpx.AsyncClient | None = None,
     timeout: float = 30.0,
 ) -> AtagiaClient:
@@ -1342,6 +1344,18 @@ async def connect_atagia(
         resolved_transport = "http" if resolved_base_url else "local"
 
     if resolved_transport == "http":
+        if any(
+            value is not None
+            for value in (
+                inference_access_mode,
+                local_llm_endpoints_file,
+                zero_cost_openrouter_profile,
+            )
+        ):
+            raise ValueError(
+                "Inference access settings must be configured on the remote Atagia "
+                "server, not on an HTTP client."
+            )
         if resolved_base_url is None:
             raise ValueError(
                 "base_url or ATAGIA_BASE_URL is required for HTTP transport"
@@ -1362,12 +1376,11 @@ async def connect_atagia(
     if resolved_transport != "local":
         raise ValueError(f"Unsupported Atagia transport: {transport}")
 
-    resolved_db_path = (
-        db_path
-        or os.getenv("ATAGIA_DB_PATH")
-        or os.getenv("ATAGIA_SQLITE_PATH")
-        or "atagia.db"
-    )
+    # `ATAGIA_DB_PATH` is the client/MCP-level knob; `ATAGIA_SQLITE_PATH` and its
+    # default belong to the engine, which resolves them now that omitting
+    # `db_path` no longer silences the environment. Passing `None` through keeps
+    # ONE resolution instead of a second default that disagreed with it.
+    resolved_db_path = db_path or os.getenv("ATAGIA_DB_PATH")
     client = LocalAtagiaClient(
         Atagia(
             db_path=resolved_db_path,
@@ -1379,12 +1392,14 @@ async def connect_atagia(
             openai_api_key=openai_api_key,
             google_api_key=google_api_key,
             openrouter_api_key=openrouter_api_key,
+            inference_access_mode=inference_access_mode,
+            local_llm_endpoints_file=local_llm_endpoints_file,
+            zero_cost_openrouter_profile=zero_cost_openrouter_profile,
             embedding_backend=embedding_backend,
             embedding_model=embedding_model,
             context_cache_enabled=context_cache_enabled,
             disable_chunking_extraction=disable_chunking_extraction,
             assistant_guidance_enabled=assistant_guidance_enabled,
-            recent_transcript_budget_tokens=recent_transcript_budget_tokens,
         )
     )
     await client.setup()

@@ -1,0 +1,1 @@
+{"model":"jev-test","questions":{"place":{"criteria":{"attic":null,"cellar":null},"instructions":"Where is the lantern?","type":"choice"}},"state":[{"content":"Ada said the blue lantern is in the attic.","role":"user"}]}

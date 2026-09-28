@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from atagia.core.belief_repository import BeliefRepository
@@ -16,7 +18,8 @@ from atagia.core.repositories import ConversationRepository, MemoryObjectReposit
 from atagia.core.retrieval_event_repository import MemoryFeedbackRepository, RetrievalEventRepository
 from atagia.memory.metrics_computer import MetricsComputer
 from atagia.memory.policy_manifest import ManifestLoader, sync_assistant_modes
-from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus
+from tests.turn_telemetry_support import sample_turn_telemetry
+from atagia.models.schemas_memory import MemoryObjectType, MemoryScope, MemorySourceKind, MemoryStatus, TurnSurface
 from atagia.services.llm_client import (
     LLMClient,
     LLMCompletionRequest,
@@ -55,7 +58,7 @@ class CCRProvider(LLMProvider):
 
 
 async def _build_runtime() -> tuple[
-    object,
+    aiosqlite.Connection,
     FrozenClock,
     MessageRepository,
     MemoryObjectRepository,
@@ -151,7 +154,18 @@ async def _create_event_at(
     items_dropped: int = 0,
     total_tokens_estimate: int = 0,
     outcome: dict[str, object] | None = None,
+    surface: TurnSurface = TurnSurface.CHAT,
+    retrieval_duration_ms: float | None = None,
 ) -> dict[str, object]:
+    telemetry = sample_turn_telemetry(surface)
+    if retrieval_duration_ms is not None:
+        # A turn contains its retrieval, and TurnTelemetry enforces that, so the
+        # turn duration has to move with the retrieval duration it wraps.
+        telemetry = replace(
+            telemetry,
+            retrieval_duration_ms=retrieval_duration_ms,
+            turn_to_event_write_wall_ms=retrieval_duration_ms + telemetry.turn_to_event_write_wall_ms,
+        )
     return await events.create_event(
         {
             "id": event_id,
@@ -171,8 +185,40 @@ async def _create_event_at(
             },
             "outcome_json": outcome or {},
             "created_at": at.isoformat(),
-        }
+        },
+        telemetry=telemetry,
     )
+
+
+async def _strip_persisted_telemetry(
+    connection: aiosqlite.Connection,
+    event_id: str,
+    user_id: str,
+) -> None:
+    """Turn a seeded event into a pre-migration row.
+
+    Rows written before the turn-telemetry migration have NULL measurement
+    columns, and the repository refuses to create one that way on purpose, so
+    the only honest way to exercise that path is to clear the columns after the
+    fact. ``turn_surface`` keeps its backfilled 'chat' value, exactly like a
+    real pre-migration row.
+    """
+    await connection.execute(
+        """
+        UPDATE retrieval_events
+        SET turn_to_event_write_wall_ms = NULL,
+            retrieval_duration_ms = NULL,
+            llm_total_calls = NULL,
+            llm_failed_calls = NULL,
+            llm_total_latency_ms = NULL,
+            llm_by_purpose_json = NULL,
+            stage_timings_ms_json = NULL
+        WHERE id = ?
+          AND user_id = ?
+        """,
+        (event_id, user_id),
+    )
+    await connection.commit()
 
 
 async def _create_feedback_at(
@@ -777,6 +823,7 @@ async def test_compute_system_metrics_computes_latency_counts_and_token_usage() 
             items_dropped=1,
             total_tokens_estimate=100,
             outcome={"cold_start": True, "zero_candidates": False},
+            retrieval_duration_ms=20.0,
         )
         await _create_event_at(
             events,
@@ -792,16 +839,479 @@ async def test_compute_system_metrics_computes_latency_counts_and_token_usage() 
             items_dropped=0,
             total_tokens_estimate=200,
             outcome={"cold_start": False, "zero_candidates": True},
+            retrieval_duration_ms=40.0,
         )
 
         metrics = await computer.compute_system_metrics("2026-03-31")
 
-        assert metrics["retrieval_latency_ms"].value == pytest.approx(3500.0, rel=1e-3)
+        # Both events measured their own retrieval stage, so the average is
+        # mean(20.0, 40.0) and not the 3500 ms the message-timestamp gap would
+        # have derived (2 s and 5 s after their request messages).
+        assert metrics["retrieval_stage_latency_ms"].value == pytest.approx(30.0)
+        assert metrics["retrieval_stage_latency_ms"].sample_count == 2
+        # The wall-gap series exists but has no population here: every event
+        # measured itself, so nothing fell back to the derivation. sample_count
+        # 0 is "no data", not "zero milliseconds".
+        assert metrics["request_to_event_wall_ms"].sample_count == 0
+        assert metrics["request_to_event_wall_ms"].value == 0.0
+        # The retired blended name is never written again, so a stored row still
+        # carrying it is unambiguously pre-cutover.
+        assert "retrieval_latency_ms" not in metrics
         assert metrics["avg_items_included"].value == pytest.approx(3.0)
         assert metrics["avg_items_dropped"].value == pytest.approx(0.5)
         assert metrics["avg_token_estimate"].value == pytest.approx(150.0)
         assert metrics["cold_start_rate"].value == pytest.approx(0.5)
         assert metrics["zero_candidate_rate"].value == pytest.approx(0.5)
         assert metrics["cold_start_rate"].sample_count == 2
+    finally:
+        await connection.close()
+
+
+async def _seed_mixed_surface_events(
+    messages: MessageRepository,
+    clock: FrozenClock,
+    events: RetrievalEventRepository,
+) -> None:
+    """Seed two chat turns and one retrieve-only context call for one user.
+
+    The context event carries no response message because the host that called
+    get_context owns the reply, which is exactly why its measurements are not
+    comparable with a chat turn's.
+    """
+    await _create_message_at(messages, clock, message_id="msg_1", conversation_id="cnv_dbg_1", role="user", seq=1, text="Need help", at=_dt(10, 0))
+    await _create_message_at(messages, clock, message_id="msg_2", conversation_id="cnv_dbg_1", role="assistant", seq=2, text="Answer", at=_dt(10, 1))
+    await _create_message_at(messages, clock, message_id="msg_3", conversation_id="cnv_dbg_1", role="user", seq=3, text="More help", at=_dt(10, 10))
+    await _create_message_at(messages, clock, message_id="msg_4", conversation_id="cnv_dbg_1", role="assistant", seq=4, text="More answer", at=_dt(10, 11))
+    await _create_message_at(messages, clock, message_id="msg_5", conversation_id="cnv_dbg_1", role="user", seq=5, text="Sidecar prompt", at=_dt(10, 20))
+    await _create_event_at(
+        events,
+        event_id="ret_chat_1",
+        user_id="usr_1",
+        conversation_id="cnv_dbg_1",
+        request_message_id="msg_1",
+        response_message_id="msg_2",
+        assistant_mode_id="coding_debug",
+        selected_memory_ids=[],
+        at=_dt(10, 0, 2),
+        items_included=2,
+        items_dropped=1,
+        total_tokens_estimate=100,
+        outcome={"cold_start": True, "zero_candidates": False},
+        surface=TurnSurface.CHAT,
+        retrieval_duration_ms=20.0,
+    )
+    await _create_event_at(
+        events,
+        event_id="ret_chat_2",
+        user_id="usr_1",
+        conversation_id="cnv_dbg_1",
+        request_message_id="msg_3",
+        response_message_id="msg_4",
+        assistant_mode_id="coding_debug",
+        selected_memory_ids=[],
+        at=_dt(10, 10, 5),
+        items_included=4,
+        items_dropped=3,
+        total_tokens_estimate=200,
+        outcome={"cold_start": False, "zero_candidates": True},
+        surface=TurnSurface.CHAT,
+        retrieval_duration_ms=40.0,
+    )
+    await _create_event_at(
+        events,
+        event_id="ret_ctx_1",
+        user_id="usr_1",
+        conversation_id="cnv_dbg_1",
+        request_message_id="msg_5",
+        response_message_id=None,
+        assistant_mode_id="coding_debug",
+        selected_memory_ids=[],
+        at=_dt(10, 20, 1),
+        items_included=6,
+        items_dropped=5,
+        total_tokens_estimate=600,
+        outcome={"cold_start": False, "zero_candidates": False},
+        surface=TurnSurface.CONTEXT,
+        retrieval_duration_ms=90.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_summarize_retrieval_events_splits_chat_and_context_surfaces() -> None:
+    connection, clock, messages, _memories, events, _feedback, _beliefs, computer = await _build_runtime()
+    try:
+        await _seed_mixed_surface_events(messages, clock, events)
+
+        summary = await computer.summarize_retrieval_events(
+            from_date="2026-03-31",
+            to_date="2026-03-31",
+            user_id="usr_1",
+            assistant_mode_id=None,
+            turn_surface=None,
+        )
+
+        assert summary.surface_filter is None
+        assert summary.total_events == 3
+        assert summary.cold_start_count == 1
+        assert summary.zero_candidate_count == 1
+        assert summary.avg_items_included == pytest.approx(4.0)
+        assert summary.avg_items_dropped == pytest.approx(3.0)
+        assert summary.avg_token_estimate == pytest.approx(300.0)
+        assert summary.avg_retrieval_stage_latency_ms == pytest.approx(50.0)
+        assert summary.retrieval_stage_latency_sample_count == 3
+        assert summary.avg_request_to_event_wall_ms == 0.0
+        assert summary.request_to_event_wall_sample_count == 0
+
+        assert set(summary.by_surface) == {TurnSurface.CHAT, TurnSurface.CONTEXT}
+        chat_stats = summary.by_surface[TurnSurface.CHAT]
+        context_stats = summary.by_surface[TurnSurface.CONTEXT]
+        assert chat_stats.total_events == 2
+        assert chat_stats.cold_start_count == 1
+        assert chat_stats.zero_candidate_count == 1
+        assert chat_stats.avg_items_included == pytest.approx(3.0)
+        assert chat_stats.avg_items_dropped == pytest.approx(2.0)
+        assert chat_stats.avg_token_estimate == pytest.approx(150.0)
+        assert chat_stats.avg_retrieval_stage_latency_ms == pytest.approx(30.0)
+        assert chat_stats.retrieval_stage_latency_sample_count == 2
+        assert context_stats.total_events == 1
+        assert context_stats.cold_start_count == 0
+        assert context_stats.zero_candidate_count == 0
+        assert context_stats.avg_items_included == pytest.approx(6.0)
+        assert context_stats.avg_token_estimate == pytest.approx(600.0)
+        assert context_stats.avg_retrieval_stage_latency_ms == pytest.approx(90.0)
+        assert context_stats.retrieval_stage_latency_sample_count == 1
+        # Cross-surface totals are not any surface's number, which is the whole
+        # point of shipping the breakdown alongside them.
+        assert summary.avg_retrieval_stage_latency_ms != pytest.approx(
+            chat_stats.avg_retrieval_stage_latency_ms
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_summarize_retrieval_events_filters_to_a_single_surface() -> None:
+    connection, clock, messages, _memories, events, _feedback, _beliefs, computer = await _build_runtime()
+    try:
+        await _seed_mixed_surface_events(messages, clock, events)
+
+        chat_only = await computer.summarize_retrieval_events(
+            from_date="2026-03-31",
+            to_date="2026-03-31",
+            user_id="usr_1",
+            assistant_mode_id=None,
+            turn_surface=TurnSurface.CHAT,
+        )
+        context_only = await computer.summarize_retrieval_events(
+            from_date="2026-03-31",
+            to_date="2026-03-31",
+            user_id="usr_1",
+            assistant_mode_id=None,
+            turn_surface=TurnSurface.CONTEXT,
+        )
+        proxy_only = await computer.summarize_retrieval_events(
+            from_date="2026-03-31",
+            to_date="2026-03-31",
+            user_id="usr_1",
+            assistant_mode_id=None,
+            turn_surface=TurnSurface.PROXY_STREAM,
+        )
+
+        assert chat_only.surface_filter is TurnSurface.CHAT
+        assert set(chat_only.by_surface) == {TurnSurface.CHAT}
+        assert chat_only.total_events == 2
+        assert chat_only.avg_items_included == pytest.approx(3.0)
+        assert chat_only.avg_retrieval_stage_latency_ms == pytest.approx(30.0)
+
+        assert context_only.surface_filter is TurnSurface.CONTEXT
+        assert set(context_only.by_surface) == {TurnSurface.CONTEXT}
+        assert context_only.total_events == 1
+        assert context_only.avg_items_included == pytest.approx(6.0)
+        assert context_only.avg_retrieval_stage_latency_ms == pytest.approx(90.0)
+
+        # A surface with no events in the window reports emptiness instead of
+        # inventing a zero-latency measurement for it.
+        assert proxy_only.surface_filter is TurnSurface.PROXY_STREAM
+        assert proxy_only.by_surface == {}
+        assert proxy_only.total_events == 0
+        assert proxy_only.avg_retrieval_stage_latency_ms == 0.0
+        assert proxy_only.retrieval_stage_latency_sample_count == 0
+        assert proxy_only.avg_request_to_event_wall_ms == 0.0
+        assert proxy_only.request_to_event_wall_sample_count == 0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_summarize_retrieval_events_reports_measured_and_derived_latency_apart() -> None:
+    """The measured stage and the legacy wall gap are different quantities.
+
+    A mean over both is neither: the derivation contains the reply generation,
+    so blending it with a retrieval-stage measurement produces a figure that
+    describes nothing. Each series is reported on its own, over its own
+    population.
+    """
+    connection, clock, messages, _memories, events, _feedback, _beliefs, computer = await _build_runtime()
+    try:
+        await _create_message_at(messages, clock, message_id="msg_1", conversation_id="cnv_dbg_1", role="user", seq=1, text="Need help", at=_dt(10, 0))
+        await _create_message_at(messages, clock, message_id="msg_2", conversation_id="cnv_dbg_1", role="assistant", seq=2, text="Answer", at=_dt(10, 1))
+        await _create_message_at(messages, clock, message_id="msg_3", conversation_id="cnv_dbg_1", role="user", seq=3, text="More help", at=_dt(10, 10))
+        await _create_message_at(messages, clock, message_id="msg_4", conversation_id="cnv_dbg_1", role="assistant", seq=4, text="More answer", at=_dt(10, 11))
+        await _create_event_at(
+            events,
+            event_id="ret_measured",
+            user_id="usr_1",
+            conversation_id="cnv_dbg_1",
+            request_message_id="msg_1",
+            response_message_id="msg_2",
+            assistant_mode_id="coding_debug",
+            selected_memory_ids=[],
+            at=_dt(10, 0, 2),
+            retrieval_duration_ms=20.0,
+        )
+        await _create_event_at(
+            events,
+            event_id="ret_pre_migration",
+            user_id="usr_1",
+            conversation_id="cnv_dbg_1",
+            request_message_id="msg_3",
+            response_message_id="msg_4",
+            assistant_mode_id="coding_debug",
+            selected_memory_ids=[],
+            at=_dt(10, 10, 5),
+        )
+        await _strip_persisted_telemetry(connection, "ret_pre_migration", "usr_1")
+
+        summary = await computer.summarize_retrieval_events(
+            from_date="2026-03-31",
+            to_date="2026-03-31",
+            user_id="usr_1",
+            assistant_mode_id=None,
+            turn_surface=None,
+        )
+
+        # ret_measured contributes its persisted 20 ms to the measured series and
+        # nothing to the derived one. ret_pre_migration has a NULL column, so it
+        # contributes only the 5 s gap between its request message (10:10:00)
+        # and the event row (10:10:05) to the derived series.
+        assert summary.total_events == 2
+        assert summary.retrieval_stage_latency_sample_count == 1
+        assert summary.avg_retrieval_stage_latency_ms == pytest.approx(20.0)
+        assert summary.request_to_event_wall_sample_count == 1
+        assert summary.avg_request_to_event_wall_ms == pytest.approx(5000.0, rel=1e-3)
+        # The old blended average, mean(20 ms, 5000 ms), is exactly the number
+        # neither series may report.
+        assert summary.avg_retrieval_stage_latency_ms != pytest.approx(2510.0, rel=1e-3)
+        assert summary.avg_request_to_event_wall_ms != pytest.approx(2510.0, rel=1e-3)
+        chat_stats = summary.by_surface[TurnSurface.CHAT]
+        assert chat_stats.total_events == 2
+        assert chat_stats.retrieval_stage_latency_sample_count == 1
+        assert chat_stats.avg_retrieval_stage_latency_ms == pytest.approx(20.0)
+        assert chat_stats.request_to_event_wall_sample_count == 1
+        assert chat_stats.avg_request_to_event_wall_ms == pytest.approx(5000.0, rel=1e-3)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_surface_totals_weight_each_latency_series_by_its_own_population() -> None:
+    """Folding surfaces back together must not weight by the event count.
+
+    Each latency series covers a subset of the rows, so weighting a surface's
+    average by ``total_events`` credits it with samples it never contributed.
+    Here chat measured 1 of its 2 events and context measured its only one: the
+    measured total is mean(20, 90) = 55, not the 43.33 an event-count weighting
+    would produce.
+    """
+    connection, clock, messages, _memories, events, _feedback, _beliefs, computer = await _build_runtime()
+    try:
+        await _create_message_at(messages, clock, message_id="msg_1", conversation_id="cnv_dbg_1", role="user", seq=1, text="Need help", at=_dt(10, 0))
+        await _create_message_at(messages, clock, message_id="msg_2", conversation_id="cnv_dbg_1", role="assistant", seq=2, text="Answer", at=_dt(10, 1))
+        await _create_message_at(messages, clock, message_id="msg_3", conversation_id="cnv_dbg_1", role="user", seq=3, text="More help", at=_dt(10, 10))
+        await _create_message_at(messages, clock, message_id="msg_4", conversation_id="cnv_dbg_1", role="assistant", seq=4, text="More answer", at=_dt(10, 11))
+        await _create_message_at(messages, clock, message_id="msg_5", conversation_id="cnv_dbg_1", role="user", seq=5, text="Sidecar prompt", at=_dt(10, 20))
+        await _create_event_at(
+            events,
+            event_id="ret_chat_measured",
+            user_id="usr_1",
+            conversation_id="cnv_dbg_1",
+            request_message_id="msg_1",
+            response_message_id="msg_2",
+            assistant_mode_id="coding_debug",
+            selected_memory_ids=[],
+            at=_dt(10, 0, 2),
+            surface=TurnSurface.CHAT,
+            retrieval_duration_ms=20.0,
+        )
+        await _create_event_at(
+            events,
+            event_id="ret_chat_pre_migration",
+            user_id="usr_1",
+            conversation_id="cnv_dbg_1",
+            request_message_id="msg_3",
+            response_message_id="msg_4",
+            assistant_mode_id="coding_debug",
+            selected_memory_ids=[],
+            at=_dt(10, 10, 5),
+            surface=TurnSurface.CHAT,
+        )
+        await _strip_persisted_telemetry(connection, "ret_chat_pre_migration", "usr_1")
+        await _create_event_at(
+            events,
+            event_id="ret_ctx_measured",
+            user_id="usr_1",
+            conversation_id="cnv_dbg_1",
+            request_message_id="msg_5",
+            response_message_id=None,
+            assistant_mode_id="coding_debug",
+            selected_memory_ids=[],
+            at=_dt(10, 20, 1),
+            surface=TurnSurface.CONTEXT,
+            retrieval_duration_ms=90.0,
+        )
+
+        summary = await computer.summarize_retrieval_events(
+            from_date="2026-03-31",
+            to_date="2026-03-31",
+            user_id="usr_1",
+            assistant_mode_id=None,
+            turn_surface=None,
+        )
+
+        assert summary.total_events == 3
+        assert summary.retrieval_stage_latency_sample_count == 2
+        assert summary.avg_retrieval_stage_latency_ms == pytest.approx(55.0)
+        assert summary.avg_retrieval_stage_latency_ms != pytest.approx(43.333, rel=1e-3)
+        assert summary.request_to_event_wall_sample_count == 1
+        assert summary.avg_request_to_event_wall_ms == pytest.approx(5000.0, rel=1e-3)
+        # Only the chat surface holds a pre-migration row, so the derived series
+        # is empty for context rather than reported as a zero measurement.
+        context_stats = summary.by_surface[TurnSurface.CONTEXT]
+        assert context_stats.request_to_event_wall_sample_count == 0
+        assert context_stats.avg_request_to_event_wall_ms == 0.0
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_open_retrieval_never_enters_the_measured_success_series() -> None:
+    """A retrieval that FAILED does not describe what a retrieval costs.
+
+    The proxy's fail-open row carries a real, deliberately-measured duration --
+    the attempt was paid for -- but it timed an attempt that produced no memory
+    context. Averaging it with the turns whose retrieval worked yields a figure
+    that describes neither: here mean(200, 220, 52.87) = 157.62 instead of the
+    210 two working retrievals actually cost. The spend stays visible in its own
+    series instead of being deleted or blended.
+    """
+    connection, clock, messages, _memories, events, _feedback, _beliefs, computer = await _build_runtime()
+    try:
+        for seq, text in ((1, "Need help"), (2, "More help"), (3, "Third")):
+            await _create_message_at(
+                messages,
+                clock,
+                message_id=f"msg_{seq}",
+                conversation_id="cnv_dbg_1",
+                role="user",
+                seq=seq,
+                text=text,
+                at=_dt(10, seq),
+            )
+        for event_id, request_message_id, duration in (
+            ("ret_ok_1", "msg_1", 200.0),
+            ("ret_ok_2", "msg_2", 220.0),
+        ):
+            await _create_event_at(
+                events,
+                event_id=event_id,
+                user_id="usr_1",
+                conversation_id="cnv_dbg_1",
+                request_message_id=request_message_id,
+                response_message_id=None,
+                assistant_mode_id="coding_debug",
+                selected_memory_ids=[],
+                at=_dt(10, 30),
+                surface=TurnSurface.PROXY_COMPLETION,
+                retrieval_duration_ms=duration,
+            )
+        # Exactly the row _turn_telemetry builds when memory context failed open.
+        await _create_event_at(
+            events,
+            event_id="ret_failed_open",
+            user_id="usr_1",
+            conversation_id="cnv_dbg_1",
+            request_message_id="msg_3",
+            response_message_id=None,
+            assistant_mode_id="coding_debug",
+            selected_memory_ids=[],
+            at=_dt(10, 31),
+            surface=TurnSurface.PROXY_COMPLETION,
+            retrieval_duration_ms=52.87,
+            outcome={"memory_context_available": False},
+        )
+
+        summary = await computer.summarize_retrieval_events(
+            from_date="2026-03-31",
+            to_date="2026-03-31",
+            user_id="usr_1",
+            assistant_mode_id=None,
+            turn_surface=None,
+        )
+
+        assert summary.total_events == 3
+        assert summary.retrieval_stage_latency_sample_count == 2
+        assert summary.avg_retrieval_stage_latency_ms == pytest.approx(210.0)
+        assert summary.avg_retrieval_stage_latency_ms != pytest.approx(157.623, rel=1e-3)
+        assert summary.failed_retrieval_stage_latency_sample_count == 1
+        assert summary.avg_failed_retrieval_stage_latency_ms == pytest.approx(52.87)
+        # Every row lands in exactly one series.
+        assert summary.request_to_event_wall_sample_count == 0
+        proxy_stats = summary.by_surface[TurnSurface.PROXY_COMPLETION]
+        assert proxy_stats.avg_retrieval_stage_latency_ms == pytest.approx(210.0)
+        assert proxy_stats.failed_retrieval_stage_latency_sample_count == 1
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_a_slice_without_failed_retrievals_reports_an_empty_failure_series() -> None:
+    """0.0 with a 0 count means "nothing contributed", not "it took no time"."""
+    connection, clock, messages, _memories, events, _feedback, _beliefs, computer = await _build_runtime()
+    try:
+        await _create_message_at(
+            messages,
+            clock,
+            message_id="msg_1",
+            conversation_id="cnv_dbg_1",
+            role="user",
+            seq=1,
+            text="Need help",
+            at=_dt(10, 0),
+        )
+        await _create_event_at(
+            events,
+            event_id="ret_ok",
+            user_id="usr_1",
+            conversation_id="cnv_dbg_1",
+            request_message_id="msg_1",
+            response_message_id=None,
+            assistant_mode_id="coding_debug",
+            selected_memory_ids=[],
+            at=_dt(10, 5),
+            retrieval_duration_ms=33.0,
+        )
+
+        summary = await computer.summarize_retrieval_events(
+            from_date="2026-03-31",
+            to_date="2026-03-31",
+            user_id="usr_1",
+            assistant_mode_id=None,
+            turn_surface=None,
+        )
+
+        assert summary.retrieval_stage_latency_sample_count == 1
+        assert summary.avg_retrieval_stage_latency_ms == pytest.approx(33.0)
+        assert summary.failed_retrieval_stage_latency_sample_count == 0
+        assert summary.avg_failed_retrieval_stage_latency_ms == 0.0
     finally:
         await connection.close()

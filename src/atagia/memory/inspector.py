@@ -57,6 +57,15 @@ _MEMORY_INSPECTION_FIELDS: tuple[str, ...] = (
     "confidence",
     "created_at",
     "updated_at",
+    # Both endpoints of the ingest interval, together and next to created_at on
+    # purpose. created_at is when the ROW appeared, which is not when the memory
+    # became retrievable -- a 'review_required' or 'pending_user_confirmation'
+    # row is in the FTS index but invisible to retrieval until it turns active,
+    # if it ever does (migration 0071). Exposing created_at alone left an
+    # operator reading the one number that looks like a freshness stamp and is
+    # not, with no way to see the one that is.
+    "source_message_created_at",
+    "queryable_at",
     "canonical_text",
 )
 

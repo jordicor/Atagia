@@ -37,6 +37,7 @@ from atagia.services.lifecycle_service import (
     HARD_DELETE_MEMORY_CONFIRMATION,
     ConversationLifecycleService,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
@@ -67,6 +68,7 @@ class _Runtime:
             erasure_purge_streams=False,
             storage_backend="inprocess",
         )
+        self.token_document_frequency_cache = TokenDocumentFrequencyCache()
 
     async def open_connection(self) -> aiosqlite.Connection:
         return await open_connection(self.database_path)

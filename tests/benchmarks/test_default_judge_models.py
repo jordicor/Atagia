@@ -21,10 +21,10 @@ OPTIONAL_PRIVATE_CLI_MODULES = [
     "cli_module",
     PUBLIC_CLI_MODULES,
 )
-def test_benchmark_default_judge_is_direct_kimi_k27_code(cli_module) -> None:
+def test_benchmark_default_judge_is_openrouter_luna_medium(cli_module) -> None:
     args = SimpleNamespace(provider="anthropic", judge_model=None)
 
-    assert cli_module._resolve_judge_model(args) == "kimi/kimi-k2.7-code"
+    assert cli_module._resolve_judge_model(args) == "openrouter/openai/gpt-5.6-luna,medium"
 
 
 @pytest.mark.parametrize(
@@ -41,10 +41,10 @@ def test_benchmark_explicit_judge_model_overrides_default(cli_module) -> None:
     "cli_module",
     PUBLIC_CLI_MODULES,
 )
-def test_non_kimi_benchmark_default_judge_stays_direct_kimi(cli_module) -> None:
+def test_non_openai_benchmark_default_judge_stays_openrouter_luna(cli_module) -> None:
     args = SimpleNamespace(provider="openrouter", judge_model=None)
 
-    assert cli_module._resolve_judge_model(args) == "kimi/kimi-k2.7-code"
+    assert cli_module._resolve_judge_model(args) == "openrouter/openai/gpt-5.6-luna,medium"
 
 
 @pytest.mark.parametrize("module_name", OPTIONAL_PRIVATE_CLI_MODULES)
@@ -56,10 +56,10 @@ def test_optional_private_benchmark_judge_defaults(module_name: str) -> None:
 
     assert cli_module._resolve_judge_model(
         SimpleNamespace(provider="anthropic", judge_model=None)
-    ) == "kimi/kimi-k2.7-code"
+    ) == "openrouter/openai/gpt-5.6-luna,medium"
     assert cli_module._resolve_judge_model(
         SimpleNamespace(provider="anthropic", judge_model="openrouter/test-judge")
     ) == "openrouter/test-judge"
     assert cli_module._resolve_judge_model(
         SimpleNamespace(provider="openrouter", judge_model=None)
-    ) == "kimi/kimi-k2.7-code"
+    ) == "openrouter/openai/gpt-5.6-luna,medium"

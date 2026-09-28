@@ -26,7 +26,6 @@
   "retrieval_params": {
     "fts_limit": 20,
     "vector_limit": 8,
-    "graph_hops": 0,
     "rerank_top_k": 12,
     "final_context_items": 7
   },

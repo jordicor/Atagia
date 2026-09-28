@@ -1,0 +1,101 @@
+-- Ingest freshness gets its real end point. 0069 measured the interval as
+-- created_at - source_message_created_at and then documented, in its own
+-- comment, why the left-hand side was wrong: created_at is when the row entered
+-- the FTS index, but retrieval only ever considers status = 'active'
+-- (RETRIEVAL_ELIGIBLE_MEMORY_STATUSES in core/repositories.py, turned into a
+-- plan filter in memory/retrieval_planner.py and applied in
+-- memory/candidate_search.py). Extraction routinely mints rows that are not
+-- active: below REVIEW_REQUIRED_CONFIDENCE it writes 'review_required'
+-- (memory/extractor.py), and a consent-gated one lands as
+-- 'pending_user_confirmation', where it waits up to
+-- PENDING_USER_CONFIRMATION_TTL_DAYS -- or forever, if the user declines. For
+-- those rows created_at overstated freshness by minutes, by days, or by
+-- infinity.
+--
+-- queryable_at is that missing stamp: the FIRST instant the memory was actually
+-- retrievable. Ingest latency is now
+--   queryable_at - source_message_created_at
+-- computed from two stored timestamps, both taken from the injected clock, with
+-- no derived delta anybody would have to trust.
+--
+-- WHEN IT IS WRITTEN
+--   * At INSERT, for a memory born active: _create_memory_object_impl stores
+--     the row's own created_at (core/repositories.py). Rows born
+--     'review_required' or 'pending_user_confirmation' insert NULL.
+--   * At the TRANSITION into 'active', by every statement whose target status
+--     is chosen at runtime rather than hardcoded. Three statements qualify, all
+--     in core/repositories.py, and each carries the same assignment:
+--       queryable_at = CASE
+--           WHEN status = ? THEN queryable_at      -- ? binds 'active'
+--           ELSE COALESCE(queryable_at, ?)         -- ? binds the stamp or NULL
+--       END
+--     update_memory_object_status is the live confirmation path
+--     (services/confirmation_service.py turns a marker the user accepted into
+--     an active memory); upsert_summary_mirror rewrites a summary mirror's
+--     status on every compaction; merge_memory_object_write_restrictions
+--     rewrites a status it derived from the existing row.
+--
+-- The assignment, not the caller, is what makes the stamp honest:
+--   * `status` on the right-hand side reads the PRE-update value, so a row that
+--     was already active keeps whatever it has. Rewriting 'active' over
+--     'active' can neither restamp a live row nor invent a stamp for a row that
+--     predates this migration.
+--   * A row entering 'active' is stamped only while the column is NULL, so
+--     active -> archived -> active keeps the FIRST stamp. It *was* queryable
+--     then; that is the honest reading of "time to queryable".
+--   * Any other target status binds NULL and the COALESCE leaves the column
+--     alone.
+--
+-- WHEN IT STAYS NULL, DELIBERATELY. Every other statement that writes
+-- memory_objects.status writes a hardcoded status that is never 'active', so it
+-- can only ever move a row OUT of retrievability and has nothing to stamp:
+--   * MemoryObjectRepository.archive_memory_object (core/repositories.py)
+--   * MemoryLifecycleManager._archive_low_value_memories,
+--     _archive_expired_state_snapshots and
+--     _decline_expired_pending_confirmations (memory/lifecycle.py)
+--   * BeliefReviser._apply_supersede and _archive_belief
+--     (memory/belief_reviser.py)
+--   * LifecycleService's conversation archive, memory archive and
+--     _tombstone_memory_rows (services/lifecycle_service.py)
+--   * SidecarService's review_required fence (services/sidecar_service.py)
+-- A memory that is created 'review_required' and never confirmed therefore ends
+-- its life with queryable_at NULL, which is a true statement about it: it never
+-- became retrievable.
+--
+-- BACKFILL: NONE. Pre-migration rows keep NULL, including the active ones.
+-- They genuinely were queryable, but nothing recorded WHEN, and created_at is
+-- exactly the number 0069 refused to trust for non-active rows -- writing it in
+-- here would launder that same guess into a column whose whole purpose is to
+-- not be a guess. This is 0069's "NULL means written before this migration"
+-- convention, unchanged.
+--
+-- So NULL carries two meanings, and they are separable WITHOUT a second column:
+-- schema_migrations.applied_at already records when this migration ran on THIS
+-- database, and that instant is the window boundary. Inside the window a NULL
+-- means "never became queryable"; outside it means "predates the column". On a
+-- database created after this migration the window is the whole table. An
+-- ingest-latency aggregate therefore scopes itself to the window and reports
+-- its own exclusions rather than silently averaging over survivors:
+--   SELECT
+--       COUNT(*) FILTER (WHERE mo.queryable_at IS NOT NULL) AS measured_rows,
+--       COUNT(*) FILTER (WHERE mo.queryable_at IS NULL)     AS excluded_rows,
+--       AVG(
+--           (julianday(mo.queryable_at)
+--            - julianday(mo.source_message_created_at)) * 86400000.0
+--       ) AS avg_ingest_latency_ms
+--   FROM memory_objects AS mo
+--   WHERE mo.user_id = ?
+--     AND mo.source_message_created_at IS NOT NULL
+--     AND mo.created_at >= (SELECT applied_at
+--                           FROM schema_migrations
+--                           WHERE version = 71);
+-- AVG ignores the NULL-stamp rows on its own; excluded_rows is what makes that
+-- visible instead of implicit. No such aggregate exists in the engine yet, so
+-- none is added here -- this is the shape the first one has to take.
+--
+-- No index. There is no ingest-latency aggregate in the engine yet, and this
+-- column is written on the hottest write path there is (every extracted
+-- memory), so an index would cost every ingest to serve a query nobody makes.
+-- Add one with the aggregate that needs it, not before.
+
+ALTER TABLE memory_objects ADD COLUMN queryable_at TEXT;

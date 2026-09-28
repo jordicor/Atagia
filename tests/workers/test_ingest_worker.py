@@ -14,6 +14,7 @@ import pytest
 
 from atagia.app import create_app
 from atagia.core.clock import FrozenClock
+from atagia.core.belief_repository import BeliefRepository
 from atagia.core.communication_profile_repository import CommunicationProfileRepository
 from atagia.core.config import Settings
 from atagia.core.contract_repository import ContractDimensionRepository
@@ -32,6 +33,7 @@ from atagia.core.user_lifecycle_repository import UserLifecycleRepository
 from atagia.memory.candidate_search import CandidateSearch
 from atagia.memory.context_composer import ContextComposer
 from atagia.memory.extractor import ExtractionPersistenceDetails
+from atagia.memory.intent_classifier import ClaimKeyEquivalenceSession
 from atagia.memory.policy_manifest import (
     ManifestLoader,
     PolicyResolver,
@@ -82,6 +84,7 @@ from atagia.services.llm_client import (
 from atagia.services.worker_control_service import WorkerControlService
 from atagia.workers.contract_worker import ContractWorker
 from atagia.workers.ingest_worker import IngestWorker
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 from tests.extraction_payload_support import (
     is_memory_extraction_card_purpose,
     memory_extraction_card_output_from_payload,
@@ -116,11 +119,18 @@ _EMPTY_LANGUAGE_PROFILE_CARD_OUTPUTS = {
 }
 
 _MEMORY_EXTRACTION_ENRICHMENT_CARD_PURPOSES = {
-    "memory_extraction_kind_scope_card",
-    "memory_extraction_evidence_card",
+    "memory_extraction_kind_card",
+    "memory_extraction_scope_card",
+    "memory_extraction_confidence_card",
+    "memory_extraction_evidence_support_card",
+    "memory_extraction_preserve_verbatim_card",
+    "memory_extraction_candidate_language_card",
+    "memory_extraction_source_reference_card",
     "memory_extraction_index_card",
-    "memory_extraction_temporal_card",
-    "memory_extraction_belief_card",
+    "memory_extraction_belief_key_card",
+    "memory_extraction_belief_value_card",
+    "memory_extraction_temporal_type_card",
+    "memory_extraction_temporal_interval_card",
     "memory_extraction_coverage_members_card",
 }
 
@@ -145,7 +155,8 @@ class QueueProvider(LLMProvider):
         if _is_need_detection_card_purpose(request.metadata.get("purpose")):
             outputs = {
                 "need_detection_needs_card": "none",
-                "need_detection_language_card": "en\nen",
+                "need_detection_query_language_card": "en",
+                "need_detection_answer_language_card": "en",
                 "need_detection_memory_card": "mixed",
                 "need_detection_exact_card": "no",
                 "need_detection_shape_card": "default",
@@ -182,7 +193,7 @@ class QueueProvider(LLMProvider):
             return LLMCompletionResponse(
                 provider=self.name,
                 model=request.model,
-                output_text=json.dumps({"equivalent": True}),
+                output_text="yes",
             )
         if request.metadata.get("purpose") == "consequence_gate_card":
             return LLMCompletionResponse(
@@ -245,6 +256,7 @@ class QueueProvider(LLMProvider):
                 output_text = memory_extraction_card_output_from_payload(
                     self._active_extraction_payload,
                     purpose,
+                    prompt="\n".join(message.content for message in request.messages),
                 )
                 if output_text == "none" or "|" not in output_text:
                     self._active_extraction_payload = None
@@ -256,6 +268,7 @@ class QueueProvider(LLMProvider):
             output_text = memory_extraction_card_output_from_payload(
                 self._active_extraction_payload or {"candidates": []},
                 purpose,
+                prompt="\n".join(message.content for message in request.messages),
             )
             self._active_extraction_consumed.add(purpose)
             if (
@@ -796,7 +809,11 @@ async def test_ingest_worker_retrieval_packet_surface_recovers_and_composes_base
         assert fts_count == 1
 
         fts_query_audit: list[dict[str, object]] = []
-        candidates = await CandidateSearch(connection, clock).search(
+        candidates = await CandidateSearch(
+            connection,
+            clock,
+            token_document_frequency_cache=TokenDocumentFrequencyCache(),
+        ).search(
             _persisted_surface_plan("respuestas depuracion concisas"),
             user_id="usr_1",
             fts_query_audit=fts_query_audit,
@@ -882,6 +899,11 @@ async def test_ingest_worker_lean_extraction_persists_formerly_high_risk_as_acti
     )
     try:
         message_text = "The retry issue recovery PIN is stored elsewhere"
+        await connection.execute(
+            "UPDATE messages SET text = ? WHERE id = ?",
+            (message_text, str(message["id"])),
+        )
+        await connection.commit()
         await backend.stream_add(
             EXTRACT_STREAM_NAME,
             _extract_job(str(message["id"]), message_text=message_text).model_dump(
@@ -985,6 +1007,63 @@ async def test_ingest_worker_processes_stream_job_and_acks() -> None:
         stored = await memories.list_for_user("usr_1")
         assert len(stored) == 1
         assert stored[0]["object_type"] == MemoryObjectType.EVIDENCE.value
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_worker_stamps_source_message_arrival_on_new_memories() -> None:
+    """Ingest freshness needs both ends of the interval stored, not a delta.
+
+    The two ends live in different jobs: the request path writes the message and
+    the ingest worker writes the memory, so nothing could subtract them without
+    both stamps. The right-hand end is ``queryable_at`` (migration 0071), not
+    ``created_at`` -- the extraction below is confident enough to be born
+    ``active``, so here they coincide, and the assertion below is what keeps
+    them coinciding for that reason rather than by accident.
+    """
+    (
+        connection,
+        clock,
+        backend,
+        _provider,
+        memories,
+        ingest_worker,
+        _contract_worker,
+        message,
+    ) = await _build_runtime([_public_extraction_payload()])
+    try:
+        # Move the clock so the ingest stamp cannot coincidentally equal the
+        # message stamp and pass a broken implementation.
+        clock.advance(seconds=90)
+        await backend.stream_add(
+            EXTRACT_STREAM_NAME,
+            _extract_job(str(message["id"])).model_dump(mode="json"),
+        )
+        await ingest_worker.run_once()
+
+        stored = await memories.list_for_user("usr_1")
+        assert len(stored) == 1
+        memory = stored[0]
+        assert memory["source_message_created_at"] == message["created_at"]
+        assert memory["created_at"] > memory["source_message_created_at"]
+        assert memory["status"] == MemoryStatus.ACTIVE.value
+        assert memory["queryable_at"] == memory["created_at"]
+        assert memory["queryable_at"] > memory["source_message_created_at"]
+
+        cursor = await connection.execute(
+            """
+            SELECT COUNT(*) AS indexed
+            FROM memory_objects AS mo
+            JOIN memory_objects_fts ON memory_objects_fts.rowid = mo._rowid
+            WHERE mo.id = ?
+            """,
+            (memory["id"],),
+        )
+        # The queryable claim is checked, not assumed: the row is in FTS as of
+        # the same instant queryable_at reports, and it is retrieval-eligible
+        # there -- being indexed is only half of being queryable.
+        assert (await cursor.fetchone())["indexed"] == 1
     finally:
         await connection.close()
 
@@ -1592,7 +1671,7 @@ async def test_ingest_worker_dead_letters_after_transient_defer_age_exhaustion(
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_tolerates_malformed_card_output_as_no_durable_memory() -> (
+async def test_ingest_worker_fails_explicitly_on_malformed_card_output() -> (
     None
 ):
     (
@@ -1604,7 +1683,9 @@ async def test_ingest_worker_tolerates_malformed_card_output_as_no_durable_memor
         ingest_worker,
         _contract_worker,
         message,
-    ) = await _build_runtime(["not-json"])
+    ) = await _build_runtime([
+        "cand_001 | I prefer concise debugging answers for retry issues."
+    ])
     try:
         await backend.stream_add(
             EXTRACT_STREAM_NAME,
@@ -1612,11 +1693,15 @@ async def test_ingest_worker_tolerates_malformed_card_output_as_no_durable_memor
         )
 
         result = await ingest_worker.run_once()
+        stored_job = await JobRunRepository(connection, _clock).get_job("job_extract_1")
 
         assert result.received == 1
-        assert result.acked == 1
-        assert result.failed == 0
+        assert result.acked == 0
+        assert result.failed == 1
         assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
+        assert stored_job is not None
+        assert stored_job["status"] == "retrying"
+        assert stored_job["error_class"] == "LLMError"
         stored = await memories.list_for_user("usr_1")
         assert stored == []
     finally:
@@ -1662,7 +1747,7 @@ async def test_ingest_worker_dead_letters_after_max_failed_deliveries() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ingest_worker_card_assembly_drops_invalid_temporal_bounds() -> None:
+async def test_ingest_worker_retries_invalid_temporal_bounds_without_persisting() -> None:
     invalid_payload = json.dumps(
         {
             "evidences": [],
@@ -1699,11 +1784,17 @@ async def test_ingest_worker_card_assembly_drops_invalid_temporal_bounds() -> No
         [invalid_payload],
     )
     try:
+        message_text = "I am on vacation this week."
+        await connection.execute(
+            "UPDATE messages SET text = ? WHERE id = ?",
+            (message_text, str(message["id"])),
+        )
+        await connection.commit()
         await backend.stream_add(
             EXTRACT_STREAM_NAME,
             _extract_job(
                 str(message["id"]),
-                message_text="I am on vacation this week.",
+                message_text=message_text,
             ).model_dump(mode="json"),
         )
 
@@ -1712,14 +1803,17 @@ async def test_ingest_worker_card_assembly_drops_invalid_temporal_bounds() -> No
             f"dead_letter:{EXTRACT_STREAM_NAME}", timeout_seconds=0
         )
         stored = await memories.list_for_user("usr_1")
+        stored_job = await JobRunRepository(connection, _clock).get_job("job_extract_1")
 
-        assert result.acked == 1
-        assert result.failed == 0
+        assert result.acked == 0
+        assert result.failed == 1
         assert result.dead_lettered == 0
         assert backend._stream_pending[(EXTRACT_STREAM_NAME, WORKER_GROUP_NAME)] == {}
         assert dead_letter is None
-        assert len(stored) == 1
-        assert stored[0]["temporal_type"] == "unknown"
+        assert stored == []
+        assert stored_job is not None
+        assert stored_job["status"] == "retrying"
+        assert stored_job["error_class"] == "ValueError"
     finally:
         await connection.close()
 
@@ -2155,6 +2249,138 @@ async def test_ingest_marks_belief_revision_claim_key_validated_by_match(
         assert payload.claim_key == "response_style.debugging"
         assert payload.claim_key_already_validated is expected_validated
         assert payload.belief_id == expected_belief_id
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_belief_match_skips_ineligible_candidates_before_equivalence() -> None:
+    connection, _clock, _backend, provider, memories, worker, _contract_worker, _message = (
+        await _build_runtime([
+            "yes"
+        ])
+    )
+    beliefs = BeliefRepository(connection, worker._clock)
+    requested_key = "response_style.debugging"
+    candidate_key = "response_style.concise"
+    candidates = (
+        ("mem_00_current", MemoryScope.CONVERSATION, [], None),
+        ("mem_01_source", MemoryScope.CONVERSATION, ["msg_1"], None),
+        ("mem_02_realm", MemoryScope.CONVERSATION, [], "other_realm"),
+        ("mem_03_lower", MemoryScope.ASSISTANT_MODE, [], None),
+        ("mem_04_higher", MemoryScope.CONVERSATION, [], None),
+        ("mem_05_higher", MemoryScope.CONVERSATION, [], None),
+    )
+    try:
+        for belief_id, scope, source_ids, realm_id in candidates:
+            created = await memories.create_memory_object(
+                user_id="usr_1",
+                conversation_id="cnv_1",
+                assistant_mode_id="coding_debug",
+                object_type=MemoryObjectType.BELIEF,
+                scope=scope,
+                canonical_text=f"{candidate_key}:concise",
+                source_kind=MemorySourceKind.INFERRED,
+                confidence=0.8,
+                privacy_level=0,
+                payload={
+                    "claim_key": candidate_key,
+                    "claim_value": "concise",
+                    "source_message_ids": source_ids,
+                },
+                memory_id=belief_id,
+                realm_id=realm_id,
+            )
+            await beliefs.create_first_version(
+                belief_id=belief_id,
+                claim_key=candidate_key,
+                claim_value="concise",
+                created_at=str(created["created_at"]),
+            )
+
+        match = await worker._find_existing_belief_id(
+            claim_key=requested_key,
+            current_belief_id="mem_00_current",
+            source_message_id="msg_1",
+            assistant_mode_id="coding_debug",
+            workspace_id=None,
+            conversation_id="cnv_1",
+            scope=MemoryScope.CHAT.value,
+            user_id="usr_1",
+            user_persona_id=None,
+            platform_id="default",
+            character_id=None,
+            incognito=False,
+            remember_across_chats=True,
+            remember_across_devices=True,
+            equivalence=ClaimKeyEquivalenceSession(
+                worker._llm_client, worker._classifier_model, user_id="usr_1"
+            ),
+        )
+
+        assert match == "mem_04_higher"
+        batch_requests = [
+            request for request in provider.requests
+            if request.metadata.get("purpose") == "intent_classifier_claim_key_equivalence_batch"
+        ]
+        assert len(batch_requests) == 1
+        assert batch_requests[0].metadata["user_id"] == "usr_1"
+        assert batch_requests[0].metadata["stage"] == "pair_0"
+        assert requested_key in batch_requests[0].messages[0].content
+        assert candidate_key in batch_requests[0].messages[0].content
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_belief_match_reports_noncanonical_persisted_key() -> None:
+    connection, _clock, _backend, provider, memories, worker, _contract_worker, _message = (
+        await _build_runtime([])
+    )
+    beliefs = BeliefRepository(connection, worker._clock)
+    old_key = "response_style.no_és_actiu"
+    try:
+        created = await memories.create_memory_object(
+            user_id="usr_1",
+            conversation_id="cnv_1",
+            assistant_mode_id="coding_debug",
+            object_type=MemoryObjectType.BELIEF,
+            scope=MemoryScope.CONVERSATION,
+            canonical_text="Legacy multilingual key",
+            source_kind=MemorySourceKind.INFERRED,
+            confidence=0.8,
+            privacy_level=0,
+            payload={"claim_key": old_key, "claim_value": True},
+            memory_id="mem_legacy_key",
+        )
+        await beliefs.create_first_version(
+            belief_id="mem_legacy_key",
+            claim_key=old_key,
+            claim_value=True,
+            created_at=str(created["created_at"]),
+        )
+
+        with pytest.raises(ValueError, match="claim_key"):
+            await worker._find_existing_belief_id(
+                claim_key="response_style.is_active",
+                current_belief_id="mem_new",
+                source_message_id="msg_1",
+                assistant_mode_id="coding_debug",
+                workspace_id=None,
+                conversation_id="cnv_1",
+                scope=MemoryScope.CHAT.value,
+                user_id="usr_1",
+                user_persona_id=None,
+                platform_id="default",
+                character_id=None,
+                incognito=False,
+                remember_across_chats=True,
+                remember_across_devices=True,
+                equivalence=ClaimKeyEquivalenceSession(
+                    worker._llm_client, worker._classifier_model, user_id="usr_1"
+                ),
+            )
+        assert provider.requests == []
     finally:
         await connection.close()
 

@@ -71,6 +71,7 @@ class PurposeProvider(LLMProvider):
                 output_text=memory_extraction_card_output_from_payload(
                     {"candidates": [], "nothing_durable": True},
                     purpose,
+                    prompt="\n".join(message.content for message in request.messages),
                 ),
             )
         if purpose == "consequence_gate_card":

@@ -9,7 +9,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from atagia.integrations import SidecarBridge, extract_context_system_prompt
+from atagia.integrations import (
+    MINIMAL_MEMORY_INSTRUCTION,
+    SidecarBridge,
+    extract_context_system_prompt,
+    extract_prompt_data_sections,
+    minimal_memory_payload,
+)
 
 
 @dataclass(slots=True)
@@ -56,8 +62,15 @@ class AtagiaHermesProvider:
             confirmation_strategy="live_prompt_allowed",
             memory_privacy_mode=memory_privacy_mode,
         )
+        payload = minimal_memory_payload(extract_context_system_prompt(context))
+        # The host injects this string verbatim as its own system prompt, so
+        # the instruction must travel with the data sections rather than being
+        # added by ``append_context_to_prompt``. A foreign pass-through payload
+        # carries no Atagia data sections and is forwarded unframed, as before.
+        if extract_prompt_data_sections(payload):
+            payload = f"{MINIMAL_MEMORY_INSTRUCTION}\n\n{payload}"
         return HermesMemoryContext(
-            system_prompt=extract_context_system_prompt(context),
+            system_prompt=payload,
             raw_context=context,
         )
 

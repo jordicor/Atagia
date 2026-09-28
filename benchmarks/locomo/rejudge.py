@@ -17,9 +17,9 @@ Protocols:
   conversation transcript as ground truth for extras). The E1b extras-truth
   audit falls out of these structured verdicts.
 
-Cost safety: the judge is pinned to a Kimi model. Real token counts (including
-provider-reported cached-input tokens) are captured per call and priced with the
-documented Kimi rates. A live budget guard extrapolates observed cost at
+Cost safety: real token counts (including provider-reported cached-input
+tokens) are captured per call and priced with the configured judge rates
+(defaults match the default judge model). A live budget guard extrapolates observed cost at
 per-conversation granularity and halts (writing a partial report) once the
 projection exceeds ``--max-cost-usd``; because it checks between conversations,
 it can overshoot by up to one conversation's batch.
@@ -50,6 +50,7 @@ from benchmarks.locomo.night_run_artifacts import (
     source_evidence_for_record,
 )
 from benchmarks.output_root import assert_outside_repo, utc_run_id
+from atagia.core.llm_output_limits import GENERIC_JUDGE_MAX_OUTPUT_TOKENS
 from benchmarks.scorer import JudgeProtocol, JudgeVerdict, LLMJudgeScorer
 from atagia.core.config import Settings
 from atagia.services.providers import build_llm_client
@@ -57,13 +58,16 @@ from atagia.services.providers import build_llm_client
 # Load .env before any Settings.from_env() call resolves provider keys.
 load_dotenv()
 
-_DEFAULT_JUDGE_MODEL = "kimi/kimi-k2.7-code-highspeed"
+_DEFAULT_JUDGE_MODEL = "openrouter/openai/gpt-5.6-luna,medium"
 _DEFAULT_DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "locomo10.json"
-# Documented Kimi K2.7 Code rates (USD per 1M tokens): openrouter.ai/moonshotai
-# /kimi-k2.7-code and platform.kimi.ai/docs/pricing/chat.
-_KIMI_INPUT_PRICE = 0.95
-_KIMI_OUTPUT_PRICE = 4.00
-_KIMI_CACHED_INPUT_PRICE = 0.19
+# GPT-5.6 Luna direct-OpenAI list rates after the 2026-07-30 cut (USD per 1M
+# tokens; developers.openai.com/api/docs/pricing). Deliberately conservative:
+# the OpenRouter route currently bills ~half under a promo discount — pass the
+# promo rates via --input-price/--output-price/--cached-input-price when the
+# projection should reflect it.
+_LUNA_INPUT_PRICE = 0.20
+_LUNA_OUTPUT_PRICE = 1.20
+_LUNA_CACHED_INPUT_PRICE = 0.02
 # Rough char-per-token ratio for the pre-run projection only (real token counts
 # come from the provider during the run).
 _CHARS_PER_TOKEN = 4.0
@@ -87,9 +91,10 @@ class RejudgeConfig:
     max_questions: int | None = None
     max_cost_usd: float = 10.0
     dry_run: bool = False
-    input_price: float = _KIMI_INPUT_PRICE
-    output_price: float = _KIMI_OUTPUT_PRICE
-    cached_input_price: float = _KIMI_CACHED_INPUT_PRICE
+    input_price: float = _LUNA_INPUT_PRICE
+    output_price: float = _LUNA_OUTPUT_PRICE
+    cached_input_price: float = _LUNA_CACHED_INPUT_PRICE
+    judge_max_output_tokens: int = GENERIC_JUDGE_MAX_OUTPUT_TOKENS
 
 
 @dataclass(slots=True)
@@ -308,7 +313,7 @@ async def run_rejudge(config: RejudgeConfig) -> dict[str, Any]:
         print(
             f"NOTE: cache-free projection "
             f"${projection['estimated_cost_usd_no_cache']} exceeds "
-            f"--max-cost-usd ${config.max_cost_usd}. Kimi prefix-caching of the "
+            f"--max-cost-usd ${config.max_cost_usd}. Provider prefix-caching of the "
             f"shared transcript prefix typically reduces this well below the "
             f"cap; a live per-conversation budget guard will halt the run if the "
             f"observed cost trends above the cap.",
@@ -328,7 +333,12 @@ async def run_rejudge(config: RejudgeConfig) -> dict[str, Any]:
     client = build_llm_client(settings)
     recorder = LLMCallRecorder()
     install_llm_call_recorder(client, recorder)
-    scorer = LLMJudgeScorer(client, config.judge_model, config.protocol)
+    scorer = LLMJudgeScorer(
+        client,
+        config.judge_model,
+        config.protocol,
+        max_output_tokens=config.judge_max_output_tokens,
+    )
 
     verdicts: list[_Verdict] = []
     stopped_early = False
@@ -440,6 +450,7 @@ def _build_result(
             "concurrency": config.concurrency,
             "max_questions": config.max_questions,
             "max_cost_usd": config.max_cost_usd,
+            "judge_max_output_tokens": config.judge_max_output_tokens,
             "privacy_enforcement": "off",
         },
         "stopped_early": stopped_early,
@@ -737,9 +748,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-questions", type=int, default=None)
     parser.add_argument("--max-cost-usd", type=float, default=10.0)
     parser.add_argument("--dry-run", action="store_true", help="Print projection and exit.")
-    parser.add_argument("--input-price", type=float, default=_KIMI_INPUT_PRICE)
-    parser.add_argument("--output-price", type=float, default=_KIMI_OUTPUT_PRICE)
-    parser.add_argument("--cached-input-price", type=float, default=_KIMI_CACHED_INPUT_PRICE)
+    parser.add_argument("--input-price", type=float, default=_LUNA_INPUT_PRICE)
+    parser.add_argument("--output-price", type=float, default=_LUNA_OUTPUT_PRICE)
+    parser.add_argument("--cached-input-price", type=float, default=_LUNA_CACHED_INPUT_PRICE)
+    parser.add_argument(
+        "--judge-max-output-tokens",
+        type=int,
+        default=GENERIC_JUDGE_MAX_OUTPUT_TOKENS,
+        help=(
+            "Output-token budget per judge call. Reasoning-model judges spend "
+            "thinking tokens inside this budget; raise it for high-effort specs."
+        ),
+    )
     return parser
 
 
@@ -757,6 +777,7 @@ def _config_from_args(args: argparse.Namespace) -> RejudgeConfig:
         input_price=args.input_price,
         output_price=args.output_price,
         cached_input_price=args.cached_input_price,
+        judge_max_output_tokens=args.judge_max_output_tokens,
     )
 
 

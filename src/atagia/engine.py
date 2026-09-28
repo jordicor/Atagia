@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace as dataclass_replace
 import os
 from pathlib import Path
 import sqlite3
@@ -11,11 +12,16 @@ from typing import Any
 
 from atagia.app import AppRuntime, initialize_runtime
 from atagia.core.config import Settings, configured_resource_path
+from atagia.core.effective_settings import (
+    ResolvedPolicyReport,
+    build_effective_settings_report,
+)
 from atagia.core import json_utils
 from atagia.core.job_run_repository import JobRunRepository
 from atagia.core.repositories import MemoryObjectRepository, WorkspaceRepository
 from atagia.core.runtime_safety import wait_for_in_memory_worker_quiescence
 from atagia.core.transcript_rebuild_repository import TranscriptRebuildRepository
+from atagia.memory.policy_manifest import resolved_policy_provenance
 from atagia.models.schemas_api import (
     ChatResult,
     ContextResult,
@@ -95,6 +101,27 @@ def _models_after_phase_overrides(
     return models
 
 
+def _resolved_manifest_policies(runtime: AppRuntime) -> dict[str, ResolvedPolicyReport]:
+    """Resolve every mode manifest into the retrieval policy a run starts from.
+
+    This is the manifest layer of the effective configuration: the policy as the
+    mode files define it, with no workspace, conversation, or operational
+    override applied, because those are per-request rather than per-run. Each
+    field carries the layer that produced it -- the manifest file, a schema
+    default the file left unset, the resolver's own constants, or a value
+    computed from the manifest payload.
+    """
+    return {
+        mode_id: ResolvedPolicyReport(
+            values=runtime.policy_resolver.resolve(manifest, None, None).model_dump(
+                mode="json"
+            ),
+            provenance=resolved_policy_provenance(manifest),
+        )
+        for mode_id, manifest in runtime.manifests.items()
+    }
+
+
 def _is_sqlite_busy_or_locked(exc: sqlite3.OperationalError) -> bool:
     error_code = getattr(exc, "sqlite_errorcode", None)
     if isinstance(error_code, int) and (error_code & 0xFF) in {
@@ -106,12 +133,111 @@ def _is_sqlite_busy_or_locked(exc: sqlite3.OperationalError) -> bool:
     return "locked" in message or "busy" in message
 
 
+# Settings fields that library-mode `_build_settings` writes on top of the
+# env-derived base (`Settings.from_env()`). Every other Settings field flows
+# straight through from env. This is the single source of truth for the
+# override allowlist: the runtime guard in `_build_settings` asserts the
+# constructed override dict uses exactly these keys, and the engine tests import
+# it to prove no Settings field silently diverges from env in library mode.
+#
+# Structural allowlist only -- it says which fields `_build_settings` may write,
+# NOT which of them the engine actually decided on a given boot. Every entry
+# except `_ENGINE_FORCED_SETTINGS_FIELDS` is a conditional merge, so with no
+# constructor argument it writes the env-derived value back verbatim. Provenance
+# therefore uses `_ENGINE_FORCED_SETTINGS_FIELDS | <caller-supplied fields>`, a
+# subset of this set, computed per boot by `_resolve_engine_override_fields`.
+_ENGINE_SETTINGS_OVERRIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        "sqlite_path",
+        "manifests_path",
+        "operational_profiles_path",
+        "storage_backend",
+        "redis_url",
+        "anthropic_api_key",
+        "openai_api_key",
+        "google_api_key",
+        "openrouter_api_key",
+        "inference_access_mode",
+        "local_llm_endpoints_file",
+        "zero_cost_openrouter_profile",
+        "llm_chat_model",
+        "llm_forced_global_model",
+        "llm_ingest_model",
+        "llm_retrieval_model",
+        "llm_component_models",
+        "llm_intimacy_ingest_model",
+        "llm_intimacy_retrieval_model",
+        "llm_intimacy_component_models",
+        "llm_intimacy_proactive_routing_enabled",
+        "llm_structured_output_retry_attempts",
+        "llm_structured_output_rescue_enabled",
+        "llm_structured_output_rescue_model",
+        "answer_postcondition_guard_enabled",
+        "answer_stance",
+        "answer_stance_prompt_variant",
+        "service_mode",
+        "service_api_key",
+        "admin_api_key",
+        "workers_enabled",
+        "allow_insecure_http",
+        "embedding_backend",
+        "embedding_model",
+        "skip_belief_revision",
+        "skip_compaction",
+        "context_cache_enabled",
+        "disable_chunking_extraction",
+        "assistant_guidance_enabled",
+        "context_envelope_budget_tokens",
+        "context_envelope_ratios",
+    }
+)
+
+# Fields library mode pins on its own authority. Their value is a hardcoded
+# literal in `_build_settings`, decided whatever the caller passed and whatever
+# the environment holds, so the engine is their source on every boot: library
+# mode is not a service (`service_mode`, `service_api_key`, `admin_api_key`),
+# runs its own workers (`workers_enabled`), and talks over loopback
+# (`allow_insecure_http`).
+#
+# Their environment variables are service-mode configuration read by `app.py`,
+# not library-mode configuration. Nothing else belongs here: a field the
+# environment is allowed to configure must reach the runtime, so it is a
+# sentinel or fallback merge instead (see `_resolve_engine_override_fields`).
+_ENGINE_FORCED_SETTINGS_FIELDS: frozenset[str] = frozenset(
+    {
+        "service_mode",
+        "service_api_key",
+        "admin_api_key",
+        "workers_enabled",
+        "allow_insecure_http",
+    }
+)
+
+# `storage_backend` is neither forced nor a plain merge. Library mode collapses
+# everything that is not redis to "inprocess", but WHO asked for redis varies:
+# the caller's `redis_url` argument or `ATAGIA_STORAGE_BACKEND=redis`. Reporting
+# the environment's own choice as an engine override would credit the wrong
+# layer, so `_resolve_engine_override_fields` decides it from the very predicate
+# `_build_settings` computes.
+_ENV_PREDICATE_MERGE_FIELDS: frozenset[str] = frozenset({"storage_backend"})
+
+# The two mappings `_models_after_phase_overrides` merges: neither a plain
+# fallback nor a sentinel-guarded assignment, so `_resolve_engine_override_fields`
+# decides them from the merge inputs instead of from a single argument.
+_COMPONENT_MODEL_MERGE_FIELDS: frozenset[str] = frozenset(
+    {
+        "llm_component_models",
+        "llm_intimacy_component_models",
+    }
+)
+
+
 class Atagia:
     """Library interface for retrieval and chat flows."""
 
     def __init__(
         self,
-        db_path: str | Path = "atagia.db",
+        db_path: str | Path | None = None,
         redis_url: str | None = None,
         manifests_dir: str | Path | None = None,
         operational_profiles_dir: str | Path | None = None,
@@ -131,24 +257,29 @@ class Atagia:
         openai_api_key: str | None = None,
         google_api_key: str | None = None,
         openrouter_api_key: str | None = None,
+        inference_access_mode: str | None = None,
+        local_llm_endpoints_file: str | Path | None = None,
+        zero_cost_openrouter_profile: str | None = None,
+        _inference_startup_completion_models: dict[str, str] | None = None,
         embedding_backend: str | None = None,
         embedding_model: str | None = None,
-        skip_belief_revision: bool = False,
-        skip_compaction: bool = False,
+        skip_belief_revision: bool | None = None,
+        skip_compaction: bool | None = None,
         context_cache_enabled: bool | None = None,
         disable_chunking_extraction: bool | None = None,
         assistant_guidance_enabled: bool | None = None,
-        recent_transcript_budget_tokens: int | None = None,
         context_envelope_budget_tokens: int | None = None,
         context_envelope_ratios: dict[str, float] | None = None,
         answer_stance: str | None = None,
         answer_stance_prompt_variant: str | None = None,
         answer_postcondition_guard_enabled: bool | None = None,
     ) -> None:
-        self._db_path = (
-            str(Path(db_path).expanduser())
-            if isinstance(db_path, Path)
-            else str(db_path)
+        # `None` means "the caller did not supply this", which is what lets the
+        # environment reach the runtime. Every parameter below whose omission
+        # must not silence an env var uses that sentinel, so "not supplied" is
+        # distinguishable from "supplied a value that equals the default".
+        self._db_path: str | None = (
+            str(Path(db_path).expanduser()) if isinstance(db_path, Path) else db_path
         )
         self._redis_url = redis_url
         self._manifests_dir = (
@@ -183,6 +314,16 @@ class Atagia:
         self._openai_api_key = openai_api_key
         self._google_api_key = google_api_key
         self._openrouter_api_key = openrouter_api_key
+        self._inference_access_mode = inference_access_mode
+        self._local_llm_endpoints_file = (
+            str(Path(local_llm_endpoints_file).expanduser())
+            if isinstance(local_llm_endpoints_file, Path)
+            else local_llm_endpoints_file
+        )
+        self._zero_cost_openrouter_profile = zero_cost_openrouter_profile
+        self._inference_startup_completion_models = dict(
+            _inference_startup_completion_models or {}
+        )
         self._embedding_backend = embedding_backend
         self._embedding_model = embedding_model
         self._skip_belief_revision = skip_belief_revision
@@ -190,7 +331,6 @@ class Atagia:
         self._context_cache_enabled = context_cache_enabled
         self._disable_chunking_extraction = disable_chunking_extraction
         self._assistant_guidance_enabled = assistant_guidance_enabled
-        self._recent_transcript_budget_tokens = recent_transcript_budget_tokens
         self._context_envelope_budget_tokens = context_envelope_budget_tokens
         self._context_envelope_ratios = (
             dict(context_envelope_ratios)
@@ -202,6 +342,12 @@ class Atagia:
         self._answer_postcondition_guard_enabled = answer_postcondition_guard_enabled
         self._runtime: AppRuntime | None = None
         self._closed = False
+        # Populated by `_build_settings` (the environment as it stood when it
+        # read its base, and the fields the engine actually decided) and frozen
+        # into the effective-settings report by `setup()`.
+        self._present_env_names: frozenset[str] = frozenset()
+        self._engine_override_fields: frozenset[str] = frozenset()
+        self._effective_settings_report: dict[str, Any] | None = None
 
     @property
     def runtime(self) -> AppRuntime | None:
@@ -211,7 +357,19 @@ class Atagia:
     async def setup(self) -> Atagia:
         """Initialize the runtime if it has not been started yet."""
         if self._runtime is None:
-            self._runtime = await initialize_runtime(self._build_settings())
+            settings = self._build_settings()
+            self._runtime = await initialize_runtime(
+                settings,
+                additional_inference_completion_models=(
+                    self._inference_startup_completion_models
+                ),
+            )
+            self._effective_settings_report = build_effective_settings_report(
+                effective_settings=settings,
+                present_env_names=self._present_env_names,
+                engine_override_fields=self._engine_override_fields,
+                resolved_policies=_resolved_manifest_policies(self._runtime),
+            )
         self._closed = False
         return self
 
@@ -1541,8 +1699,144 @@ class Atagia:
         await self._runtime.close()
         self._runtime = None
 
+    def _resolve_engine_override_fields(
+        self,
+        *,
+        phase_models_overridden: bool,
+        intimacy_phase_models_overridden: bool,
+        storage_backend_from_env: bool,
+    ) -> frozenset[str]:
+        """Settings fields whose value THIS boot's engine layer decided.
+
+        `_ENGINE_SETTINGS_OVERRIDE_FIELDS` says which fields `_build_settings`
+        may write; this says which of them it actually sourced. The difference
+        matters for the effective-settings report: most entries are conditional
+        merges, and with no constructor argument the merge is the identity on
+        the env-derived value. Tagging those `engine_override` would credit a
+        layer that only copied the environment back -- the same misattribution
+        the report exists to prevent.
+
+        The rule is per field, mirroring the exact merge `_build_settings`
+        performs, never a comparison against the env value:
+
+        * `_ENGINE_FORCED_SETTINGS_FIELDS` -- always the engine (see there).
+        * `self._x or env_settings.x` -- the engine when the caller's operand is
+          the one `or` selects. An empty string is not selected, so the value
+          came from env and is reported as such.
+        * `env_settings.x if self._x is None else self._x` -- the engine when the
+          argument is not `None`. `None` is the "not supplied" marker for every
+          one of these parameters; a falsy-but-supplied value such as `0` or
+          `""` IS taken by the engine and is reported as the engine's.
+        * the two component-model mappings -- merges rather than fallbacks:
+          `_models_after_phase_overrides` drops env-configured components whose
+          phase received a constructor-level model, then applies the caller's
+          mapping. The engine decided them when the caller's mapping contributed
+          at least one entry or a supplied phase model parameterized the filter;
+          with neither, the merge returns the env-derived mapping.
+        * `storage_backend` -- the engine unless the environment is what asked
+          for redis (`storage_backend_from_env`, the same predicate
+          `_build_settings` computes). The caller's `redis_url` and the
+          collapse-to-inprocess floor are both the engine's decision; a run that
+          talks to redis because `ATAGIA_STORAGE_BACKEND=redis` was exported is
+          the environment's.
+        """
+        # `self._x or env_settings.x` merges.
+        fallback_arguments: dict[str, Any] = {
+            "manifests_path": self._manifests_dir,
+            "operational_profiles_path": self._operational_profiles_dir,
+            "redis_url": self._redis_url,
+            "anthropic_api_key": self._anthropic_api_key,
+            "openai_api_key": self._openai_api_key,
+            "google_api_key": self._google_api_key,
+            "openrouter_api_key": self._openrouter_api_key,
+            "llm_forced_global_model": self._llm_forced_global_model,
+            "llm_chat_model": self._llm_chat_model,
+            "llm_ingest_model": self._llm_ingest_model,
+            "llm_retrieval_model": self._llm_retrieval_model,
+            "llm_intimacy_ingest_model": self._llm_intimacy_ingest_model,
+            "llm_intimacy_retrieval_model": self._llm_intimacy_retrieval_model,
+            "llm_structured_output_rescue_model": (
+                self._llm_structured_output_rescue_model
+            ),
+            "embedding_backend": self._embedding_backend,
+            "embedding_model": self._embedding_model,
+        }
+        # `env_settings.x if self._x is None else self._x` merges.
+        sentinel_arguments: dict[str, Any] = {
+            "sqlite_path": self._db_path,
+            "skip_belief_revision": self._skip_belief_revision,
+            "skip_compaction": self._skip_compaction,
+            "llm_intimacy_proactive_routing_enabled": (
+                self._llm_intimacy_proactive_routing_enabled
+            ),
+            "llm_structured_output_retry_attempts": (
+                self._llm_structured_output_retry_attempts
+            ),
+            "llm_structured_output_rescue_enabled": (
+                self._llm_structured_output_rescue_enabled
+            ),
+            "answer_postcondition_guard_enabled": (
+                self._answer_postcondition_guard_enabled
+            ),
+            "answer_stance": self._answer_stance,
+            "answer_stance_prompt_variant": self._answer_stance_prompt_variant,
+            "context_cache_enabled": self._context_cache_enabled,
+            "disable_chunking_extraction": self._disable_chunking_extraction,
+            "assistant_guidance_enabled": self._assistant_guidance_enabled,
+            "context_envelope_budget_tokens": self._context_envelope_budget_tokens,
+            "context_envelope_ratios": self._context_envelope_ratios,
+            "inference_access_mode": self._inference_access_mode,
+            "local_llm_endpoints_file": self._local_llm_endpoints_file,
+            "zero_cost_openrouter_profile": self._zero_cost_openrouter_profile,
+        }
+        classified = (
+            frozenset(fallback_arguments)
+            | frozenset(sentinel_arguments)
+            | _COMPONENT_MODEL_MERGE_FIELDS
+            | _ENV_PREDICATE_MERGE_FIELDS
+            | _ENGINE_FORCED_SETTINGS_FIELDS
+        )
+        classified_count = (
+            len(fallback_arguments)
+            + len(sentinel_arguments)
+            + len(_COMPONENT_MODEL_MERGE_FIELDS)
+            + len(_ENV_PREDICATE_MERGE_FIELDS)
+            + len(_ENGINE_FORCED_SETTINGS_FIELDS)
+        )
+        if (
+            classified != _ENGINE_SETTINGS_OVERRIDE_FIELDS
+            or classified_count != len(classified)
+        ):
+            raise RuntimeError(
+                "engine provenance classification drifted: every field in "
+                "_ENGINE_SETTINGS_OVERRIDE_FIELDS must be classified exactly "
+                "once as engine-forced, a fallback merge, a sentinel merge, a "
+                "component-model merge, or an env-predicate merge"
+            )
+
+        engine_sourced = set(_ENGINE_FORCED_SETTINGS_FIELDS)
+        engine_sourced.update(
+            field for field, argument in fallback_arguments.items() if argument
+        )
+        engine_sourced.update(
+            field
+            for field, argument in sentinel_arguments.items()
+            if argument is not None
+        )
+        if self._llm_component_models or phase_models_overridden:
+            engine_sourced.add("llm_component_models")
+        if self._llm_intimacy_component_models or intimacy_phase_models_overridden:
+            engine_sourced.add("llm_intimacy_component_models")
+        if not storage_backend_from_env:
+            engine_sourced.add("storage_backend")
+        return frozenset(engine_sourced)
+
     def _build_settings(self) -> Settings:
         env_settings = Settings.from_env()
+        # Record the environment as it stood for this build so the
+        # effective-settings report describes what ran instead of re-reading a
+        # later environment.
+        self._present_env_names = frozenset(os.environ)
         manifests_path = self._manifests_dir or configured_resource_path(
             "manifests",
             os.getenv("ATAGIA_MANIFESTS_PATH"),
@@ -1554,10 +1848,9 @@ class Atagia:
                 os.getenv("ATAGIA_OPERATIONAL_PROFILES_PATH"),
             )
         )
-        migrations_path = configured_resource_path(
-            "migrations",
-            os.getenv("ATAGIA_MIGRATIONS_PATH"),
-        )
+        # `use_env_redis` is also the provenance predicate for `storage_backend`:
+        # when it holds, the environment chose redis and the engine only carried
+        # the choice through (see `_resolve_engine_override_fields`).
         use_env_redis = (
             self._redis_url is None and env_settings.storage_backend == "redis"
         )
@@ -1598,288 +1891,168 @@ class Atagia:
             self._llm_intimacy_component_models,
             overridden_intimacy_categories,
         )
-        return Settings(
-            sqlite_path=self._db_path,
-            migrations_path=migrations_path,
-            manifests_path=manifests_path,
-            operational_profiles_path=operational_profiles_path,
-            storage_backend=storage_backend,
-            redis_url=self._redis_url or env_settings.redis_url,
-            anthropic_api_key=anthropic_api_key,
-            openai_api_key=openai_api_key,
-            google_api_key=google_api_key,
-            kimi_api_key=env_settings.kimi_api_key,
-            minimax_api_key=env_settings.minimax_api_key,
-            openrouter_api_key=openrouter_api_key,
-            anthropic_base_url=env_settings.anthropic_base_url,
-            openai_base_url=env_settings.openai_base_url,
-            openai_embedding_base_url=env_settings.openai_embedding_base_url,
-            kimi_base_url=env_settings.kimi_base_url,
-            minimax_base_url=env_settings.minimax_base_url,
-            openrouter_base_url=env_settings.openrouter_base_url,
-            openrouter_site_url=env_settings.openrouter_site_url,
-            openrouter_app_name=env_settings.openrouter_app_name,
-            llm_chat_model=self._llm_chat_model or env_settings.llm_chat_model,
-            llm_forced_global_model=forced_global_model,
-            llm_ingest_model=self._llm_ingest_model or env_settings.llm_ingest_model,
-            llm_retrieval_model=self._llm_retrieval_model
-            or env_settings.llm_retrieval_model,
-            llm_component_models=component_models,
-            llm_intimacy_ingest_model=(
+        overrides: dict[str, Any] = {
+            "sqlite_path": (
+                env_settings.sqlite_path if self._db_path is None else self._db_path
+            ),
+            "manifests_path": manifests_path,
+            "operational_profiles_path": operational_profiles_path,
+            "storage_backend": storage_backend,
+            "redis_url": self._redis_url or env_settings.redis_url,
+            "anthropic_api_key": anthropic_api_key,
+            "openai_api_key": openai_api_key,
+            "google_api_key": google_api_key,
+            "openrouter_api_key": openrouter_api_key,
+            "inference_access_mode": (
+                env_settings.inference_access_mode
+                if self._inference_access_mode is None
+                else self._inference_access_mode
+            ),
+            "local_llm_endpoints_file": (
+                env_settings.local_llm_endpoints_file
+                if self._local_llm_endpoints_file is None
+                else self._local_llm_endpoints_file
+            ),
+            "zero_cost_openrouter_profile": (
+                env_settings.zero_cost_openrouter_profile
+                if self._zero_cost_openrouter_profile is None
+                else self._zero_cost_openrouter_profile
+            ),
+            "llm_chat_model": self._llm_chat_model or env_settings.llm_chat_model,
+            "llm_forced_global_model": forced_global_model,
+            "llm_ingest_model": (
+                self._llm_ingest_model or env_settings.llm_ingest_model
+            ),
+            "llm_retrieval_model": (
+                self._llm_retrieval_model or env_settings.llm_retrieval_model
+            ),
+            "llm_component_models": component_models,
+            "llm_intimacy_ingest_model": (
                 self._llm_intimacy_ingest_model
                 or env_settings.llm_intimacy_ingest_model
             ),
-            llm_intimacy_retrieval_model=(
+            "llm_intimacy_retrieval_model": (
                 self._llm_intimacy_retrieval_model
                 or env_settings.llm_intimacy_retrieval_model
             ),
-            llm_intimacy_component_models=intimacy_component_models,
-            llm_intimacy_proactive_routing_enabled=(
+            "llm_intimacy_component_models": intimacy_component_models,
+            "llm_intimacy_proactive_routing_enabled": (
                 env_settings.llm_intimacy_proactive_routing_enabled
                 if self._llm_intimacy_proactive_routing_enabled is None
                 else self._llm_intimacy_proactive_routing_enabled
             ),
-            llm_structured_output_retry_attempts=(
+            "llm_structured_output_retry_attempts": (
                 env_settings.llm_structured_output_retry_attempts
                 if self._llm_structured_output_retry_attempts is None
                 else self._llm_structured_output_retry_attempts
             ),
-            llm_structured_output_rescue_enabled=(
+            "llm_structured_output_rescue_enabled": (
                 env_settings.llm_structured_output_rescue_enabled
                 if self._llm_structured_output_rescue_enabled is None
                 else self._llm_structured_output_rescue_enabled
             ),
-            llm_structured_output_rescue_model=(
+            "llm_structured_output_rescue_model": (
                 self._llm_structured_output_rescue_model
                 or env_settings.llm_structured_output_rescue_model
             ),
-            llm_debug_io_enabled=env_settings.llm_debug_io_enabled,
-            llm_debug_io_dir=env_settings.llm_debug_io_dir,
-            llm_debug_io_purposes=env_settings.llm_debug_io_purposes,
-            llm_debug_io_raw=env_settings.llm_debug_io_raw,
-            llm_debug_io_max_chars=env_settings.llm_debug_io_max_chars,
-            answer_postcondition_guard_enabled=(
+            "answer_postcondition_guard_enabled": (
                 env_settings.answer_postcondition_guard_enabled
                 if self._answer_postcondition_guard_enabled is None
                 else self._answer_postcondition_guard_enabled
             ),
-            answer_postcondition_retry_max_output_tokens=(
-                env_settings.answer_postcondition_retry_max_output_tokens
-            ),
-            answer_stance=(
+            "answer_stance": (
                 env_settings.answer_stance
                 if self._answer_stance is None
                 else self._answer_stance
             ),
-            answer_stance_prompt_variant=(
+            "answer_stance_prompt_variant": (
                 env_settings.answer_stance_prompt_variant
                 if self._answer_stance_prompt_variant is None
                 else self._answer_stance_prompt_variant
             ),
-            service_mode=False,
-            service_api_key=None,
-            admin_api_key=None,
-            workers_enabled=True,
-            debug=env_settings.debug,
-            worker_circuit_breaker_enabled=env_settings.worker_circuit_breaker_enabled,
-            worker_circuit_breaker_failure_threshold=(
-                env_settings.worker_circuit_breaker_failure_threshold
+            "service_mode": False,
+            "service_api_key": None,
+            "admin_api_key": None,
+            "workers_enabled": True,
+            "allow_insecure_http": True,
+            "embedding_backend": (
+                self._embedding_backend or env_settings.embedding_backend
             ),
-            worker_circuit_breaker_window_seconds=(
-                env_settings.worker_circuit_breaker_window_seconds
+            "embedding_model": self._embedding_model or env_settings.embedding_model,
+            "skip_belief_revision": (
+                env_settings.skip_belief_revision
+                if self._skip_belief_revision is None
+                else self._skip_belief_revision
             ),
-            worker_circuit_breaker_min_failure_ratio=(
-                env_settings.worker_circuit_breaker_min_failure_ratio
+            "skip_compaction": (
+                env_settings.skip_compaction
+                if self._skip_compaction is None
+                else self._skip_compaction
             ),
-            llm_run_guard_enabled=env_settings.llm_run_guard_enabled,
-            llm_run_guard_mode=env_settings.llm_run_guard_mode,
-            llm_run_guard_max_total_calls=env_settings.llm_run_guard_max_total_calls,
-            llm_run_guard_max_total_failed_calls=(
-                env_settings.llm_run_guard_max_total_failed_calls
-            ),
-            llm_run_guard_max_failed_call_ratio=(
-                env_settings.llm_run_guard_max_failed_call_ratio
-            ),
-            llm_run_guard_failed_ratio_min_calls=(
-                env_settings.llm_run_guard_failed_ratio_min_calls
-            ),
-            llm_run_guard_max_failed_calls_per_purpose=(
-                env_settings.llm_run_guard_max_failed_calls_per_purpose
-            ),
-            llm_run_guard_max_failed_ratio_per_purpose=(
-                env_settings.llm_run_guard_max_failed_ratio_per_purpose
-            ),
-            llm_run_guard_purpose_failure_ratio_min_calls=(
-                env_settings.llm_run_guard_purpose_failure_ratio_min_calls
-            ),
-            llm_run_guard_max_consecutive_failures_per_purpose=(
-                env_settings.llm_run_guard_max_consecutive_failures_per_purpose
-            ),
-            llm_run_guard_max_total_tokens=env_settings.llm_run_guard_max_total_tokens,
-            llm_run_guard_max_reported_cost_usd=(
-                env_settings.llm_run_guard_max_reported_cost_usd
-            ),
-            bulk_ingest_llm_run_guard_enabled=(
-                env_settings.bulk_ingest_llm_run_guard_enabled
-            ),
-            bulk_ingest_llm_run_guard_max_total_calls=(
-                env_settings.bulk_ingest_llm_run_guard_max_total_calls
-            ),
-            bulk_ingest_llm_run_guard_max_total_failed_calls=(
-                env_settings.bulk_ingest_llm_run_guard_max_total_failed_calls
-            ),
-            bulk_ingest_llm_run_guard_max_failed_call_ratio=(
-                env_settings.bulk_ingest_llm_run_guard_max_failed_call_ratio
-            ),
-            bulk_ingest_llm_run_guard_failed_ratio_min_calls=(
-                env_settings.bulk_ingest_llm_run_guard_failed_ratio_min_calls
-            ),
-            bulk_ingest_llm_run_guard_max_failed_calls_per_purpose=(
-                env_settings.bulk_ingest_llm_run_guard_max_failed_calls_per_purpose
-            ),
-            bulk_ingest_llm_run_guard_max_failed_ratio_per_purpose=(
-                env_settings.bulk_ingest_llm_run_guard_max_failed_ratio_per_purpose
-            ),
-            bulk_ingest_llm_run_guard_purpose_failure_ratio_min_calls=(
-                env_settings.bulk_ingest_llm_run_guard_purpose_failure_ratio_min_calls
-            ),
-            bulk_ingest_llm_run_guard_max_consecutive_failures_per_purpose=(
-                env_settings.bulk_ingest_llm_run_guard_max_consecutive_failures_per_purpose
-            ),
-            bulk_ingest_llm_run_guard_max_total_tokens=(
-                env_settings.bulk_ingest_llm_run_guard_max_total_tokens
-            ),
-            bulk_ingest_llm_run_guard_max_reported_cost_usd=(
-                env_settings.bulk_ingest_llm_run_guard_max_reported_cost_usd
-            ),
-            bulk_ingest_llm_run_guard_max_wall_time_seconds=(
-                env_settings.bulk_ingest_llm_run_guard_max_wall_time_seconds
-            ),
-            allow_insecure_http=True,
-            embedding_backend=self._embedding_backend or env_settings.embedding_backend,
-            embedding_model=self._embedding_model or env_settings.embedding_model,
-            embedding_dimension=env_settings.embedding_dimension,
-            embedding_vector_limit_cap=env_settings.embedding_vector_limit_cap,
-            embedding_search_overfetch_multiplier=(
-                env_settings.embedding_search_overfetch_multiplier
-            ),
-            memory_fts_canonical_bm25_weight=env_settings.memory_fts_canonical_bm25_weight,
-            memory_fts_index_bm25_weight=env_settings.memory_fts_index_bm25_weight,
-            lifecycle_decay_days=env_settings.lifecycle_decay_days,
-            lifecycle_decay_rate=env_settings.lifecycle_decay_rate,
-            lifecycle_archive_vitality=env_settings.lifecycle_archive_vitality,
-            lifecycle_archive_confidence=env_settings.lifecycle_archive_confidence,
-            ephemeral_scoring_hours=env_settings.ephemeral_scoring_hours,
-            lifecycle_ephemeral_ttl_hours=env_settings.lifecycle_ephemeral_ttl_hours,
-            lifecycle_review_ttl_days=env_settings.lifecycle_review_ttl_days,
-            lifecycle_lazy_enabled=env_settings.lifecycle_lazy_enabled,
-            lifecycle_min_interval_seconds=env_settings.lifecycle_min_interval_seconds,
-            lifecycle_busy_timeout_ms=env_settings.lifecycle_busy_timeout_ms,
-            lifecycle_busy_backoff_seconds=env_settings.lifecycle_busy_backoff_seconds,
-            lifecycle_failure_backoff_seconds=env_settings.lifecycle_failure_backoff_seconds,
-            lifecycle_worker_enabled=env_settings.lifecycle_worker_enabled,
-            lifecycle_worker_interval_seconds=env_settings.lifecycle_worker_interval_seconds,
-            retrieval_packets_dry_run_enabled=(
-                env_settings.retrieval_packets_dry_run_enabled
-            ),
-            retrieval_packets_write_enabled=env_settings.retrieval_packets_write_enabled,
-            fact_facet_surfaces_enabled=env_settings.fact_facet_surfaces_enabled,
-            fact_facet_retrieval_enabled=env_settings.fact_facet_retrieval_enabled,
-            fact_facet_structured_only=env_settings.fact_facet_structured_only,
-            fact_facet_span_coadmission_enabled=(
-                env_settings.fact_facet_span_coadmission_enabled
-            ),
-            fact_facet_retrieval_limit=env_settings.fact_facet_retrieval_limit,
-            fact_facet_retrieval_rrf_weight=(
-                env_settings.fact_facet_retrieval_rrf_weight
-            ),
-            applicability_gate_mode=env_settings.applicability_gate_mode,
-            response_mode=env_settings.response_mode,
-            adaptive_retrieval=env_settings.adaptive_retrieval,
-            promotion_conv_to_ws_min_conversations=env_settings.promotion_conv_to_ws_min_conversations,
-            promotion_ws_to_global_min_sessions=env_settings.promotion_ws_to_global_min_sessions,
-            promotion_require_mode_consistency=env_settings.promotion_require_mode_consistency,
-            skip_belief_revision=self._skip_belief_revision,
-            skip_compaction=self._skip_compaction,
-            context_cache_enabled=(
+            "context_cache_enabled": (
                 env_settings.context_cache_enabled
                 if self._context_cache_enabled is None
                 else self._context_cache_enabled
             ),
-            context_cache_min_ttl_seconds=env_settings.context_cache_min_ttl_seconds,
-            context_cache_max_ttl_seconds=env_settings.context_cache_max_ttl_seconds,
-            temporary_default_ttl_seconds=env_settings.temporary_default_ttl_seconds,
-            temporary_default_purge_on_close=env_settings.temporary_default_purge_on_close,
-            tombstone_retention_days=env_settings.tombstone_retention_days,
-            erasure_purge_streams=env_settings.erasure_purge_streams,
-            disable_chunking_extraction=(
+            "disable_chunking_extraction": (
                 env_settings.disable_chunking_extraction
                 if self._disable_chunking_extraction is None
                 else self._disable_chunking_extraction
             ),
-            chunking_extraction_threshold_tokens=(
-                env_settings.chunking_extraction_threshold_tokens
-            ),
-            extraction_watchdog_enabled=env_settings.extraction_watchdog_enabled,
-            extraction_watchdog_allow_different_provider=(
-                env_settings.extraction_watchdog_allow_different_provider
-            ),
-            extraction_watchdog_bounded_retry_max_items=(
-                env_settings.extraction_watchdog_bounded_retry_max_items
-            ),
-            extraction_watchdog_bounded_retry_max_output_tokens=(
-                env_settings.extraction_watchdog_bounded_retry_max_output_tokens
-            ),
-            small_corpus_token_threshold_ratio=(
-                env_settings.small_corpus_token_threshold_ratio
-            ),
-            assistant_guidance_enabled=(
+            "assistant_guidance_enabled": (
                 env_settings.assistant_guidance_enabled
                 if self._assistant_guidance_enabled is None
                 else self._assistant_guidance_enabled
             ),
-            recent_transcript_budget_tokens=(
-                env_settings.recent_transcript_budget_tokens
-                if self._recent_transcript_budget_tokens is None
-                else self._recent_transcript_budget_tokens
-            ),
-            context_envelope_budget_tokens=(
+            "context_envelope_budget_tokens": (
                 env_settings.context_envelope_budget_tokens
                 if self._context_envelope_budget_tokens is None
                 else self._context_envelope_budget_tokens
             ),
-            context_envelope_ratios=(
+            "context_envelope_ratios": (
                 env_settings.context_envelope_ratios
                 if self._context_envelope_ratios is None
                 else self._context_envelope_ratios
             ),
-            benchmark_disable_raw_recent_transcript=(
-                env_settings.benchmark_disable_raw_recent_transcript
-            ),
-            recent_transcript_overage_ratio=env_settings.recent_transcript_overage_ratio,
-            topic_working_set_enabled=env_settings.topic_working_set_enabled,
-            topic_working_set_refresh_message_lag=(
-                env_settings.topic_working_set_refresh_message_lag
-            ),
-            topic_working_set_stale_message_lag=(
-                env_settings.topic_working_set_stale_message_lag
-            ),
-            topic_working_set_refresh_token_lag=(
-                env_settings.topic_working_set_refresh_token_lag
-            ),
-            topic_working_set_stale_token_lag=(
-                env_settings.topic_working_set_stale_token_lag
-            ),
-            topic_working_set_refresh_batch_messages=(
-                env_settings.topic_working_set_refresh_batch_messages
-            ),
-            graph_projection_enabled=env_settings.graph_projection_enabled,
-            verbatim_evidence_search_enabled=env_settings.verbatim_evidence_search_enabled,
-            verbatim_evidence_search_rrf_weight=env_settings.verbatim_evidence_search_rrf_weight,
-            verbatim_evidence_search_limit=env_settings.verbatim_evidence_search_limit,
-            verbatim_evidence_window_size=env_settings.verbatim_evidence_window_size,
-            verbatim_evidence_window_overlap=env_settings.verbatim_evidence_window_overlap,
+        }
+        if frozenset(overrides) != _ENGINE_SETTINGS_OVERRIDE_FIELDS:
+            raise RuntimeError(
+                "engine settings override keys drifted from "
+                "_ENGINE_SETTINGS_OVERRIDE_FIELDS; update the allowlist "
+                "constant and its test in lockstep"
+            )
+        # Which of those writes the engine actually sourced, for the
+        # effective-settings report `setup()` freezes.
+        self._engine_override_fields = self._resolve_engine_override_fields(
+            phase_models_overridden=bool(overridden_categories),
+            intimacy_phase_models_overridden=bool(overridden_intimacy_categories),
+            storage_backend_from_env=use_env_redis,
         )
+        return dataclass_replace(env_settings, **overrides)
+
+    def effective_settings_report(self) -> dict[str, Any]:
+        """Auditable snapshot of the configuration this engine actually ran with.
+
+        The snapshot is built once, during ``setup()``, from the very Settings
+        handed to the runtime and the environment as it stood at that moment; it
+        is never re-derived from the live environment, so mutating ``os.environ``
+        after setup cannot change what the report claims a run executed with.
+
+        The ``settings`` block carries every ``Settings`` field with a provenance
+        tag (``default`` / ``env`` / ``engine_override``) and secret-shaped
+        fields redacted mechanically by name; the ``resolved_policy`` block
+        carries the retrieval policy resolved from each mode manifest, tagged
+        ``manifest``. ``engine_override`` means this engine sourced the value --
+        library mode pinned it, or the caller passed it to the constructor -- not
+        merely that the field is one library mode is allowed to write. See
+        ``_resolve_engine_override_fields``.
+        """
+        if self._effective_settings_report is None:
+            raise RuntimeNotInitializedError(
+                "effective_settings_report() reports what a run executed with; "
+                "call setup() before reading it"
+            )
+        return self._effective_settings_report
 
     @staticmethod
     async def _require_user_memory_available(

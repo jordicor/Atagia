@@ -14,11 +14,30 @@ from pathlib import Path
 from typing import Any
 
 from benchmarks.artifact_hash import sha256_file_if_exists
+from benchmarks.invocation_args import redact_invocation_args
 from benchmarks.json_artifacts import write_json_atomic
 
 
 DEFAULT_FULL_RUN_FLUSH_EVERY_TURNS = 50
 _PHASE_CANCEL_WAIT_SECONDS = 10.0
+
+
+def _persisted_command(command: list[str]) -> dict[str, Any]:
+    """The manifest's record of a phase command, with credentials removed.
+
+    The child process still receives the real command; only this record is
+    redacted. Every phase runs ``benchmarks.locomo``, so that CLI's parser is the
+    authority on which flags carry credentials -- the same mechanism the CLI uses
+    on its own ``sys.argv``, rather than a second rule to keep in sync.
+
+    The CLI module is imported here rather than at module scope because importing
+    it runs ``load_dotenv()``, which must not happen merely because something
+    imported this runner.
+    """
+    from benchmarks.locomo.__main__ import _build_parser as _build_locomo_parser
+
+    redacted = redact_invocation_args(command, _build_locomo_parser())
+    return {"command": redacted, "command_text": shlex.join(redacted)}
 
 
 @dataclass(frozen=True)
@@ -223,8 +242,7 @@ def _run_phase(
     if config.dry_run:
         return {
             "phase": phase,
-            "command": command,
-            "command_text": shlex.join(command),
+            **_persisted_command(command),
             "started_at": started_at.isoformat(),
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "returncode": None,
@@ -245,8 +263,7 @@ def _run_phase(
         returncode = process.wait()
     return {
         "phase": phase,
-        "command": command,
-        "command_text": shlex.join(command),
+        **_persisted_command(command),
         "started_at": started_at.isoformat(),
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "returncode": returncode,
@@ -259,8 +276,7 @@ def _skipped_phase(phase: str, command: list[str], *, reason: str) -> dict[str, 
     now = datetime.now(timezone.utc).isoformat()
     return {
         "phase": phase,
-        "command": command,
-        "command_text": shlex.join(command),
+        **_persisted_command(command),
         "started_at": now,
         "finished_at": now,
         "returncode": None,

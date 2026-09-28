@@ -15,11 +15,15 @@ from atagia.services.llm_client import (
     LLMCompletionResponse,
     LLMStreamEvent,
 )
-from atagia.services.openai_proxy_service import OpenAIProxyService
+from atagia.services.openai_proxy_service import (
+    OpenAIProxyService,
+    ProxyContextAttempt,
+)
 from tests.api.test_openai_proxy import _settings
+from tests.turn_telemetry_support import TurnCallMeterMixin
 
 
-class _ProxyLLMClient:
+class _ProxyLLMClient(TurnCallMeterMixin):
     async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
         return LLMCompletionResponse(
             provider="proxy-control-test",
@@ -82,10 +86,10 @@ def _capture_retrieval_identity(
         *,
         message_metadata: dict[str, Any],
         prompt_authority_context: Any = None,
-    ) -> None:
+    ) -> ProxyContextAttempt:
         assert message_metadata
         calls.append((identity, prompt_authority_context))
-        return None
+        return ProxyContextAttempt(context=None, elapsed_ms=0.0)
 
     monkeypatch.setattr(
         OpenAIProxyService,

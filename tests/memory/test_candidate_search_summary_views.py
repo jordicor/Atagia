@@ -22,6 +22,7 @@ from atagia.models.schemas_memory import (
     RetrievalPlan,
     SummaryViewKind,
 )
+from atagia.memory.token_document_frequency import TokenDocumentFrequencyCache
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "migrations"
 MANIFESTS_DIR = Path(__file__).resolve().parents[2] / "src" / "atagia" / "resources" / "manifests"
@@ -35,7 +36,11 @@ async def _build_runtime() -> tuple[object, MemoryObjectRepository, CandidateSea
     workspaces = WorkspaceRepository(connection, clock)
     conversations = ConversationRepository(connection, clock)
     memories = MemoryObjectRepository(connection, clock)
-    search = CandidateSearch(connection, clock)
+    search = CandidateSearch(
+        connection,
+        clock,
+        token_document_frequency_cache=TokenDocumentFrequencyCache(),
+    )
     await users.create_user("usr_1")
     await users.create_user("usr_2")
     await workspaces.create_workspace("wrk_1", "usr_1", "Workspace")

@@ -1,0 +1,47 @@
+-- `turn_duration_ms` never measured a turn's duration, and the name invited an
+-- arithmetic that is wrong by a fixed margin. Renamed to state its real span.
+--
+-- The value is stamped at the instant the retrieval_events row is written, so
+-- everything a turn does AFTER that write is outside it: the rest of the
+-- terminal transaction, the commit, cache publication, job dispatch, connection
+-- teardown, and result assembly. Measured on 2026-07-25, 3 runs x 30 turns per
+-- surface, real SQLite in WAL with a stubbed provider:
+--
+--   surface            median tail after the write
+--   chat                12.1 - 14.2 ms
+--   context              7.1 -  8.8 ms
+--   proxy_completion     4.7 -  4.9 ms
+--   proxy_stream         4.4 -  4.9 ms
+--
+-- The tail is provider-independent: injecting 50 ms into every LLM call grew
+-- the recorded value ~7x and moved the tail by less than 0.6 ms, because the
+-- tail is SQLite and asyncio work, not model time. It is therefore a small
+-- fixed cost (under 1% of a turn that makes real provider calls), not a
+-- proportional one -- the large percentages it shows against a stubbed provider
+-- are an artifact of the stub, not a property of the engine.
+--
+-- WHY THE SPAN IS NOT EXTENDED TO COVER IT. Closing the span means a second
+-- write after the tail completes. Only `chat` could do that cheaply: it already
+-- runs a second UPDATE on this row and could extend it for ~0.14 ms. The other
+-- three surfaces have closed their connection by then, so a closing write costs
+-- ~1.95 ms -- roughly 40% of the very tail it is trying to describe -- and it
+-- still could not measure its own commit, so the column would stay an
+-- under-report, just a quieter one. On `proxy_stream` there is no correct place
+-- for it at all: the turn ends when the `[DONE]` chunk is emitted, and a write
+-- either lands after the client already has the whole answer or delays the
+-- chunk. Making the span mean one thing on `chat` and another on the rest would
+-- be worse than either, so all four surfaces keep the same measurement and the
+-- name now states what it is.
+--
+-- The name follows the existing `<start>_to_<end>_wall_ms` metric convention
+-- (see `request_to_event_wall_ms` in memory/metrics_computer.py). Note the
+-- deliberate asymmetry with the neighbouring `retrieval_duration_ms`: retrieval
+-- IS a bounded phase with a real duration, so `_duration_ms` is correct there
+-- and was never correct here.
+--
+-- A genuine end-to-end turn number, if one is ever wanted, belongs to a
+-- wall-clock delta around the API handler, not to a second write inside the
+-- engine.
+
+ALTER TABLE retrieval_events
+    RENAME COLUMN turn_duration_ms TO turn_to_event_write_wall_ms;

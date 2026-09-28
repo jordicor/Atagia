@@ -14,12 +14,14 @@ from atagia.core import json_utils
 from atagia.core.clock import Clock
 from atagia.core.config import Settings
 from atagia.core.repositories import MessageRepository
+from atagia.core.text_utils import strip_card_output_wrappers
 from atagia.core.topic_repository import TopicRepository
 from atagia.memory.card_prompt import compose_card_prompt
 from atagia.memory.intimacy_boundary_policy import (
     normalize_intimacy_boundary,
     strongest_intimacy_boundary,
 )
+from atagia.models.schemas_decisions import ChoiceQuestion
 from atagia.models.schemas_memory import IntimacyBoundary
 from atagia.services.llm_client import (
     LLMClient,
@@ -28,7 +30,9 @@ from atagia.services.llm_client import (
     known_intimacy_context_metadata,
 )
 from atagia.services.model_resolution import (
+    component_id_for_llm_purpose,
     examples_enabled_for_component,
+    parse_model_spec,
     resolve_component_model,
 )
 
@@ -52,18 +56,64 @@ _TOPIC_INT_SENTINEL = -1
 _TOPIC_BOUNDARY_SENTINEL = ""
 _INTIMACY_BOUNDARY_VALUES = {boundary.value for boundary in IntimacyBoundary}
 
-TopicWorkingSetCardName = Literal["route", "content", "boundary"]
+TopicContentField = Literal["title", "summary", "active_goal", "open_questions", "decisions"]
+TopicWorkingSetCardName = Literal[
+    "route",
+    "content_title",
+    "content_summary",
+    "content_goal",
+    "content_questions",
+    "content_decisions",
+    "boundary",
+]
+
+_CONTENT_FIELDS: tuple[TopicContentField, ...] = (
+    "title",
+    "summary",
+    "active_goal",
+    "open_questions",
+    "decisions",
+)
+_CONTENT_CARD_NAMES: dict[TopicContentField, TopicWorkingSetCardName] = {
+    "title": "content_title",
+    "summary": "content_summary",
+    "active_goal": "content_goal",
+    "open_questions": "content_questions",
+    "decisions": "content_decisions",
+}
+_CONTENT_DECISION_PURPOSES: dict[TopicContentField, str] = {
+    "title": "topic_working_set_title_decision_card",
+    "summary": "topic_working_set_summary_decision_card",
+    "active_goal": "topic_working_set_goal_decision_card",
+    "open_questions": "topic_working_set_questions_decision_card",
+    "decisions": "topic_working_set_decisions_decision_card",
+}
+_CONTENT_FIELD_LABELS: dict[TopicContentField, str] = {
+    "title": "title",
+    "summary": "summary",
+    "active_goal": "active goal",
+    "open_questions": "open questions",
+    "decisions": "settled decisions",
+}
 
 TOPIC_WORKING_SET_CARD_CONCURRENCY = 2
 
 _CARD_PURPOSES: dict[TopicWorkingSetCardName, str] = {
     "route": "topic_working_set_route_card",
-    "content": "topic_working_set_content_card",
+    "content_title": "topic_working_set_title_card",
+    "content_summary": "topic_working_set_summary_card",
+    "content_goal": "topic_working_set_goal_card",
+    "content_questions": "topic_working_set_questions_card",
+    "content_decisions": "topic_working_set_decisions_card",
     "boundary": "topic_working_set_boundary_card",
 }
 _CARD_MAX_OUTPUT_TOKENS: dict[TopicWorkingSetCardName, int] = {
     "route": 192,
-    "content": 512,
+    "content_title": 96,
+    "content_summary": 160,
+    "content_goal": 128,
+    "content_questions": 256,
+    "content_decisions": 256,
     "boundary": 192,
 }
 _MAX_TOPIC_CARD_ACTIONS = 6
@@ -82,8 +132,8 @@ class _TopicContent:
     title: str | None = None
     summary: str | None = None
     active_goal: str | None = None
-    open_questions: tuple[str, ...] = ()
-    decisions: tuple[str, ...] = ()
+    open_questions: tuple[str, ...] | None = None
+    decisions: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +164,10 @@ class TopicUpdateAction(BaseModel):
     active_goal: str = _TOPIC_STRING_SENTINEL
     open_questions: list[str] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
+    clear_summary: bool = False
+    clear_active_goal: bool = False
+    clear_open_questions: bool = False
+    clear_decisions: bool = False
     artifact_ids: list[str] = Field(default_factory=list)
     source_message_ids: list[str] = Field(default_factory=list)
     confidence: float = _TOPIC_FLOAT_SENTINEL
@@ -169,6 +223,23 @@ class TopicUpdateAction(BaseModel):
             raise ValueError(
                 "intimacy_boundary_confidence must be -1.0 or between 0.0 and 1.0"
             )
+        if any(
+            (
+                self.clear_summary,
+                self.clear_active_goal,
+                self.clear_open_questions,
+                self.clear_decisions,
+            )
+        ):
+            if self.action is not TopicUpdateActionType.UPDATE:
+                raise ValueError("content can only be cleared by an update action")
+            if (
+                (self.clear_summary and self.summary)
+                or (self.clear_active_goal and self.active_goal)
+                or (self.clear_open_questions and self.open_questions)
+                or (self.clear_decisions and self.decisions)
+            ):
+                raise ValueError("a cleared content field cannot also have a replacement")
         return self
 
 
@@ -241,6 +312,18 @@ class TopicWorkingSetUpdater:
         self._card_models = {
             card_name: self._model for card_name in _CARD_PURPOSES
         }
+        self._update_mode = resolved_settings.topic_working_set_update_mode
+        self._decision_models = (
+            {
+                field_name: resolve_component_model(
+                    resolved_settings,
+                    component_id_for_llm_purpose(purpose),
+                )
+                for field_name, purpose in _CONTENT_DECISION_PURPOSES.items()
+            }
+            if self._update_mode == "selective"
+            else {}
+        )
 
     async def update_from_messages(
         self,
@@ -407,29 +490,231 @@ class TopicWorkingSetUpdater:
         if not routes:
             return {}
         topics_by_id = _topics_by_id_from_snapshot(snapshot)
-        semaphore = asyncio.Semaphore(TOPIC_WORKING_SET_CARD_CONCURRENCY)
-
-        async def run_card(route: _TopicRoute) -> tuple[str, _TopicContent]:
-            async with semaphore:
-                request = self._card_request(
-                    card_name="content",
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    prompt=self._build_content_prompt(
-                        conversation_id=conversation_id,
-                        snapshot=snapshot,
-                        messages=messages,
-                        route=route,
-                        existing_topic=topics_by_id.get(route.target_id),
-                    ),
-                    snapshot=snapshot,
-                    target_id=route.target_id,
+        update_routes = tuple(
+            route for route in routes if route.action is TopicUpdateActionType.UPDATE
+        )
+        state: list[LLMMessage] = []
+        if self._update_mode == "selective" and update_routes:
+            context = []
+            for route in update_routes:
+                existing_topic = topics_by_id.get(route.target_id)
+                if existing_topic is None:
+                    raise ValueError(
+                        f"Existing topic {route.target_id} is missing from the snapshot"
+                    )
+                context.append(
+                    {
+                        "topic_id": route.target_id,
+                        "existing_topic": {
+                            field_name: existing_topic.get(field_name)
+                            for field_name in _CONTENT_FIELDS
+                        },
+                        "source_messages": self._message_payload(
+                            self._messages_for_route(messages, route)
+                        ),
+                    }
                 )
-                response = await self._llm_client.complete(request)
-                return route.target_id, _parse_content_card_output(response.output_text)
+            state = [
+                LLMMessage(
+                    role="user",
+                    content=json_utils.dumps(
+                        {"conversation_id": conversation_id, "topics": context},
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                )
+            ]
+        semaphore = asyncio.Semaphore(TOPIC_WORKING_SET_CARD_CONCURRENCY)
+        failed = asyncio.Event()
 
-        results = await asyncio.gather(*(run_card(route) for route in routes))
-        return {target_id: content for target_id, content in results}
+        async def generate(
+            route: _TopicRoute,
+            field_name: TopicContentField,
+        ) -> str | tuple[str, ...] | None:
+            request = self._card_request(
+                card_name=_CONTENT_CARD_NAMES[field_name],
+                user_id=user_id,
+                conversation_id=conversation_id,
+                prompt=self._build_content_prompt(
+                    field_name=field_name,
+                    messages=messages,
+                    route=route,
+                    existing_topic=topics_by_id.get(route.target_id),
+                ),
+                snapshot=snapshot,
+                target_id=route.target_id,
+            )
+            response = await self._llm_client.complete(request)
+            return _parse_content_field_output(
+                response.output_text,
+                field_name=field_name,
+                action=route.action,
+            )
+
+        async def choose_field(
+            field_name: TopicContentField,
+            selected_routes: tuple[_TopicRoute, ...],
+        ) -> dict[str, str]:
+            purpose = _CONTENT_DECISION_PURPOSES[field_name]
+            questions = {
+                route.target_id: self._build_content_decision_question(
+                    field_name=field_name,
+                    topic_id=route.target_id,
+                )
+                for route in selected_routes
+            }
+            answers = await self._llm_client.complete_choice_questions(
+                model=self._decision_models[field_name],
+                messages=state,
+                questions=questions,
+                metadata={
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "purpose": purpose,
+                    "topic_working_set_card": f"decision_{field_name}",
+                    **self._intimacy_metadata_from_snapshot(snapshot),
+                },
+                concurrency=TOPIC_WORKING_SET_CARD_CONCURRENCY,
+            )
+            if answers.keys() != questions.keys():
+                raise ValueError(f"{field_name} decisions did not cover every topic")
+            return answers
+
+        async def apply_choice(
+            route: _TopicRoute,
+            field_name: TopicContentField,
+            decision: str,
+        ) -> str | tuple[str, ...] | None:
+            if decision == "keep":
+                return None
+            if decision == "clear" and field_name != "title":
+                return () if field_name in {"open_questions", "decisions"} else ""
+            if decision == "regenerate":
+                return await generate(route, field_name)
+            raise ValueError(f"Invalid {field_name} content decision: {decision}")
+
+        async def run_field(
+            route: _TopicRoute,
+            field_name: TopicContentField,
+            *,
+            selective: bool,
+        ) -> list[tuple[str, TopicContentField, str | tuple[str, ...] | None]]:
+            async with semaphore:
+                if failed.is_set():
+                    raise asyncio.CancelledError()
+                try:
+                    if selective:
+                        answers = await choose_field(field_name, (route,))
+                        value = await apply_choice(
+                            route, field_name, answers[route.target_id]
+                        )
+                    else:
+                        value = await generate(route, field_name)
+                    return [(route.target_id, field_name, value)]
+                except BaseException:
+                    failed.set()
+                    raise
+
+        async def run_typed_field(
+            field_name: TopicContentField,
+        ) -> list[tuple[str, TopicContentField, str | tuple[str, ...] | None]]:
+            try:
+                async with semaphore:
+                    if failed.is_set():
+                        raise asyncio.CancelledError()
+                    answers = await choose_field(field_name, update_routes)
+
+                async def resolve(
+                    route: _TopicRoute,
+                ) -> tuple[str, TopicContentField, str | tuple[str, ...] | None]:
+                    decision = answers[route.target_id]
+                    if decision == "regenerate":
+                        async with semaphore:
+                            if failed.is_set():
+                                raise asyncio.CancelledError()
+                            value = await apply_choice(route, field_name, decision)
+                    else:
+                        value = await apply_choice(route, field_name, decision)
+                    return route.target_id, field_name, value
+
+                async with asyncio.TaskGroup() as group:
+                    tasks = [group.create_task(resolve(route)) for route in update_routes]
+                return [task.result() for task in tasks]
+            except BaseException:
+                failed.set()
+                raise
+
+        try:
+            async with asyncio.TaskGroup() as group:
+                tasks = []
+                if self._update_mode == "direct":
+                    tasks.extend(
+                        group.create_task(run_field(route, field_name, selective=False))
+                        for route in routes
+                        for field_name in _CONTENT_FIELDS
+                    )
+                else:
+                    for field_name in _CONTENT_FIELDS:
+                        tasks.extend(
+                            group.create_task(run_field(route, field_name, selective=False))
+                            for route in routes
+                            if route.action is TopicUpdateActionType.CREATE
+                        )
+                        if not update_routes:
+                            continue
+                        if parse_model_spec(
+                            self._decision_models[field_name]
+                        ).provider_slug == "typesafe":
+                            tasks.append(group.create_task(run_typed_field(field_name)))
+                        else:
+                            tasks.extend(
+                                group.create_task(
+                                    run_field(route, field_name, selective=True)
+                                )
+                                for route in update_routes
+                            )
+        except BaseExceptionGroup as errors:
+            raise errors.exceptions[0] from None
+        content_fields: dict[str, dict[str, str | tuple[str, ...] | None]] = {
+            route.target_id: {} for route in routes
+        }
+        for task in tasks:
+            for target_id, field_name, value in task.result():
+                content_fields[target_id][field_name] = value
+        return {
+            target_id: _TopicContent(**fields)
+            for target_id, fields in content_fields.items()
+        }
+
+    @staticmethod
+    def _build_content_decision_question(
+        *,
+        field_name: TopicContentField,
+        topic_id: str,
+    ) -> ChoiceQuestion:
+        label = _CONTENT_FIELD_LABELS[field_name]
+        criteria = {
+            "keep": "The stored field remains accurate and complete; preserve it exactly.",
+            "regenerate": (
+                "New evidence or a correction requires a complete revised field. "
+                "A separate content generator will write it."
+            ),
+        }
+        if field_name != "title":
+            criteria["clear"] = (
+                "The stored field should be explicitly removed because no current "
+                "supported value remains."
+            )
+        return ChoiceQuestion(
+            instructions=(
+                f"For existing topic {topic_id}, decide only what to do with its {label}. "
+                "Use this topic's existing fields and its assigned source messages in the state. "
+                "Treat corrections and resolved questions or decisions as changes when they "
+                "make the stored field outdated. For a list, evaluate the entire current list. "
+                "Do not write replacement content."
+            ),
+            criteria=criteria,
+        )
 
     async def _run_boundary_cards(
         self,
@@ -480,7 +765,7 @@ class TopicWorkingSetUpdater:
         card_name: TopicWorkingSetCardName,
         user_id: str,
         conversation_id: str,
-        prompt: str,
+        prompt: str | tuple[str, str],
         snapshot: dict[str, Any],
         target_id: str | None = None,
     ) -> LLMCompletionRequest:
@@ -494,17 +779,27 @@ class TopicWorkingSetUpdater:
         }
         if target_id is not None:
             metadata["topic_working_set_target_id"] = target_id
+        system_content = (
+            "Keep track of the topics in this conversation, using the data below. "
+            "Write only the requested plain-text lines. No JSON. No explanation."
+        )
+        if card_name in _CONTENT_CARD_NAMES.values():
+            if not isinstance(prompt, tuple):
+                raise ValueError("Content card prompt requires instructions and source context")
+            instructions, source = prompt
+            if not instructions.strip() or not source.strip():
+                raise ValueError("Content card prompt requires instructions and source context")
+            system_content = f"{system_content}\n{instructions}"
+            user_content = source
+        else:
+            if not isinstance(prompt, str):
+                raise ValueError("Non-content card prompt must be text")
+            user_content = prompt
         return LLMCompletionRequest(
             model=self._card_models[card_name],
             messages=[
-                LLMMessage(
-                    role="system",
-                    content=(
-                        "Keep track of the topics in this conversation, using the data below. "
-                        "Write only the requested plain-text lines. No JSON. No explanation."
-                    ),
-                ),
-                LLMMessage(role="user", content=prompt),
+                LLMMessage(role="system", content=system_content),
+                LLMMessage(role="user", content=user_content),
             ],
             max_output_tokens=_CARD_MAX_OUTPUT_TOKENS[card_name],
             metadata=metadata,
@@ -621,64 +916,51 @@ class TopicWorkingSetUpdater:
     def _build_content_prompt(
         self,
         *,
-        conversation_id: str,
-        snapshot: dict[str, Any],
+        field_name: TopicContentField,
         messages: list[dict[str, Any]],
         route: _TopicRoute,
         existing_topic: dict[str, Any] | None,
-    ) -> str:
-        source_messages = self._messages_for_route(messages, route)
-        instruction_head = "\n".join(
-            [
-                "Write content fields for one topic.",
-                "Write only fields that should be created or changed. If no content field should change, write exactly: none",
-                "Do not write JSON.",
-                "Do not invent decisions or open questions.",
-                "decision means the conversation settled or chose something.",
-                "question means something is still unresolved.",
-                "For an update, omit any field that should stay as-is.",
-                "For a create, title is required.",
-                "Use neutral titles for sensitive topics; privacy is handled by another card.",
-                "Allowed field lines:",
-                "title: short stable topic label",
-                "summary: one concise sentence",
-                "goal: current active goal, if any",
-                "question: one unresolved question",
-                "decision: one settled decision",
-            ]
-        )
-        examples_block = "\n".join(
-            [
-                "Create for a fresh planning thread.",
-                "title: Garden shed build",
-                "summary: The user is planning to build a backyard shed.",
-                "goal: Pick materials within budget.",
-                "Create with one open issue and one settled choice.",
-                "title: Trip booking",
-                "question: Which dates work for the flights?",
-                "decision: Book the seaside hotel.",
-                "Update that changes only the goal.",
-                "goal: Finish the draft before review.",
-                "Nothing changed.",
-                "none",
-            ]
-        )
-        body = compose_card_prompt(
-            instruction_head,
-            examples_block,
-            include_examples=self._include_examples,
-        )
-        lines = [
-            body,
-            f"conversation_id={conversation_id}",
-            f"action={route.action.value}",
-            f"target_id={route.target_id}",
+    ) -> tuple[str, str]:
+        instructions = {
+            "title": "Choose a short, stable title for this topic. Use a neutral title for sensitive topics.",
+            "summary": "Write one concise sentence summarizing this topic, only when the messages support it.",
+            "active_goal": "State the current active goal for this topic, only when the messages support one.",
+            "open_questions": "List the currently unresolved questions for this topic. Include the complete updated list, one question per line. Do not invent questions.",
+            "decisions": "List the decisions already settled for this topic. Include the complete updated list, one decision per line. Do not treat a mere proposal as settled.",
+        }
+        instruction_lines = [
+            instructions[field_name],
+            "Use only the source messages and existing topic values supplied in the user message.",
+            "Answer only this requested content. Do not include a field label, topic ID, JSON, or explanation.",
         ]
+        if route.action is TopicUpdateActionType.CREATE and field_name == "title":
+            instruction_lines.append("A new topic requires a title. Write exactly one title line.")
+        else:
+            instruction_lines.append("Write exactly none when this value should not be created or changed.")
+        if route.action is TopicUpdateActionType.UPDATE:
+            if field_name != "title":
+                instruction_lines.append(
+                    "Write exactly clear only when the existing value should be removed."
+                )
+            instruction_lines.append("Otherwise, preserve the existing value by writing none.")
+        instruction_lines.append(f"action={route.action.value}")
+        instruction_head = "\n".join(instruction_lines)
+        lines = []
         if existing_topic is not None:
             lines.extend(
                 [
                     "<existing_target_topic>",
-                    json_utils.dumps(existing_topic, indent=2, sort_keys=True),
+                    json_utils.dumps(
+                        {
+                            "title": existing_topic["title"],
+                            "summary": existing_topic.get("summary"),
+                            "active_goal": existing_topic.get("active_goal"),
+                            "open_questions": existing_topic.get("open_questions"),
+                            "decisions": existing_topic.get("decisions"),
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    ),
                     "</existing_target_topic>",
                 ]
             )
@@ -686,17 +968,14 @@ class TopicWorkingSetUpdater:
             [
                 "<source_messages>",
                 json_utils.dumps(
-                    self._message_payload(source_messages),
+                    self._message_payload(self._messages_for_route(messages, route)),
                     indent=2,
                     sort_keys=True,
                 ),
                 "</source_messages>",
-                "<full_existing_topic_snapshot>",
-                json_utils.dumps(snapshot, indent=2, sort_keys=True),
-                "</full_existing_topic_snapshot>",
             ]
         )
-        return "\n".join(lines)
+        return instruction_head, "\n".join(lines)
 
     def _build_target_boundary_prompt(
         self,
@@ -710,8 +989,8 @@ class TopicWorkingSetUpdater:
             "title": content.title,
             "summary": content.summary,
             "active_goal": content.active_goal,
-            "open_questions": list(content.open_questions),
-            "decisions": list(content.decisions),
+            "open_questions": list(content.open_questions or ()),
+            "decisions": list(content.decisions or ()),
         }
         route_payload = {
             "action": route.action.value,
@@ -1045,8 +1324,8 @@ class TopicWorkingSetUpdater:
         parent_topic_id_value = _wire_string_to_none(action.parent_topic_id)
         topic_id_value = _wire_string_to_none(action.topic_id)
         title_value = _wire_string_to_none(action.title)
-        summary_value = _wire_string_to_none(action.summary)
-        active_goal_value = _wire_string_to_none(action.active_goal)
+        summary_value = "" if action.clear_summary else _wire_string_to_none(action.summary)
+        active_goal_value = "" if action.clear_active_goal else _wire_string_to_none(action.active_goal)
         confidence_value = _wire_float_to_none(action.confidence)
         privacy_level_value = _wire_int_to_none(action.privacy_level)
         boundary_value = _wire_boundary_to_none(action.intimacy_boundary)
@@ -1109,8 +1388,12 @@ class TopicWorkingSetUpdater:
             title=title_value,
             summary=summary_value,
             active_goal=active_goal_value,
-            open_questions=action.open_questions if action.open_questions else None,
-            decisions=action.decisions if action.decisions else None,
+            open_questions=(
+                []
+                if action.clear_open_questions
+                else action.open_questions if action.open_questions else None
+            ),
+            decisions=[] if action.clear_decisions else action.decisions if action.decisions else None,
             artifact_ids=artifact_ids if artifact_ids else None,
             source_message_start_seq=(
                 existing.get("source_message_start_seq")
@@ -1295,40 +1578,30 @@ def _dedupe_routes(routes: list[_TopicRoute]) -> tuple[_TopicRoute, ...]:
     return tuple(deduped)
 
 
-def _parse_content_card_output(text: str) -> _TopicContent:
-    lines = _card_lines(text)
-    if _lines_are_none(lines):
-        return _TopicContent()
-    title: str | None = None
-    summary: str | None = None
-    active_goal: str | None = None
-    open_questions: list[str] = []
-    decisions: list[str] = []
-    for line in lines:
-        if ":" not in line:
-            continue
-        raw_key, raw_value = line.split(":", 1)
-        key = _clean_atom(raw_key)
-        value = _clean_text_value(raw_value)
-        if not value:
-            continue
-        if key == "title":
-            title = value
-        elif key == "summary":
-            summary = value
-        elif key in {"goal", "active_goal"}:
-            active_goal = value
-        elif key in {"question", "open_question"}:
-            open_questions.append(value)
-        elif key == "decision":
-            decisions.append(value)
-    return _TopicContent(
-        title=title,
-        summary=summary,
-        active_goal=active_goal,
-        open_questions=tuple(_dedupe_texts(open_questions)),
-        decisions=tuple(_dedupe_texts(decisions)),
-    )
+def _parse_content_field_output(
+    text: str,
+    *,
+    field_name: TopicContentField,
+    action: TopicUpdateActionType,
+) -> str | tuple[str, ...] | None:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"{field_name} card returned an empty answer")
+    if len(lines) == 1 and lines[0].casefold() == "none":
+        if field_name == "title" and action is TopicUpdateActionType.CREATE:
+            raise ValueError("create actions require a title")
+        return None
+    if len(lines) == 1 and lines[0].casefold() == "clear":
+        if action is not TopicUpdateActionType.UPDATE or field_name == "title":
+            raise ValueError(f"{field_name} cannot be cleared for {action.value}")
+        return () if field_name in {"open_questions", "decisions"} else ""
+    if any(line.casefold() in {"none", "clear"} for line in lines):
+        raise ValueError(f"{field_name} card mixed an instruction token with content")
+    if field_name in {"open_questions", "decisions"}:
+        return tuple(_dedupe_texts(lines))
+    if len(lines) != 1:
+        raise ValueError(f"{field_name} card returned multiple answers")
+    return lines[0]
 
 
 def _parse_boundary_card_output(
@@ -1367,7 +1640,7 @@ def _topic_card_plan_to_structured_plan(card_plan: _TopicCardPlan) -> TopicWorki
         source_message_ids = list(route.source_message_ids)
         if route.action is TopicUpdateActionType.CREATE:
             if content.title is None:
-                continue
+                raise ValueError("create actions require a title")
             boundary_value, privacy_level, boundary_confidence = _boundary_fields_for_action(
                 route,
                 boundary,
@@ -1378,8 +1651,8 @@ def _topic_card_plan_to_structured_plan(card_plan: _TopicCardPlan) -> TopicWorki
                     title=content.title,
                     summary=content.summary or _TOPIC_STRING_SENTINEL,
                     active_goal=content.active_goal or _TOPIC_STRING_SENTINEL,
-                    open_questions=list(content.open_questions),
-                    decisions=list(content.decisions),
+                    open_questions=list(content.open_questions or ()),
+                    decisions=list(content.decisions or ()),
                     artifact_ids=artifact_ids,
                     source_message_ids=source_message_ids,
                     privacy_level=privacy_level,
@@ -1394,15 +1667,22 @@ def _topic_card_plan_to_structured_plan(card_plan: _TopicCardPlan) -> TopicWorki
                 route,
                 boundary,
             )
+            content_updates: dict[str, Any] = {}
+            for field_name in _CONTENT_FIELDS:
+                value = getattr(content, field_name)
+                if value is None:
+                    continue
+                if field_name != "title" and not value:
+                    content_updates[f"clear_{field_name}"] = True
+                    continue
+                content_updates[field_name] = (
+                    list(value) if field_name in {"open_questions", "decisions"} else value
+                )
             actions.append(
                 TopicUpdateAction(
                     action=TopicUpdateActionType.UPDATE,
                     topic_id=route.target_id,
-                    title=content.title or _TOPIC_STRING_SENTINEL,
-                    summary=content.summary or _TOPIC_STRING_SENTINEL,
-                    active_goal=content.active_goal or _TOPIC_STRING_SENTINEL,
-                    open_questions=list(content.open_questions),
-                    decisions=list(content.decisions),
+                    **content_updates,
                     artifact_ids=artifact_ids,
                     source_message_ids=source_message_ids,
                     privacy_level=privacy_level,
@@ -1500,7 +1780,7 @@ def _is_temp_topic_target(value: str) -> bool:
 
 def _card_lines(text: str) -> list[str]:
     normalized = (
-        text.strip()
+        strip_card_output_wrappers(text)
         .replace("<TAB>", " ")
         .replace("<tab>", " ")
         .replace("\\t", " ")
@@ -1521,7 +1801,7 @@ def _line_tokens(line: str) -> list[str]:
 
 
 def _clean_identifier(value: str) -> str:
-    return value.strip().strip("`*_.,;[](){}\"'")
+    return strip_card_output_wrappers(value).strip("`*_.,;[](){}\"'")
 
 
 def _clean_atom(value: str) -> str:

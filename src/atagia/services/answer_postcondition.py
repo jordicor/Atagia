@@ -22,6 +22,7 @@ from atagia.services.llm_client import (
 from atagia.services.chat_support import (
     answer_support_prompt_payload,
     render_answer_support_block,
+    render_prompt_data_section,
 )
 from atagia.services.prompt_authority import (
     PromptAuthorityContext,
@@ -29,6 +30,7 @@ from atagia.services.prompt_authority import (
     prompt_authority_metadata,
     render_verifier_mode_note,
 )
+from atagia.services.prompt_section_rules import ANSWER_SUPPORT_INSTRUCTION
 
 
 AnswerPostconditionFailure = Literal[
@@ -206,7 +208,6 @@ class AnswerPostconditionReport(BaseModel):
     status: Literal[
         "passed",
         "retry_passed",
-        "supported_partial_fallback",
         "abstained",
         "failed",
     ]
@@ -762,7 +763,6 @@ async def _try_required_answer_evidence_repair(
         evidence_use_repair_count=1,
         evidence_use_repair_failure_count=1,
         abstention_reason="supported_answer_repair_failed",
-        repair_verdict_existed=repair_verdict is not None,
     )
 
 
@@ -941,7 +941,6 @@ async def _try_evidence_use_repair(
         evidence_use_repair_count=1,
         evidence_use_repair_failure_count=1,
         abstention_reason="supported_answer_repair_failed",
-        repair_verdict_existed=retry_verdict is not None,
     )
 
 
@@ -1065,7 +1064,6 @@ async def _try_supported_answer_repair_after_failed_answer(
         evidence_use_repair_count=1,
         evidence_use_repair_failure_count=1,
         abstention_reason="supported_answer_repair_failed",
-        repair_verdict_existed=repair_verdict is not None,
     )
 
 
@@ -1297,22 +1295,13 @@ def _abstain_result(
     evidence_use_repair_count: int = 0,
     evidence_use_repair_failure_count: int = 0,
     abstention_reason: AnswerPostconditionAbstentionReason | None = None,
-    repair_verdict_existed: bool = False,
 ) -> GuardedAnswerResult:
-    supported_partial_fallback = _supported_partial_answer_fallback(
-        composed_context,
-        failure_reasons=failure_reasons,
-        abstention_reason=abstention_reason,
-        repair_verdict_existed=repair_verdict_existed,
-    )
-    output_text = supported_partial_fallback or fallback_text
+    output_text = fallback_text
     return GuardedAnswerResult(
         output_text=output_text,
         response=response.model_copy(update={"output_text": output_text}),
         report=AnswerPostconditionReport(
-            status="supported_partial_fallback"
-            if supported_partial_fallback is not None
-            else "abstained",
+            status="abstained",
             retry_count=retry_count,
             output_limit_retry=output_limit_retry,
             initial_output_chars=initial_output_chars,
@@ -1348,41 +1337,6 @@ def _abstain_result(
             ),
         ),
     )
-
-
-def _supported_partial_answer_fallback(
-    composed_context: ComposedContext,
-    *,
-    failure_reasons: list[AnswerPostconditionFailure],
-    abstention_reason: AnswerPostconditionAbstentionReason | None,
-    repair_verdict_existed: bool,
-) -> str | None:
-    if abstention_reason != "supported_answer_repair_failed":
-        return None
-    if not repair_verdict_existed:
-        return None
-    if "missing_required_abstention" in failure_reasons:
-        return None
-    if composed_context.answer_shape not in {
-        "single_fact",
-        "list",
-        "temporal",
-        "raw_context",
-    }:
-        return None
-    if composed_context.coverage_state not in {"complete", "partial"}:
-        return None
-    values = [
-        str(item.get("display_text") or "").strip()
-        for item in composed_context.allowed_values
-        if isinstance(item, dict) and str(item.get("display_text") or "").strip()
-    ]
-    values = list(dict.fromkeys(values))
-    if not values:
-        return None
-    # Keep this last-resort fallback language-agnostic; DEFAULT_ABSTENTION_TEXT
-    # is separate pre-existing English debt.
-    return ", ".join(values)
 
 
 def _verification_report_fields(
@@ -2087,14 +2041,16 @@ def _verification_prompt(
         "answer_evidence.sufficiency.state is sufficient_direct_quote, treat the "
         "listed answer_evidence items as selected direct evidence: fail an "
         "abstention or conflicting nearby answer when that direct quote answers "
-        "the original query. If answer_support.allowed_values is present for a "
-        "list, temporal, raw-context, or exact single-fact answer, "
-        "fail answers that add concrete values outside allowed_values for the "
-        "requested facet. If answer_support.coverage_state is partial, a plain "
-        "supported subset can pass; a complete-looking answer with unsupported "
-        "extra values must fail. If answer_support.values_truncated is true, "
-        "treat the visible support values as a bounded sample, not as an "
-        "exhaustive complete set."
+        "the original query. "
+        "answer_support.source_inventory is only a bounded provenance index. "
+        "Its labels may be unrelated to the query and must not restrict facts "
+        "supported by source text or direct quotes. "
+        "answer_support.source_coverage_gaps names omitted source groups, not "
+        "facts the answer may assert. "
+        "answer_support.source_group_coverage_state describes composition of "
+        "source groups, not completeness of the requested answer. A supported "
+        "subset can pass when missing requested facets are stated plainly; "
+        "fail unsupported additions or a false claim of completeness."
     )
 
 
@@ -2286,9 +2242,15 @@ def _request_with_answer_support_context(
     answer_support_block = render_answer_support_block(composed_context)
     if not answer_support_block:
         return request
-    rendered_block = f"<answer_support>\n{answer_support_block}\n</answer_support>"
+    rendered_block = (
+        f"{ANSWER_SUPPORT_INSTRUCTION}\n\n"
+        f"{render_prompt_data_section('answer_support', answer_support_block)}"
+    )
     messages = list(request.messages)
-    if messages and "<answer_support>" in messages[0].content:
+    if messages and (
+        messages[0].content.startswith("<answer_support>\n")
+        or "\n<answer_support>\n" in messages[0].content
+    ):
         return request
     if messages and messages[0].role == "system":
         messages[0] = messages[0].model_copy(
@@ -2383,7 +2345,7 @@ def _should_attempt_supported_answer_repair(
         retrieval_diagnostics
     ) or _has_direct_answer_evidence_support(
         retrieval_diagnostics
-    ) or _has_answer_support_allowed_values(retrieval_diagnostics)
+    )
 
 
 def _supported_answer_repair_verdict(
@@ -2393,22 +2355,22 @@ def _supported_answer_repair_verdict(
         return None
     obligations = _supported_obligation_descriptions(
         retrieval_diagnostics
-    ) or _answer_support_obligation_descriptions(
-        retrieval_diagnostics
     ) or _answer_evidence_obligation_descriptions(retrieval_diagnostics)
     if not obligations:
         return None
+    source_coverage_notes = _answer_support_obligation_descriptions(
+        retrieval_diagnostics
+    )
     return AbstentionLegitimacyVerdict(
         abstention_allowed=False,
         reason=(
             "Selected eligible evidence covers the requested obligation; "
             "attempting a claim-level supported answer repair before fallback."
         ),
-        missing_supported_obligations=obligations,
+        missing_supported_obligations=[*obligations, *source_coverage_notes],
         evidence_ids_supporting_answer=sorted(
             _eligible_evidence_ids(retrieval_diagnostics)
             | _direct_answer_evidence_ids(retrieval_diagnostics)
-            | _answer_support_evidence_ids(retrieval_diagnostics)
         ),
         policy_or_scope_blocker=False,
         evidence_insufficient=False,
@@ -2480,18 +2442,6 @@ def _has_direct_answer_evidence_support(
     return bool(_direct_answer_evidence_items(retrieval_diagnostics))
 
 
-def _has_answer_support_allowed_values(
-    retrieval_diagnostics: dict[str, Any],
-) -> bool:
-    answer_support = retrieval_diagnostics.get("answer_support")
-    if not isinstance(answer_support, dict):
-        return False
-    if str(answer_support.get("coverage_state") or "") == "insufficient":
-        return False
-    allowed_values = answer_support.get("allowed_values")
-    return isinstance(allowed_values, list) and bool(allowed_values)
-
-
 def _direct_answer_evidence_ids(retrieval_diagnostics: dict[str, Any]) -> set[str]:
     return {
         str(item.get("memory_id"))
@@ -2552,21 +2502,17 @@ def _supported_obligation_descriptions(
 def _missing_members_obligation_description(
     answer_support: dict[str, Any],
 ) -> str | None:
-    """Name the known members that retrieved evidence did not cover.
-
-    Built from ``missing_slots[].display_text`` so the answer model is told an
-    exhaustive list is incomplete. Returns ``None`` when there is nothing to
-    report. This is intentionally independent of ``allowed_values`` so it still
-    fires when every member was dropped (empty ``allowed_values``).
-    """
-    coverage_state = str(answer_support.get("coverage_state") or "").strip()
+    """Describe omitted source groups without treating their labels as answers."""
+    coverage_state = str(
+        answer_support.get("source_group_coverage_state") or ""
+    ).strip()
     if coverage_state not in {"partial", "insufficient"}:
         return None
-    missing_slots = answer_support.get("missing_slots")
-    if not isinstance(missing_slots, list):
+    source_coverage_gaps = answer_support.get("source_coverage_gaps")
+    if not isinstance(source_coverage_gaps, list):
         return None
     display_texts: list[str] = []
-    for slot in missing_slots[:12]:
+    for slot in source_coverage_gaps[:12]:
         if not isinstance(slot, dict):
             continue
         display_text = str(slot.get("display_text") or "").strip()
@@ -2576,57 +2522,36 @@ def _missing_members_obligation_description(
     if not display_texts:
         return None
     return (
-        "Known members not covered by retrieved evidence: "
+        "Source groups omitted from composed context: "
         + ", ".join(display_texts)
-        + "; state that this list is incomplete."
+        + ". These labels are not answer evidence; check requested facts against "
+        "the selected sources and state any unsupported parts."
     )
 
 
 def _answer_support_obligation_descriptions(
     retrieval_diagnostics: dict[str, Any],
 ) -> list[str]:
+    """Return source coverage notes for an independently supported repair."""
     answer_support = retrieval_diagnostics.get("answer_support")
     if not isinstance(answer_support, dict):
         return []
     descriptions: list[str] = []
-    # Name the missing members BEFORE the allowed_values guard so this honesty
-    # signal still reaches the answer model when every member was dropped (empty
-    # allowed_values → coverage_state == "insufficient").
     missing_members_obligation = _missing_members_obligation_description(answer_support)
     if missing_members_obligation is not None:
         descriptions.append(missing_members_obligation)
-    allowed_values = answer_support.get("allowed_values")
-    if not isinstance(allowed_values, list):
-        return descriptions
-    for item in allowed_values[:8]:
-        if not isinstance(item, dict):
-            continue
-        display_text = str(item.get("display_text") or "").strip()
-        normalized_key = str(item.get("normalized_key") or "").strip()
-        evidence_ids = [
-            str(evidence_id).strip()
-            for evidence_id in item.get("evidence_ids") or []
-            if str(evidence_id).strip()
-        ][:6]
-        if display_text and evidence_ids:
+    if bool(answer_support.get("source_inventory_truncated")):
+        descriptions.append(
+            "The source inventory is truncated; inspect the selected source "
+            "text for all requested facts."
+        )
+    if descriptions:
+        evidence_ids = sorted(_answer_support_evidence_ids(retrieval_diagnostics))[:12]
+        if evidence_ids:
             descriptions.append(
-                f"Use supported value {display_text!r} from evidence IDs: "
+                "Source inventory evidence IDs for inspection only: "
                 + ", ".join(evidence_ids)
             )
-        elif display_text:
-            descriptions.append(f"Use supported value {display_text!r}")
-        elif normalized_key:
-            descriptions.append(f"Use supported value key {normalized_key!r}")
-    allowed_value_descriptions = (
-        descriptions[1:] if missing_members_obligation is not None else descriptions
-    )
-    coverage_state = str(answer_support.get("coverage_state") or "").strip()
-    if coverage_state == "partial" and allowed_value_descriptions:
-        descriptions.append(
-            "State that the answer is the supported subset from retrieved evidence."
-        )
-    if bool(answer_support.get("values_truncated")) and allowed_value_descriptions:
-        descriptions.append("The shown support values were truncated for prompt size.")
     return descriptions
 
 
@@ -2634,11 +2559,11 @@ def _answer_support_evidence_ids(retrieval_diagnostics: dict[str, Any]) -> set[s
     answer_support = retrieval_diagnostics.get("answer_support")
     if not isinstance(answer_support, dict):
         return set()
-    allowed_values = answer_support.get("allowed_values")
-    if not isinstance(allowed_values, list):
+    source_inventory = answer_support.get("source_inventory")
+    if not isinstance(source_inventory, list):
         return set()
     evidence_ids: set[str] = set()
-    for item in allowed_values:
+    for item in source_inventory:
         if not isinstance(item, dict):
             continue
         for evidence_id in item.get("evidence_ids") or []:
@@ -2728,8 +2653,9 @@ def _retry_request(
         "retrieved evidence. If the original user query names the current user "
         "and the retrieved context describes that same person as 'user', you may "
         "use the query's name for that person. When <answer_support> is present, "
-        "use only allowed_values for list/exact/temporal requested values and "
-        "plainly mark partial coverage instead of adding unsupported items. Do "
+        "answer only from source evidence for list/exact/temporal requested "
+        "values. Treat source_inventory as provenance, not a value limit. Mark "
+        "missing requested facts plainly instead of adding unsupported items. Do "
         "not add reasoning prose."
         f"{_answer_stance_retry_note(answer_stance)}"
         f"{diagnostic_note}"
@@ -2821,8 +2747,8 @@ def _evidence_use_retry_request(
         "explicitly supported by the retrieved context; a shorter partial list is "
         "safer than adding plausible but unsupported items. Do not infer event "
         "names, timings, or examples from related context. Do not add unsupported "
-        "facts. When <answer_support> is present, treat allowed_values as the "
-        "complete set of values you may name for the requested facet. If the "
+        "facts. When <answer_support> is present, use relevant source evidence "
+        "for the requested facet; source_inventory is not a complete answer set. If the "
         "context still does not actually contain the answer, say "
         "that you do not have enough reliable retrieved evidence."
         f"{_answer_stance_retry_note(answer_stance)}"

@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import AsyncOpenAI
 
 from atagia.core.config import Settings, default_resource_path
 from atagia.services.llm_client import (
     ConfigurationError,
+    InferenceAccessDeniedError,
     LLMCompletionRequest,
     LLMCompletionResponse,
     LLMEmbeddingRequest,
     LLMEmbeddingResponse,
     LLMEmbeddingVector,
     LLMMessage,
+    LLMToolSpec,
     LLMProvider,
     TransientLLMError,
 )
@@ -73,7 +78,9 @@ async def test_openrouter_stream_maps_text_tool_call_and_done() -> None:
                                 index=0,
                                 id="call_1",
                                 type="function",
-                                function=SimpleNamespace(name="lookup", arguments='{"q":"hel'),
+                                function=SimpleNamespace(
+                                    name="lookup", arguments='{"q":"hel'
+                                ),
                             )
                         ],
                     ),
@@ -256,7 +263,10 @@ async def test_openrouter_strips_nullable_for_google_structured_output() -> None
     schema = response_format["json_schema"]["schema"]
     assert "$defs" not in schema
     assert "additionalProperties" not in schema
-    assert schema["properties"]["status"] == {"type": "string", "enum": ["ok", "warning"]}
+    assert schema["properties"]["status"] == {
+        "type": "string",
+        "enum": ["ok", "warning"],
+    }
     assert schema["properties"]["note"] == {"type": "string"}
 
 
@@ -296,11 +306,16 @@ async def test_openrouter_preserves_nullable_for_openai_vendor() -> None:
     response_format = completions.calls[0]["response_format"]
     assert response_format["json_schema"]["strict"] is True
     schema = response_format["json_schema"]["schema"]
-    assert schema["properties"]["note"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
+    assert schema["properties"]["note"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "null"},
+    ]
 
 
 @pytest.mark.asyncio
-async def test_openrouter_complete_preserves_provider_body_when_requiring_schema_support() -> None:
+async def test_openrouter_complete_preserves_provider_body_when_requiring_schema_support() -> (
+    None
+):
     response = SimpleNamespace(
         model="openai/gpt-chat-latest",
         choices=[SimpleNamespace(message=SimpleNamespace(content='{"score":0.8}'))],
@@ -336,6 +351,114 @@ async def test_openrouter_complete_preserves_provider_body_when_requiring_schema
         "provider": {"sort": "latency", "require_parameters": True},
         "reasoning": {"effort": "low"},
     }
+
+
+@pytest.mark.asyncio
+async def test_zero_cost_openrouter_serializes_immutable_free_routing_body_for_complete_and_stream() -> (
+    None
+):
+    serialized_bodies: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        serialized_bodies.append(body)
+        if body["stream"]:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=(
+                    'data: {"id":"chatcmpl-stream","object":"chat.completion.chunk",'
+                    '"created":0,"model":"openai/gpt-example:free","choices":['
+                    '{"index":0,"delta":{"content":"streamed"},"finish_reason":null}]}\n\n'
+                    'data: {"id":"chatcmpl-stream","object":"chat.completion.chunk",'
+                    '"created":0,"model":"openai/gpt-example:free","choices":['
+                    '{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                    "data: [DONE]\n\n"
+                ),
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-complete",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "openai/gpt-example:free",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "complete"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    provider = OpenRouterProvider(
+        api_key="test",
+        site_url="https://atagia.org",
+        app_name="Atagia",
+        zero_cost=True,
+    )
+    await provider.aclose()
+    wire_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider._owned_http_clients = [wire_client]
+    sdk_client = AsyncOpenAI(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        http_client=wire_client,
+        max_retries=0,
+    )
+    provider._client = sdk_client
+    provider._embedding_client = sdk_client
+    request = LLMCompletionRequest(
+        model="openai/gpt-example:free",
+        messages=[LLMMessage(role="user", content="Return JSON.")],
+        response_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+    )
+
+    try:
+        completion = await provider.complete(request)
+        events = [event async for event in provider.stream(request)]
+
+        assert completion.output_text == "complete"
+        assert [event.content for event in events if event.type == "text"] == [
+            "streamed"
+        ]
+        expected_provider_body = {
+            "allow_fallbacks": False,
+            "max_price": {
+                "prompt": 0,
+                "completion": 0,
+                "request": 0,
+                "image": 0,
+            },
+            "require_parameters": True,
+        }
+        assert [body["model"] for body in serialized_bodies] == [
+            "openai/gpt-example:free",
+            "openai/gpt-example:free",
+        ]
+        assert all(
+            body["provider"] == expected_provider_body for body in serialized_bodies
+        )
+
+        with pytest.raises(InferenceAccessDeniedError, match="provider_extra_body"):
+            await provider.complete(
+                request.model_copy(
+                    update={"metadata": {"provider_extra_body": {"models": ["paid"]}}}
+                )
+            )
+        with pytest.raises(InferenceAccessDeniedError, match="tools"):
+            await provider.complete(
+                request.model_copy(update={"tools": [LLMToolSpec(name="lookup")]})
+            )
+
+        assert len(serialized_bodies) == 2
+    finally:
+        await provider.aclose()
 
 
 @pytest.mark.asyncio
@@ -450,7 +573,9 @@ async def test_openrouter_complete_omits_response_format_for_flexible_vendor() -
     assert "extra_body" not in completions.calls[0]
 
 
-def test_openrouter_default_headers_and_factory_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openrouter_default_headers_and_factory_wiring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured = {}
 
     class FakeAsyncOpenAI:
@@ -505,12 +630,18 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
         def __init__(self, *args, **kwargs) -> None:
             self.embed_calls = 0
 
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
+            return LLMCompletionResponse(
+                provider=self.name, model=request.model, output_text="ok"
+            )
 
         async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
             self.embed_calls += 1
-            raise AssertionError("Anthropic provider should not handle embeddings in this configuration")
+            raise AssertionError(
+                "Anthropic provider should not handle embeddings in this configuration"
+            )
 
     class FakeOpenAIProvider(LLMProvider):
         name = "openai"
@@ -518,8 +649,12 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
         def __init__(self, *args, **kwargs) -> None:
             self.embed_calls = 0
 
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
+            return LLMCompletionResponse(
+                provider=self.name, model=request.model, output_text="ok"
+            )
 
         async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
             self.embed_calls += 1
@@ -529,7 +664,9 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
                 vectors=[LLMEmbeddingVector(index=0, values=[0.1, 0.2])],
             )
 
-    monkeypatch.setattr("atagia.services.providers.AnthropicProvider", FakeAnthropicProvider)
+    monkeypatch.setattr(
+        "atagia.services.providers.AnthropicProvider", FakeAnthropicProvider
+    )
     monkeypatch.setattr("atagia.services.providers.OpenAIProvider", FakeOpenAIProvider)
 
     settings = Settings(
@@ -556,7 +693,9 @@ async def test_build_llm_client_routes_embeddings_to_openai_for_anthropic(
 
     client = build_llm_client(settings)
     embedding = await client.embed(
-        LLMEmbeddingRequest(model="openai/text-embedding-3-small", input_texts=["hello"])
+        LLMEmbeddingRequest(
+            model="openai/text-embedding-3-small", input_texts=["hello"]
+        )
     )
 
     assert client.provider_name is None
@@ -573,8 +712,12 @@ def test_build_llm_client_requires_openai_for_anthropic_embeddings(
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
+            return LLMCompletionResponse(
+                provider=self.name, model=request.model, output_text="ok"
+            )
 
         async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
             raise AssertionError("Embeddings should fail at startup before use")
@@ -585,14 +728,24 @@ def test_build_llm_client_requires_openai_for_anthropic_embeddings(
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
+            return LLMCompletionResponse(
+                provider=self.name, model=request.model, output_text="ok"
+            )
 
         async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-            return LLMEmbeddingResponse(provider=self.name, model=request.model, vectors=[])
+            return LLMEmbeddingResponse(
+                provider=self.name, model=request.model, vectors=[]
+            )
 
-    monkeypatch.setattr("atagia.services.providers.AnthropicProvider", FakeAnthropicProvider)
-    monkeypatch.setattr("atagia.services.providers.OpenRouterProvider", FakeOpenRouterProvider)
+    monkeypatch.setattr(
+        "atagia.services.providers.AnthropicProvider", FakeAnthropicProvider
+    )
+    monkeypatch.setattr(
+        "atagia.services.providers.OpenRouterProvider", FakeOpenRouterProvider
+    )
 
     settings = Settings(
         sqlite_path=":memory:",
@@ -631,11 +784,17 @@ async def test_build_llm_client_routes_embeddings_by_provider_qualified_model(
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
+            return LLMCompletionResponse(
+                provider=self.name, model=request.model, output_text="ok"
+            )
 
         async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
-            raise AssertionError("Anthropic provider should not handle embeddings in this configuration")
+            raise AssertionError(
+                "Anthropic provider should not handle embeddings in this configuration"
+            )
 
     class FakeOpenRouterProvider(LLMProvider):
         name = "openrouter"
@@ -643,8 +802,12 @@ async def test_build_llm_client_routes_embeddings_by_provider_qualified_model(
         def __init__(self, *args, **kwargs) -> None:
             self.embed_calls = 0
 
-        async def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
-            return LLMCompletionResponse(provider=self.name, model=request.model, output_text="ok")
+        async def complete(
+            self, request: LLMCompletionRequest
+        ) -> LLMCompletionResponse:
+            return LLMCompletionResponse(
+                provider=self.name, model=request.model, output_text="ok"
+            )
 
         async def embed(self, request: LLMEmbeddingRequest) -> LLMEmbeddingResponse:
             self.embed_calls += 1
@@ -654,8 +817,12 @@ async def test_build_llm_client_routes_embeddings_by_provider_qualified_model(
                 vectors=[LLMEmbeddingVector(index=0, values=[0.3, 0.4])],
             )
 
-    monkeypatch.setattr("atagia.services.providers.AnthropicProvider", FakeAnthropicProvider)
-    monkeypatch.setattr("atagia.services.providers.OpenRouterProvider", FakeOpenRouterProvider)
+    monkeypatch.setattr(
+        "atagia.services.providers.AnthropicProvider", FakeAnthropicProvider
+    )
+    monkeypatch.setattr(
+        "atagia.services.providers.OpenRouterProvider", FakeOpenRouterProvider
+    )
 
     settings = Settings(
         sqlite_path=":memory:",
